@@ -5491,6 +5491,186 @@ async fn stream_scope_is_project_qualified_and_isolates_foreign_tenants() {
     );
 }
 
+/// #14 (GraphQL-subscription surface) — the graphql-sse subscription stream subscribes the
+/// PROJECT-QUALIFIED scope `default/blog/<topic>`, exactly where a deployed producer (a mutation
+/// handler / function / consumer) publishes the subscription's execution result via
+/// `wasi:messaging` (`ProjectRef::qualified`). This mirrors the host-`stream` #14 fix on the one
+/// surface it left on the bare-site scope. The test is a genuine ≥2-tenant isolation proof:
+///   - the subscriber (project `default`, site `blog`) receives ITS OWN project's event, published
+///     at the real `ProjectRef::new("default").qualified("blog")` producer key — the fan-out the old
+///     BARE-site scope (`blog/<topic>`) could not reach from any deployed producer; and
+///   - a FOREIGN tenant's event seeded on `acme/blog/<topic>` in the SAME shared messaging keyspace
+///     is NEVER delivered (zero foreign-tenant bytes) — the project prefix isolates.
+///
+/// RED WITHOUT THE FIX: with the bare-site scope the stream subscribes `blog/<topic>`, while BOTH
+/// producers publish project-qualified (`default/blog/<topic>`, `acme/blog/<topic>`) — so the
+/// subscriber receives NEITHER event and the "own event" read below times out (panics). The scopes
+/// are derived through the real `ProjectRef::qualified`, so the test tracks the producer key rather
+/// than a literal and stays honest if the scheme changes.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graphql_subscription_scope_is_project_qualified_and_isolates_foreign_tenants() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::time::Duration;
+
+    // The `/graphql` handler's component is never run for a subscription (the graphql edge frames the
+    // messaging topic as a graphql-sse stream and returns before loading the blob), but the route must
+    // route to the handler and the manifest needs a valid entry — point it at http-200.
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                no_secrets: false,
+                secrets: Vec::new(),
+                tenancy: None,
+                token_claims: None,
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                streaming: false,
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
+                blobstore_containers: Vec::new(),
+                egress_allowlist: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    // A plain (non-federated) graphql edge: a subscription op is framed as a
+                    // graphql-sse stream off its root-field topic.
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let log = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    let messaging: Arc<dyn Messaging> = log.clone();
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // A subscription POST: its single root field (`messageAdded`) names the messaging topic.
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/_sites/blog/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"query":"subscription { messageAdded { id body } }"}"#,
+        ))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40002))));
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream")),
+        "a subscription must open a graphql-sse event stream"
+    );
+    let mut body = response.into_body().into_data_stream();
+
+    // Derive the two tenants' producer scopes the SAME way a guest `wasi:messaging` binding does
+    // (`ProjectRef::qualified`), so the test tracks the real producer key — not a hardcoded string.
+    // Topic = the subscription's root field.
+    let mine = format!(
+        "{}/messageAdded",
+        ProjectRef::new("default").qualified("blog")
+    );
+    let foreign = format!("{}/messageAdded", ProjectRef::new("acme").qualified("blog"));
+    assert_ne!(
+        mine, foreign,
+        "the project prefix must segregate the two tenants"
+    );
+
+    // Seed a FOREIGN tenant's execution result (acme) in the shared keyspace, then the subscriber's
+    // own (default) — each the `{"data": …}` a real producer publishes for the subscription.
+    log.publish(
+        &foreign,
+        br#"{"data":{"messageAdded":{"id":"9","body":"FOREIGN-TENANT"}}}"#,
+    )
+    .await
+    .unwrap();
+    log.publish(
+        &mine,
+        br#"{"data":{"messageAdded":{"id":"1","body":"mine"}}}"#,
+    )
+    .await
+    .unwrap();
+
+    // The default-project subscriber receives ITS event — the guest-scope fan-out the bare-site scope
+    // could not reach — framed as a graphql-sse `next`, and never the foreign tenant's bytes.
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for the subscriber's own event")
+        .expect("stream ended")
+        .expect("body error");
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(
+        text.contains("event: next"),
+        "payload must be framed as a graphql-sse `next` event: {text:?}"
+    );
+    assert!(
+        text.contains("\"body\":\"mine\""),
+        "subscriber must receive its own project's guest-scoped event: {text:?}"
+    );
+    assert!(
+        !text.contains("FOREIGN"),
+        "a foreign tenant's bytes must never reach the subscriber: {text:?}"
+    );
+}
+
 /// The per-site SSE connection cap (`maxStreamConnections`) is enforced: with a
 /// cap of 1, a second concurrent connection to the same scope is refused with
 /// `503` while the first is still open.

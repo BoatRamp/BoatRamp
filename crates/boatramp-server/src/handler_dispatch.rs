@@ -264,6 +264,7 @@ pub(super) async fn dispatch_handler(
                                 .map(str::to_string);
                             return crate::stream::serve_graphql_subscription(
                                 inner,
+                                project,
                                 site,
                                 site_handlers,
                                 &topic,

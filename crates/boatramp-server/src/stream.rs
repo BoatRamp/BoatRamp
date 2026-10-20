@@ -657,6 +657,7 @@ pub(super) async fn serve_stream(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_graphql_subscription(
     inner: &Arc<HandlerRuntimeInner>,
+    project: &str,
     site: &str,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     topic: &str,
@@ -673,14 +674,14 @@ pub(super) async fn serve_graphql_subscription(
     };
     // Binding identity, same rule as request handlers and `serve_stream`: live binds to
     // the site, a preview to its own `{site}/_preview/{id}` namespace.
-    // NOTE (#14): this GraphQL-subscription surface still subscribes the BARE-site scope and has no
-    // `project` in hand; it is out of #14's scope (the request targets the host `stream` —
-    // serve_stream/serve_ws_stream). If GraphQL subscriptions fan out guest-published events they
-    // likely need the same project-qualification (threading `project` here) — flagged as a follow-up.
-    let scope = match preview {
+    // #14: project-qualify the scope to match where a deployed guest's `wasi:messaging` binding
+    // publishes — `{project}/{site}/<topic>` (`ProjectRef::qualified` prefixes the project for every
+    // project incl. `default`). The bare-site scope was unreachable by any deployed handler/function.
+    let base = match preview {
         Some(id) => format!("{site}/_preview/{id}"),
         None => site.to_string(),
     };
+    let scope = boatramp_core::project::ProjectRef::new(project).qualified(&base);
     let site_permit = match acquire_stream_permit(inner, &scope, site_handlers) {
         Ok(permit) => permit,
         Err(()) => {
