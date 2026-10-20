@@ -1873,6 +1873,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "boatramp-overlay"
+version = "0.40.0"
+dependencies = [
+ "boatramp-overlay-proto",
+ "boatramp-rpktls",
+ "quinn",
+ "rustls 0.23.40",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boatramp-overlay-proto"
 version = "0.40.0"
 dependencies = [
