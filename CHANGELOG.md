@@ -5,6 +5,50 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.42.0] - 2026-10-20
+
+boatramp gains its own **overlay network fabric** — the `bro` fabric — a from-scratch boatramp-idiom
+reimplementation of a relay-blind, capability-gated overlay (no vendored code). A remote operator can
+now `boatramp forward 127.0.0.1:5432 svc/db` and reach an in-cluster service over the overlay: the
+dial is gated by a holder-bound COSE capability, the bytes are end-to-end encrypted so the relay
+carries only ciphertext, and the flow transparently promotes from the relay onto a direct
+hole-punched link when one is reachable — surviving the relay being severed. The same fabric can now
+carry boatramp's own Raft cluster mesh. This release also completes mailroom #13 (shared site-blob
+binding for consumers and standalone functions).
+
+### Added
+
+- **Overlay fabric** (two new crates: `boatramp-overlay-proto`, the pure protocol/crypto core, and
+  `boatramp-overlay`, the async runtime):
+  - identity + peer policy over the existing Ed25519 / `TrustSet` substrate, and an offline,
+    holder-key-bound COSE **overlay-dial capability** + gate (no control-plane round-trip);
+  - QUIC on RFC-7250 **raw-public-key TLS** (reusing `boatramp-rpktls`);
+  - a one-round hybrid-KEM **relay-blind E2EE** splice — the relay sees only ciphertext;
+  - a **resumable circuit** that survives a link swap with zero loss or duplication;
+  - ICE + **direct-path promotion** (a QUIC hole-punch pinned to the E2EE-learned identity), so a
+    flow migrates off the relay and keeps running after the relay is gone.
+- **`boatramp forward` + the overlay serve roles.** The `boatramp forward <local> <target>` CLI (a
+  plain client-edge, explicit per-port forward, no OS capture), plus the **relay/ingress** and
+  **egress/terminator** roles served from a new `[overlay]` config section (`relay_listen` +
+  `allowed_clients` + `routes`; `egress_listen` + `services`), so a cluster can accept a forward.
+- **Cluster mesh on the overlay.** `[cluster.mesh] transport = "overlay"` carries the Raft peer mesh
+  (consensus RPCs + client-write forwarding + stream fan-out) over overlay QUIC instead of HTTP,
+  reusing the mesh's existing raw-public-key identity + **live** trust set. Default stays HTTP.
+- **Standalone-function site-blob binding** (`FunctionConfig.blob_site`, mailroom #13). A
+  bus-triggered standalone function can bind a named site's shared blob namespace, matching the
+  consumer / handler / producer scope — gated by the same `allow_imports` consent + container
+  allowlist + per-tenant confinement, fail-closed.
+
+### Security
+
+- The overlay was reviewed to convergence. The egress is **zero-trust**: it re-authorizes the sealed
+  dial capability end-to-end against its own trust root and the cryptographically-proven client
+  identity before connecting a backend, so a compromised or misrouting relay cannot reach one;
+  authorization is anchored to the service the egress actually fronts. The consensus mesh and the
+  network-exposed egress are bounded against resource-exhaustion (handshake timeouts + concurrency
+  caps + chunked reads). The overlay-dial capability must be time-bounded. No reference-project
+  vocabulary survives in the shipped crates.
+
 ## [0.41.0] - 2026-10-20
 
 The compute messaging bind is now live. A native or container workload can use the project messaging

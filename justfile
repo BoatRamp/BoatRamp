@@ -255,7 +255,7 @@ bump-version version:
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' Cargo.toml
     # The internal path-dep pins, anchored on the boatramp path so no external dep
     # is touched.
-    perl -i -pe 's/(boatramp-[a-z]+ = \{ path = "crates\/boatramp-[a-z]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
+    perl -i -pe 's/(boatramp-[a-z-]+ = \{ path = "crates\/boatramp-[a-z-]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
     # The workspace-excluded console crate (its own manifest + lockfile).
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
     # The README's install pins (`cargo install boatramp@X`, `nix run …/vX`,
