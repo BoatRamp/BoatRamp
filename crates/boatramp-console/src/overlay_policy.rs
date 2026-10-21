@@ -298,6 +298,19 @@ pub fn overlay_policy(props: &OverlayPolicyProps) -> Html {
             reload.emit(());
         })
     };
+    // The "Policy saved." notice is durable across the reload the save itself triggers (that's
+    // the whole point of lifting it here), but it shouldn't linger once the operator starts a NEW
+    // edit on the fresh draft — clear it the moment `PolicyEditor` reports dirty again.
+    let on_editor_dirty = {
+        let saved_notice = saved_notice.clone();
+        let on_dirty = props.on_dirty.clone();
+        Callback::from(move |dirty: bool| {
+            if dirty {
+                saved_notice.set(None);
+            }
+            on_dirty.emit(dirty);
+        })
+    };
 
     match &*state {
         LoadState::Loading => html! { <Spinner label="Loading overlay flow policy…" /> },
@@ -314,11 +327,11 @@ pub fn overlay_policy(props: &OverlayPolicyProps) -> Html {
                     { saved_notice_banner(s) }
                 }
                 if *refreshing {
-                    <p role="status" class="mb-2 text-xs text-slate-400">{ "Refreshing…" }</p>
+                    <p role="status" class="mb-2 text-xs text-slate-600">{ "Refreshing…" }</p>
                 }
                 <PolicyEditor key={(*tick).to_string()} loaded={loaded.clone()}
                               on_saved={on_save_success.clone()} on_reload={reload.clone()}
-                              on_dirty={props.on_dirty.clone()} />
+                              on_dirty={on_editor_dirty.clone()} />
             </>
         },
     }
@@ -701,11 +714,31 @@ struct CliffDialogProps {
 /// Save are the same commit, so there is no earlier point to move focus from), Tab/Shift+Tab cycle
 /// within it ([`trap_tab_key`]), Escape cancels, and "Store it" stays disabled until the operator
 /// has both acknowledged the consequence (a checkbox) AND run the embedded dry-run at least once.
+///
+/// Deliberately NOT `aria-modal` (R1b): the rest of the page stays interactive (the draft textarea
+/// above this dialog is not disabled/`inert`, so the operator can still edit it — see the
+/// draft-empties-while-open effect in `policy_editor`), so claiming a modality this component does
+/// not actually enforce (no inert/`aria-hidden` background) would mislead assistive tech. `role` +
+/// `aria-label` + `aria-describedby` + the focus trap + the ack/dry-run gate are the real,
+/// enforced safety; a true inert-background modal is a bigger change, tracked separately.
 #[function_component(CliffDialog)]
 fn cliff_dialog(props: &CliffDialogProps) -> Html {
     let dialog_ref = use_node_ref();
     let ack = use_state(|| false);
     let dry_run_done = use_state(|| false);
+
+    // The textarea above this dialog stays editable while it's open (see the module doc / R1b),
+    // so a dry-run already run against an earlier draft must not keep "Store it" armed once the
+    // operator edits the draft further — mirrors `DryRunPanel`'s own result-clearing on
+    // `policy_override` change.
+    {
+        let dry_run_done = dry_run_done.clone();
+        let draft = props.draft.clone();
+        use_effect_with(draft, move |_| {
+            dry_run_done.set(false);
+            || ()
+        });
+    }
 
     {
         let dialog_ref = dialog_ref.clone();
@@ -759,7 +792,7 @@ fn cliff_dialog(props: &CliffDialogProps) -> Html {
     const WARNING_ID: &str = "cliff-warning-text";
 
     html! {
-        <div ref={dialog_ref} role="alertdialog" aria-modal="true"
+        <div ref={dialog_ref} role="alertdialog"
              aria-label="Confirm storing the first overlay flow policy"
              aria-describedby={WARNING_ID}
              tabindex="-1" onkeydown={on_keydown}
@@ -795,6 +828,15 @@ fn cliff_dialog(props: &CliffDialogProps) -> Html {
 /// focusable element wraps to the first, Shift+Tab past the first wraps to the last. Identity
 /// compared via `is_same_node` (`web_sys` extern types don't derive `PartialEq`, so `==` is not
 /// available between two `HtmlElement`s).
+///
+/// R1a: focus starts on the CONTAINER itself right after the dialog opens (`tabindex="-1"`, so it
+/// is never one of the `FOCUSABLE_SELECTOR` matches). A Shift+Tab as that very first keystroke
+/// used to fall through uncaught: `tabindex="-1"` removes the container from the browser's normal
+/// tab order, so a native reverse-Tab from it lands on whatever is focusable just BEFORE the
+/// dialog in the page (e.g. the textarea above it) — escaping the trap. Forward Tab from the
+/// container needs no special case: the browser already lands on the first focusable CHILD
+/// (document order), which is `first`. So only the Shift+Tab direction needs "focus is not
+/// anywhere in the trapped set at all" treated the same as "focus is on `first`".
 fn trap_tab_key(container: &HtmlElement, focused: &HtmlElement, shift: bool, e: &KeyboardEvent) {
     let Ok(list) = container.query_selector_all(FOCUSABLE_SELECTOR) else {
         return;
@@ -807,16 +849,21 @@ fn trap_tab_key(container: &HtmlElement, focused: &HtmlElement, shift: bool, e: 
     let last = list
         .get(len - 1)
         .and_then(|n| n.dyn_into::<HtmlElement>().ok());
-    let is_focused = |el: &Option<HtmlElement>| {
+    let is_same = |el: &Option<HtmlElement>| {
         el.as_ref()
             .is_some_and(|e| focused.is_same_node(e.dyn_ref::<web_sys::Node>()))
     };
-    if shift && is_focused(&first) {
+    let in_trapped_set = (0..len).any(|i| {
+        list.get(i)
+            .and_then(|n| n.dyn_into::<HtmlElement>().ok())
+            .is_some_and(|el| focused.is_same_node(el.dyn_ref::<web_sys::Node>()))
+    });
+    if shift && (is_same(&first) || !in_trapped_set) {
         e.prevent_default();
         if let Some(last) = &last {
             let _ = last.focus();
         }
-    } else if !shift && is_focused(&last) {
+    } else if !shift && is_same(&last) {
         e.prevent_default();
         if let Some(first) = &first {
             let _ = first.focus();
