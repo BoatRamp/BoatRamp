@@ -275,6 +275,13 @@ pub struct OverlayServeConfig {
     pub allowed_clients: Vec<String>,
     /// Relay routing: a requested service → its egress. Used when `relay_listen` is set.
     pub routes: Vec<OverlayRoute>,
+    /// Reverse ingress (`boatramp expose`): accept exposer REGISTRATIONS on this relay, so a LOCAL
+    /// service published into the cluster (the exposer dials OUT and parks a connection) is reachable
+    /// by a cluster-side `boatramp forward svc/<name>`. Opt-in — a relay accepts exposers only when
+    /// this is `true`; `None`/`false` keeps the forward-only relay. Requires `relay_listen`. The
+    /// registration is holder-bound to an `overlay-publish` capability the relay verifies against
+    /// `trust_root`; first-live-claim-wins on the name.
+    pub accept_exposed: Option<bool>,
     /// Bind an **egress/terminator** here (UDP/QUIC). Unset ⇒ this node runs no egress.
     pub egress_listen: Option<SocketAddr>,
     /// Egress service map: a service name → the local backend it fronts. Used when `egress_listen`

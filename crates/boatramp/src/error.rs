@@ -27,6 +27,10 @@ pub enum CliError {
     #[cfg(feature = "overlay")]
     #[error(transparent)]
     Forward(#[from] crate::forward::ForwardError),
+    /// The `expose` command (overlay reverse-ingress).
+    #[cfg(feature = "overlay")]
+    #[error(transparent)]
+    Expose(#[from] crate::expose::ExposeError),
     /// The `overlay` command group (admin-side grant/ticket).
     #[cfg(feature = "overlay")]
     #[error(transparent)]

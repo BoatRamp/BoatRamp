@@ -150,6 +150,16 @@ pub const KIND_S3_SESSION: &str = "s3-session";
 /// round-trip. Domain-separated: the exact `br_kind` check means it can never be redeemed as any
 /// other token kind, nor they as it.
 pub const KIND_OVERLAY_DIAL: &str = "overlay-dial";
+/// Token kind: an **overlay-publish capability** (boatramp overlay fabric) — the structural mirror of
+/// [`KIND_OVERLAY_DIAL`] for the reverse-ingress (`boatramp expose`) direction. A holder-key-bound,
+/// offline-verifiable CWT authorizing the holder identity to PUBLISH a local service into the cluster
+/// overlay under an exact service name (`br_ovscope`), so a cluster-side `boatramp forward` reaches
+/// it. A relay verifies it (signature + expiry + `br_kind == "overlay-publish"`) and binds `cnf` to
+/// the registering exposer's E2EE-proven identity AT REGISTRATION — the exposer is terminal, so the
+/// relay is the holder-binding authority (there is no downstream party to defer to). Domain-separated:
+/// the exact `br_kind` check means an overlay-dial capability can never be redeemed to publish, nor an
+/// overlay-publish capability to dial.
+pub const KIND_OVERLAY_PUBLISH: &str = "overlay-publish";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -1030,6 +1040,94 @@ pub fn verify_overlay_dial(
     let scope =
         scope.ok_or_else(|| TokenError::Claims("overlay-dial capability has no scope".into()))?;
     Ok(VerifiedOverlayDial { holder, scope })
+}
+
+/// The verified contents of an overlay-publish capability ([`verify_overlay_publish`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverlayPublish {
+    /// The holder key (`cnf`, `"<alg>:<hex>"`) the registering exposer must prove possession of — the
+    /// relay checks it equals the exposer's E2EE-proven overlay identity AT REGISTRATION.
+    pub holder: String,
+    /// The EXACT service name this capability authorizes the holder to publish as (no wildcard — a
+    /// publish capability names one concrete service). The relay enforces `scope == service`.
+    pub scope: String,
+    /// The capability's expiry (Unix seconds) — always present (an overlay-publish capability MUST be
+    /// time-bounded). The relay uses it to bound a parked registration's lifetime.
+    pub exp: u64,
+}
+
+/// Mint an **overlay-publish capability** (`br_kind = "overlay-publish"`): an exact structural mirror
+/// of [`mint_overlay_dial`] for the reverse-ingress direction. A holder-key-bound, offline-verifiable
+/// `COSE_Sign1` CWT authorizing `holder` to publish the local service `scope` into the overlay, signed
+/// by the fleet `Signer` trust root with `iat = now`, `exp = now + ttl_secs`, and a `cti`. A relay
+/// authorizes a registration from it with [`verify_overlay_publish`] plus a holder-key check against
+/// the registering exposer's E2EE-proven identity — no control-plane round-trip. The holder's private
+/// key never leaves the holder; only its public half (`cnf`) is embedded.
+pub async fn mint_overlay_publish(
+    holder: &TokenPublicKey,
+    scope: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_OVERLAY_PUBLISH.to_string()),
+        )
+        .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder.to_hex()))
+        .text_claim(
+            CLAIM_OVERLAY_SCOPE.to_string(),
+            CborValue::Text(scope.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an overlay-publish capability against the fleet public key at `now_unix`: checks the COSE
+/// signature, the **mandatory** expiry, and `br_kind == "overlay-publish"`, returning the bound holder
+/// key, scope, and expiry. Fail-closed: a forged/unsigned/expired/wrong-kind token never verifies, and
+/// an overlay-DIAL token (or any other kind) presented here is rejected (domain separation). The caller
+/// MUST additionally confirm the returned `holder` equals the registering exposer's E2EE-proven identity
+/// (holder binding) and that `scope` equals the service being registered before honoring it.
+pub fn verify_overlay_publish(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedOverlayPublish, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    // An overlay-publish capability MUST be time-bounded (as overlay-dial is): a token with no `exp`
+    // is refused rather than treated as immortal — an unbounded publish capability is never acceptable.
+    let exp = check_exp(&claims, now_unix)?
+        .ok_or_else(|| TokenError::Claims("overlay-publish capability has no expiry".into()))?;
+    let mut kind = None;
+    let mut holder = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_CNF => holder = Some(v.clone()),
+                CLAIM_OVERLAY_SCOPE => scope = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_OVERLAY_PUBLISH) {
+        return Err(TokenError::Claims(
+            "not an overlay-publish capability".into(),
+        ));
+    }
+    let holder = holder
+        .ok_or_else(|| TokenError::Claims("overlay-publish capability has no holder".into()))?;
+    let scope = scope
+        .ok_or_else(|| TokenError::Claims("overlay-publish capability has no scope".into()))?;
+    Ok(VerifiedOverlayPublish { holder, scope, exp })
 }
 
 /// The fully-verified contents of a durable signed-context envelope (R1 + async-lane persona,
@@ -3453,6 +3551,102 @@ mod tests {
                 Err(TokenError::Claims(_))
             ),
             "an overlay-dial capability with no expiry must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_publish_round_trips_and_requires_an_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+
+        // A properly-minted capability (exp = now + ttl) verifies and carries holder + scope + exp.
+        let good = mint_overlay_publish(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_publish(&good, &root_pub, NOW).unwrap();
+        assert_eq!(v.holder, holder_pub.to_hex());
+        assert_eq!(v.scope, "svc/db");
+        assert_eq!(v.exp, NOW + 300);
+
+        // A token with NO `exp` claim — otherwise identical and correctly signed — is REFUSED: an
+        // overlay-publish capability is never treated as immortal.
+        let no_exp = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_PUBLISH.to_string()),
+            )
+            .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder_pub.to_hex()))
+            .text_claim(
+                CLAIM_OVERLAY_SCOPE.to_string(),
+                CborValue::Text("svc/db".to_string()),
+            )
+            .build();
+        let no_exp = sign_claims(no_exp, &root).await.unwrap();
+        assert!(
+            matches!(
+                verify_overlay_publish(&no_exp, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-publish capability with no expiry must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_publish_rejects_a_wrong_trust_root_and_an_expired_token() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let impostor = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+        let token = mint_overlay_publish(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+
+        // Verified against the WRONG root → the signature check fails.
+        assert!(
+            verify_overlay_publish(&token, &impostor.public_key(), NOW).is_err(),
+            "a publish capability from a different trust root must be refused"
+        );
+        // Evaluated past expiry → refused.
+        assert!(
+            verify_overlay_publish(&token, &root.public_key(), NOW + 600).is_err(),
+            "an expired publish capability must be refused"
+        );
+    }
+
+    /// Domain separation (the load-bearing `br_kind` check): an overlay-DIAL token never verifies as a
+    /// publish capability, and an overlay-PUBLISH token never verifies as a dial capability — so a
+    /// capability minted for one direction can never be redeemed for the other.
+    #[tokio::test]
+    async fn overlay_publish_and_dial_are_domain_separated() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+
+        let dial = mint_overlay_dial(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let publish = mint_overlay_publish(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                verify_overlay_publish(&dial, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-dial token must not verify as an overlay-publish capability"
+        );
+        assert!(
+            matches!(
+                verify_overlay_dial(&publish, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-publish token must not verify as an overlay-dial capability"
         );
     }
 }

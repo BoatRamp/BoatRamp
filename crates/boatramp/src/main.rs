@@ -86,6 +86,8 @@ mod workflow;
 #[cfg(feature = "email")]
 mod email;
 #[cfg(feature = "overlay")]
+mod expose;
+#[cfg(feature = "overlay")]
 mod forward;
 #[cfg(feature = "cluster")]
 mod join;
@@ -152,6 +154,11 @@ enum Command {
     /// relay-blind, capability-gated, `ssh -L`-shaped (requires `--features overlay`).
     #[cfg(feature = "overlay")]
     Forward(forward::ForwardArgs),
+    /// Publish a LOCAL service INTO the cluster overlay (the reverse of `forward`) — the exposer
+    /// dials the relay outbound and holds it open, so a cluster-side `boatramp forward svc/<name>`
+    /// reaches a NAT'd local service, relay-blind and capability-gated (requires `--features overlay`).
+    #[cfg(feature = "overlay")]
+    Expose(expose::ExposeArgs),
     /// Admin tooling for the overlay forward-flow: mint a dial capability and emit a one-flag
     /// forward ticket (`overlay grant`) for `boatramp forward --ticket` (requires `--features overlay`).
     #[cfg(feature = "overlay")]
@@ -516,6 +523,17 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `expose` is a long-running overlay reverse-ingress (like `forward`). It consults no config —
+    // the ticket / explicit flags carry everything (topology + publish capability + trust root).
+    #[cfg(feature = "overlay")]
+    if matches!(cli.command, Command::Expose(_)) {
+        let Command::Expose(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        expose::run(args).await?;
+        return Ok(());
+    }
+
     // `security` also reads the server daemon config (`boatramp.cfg`), like
     // `serve`, since the posture lives there — not in the project config.
     if matches!(cli.command, Command::Security(_)) {
@@ -596,6 +614,8 @@ async fn async_main() -> Result<(), CliError> {
         Command::Serve(_) => unreachable!("handled above"),
         #[cfg(feature = "overlay")]
         Command::Forward(_) => unreachable!("handled above"),
+        #[cfg(feature = "overlay")]
+        Command::Expose(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
         Command::Migrate(_) => unreachable!("handled above"),
         #[cfg(feature = "operator")]
