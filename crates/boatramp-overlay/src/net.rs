@@ -2107,6 +2107,10 @@ pub enum PairShortCodeError {
     /// loop forever or silently mint a weaker (shorter/predictable) code.
     #[error("exhausted short-code collision retries")]
     ExhaustedRetries,
+    /// The platform entropy source faulted while drawing randomness for a mint (Security LOW-2:
+    /// fails CLOSED — a mint NEVER falls back to a zeroed/predictable draw).
+    #[error("random number generation failed")]
+    Rng,
 }
 
 /// A relay-side alias table mapping a human-typeable [`ShortCode`] to the strong rendezvous id it
@@ -2132,12 +2136,14 @@ impl PairShortCodes {
     }
 
     /// Mint + park a NEW short-code alias for `rendezvous_id`, expiring at `expires_at`. `draw`
-    /// supplies raw randomness per attempt (injectable for deterministic tests; production mints via
-    /// [`PairShortCodes::mint`], which wires real platform entropy): a draw colliding with a LIVE
-    /// alias is regenerated, up to [`PAIR_SHORT_CODE_MINT_RETRIES`] times, before giving up — a
-    /// dead/expired alias is silently reused (never a park-style rejection; a short code is minted
-    /// fresh each time, so there is no "first-wins" semantic to preserve).
-    pub async fn insert_unique<R: FnMut() -> u64>(
+    /// supplies raw randomness per attempt (injectable for deterministic tests — `Ok(..)` always;
+    /// production mints via [`PairShortCodes::mint`], which wires real platform entropy and can
+    /// propagate a genuine RNG fault through `draw`'s `Err`, failing this CLOSED rather than minting
+    /// off a zeroed/predictable draw): a draw colliding with a LIVE alias is regenerated, up to
+    /// [`PAIR_SHORT_CODE_MINT_RETRIES`] times, before giving up — a dead/expired alias is silently
+    /// reused (never a park-style rejection; a short code is minted fresh each time, so there is no
+    /// "first-wins" semantic to preserve).
+    pub async fn insert_unique<R: FnMut() -> Result<u64, PairShortCodeError>>(
         &self,
         mut draw: R,
         digits: usize,
@@ -2149,7 +2155,7 @@ impl PairShortCodes {
             boatramp_overlay_proto::pair_code::ShortCodeError::DigitsOutOfRange { digits },
         )?;
         for _ in 0..PAIR_SHORT_CODE_MINT_RETRIES {
-            let value = draw() % modulus;
+            let value = draw()? % modulus;
             let code = ShortCode::from_value(value, digits)?;
             let mut map = self.inner.lock().await;
             let collides = map
@@ -2172,7 +2178,9 @@ impl PairShortCodes {
     /// [`PairShortCodes::insert_unique`] wired to real platform randomness
     /// ([`aws_lc_rs::rand::SystemRandom`] — the one platform RNG this crate already uses for the
     /// pairing nonces, `crate::pair`). The production mint entry point; tests needing a deterministic
-    /// or colliding draw call `insert_unique` directly.
+    /// or colliding draw call `insert_unique` directly. FAILS CLOSED on a platform entropy-source
+    /// fault (Security LOW-2) — propagates [`PairShortCodeError::Rng`] rather than minting off a
+    /// zeroed (predictable) draw.
     pub async fn mint(
         &self,
         digits: usize,
@@ -2185,12 +2193,8 @@ impl PairShortCodes {
         self.insert_unique(
             || {
                 let mut buf = [0u8; 8];
-                // `SystemRandom::fill` only fails on a platform entropy-source fault; on that rare
-                // failure the zeroed buffer still yields a (not-cryptographically-strong) draw rather
-                // than panicking the relay — `insert_unique`'s retry loop + collision check is the
-                // safety net, not this fallback.
-                let _ = rng.fill(&mut buf);
-                u64::from_le_bytes(buf)
+                rng.fill(&mut buf).map_err(|_| PairShortCodeError::Rng)?;
+                Ok(u64::from_le_bytes(buf))
             },
             digits,
             rendezvous_id,
@@ -2265,6 +2269,13 @@ impl PairGuessLimiter {
     /// so a source already over budget is refused even for a code that WOULD otherwise hit. Lazily
     /// prunes failures older than the rolling window first (never across an `.await` — both locks are
     /// plain `std::sync::Mutex`, held only for this synchronous prune+compare).
+    ///
+    /// SECURITY (HIGH-1 fix): this is READ-ONLY with respect to `by_ip` MEMBERSHIP — it never inserts
+    /// a key for a source that has recorded no failure (`get_mut`, never `entry(..).or_default()`),
+    /// and it EVICTS the key once its deque prunes to empty. Only [`PairGuessLimiter::record_failure`]
+    /// may insert a key. Without this, every admitted-but-never-failing source (e.g. a flood of
+    /// malformed-length requests from fresh IPs, before the HIGH-1 call-order fix below) would leave a
+    /// PERMANENT entry in `by_ip` — unbounded memory growth, a relay OOM.
     fn admit(&self, ip: IpAddr, now: u64) -> bool {
         let cutoff = now.saturating_sub(self.window_secs);
         {
@@ -2279,13 +2290,25 @@ impl PairGuessLimiter {
         let Ok(mut by_ip) = self.by_ip.lock() else {
             return false;
         };
-        let entry = by_ip.entry(ip).or_default();
-        entry.retain(|&t| t > cutoff);
-        (entry.len() as u32) < self.max_per_ip
+        let count = match by_ip.get_mut(&ip) {
+            Some(deque) => {
+                deque.retain(|&t| t > cutoff);
+                let n = deque.len();
+                if n == 0 {
+                    // Evict: a source with no in-window failures left carries no state (mirrors
+                    // `ParkIpGuard`'s `if *c == 0 { remove }`).
+                    by_ip.remove(&ip);
+                }
+                n
+            }
+            None => 0,
+        };
+        (count as u32) < self.max_per_ip
     }
 
     /// Record a FAILED short-redeem attempt from `ip` at `now`. Called ONLY on a miss — a successful
-    /// resolve must NEVER call this (an honest first try never trips the limiter).
+    /// resolve must NEVER call this (an honest first try never trips the limiter). This is the ONLY
+    /// method that may insert a `by_ip` key (see [`PairGuessLimiter::admit`]'s HIGH-1 note).
     fn record_failure(&self, ip: IpAddr, now: u64) {
         if let Ok(mut g) = self.global.lock() {
             let cutoff = now.saturating_sub(self.window_secs);
@@ -2302,13 +2325,15 @@ impl PairGuessLimiter {
 }
 
 /// Relay pairing: REDEEM a parked rendezvous for the dialer via its human-typeable SHORT-CODE alias
-/// (overlay follow-up #2 inc3). Order (load-bearing): the guess-rate LOCKOUT is checked FIRST — before
-/// the code is even validated or resolved — so an over-budget source is refused even for a code that
-/// would otherwise hit; then a length mismatch against this relay's configured `short_code_digits` is
-/// an `InvalidCode` (malformed-request, never counted as a guess); only a well-formed code that MISSES
-/// resolution counts as a failed attempt (a successful resolve counts nothing). Short→id resolution
-/// hands off to the EXISTING [`PairRendezvous::redeem`] + [`bridge`] — single-use/TTL/consume and the
-/// blind bridge stay in exactly the same place the full-`bropair1` path uses.
+/// (overlay follow-up #2 inc3). Order (load-bearing, Security HIGH-1): a length/digit mismatch
+/// against this relay's configured `short_code_digits` is checked FIRST and rejected `InvalidCode`
+/// WITHOUT ever consulting the guess limiter — a malformed (non-guess) request must never touch it,
+/// so a flood of malformed frames from fresh source IPs cannot grow its per-IP map. Only once the
+/// request is well-formed is the guess-rate LOCKOUT checked — still BEFORE the code is resolved, so
+/// an over-budget source is refused even for a code that would otherwise hit. Only a well-formed code
+/// that MISSES resolution counts as a failed attempt (a successful resolve counts nothing). Short→id
+/// resolution hands off to the EXISTING [`PairRendezvous::redeem`] + [`bridge`] — single-use/TTL/
+/// consume and the blind bridge stay in exactly the same place the full-`bropair1` path uses.
 #[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 async fn redeem_rendezvous_short(
@@ -2323,19 +2348,11 @@ async fn redeem_rendezvous_short(
 ) -> Result<(), NetError> {
     let now = now_unix();
     let ip = client.remote_address().ip();
-    // Lockout FIRST (mutation-RED guard: drop this check and a guess over budget would still succeed
-    // against a live code).
-    if !guess_limiter.admit(ip, now) {
-        write_msg(
-            &mut client_send,
-            &PairResult::Rejected(PairReject::TooManyAttempts),
-        )
-        .await?;
-        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
-        return Err(NetError::PairRejected(PairReject::TooManyAttempts));
-    }
-    // A malformed-length request is never a counted guess (mirrors the full-id path's `InvalidCode`,
-    // distinct from a miss).
+    // A malformed-length (or non-digit) request is structurally invalid, not a guess — reject it
+    // BEFORE even consulting the guess limiter (Security HIGH-1): the limiter must never be touched
+    // by a non-guess request, so a flood of malformed frames from fresh source IPs cannot exercise
+    // ANY limiter code path (`admit` itself is also hardened — see its doc comment — but a malformed
+    // frame should never reach it in the first place).
     if req.code.len() != short_code_digits || !req.code.bytes().all(|b| b.is_ascii_digit()) {
         write_msg(
             &mut client_send,
@@ -2344,6 +2361,17 @@ async fn redeem_rendezvous_short(
         .await?;
         let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
         return Err(NetError::PairRejected(PairReject::InvalidCode));
+    }
+    // Lockout next — still BEFORE resolving the code (mutation-RED guard: drop this check and a guess
+    // over budget would still succeed against a live code).
+    if !guess_limiter.admit(ip, now) {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::TooManyAttempts),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::TooManyAttempts));
     }
     let Some(rendezvous_id) = short_codes.resolve_and_take(&req.code, now).await else {
         // A genuine miss: count it, and return the SAME reject a spent/unknown FULL id would — no
@@ -4893,7 +4921,7 @@ mod tests {
         let expires = now + 300;
 
         let first = codes
-            .insert_unique(|| 12_345_678, digits, vec![1u8; 16], expires, now)
+            .insert_unique(|| Ok(12_345_678), digits, vec![1u8; 16], expires, now)
             .await
             .unwrap();
 
@@ -4905,7 +4933,7 @@ mod tests {
             .insert_unique(
                 || {
                     calls += 1;
-                    if calls == 1 { 12_345_678 } else { 87_654_321 }
+                    Ok(if calls == 1 { 12_345_678 } else { 87_654_321 })
                 },
                 digits,
                 vec![2u8; 16],
@@ -4934,16 +4962,40 @@ mod tests {
         let now = 1_000;
         let expires = now + 300;
         let _first = codes
-            .insert_unique(|| 11_111_111, digits, vec![1u8; 16], expires, now)
+            .insert_unique(|| Ok(11_111_111), digits, vec![1u8; 16], expires, now)
             .await
             .unwrap();
         let result = codes
-            .insert_unique(|| 11_111_111, digits, vec![2u8; 16], expires, now)
+            .insert_unique(|| Ok(11_111_111), digits, vec![2u8; 16], expires, now)
             .await;
         assert!(
             matches!(result, Err(PairShortCodeError::ExhaustedRetries)),
             "an always-colliding draw must exhaust retries and error, got {result:?}"
         );
+    }
+
+    /// Anti-hollow (Security LOW-2, fail-closed RNG): a draw that fails (models a platform
+    /// entropy-source fault) must propagate the error — `insert_unique` must NEVER substitute a
+    /// zeroed/predictable value and proceed. MUTATION-RED: swallow the draw error (e.g.
+    /// `draw().unwrap_or(0)`) and this would instead mint `"00000000"` — the `matches!` below goes RED.
+    #[tokio::test]
+    async fn short_code_mint_fails_closed_on_an_rng_fault() {
+        let codes = PairShortCodes::new();
+        let result = codes
+            .insert_unique(
+                || Err(PairShortCodeError::Rng),
+                8,
+                vec![1u8; 16],
+                1_300,
+                1_000,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(PairShortCodeError::Rng)),
+            "a failing draw must propagate the error, never a zeroed/predictable fallback, got {result:?}"
+        );
+        // Nothing was minted — no alias of any kind exists.
+        assert!(!codes.is_active("00000000", 1_000).await);
     }
 
     /// Resolve-and-take semantics (unit, no transport): a live alias resolves ONCE (consuming it,
@@ -4952,7 +5004,7 @@ mod tests {
     async fn short_codes_resolve_and_take_is_single_use_and_ttl_bound() {
         let codes = PairShortCodes::new();
         let code = codes
-            .insert_unique(|| 42, 8, vec![9u8; 16], 100, 50)
+            .insert_unique(|| Ok(42), 8, vec![9u8; 16], 100, 50)
             .await
             .unwrap();
         // Live before expiry; resolves to the aliased id and is consumed.
@@ -4969,7 +5021,7 @@ mod tests {
 
         // A fresh alias past its expiry is a miss (TTL), even though never resolved.
         let expired = codes
-            .insert_unique(|| 43, 8, vec![7u8; 16], 100, 50)
+            .insert_unique(|| Ok(43), 8, vec![7u8; 16], 100, 50)
             .await
             .unwrap();
         assert_eq!(codes.resolve_and_take(expired.digits(), 100).await, None);
@@ -5099,6 +5151,61 @@ mod tests {
         let _ = acc.await;
     }
 
+    /// Anti-hollow (Security HIGH-1, unbounded `by_ip` memory growth): a source that is only ever
+    /// `admit`-checked and never fails (models a flood of malformed-length short-redeems from fresh
+    /// IPs, which — after the HIGH-1 order fix — never even reach the limiter, but this pins `admit`
+    /// itself too) must NEVER leave a key in `by_ip`; and a key [`PairGuessLimiter::record_failure`]
+    /// DOES create is evicted once its rolling window rolls off (the next `admit` for that same IP
+    /// prunes its deque to empty and removes the key) — so the map stays bounded by sources with an
+    /// actual IN-WINDOW failure, never growing without limit. MUTATION-RED: revert `admit` to
+    /// `by_ip.entry(ip).or_default()` (inserting on every call) and the first assertion goes RED.
+    #[test]
+    fn guess_limiter_by_ip_map_stays_bounded_and_evicts_on_window_roll_off() {
+        use std::net::Ipv4Addr;
+
+        let limiter = PairGuessLimiter::new(60, 10, 30);
+
+        // N `admit`-only calls from DISTINCT source IPs, none of which ever fails, must leave `by_ip`
+        // EMPTY — `admit` is read-only with respect to map membership.
+        for i in 0..20u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            assert!(
+                limiter.admit(ip, 1_000),
+                "a clean source must always be admitted"
+            );
+        }
+        assert_eq!(
+            limiter.by_ip.lock().unwrap().len(),
+            0,
+            "admit() alone (no record_failure) must NEVER insert/retain a per-IP key"
+        );
+
+        // A key `record_failure` DOES create persists while in-window, then is evicted once the
+        // window rolls off.
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
+        limiter.record_failure(ip, 1_000);
+        assert_eq!(
+            limiter.by_ip.lock().unwrap().len(),
+            1,
+            "a failure must be recorded"
+        );
+        assert!(
+            limiter.admit(ip, 1_059),
+            "still within the 60s window (1 failure < the cap of 10)"
+        );
+        assert_eq!(
+            limiter.by_ip.lock().unwrap().len(),
+            1,
+            "the key persists while the recorded failure is still in-window"
+        );
+        assert!(limiter.admit(ip, 1_061), "past the window — admitted again");
+        assert_eq!(
+            limiter.by_ip.lock().unwrap().len(),
+            0,
+            "a key created by record_failure must be evicted once its window rolls off"
+        );
+    }
+
     /// Anti-hollow (no distinguishing oracle + only-misses-count): a WRONG short-redeem guess returns
     /// the SAME `UnknownOrSpent` reject a spent/unknown id gets, and repeating it counts against the
     /// per-IP guess budget — after `PAIR_SHORT_GUESS_MAX_PER_IP` such misses, the NEXT attempt is
@@ -5175,6 +5282,74 @@ mod tests {
         assert!(
             short_codes.is_active(short.digits(), now_unix()).await,
             "the live alias must be untouched — the lockout refused the attempt before resolving it"
+        );
+        let _ = acc.await;
+    }
+
+    /// Anti-hollow (Security HIGH-1, call-order): a MALFORMED-LENGTH short-redeem is refused
+    /// `InvalidCode` — even from a source ALREADY locked out — proving the length/digit validation
+    /// runs BEFORE (and independently of) the guess-rate limiter, so a flood of malformed frames can
+    /// never reach (or grow state in) the limiter at all. MUTATION-RED: move the
+    /// `guess_limiter.admit(...)` check back before the length/digit validation in
+    /// `redeem_rendezvous_short`, and this already-locked-out source's malformed request would instead
+    /// be refused `TooManyAttempts` — the assertion below goes RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_malformed_length_short_redeem_is_refused_invalid_code_even_when_locked_out() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        let relay_addr = spawn_ingress_relay_with_short_codes(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+        );
+
+        let code = vec![0x9Bu8; 16];
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let _ = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL).await;
+            conn.closed().await;
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+
+        // Drive this source over the per-IP budget with well-formed-length WRONG guesses.
+        let wrong = "0".repeat(digits);
+        for i in 0..PAIR_SHORT_GUESS_MAX_PER_IP {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let res = pair_relay_redeem_short(&ep, relay_addr, wrong.clone()).await;
+            assert!(
+                matches!(res, Err(NetError::PairRejected(PairReject::UnknownOrSpent))),
+                "attempt {i}: a wrong guess must be refused UnknownOrSpent, got {res:?}"
+            );
+        }
+        // Confirm the source really is locked out now (sanity, mirrors the sibling lockout test).
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let locked = pair_relay_redeem_short(&ep, relay_addr, wrong.clone()).await;
+        assert!(matches!(
+            locked,
+            Err(NetError::PairRejected(PairReject::TooManyAttempts))
+        ));
+
+        // A MALFORMED-LENGTH request from this SAME (locked-out) source is still `InvalidCode` — the
+        // length check runs first and the limiter is never consulted for it.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let malformed = "1".repeat(digits - 1); // one digit short
+        let res = pair_relay_redeem_short(&ep, relay_addr, malformed).await;
+        assert!(
+            matches!(res, Err(NetError::PairRejected(PairReject::InvalidCode))),
+            "a malformed-length request must be InvalidCode even when the source is locked out, got {res:?}"
         );
         let _ = acc.await;
     }
