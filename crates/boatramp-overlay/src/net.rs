@@ -166,7 +166,7 @@ where
     }
 
     // End-to-end E2EE with the egress (the relay forwards the sealed stream blind).
-    let (session, _egress) = establish(
+    let (session, _egress, _sas) = establish(
         &mut send,
         &mut recv,
         secret,
@@ -604,7 +604,7 @@ where
         // The E2EE handshake learns the client identity (the responder does not pin it in
         // advance); it is the identity the dial capability must be holder-bound to, and that
         // direct-path promotion pins its link to.
-        let (session, client_id) =
+        let (session, client_id, _sas) =
             establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
         let (sealer, mut opener) = session.split();
         // Zero-trust: open the sealed dial capability the client presents end-to-end (the first
@@ -983,7 +983,7 @@ async fn register_exposer(
     // Complete the E2EE handshake first, LEARNING the exposer's cryptographically-proven identity
     // (expect = None). Bounding it (MEDIUM-B): a half-open registration must not park a relay task.
     let proven = timeout(HANDSHAKE_TIMEOUT, async {
-        let (_session, peer) = establish(
+        let (_session, peer, _sas) = establish(
             &mut send,
             &mut recv,
             relay_secret,

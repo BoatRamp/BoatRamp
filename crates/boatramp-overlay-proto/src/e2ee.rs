@@ -456,6 +456,16 @@ mod tests {
             open.open(&ct).is_err(),
             "a diverging-identity transcript must fail AEAD open"
         );
+
+        // The SAME divergence the AEAD rejects is ALSO visible to the humans: the pairing SAS
+        // derived from each side's transcript differs, so a substituted-identity MITM cannot show a
+        // matching code on both legs. This is the out-of-band MITM-detection the AEAD binding backs.
+        use crate::sas::sas_from_transcript;
+        assert_ne!(
+            sas_from_transcript(&t_honest).bits(),
+            sas_from_transcript(&t_forged).bits(),
+            "a substituted identity must yield a different pairing SAS"
+        );
     }
 
     #[tokio::test]

@@ -71,6 +71,12 @@ const CLAIM_S3: &str = "br_s3";
 /// the in-cluster service/target the holder may dial (`"*"` = any within the issuer's authority).
 /// The scope lives in the SIGNED payload, so a client can never widen it.
 const CLAIM_OVERLAY_SCOPE: &str = "br_ovscope";
+/// Text claim key for an overlay enrollment/member role (boatramp overlay fabric): a single scalar
+/// member-role string ([`OverlayMemberRole`] — `node`/`device`/`workload`), carried in the SIGNED
+/// payload of an [`KIND_OVERLAY_ENROLL`] invitation or an [`KIND_OVERLAY_MEMBER`] credential. The set
+/// is CLOSED: a token whose `br_ovrole` is any other value is rejected on verify (fail-closed), so a
+/// corrupt/unknown role never degrades to a weaker-but-accepted one.
+const CLAIM_OVERLAY_ROLE: &str = "br_ovrole";
 
 /// Bounds on the opaque app-context (R6): a capability may carry at most this many entries, and its
 /// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
@@ -160,6 +166,28 @@ pub const KIND_OVERLAY_DIAL: &str = "overlay-dial";
 /// the exact `br_kind` check means an overlay-dial capability can never be redeemed to publish, nor an
 /// overlay-publish capability to dial.
 pub const KIND_OVERLAY_PUBLISH: &str = "overlay-publish";
+/// Token kind: an **overlay enrollment invitation** (boatramp overlay fabric, enrollment & pairing) —
+/// a single-use, root-signed `COSE_Sign1` CWT that invites a NOT-YET-KNOWN member key into the
+/// overlay with a declared role (`br_ovrole`) and service scope (`br_ovscope`). It is the exact
+/// structural analogue of the cluster [`KIND_JOIN`] token: TTL'd via a **mandatory** `exp`, spent
+/// single-use via its `cti`/`jti`, and — deliberately — **NOT** holder-bound (no `cnf`), because the
+/// enrollee's overlay key is unknown at mint time (contrast [`KIND_OVERLAY_DIAL`], which IS `cnf`-
+/// bound). At redemption the enrollee presents its overlay key AND a possession proof (an Ed25519
+/// signature over [`join_challenge`] naming this `jti` + that key), exactly as a cluster joiner does,
+/// so a token alone (without the overlay private key) enrolls nothing. Domain-separated: the exact
+/// `br_kind` check means an enroll invitation can never be redeemed as a join / dial / publish /
+/// member token, nor any of those as an enroll invitation.
+pub const KIND_OVERLAY_ENROLL: &str = "overlay-enroll";
+/// Token kind: an **overlay membership credential** (boatramp overlay fabric, enrollment & pairing) —
+/// the root key vouching, offline-verifiably, that a given overlay key (`br_pubkey`) is an ENROLLED
+/// member with role `br_ovrole` and scope `br_ovscope`. It is the exact structural analogue of the
+/// cluster [`KIND_MESH_MEMBER`] assertion: a joiner adopts the vouched key into its trust set only
+/// after verifying this against the root anchor (signature + `exp` + `br_kind == "overlay-member"`),
+/// so a malicious seed cannot inject a fabricated member. Unlike a dial/publish capability it is NOT
+/// `cnf`-bound (it is a third-party-verifiable statement ABOUT a key, not a per-request possession
+/// capability the holder proves); the member's key is the VOUCHED `br_pubkey`. Domain-separated by the
+/// exact `br_kind` check from every other token kind.
+pub const KIND_OVERLAY_MEMBER: &str = "overlay-member";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -1128,6 +1156,254 @@ pub fn verify_overlay_publish(
     let scope = scope
         .ok_or_else(|| TokenError::Claims("overlay-publish capability has no scope".into()))?;
     Ok(VerifiedOverlayPublish { holder, scope, exp })
+}
+
+/// A member's role in the boatramp overlay fabric — a **closed** scalar set carried by both an
+/// enrollment invitation ([`KIND_OVERLAY_ENROLL`]) and a membership credential ([`KIND_OVERLAY_MEMBER`]).
+/// Representing it as an enum (rather than a bare string) makes an invalid role unrepresentable at mint
+/// and lets verify reject an unknown/typo'd value fail-closed — a corrupt role never degrades to a
+/// weaker-but-accepted one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMemberRole {
+    /// A full overlay node (relay/egress-capable peer).
+    Node,
+    /// An end-user device (laptop/phone paired into the overlay).
+    Device,
+    /// A workload/service identity enrolled into the overlay.
+    Workload,
+}
+
+impl OverlayMemberRole {
+    /// The wire string stored in `br_ovrole` (stable; part of the signed payload).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Device => "device",
+            Self::Workload => "workload",
+        }
+    }
+
+    /// Parse the `br_ovrole` wire string; `None` for any value outside the closed set (the verifier
+    /// turns that into a fail-closed [`TokenError::Claims`]).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "node" => Some(Self::Node),
+            "device" => Some(Self::Device),
+            "workload" => Some(Self::Workload),
+            _ => None,
+        }
+    }
+}
+
+/// The verified contents of an overlay enrollment invitation ([`verify_overlay_enroll`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverlayEnroll {
+    /// The single-use handle (`jti` = `cti`, hex): the control plane spends it once, so a replayed
+    /// invitation enrolls nothing. Mirrors [`verify_join`]'s returned `jti`.
+    pub jti: String,
+    /// The role this invitation grants the enrollee once redeemed.
+    pub role: OverlayMemberRole,
+    /// The service scope the enrollee may dial/expose once enrolled (`"*"` = any within the issuer's
+    /// authority).
+    pub scope: String,
+    /// The invitation's expiry (Unix seconds) — always present (an enrollment invitation MUST be
+    /// time-bounded, like the cluster join token and the overlay-dial capability).
+    pub exp: u64,
+}
+
+/// Mint an **overlay enrollment invitation** (`br_kind = "overlay-enroll"`): a single-use, root-signed
+/// `COSE_Sign1` CWT inviting a not-yet-known member key into the overlay with `role` + `scope`, a
+/// **mandatory** `exp` (`now + ttl_secs`), and a single-use `cti`/`jti`. Modeled exactly on
+/// [`mint_join`]: it is **not** holder-bound (no `cnf`) because the enrollee's overlay key is unknown
+/// at mint time — at redemption the enrollee presents its key plus a possession proof over
+/// [`join_challenge`] naming this `jti`. Minted where the root key lives; shown once.
+pub async fn mint_overlay_enroll(
+    role: OverlayMemberRole,
+    scope: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_OVERLAY_ENROLL.to_string()),
+        )
+        .text_claim(
+            CLAIM_OVERLAY_ROLE.to_string(),
+            CborValue::Text(role.as_str().to_string()),
+        )
+        .text_claim(
+            CLAIM_OVERLAY_SCOPE.to_string(),
+            CborValue::Text(scope.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an overlay enrollment invitation against the fleet public key at `now_unix`: checks the COSE
+/// signature, the **mandatory** expiry, `br_kind == "overlay-enroll"`, and a role in the closed
+/// [`OverlayMemberRole`] set, returning the single-use `jti`, role, scope, and expiry. Fail-closed: a
+/// forged/unsigned/expired/wrong-kind/unknown-role token never verifies, and a join / dial / publish /
+/// member token presented here is rejected on the kind check (domain separation). IO-free: the caller
+/// must still spend the `jti` single-use and verify the enrollee's possession proof
+/// ([`join_challenge`] + [`TokenPublicKey::verify`]) at admission.
+pub fn verify_overlay_enroll(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedOverlayEnroll, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    let jti = claim_cti(&claims)?;
+    // An enrollment invitation MUST be time-bounded (as the join token and overlay capabilities are):
+    // a token with no `exp` is refused rather than treated as immortal.
+    let exp = check_exp(&claims, now_unix)?
+        .ok_or_else(|| TokenError::Claims("overlay-enroll invitation has no expiry".into()))?;
+    let mut kind = None;
+    let mut role = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_OVERLAY_ROLE => role = Some(v.clone()),
+                CLAIM_OVERLAY_SCOPE => scope = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_OVERLAY_ENROLL) {
+        return Err(TokenError::Claims(
+            "not an overlay-enroll invitation".into(),
+        ));
+    }
+    let role = role
+        .ok_or_else(|| TokenError::Claims("overlay-enroll invitation has no role".into()))
+        .and_then(|r| {
+            OverlayMemberRole::parse(&r).ok_or_else(|| {
+                TokenError::Claims("overlay-enroll invitation has an unknown role".into())
+            })
+        })?;
+    let scope =
+        scope.ok_or_else(|| TokenError::Claims("overlay-enroll invitation has no scope".into()))?;
+    Ok(VerifiedOverlayEnroll {
+        jti,
+        role,
+        scope,
+        exp,
+    })
+}
+
+/// The verified contents of an overlay membership credential ([`verify_overlay_member`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverlayMember {
+    /// The member's overlay key (`"<alg>:<hex>"`, from `br_pubkey`) the trust anchor vouches is an
+    /// enrolled member — a joiner compares it to the peer's TLS/E2EE-proven identity before trusting.
+    pub member_key: String,
+    /// The role the trust anchor vouches this member holds.
+    pub role: OverlayMemberRole,
+    /// The service scope this member is enrolled for.
+    pub scope: String,
+    /// The credential's expiry (Unix seconds) — always present (a membership credential MUST be
+    /// time-bounded).
+    pub exp: u64,
+}
+
+/// Mint an **overlay membership credential** (`br_kind = "overlay-member"`): a root-signed `COSE_Sign1`
+/// CWT vouching that `member`'s overlay key is an enrolled member with `role` + `scope`, with a
+/// **mandatory** `exp` (`now + ttl_secs`) and a `cti`. Modeled exactly on [`mint_member_assertion`]:
+/// the member's key is carried as the VOUCHED `br_pubkey` (NOT a `cnf` possession binding — this is a
+/// third-party-verifiable statement about a key). A joiner adopts the vouched key only after verifying
+/// this against the root anchor with [`verify_overlay_member`]. The member's private key never leaves
+/// the member; only its public half is embedded.
+pub async fn mint_overlay_member(
+    member: &TokenPublicKey,
+    role: OverlayMemberRole,
+    scope: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_OVERLAY_MEMBER.to_string()),
+        )
+        .text_claim(CLAIM_PUBKEY.to_string(), CborValue::Text(member.to_hex()))
+        .text_claim(
+            CLAIM_OVERLAY_ROLE.to_string(),
+            CborValue::Text(role.as_str().to_string()),
+        )
+        .text_claim(
+            CLAIM_OVERLAY_SCOPE.to_string(),
+            CborValue::Text(scope.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an overlay membership credential against the fleet public key at `now_unix`: checks the COSE
+/// signature, the **mandatory** expiry, `br_kind == "overlay-member"`, and a role in the closed
+/// [`OverlayMemberRole`] set, returning the vouched member key, role, scope, and expiry. Fail-closed:
+/// a forged/unsigned/expired/wrong-kind/unknown-role token never verifies, and a token of any other
+/// kind (join / dial / publish / enroll / mesh-member) presented here is rejected (domain separation).
+pub fn verify_overlay_member(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedOverlayMember, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    let exp = check_exp(&claims, now_unix)?
+        .ok_or_else(|| TokenError::Claims("overlay-member credential has no expiry".into()))?;
+    let mut kind = None;
+    let mut member_key = None;
+    let mut role = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_PUBKEY => member_key = Some(v.clone()),
+                CLAIM_OVERLAY_ROLE => role = Some(v.clone()),
+                CLAIM_OVERLAY_SCOPE => scope = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_OVERLAY_MEMBER) {
+        return Err(TokenError::Claims(
+            "not an overlay-member credential".into(),
+        ));
+    }
+    let member_key = member_key
+        .ok_or_else(|| TokenError::Claims("overlay-member credential has no member key".into()))?;
+    let role = role
+        .ok_or_else(|| TokenError::Claims("overlay-member credential has no role".into()))
+        .and_then(|r| {
+            OverlayMemberRole::parse(&r).ok_or_else(|| {
+                TokenError::Claims("overlay-member credential has an unknown role".into())
+            })
+        })?;
+    let scope =
+        scope.ok_or_else(|| TokenError::Claims("overlay-member credential has no scope".into()))?;
+    Ok(VerifiedOverlayMember {
+        member_key,
+        role,
+        scope,
+        exp,
+    })
 }
 
 /// The fully-verified contents of a durable signed-context envelope (R1 + async-lane persona,
@@ -3648,5 +3924,305 @@ mod tests {
             ),
             "an overlay-publish token must not verify as an overlay-dial capability"
         );
+    }
+
+    // --- overlay enrollment & pairing: enroll invitation + membership credential ----------------
+
+    #[tokio::test]
+    async fn overlay_enroll_round_trips_and_requires_an_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let root_pub = root.public_key();
+
+        // A properly-minted invitation (exp = now + ttl) verifies and carries role + scope + a
+        // single-use jti; it is deliberately NOT holder-bound (no cnf), like the cluster join token.
+        let good = mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_enroll(&good, &root_pub, NOW).unwrap();
+        assert_eq!(v.role, OverlayMemberRole::Device);
+        assert_eq!(v.scope, "svc/db");
+        assert_eq!(v.exp, NOW + 300);
+        assert!(!v.jti.is_empty(), "the jti is the single-use handle");
+        // Stable across re-verification (the control plane spends it once).
+        assert_eq!(
+            verify_overlay_enroll(&good, &root_pub, NOW).unwrap().jti,
+            v.jti
+        );
+
+        // A token with NO `exp` claim — otherwise identical and correctly signed — is REFUSED: an
+        // enrollment invitation is never treated as immortal.
+        let no_exp = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_ENROLL.to_string()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_ROLE.to_string(),
+                CborValue::Text("device".to_string()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_SCOPE.to_string(),
+                CborValue::Text("svc/db".to_string()),
+            )
+            .build();
+        let no_exp = sign_claims(no_exp, &root).await.unwrap();
+        assert!(
+            matches!(
+                verify_overlay_enroll(&no_exp, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-enroll invitation with no expiry must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_enroll_rejects_an_unknown_role_fail_closed() {
+        // Only the root signs an invitation, but an unknown/typo'd role is still refused rather than
+        // silently accepted — the role set is closed (defense in depth).
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let bogus = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .expiration_time(Timestamp::WholeSeconds((NOW + 300) as i64))
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_ENROLL.to_string()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_ROLE.to_string(),
+                CborValue::Text("admin".to_string()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_SCOPE.to_string(),
+                CborValue::Text("*".to_string()),
+            )
+            .build();
+        let bogus = sign_claims(bogus, &root).await.unwrap();
+        assert!(matches!(
+            verify_overlay_enroll(&bogus, &root_pub, NOW),
+            Err(TokenError::Claims(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn overlay_member_round_trips_and_requires_an_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let member = LocalSigner::generate(TokenAlg::Ed25519);
+        let member_pub = member.public_key();
+
+        // Round-trip: the vouched (member key, role, scope, exp) comes back.
+        let m = mint_overlay_member(
+            &member_pub,
+            OverlayMemberRole::Node,
+            "svc/*",
+            3600,
+            NOW,
+            &root,
+        )
+        .await
+        .unwrap();
+        let v = verify_overlay_member(&m, &root_pub, NOW + 60).unwrap();
+        assert_eq!(v.member_key, member_pub.to_hex());
+        assert_eq!(v.role, OverlayMemberRole::Node);
+        assert_eq!(v.scope, "svc/*");
+        assert_eq!(v.exp, NOW + 3600);
+
+        // A token with NO `exp` — otherwise identical and correctly signed — is REFUSED.
+        let no_exp = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_MEMBER.to_string()),
+            )
+            .text_claim(
+                CLAIM_PUBKEY.to_string(),
+                CborValue::Text(member_pub.to_hex()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_ROLE.to_string(),
+                CborValue::Text("node".to_string()),
+            )
+            .text_claim(
+                CLAIM_OVERLAY_SCOPE.to_string(),
+                CborValue::Text("svc/*".to_string()),
+            )
+            .build();
+        let no_exp = sign_claims(no_exp, &root).await.unwrap();
+        assert!(matches!(
+            verify_overlay_member(&no_exp, &root_pub, NOW),
+            Err(TokenError::Claims(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn overlay_enroll_and_member_reject_a_wrong_root_and_an_expired_token() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let impostor = LocalSigner::generate(TokenAlg::Es256);
+        let member = LocalSigner::generate(TokenAlg::Ed25519);
+        let member_pub = member.public_key();
+
+        let enroll = mint_overlay_enroll(OverlayMemberRole::Workload, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let memtok = mint_overlay_member(
+            &member_pub,
+            OverlayMemberRole::Workload,
+            "svc/db",
+            300,
+            NOW,
+            &root,
+        )
+        .await
+        .unwrap();
+
+        // Verified against the WRONG root → the signature check fails.
+        assert!(
+            matches!(
+                verify_overlay_enroll(&enroll, &impostor.public_key(), NOW),
+                Err(TokenError::Invalid(_))
+            ),
+            "an enroll invitation from a different trust root must be refused"
+        );
+        assert!(
+            matches!(
+                verify_overlay_member(&memtok, &impostor.public_key(), NOW),
+                Err(TokenError::Invalid(_))
+            ),
+            "a membership credential from a different trust root must be refused"
+        );
+
+        // Evaluated past expiry → refused.
+        assert!(matches!(
+            verify_overlay_enroll(&enroll, &root.public_key(), NOW + 600),
+            Err(TokenError::Expired)
+        ));
+        assert!(matches!(
+            verify_overlay_member(&memtok, &root.public_key(), NOW + 600),
+            Err(TokenError::Expired)
+        ));
+    }
+
+    /// The load-bearing domain separation (the `br_kind` check), BOTH ways: an overlay-enroll /
+    /// overlay-member token is rejected by every OTHER kind's verifier, and an enroll/member verifier
+    /// rejects every other kind — so a token minted for one purpose can never be redeemed as another.
+    #[tokio::test]
+    async fn overlay_enroll_and_member_are_domain_separated_from_every_other_kind() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+
+        let enroll = mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let member = mint_overlay_member(
+            &holder_pub,
+            OverlayMemberRole::Device,
+            "svc/db",
+            300,
+            NOW,
+            &root,
+        )
+        .await
+        .unwrap();
+        let join = mint_join(300, NOW, &root).await.unwrap();
+        let dial = mint_overlay_dial(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let publish = mint_overlay_publish(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+
+        // An enroll / member token is rejected by join / dial / publish verifiers (the `br_kind`
+        // check). verify_join does NOT enforce exp-presence, so a wrong-kind token yields Claims.
+        for (label, tok) in [("enroll", &enroll), ("member", &member)] {
+            assert!(
+                matches!(verify_join(tok, &root_pub, NOW), Err(TokenError::Claims(_))),
+                "{label} must not verify as a join token"
+            );
+            assert!(
+                matches!(
+                    verify_overlay_dial(tok, &root_pub, NOW),
+                    Err(TokenError::Claims(_))
+                ),
+                "{label} must not verify as an overlay-dial capability"
+            );
+            assert!(
+                matches!(
+                    verify_overlay_publish(tok, &root_pub, NOW),
+                    Err(TokenError::Claims(_))
+                ),
+                "{label} must not verify as an overlay-publish capability"
+            );
+        }
+
+        // And the reverse: a join / dial / publish token is rejected by the enroll AND member
+        // verifiers.
+        for (label, tok) in [("join", &join), ("dial", &dial), ("publish", &publish)] {
+            assert!(
+                matches!(
+                    verify_overlay_enroll(tok, &root_pub, NOW),
+                    Err(TokenError::Claims(_))
+                ),
+                "{label} must not verify as an overlay-enroll invitation"
+            );
+            assert!(
+                matches!(
+                    verify_overlay_member(tok, &root_pub, NOW),
+                    Err(TokenError::Claims(_))
+                ),
+                "{label} must not verify as an overlay-member credential"
+            );
+        }
+
+        // enroll and member are also separated from EACH OTHER.
+        assert!(
+            matches!(
+                verify_overlay_member(&enroll, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an enroll invitation must not verify as a membership credential"
+        );
+        assert!(
+            matches!(
+                verify_overlay_enroll(&member, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "a membership credential must not verify as an enroll invitation"
+        );
+    }
+
+    /// The enrollee's possession proof REUSES [`join_challenge`] verbatim (no new challenge
+    /// primitive): the enrollee signs `join_challenge(enroll_jti, overlay_key_hex, iat)` with its
+    /// overlay key, and the control plane verifies it against the presented key — exactly as a cluster
+    /// joiner proves possession of its mesh key.
+    #[tokio::test]
+    async fn overlay_enroll_possession_proof_reuses_join_challenge() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let enrollee = LocalSigner::generate(TokenAlg::Ed25519);
+        let enrollee_pub = enrollee.public_key();
+
+        let enroll = mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_enroll(&enroll, &root_pub, NOW).unwrap();
+
+        // Enrollee proves possession of its overlay key over the SAME challenge primitive.
+        let proof_iat = NOW + 1;
+        let challenge = join_challenge(&v.jti, &enrollee_pub.to_hex(), proof_iat);
+        let sig = enrollee.sign(&challenge).await.unwrap();
+        assert!(
+            enrollee_pub.verify(&challenge, &sig).is_ok(),
+            "a valid possession proof over join_challenge verifies"
+        );
+        // A proof naming a DIFFERENT jti does not verify against this challenge (no cross-replay).
+        let other = join_challenge("different-jti", &enrollee_pub.to_hex(), proof_iat);
+        assert!(enrollee_pub.verify(&other, &sig).is_err());
     }
 }

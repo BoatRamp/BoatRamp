@@ -12,6 +12,7 @@ use boatramp_overlay_proto::e2ee::{
     seal_signed_share, transcript,
 };
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
+use boatramp_overlay_proto::sas::{SasCode, sas_from_transcript};
 use boatramp_overlay_proto::wire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -74,10 +75,18 @@ pub(crate) async fn read_lp(
     Ok(Some(buf))
 }
 
-/// Run the identity-signed hybrid-KEM handshake over `(send, recv)` and return the session plus the
-/// learned peer identity. The initiator pins the egress (`expect = Some`); the responder learns the
-/// initiator (`expect = None`). `established`, if given, is fired with the peer identity the instant
-/// the session is ready (before any app byte).
+/// Run the identity-signed hybrid-KEM handshake over `(send, recv)` and return the session, the
+/// learned peer identity, and the pairing [`SasCode`] derived from the handshake transcript. The
+/// initiator pins the egress (`expect = Some`); the responder learns the initiator (`expect = None`).
+/// `established`, if given, is fired with the peer identity the instant the session is ready (before
+/// any app byte).
+///
+/// The returned [`SasCode`] is what a future `overlay pair` command shows the operator to compare
+/// out-of-band (an active relay-in-the-middle runs two distinct transcripts, so the two codes
+/// diverge). The RAW transcript never leaves this function — it stays a local `t`, and only the
+/// derived SAS crosses the API boundary — so the key-schedule/channel-binding material is not exposed.
+/// Deriving the SAS is read-only over the transcript: it changes neither the session keys nor the
+/// handshake wire.
 pub async fn establish<S, R>(
     send: &mut S,
     recv: &mut R,
@@ -85,12 +94,12 @@ pub async fn establish<S, R>(
     role: Role,
     expect: Option<OverlayId>,
     established: Option<oneshot::Sender<OverlayId>>,
-) -> Result<(Session, OverlayId), SpliceError>
+) -> Result<(Session, OverlayId, SasCode), SpliceError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let (session, peer) = match role {
+    let (session, peer, sas) = match role {
         Role::Initiator => {
             let initiator = HybridInitiator::generate()?;
             let offer = initiator.offer();
@@ -101,7 +110,11 @@ where
             let (reply, peer) = open_signed_share(&signed_reply, expect.as_ref())?;
             let combined = initiator.finish(&reply)?;
             let t = transcript(&offer, &reply, &secret.id(), &peer);
-            (Session::new(&combined, &t, role)?, peer)
+            (
+                Session::new(&combined, &t, role)?,
+                peer,
+                sas_from_transcript(&t),
+            )
         }
         Role::Responder => {
             let signed_offer = read_lp(recv, MAX_SHARE)
@@ -111,13 +124,17 @@ where
             let (reply, combined) = hybrid_respond(&offer)?;
             write_lp(send, &seal_signed_share(&reply, secret).await?).await?;
             let t = transcript(&offer, &reply, &peer, &secret.id());
-            (Session::new(&combined, &t, role)?, peer)
+            (
+                Session::new(&combined, &t, role)?,
+                peer,
+                sas_from_transcript(&t),
+            )
         }
     };
     if let Some(tx) = established {
         let _ = tx.send(peer); // receiver may have dropped; the session is still valid
     }
-    Ok((session, peer))
+    Ok((session, peer, sas))
 }
 
 /// Run the two record-mux pumps of an established session: seal application bytes from `app_r` and
@@ -230,20 +247,27 @@ mod tests {
                 Some(tx_est),
             )
             .await
-            .map(|(s, peer)| (s, peer, a))
+            .map(|(s, peer, sas)| (s, peer, sas, a))
         });
-        let (sess_b, learned_a) = {
+        let (sess_b, learned_a, sas_b) = {
             let b_ref = &b;
             establish(&mut hb_w, &mut hb_r, b_ref, Role::Responder, None, None)
                 .await
                 .unwrap()
         };
-        let (sess_a, learned_b, _a_held) = a_task.await.unwrap().unwrap();
+        let (sess_a, learned_b, sas_a, _a_held) = a_task.await.unwrap().unwrap();
 
         // The responder learned the initiator; the initiator pinned the egress; the hook fired.
         assert_eq!(learned_a, a_id);
         assert_eq!(learned_b, b_id);
         assert_eq!(rx_est.await.unwrap(), b_id);
+
+        // Two HONEST peers derive the SAME pairing SAS from the shared transcript — the property an
+        // `overlay pair` command relies on to let operators compare out-of-band.
+        assert_eq!(
+            sas_a, sas_b,
+            "two honest peers must derive an identical pairing SAS"
+        );
 
         // --- splice application data A -> B over a second duplex (the data link) ---
         let (la, lb) = tokio::io::duplex(64 * 1024);
@@ -314,10 +338,10 @@ mod tests {
         let at = tokio::spawn(async move {
             establish(&mut ha_w, &mut ha_r, &a2, Role::Initiator, Some(b_id), None).await
         });
-        let (sess_b, _) = establish(&mut hb_w, &mut hb_r, &b, Role::Responder, None, None)
+        let (sess_b, _, _) = establish(&mut hb_w, &mut hb_r, &b, Role::Responder, None, None)
             .await
             .unwrap();
-        let (sess_a, _) = at.await.unwrap().unwrap();
+        let (sess_a, _, _) = at.await.unwrap().unwrap();
 
         let (la, lb) = tokio::io::duplex(64 * 1024);
         let (la_r, la_w) = tokio::io::split(la);

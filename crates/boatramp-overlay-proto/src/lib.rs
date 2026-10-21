@@ -41,6 +41,7 @@ pub mod e2ee;
 pub mod ice;
 pub mod identity;
 pub mod peer_policy;
+pub mod sas;
 pub mod wire;
 
 pub use circuit::{RxPortal, TxPortal, XgressFrame};
@@ -49,3 +50,4 @@ pub use e2ee::{E2eeError, HybridInitiator, Opener, Role, Sealer, Session, hybrid
 pub use ice::{Candidate, CandidateKind, CandidateSet, Signal};
 pub use identity::{OverlayId, OverlayIdError, OverlaySecret};
 pub use peer_policy::OverlayPeerPolicy;
+pub use sas::{Fingerprint, SasCode, identity_fp, sas_from_transcript};
