@@ -124,6 +124,31 @@ pub fn client_endpoint_server_auth(policy: &OverlayPeerPolicy) -> Result<Endpoin
     Ok(endpoint)
 }
 
+/// A dial-only endpoint for **pairing** (overlay follow-up #2): it accepts ANY
+/// raw public key the listener presents (trust-on-first-use, **no pinning**) and
+/// presents **no** client certificate. This is intentional and safe *only*
+/// because pairing authenticates nothing at the TLS layer — the two peers do not
+/// yet know each other's keys; establishing that mutual knowledge is the whole
+/// point. All authentication is deferred to the relay-blind E2EE pairing
+/// handshake (which proves BOTH identities) plus the out-of-band commit-then-
+/// reveal SAS the operators compare ([`crate::pair::pair_handshake`]). The
+/// listener side is a plain [`server_endpoint`] under
+/// [`OverlayPeerPolicy::AcceptAny`] (server-auth-only, no client cert required).
+///
+/// NEVER use this endpoint for a flow that is not SAS-gated — on its own the TLS
+/// layer here authenticates nothing.
+pub fn pair_dial_endpoint() -> Result<Endpoint, QuicError> {
+    // A throwaway capture slot: the SAS, not this TOFU record, is the authenticator, so the
+    // captured key is deliberately ignored (the E2EE handshake proves the listener's identity).
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let mut tls = boatramp_rpktls::client_config_capturing(captured)?;
+    tls.alpn_protocols = vec![wire::ALPN.to_vec()];
+    let qcc = QuicClientConfig::try_from(tls).map_err(|_| QuicError::NoInitialCipherSuite)?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid wildcard addr"))?;
+    endpoint.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
+    Ok(endpoint)
+}
+
 /// An accept-only endpoint bound to `bind` under `policy` (a relay/ingress or
 /// egress/terminator).
 pub fn server_endpoint(

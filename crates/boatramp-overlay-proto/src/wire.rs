@@ -58,6 +58,21 @@ pub const TAG_SAS: &[u8] = b"bro-sas-v1";
 /// Domain tag for the identity fingerprint derivation (IU-aux).
 pub const TAG_IDENTITY_FP: &[u8] = b"bro-identity-fp-v1";
 
+/// Domain tag prepended to the pairing commitment preimage (overlay follow-up #2,
+/// pairing). A `SHA-256` over `TAG_PAIR_COMMIT ‖ role ‖ id_i ‖ id_r ‖
+/// kem_contribution ‖ nonce` (all fixed-width) binds a peer to a hidden nonce
+/// before either side reveals it, so a relay-in-the-middle cannot grind its
+/// contribution to force the human-compared SAS to collide. See
+/// [`crate::pairing::pair_commit`].
+pub const TAG_PAIR_COMMIT: &[u8] = b"bro-pair-commit-v1";
+
+/// Domain tag (HKDF salt) for the commit-then-reveal pairing SAS derived from the
+/// handshake transcript AND both peers' revealed nonces (overlay follow-up #2).
+/// Distinct from [`TAG_SAS`] (the egress-pinned, transcript-only SAS), so the two
+/// SAS schemes are domain-separated and never collide. See
+/// [`crate::sas::sas_from_pair_transcript`].
+pub const TAG_PAIR_SAS: &[u8] = b"bro-pair-sas-v1";
+
 /// Fixed marker the initiator writes first on a freshly opened direct bi-stream
 /// so the responder's `accept_bi` unblocks (quinn surfaces a stream to the peer
 /// only on first write) and the stream is unambiguously the promotion path
@@ -117,6 +132,8 @@ mod tests {
             std::str::from_utf8(TAG_HANDSHAKE_AUTH).unwrap(),
             std::str::from_utf8(TAG_SAS).unwrap(),
             std::str::from_utf8(TAG_IDENTITY_FP).unwrap(),
+            std::str::from_utf8(TAG_PAIR_COMMIT).unwrap(),
+            std::str::from_utf8(TAG_PAIR_SAS).unwrap(),
             std::str::from_utf8(PROMOTE_MARKER).unwrap(),
         ] {
             assert!(!s.contains("wt"), "wire id `{s}` leaks `wt`");

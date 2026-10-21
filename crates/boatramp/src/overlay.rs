@@ -22,7 +22,7 @@ use boatramp_core::cose::{
     OverlayMemberRole, TokenPublicKey, join_challenge, mint_overlay_dial, mint_overlay_enroll,
     mint_overlay_publish, verify_overlay_enroll,
 };
-use boatramp_overlay::{OverlayId, OverlaySecret};
+use boatramp_overlay::{OverlayId, OverlaySecret, SasCode};
 
 use crate::output::Rendered;
 
@@ -173,6 +173,33 @@ enum OverlayCommand {
         /// boatramp server base URL (overrides `[publish].server`).
         #[arg(long, env = "BOATRAMP_SERVER")]
         server: Option<String>,
+    },
+    /// Pair with another operator's device over a DIRECT link and mutually verify identities with a
+    /// short authentication string (SAS), detecting an active man-in-the-middle.
+    ///
+    /// One side LISTENS (`--listen <addr>`), the other DIALS (`<peer-addr>`). Both run a
+    /// relay-blind E2EE handshake, then a commit-then-reveal nonce exchange, and each derives a SAS
+    /// the two operators compare out of band. On a match the peer's proven identity is pinned
+    /// (locally, in-memory this increment); on a mismatch the command aborts without pinning.
+    Pair {
+        /// Act as the RESPONDER: listen on this `host:port` for a pairing dialer (instead of dialing).
+        #[arg(long, value_name = "ADDR", conflicts_with = "peer")]
+        listen: Option<String>,
+        /// Act as the INITIATOR: dial this peer `host:port` (the address the responder is listening on).
+        #[arg(value_name = "PEER_ADDR", conflicts_with = "listen")]
+        peer: Option<String>,
+        /// The overlay identity to pair AS: a tagged seed (`ed25519:<hex>`) or a key-file path.
+        /// Omit to use this operator's persistent identity (as `overlay id`).
+        #[arg(long)]
+        identity: Option<String>,
+        /// Non-interactive confirm: the FULL expected SAS words (e.g. `cargo-delta-hotel`), as shown
+        /// on the PEER's device, compared case-insensitively. The pairing ABORTS unless the derived
+        /// SAS equals this — there is no check-skipping `--yes`. Required when stdin is not a TTY.
+        #[arg(long, value_name = "SAS_WORDS")]
+        expect: Option<String>,
+        /// Bound the pairing window in seconds (the whole handshake must complete within it).
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
     },
 }
 
@@ -417,6 +444,18 @@ pub enum OverlayOutput {
     Directory { services: Vec<ServiceEntry> },
     /// `overlay resolve <name>` — one service's topology.
     Resolved(ServiceEntry),
+    /// `overlay pair` — a confirmed pairing: the peer's proven identity (pinned locally) plus the
+    /// SAS the operators compared.
+    Paired {
+        /// The peer's E2EE-proven overlay identity (`ed25519:<hex>`), now pinned.
+        peer_id: String,
+        /// The peer identity's display fingerprint.
+        fingerprint: String,
+        /// The SAS word rendering the operators compared.
+        sas_words: String,
+        /// The SAS keypad-digit rendering the operators compared.
+        sas_digits: String,
+    },
 }
 
 /// One overlay service directory entry (the CLI mirror of the server's response).
@@ -493,6 +532,21 @@ impl Rendered for OverlayOutput {
                     writeln!(w, "client auth: {}", s.client_auth)?;
                 }
                 Ok(())
+            }
+            Self::Paired {
+                peer_id,
+                fingerprint,
+                sas_words,
+                sas_digits,
+            } => {
+                writeln!(w, "paired with {peer_id}")?;
+                writeln!(w, "  fingerprint: {fingerprint}")?;
+                writeln!(w, "  SAS words:   {sas_words}")?;
+                writeln!(w, "  SAS digits:  {sas_digits}")?;
+                writeln!(
+                    w,
+                    "# identity verified out-of-band via the SAS and pinned (in-memory this session)"
+                )
             }
             Self::Granted {
                 ticket,
@@ -595,6 +649,13 @@ pub async fn run(
                     ))
                 })
         }
+        OverlayCommand::Pair {
+            listen,
+            peer,
+            identity,
+            expect,
+            timeout_secs,
+        } => pair_run(listen, peer, identity, expect, timeout_secs).await,
         OverlayCommand::Invite {
             role,
             scope,
@@ -773,6 +834,184 @@ pub async fn run(
             })
         }
     }
+}
+
+/// The operator's decision after seeing the SAS: pin the peer, or abort without pinning.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmOutcome {
+    /// The SAS matched — pin the peer's proven identity.
+    Confirm,
+    /// The SAS did not match (or was declined) — pin nothing, fail-closed.
+    Reject,
+}
+
+/// Decide a pairing from the operator's answer: `Confirm` iff `typed` parses as the FULL SAS words
+/// AND equals the locally-derived `sas`. A mistyped, unparseable, or differing value is `Reject`
+/// (never a default-yes) — the parse itself is case-insensitive and separator-tolerant via
+/// [`SasCode::from_words`], so only a genuinely matching code confirms.
+fn decide_sas(sas: &SasCode, typed: &str) -> ConfirmOutcome {
+    match SasCode::from_words(typed) {
+        Some(got) if got == *sas => ConfirmOutcome::Confirm,
+        _ => ConfirmOutcome::Reject,
+    }
+}
+
+/// Run `overlay pair`: stand up the direct-dial transport, run the SAS pairing handshake, confirm
+/// the SAS out-of-band (fail-closed), and pin the peer on a positive match.
+async fn pair_run(
+    listen: Option<String>,
+    peer: Option<String>,
+    identity: Option<String>,
+    expect: Option<String>,
+    timeout_secs: u64,
+) -> Result<OverlayOutput> {
+    use boatramp_overlay::{
+        OverlayPeerPolicy, Role, VerifiedPeers, accept, dial, identity_fp, pair_dial_endpoint,
+        pair_handshake, server_endpoint,
+    };
+
+    let secret = load_identity(identity.as_deref())?;
+    let deadline = std::time::Duration::from_secs(timeout_secs);
+    let q = |e: boatramp_overlay::QuicError| Error::Overlay(e.to_string());
+
+    // Hold the endpoint + connection alive through the (possibly interactive) confirm, so the final
+    // sealed reveal reaches the peer and the stream is not reset early.
+    let _hold;
+    let (sas, peer_id) = match (listen, peer) {
+        (Some(bind), _) => {
+            let addr = bind
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| Error::Overlay(format!("--listen `{bind}`: {e}")))?;
+            let ep = server_endpoint(&secret, &OverlayPeerPolicy::AcceptAny, addr).map_err(q)?;
+            eprintln!(
+                "boatramp overlay pair: listening on {} as {}",
+                ep.local_addr().map_err(|e| Error::Overlay(e.to_string()))?,
+                secret.id().to_bech32()
+            );
+            let conn = accept(&ep)
+                .await
+                .map_err(q)?
+                .ok_or_else(|| Error::Overlay("listener closed before a peer dialed".into()))?;
+            let (mut send, mut recv) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| Error::Overlay(format!("accepting the pairing stream: {e}")))?;
+            let out = pair_handshake(&mut send, &mut recv, &secret, Role::Responder, deadline)
+                .await
+                .map_err(|e| Error::Overlay(format!("pairing handshake: {e}")))?;
+            _hold = (ep, conn);
+            out
+        }
+        (None, Some(addr_s)) => {
+            let addr = addr_s
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| Error::Overlay(format!("peer address `{addr_s}`: {e}")))?;
+            let ep = pair_dial_endpoint().map_err(q)?;
+            let conn = dial(&ep, addr)
+                .await
+                .map_err(|e| Error::Overlay(format!("dialing {addr}: {e}")))?;
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| Error::Overlay(format!("opening the pairing stream: {e}")))?;
+            let out = pair_handshake(&mut send, &mut recv, &secret, Role::Initiator, deadline)
+                .await
+                .map_err(|e| Error::Overlay(format!("pairing handshake: {e}")))?;
+            _hold = (ep, conn);
+            out
+        }
+        (None, None) => {
+            return Err(Error::Overlay(
+                "specify either `--listen <addr>` (responder) or a peer `<addr>` (initiator)"
+                    .into(),
+            ));
+        }
+    };
+
+    let fp = identity_fp(&peer_id);
+    match confirm_sas(&sas, &peer_id, &fp, expect.as_deref())? {
+        ConfirmOutcome::Confirm => {
+            // Pin the E2EE-proven identity (never operator-typed). In-memory this increment; a
+            // KV-persistent verified pin is the next increment.
+            let mut pins = VerifiedPeers::new();
+            let vp = pins.confirm(peer_id);
+            Ok(OverlayOutput::Paired {
+                peer_id: peer_id.to_hex(),
+                fingerprint: vp.fingerprint.to_string(),
+                sas_words: sas.words(),
+                sas_digits: sas.digits(),
+            })
+        }
+        ConfirmOutcome::Reject => {
+            // Fail-closed: no pin, loud warning, security event, non-zero exit.
+            eprintln!("DO NOT CONFIRM — safety numbers differ; a man-in-the-middle may be present");
+            tracing::warn!(
+                target: "overlay.pair",
+                peer = %peer_id.to_bech32(),
+                "overlay pairing REJECTED: SAS did not match — identity NOT pinned"
+            );
+            Err(Error::Overlay(
+                "pairing aborted: the safety numbers did not match — the peer was NOT pinned"
+                    .into(),
+            ))
+        }
+    }
+}
+
+/// Gather the operator's confirmation of the derived `sas`, fail-closed.
+///
+/// `--expect` (the SAS words shown on the PEER device) is the non-interactive path: present, it is
+/// compared directly ([`decide_sas`]) and no prompt is shown. Absent, an interactive TTY is
+/// required — a non-TTY stdin with no `--expect` is an error (never a default-yes on a pipe). On a
+/// TTY we show the SAS + peer identity on stderr (stdout stays the typed result) and read the SAS
+/// words the operator sees on the PEER device, then compare.
+fn confirm_sas(
+    sas: &SasCode,
+    peer_id: &OverlayId,
+    fp: &boatramp_overlay::Fingerprint,
+    expect: Option<&str>,
+) -> Result<ConfirmOutcome> {
+    if let Some(words) = expect {
+        return Ok(decide_sas(sas, words));
+    }
+
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::Overlay(
+            "pairing needs confirmation: pass `--expect <sas-words>` (the SAS shown on the peer \
+             device) for non-interactive use — stdin is not a terminal"
+                .into(),
+        ));
+    }
+
+    // Interactive: show the SAS on stderr (stdout stays the typed result) and read the operator's
+    // answer — the SAS words shown on the OTHER device.
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    writeln!(err).ok();
+    writeln!(err, "Pairing with overlay peer:").ok();
+    writeln!(err, "  identity:    {}", peer_id.to_hex()).ok();
+    writeln!(err, "  fingerprint: {fp}").ok();
+    writeln!(err, "  SAS words:   {}", sas.words()).ok();
+    writeln!(err, "  SAS digits:  {}", sas.digits()).ok();
+    writeln!(err).ok();
+    writeln!(
+        err,
+        "Compare the SAS with the peer's device — it MUST match on BOTH sides."
+    )
+    .ok();
+    write!(
+        err,
+        "To confirm, type the SAS words shown on the PEER device (anything else aborts): "
+    )
+    .ok();
+    err.flush().ok();
+
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| Error::Overlay(format!("reading confirmation: {e}")))?;
+    Ok(decide_sas(sas, line.trim()))
 }
 
 /// Mint a holder-bound overlay-dial capability for `service`, signed offline by the root signer
@@ -1136,6 +1375,30 @@ mod tests {
         assert_eq!(back.role, "device");
         assert_eq!(back.scope, "svc/db");
         assert_eq!(back.relay.as_deref(), Some("ed25519:relay"));
+    }
+
+    #[test]
+    fn decide_sas_confirms_only_a_full_matching_code() {
+        // bits [0,1,255] → "acorn-admiral-igloo" (see the proto SAS stability test).
+        let sas = SasCode::from_words("acorn-admiral-igloo").unwrap();
+        // An exact match confirms; case- and separator-insensitive via from_words.
+        assert_eq!(
+            decide_sas(&sas, "acorn-admiral-igloo"),
+            ConfirmOutcome::Confirm
+        );
+        assert_eq!(
+            decide_sas(&sas, "ACORN ADMIRAL IGLOO"),
+            ConfirmOutcome::Confirm
+        );
+        // One word off → reject (the MITM case: --expect carries the peer's DIFFERING code).
+        assert_eq!(
+            decide_sas(&sas, "acorn-admiral-icon"),
+            ConfirmOutcome::Reject
+        );
+        // Unparseable / empty / partial → reject (never a default-yes).
+        assert_eq!(decide_sas(&sas, "yes"), ConfirmOutcome::Reject);
+        assert_eq!(decide_sas(&sas, ""), ConfirmOutcome::Reject);
+        assert_eq!(decide_sas(&sas, "acorn-admiral"), ConfirmOutcome::Reject);
     }
 
     #[test]

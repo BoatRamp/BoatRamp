@@ -1878,6 +1878,7 @@ dependencies = [
 name = "boatramp-overlay"
 version = "0.42.0"
 dependencies = [
+ "aws-lc-rs",
  "boatramp-core",
  "boatramp-overlay-proto",
  "boatramp-rpktls",

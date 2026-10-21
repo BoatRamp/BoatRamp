@@ -36,10 +36,14 @@ const MLKEM_PUB_LEN: usize = 1184;
 const MLKEM_CT_LEN: usize = 1088;
 const X25519_PUB_LEN: usize = 32;
 const SHARED_LEN: usize = 32;
-/// The initiator's KEM offer: ML-KEM-768 public key ‖ X25519 public key.
-const OFFER_LEN: usize = MLKEM_PUB_LEN + X25519_PUB_LEN;
-/// The responder's KEM reply: ML-KEM-768 ciphertext ‖ X25519 public key.
-const REPLY_LEN: usize = MLKEM_CT_LEN + X25519_PUB_LEN;
+/// The initiator's KEM offer: ML-KEM-768 public key ‖ X25519 public key. Public
+/// so the pairing commitment ([`crate::pairing`]) can bind the offer at its exact
+/// fixed width (a canonical fixed-length preimage); `establish` is unchanged.
+pub const OFFER_LEN: usize = MLKEM_PUB_LEN + X25519_PUB_LEN;
+/// The responder's KEM reply: ML-KEM-768 ciphertext ‖ X25519 public key. Public
+/// so the pairing commitment ([`crate::pairing`]) can bind the reply at its exact
+/// fixed width (a canonical fixed-length preimage); `establish` is unchanged.
+pub const REPLY_LEN: usize = MLKEM_CT_LEN + X25519_PUB_LEN;
 const SIG_LEN: usize = 64;
 
 /// HKDF `info` separating the two directional keys. Internal (never on the

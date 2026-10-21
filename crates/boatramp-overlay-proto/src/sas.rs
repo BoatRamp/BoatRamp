@@ -189,6 +189,43 @@ pub fn sas_from_transcript(transcript: &[u8; 32]) -> SasCode {
     SasCode { bits }
 }
 
+/// Derive the **commit-then-reveal pairing SAS** from the handshake `transcript`
+/// AND both peers' revealed nonces (overlay follow-up #2, pairing):
+/// `HKDF-SHA256(salt = [`wire::TAG_PAIR_SAS`], ikm = transcript ‖ n_init ‖
+/// n_resp)` → the first [`SAS_BITS`] bits.
+///
+/// The ikm is a **canonical fixed-width** concatenation (`32 + 32 + 32 = 96`
+/// bytes), in the fixed `transcript`-then-`n_init`-then-`n_resp` order, so both
+/// honest peers — who agree on the transcript and on which revealed nonce is the
+/// initiator's — derive the identical code. Folding both nonces in is what
+/// upgrades the MITM-detection to `2^-SAS_BITS` **per online attempt**: because
+/// each nonce is committed (hashed via [`crate::pairing::pair_commit`]) before
+/// *either* is revealed, an active relay cannot choose its nonce after learning
+/// the peer's, so it cannot grind the (attacker-malleable) transcript to force
+/// the two human-compared codes to collide. See the `CRITICAL` note on
+/// [`SAS_BITS`].
+///
+/// Domain-separated from [`sas_from_transcript`] by the distinct salt
+/// [`wire::TAG_PAIR_SAS`], so the committed and un-committed SAS schemes never
+/// collide. [`sas_from_transcript`] is intentionally left unchanged — the
+/// egress-pinned / non-paired flows keep deriving from it; this is the additional
+/// commit-then-reveal form the pairing handshake uses.
+#[must_use]
+pub fn sas_from_pair_transcript(
+    transcript: &[u8; 32],
+    n_init: &[u8; 32],
+    n_resp: &[u8; 32],
+) -> SasCode {
+    // Canonical, fixed-width ikm: transcript ‖ n_init ‖ n_resp (96 bytes).
+    let mut ikm = [0u8; 96];
+    ikm[..32].copy_from_slice(transcript);
+    ikm[32..64].copy_from_slice(n_init);
+    ikm[64..].copy_from_slice(n_resp);
+    let mut bits = [0u8; SAS_BYTES];
+    hkdf_expand(wire::TAG_PAIR_SAS, &ikm, &mut bits);
+    SasCode { bits }
+}
+
 /// A short, stable fingerprint of an overlay identity, for display (e.g. "you
 /// are connecting to `…`"). Derived — not a raw key prefix — so it is uniformly
 /// spread and domain-separated via [`wire::TAG_IDENTITY_FP`].
@@ -584,6 +621,81 @@ mod tests {
             sas.bits(),
             &swapped,
             "salt/ikm roles are not interchangeable"
+        );
+    }
+
+    #[test]
+    fn pair_sas_is_deterministic_and_nonce_sensitive() {
+        let tr = t(11);
+        let n1 = [1u8; 32];
+        let n2 = [2u8; 32];
+        // Deterministic for the same (transcript, n_init, n_resp) — what lets two honest peers,
+        // who share the transcript and both revealed nonces, derive an identical code to compare.
+        assert_eq!(
+            sas_from_pair_transcript(&tr, &n1, &n2).bits(),
+            sas_from_pair_transcript(&tr, &n1, &n2).bits()
+        );
+        // Nonce-sensitive: the SAS folds in BOTH nonces. (If the nonces were dropped from the ikm —
+        // degenerating to the un-committed transcript SAS — these would collapse to one code, so
+        // these assertions double as the guard against that mutation.)
+        let base = sas_from_pair_transcript(&tr, &n1, &n2);
+        assert_ne!(
+            base.bits(),
+            sas_from_pair_transcript(&tr, &[9u8; 32], &n2).bits(),
+            "the initiator nonce must affect the SAS"
+        );
+        assert_ne!(
+            base.bits(),
+            sas_from_pair_transcript(&tr, &n1, &[9u8; 32]).bits(),
+            "the responder nonce must affect the SAS"
+        );
+        // The init/resp order is bound (the ikm is ordered): swapping the two nonces changes it.
+        assert_ne!(
+            base.bits(),
+            sas_from_pair_transcript(&tr, &n2, &n1).bits(),
+            "the initiator/responder nonce order is bound into the SAS"
+        );
+    }
+
+    #[test]
+    fn pair_sas_is_domain_separated_from_the_transcript_sas() {
+        // Even with the SAME 32-byte value in all three ikm slots, the pairing SAS
+        // (salt = TAG_PAIR_SAS, 96-byte ikm) differs from the transcript SAS
+        // (salt = TAG_SAS, 32-byte ikm): the committed and un-committed schemes never collide.
+        let tr = t(21);
+        assert_ne!(
+            sas_from_pair_transcript(&tr, &tr, &tr).bits(),
+            sas_from_transcript(&tr).bits(),
+            "the committed-nonce pairing SAS is domain-separated from the transcript SAS"
+        );
+    }
+
+    #[test]
+    fn pair_sas_denies_the_offline_transcript_grind() {
+        // Model one online MITM attempt against the human-compared codes.
+        //
+        // The attack the un-committed transcript SAS is vulnerable to (see the CRITICAL note on
+        // SAS_BITS): a MITM-as-responder, after learning one leg's target, grinds its KEM `reply`
+        // offline to drive the OTHER leg's transcript to the SAME transcript-only SAS. We model the
+        // attacker having SUCCEEDED at that grind — a PERFECT base-transcript-SAS collision — by
+        // reusing one transcript on both legs (the strongest case for the attacker):
+        let t_grind = t(33);
+        assert_eq!(
+            sas_from_transcript(&t_grind).bits(),
+            sas_from_transcript(&t_grind).bits(),
+            "models the attacker's achieved base-transcript-SAS collision"
+        );
+        // WITHOUT the nonces, both legs would now show an IDENTICAL code and the human check passes
+        // the attacker through. WITH the committed nonces — the attacker must fix n_m1/n_m2 BEFORE
+        // learning the honest n_a/n_b — the two human-compared codes still diverge, so the attack
+        // fails. Removing the nonces from the ikm (the mutation) collapses both sides to
+        // `sas_from_transcript(t_grind)` and this assertion goes RED (the two become equal).
+        let (n_a, n_m1) = ([0xA1u8; 32], [0x1Au8; 32]); // A-leg: honest n_a, attacker-committed n_m1
+        let (n_m2, n_b) = ([0x2Bu8; 32], [0xB2u8; 32]); // B-leg: attacker-committed n_m2, honest n_b
+        assert_ne!(
+            sas_from_pair_transcript(&t_grind, &n_a, &n_m1).bits(),
+            sas_from_pair_transcript(&t_grind, &n_m2, &n_b).bits(),
+            "committed per-leg nonces keep the two SAS codes apart even on a ground transcript collision"
         );
     }
 

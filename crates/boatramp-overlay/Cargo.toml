@@ -20,6 +20,9 @@ boatramp-overlay-proto = { workspace = true }
 boatramp-core = { workspace = true, features = ["authz"] }
 # Raw-public-key TLS configs wired into quinn (reused, not rebuilt).
 boatramp-rpktls = { workspace = true }
+# Platform RNG for the commit-then-reveal pairing nonces (same backend the pure
+# core and rpktls use — ONE crypto provider in the graph).
+aws-lc-rs = "1.17"
 # Dial-handshake request/verdict wire codec.
 serde = { workspace = true }
 serde_json = { workspace = true }

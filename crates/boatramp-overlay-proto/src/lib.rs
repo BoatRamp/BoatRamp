@@ -40,6 +40,7 @@ pub mod dial;
 pub mod e2ee;
 pub mod ice;
 pub mod identity;
+pub mod pairing;
 pub mod peer_policy;
 pub mod sas;
 pub mod wire;
@@ -49,5 +50,8 @@ pub use dial::{DialReject, DialRequest, DialVerdict, authorize_dial};
 pub use e2ee::{E2eeError, HybridInitiator, Opener, Role, Sealer, Session, hybrid_respond};
 pub use ice::{Candidate, CandidateKind, CandidateSet, Signal};
 pub use identity::{OverlayId, OverlayIdError, OverlaySecret};
+pub use pairing::{
+    PAIR_NONCE_LEN, PAIR_ROLE_INITIATOR, PAIR_ROLE_RESPONDER, pair_commit, pair_commit_verify,
+};
 pub use peer_policy::OverlayPeerPolicy;
-pub use sas::{Fingerprint, SasCode, identity_fp, sas_from_transcript};
+pub use sas::{Fingerprint, SasCode, identity_fp, sas_from_pair_transcript, sas_from_transcript};

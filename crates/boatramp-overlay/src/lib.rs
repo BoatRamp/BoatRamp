@@ -20,6 +20,7 @@ pub mod direct;
 pub mod e2ee;
 pub mod ice;
 pub mod net;
+pub mod pair;
 pub mod quic;
 
 pub use circuit::{
@@ -32,9 +33,10 @@ pub use net::{
     run_egress_router, run_forwarding_router, run_ingress_router, run_published_service,
     terminate_one,
 };
+pub use pair::{PairError, VerifiedPeer, VerifiedPeers, pair_handshake};
 pub use quic::{
     QuicError, accept, client_endpoint, client_endpoint_server_auth, dial, dial_mesh_peer,
-    mesh_endpoint, peer_endpoint, server_endpoint, server_endpoint_with_trust,
+    mesh_endpoint, pair_dial_endpoint, peer_endpoint, server_endpoint, server_endpoint_with_trust,
 };
 // Re-export the rpktls types the mesh transport (IU-9) builds endpoints from, and quinn itself, so
 // a consumer (e.g. boatramp-cluster's overlay mesh transport) depends on this one integration crate.
@@ -44,5 +46,6 @@ pub use quinn;
 // Re-export the pure-core types a consumer (e.g. the `boatramp forward` CLI) needs, so it can
 // depend on this one crate.
 pub use boatramp_overlay_proto::{
-    DialRequest, DialVerdict, OverlayId, OverlayIdError, OverlayPeerPolicy, OverlaySecret,
+    DialRequest, DialVerdict, Fingerprint, OverlayId, OverlayIdError, OverlayPeerPolicy,
+    OverlaySecret, Role, SasCode, identity_fp,
 };
