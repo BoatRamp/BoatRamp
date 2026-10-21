@@ -21,7 +21,10 @@ use boatramp_core::sql::{
     MoveDatabaseReport, PreviewSqlMode, SqlBackend, SqlBackends, SqlError, SqlRows, SqlTransaction,
     SqlValue,
 };
-use libsql::{Builder, Connection, Database, Value as LibsqlValue};
+use libsql::{
+    AuthAction, AuthContext, AuthHook, Authorization, Builder, Connection, Database,
+    Value as LibsqlValue,
+};
 use tokio::sync::Mutex;
 
 /// How long a contended writer waits for the single-writer lock before giving
@@ -1023,6 +1026,9 @@ impl LibsqlSqlBackends {
                  namespace restore is not yet supported",
             ));
         };
+        // Defense-in-depth: screen the (already project-prefixed) site identity at the restore
+        // entry too, so a future path-building refactor can't let a traversing identity through.
+        validate_site_ident(site)?;
         let canon = canonical_name(name);
         let live = Self::resolve_local_path(dir, site, canon);
         // Overwrite gate (replaces the v1 no-clobber): refuse a non-empty live unless `overwrite`.
@@ -1131,6 +1137,10 @@ impl LibsqlSqlBackends {
                 "libsql shadow restore is supported for local single-node databases only",
             ));
         };
+        // Defense-in-depth: the site identity is already project-prefixed + `.db`-glued by the
+        // caller, but screen it here too so a future refactor of `local_path` /
+        // `site_from_libsql_member` can't let a traversing identity reach the filesystem.
+        validate_site_ident(site)?;
         let canon = canonical_name(name);
         let live = Self::resolve_local_path(dir, site, canon);
         if let Ok(meta) = std::fs::metadata(&live)
@@ -1158,6 +1168,16 @@ impl LibsqlSqlBackends {
         run_pragma(&conn, "PRAGMA journal_mode=DELETE").await?;
         run_pragma(&conn, "PRAGMA foreign_keys=OFF").await?;
         run_pragma(&conn, "PRAGMA synchronous=OFF").await?;
+        // HIGH-1 (inc2 Security): the streamed `.dump` crosses a TRUST boundary — the trailer SHA is
+        // integrity, not authenticity, so a crafted member can carry arbitrary SQL. Confine the
+        // apply with a SQLite authorizer (installed AFTER our own setup pragmas) so a statement can
+        // ONLY create/populate tables in the shadow's own `main`/`temp` schema: `ATTACH`/`DETACH`
+        // and every `PRAGMA` are DENIED (a legit `.dump` from our generator emits neither), and any
+        // action targeting another database name is denied. `ATTACH` is refused at PREPARE — before
+        // SQLite opens the target file — so a refused import writes NOTHING outside the shadow (and
+        // the compounding autocommit-escapes-the-shadow hazard never arises: the ATTACH never runs).
+        conn.authorizer(Some(shadow_apply_authorizer()))
+            .map_err(SqlError::other)?;
         Ok(DumpShadow {
             live_path: live,
             shadow_path: shadow,
@@ -1180,6 +1200,9 @@ impl LibsqlSqlBackends {
                 .as_ref()
                 .ok_or_else(|| SqlError::other("shadow connection already closed"))?;
             shadow.applier.finish(conn).await?;
+            // The untrusted `.dump` is now fully applied under the authorizer; lift it so our OWN
+            // trusted `PRAGMA integrity_check` (which the authorizer would otherwise DENY) can run.
+            conn.authorizer(None).map_err(SqlError::other)?;
             let mut rows = conn
                 .query("PRAGMA integrity_check", ())
                 .await
@@ -1510,34 +1533,104 @@ impl Drop for DumpShadow {
     }
 }
 
+/// Where the statement splitter currently is in the byte stream. A `;` terminates a statement only
+/// in [`Normal`](Scan::Normal) — inside a string/identifier/comment it is literal.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Scan {
+    #[default]
+    Normal,
+    /// `'…'` string literal (`''` = an escaped quote).
+    Single,
+    /// `"…"` quoted identifier (`""` = escaped).
+    Double,
+    /// `[…]` quoted identifier (SQLite; no doubling — closes on the first `]`).
+    Bracket,
+    /// `` `…` `` quoted identifier (closes on a backtick).
+    Backtick,
+    /// `-- …` line comment (ends at the next newline).
+    LineComment,
+    /// `/* … */` block comment (ends at `*/`).
+    BlockComment,
+}
+
 /// An incremental SQL-statement splitter + executor for a streamed libsql `.dump`. Scans the byte
-/// stream for a `;` that terminates a statement — tracking single-/double-quote string state at the
-/// BYTE level (every quote/`;` delimiter is ASCII, and a UTF-8 continuation byte is always ≥ 0x80,
-/// so arbitrary UTF-8 inside a quoted literal never confuses the scan) — and `execute_batch`es each
-/// complete statement against the shadow connection. `''`/`""` escapes net-toggle correctly, so the
-/// quote state at every `;` is accurate.
+/// stream for a `;` that terminates a statement, tracking quote/identifier/comment state at the BYTE
+/// level — every delimiter (`'"`[]```;` and the comment markers) is ASCII and a UTF-8 continuation
+/// byte is always ≥ 0x80, so arbitrary UTF-8 inside a quoted literal never confuses the scan. It
+/// handles single/double-quoted strings, `[…]` and backtick identifiers, and `--` / `/* */`
+/// comments, so a legit identifier/literal/comment containing `;` cannot split wrongly (round-trip
+/// fidelity); each complete statement is run via `execute_batch`. (The authorizer on the shadow
+/// connection is the security barrier — it fires per statement inside `execute_batch` regardless of
+/// how the text is split — so this scanner is for correctness, and reinforces that barrier.)
 #[derive(Default)]
 struct SqlStatementApplier {
     /// Bytes of the current (incomplete) statement, accumulated across `feed` calls.
     buf: Vec<u8>,
-    /// Inside a single-quoted string literal.
-    in_single: bool,
-    /// Inside a double-quoted identifier.
-    in_double: bool,
+    /// The current scanner state (persists across `feed` calls — a statement may span chunks).
+    scan: Scan,
+    /// The previous byte (for 2-byte comment-start / `*/` detection across chunk boundaries).
+    prev: u8,
 }
 
 impl SqlStatementApplier {
     async fn feed(&mut self, conn: &Connection, bytes: &[u8]) -> Result<(), SqlError> {
         for &b in bytes {
             self.buf.push(b);
-            match b {
-                b'\'' if !self.in_double => self.in_single = !self.in_single,
-                b'"' if !self.in_single => self.in_double = !self.in_double,
-                b';' if !self.in_single && !self.in_double => {
-                    self.exec_pending(conn).await?;
+            match self.scan {
+                Scan::Normal => {
+                    if self.prev == b'-' && b == b'-' {
+                        self.scan = Scan::LineComment;
+                    } else if self.prev == b'/' && b == b'*' {
+                        self.scan = Scan::BlockComment;
+                    } else {
+                        match b {
+                            b'\'' => self.scan = Scan::Single,
+                            b'"' => self.scan = Scan::Double,
+                            b'[' => self.scan = Scan::Bracket,
+                            b'`' => self.scan = Scan::Backtick,
+                            b';' => {
+                                self.prev = b;
+                                self.exec_pending(conn).await?;
+                                continue; // buf cleared; don't carry a stale `prev` across statements
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                _ => {}
+                Scan::Single => {
+                    if b == b'\'' {
+                        self.scan = Scan::Normal; // a following `'` re-opens (handles `''`)
+                    }
+                }
+                Scan::Double => {
+                    if b == b'"' {
+                        self.scan = Scan::Normal; // a following `"` re-opens (handles `""`)
+                    }
+                }
+                Scan::Bracket => {
+                    if b == b']' {
+                        self.scan = Scan::Normal;
+                    }
+                }
+                Scan::Backtick => {
+                    if b == b'`' {
+                        self.scan = Scan::Normal; // a following backtick re-opens
+                    }
+                }
+                Scan::LineComment => {
+                    if b == b'\n' {
+                        self.scan = Scan::Normal;
+                    }
+                }
+                Scan::BlockComment => {
+                    if self.prev == b'*' && b == b'/' {
+                        self.scan = Scan::Normal;
+                        self.prev = 0; // don't let the closing `/` start a new `/*`
+                        continue;
+                    }
+                }
             }
+            self.prev = b;
         }
         Ok(())
     }
@@ -1561,6 +1654,34 @@ impl SqlStatementApplier {
     async fn finish(&mut self, conn: &Connection) -> Result<(), SqlError> {
         self.exec_pending(conn).await
     }
+}
+
+/// Build the SQLite authorizer installed on a shadow-restore connection (HIGH-1). A streamed
+/// `.dump` crosses a trust boundary (the trailer SHA is integrity, not authenticity), so the apply
+/// is confined to the shadow's own schema: DENY `ATTACH` (the proven arbitrary-file read/write
+/// escape) and `DETACH`, DENY every `PRAGMA` (a legit `.dump` from our generator emits none; a
+/// crafted filesystem/other-DB pragma is refused), and DENY any action whose target database is not
+/// the shadow's own `main`/`temp`. Everything a legit `.dump` needs — CREATE TABLE/INDEX/TRIGGER/
+/// VIEW + INSERT against `main` — is allowed. SQLite fires the authorizer at PREPARE, so a crafted
+/// `ATTACH` is refused BEFORE the target file is opened: a refused import touches nothing outside
+/// the shadow (and the autocommit-escapes-the-shadow hazard never arises — the ATTACH never runs).
+fn shadow_apply_authorizer() -> AuthHook {
+    std::sync::Arc::new(|ctx: &AuthContext| {
+        if matches!(
+            ctx.action,
+            AuthAction::Attach { .. } | AuthAction::Detach { .. } | AuthAction::Pragma { .. }
+        ) {
+            return Authorization::Deny;
+        }
+        // Belt-and-suspenders: even if an alias existed, never read/write another database.
+        if let Some(db) = ctx.database_name
+            && db != "main"
+            && db != "temp"
+        {
+            return Authorization::Deny;
+        }
+        Authorization::Allow
+    })
 }
 
 /// A `<live>.shadow_<nanos>_<pid>` path in the SAME directory as `live`, so a later `std::fs::rename`
@@ -2931,5 +3052,92 @@ mod tests {
         assert_eq!(removed, 2, "both stale shadows swept (recursively)");
         assert_eq!(shadow_files(&dir), 0);
         assert!(dir.join("keep.db").exists(), "a real db is never swept");
+    }
+
+    /// HIGH-1: the shadow-apply authorizer refuses a crafted `.dump`'s `ATTACH DATABASE`, so the
+    /// apply can never reach a file outside the shadow. The ATTACH is denied at PREPARE — before
+    /// SQLite opens the target — so the out-of-target victim file stays byte-for-byte UNTOUCHED.
+    #[tokio::test]
+    async fn shadow_apply_authorizer_refuses_attach_and_leaves_victim_untouched() {
+        let dir = factory_dir("shadow-attack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        // A victim PATH OUTSIDE the target dir that does NOT yet exist — a real ATTACH would CREATE
+        // it (SQLite opens attach targets read-write-create), so "victim never created" is an
+        // unambiguous proof the escape wrote nothing (a pre-existing non-db file would make ATTACH
+        // fail on its own, a false pass).
+        let victim_dir = factory_dir("shadow-victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("victim.db");
+        assert!(!victim.exists());
+
+        let mut shadow = backends.begin_dump_shadow("blog", "", false).await.unwrap();
+        // A legit opening statement, then the ATTACH escape + a cross-db write.
+        let evil = format!(
+            "CREATE TABLE t(v TEXT);\nATTACH DATABASE '{}' AS v;\n\
+             CREATE TABLE v.pwned(x);\nINSERT INTO v.pwned VALUES (1);\n",
+            victim.display()
+        );
+        let fed = shadow.feed(evil.as_bytes()).await;
+        assert!(
+            fed.is_err(),
+            "the crafted ATTACH must be refused by the authorizer"
+        );
+        drop(shadow); // abort
+
+        // The victim was NEVER created (ATTACH refused at prepare), and no shadow residue remains.
+        assert!(
+            !victim.exists(),
+            "a refused ATTACH must not have created/written the out-of-target victim file"
+        );
+        assert_eq!(
+            shadow_files(&dir),
+            0,
+            "aborted apply left no shadow residue"
+        );
+
+        // MUTATION (RED): without the authorizer, ATTACH creates the victim db + INSERT writes it
+        // (a cross-tenant/file escape the shadow-drop does NOT undo) → `fed` is Ok and the victim
+        // file exists → both assertions above go RED.
+    }
+
+    /// Splitter robustness: a `.dump` whose statements contain `;` inside a `[bracket]`/backtick
+    /// identifier, a `-- line` comment, and a `/* block ; */` comment must NOT split wrongly — every
+    /// row round-trips. (Reinforces the authorizer: a wrong split can not smuggle a statement past it.)
+    #[tokio::test]
+    async fn shadow_apply_splitter_handles_identifiers_and_comments() {
+        let dir = factory_dir("shadow-split");
+        std::fs::create_dir_all(&dir).unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        let mut shadow = backends.begin_dump_shadow("blog", "", false).await.unwrap();
+        // `;` appears inside: a bracket identifier, a string literal, a line comment, and a block
+        // comment — none may terminate a statement early.
+        let dump = "CREATE TABLE \"we;ird\"(v TEXT); -- trailing ; comment\n\
+             INSERT INTO \"we;ird\" VALUES ('a ; b'); /* block ; comment ; */\n\
+             INSERT INTO `we;ird`(v) VALUES ('c');\n"
+            .to_string();
+        shadow.feed(dump.as_bytes()).await.unwrap();
+        backends.commit_dump_shadow(shadow).await.unwrap();
+
+        let db: Arc<dyn SqlBackend> =
+            Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+        let rows = {
+            let mut tx = db.begin().await.unwrap();
+            let r = tx
+                .query("SELECT v FROM \"we;ird\" ORDER BY v", &[])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            r.rows
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqlValue::Text("a ; b".into())],
+                vec![SqlValue::Text("c".into())],
+            ],
+            "the splitter kept every in-identifier / in-literal / in-comment `;` from splitting the statement early"
+        );
     }
 }

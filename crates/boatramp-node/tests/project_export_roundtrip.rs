@@ -1353,6 +1353,34 @@ async fn project_export_cross_tenant_leak_gate() {
         out
     }
 
+    /// Hand-build a v3 bundle carrying ONLY a CHUNKED libsql member whose `.dump` is arbitrary
+    /// attacker-supplied SQL text — models a crafted libsql member crossing the trust boundary
+    /// (HIGH-1). The member path `libsql/<source>/<site>/default.sqlite` makes the import resolve
+    /// the target site; the import must confine the apply so the `.dump` can touch nothing outside
+    /// the shadow.
+    fn craft_chunked_libsql_bundle(source: &str, site: &str, dump_text: &str) -> Vec<u8> {
+        use boatramp_node::project_bundle::{self, MemberKind, MemberSpec, SourceInfo};
+        let member_path = format!("libsql/{source}/{site}/default.sqlite");
+        let specs = vec![MemberSpec::chunked(member_path, MemberKind::Libsql, None)];
+        let dump = dump_text.as_bytes().to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        project_bundle::write_bundle_streaming_v3(
+            &mut out,
+            0,
+            false,
+            SourceInfo {
+                project: source.to_string(),
+                site: Some(site.to_string()),
+            },
+            specs,
+            64,
+            |_spec| unreachable!("the crafted bundle has no sidecar member"),
+            |_spec| Ok(Box::new(std::io::Cursor::new(dump.clone())) as Box<dyn std::io::Read>),
+        )
+        .unwrap();
+        out
+    }
+
     // A value that exists ONLY in globex's data / the global crown jewels — if any of it ever
     // appears in acme's export or an imported target, a tenant boundary leaked.
     const GLOBEX_SENTINEL: &[u8] = b"GLOBEX_ONLY_CROWN_JEWEL_SENTINEL_9e3af17c";
@@ -1787,6 +1815,66 @@ async fn project_export_cross_tenant_leak_gate() {
                 "a refused {framing} import ({what}) must not have written any foreign/global key"
             );
         }
+    }
+
+    // === HIGH-1 (inc2 Security): a crafted CHUNKED LIBSQL member whose `.dump` carries an
+    //     `ATTACH DATABASE '<out-of-target abs path>'` escape is REFUSED, and the out-of-target
+    //     victim file is byte-for-byte UNTOUCHED — proven through the REAL NodeProjectExport::import
+    //     (the shadow-apply authorizer denies ATTACH at PREPARE, before the file is opened). ===
+    {
+        let atk_tmp = tempfile::tempdir().unwrap();
+        // A victim PATH OUTSIDE the target's libsql dir that does NOT yet exist — a real ATTACH
+        // would CREATE it, so "never created" is an unambiguous proof the escape wrote nothing.
+        let victim = atk_tmp.path().join("victim.db");
+        assert!(!victim.exists());
+        let evil_dump = format!(
+            "CREATE TABLE t(v TEXT);\nATTACH DATABASE '{}' AS v;\n\
+             CREATE TABLE v.pwned(x);\nINSERT INTO v.pwned VALUES (1);\n",
+            victim.display()
+        );
+        let crafted = craft_chunked_libsql_bundle("acme", "blog", &evil_dump);
+
+        let atk_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let atk_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(atk_tmp.path().join("blobs")));
+        let atk_libsql = Arc::new(LibsqlSqlBackends::local(
+            atk_tmp.path().join("handlers-sql"),
+        ));
+        let atk_work = atk_tmp.path().join("work");
+        std::fs::create_dir_all(&atk_work).unwrap();
+        let atk = NodeProjectExport::new(
+            BTreeMap::new(),
+            DeployStore::new(atk_blobs.clone(), atk_kv.clone()),
+            atk_kv.clone(),
+            atk_blobs.clone(),
+            atk_work,
+        )
+        .with_libsql(atk_libsql.clone());
+
+        let mut src = futures::io::Cursor::new(crafted);
+        let res = atk
+            .import(
+                "acme",
+                &mut src,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "a crafted libsql `.dump` carrying ATTACH DATABASE MUST be refused (fail-closed)"
+        );
+        assert!(
+            !victim.exists(),
+            "the ATTACH escape must NOT have created/written the out-of-target victim file"
+        );
+        // MUTATION (RED): remove the shadow-apply authorizer → the ATTACH creates the victim db +
+        // INSERT writes it (a cross-tenant/file escape the shadow-drop does NOT undo) → the
+        // victim-not-created assertion goes RED.
     }
 
     // === RENAME variant: import acme's bundle AS `acmeclone` ===
