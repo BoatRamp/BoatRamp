@@ -107,6 +107,8 @@ pub fn router_with_fast(
     let mesh_control = MeshControlHandle(options.mesh_control.clone());
     // The overlay forward-flow directory, for `/api/overlay/*` (resolve + dial-mint).
     let overlay_directory = options.overlay_directory.clone();
+    // The overlay-enrollment admit hook, for `POST /api/overlay/enroll`.
+    let overlay_enroll_hook = OverlayEnrollHandle(options.overlay_enroll.clone());
     #[cfg(feature = "oidc")]
     let oidc_state = OidcState(options.oidc_verifier.clone());
     let probe = options.probe.unwrap_or_else(|| {
@@ -281,6 +283,12 @@ pub fn router_with_fast(
         // Overlay reverse-ingress self-serve publish: mint an overlay-PUBLISH capability + return the
         // ingress relay topology (`Overlay·Admin`, strictly above dial's `Overlay·Write`).
         .route("/api/overlay/expose", post(overlay_expose))
+        // Overlay enrollment: mint a single-use `overlay-enroll` invitation (`Overlay·Admin`, the
+        // owner-grade tier — redeeming it admits a new identity into the overlay trust set) and redeem
+        // one (`/enroll`, token-gated like `/api/cluster/join` — the handler verifies the invitation +
+        // a possession proof, then trusts the key in the relay's live set).
+        .route("/api/overlay/invite", post(overlay_invite))
+        .route("/api/overlay/enroll", post(overlay_enroll))
         // Rotate this node's mesh key (make-before-break). Admin-scoped via the
         // deny-safe `Right::required` default for `/api/cluster/*`.
         .route("/api/cluster/rotate-key", post(cluster_rotate_key))
@@ -711,6 +719,7 @@ pub fn router_with_fast(
         .layer(Extension(bootstrap))
         .layer(Extension(mesh_control))
         .layer(Extension(overlay_directory))
+        .layer(Extension(overlay_enroll_hook))
         .layer(Extension(probe))
         .layer(Extension(record_probe))
         .layer(Extension(operator_sql_cap))

@@ -134,9 +134,9 @@ pub(crate) use control_api::{
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
     delete_secret, delete_tenant_secret, get_authz_policy, kv_checkpoint, kv_export, kv_import,
     kv_status, list_email_profiles, list_root_anchors, list_secrets, list_tenant_secrets,
-    list_tokens, node_version, overlay_dial, overlay_expose, overlay_services, put_authz_policy,
-    remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
-    show_email_profile,
+    list_tokens, node_version, overlay_dial, overlay_enroll, overlay_expose, overlay_invite,
+    overlay_services, put_authz_policy, remove_root_anchor, revoke_token, set_email_profile,
+    set_secret, set_tenant_secret, show_email_profile,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
@@ -2584,6 +2584,10 @@ pub struct ServerOptions {
     /// `GET /api/overlay/services` + `POST /api/overlay/dial` (resolve + mint). Empty ⇒ those
     /// routes report an empty directory / 404 on resolve.
     pub overlay_directory: OverlayDirectory,
+    /// The overlay-enrollment ADMIT hook, wired when this node runs an overlay relay accepting
+    /// enrollments. Backs `POST /api/overlay/enroll` (redeem an `overlay-enroll` invitation →
+    /// trust the key in the relay's live set). `None` ⇒ that route returns `501`.
+    pub overlay_enroll: Option<Arc<dyn OverlayEnroll>>,
     /// Origins allowed to call the control-plane `/api/*` routes cross-origin
     /// (CORS). Empty (the default) ⇒ no `Access-Control-*` headers at all, i.e.
     /// same-origin only — which is exactly the dogfood console, served from the
@@ -3024,6 +3028,56 @@ pub struct MeshMember {
 /// `None` ⇒ this node is not a cluster node, so those routes return `501`.
 #[derive(Clone, Default)]
 struct MeshControlHandle(Option<Arc<dyn MeshControl>>);
+
+/// The overlay-enrollment ADMIT hook exposed to the control-plane API, implemented by the
+/// `boatramp` binary over its live overlay relay (the trust set + an in-memory single-use jti
+/// ledger + a revoked-key bar). `None` on a node that runs no overlay relay accepting enrollments
+/// (`POST /api/overlay/enroll` then returns `501`).
+///
+/// Mirrors [`MeshControl`]: the control-plane HANDLER verifies the `overlay-enroll` invitation
+/// (signature + `exp` + kind) against the trust anchor and hands the verified single-use `jti`, the
+/// enrollee's presented key, and the possession proof to [`admit`](OverlayEnroll::admit). The impl —
+/// which lives in the binary, where the overlay transport deps (`boatramp-rpktls`) are — verifies the
+/// possession proof against the PRESENTED key, then ATOMICALLY (one critical section): bars a revoked
+/// key, refuses an already-spent `jti` (single-use), and on success spends the `jti` and inserts the
+/// key into the relay's LIVE trust set. This is the exact split `cluster_join` uses (token verified in
+/// the handler; proof-verify + atomic spend+trust in the `MeshControl` impl), kept so `boatramp-server`
+/// stays free of the overlay-transport deps (the same reason [`LiveExposers`]/[`MeshControl`] are traits).
+#[async_trait::async_trait]
+pub trait OverlayEnroll: Send + Sync {
+    /// Admit the enrollee presenting an `overlay-enroll` invitation whose verified single-use handle
+    /// is `jti`, enrolling `overlay_pubkey_hex` (`ed25519:<hex>`) with a `possession_proof` (an
+    /// Ed25519 signature over `cose::join_challenge(jti, overlay_pubkey_hex, proof_iat)`, fresh at
+    /// `now`). On success the key is trusted in the relay's live set and the `jti` is spent. `Err` is a
+    /// human-readable internal failure.
+    async fn admit(
+        &self,
+        overlay_pubkey_hex: &str,
+        jti: &str,
+        possession_proof: &[u8],
+        proof_iat: u64,
+        now: u64,
+    ) -> Result<OverlayEnrollOutcome, String>;
+}
+
+/// The result of an overlay enrollment admission ([`OverlayEnroll::admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayEnrollOutcome {
+    /// Admitted — the enrollee's key is now trusted in the relay's live set and the `jti` is spent.
+    Admitted,
+    /// The invitation's `jti` was already spent (single-use) → `409`.
+    TokenSpent,
+    /// The possession proof was missing/stale/invalid, or did not match the presented key → `403`.
+    ProofInvalid,
+    /// The presented key is barred (revoked) from (re-)enrollment → `403`.
+    Revoked,
+}
+
+/// The overlay-enrollment admit hook, carried as an extension for the enroll handler.
+/// `None` ⇒ this node runs no overlay relay accepting enrollments, so `POST /api/overlay/enroll`
+/// returns `501`.
+#[derive(Clone, Default)]
+struct OverlayEnrollHandle(Option<Arc<dyn OverlayEnroll>>);
 
 /// The OIDC verifier for the exchange endpoint, carried as an extension.
 #[cfg(feature = "oidc")]

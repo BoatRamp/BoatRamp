@@ -302,6 +302,34 @@ impl Auth {
         }
     }
 
+    /// Verify an **overlay-enroll invitation** against the primary root, then — on failure — the
+    /// replicated rotation anchor set, returning the verified single-use `jti`, role and scope. The
+    /// exact anchor-set shape of [`verify_join_token`](Self::verify_join_token): an overlay enrollment
+    /// can be minted under a distinct admission key trusted alongside the admin-token root, without a
+    /// separate signer config. The caller MUST still verify the enrollee's possession proof and spend
+    /// the `jti` single-use at admission. `Err` when auth is disabled or the invitation verifies under
+    /// no trusted anchor.
+    pub async fn verify_overlay_enroll_token(
+        &self,
+        token: &str,
+        now: u64,
+    ) -> Result<cose::VerifiedOverlayEnroll, TokenError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(TokenError::Invalid("auth disabled".into()));
+        };
+        match cose::verify_overlay_enroll(token, &inner.public, now) {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                for anchor in inner.rotation_anchors().await {
+                    if let Ok(v) = cose::verify_overlay_enroll(token, &anchor, now) {
+                        return Ok(v);
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
     /// Like [`verify_bearer`](Self::verify_bearer), but returns the token's
     /// granted roles on success. `whoami` uses this so it reports an identity
     /// only for a token that is authentic, **unexpired, and unrevoked** — not for
@@ -887,6 +915,58 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// `verify_overlay_enroll_token` accepts a valid invitation under the trust anchor (returning the
+    /// role + scope), and rejects an expired one, a wrong-kind token (a join token — domain
+    /// separation), and a foreign-signer invitation (not under the anchor). Mirrors
+    /// `verify_join_token`'s anchor wiring for the enrollment path.
+    #[tokio::test]
+    async fn verify_overlay_enroll_token_accepts_valid_rejects_expired_wrong_kind_and_forged() {
+        use boatramp_core::cose::{OverlayMemberRole, mint_join, mint_overlay_enroll};
+        const NOW: u64 = 1_000_000;
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let auth = auth_with(&root, false);
+
+        // A valid invitation verifies and returns the role + scope it carries.
+        let token = mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = auth
+            .verify_overlay_enroll_token(&token, NOW + 10)
+            .await
+            .expect("a valid invitation verifies under the anchor");
+        assert_eq!(v.role, OverlayMemberRole::Device);
+        assert_eq!(v.scope, "svc/db");
+
+        // Expired → rejected (the invitation MUST be time-bounded; control: the `exp` check).
+        assert!(
+            auth.verify_overlay_enroll_token(&token, NOW + 10_000)
+                .await
+                .is_err(),
+            "an expired invitation must be rejected"
+        );
+
+        // A join token presented here → rejected (wrong kind; control: the `br_kind` check).
+        let join = mint_join(300, NOW, &root).await.unwrap();
+        assert!(
+            auth.verify_overlay_enroll_token(&join, NOW + 10)
+                .await
+                .is_err(),
+            "a wrong-kind token must not verify as an overlay-enroll invitation"
+        );
+
+        // A foreign signer's invitation → rejected (not under the trusted anchor).
+        let stranger = LocalSigner::generate(TokenAlg::Ed25519);
+        let forged = mint_overlay_enroll(OverlayMemberRole::Node, "svc/db", 300, NOW, &stranger)
+            .await
+            .unwrap();
+        assert!(
+            auth.verify_overlay_enroll_token(&forged, NOW + 10)
+                .await
+                .is_err(),
+            "an invitation signed by an untrusted key must be rejected"
+        );
     }
 
     /// Make-before-break root rotation: a token signed by a **new** root verifies

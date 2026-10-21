@@ -18,7 +18,10 @@
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 
-use boatramp_core::cose::{TokenPublicKey, mint_overlay_dial, mint_overlay_publish};
+use boatramp_core::cose::{
+    OverlayMemberRole, TokenPublicKey, join_challenge, mint_overlay_dial, mint_overlay_enroll,
+    mint_overlay_publish, verify_overlay_enroll,
+};
 use boatramp_overlay::{OverlayId, OverlaySecret};
 
 use crate::output::Rendered;
@@ -40,6 +43,10 @@ pub enum Error {
 const TICKET_MAGIC: &str = "brfwd1";
 /// Magic prefix for an **expose ticket** (the reverse-ingress analog of the forward ticket).
 const EXPOSE_TICKET_MAGIC: &str = "brexp1";
+/// Magic prefix for an **enrollment ticket** — the `HRP_JOIN` (`"brojoin"`, reserved in
+/// `boatramp-overlay-proto`'s `wire.rs`) + the bech32-style `1`, so a rendered invitation reads
+/// `brojoin1.…` (the overlay-enrollment analog of the cluster `JoinTicket`).
+const ENROLL_TICKET_MAGIC: &str = "brojoin1";
 
 /// `boatramp overlay …` — admin tooling for the overlay forward-flow feature.
 #[derive(Args, Debug)]
@@ -108,6 +115,47 @@ enum OverlayCommand {
         /// Path to the config holding the root signer (`[serve.signer]` / `auth_root_private_key`).
         #[arg(long, default_value = "boatramp.cfg")]
         config: std::path::PathBuf,
+    },
+    /// Mint a single-use overlay-ENROLL invitation for a role + scope and emit a one-flag
+    /// `brojoin1.…` enrollment ticket for `boatramp overlay join`.
+    ///
+    /// Offline: signs with the cluster root key resolved from the config (or
+    /// `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`), the same signer `token mint`/`grant` use. The authority is
+    /// possession of the cluster root private key — the trust root the relay verifies the invitation
+    /// against on redemption. The ticket carries the root's PUBLIC key so the enrollee can verify the
+    /// invitation + extract the single-use handle it must prove possession against. The invitation is
+    /// a confidential BEARER secret (whoever holds it, plus their own overlay key, can enroll until it
+    /// is spent): deliver it over a private channel; its blast radius is bounded by `exp` + single-use.
+    Invite {
+        /// The role the invitation grants once redeemed.
+        #[arg(long, value_parser = ["node", "device", "workload"])]
+        role: String,
+        /// The service scope the enrollee may dial/expose once enrolled (e.g. `svc/db`, or `*`).
+        #[arg(long)]
+        scope: String,
+        /// Invitation lifetime in seconds (an enrollment invitation MUST be time-bounded).
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u64,
+        /// The relay's overlay identity to pin once enrolled (`ed25519:<hex>`/`bro1…`); advisory,
+        /// carried in the ticket for the enrollee's reference.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Path to the config holding the root signer (`[serve.signer]` / `auth_root_private_key`).
+        #[arg(long, default_value = "boatramp.cfg")]
+        config: std::path::PathBuf,
+    },
+    /// Redeem an overlay-enroll invitation: prove possession of this node's overlay identity and be
+    /// admitted into the relay's live trust set, adopting the returned membership credential.
+    Join {
+        /// The `brojoin1.…` enrollment ticket from `boatramp overlay invite`.
+        token: String,
+        /// The overlay identity to enroll: a tagged seed (`ed25519:<hex>`) or a path to a key file.
+        /// Omit to load-or-generate this operator's persistent identity (as `overlay id` does).
+        #[arg(long)]
+        identity: Option<String>,
+        /// boatramp server base URL to redeem against (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
     },
     /// Print this operator's overlay identity (load-or-generate at `~/.config/boatramp/overlay.key`).
     /// This is the identity self-serve `boatramp forward svc/<name>` binds its dial capability to.
@@ -251,6 +299,64 @@ impl ExposeTicket {
     }
 }
 
+/// A copy-pasteable **enrollment ticket**: everything `boatramp overlay join` needs to redeem an
+/// overlay-enroll invitation, bundled into one magic-prefixed base64url(JSON) blob (the
+/// overlay-enrollment analog of [`ForwardTicket`]). It carries the cluster `trust_root` public key so
+/// the enrollee can verify the invitation and extract the single-use handle (`jti`) its possession
+/// proof must bind to — without needing the root key out of band. The invitation `token` it carries
+/// is a **confidential bearer secret** (it grants enrollment until spent); the relay still verifies it
+/// against its own trust root + requires a matching possession proof on use, so a forged ticket buys
+/// nothing, but a *leaked unspent* ticket is a bearer risk bounded by `exp` + single-use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnrollTicket {
+    /// The overlay-enroll invitation (COSE) to redeem.
+    pub token: String,
+    /// The cluster trust root's PUBLIC key (`ed25519:`/`es256:` tagged hex) — the enrollee verifies
+    /// the invitation against this to extract the `jti` its possession proof binds to.
+    pub trust_root: String,
+    /// The role the invitation grants (display/reference; authoritative value is inside the token).
+    pub role: String,
+    /// The scope the invitation grants (display/reference; authoritative value is inside the token).
+    pub scope: String,
+    /// The relay's overlay identity to pin once enrolled (advisory; display/reference). Absent when
+    /// the inviter did not supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+impl EnrollTicket {
+    /// Encode to `brojoin1.<base64url(json)>`.
+    pub fn encode(&self) -> Result<String> {
+        let json = serde_json::to_vec(self).map_err(|e| Error::Overlay(e.to_string()))?;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        Ok(format!("{ENROLL_TICKET_MAGIC}.{b64}"))
+    }
+
+    /// Decode a `brojoin1.…` ticket, rejecting a bad prefix or empty required fields.
+    pub fn decode(blob: &str) -> Result<Self> {
+        let b64 = blob
+            .trim()
+            .strip_prefix(ENROLL_TICKET_MAGIC)
+            .and_then(|r| r.strip_prefix('.'))
+            .ok_or_else(|| {
+                Error::Overlay(format!(
+                    "not an enrollment ticket (expected `{ENROLL_TICKET_MAGIC}.…`)"
+                ))
+            })?;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|e| Error::Overlay(format!("malformed enrollment ticket: {e}")))?;
+        let t: Self = serde_json::from_slice(&json)
+            .map_err(|e| Error::Overlay(format!("malformed enrollment ticket: {e}")))?;
+        if t.token.is_empty() || t.trust_root.is_empty() || t.scope.is_empty() {
+            return Err(Error::Overlay(
+                "enrollment ticket is missing a required field".into(),
+            ));
+        }
+        Ok(t)
+    }
+}
+
 /// The result of an `overlay` command (emitted via [`crate::output`]).
 #[derive(serde::Serialize)]
 pub enum OverlayOutput {
@@ -275,6 +381,30 @@ pub enum OverlayOutput {
         enroll: String,
         /// Whether the ticket carries the exposer's secret seed (convenience mode).
         secret_ticket: bool,
+    },
+    /// `overlay invite` — the enrollment ticket plus the raw invitation + redeem hint.
+    Invited {
+        /// The `brojoin1.…` enrollment ticket for the enrollee to redeem with `overlay join`.
+        ticket: String,
+        /// The raw overlay-enroll invitation (COSE) — the confidential bearer secret inside the ticket.
+        token: String,
+        /// The role the invitation grants.
+        role: String,
+        /// The scope the invitation grants.
+        scope: String,
+        /// The invitation's expiry (Unix seconds).
+        expires_at: u64,
+    },
+    /// `overlay join` — the adopted membership credential after a successful enrollment.
+    Enrolled {
+        /// The root-signed `overlay-member` credential the enrollee adopts.
+        member: String,
+        /// The role the membership grants.
+        role: String,
+        /// The scope the membership grants.
+        scope: String,
+        /// The credential's expiry (Unix seconds).
+        expires_at: u64,
     },
     /// `overlay id` — this operator's overlay identity.
     Identity {
@@ -304,6 +434,38 @@ pub struct ServiceEntry {
 impl Rendered for OverlayOutput {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         match self {
+            Self::Invited {
+                ticket,
+                token: _,
+                role,
+                scope,
+                expires_at,
+            } => {
+                writeln!(w, "{ticket}")?;
+                writeln!(w)?;
+                writeln!(
+                    w,
+                    "# This enrollment ticket embeds a single-use invitation — treat it as a secret \
+                     (a leaked unspent ticket grants enrollment until it expires or is spent)."
+                )?;
+                writeln!(w, "#   role:  {role}")?;
+                writeln!(w, "#   scope: {scope}")?;
+                writeln!(w, "#   expires at (unix): {expires_at}")?;
+                writeln!(
+                    w,
+                    "# Redeem on the enrollee:   boatramp overlay join <ticket> --server <url>"
+                )
+            }
+            Self::Enrolled {
+                member,
+                role,
+                scope,
+                expires_at,
+            } => {
+                writeln!(w, "enrolled for scope {scope} (role {role})")?;
+                writeln!(w, "# member credential expires at (unix): {expires_at}")?;
+                writeln!(w, "{member}")
+            }
             Self::Identity { id, bech32 } => {
                 writeln!(w, "{id}")?;
                 writeln!(w, "{bech32}")
@@ -432,6 +594,81 @@ pub async fn run(
                          see available services"
                     ))
                 })
+        }
+        OverlayCommand::Invite {
+            role,
+            scope,
+            ttl_secs,
+            relay,
+            config,
+        } => {
+            let Some(role_enum) = OverlayMemberRole::parse(&role) else {
+                return Err(Error::Overlay(format!(
+                    "role `{role}` must be node|device|workload"
+                )));
+            };
+            if let Some(r) = &relay {
+                let _ = parse_id(r)?; // validate the pinned relay id up front (fail before signing)
+            }
+            let (token, trust_root, expires_at) =
+                mint_enroll(role_enum, &scope, ttl_secs, &config).await?;
+            let ticket = EnrollTicket {
+                token: token.clone(),
+                trust_root,
+                role: role.clone(),
+                scope: scope.clone(),
+                relay,
+            }
+            .encode()?;
+            Ok(OverlayOutput::Invited {
+                ticket,
+                token,
+                role,
+                scope,
+                expires_at,
+            })
+        }
+        OverlayCommand::Join {
+            token,
+            identity,
+            server,
+        } => {
+            let ticket = EnrollTicket::decode(&token)?;
+            let trust_root = TokenPublicKey::from_hex(&ticket.trust_root)
+                .map_err(|e| Error::Overlay(format!("enrollment ticket trust_root: {e}")))?;
+            let now = now_secs();
+            // Verify the invitation against the trust root to extract the single-use `jti` the
+            // possession proof must bind to (the relay re-verifies it on redemption).
+            let verified = verify_overlay_enroll(&ticket.token, &trust_root, now).map_err(|e| {
+                Error::Overlay(format!("enrollment invitation did not verify: {e}"))
+            })?;
+            // This node's overlay identity: the key being enrolled. Its private half never leaves —
+            // only a possession proof over the challenge does.
+            let secret = load_identity(identity.as_deref())?;
+            let overlay_pubkey = secret.id().to_hex();
+            let rpk = secret
+                .rpk_identity()
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let proof_iat = now;
+            let challenge = join_challenge(&verified.jti, &overlay_pubkey, proof_iat);
+            let proof = rpk
+                .sign(&challenge)
+                .map_err(|e| Error::Overlay(format!("building possession proof: {e}")))?;
+            let body = redeem_enroll(
+                server,
+                config,
+                &ticket.token,
+                &overlay_pubkey,
+                &hex::encode(proof),
+                proof_iat,
+            )
+            .await?;
+            Ok(OverlayOutput::Enrolled {
+                member: body.member,
+                role: body.role,
+                scope: body.scope,
+                expires_at: body.expires_at,
+            })
         }
         OverlayCommand::Grant {
             service,
@@ -579,6 +816,113 @@ async fn mint_publish(
         .await
         .map_err(|e| Error::Overlay(format!("minting publish capability: {e}")))?;
     Ok((token, trust_root))
+}
+
+/// Unix seconds now (the `mint`/`forward` time source), `0` before the epoch.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mint a single-use `overlay-enroll` invitation for `role` + `scope`, signed offline by the root
+/// signer resolved from `config` (the same cluster root key as `token`/`grant`). Returns the
+/// invitation, the signer's PUBLIC key (the trust root the enrollee verifies it against), and its
+/// expiry.
+async fn mint_enroll(
+    role: OverlayMemberRole,
+    scope: &str,
+    ttl_secs: u64,
+    config: &std::path::Path,
+) -> Result<(String, String, u64)> {
+    let signer = crate::token::resolve_signer(config)
+        .await
+        .map_err(|e| Error::Signer(e.to_string()))?;
+    let trust_root = signer.public_key().to_hex();
+    let now = now_secs();
+    let token = mint_overlay_enroll(role, scope, ttl_secs, now, &*signer)
+        .await
+        .map_err(|e| Error::Overlay(format!("minting enrollment invitation: {e}")))?;
+    Ok((token, trust_root, now.saturating_add(ttl_secs)))
+}
+
+/// Load the overlay identity to enroll: a tagged seed (`ed25519:<hex>`) or a path to a key file,
+/// else (none) this operator's persistent load-or-generate identity (as `overlay id` uses).
+fn load_identity(spec: Option<&str>) -> Result<OverlaySecret> {
+    match spec {
+        None => operator_identity(),
+        Some(s) => {
+            let s = s.trim();
+            // A tagged seed given directly?
+            if let Ok(secret) = OverlaySecret::from_seed_hex(s) {
+                return Ok(secret);
+            }
+            // Else a path to a key file (one seed line, like the operator key file).
+            let seed =
+                std::fs::read_to_string(s).map_err(|e| Error::Overlay(format!("{s}: {e}")))?;
+            OverlaySecret::from_seed_hex(seed.trim())
+                .map_err(|e| Error::Overlay(format!("{s}: {e}")))
+        }
+    }
+}
+
+/// `POST /api/overlay/enroll` request/response (CLI mirror of the server types).
+#[derive(serde::Serialize)]
+struct EnrollRequestBody {
+    token: String,
+    overlay_pubkey: String,
+    possession_proof: String,
+    proof_iat: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct EnrollResponseBody {
+    member: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    expires_at: u64,
+}
+
+/// Redeem an overlay-enroll invitation at the control plane's `POST /api/overlay/enroll`, presenting
+/// the invitation itself as the bearer (the route is token-gated — no RBAC right — and the handler
+/// verifies the invitation, exactly as the cluster joiner presents its join token). The server pin
+/// (`BOATRAMP_SERVER_PUBKEY`) still applies.
+async fn redeem_enroll(
+    server: Option<String>,
+    config: &crate::config::ProjectConfig,
+    token: &str,
+    overlay_pubkey: &str,
+    possession_proof: &str,
+    proof_iat: u64,
+) -> Result<EnrollResponseBody> {
+    let server =
+        crate::client::resolve_server(server, config).map_err(|e| Error::Overlay(e.to_string()))?;
+    let http = crate::client::http_client(Some(token));
+    let resp = http
+        .post(format!("{server}/api/overlay/enroll"))
+        .json(&EnrollRequestBody {
+            token: token.to_string(),
+            overlay_pubkey: overlay_pubkey.to_string(),
+            possession_proof: possession_proof.to_string(),
+            proof_iat,
+        })
+        .send()
+        .await
+        .map_err(|e| Error::Overlay(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Overlay(format!(
+            "enroll refused ({}): {}",
+            status.as_u16(),
+            body.trim()
+        )));
+    }
+    resp.json().await.map_err(|e| Error::Overlay(e.to_string()))
 }
 
 /// The operator's overlay identity key path: `$XDG_CONFIG_HOME/boatramp/overlay.key`, else
@@ -773,5 +1117,47 @@ mod tests {
         // Missing the required trust_root is refused.
         let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"relay\":\"a:1\",\"relay_id\":\"x\",\"service\":\"s\",\"token\":\"t\",\"trust_root\":\"\"}");
         assert!(ExposeTicket::decode(&format!("brexp1.{bad}")).is_err());
+    }
+
+    #[test]
+    fn enroll_ticket_round_trips() {
+        let t = EnrollTicket {
+            token: "ENROLLCOSE".into(),
+            trust_root: "ed25519:root".into(),
+            role: "device".into(),
+            scope: "svc/db".into(),
+            relay: Some("ed25519:relay".into()),
+        };
+        let blob = t.encode().unwrap();
+        assert!(blob.starts_with("brojoin1."));
+        let back = EnrollTicket::decode(&blob).unwrap();
+        assert_eq!(back.token, "ENROLLCOSE");
+        assert_eq!(back.trust_root, "ed25519:root");
+        assert_eq!(back.role, "device");
+        assert_eq!(back.scope, "svc/db");
+        assert_eq!(back.relay.as_deref(), Some("ed25519:relay"));
+    }
+
+    #[test]
+    fn enroll_ticket_rejects_garbage_and_other_tickets() {
+        assert!(EnrollTicket::decode("not-a-ticket").is_err());
+        assert!(EnrollTicket::decode("brojoin1.@@@@").is_err());
+        // A forward ticket is not an enrollment ticket (distinct magic).
+        let fwd = ForwardTicket {
+            relay: "1.2.3.4:5".into(),
+            relay_id: "ed25519:aa".into(),
+            egress_id: "ed25519:bb".into(),
+            service: "svc/db".into(),
+            token: "t".into(),
+            identity: None,
+        }
+        .encode()
+        .unwrap();
+        assert!(EnrollTicket::decode(&fwd).is_err());
+        // Missing the required trust_root is refused.
+        let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            b"{\"token\":\"t\",\"trust_root\":\"\",\"role\":\"device\",\"scope\":\"svc/db\"}",
+        );
+        assert!(EnrollTicket::decode(&format!("brojoin1.{bad}")).is_err());
     }
 }

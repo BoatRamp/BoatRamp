@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use boatramp_overlay_proto::{OverlayPeerPolicy, OverlaySecret, wire};
-use boatramp_rpktls::RpkTls;
+use boatramp_rpktls::{RpkTls, TrustSet};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 
@@ -133,6 +133,33 @@ pub fn server_endpoint(
 ) -> Result<Endpoint, QuicError> {
     let sc = accept_server_config(secret, policy)?;
     Ok(Endpoint::server(sc, bind)?)
+}
+
+/// Like [`server_endpoint`], but also returns the **live** [`TrustSet`] the acceptor's
+/// client-cert verifier reads at handshake time — so the control plane can RETAIN a handle
+/// and admit a newly-enrolled key into it at runtime (overlay enrollment). The returned set
+/// and the endpoint's verifier share the same inner `Arc`, so a later [`TrustSet::insert`] is
+/// honored live on the next handshake with **no** endpoint rebuild. For an `Allowlist`
+/// (mutual-pin) relay the set IS the TLS-layer gate; for the permissive `AcceptAny`
+/// (capability-only) relay it is the empty server-auth-only set — admitting a key records the
+/// overlay's live membership in it while the capability gate stays the data-plane authorization.
+pub fn server_endpoint_with_trust(
+    secret: &OverlaySecret,
+    policy: &OverlayPeerPolicy,
+    bind: SocketAddr,
+) -> Result<(Endpoint, TrustSet), QuicError> {
+    let identity = Arc::new(secret.rpk_identity()?);
+    let tls = RpkTls::new(identity, policy.trust_set());
+    let rustls_sc = if policy.is_accept_any() {
+        tls.server_auth()?
+    } else {
+        tls.server()?
+    };
+    let sc = quic_server_config(rustls_sc)?;
+    // Clone shares the inner Arc<RwLock<…>> with the verifier `tls.server()`/`server_auth()`
+    // just baked in, so a runtime `insert` is seen live by that acceptor.
+    let trust = tls.trust().clone();
+    Ok((Endpoint::server(sc, bind)?, trust))
 }
 
 /// An endpoint that both accepts (under `accept_policy`) and dials (pinning the
@@ -327,6 +354,60 @@ mod tests {
             "untrusted client completed a round-trip but must be rejected"
         );
 
+        let _ = srv.await;
+    }
+
+    /// The trust set RETAINED from [`server_endpoint_with_trust`] is LIVE: a mutual-pin relay
+    /// that did not initially trust a client admits it at runtime via [`TrustSet::insert`], and a
+    /// subsequent handshake as that key is then accepted with no endpoint rebuild — the overlay
+    /// enrollment admit seam. The control plane holds exactly this handle.
+    #[tokio::test]
+    async fn retained_trust_set_admits_a_key_live() {
+        let server_secret = OverlaySecret::generate().unwrap();
+        let seeded = OverlaySecret::generate().unwrap().id(); // some other allowlisted peer
+        let client_secret = OverlaySecret::generate().unwrap();
+        let client_id = client_secret.id();
+        let server_id = server_secret.id();
+
+        // The relay trusts only `seeded` at bring-up — NOT the enrolling client.
+        let (server, trust) = server_endpoint_with_trust(
+            &server_secret,
+            &Allowlist(BTreeSet::from([seeded])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        assert!(
+            trust.peer_for_key(&client_id.to_spki()).is_none(),
+            "the client must not be trusted before enrollment"
+        );
+
+        // ADMIT the client's key into the live set (what the enroll handler does).
+        trust.insert(99u64, client_id.to_spki());
+        assert!(
+            trust.peer_for_key(&client_id.to_spki()).is_some(),
+            "the admitted key must be in the relay's live trust set"
+        );
+
+        let srv = tokio::spawn(async move {
+            let conn = accept(&server).await.unwrap().unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let got = recv.read_to_end(64).await.unwrap();
+            send.write_all(&got).await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+
+        // A fresh handshake as the just-admitted key is accepted (mutual auth over the live set).
+        let client = client_endpoint(&client_secret, &Pin(server_id)).unwrap();
+        let conn = dial(&client, server_addr).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"enrolled").await.unwrap();
+        send.finish().unwrap();
+        let echo = recv.read_to_end(64).await.unwrap();
+        assert_eq!(&echo, b"enrolled");
+
+        conn.close(0u32.into(), b"done");
         let _ = srv.await;
     }
 }

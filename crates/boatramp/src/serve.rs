@@ -776,28 +776,304 @@ impl boatramp_server::LiveExposers for OverlayExposerDirectory {
     }
 }
 
+/// Freshness window (seconds) for an overlay enrollment possession proof — bounds how long a
+/// captured (pre-spend) proof stays presentable. Matches the cluster join path's skew.
+#[cfg(feature = "overlay")]
+const OVERLAY_ENROLL_PROOF_MAX_SKEW_SECS: u64 = 300;
+
+/// The in-memory per-node enrollment ledger, guarded as ONE critical section so the admit
+/// (bar-revoked → refuse-spent → spend + trust) is atomic against concurrent redemptions of the same
+/// invitation — mirroring the cluster's single-apply `WriteOp::MeshAdmit` check-and-set.
+#[cfg(feature = "overlay")]
+#[derive(Default)]
+struct EnrollLedger {
+    /// Spent invitation `jti`s (single-use): a replayed/already-redeemed `jti` is refused (409).
+    spent: std::collections::HashSet<String>,
+    /// Overlay keys (SPKI DER) barred from (re-)enrollment (the cluster's F6 revoke-bar analog).
+    /// Empty in this increment — nothing populates it yet (revoking an enrolled key is a later
+    /// increment); the bar is wired + checked so the Security reviewer sees the check-point and a
+    /// future revoke only has to add to this set.
+    revoked: std::collections::HashSet<Vec<u8>>,
+    /// Next `PeerId` to register an admitted key under in the relay trust set — seeded ABOVE the
+    /// static allowlist's indices, so an enrolled key is its own peer rather than extending another's.
+    next_peer: boatramp_rpktls::PeerId,
+}
+
+/// Admit an enrolled overlay key into THIS node's live relay trust set, with a single-use invitation
+/// ledger — the server side of `boatramp overlay join` (implements [`boatramp_server::OverlayEnroll`]).
+/// Holds the SAME [`boatramp_rpktls::TrustSet`] handle the relay acceptor's verifier reads (retained
+/// from [`boatramp_overlay::server_endpoint_with_trust`]), so an admit is honored live on the next
+/// handshake with no endpoint rebuild — co-located control-plane + relay, like the expose
+/// `ExposerRegistry` sharing.
+///
+/// IN-MEMORY by design (this increment is single-node): the spent-`jti` ledger AND the admitted keys
+/// are LOST on restart. A KV/Raft-backed durable single-use + trust snapshot — the cluster path's
+/// `WriteOp::MeshAdmit` — is the next increment.
+#[cfg(feature = "overlay")]
+struct OverlayEnrollState {
+    trust: boatramp_rpktls::TrustSet,
+    ledger: tokio::sync::Mutex<EnrollLedger>,
+}
+
+#[cfg(feature = "overlay")]
+impl OverlayEnrollState {
+    fn new(trust: boatramp_rpktls::TrustSet) -> Self {
+        // Seed the PeerId allocator above any static allowlist entry so an admitted key never
+        // collides with (extends) an existing peer's key set.
+        let next_peer = trust.snapshot().keys().copied().max().map_or(0, |m| m + 1);
+        Self {
+            trust,
+            ledger: tokio::sync::Mutex::new(EnrollLedger {
+                next_peer,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "overlay")]
+#[async_trait::async_trait]
+impl boatramp_server::OverlayEnroll for OverlayEnrollState {
+    async fn admit(
+        &self,
+        overlay_pubkey_hex: &str,
+        jti: &str,
+        possession_proof: &[u8],
+        proof_iat: u64,
+        now: u64,
+    ) -> std::result::Result<boatramp_server::OverlayEnrollOutcome, String> {
+        use boatramp_server::OverlayEnrollOutcome as O;
+
+        // (1) Freshness: the proof must be stamped within the skew window — bounds how long a
+        // captured (pre-spend) proof stays presentable.
+        let fresh = proof_iat <= now.saturating_add(OVERLAY_ENROLL_PROOF_MAX_SKEW_SECS)
+            && now <= proof_iat.saturating_add(OVERLAY_ENROLL_PROOF_MAX_SKEW_SECS);
+        if !fresh {
+            return Ok(O::ProofInvalid);
+        }
+
+        // (2) The enrollee is identified by the key it claims; parse it to an SPKI.
+        let Ok(id) = boatramp_overlay::OverlayId::from_hex(overlay_pubkey_hex) else {
+            return Ok(O::ProofInvalid);
+        };
+        let spki = id.to_spki();
+
+        // (3) Possession: the proof must be a signature BY that very key over the domain-separated
+        // challenge naming this `jti` — so a bearer invitation alone (without the private key) cannot
+        // enroll in another key's name, and an invitation presented with a proof for a DIFFERENT key
+        // (a stolen invitation) is rejected here (the proof won't match the presented key).
+        let challenge = boatramp_core::cose::join_challenge(jti, overlay_pubkey_hex, proof_iat);
+        if !boatramp_rpktls::verify_signature(&spki, &challenge, possession_proof) {
+            return Ok(O::ProofInvalid);
+        }
+
+        // (4) Atomic admit (ONE critical section, mirroring the cluster apply's single-use CAS):
+        //     bar a revoked key — WITHOUT spending the `jti`, so it stays redeemable after an
+        //     un-revoke (F6) — then refuse an already-spent `jti`, else spend the `jti` and trust the
+        //     key in the relay's LIVE set.
+        let mut led = self.ledger.lock().await;
+        if led.revoked.contains(&spki) {
+            return Ok(O::Revoked);
+        }
+        if led.spent.contains(jti) {
+            return Ok(O::TokenSpent);
+        }
+        led.spent.insert(jti.to_string());
+        let peer = led.next_peer;
+        led.next_peer = led.next_peer.saturating_add(1);
+        self.trust.insert(peer, spki);
+        Ok(O::Admitted)
+    }
+}
+
+#[cfg(all(test, feature = "overlay"))]
+mod overlay_enroll_tests {
+    use super::*;
+    use boatramp_core::cose::{
+        LocalSigner, OverlayMemberRole, Signer, TokenAlg, join_challenge, mint_overlay_enroll,
+        mint_overlay_member, verify_overlay_enroll, verify_overlay_member,
+    };
+    use boatramp_overlay::{OverlayPeerPolicy, OverlaySecret};
+    use boatramp_server::{OverlayEnroll, OverlayEnrollOutcome};
+    use std::collections::BTreeSet;
+
+    const NOW: u64 = 1_000_000;
+
+    /// An enroll state over a MUTUAL-PIN relay trust set seeded with one other allowlisted id (so the
+    /// retained set starts non-empty, exercising the real `server_endpoint_with_trust` wiring), plus a
+    /// handle to that same live set.
+    fn state_with_seed() -> (OverlayEnrollState, boatramp_rpktls::TrustSet) {
+        let relay_secret = OverlaySecret::generate().unwrap();
+        let seeded = OverlaySecret::generate().unwrap().id();
+        let (_ep, trust) = boatramp_overlay::server_endpoint_with_trust(
+            &relay_secret,
+            &OverlayPeerPolicy::Allowlist(BTreeSet::from([seeded])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        (OverlayEnrollState::new(trust.clone()), trust)
+    }
+
+    /// A valid possession proof: `secret` signs `join_challenge(jti, its_pubkey, iat)`.
+    fn proof_for(secret: &OverlaySecret, jti: &str, iat: u64) -> (String, Vec<u8>) {
+        let pubkey = secret.id().to_hex();
+        let challenge = join_challenge(jti, &pubkey, iat);
+        let sig = secret.rpk_identity().unwrap().sign(&challenge).unwrap();
+        (pubkey, sig)
+    }
+
+    /// invite → join → admit: a fresh key with a valid invitation enrolls, the `jti` is spent, a
+    /// member assertion verifies, and the key is thereafter in the relay's live trust set.
+    #[tokio::test]
+    async fn invite_join_admits_spends_and_trusts() {
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let (state, trust) = state_with_seed();
+
+        // invite: the overlay-enroll invitation `overlay invite` / POST /api/overlay/invite produce.
+        let token = mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_enroll(&token, &root.public_key(), NOW).unwrap();
+
+        // join: a fresh key proves possession and is admitted.
+        let enrollee = OverlaySecret::generate().unwrap();
+        let (pubkey, sig) = proof_for(&enrollee, &v.jti, NOW);
+        assert!(
+            trust.peer_for_key(&enrollee.id().to_spki()).is_none(),
+            "the enrollee must not be trusted before admit"
+        );
+        let out = state.admit(&pubkey, &v.jti, &sig, NOW, NOW).await.unwrap();
+        assert_eq!(out, OverlayEnrollOutcome::Admitted);
+
+        // the key is thereafter in the relay's LIVE trust set (a subsequent handshake would accept it
+        // — see `quic::retained_trust_set_admits_a_key_live` for the end-to-end handshake).
+        assert!(
+            trust.peer_for_key(&enrollee.id().to_spki()).is_some(),
+            "the admitted key must be in the relay's live trust set"
+        );
+
+        // a root-signed member assertion is mintable + verifies (what the handler returns).
+        let member = mint_overlay_member(
+            &enrollee.id().to_public(),
+            v.role,
+            &v.scope,
+            3600,
+            NOW,
+            &root,
+        )
+        .await
+        .unwrap();
+        let vm = verify_overlay_member(&member, &root.public_key(), NOW).unwrap();
+        assert_eq!(vm.member_key, enrollee.id().to_hex());
+        assert_eq!(vm.scope, "svc/db");
+        assert_eq!(vm.role, OverlayMemberRole::Device);
+
+        // the `jti` is SPENT: a replay with the SAME jti (even a fresh valid proof) is refused.
+        let (pk2, sig2) = proof_for(&enrollee, &v.jti, NOW);
+        let replay = state.admit(&pk2, &v.jti, &sig2, NOW, NOW).await.unwrap();
+        assert_eq!(
+            replay,
+            OverlayEnrollOutcome::TokenSpent,
+            "a spent jti must be refused (single-use)"
+        );
+    }
+
+    /// NEGATIVE (b): a stolen invitation presented with a possession proof for a DIFFERENT key is
+    /// rejected — an attacker can only enroll a key it holds, never a victim's. RED without the
+    /// possession-proof check (step 3): the admit would trust the victim's key.
+    #[tokio::test]
+    async fn stolen_token_with_proof_for_a_different_key_is_rejected() {
+        let (state, trust) = state_with_seed();
+        let jti = "jti-stolen";
+        let victim = OverlaySecret::generate().unwrap();
+        let attacker = OverlaySecret::generate().unwrap();
+        // The proof is signed by the ATTACKER but presents the VICTIM's key → mismatch.
+        let victim_pub = victim.id().to_hex();
+        let challenge = join_challenge(jti, &victim_pub, NOW);
+        let bad_sig = attacker.rpk_identity().unwrap().sign(&challenge).unwrap();
+        let out = state
+            .admit(&victim_pub, jti, &bad_sig, NOW, NOW)
+            .await
+            .unwrap();
+        assert_eq!(out, OverlayEnrollOutcome::ProofInvalid);
+        // Nothing was trusted and the jti was NOT spent (a proof failure never admits or spends).
+        assert!(trust.peer_for_key(&victim.id().to_spki()).is_none());
+    }
+
+    /// NEGATIVE (c-analog): a stale `proof_iat` outside the freshness window is rejected — bounds how
+    /// long a captured proof stays presentable. RED without the freshness check (step 1).
+    #[tokio::test]
+    async fn stale_proof_iat_is_rejected() {
+        let (state, _trust) = state_with_seed();
+        let jti = "jti-stale";
+        let enrollee = OverlaySecret::generate().unwrap();
+        let stale_iat = NOW - (OVERLAY_ENROLL_PROOF_MAX_SKEW_SECS + 1);
+        let (pubkey, sig) = proof_for(&enrollee, jti, stale_iat);
+        let out = state
+            .admit(&pubkey, jti, &sig, stale_iat, NOW)
+            .await
+            .unwrap();
+        assert_eq!(out, OverlayEnrollOutcome::ProofInvalid);
+    }
+
+    /// NEGATIVE (revoke-bar, F6 analog): a barred key is refused WITHOUT spending the jti, so once
+    /// un-revoked its invitation still redeems. RED without the revoked check (step 4a).
+    #[tokio::test]
+    async fn a_revoked_key_is_barred_without_spending_the_jti() {
+        let (state, _trust) = state_with_seed();
+        let jti = "jti-revoked";
+        let enrollee = OverlaySecret::generate().unwrap();
+        state
+            .ledger
+            .lock()
+            .await
+            .revoked
+            .insert(enrollee.id().to_spki());
+        let (pubkey, sig) = proof_for(&enrollee, jti, NOW);
+        let out = state.admit(&pubkey, jti, &sig, NOW, NOW).await.unwrap();
+        assert_eq!(out, OverlayEnrollOutcome::Revoked);
+        // The jti was NOT spent: once un-revoked, the same invitation still redeems.
+        state.ledger.lock().await.revoked.clear();
+        let (pk2, sig2) = proof_for(&enrollee, jti, NOW);
+        let out2 = state.admit(&pk2, jti, &sig2, NOW, NOW).await.unwrap();
+        assert_eq!(
+            out2,
+            OverlayEnrollOutcome::Admitted,
+            "a revoked-then-un-revoked key's invitation must still redeem (jti not spent while barred)"
+        );
+    }
+}
+
 /// Stand up this node's overlay forward-flow serve roles from `[overlay]` (the server side of
 /// `boatramp forward`): a relay/ingress (`relay_listen`) that capability-gates client dials and
 /// forwards them blind to the routed egress, and/or an egress/terminator (`egress_listen`) that
 /// fronts local backend services. Each runs as a background accept loop. A no-op when `[overlay]`
 /// is absent or declares neither listener.
+///
+/// Returns the control-plane [`OverlayDirectory`] AND, when this node runs a relay, the
+/// [`boatramp_server::OverlayEnroll`] admit hook holding the relay's LIVE trust set (so
+/// `POST /api/overlay/enroll` can trust an enrolled key into it).
 #[cfg(feature = "overlay")]
 async fn spawn_overlay_roles(
     config: &ServerConfig,
     serve_cfg: &crate::config::ServeConfig,
-) -> Result<boatramp_server::OverlayDirectory> {
+) -> Result<(
+    boatramp_server::OverlayDirectory,
+    Option<std::sync::Arc<dyn boatramp_server::OverlayEnroll>>,
+)> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
         ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
         run_egress_router, run_forwarding_router, run_ingress_router, server_endpoint,
+        server_endpoint_with_trust,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
     let Some(ov) = &config.overlay else {
-        return Ok(boatramp_server::OverlayDirectory::default());
+        return Ok((boatramp_server::OverlayDirectory::default(), None));
     };
     if ov.relay_listen.is_none() && ov.egress_listen.is_none() {
-        return Ok(boatramp_server::OverlayDirectory::default()); // declared no role
+        return Ok((boatramp_server::OverlayDirectory::default(), None)); // declared no role
     }
 
     let secret = load_overlay_identity(ov.identity.as_deref())?;
@@ -851,6 +1127,9 @@ async fn spawn_overlay_roles(
     // the self-serve forward/expose paths see currently-published services.
     let mut exposers: Option<std::sync::Arc<dyn boatramp_server::LiveExposers>> = None;
     let mut expose_relay: Option<boatramp_server::ExposeRelay> = None;
+    // The overlay-enrollment admit hook, set when a relay is stood up: it holds the relay's LIVE
+    // trust set so `POST /api/overlay/enroll` can trust an enrolled key into it.
+    let mut enroll: Option<std::sync::Arc<dyn boatramp_server::OverlayEnroll>> = None;
     if let Some(bind) = ov.relay_listen {
         let mut clients = BTreeSet::new();
         for c in &ov.allowed_clients {
@@ -935,8 +1214,13 @@ async fn spawn_overlay_roles(
                 },
             ));
         }
-        let ep = server_endpoint(&secret, &policy, bind)
+        // Build the relay accept endpoint AND retain its LIVE rpktls trust set (`relay_trust`), so the
+        // enroll handler can admit a key into the SAME set the acceptor verifies against — honored
+        // live on the next handshake with no endpoint rebuild. (Distinct from `trust_root`, the
+        // dial-capability verify ANCHOR the routers below enforce.)
+        let (ep, relay_trust) = server_endpoint_with_trust(&secret, &policy, bind)
             .map_err(|e| Error::ClusterStartup(format!("[overlay] relay listen {bind}: {e}")))?;
+        enroll = Some(std::sync::Arc::new(OverlayEnrollState::new(relay_trust)));
         let trust = trust_root.clone();
         let resolve = move |s: &str| routes.get(s).copied();
         // Reverse ingress (`boatramp expose`): when the relay opts into `accept_exposed`, run the
@@ -976,10 +1260,13 @@ async fn spawn_overlay_roles(
             tokio::spawn(run_forwarding_router(ep, trust, client_auth, resolve));
         }
     }
-    Ok(boatramp_server::OverlayDirectory::from_entries(directory)
-        .with_max_dial_ttl(ov.max_dial_ttl_secs)
-        .with_exposers(exposers)
-        .with_expose_relay(expose_relay))
+    Ok((
+        boatramp_server::OverlayDirectory::from_entries(directory)
+            .with_max_dial_ttl(ov.max_dial_ttl_secs)
+            .with_exposers(exposers)
+            .with_expose_relay(expose_relay),
+        enroll,
+    ))
 }
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
@@ -1030,7 +1317,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // paths; a no-op when `[overlay]` is absent or declares no listener.
     #[cfg(feature = "overlay")]
     {
-        options.overlay_directory = spawn_overlay_roles(config, &serve_cfg).await?;
+        let (directory, enroll) = spawn_overlay_roles(config, &serve_cfg).await?;
+        options.overlay_directory = directory;
+        options.overlay_enroll = enroll;
     }
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or

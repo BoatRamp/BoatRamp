@@ -208,6 +208,15 @@ impl Right {
             return None;
         }
 
+        // Overlay enrollment redemption: the enrollee presents a single-use *overlay-enroll
+        // invitation* (verified by the handler via `verify_overlay_enroll` + a possession proof),
+        // not an admin bearer — so this exact path is unauthenticated at the RBAC layer, exactly
+        // like `/api/cluster/join`. Note the `==`: the sibling `/api/overlay/invite` (minting) stays
+        // `Overlay·Admin` below.
+        if path == "/api/overlay/enroll" {
+            return None;
+        }
+
         // First-token bootstrap: the caller presents a single-use, operator-set
         // *bootstrap secret* (verified by the handler), not an admin bearer — so
         // this exact path is unauthenticated at the RBAC layer. Note the `==`: the
@@ -232,6 +241,16 @@ impl Right {
         // (`assert_overlay_expose_is_overlay_admin`) so a route-table refactor can't silently drop the
         // Admin gate down to Write.
         if path == "/api/overlay/expose" {
+            return Some(Self::new(Resource::Overlay, None, Action::Admin));
+        }
+        // Overlay enrollment INVITE (the online mint of a single-use `overlay-enroll` invitation,
+        // the analog of `/api/cluster/join-token`): minting an invitation admits a NEW identity into
+        // the overlay's live trust set once redeemed, so — like `expose`'s name claim — it is gated
+        // `Overlay·Admin`, the owner-grade tier strictly above dial's `Overlay·Write`. `Action::Admin`
+        // also satisfies the lower read/write (`Right::satisfies`), and the built-in `admin` role
+        // covers it via `Resource::ALL`. Re-derived defense-in-depth in-handler
+        // (`assert_overlay_invite_is_overlay_admin`) so a route-table refactor can't silently drop it.
+        if path == "/api/overlay/invite" {
             return Some(Self::new(Resource::Overlay, None, Action::Admin));
         }
         // Overlay forward-flow discovery. Minting a dial capability (the self-serve
@@ -3117,6 +3136,53 @@ mod tests {
             assert!(
                 !policy.rights_for(&[grant]).allows(&expose),
                 "a non-admin principal (role {role}) must be REFUSED overlay publish",
+            );
+        }
+    }
+
+    /// Overlay enrollment: minting an invitation (`/api/overlay/invite`) is `Overlay·Admin` (an
+    /// owner-grade act — redeeming it admits a new identity), and a dial-only (`Overlay·Write`)
+    /// principal must NOT reach it; redeeming (`/api/overlay/enroll`) is token-gated (no RBAC right,
+    /// `None`) exactly like `/api/cluster/join` — the handler verifies the invitation.
+    #[test]
+    fn overlay_invite_is_admin_and_enroll_is_token_gated() {
+        let invite = Right::required("POST", "/api/overlay/invite")
+            .expect("POST /api/overlay/invite must require a token (never public)");
+        assert_eq!(
+            invite,
+            Right::new(Resource::Overlay, None, Action::Admin),
+            "POST /api/overlay/invite must be gated Overlay·Admin",
+        );
+        // A dial-only grant must NOT be able to mint an enrollment invitation.
+        assert!(
+            !Right::new(Resource::Overlay, None, Action::Write).satisfies(&invite),
+            "Overlay·Write (dial) must NOT satisfy the Overlay·Admin invite gate",
+        );
+        assert!(Right::new(Resource::Overlay, None, Action::Admin).satisfies(&invite));
+
+        // Redemption is RBAC-unauthenticated (token-gated) — the exact `None` of `/api/cluster/join`.
+        assert_eq!(
+            Right::required("POST", "/api/overlay/enroll"),
+            None,
+            "POST /api/overlay/enroll must be token-gated (no RBAC right), like /api/cluster/join",
+        );
+
+        // Over the real default policy: only the `admin` role reaches invite (no tenant role does).
+        let policy = AuthzPolicy::default_policy();
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::global("admin")])
+                .allows(&invite),
+            "the admin role must reach Overlay·Admin via Resource::ALL",
+        );
+        for grant in [
+            GrantedRole::scoped("publisher", "default/site"),
+            GrantedRole::global("operator"),
+        ] {
+            let role = grant.name.clone();
+            assert!(
+                !policy.rights_for(&[grant]).allows(&invite),
+                "a non-admin principal (role {role}) must be REFUSED overlay invite",
             );
         }
     }

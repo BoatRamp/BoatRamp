@@ -833,6 +833,284 @@ pub(super) async fn overlay_expose(
     }
 }
 
+/// Default lifetime of a minted `overlay-enroll` invitation when the request omits one (1 hour) —
+/// an enrollment invitation MUST be time-bounded (like the cluster join token), and a short
+/// admission window bounds how long a leaked (unspent) invitation stays redeemable.
+const DEFAULT_OVERLAY_ENROLL_TTL_SECS: u64 = DEFAULT_JOIN_TOKEN_TTL_SECS;
+
+/// TTL on the root-signed `overlay-member` credential handed back on a successful enroll (24h): long
+/// enough for the enrollee to adopt it, bounded because a membership credential MUST be time-bounded
+/// (it is offline-verified with no revocation).
+const DEFAULT_OVERLAY_MEMBER_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Defense-in-depth (mirrors [`assert_overlay_expose_is_overlay_admin`]): re-derive that `POST
+/// /api/overlay/invite` is gated `Overlay·Admin` INSIDE the handler, so a router/table refactor that
+/// drops it (or weakens it to `Overlay·Write`, the dial tier) cannot silently let a non-admin mint an
+/// enrollment invitation — which admits a NEW identity into the overlay trust set once redeemed.
+fn assert_overlay_invite_is_overlay_admin() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/overlay/invite") {
+        Some(right)
+            if right.resource == Resource::Overlay
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay invite requires Overlay·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `POST /api/overlay/invite` request: mint a single-use `overlay-enroll` invitation for a role +
+/// scope (the online analog of `boatramp overlay invite`; the enrollment counterpart of
+/// `/api/cluster/join-token`).
+#[derive(Deserialize)]
+pub(super) struct OverlayInviteRequest {
+    /// The role the invitation grants once redeemed (`node` | `device` | `workload`).
+    pub(super) role: String,
+    /// The service scope the enrollee may dial/expose once enrolled (e.g. `svc/db`, or `*`).
+    pub(super) scope: String,
+    /// Optional TTL in seconds; omitted ⇒ [`DEFAULT_OVERLAY_ENROLL_TTL_SECS`], clamped to the
+    /// server cap.
+    #[serde(default)]
+    pub(super) ttl_secs: Option<u64>,
+}
+
+/// `POST /api/overlay/invite` response: the minted invitation + its expiry (shown once).
+#[derive(Serialize)]
+struct OverlayInviteResponse {
+    /// The minted `overlay-enroll` invitation (base64url COSE). A confidential **bearer** secret:
+    /// whoever holds it (plus their own overlay key) can enroll until it is spent — deliver it over
+    /// the authenticated control plane / the ticket, bounded by `exp` + single-use.
+    token: String,
+    /// The role it grants (echoed from the closed [`cose::OverlayMemberRole`] set).
+    role: String,
+    /// The scope it grants.
+    scope: String,
+    /// The invitation's expiry (Unix seconds).
+    expires_at: u64,
+}
+
+/// Mint a single-use `overlay-enroll` invitation for `role` + `scope`, signed by the node's root
+/// issuer. Gated `Overlay·Admin` (an owner-grade act: redeeming it admits a new identity into the
+/// overlay trust set), TTL-clamped, `501` on a verify-only node (no root key). Mirrors
+/// [`create_join_token`] + the `Overlay·Admin` gate of [`overlay_expose`].
+pub(super) async fn overlay_invite(
+    Extension(issuer): Extension<Issuer>,
+    Extension(directory): Extension<OverlayDirectory>,
+    Json(request): Json<OverlayInviteRequest>,
+) -> Response {
+    if let Some(forbidden) = assert_overlay_invite_is_overlay_admin() {
+        return forbidden;
+    }
+    let Some(signer) = issuer.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node has no root private key and cannot mint overlay invitations\n",
+        )
+            .into_response();
+    };
+    let Some(role) = cose::OverlayMemberRole::parse(request.role.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "role must be one of node|device|workload\n",
+        )
+            .into_response();
+    };
+    if request.scope.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "scope is required\n").into_response();
+    }
+    // Clamp to the same server cap a dial/publish cap uses: an `overlay-enroll` invitation is a
+    // single-use, offline-verified bearer, so an unbounded TTL is the same standing risk (MEDIUM-D).
+    let ttl = request
+        .ttl_secs
+        .unwrap_or(DEFAULT_OVERLAY_ENROLL_TTL_SECS)
+        .min(directory.max_dial_ttl_secs());
+    let now = now_unix();
+    match cose::mint_overlay_enroll(role, request.scope.trim(), ttl, now, &*signer).await {
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(OverlayInviteResponse {
+                token,
+                role: role.as_str().to_string(),
+                scope: request.scope.trim().to_string(),
+                expires_at: now.saturating_add(ttl),
+            }),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/overlay/enroll` request: redeem an `overlay-enroll` invitation + prove possession of
+/// the enrolling overlay key. Token-gated like [`cluster_join`] (no RBAC right — the handler verifies
+/// the invitation), so a stolen invitation + an observed key enrolls nothing.
+#[derive(Deserialize)]
+pub(super) struct OverlayEnrollRequest {
+    /// The single-use **bearer** `overlay-enroll` invitation (base64url COSE), from `overlay invite`.
+    pub(super) token: String,
+    /// The enrolling overlay key (`ed25519:<hex>`) — the enrollee's self-derived identity. Not
+    /// pre-named by the invitation; possession is proven below.
+    pub(super) overlay_pubkey: String,
+    /// A **possession proof**: an Ed25519 signature (hex) over
+    /// `cose::join_challenge(jti, overlay_pubkey, proof_iat)`, proving the enrollee controls
+    /// `overlay_pubkey` — so an invitation + an observed key admits nothing.
+    pub(super) possession_proof: String,
+    /// The proof's issued-at (Unix seconds); must be fresh (anti-replay).
+    pub(super) proof_iat: u64,
+}
+
+/// `POST /api/overlay/enroll` response: the root-signed membership credential the enrollee adopts.
+#[derive(Serialize)]
+struct OverlayEnrollResponse {
+    /// The root-signed `overlay-member` credential vouching the enrolled key is a member with the
+    /// invitation's role + scope. The enrollee verifies it against the root anchor before trusting it.
+    member: String,
+    /// The role the membership grants.
+    role: String,
+    /// The scope the membership grants.
+    scope: String,
+    /// The credential's expiry (Unix seconds).
+    expires_at: u64,
+}
+
+/// Redeem an `overlay-enroll` invitation: verify it (signature + mandatory `exp` + kind + closed
+/// role) against the trust anchor, verify the enrollee's possession proof against the PRESENTED key,
+/// then ADMIT — single-use spend the invitation's `jti`, bar a revoked key, and trust the key in the
+/// relay's live set — and hand back a root-signed `overlay-member` credential. Token-gated (the
+/// handler verifies the invitation). `501` on a node that runs no overlay relay accepting enrollments
+/// or has no root key to vouch for the member. Mirrors [`cluster_join`].
+pub(super) async fn overlay_enroll(
+    Extension(auth): Extension<Auth>,
+    Extension(issuer): Extension<Issuer>,
+    Extension(enroll): Extension<OverlayEnrollHandle>,
+    Json(request): Json<OverlayEnrollRequest>,
+) -> Response {
+    let Some(enroller) = enroll.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node runs no overlay relay accepting enrollments\n",
+        )
+            .into_response();
+    };
+    let Some(signer) = issuer.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "enroll requires a root private key to vouch for the member (none configured)\n",
+        )
+            .into_response();
+    };
+    let now = now_unix();
+    // (1) Verify the invitation against the anchor set (primary + rotation anchors). A
+    // signature/framing failure is unauthenticated (401); an authentic but expired/wrong-kind
+    // invitation is forbidden (403). Mirrors `cluster_join`'s token-verify classification.
+    let verified = match auth.verify_overlay_enroll_token(&request.token, now).await {
+        Ok(v) => v,
+        Err(err) => {
+            let code = match err {
+                cose::TokenError::Invalid(_) => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::FORBIDDEN,
+            };
+            return (code, format!("invalid overlay-enroll invitation: {err}\n")).into_response();
+        }
+    };
+    // (2) The enrolling key must be a valid ed25519 overlay identity (an es256 key cannot be an
+    // overlay peer); reject early with an actionable 400 (mirrors dial/expose's ed25519-only gate).
+    let member_pub = match cose::TokenPublicKey::from_hex(request.overlay_pubkey.trim()) {
+        Ok(k) if k.alg() == cose::TokenAlg::Ed25519 => k,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "overlay_pubkey must be an ed25519 overlay identity\n",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid overlay_pubkey: {err}\n"),
+            )
+                .into_response();
+        }
+    };
+    let Ok(proof) = hex::decode(request.possession_proof.trim()) else {
+        return (StatusCode::BAD_REQUEST, "possession_proof must be hex\n").into_response();
+    };
+    // (3) Admit: the impl verifies the possession proof against the presented key, then atomically
+    // bars a revoked key / refuses a spent `jti` (single-use) / spends the `jti` + trusts the key in
+    // the relay's live set.
+    match enroller
+        .admit(
+            request.overlay_pubkey.trim(),
+            &verified.jti,
+            &proof,
+            request.proof_iat,
+            now,
+        )
+        .await
+    {
+        Ok(OverlayEnrollOutcome::Admitted) => {}
+        Ok(OverlayEnrollOutcome::TokenSpent) => {
+            return (
+                StatusCode::CONFLICT,
+                "overlay-enroll invitation already spent\n",
+            )
+                .into_response();
+        }
+        Ok(OverlayEnrollOutcome::ProofInvalid) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "overlay enrollment possession proof is missing, stale, or invalid\n",
+            )
+                .into_response();
+        }
+        Ok(OverlayEnrollOutcome::Revoked) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "this overlay key is barred from enrollment (revoked)\n",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("overlay enroll failed: {err}\n"),
+            )
+                .into_response();
+        }
+    }
+    // (4) Vouch for the enrolled member with a root-signed `overlay-member` credential (the enrollee
+    // adopts it only after verifying it against the root anchor).
+    match cose::mint_overlay_member(
+        &member_pub,
+        verified.role,
+        &verified.scope,
+        DEFAULT_OVERLAY_MEMBER_TTL_SECS,
+        now,
+        &*signer,
+    )
+    .await
+    {
+        Ok(member) => (
+            StatusCode::CREATED,
+            Json(OverlayEnrollResponse {
+                member,
+                role: verified.role.as_str().to_string(),
+                scope: verified.scope.clone(),
+                expires_at: now.saturating_add(DEFAULT_OVERLAY_MEMBER_TTL_SECS),
+            }),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
 /// `GET /api/overlay/services` — list the overlay service directory (`Overlay·Read`).
 pub(super) async fn overlay_services(
     Extension(directory): Extension<OverlayDirectory>,
@@ -1781,5 +2059,195 @@ mod tests {
             assert_overlay_services_is_overlay_read().is_none(),
             "GET /api/overlay/services must be gated Overlay·Read"
         );
+        assert!(
+            assert_overlay_invite_is_overlay_admin().is_none(),
+            "POST /api/overlay/invite must be gated Overlay·Admin"
+        );
+    }
+
+    use boatramp_core::cose::{LocalSigner, OverlayMemberRole, Signer, TokenAlg};
+    use boatramp_core::kv::{KvStore, MemoryKv};
+
+    /// An `OverlayEnroll` stub returning a scripted outcome — so the enroll handler's
+    /// outcome→HTTP-status mapping can be tested without the (binary-side) real trust-set admit.
+    struct StubEnroll(OverlayEnrollOutcome);
+    #[async_trait::async_trait]
+    impl OverlayEnroll for StubEnroll {
+        async fn admit(
+            &self,
+            _overlay_pubkey_hex: &str,
+            _jti: &str,
+            _possession_proof: &[u8],
+            _proof_iat: u64,
+            _now: u64,
+        ) -> std::result::Result<OverlayEnrollOutcome, String> {
+            Ok(self.0)
+        }
+    }
+
+    fn mem_auth(root: &LocalSigner) -> Auth {
+        let kv: std::sync::Arc<dyn KvStore> = std::sync::Arc::new(MemoryKv::new());
+        Auth::with_key(root.public_key(), kv)
+    }
+
+    /// `overlay_invite` is `501` on a verify-only node (no root key) and `201` with a signer + a
+    /// role in the closed set.
+    #[tokio::test]
+    async fn overlay_invite_501_without_root_and_201_with_signer() {
+        // No root private key → 501 (mirrors `create_join_token`).
+        let resp = overlay_invite(
+            Extension(Issuer(None)),
+            Extension(OverlayDirectory::default()),
+            Json(OverlayInviteRequest {
+                role: "device".into(),
+                scope: "svc/db".into(),
+                ttl_secs: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // With a signer → 201.
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let resp = overlay_invite(
+            Extension(Issuer(Some(std::sync::Arc::new(root)))),
+            Extension(OverlayDirectory::default()),
+            Json(OverlayInviteRequest {
+                role: "device".into(),
+                scope: "svc/db".into(),
+                ttl_secs: Some(300),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // An unknown role → 400 (the closed role set is enforced at mint).
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let resp = overlay_invite(
+            Extension(Issuer(Some(std::sync::Arc::new(root)))),
+            Extension(OverlayDirectory::default()),
+            Json(OverlayInviteRequest {
+                role: "superuser".into(),
+                scope: "svc/db".into(),
+                ttl_secs: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `overlay_enroll` returns `501` when the node runs no relay (no admit hook) or has no root key,
+    /// and maps each admit outcome to its HTTP status (Admitted→201, Spent→409, ProofInvalid/Revoked
+    /// →403) once a valid invitation + an ed25519 key clear the handler's token/key checks.
+    #[tokio::test]
+    async fn overlay_enroll_501s_and_outcome_status_mapping() {
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let now = now_unix();
+        let token = cose::mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 300, now, &root)
+            .await
+            .unwrap();
+        let overlay_pubkey = LocalSigner::generate(TokenAlg::Ed25519)
+            .public_key()
+            .to_hex();
+        let req = || OverlayEnrollRequest {
+            token: token.clone(),
+            overlay_pubkey: overlay_pubkey.clone(),
+            possession_proof: "00".into(), // the stub ignores it; hex must decode
+            proof_iat: now,
+        };
+
+        // No relay admit hook → 501 (checked first, before anything else).
+        let resp = overlay_enroll(
+            Extension(Auth::disabled()),
+            Extension(Issuer(None)),
+            Extension(OverlayEnrollHandle(None)),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // A hook but no root key to vouch for the member → 501.
+        let resp = overlay_enroll(
+            Extension(Auth::disabled()),
+            Extension(Issuer(None)),
+            Extension(OverlayEnrollHandle(Some(std::sync::Arc::new(StubEnroll(
+                OverlayEnrollOutcome::Admitted,
+            ))))),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Full valid setup (anchor + issuer), scripted outcomes → their statuses.
+        let issuer = || {
+            Issuer(Some(std::sync::Arc::new(LocalSigner::generate(
+                TokenAlg::Ed25519,
+            ))))
+        };
+        for (outcome, want) in [
+            (OverlayEnrollOutcome::Admitted, StatusCode::CREATED),
+            (OverlayEnrollOutcome::TokenSpent, StatusCode::CONFLICT),
+            (OverlayEnrollOutcome::ProofInvalid, StatusCode::FORBIDDEN),
+            (OverlayEnrollOutcome::Revoked, StatusCode::FORBIDDEN),
+        ] {
+            let resp = overlay_enroll(
+                Extension(mem_auth(&root)),
+                Extension(issuer()),
+                Extension(OverlayEnrollHandle(Some(std::sync::Arc::new(StubEnroll(
+                    outcome,
+                ))))),
+                Json(req()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                want,
+                "outcome {outcome:?} must map to {want}"
+            );
+        }
+
+        // An EXPIRED invitation is rejected at the token-verify step (before admit) → 403. The
+        // handler reads its own `now_unix()`, so mint an ALREADY-expired invitation (ttl 0, issued in
+        // the past) rather than racing the clock.
+        let expired =
+            cose::mint_overlay_enroll(OverlayMemberRole::Device, "svc/db", 0, now - 10, &root)
+                .await
+                .unwrap();
+        let resp = overlay_enroll(
+            Extension(mem_auth(&root)),
+            Extension(issuer()),
+            Extension(OverlayEnrollHandle(Some(std::sync::Arc::new(StubEnroll(
+                OverlayEnrollOutcome::Admitted,
+            ))))),
+            Json(OverlayEnrollRequest {
+                token: expired,
+                overlay_pubkey: overlay_pubkey.clone(),
+                possession_proof: "00".into(),
+                proof_iat: now,
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an expired invitation must be rejected at the verify step"
+        );
+
+        // A non-ed25519 / malformed overlay_pubkey → 400 (before admit).
+        let resp = overlay_enroll(
+            Extension(mem_auth(&root)),
+            Extension(issuer()),
+            Extension(OverlayEnrollHandle(Some(std::sync::Arc::new(StubEnroll(
+                OverlayEnrollOutcome::Admitted,
+            ))))),
+            Json(OverlayEnrollRequest {
+                token: token.clone(),
+                overlay_pubkey: "not-a-key".into(),
+                possession_proof: "00".into(),
+                proof_iat: now,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
