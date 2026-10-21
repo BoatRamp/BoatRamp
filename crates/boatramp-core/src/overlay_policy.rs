@@ -232,7 +232,10 @@ impl FlowPolicy {
         let schema = flow_schema()?;
         let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
         if !result.validation_passed() {
-            let errs: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+            let errs: Vec<String> = result
+                .validation_errors()
+                .map(ToString::to_string)
+                .collect();
             return Err(FlowPolicyError::Validation(if errs.is_empty() {
                 "validation failed".to_string()
             } else {
@@ -374,12 +377,12 @@ impl FlowPolicy {
         let reasons = response
             .diagnostics()
             .reason()
-            .map(|id| id.to_string())
+            .map(ToString::to_string)
             .collect();
         let diags = response
             .diagnostics()
             .errors()
-            .map(|e| e.to_string())
+            .map(ToString::to_string)
             .collect();
         Ok(Decided {
             decision: response.decision(),
