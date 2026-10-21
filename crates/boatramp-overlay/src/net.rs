@@ -105,6 +105,21 @@ const PAIR_MAX_PARKED: usize = 64;
 #[cfg(feature = "server")]
 const PAIR_MAX_PARKED_PER_IP: u32 = 3;
 
+/// Max concurrent exposer REGISTRATIONS (`IngressFrame::Register` → [`register_exposer`]) — a
+/// SEPARATE budget from the forward/redeem [`MAX_INFLIGHT_FLOWS`] flows (expose inc3 part 3a). A
+/// registration is LONG-LIVED (held for as long as the service stays published) while a forward
+/// dial/redeem is short-lived; sharing one pool lets either workload starve the other (a node
+/// exposing many services could block production forward-dials, or a dial burst could block a new
+/// registration). Unlike [`PAIR_MAX_PARKED`] this is NOT an unauthenticated-DoS bound — `register_exposer`
+/// verifies a holder-bound publish capability BEFORE the long hold — so this is a fairness /
+/// resource-isolation split between two AUTHENTICATED workloads, not a flood gate (no per-IP cap is
+/// needed here). A node legitimately exposes at most a few hundred services even in a large fleet;
+/// 256 is comfortably large for that real use yet small enough, relative to the 1024-flow budget, that
+/// a registration burst cannot be mistaken for — or crowd out resources meant for — forward-dial
+/// capacity.
+#[cfg(feature = "server")]
+const MAX_REGISTERED_EXPOSERS: usize = 256;
+
 /// A forwarded-flow failure.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -1213,16 +1228,24 @@ pub async fn run_ingress_router<F>(
 
 /// The admission budgets a [`run_ingress_router`] loop enforces. The KEY separation (HIGH-1) is that
 /// PARK draws from `parked` (+ the per-IP cap), NEVER from `flows` — so an unauthenticated park flood
-/// can never exhaust the forward/expose flow budget. Parameterized so tests can drive the separation
+/// can never exhaust the forward/expose flow budget. A SECOND separation (expose inc3 part 3a, fairness
+/// between two authenticated workloads rather than a DoS bound) is that a long-lived exposer
+/// REGISTRATION draws from `register`, NEVER from `flows` — so a registration burst can never starve
+/// short-lived forward dials/redeems, and vice-versa. Parameterized so tests can drive the separation
 /// with tiny budgets; production uses [`IngressBudgets::DEFAULT`].
 #[cfg(feature = "server")]
 #[derive(Clone, Copy)]
 struct IngressBudgets {
     /// Concurrent pre-classification connections (the accept-loop bound; short, ≤ `HANDSHAKE_TIMEOUT`).
     handshakes: usize,
-    /// Concurrent forward/expose/redeem FLOWS (`Register`/`Dial`/`PairRedeem`).
+    /// Concurrent forward/redeem FLOWS (`Dial`/`PairRedeem`) — SEPARATE from `register` (never drawn
+    /// on by a `Register`).
     flows: usize,
-    /// Concurrent PARKED rendezvous (`PairPark`) — SEPARATE from `flows`.
+    /// Concurrent exposer REGISTRATIONS (`Register`) — SEPARATE from `flows` (never drawn on by a
+    /// `Dial`/`PairRedeem`). Long-lived (held for the service's published lifetime) vs the short-lived
+    /// `flows` workload, so the two pools must not be shared.
+    register: usize,
+    /// Concurrent PARKED rendezvous (`PairPark`) — SEPARATE from `flows` and `register`.
     parked: usize,
     /// Concurrent parked rendezvous per source IP.
     parked_per_ip: u32,
@@ -1233,6 +1256,7 @@ impl IngressBudgets {
     const DEFAULT: Self = Self {
         handshakes: MAX_INFLIGHT_HANDSHAKES,
         flows: MAX_INFLIGHT_FLOWS,
+        register: MAX_REGISTERED_EXPOSERS,
         parked: PAIR_MAX_PARKED,
         parked_per_ip: PAIR_MAX_PARKED_PER_IP,
     };
@@ -1241,8 +1265,11 @@ impl IngressBudgets {
 /// [`run_ingress_router`] with explicit [`IngressBudgets`]. The accept loop holds a short HANDSHAKE
 /// slot per connection (released the instant the frame is classified and swapped to its own budget):
 /// `PairPark` → the SEPARATE `parked` budget (+ per-IP cap), held for the park's ≤TTL life;
-/// `Register`/`Dial`/`PairRedeem` → the `flows` budget, held for the flow's life. So a park never
-/// draws from — and a park flood can never starve — the forward/expose flow budget (HIGH-1).
+/// `Register` → the SEPARATE `register` budget, held for the service's published life;
+/// `Dial`/`PairRedeem` → the `flows` budget, held for the flow's life. So a park never draws from — and
+/// a park flood can never starve — the forward/expose flow budget (HIGH-1); and a registration never
+/// draws from — and a registration burst can never starve — the SAME flow budget either way (expose
+/// inc3 part 3a).
 #[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 async fn run_ingress_router_with_budgets<F>(
@@ -1260,6 +1287,7 @@ async fn run_ingress_router_with_budgets<F>(
     let seed = secret.seed_hex();
     let handshake_limiter = Arc::new(Semaphore::new(budgets.handshakes));
     let flow_limiter = Arc::new(Semaphore::new(budgets.flows));
+    let register_limiter = Arc::new(Semaphore::new(budgets.register));
     let park_limiter = Arc::new(Semaphore::new(budgets.parked));
     let park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>> = Arc::new(StdMutex::new(HashMap::new()));
     loop {
@@ -1278,6 +1306,7 @@ async fn run_ingress_router_with_budgets<F>(
         let registry = registry.clone();
         let rendezvous = rendezvous.clone();
         let flow_limiter = Arc::clone(&flow_limiter);
+        let register_limiter = Arc::clone(&register_limiter);
         let park_limiter = Arc::clone(&park_limiter);
         let park_by_ip = Arc::clone(&park_by_ip);
         tokio::spawn(async move {
@@ -1290,6 +1319,7 @@ async fn run_ingress_router_with_budgets<F>(
                 &registry,
                 &rendezvous,
                 flow_limiter,
+                register_limiter,
                 park_limiter,
                 park_by_ip,
                 budgets.parked_per_ip,
@@ -1305,8 +1335,10 @@ async fn run_ingress_router_with_budgets<F>(
 
 /// Accept the first bi-stream + control frame on an ingress connection (holding the short handshake
 /// slot `hs_permit`), then SWAP to the budget the frame kind draws from — releasing the handshake slot
-/// — and dispatch. `PairPark` takes a SEPARATE park budget (never the flow budget, HIGH-1);
-/// `Register`/`Dial`/`PairRedeem` take the flow budget.
+/// — and dispatch. `PairPark` takes a SEPARATE park budget (never the flow budget, HIGH-1); `Register`
+/// takes a SEPARATE register budget (never the flow budget, expose inc3 part 3a — a long-lived
+/// registration must not starve short-lived flows, nor vice-versa); `Dial`/`PairRedeem` take the flow
+/// budget.
 #[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_ingress_connection<F>(
@@ -1318,6 +1350,7 @@ async fn handle_ingress_connection<F>(
     registry: &ExposerRegistry,
     rendezvous: &PairRendezvous,
     flow_limiter: Arc<Semaphore>,
+    register_limiter: Arc<Semaphore>,
     park_limiter: Arc<Semaphore>,
     park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>>,
     parked_per_ip: u32,
@@ -1333,8 +1366,9 @@ where
     let frame = timeout(HANDSHAKE_TIMEOUT, read_ingress_frame(&mut recv))
         .await
         .map_err(|_| NetError::Stream("ingress first-frame timed out".into()))??;
-    // Swap the handshake slot for the frame's own budget. PARK takes the SEPARATE park budget; every
-    // flow kind takes the flow budget. The handshake slot is released the instant the swap is made.
+    // Swap the handshake slot for the frame's own budget. PARK takes the SEPARATE park budget;
+    // REGISTER takes the SEPARATE register budget; every other flow kind takes the flow budget. The
+    // handshake slot is released the instant the swap is made.
     match frame {
         IngressFrame::PairPark(req) => {
             park_admit_and_run(
@@ -1351,10 +1385,12 @@ where
             .await
         }
         IngressFrame::Register(req) => {
-            let _flow = flow_limiter
+            // Invariant (expose inc3 part 3a): a Register NEVER draws from `flow_limiter` — it has its
+            // own budget, so a node exposing many services can never starve forward dials/redeems.
+            let _register = register_limiter
                 .acquire_owned()
                 .await
-                .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
+                .map_err(|_| NetError::Stream("ingress register budget closed".into()))?;
             drop(hs_permit);
             register_exposer(conn, send, recv, req, relay_secret, trust_root, registry).await
         }
@@ -3959,6 +3995,7 @@ mod tests {
             IngressBudgets {
                 handshakes: 8,
                 flows: 1,
+                register: 8,
                 parked: 1,
                 parked_per_ip: 4,
             },
@@ -4017,6 +4054,262 @@ mod tests {
         );
     }
 
+    // ---- expose inc3 part 3a: the register budget is SEPARATE from the forward/redeem flow budget ----
+
+    /// Anti-hollow: an exposer REGISTRATION flood cannot starve the forward/redeem flow budget. With
+    /// `flows = register = 1`, one held registration fills the REGISTER budget; a forward dial to an
+    /// unconfigured service STILL succeeds (returns its verdict) because it draws from the SEPARATE
+    /// flow budget. MUTATION-RED: route `Register` back onto `flow_limiter` (in place of
+    /// `register_limiter`) in `handle_ingress_connection` — the held registration then consumes the one
+    /// flow permit → the forward dial never gets a flow permit → `handle_ingress_connection` never
+    /// reads its request → `forward_flow` hangs → the timeout below fires → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_register_flood_does_not_starve_the_forward_flow_budget() {
+        use boatramp_core::cose::mint_overlay_publish;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let exposer = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        // flows = register = 1: the one held registration fills the REGISTER budget; the forward dial
+        // must draw from the (untouched) flow budget. handshakes = 8 so the accept loop is never the
+        // bottleneck; parked is irrelevant here.
+        let relay_addr = spawn_ingress_relay_with_budgets(
+            &relay,
+            root_pub.clone(),
+            registry.clone(),
+            PairRendezvous::new(),
+            IngressBudgets {
+                handshakes: 8,
+                flows: 1,
+                register: 1,
+                parked: 8,
+                parked_per_ip: 4,
+            },
+        );
+
+        // Exposer registers svc/held and stays registered (never unregisters) — it occupies the one
+        // REGISTER slot for the test's duration.
+        let publish_cap = mint_overlay_publish(
+            &exposer.id().to_public(),
+            "svc/held",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer = OverlaySecret::from_seed_hex(&exposer.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer,
+                    relay_addr,
+                    relay_id,
+                    "svc/held",
+                    publish_cap,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/held").await,
+            "the registration must occupy the REGISTER budget"
+        );
+
+        // A forward dial to an UNCONFIGURED service: with the separate budgets it still gets a flow
+        // permit and the relay returns ServiceNotAuthorized — promptly, well within the timeout.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/none",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/none".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            ),
+        )
+        .await
+        .expect("the forward dial must get a flow permit despite the saturated REGISTER budget");
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(DialReject::ServiceNotAuthorized))
+            ),
+            "the forward dial draws from the separate flow budget and is handled, got {res:?}"
+        );
+    }
+
+    /// Symmetric direction: a FORWARD-FLOW flood cannot starve a new exposer registration either. With
+    /// `flows = 1` and one forward flow held open (confirmed live by an actual echo round-trip through
+    /// the bridged backend, so the flow permit is DEFINITELY held — not a timing guess), a SECOND
+    /// exposer's registration still admits promptly because it draws from the separate `register`
+    /// budget (sized here for both exposers). MUTATION-RED: route `Register` onto `flow_limiter` —
+    /// exposer A's OWN registration then competes for the single flow permit (and, going first, wins
+    /// it, holding it for its published lifetime) — so the forward dial to svc/a can never acquire a
+    /// flow permit, the bridge never establishes, and the echo round-trip's bounded timeout elapses →
+    /// the assertion below fails → RED. (With the fix, `Register` never touches `flow_limiter` at all,
+    /// so this contention cannot happen regardless of ordering.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forward_flow_flood_does_not_starve_a_new_registration() {
+        use boatramp_core::cose::mint_overlay_publish;
+        use tokio::io::AsyncReadExt;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let exposer_a = OverlaySecret::generate().unwrap();
+        let exposer_b = OverlaySecret::generate().unwrap();
+        let (relay_id, exposer_a_id) = (relay.id(), exposer_a.id());
+        let root_pub = root.id().to_public();
+
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        // flows = 1, register = 2: the one held forward flow fills the ENTIRE flow budget; a second
+        // exposer must still register because it draws from the separate register budget.
+        let relay_addr = spawn_ingress_relay_with_budgets(
+            &relay,
+            root_pub.clone(),
+            registry.clone(),
+            PairRendezvous::new(),
+            IngressBudgets {
+                handshakes: 8,
+                flows: 1,
+                register: 2,
+                parked: 8,
+                parked_per_ip: 4,
+            },
+        );
+
+        // Exposer A publishes svc/a (1 of the 2 register slots).
+        let publish_cap_a = mint_overlay_publish(
+            &exposer_a.id().to_public(),
+            "svc/a",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer_a = OverlaySecret::from_seed_hex(&exposer_a.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer_a,
+                    relay_addr,
+                    relay_id,
+                    "svc/a",
+                    publish_cap_a,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/a").await,
+            "exposer A must register svc/a"
+        );
+
+        // Forward-dial svc/a and hold the flow open — confirmed live by an actual echo round-trip, so
+        // the flow permit (budget = 1) is DEFINITELY held by the time exposer B tries to register.
+        let dial_cap = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/a",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                exposer_a_id,
+                DialRequest {
+                    service: "svc/a".into(),
+                    token: dial_cap,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await;
+        });
+        app.write_all(b"x").await.unwrap();
+        let mut echoed = [0u8; 1];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            app.read_exact(&mut echoed),
+        )
+        .await
+        .expect("the forward flow must establish and bridge to the backend")
+        .unwrap();
+        assert_eq!(&echoed, b"x", "the flow must echo through the real backend");
+
+        // Exposer B registers svc/b WHILE the flow budget is fully saturated by the held flow above —
+        // never shut down, so its one flow permit stays held.
+        let publish_cap_b = mint_overlay_publish(
+            &exposer_b.id().to_public(),
+            "svc/b",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer_b = OverlaySecret::from_seed_hex(&exposer_b.seed_hex()).unwrap();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer_b,
+                    relay_addr,
+                    relay_id,
+                    "svc/b",
+                    publish_cap_b,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/b").await,
+            "exposer B must still register svc/b despite the saturated flow budget"
+        );
+    }
+
     /// Per-source-IP cap (HIGH-1 secondary bound): a single source cannot park more than
     /// `parked_per_ip` concurrent rendezvous. With the cap at 2, two held parks from loopback succeed,
     /// and the THIRD from the same IP is refused `TooManyParked`.
@@ -4037,6 +4330,7 @@ mod tests {
             IngressBudgets {
                 handshakes: 8,
                 flows: 8,
+                register: 8,
                 parked: 8,
                 parked_per_ip: 2,
             },
