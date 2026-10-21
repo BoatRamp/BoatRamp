@@ -1,0 +1,197 @@
+# Mobile cross-compile (SDK) — the empirical "cross-compiles to iOS + Android in CI"
+# proof for the embeddable overlay client SDK `boatramp-overlay-client` (overlay
+# follow-up #4, SDK increment 2). A feasibility pass already proved the stack is
+# buildable (aws-lc-sys 0.41 has first-class iOS/Android CMake support + pregenerated
+# bindings — non-FIPS, so NO bindgen/libclang — and the lean client graph is
+# aws-lc-rs-only: no `ring`, no `rustls-platform-verifier`). This workflow turns that
+# into a green CI run.
+#
+# BUILD-ONLY is the gate: the lean, ring-free client crate LINKS for each mobile target
+# with its native C toolchain. There is deliberately NO device/simulator run, NO
+# xcframework / lipo / `.a` fat-binary / AAR packaging, and NO C-ABI/UniFFI surface —
+# those land with the increment-2 bindings; this lane only proves the Rust core
+# cross-compiles.
+#
+# WHY A SEPARATE WORKFLOW (not a job in ci.yml, not the nix/musl flow):
+#   * ci.yml is the Linux-only Tier-1 merge gate ("does the SHIPPED artifact hold?").
+#     Per its own tiering doctrine, non-Linux (darwin) builds live OUTSIDE it (they are
+#     Tier 2/3 in nightly.yml + release.yml). The iOS leg needs a macOS runner, so it
+#     cannot sit in ci.yml without breaking that doctrine.
+#   * aws-lc-sys's iOS/Android CMake build wants a per-target C toolchain (Android NDK /
+#     Xcode iOS SDK) that has no place in the musl-static nix closure.
+#   So this is a cargo-NATIVE per-runner lane, mirroring release.yml's macOS/Windows
+#   build legs (`dtolnay/rust-toolchain` adds the target via rustup; `Swatinem/rust-cache`
+#   keyed by target), NOT a nix/cargo-zigbuild lane.
+#
+# SCOPE — the SDK crate ONLY: `-p boatramp-overlay-client --no-default-features
+# --features client` (the lean client build; `client` turns off boatramp-overlay's
+# server/relay/egress/mesh roles). The host consumer `examples/overlay-embed` is a host
+# `bin` already compiled by ci.yml's `--workspace` gate and is NOT cross-compiled here;
+# the full `boatramp` server never cross-compiles to mobile.
+#
+# NON-BLOCKING TO START: this is the first mobile CI, so it is intentionally NOT wired
+# into branch protection as a required check — it runs and is visible, but a red leg
+# does not block a merge while the lane is driven to green. Promote it to a required
+# check once it is reliably green. `workflow_dispatch` lets a maintainer re-run on
+# demand during that iteration.
+name: Mobile cross-compile (SDK)
+
+on:
+  # Mirror the merge gate's push/PR shape, but scoped to paths that can actually affect
+  # the SDK's mobile build (the SDK + its overlay graph, the lockfile, the toolchain
+  # pin, and this workflow) so we don't spend macOS minutes on unrelated pushes. The
+  # workflow file itself is in the filter, so edits to this lane always trigger a run
+  # while it is being driven to green.
+  push:
+    branches: ['**']
+    paths:
+      - 'crates/boatramp-overlay-client/**'
+      - 'crates/boatramp-overlay/**'
+      - 'crates/boatramp-overlay-proto/**'
+      - 'crates/boatramp-rpktls/**'
+      - 'crates/boatramp-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/mobile.yml'
+  pull_request:
+    paths:
+      - 'crates/boatramp-overlay-client/**'
+      - 'crates/boatramp-overlay/**'
+      - 'crates/boatramp-overlay-proto/**'
+      - 'crates/boatramp-rpktls/**'
+      - 'crates/boatramp-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/mobile.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match ci.yml: no incremental (fresh CI checkout) and no debug info (small target dir).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # iOS — build the lean client for the device + the Apple-silicon simulator target on a
+  # native macOS runner. CMake is preinstalled on the macos-14 image, and Xcode supplies
+  # the iOS SDK sysroot that aws-lc-sys's CMake build targets (CMAKE_OSX_SYSROOT); its
+  # pregenerated iOS bindings mean no bindgen/libclang is needed.
+  ios:
+    name: iOS cross-compile · ${{ matrix.target }}
+    # macos-14 is Apple silicon — same runner release.yml uses for aarch64-apple-darwin.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios # device
+          - aarch64-apple-ios-sim # Apple-silicon simulator
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rustup-based toolchain (exactly release.yml's cargo-native legs): `@stable` matches
+      # rust-toolchain.toml's `channel = "stable"`, and `targets:` runs `rustup target add`
+      # for the mobile target — the mechanism that solves "the pinned nix rust can't add a
+      # target" (that rust is only for the musl/nix lanes; this lane is plain rustup cargo).
+      - name: Install Rust + the iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Key per target so the two iOS legs (and the Android legs) don't share/clobber
+          # each other's aws-lc C build artifacts.
+          key: mobile-${{ matrix.target }}
+
+      - name: Ensure CMake (preinstalled on macOS runners)
+        run: |
+          if command -v cmake >/dev/null; then
+            echo "cmake present: $(cmake --version | head -1)"
+          else
+            brew install cmake
+          fi
+          rustc -vV
+          xcodebuild -version || true
+
+      # Build-only — this is the whole gate. `--locked` keeps the vetted Cargo.lock.
+      - name: Build the SDK (lean client, build-only)
+        run: |
+          cargo build -p boatramp-overlay-client \
+            --no-default-features --features client \
+            --target ${{ matrix.target }} --locked
+
+  # Android — build the lean client for each ABI on ubuntu via cargo-ndk, which sets the
+  # CC/CXX/AR + CARGO_TARGET_*_LINKER + CMAKE toolchain env that aws-lc-sys's
+  # configure_android() consumes. arm64-v8a is the load-bearing target; armeabi-v7a
+  # (32-bit) and x86_64 (emulator) are breadth. fail-fast:false so one ABI's break does
+  # not mask the others.
+  android:
+    name: Android cross-compile · ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a, target: aarch64-linux-android }
+          - { abi: armeabi-v7a, target: armv7-linux-androideabi }
+          - { abi: x86_64, target: x86_64-linux-android }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust + the Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-${{ matrix.target }}
+
+      # Pinned NDK. r27c (27.2.12479018) is the current LTS; aws-lc-sys's configure_android()
+      # consumes the NDK's CMake toolchain file (cargo-ndk points CMAKE_TOOLCHAIN_FILE at it).
+      # `add-to-path: false` — cargo-ndk locates the NDK via the env var below, not PATH.
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1.5.0
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      # nttld sets ANDROID_NDK_HOME; aws-lc-sys's CMake Android path also reads
+      # ANDROID_NDK_ROOT — export BOTH from the action output so either is honored.
+      - name: Point the toolchain at the NDK + ensure CMake/Ninja
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          # cmake is preinstalled on ubuntu-latest; ninja is cheap insurance against a
+          # CMake "generator not found" if aws-lc-sys requests the Ninja generator.
+          if command -v cmake >/dev/null && command -v ninja >/dev/null; then
+            echo "cmake + ninja present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build
+          fi
+          cmake --version | head -1
+
+      # cargo-ndk is NOT carried by taiki-e/install-action (unlike cargo-zigbuild/just),
+      # so install it from crates.io, pinned + --locked. 3.5.4 is a known-good pin that
+      # sets CMAKE_TOOLCHAIN_FILE (needed by aws-lc-sys); 4.1.2 is the newer line if a bump
+      # is wanted. Not cached (installs to ~/.cargo/bin) — adds ~1 min on a cold runner.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 3.5.4 --locked
+
+      # cargo-ndk translates `-t <abi>` into `--target <triple>` and injects the NDK env,
+      # then runs the cargo invocation after `build`. `--platform 21` is the min Android
+      # API level aws-lc-rs supports; bump to 24 if a link error reports a missing libc
+      # symbol. Build-only — no `-o`/jniLibs copy, no packaging.
+      - name: Build the SDK (lean client, build-only) via cargo-ndk
+        run: |
+          cargo ndk -t ${{ matrix.abi }} --platform 21 \
+            build -p boatramp-overlay-client \
+            --no-default-features --features client --locked
