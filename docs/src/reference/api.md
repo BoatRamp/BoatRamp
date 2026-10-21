@@ -242,6 +242,36 @@ non-`ed25519` `holder_pubkey` is `400`. The relay still holder-binds and
 scope-verifies the publish capability at registration — this route only gates WHO
 may obtain one. See the [`[overlay]`](./boatramp-cfg.md#overlay) serve roles.
 
+### Overlay flow policy
+
+An optional, operator-authored **per-flow access policy** (a Cedar policy in its own
+`Overlay` namespace) that gates the dial/publish-cap **mint** above — **deny-or-shrink-TTL
+only**, and **separate** from the RBAC right that grants `Overlay·Write`/`Admin`. All three
+verbs are gated `System·Admin` (the `GET`/`test` surfaces are a policy-enumeration oracle, so
+they sit with `PUT` at the top tier).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/overlay/policy` | Return the active flow policy (Cedar text) + its version (`ETag`). `System·Admin`. |
+| `PUT` | `/api/overlay/policy` | Replace the policy (validated on PUT: parse + schema + a single `not_after` temporal bound; `400` verbatim otherwise). `If-Match`/`409` CAS. An empty body turns the gate off. `System·Admin`. |
+| `POST` | `/api/overlay/policy/test` | Dry-run a dial/expose mint against the active (or an inline) policy — ALLOW/DENY + TTL ceiling + deciding policies + diagnostics. **No mint.** `System·Admin`. |
+
+Posture (four states): absent **or** empty ⇒ the gate is **off** (allow, preserving pre-feature
+behavior); a present policy ⇒ evaluated (Cedar default-deny within — the FIRST stored policy is a
+default-deny cliff, so `PUT` warns); corrupt ⇒ fail-closed deny-all; the store unreadable ⇒
+fail-closed deny. A denied mint returns `403 flow denied by policy` (deliberately non-enumerable —
+use `test` for detail). The policy can only **deny** a mint RBAC already permitted, or pull its TTL
+**down** (`ttl = min(requested, policy_ceiling, server_max)`); it never rewrites the minted
+capability's scope or holder.
+
+The flow principal `Overlay::Holder` carries `role`/`scope`/`enrolled` **only** when the dial/expose
+request presents a root-signed `overlay-member` credential bound to the holder key (`member_key ==
+holder_pubkey`, else `400`); a key-only holder has none of them (default-deny-safe). Because the
+minted capability is offline-verified, the gate has no real-time revocation, rate/quota, or
+concurrent-session limit — a tightening is bounded by the capability TTL (set
+`[overlay].max_dial_ttl_secs` to your acceptable revocation latency), and only a single `not_after`
+(`context.now <= N`) temporal bound is allowed.
+
 ## Root anchors
 
 Make-before-break root-key rotation (`auth rotate-root`). Admin-scoped.

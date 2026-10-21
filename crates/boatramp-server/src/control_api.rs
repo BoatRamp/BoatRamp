@@ -630,6 +630,124 @@ fn assert_overlay_services_is_overlay_read() -> Option<Response> {
     }
 }
 
+/// The short, NON-enumerable 403 a flow-gate denial returns at the mint point (REQUIRED #6): it
+/// names neither the deciding policies nor the evaluation diagnostics (those are an operator-only
+/// oracle, surfaced ONLY on the `System·Admin`-gated `POST /api/overlay/policy/test`). The CLI
+/// recognizes this body to show a distinct "RBAC OK but flow denied" message.
+fn overlay_flow_denied() -> Response {
+    (StatusCode::FORBIDDEN, "flow denied by policy\n").into_response()
+}
+
+/// The per-flow access gate shared by [`overlay_dial`] + [`overlay_expose`] (overlay follow-up #3).
+/// Runs AFTER the RBAC assert + holder parse, BEFORE the mint. It:
+/// 1. Builds the flow-policy `Overlay::Holder` principal: a verified, holder-bound `overlay-member`
+///    credential (REQUIRED #3) contributes `role`/`scope`/`enrolled=true`; a key-only caller has
+///    none of them (absent, default-deny safe). An invalid credential, or one whose `member_key`
+///    is not THIS holder, is rejected **400** (never silently downgraded to key-only).
+/// 2. Loads the flow policy through the fenced, four-state, fail-closed path ([`Auth::overlay_flow_policy`]).
+/// 3. Evaluates — ALLOW (possibly shrinking the TTL) or DENY (403, non-enumerable).
+///
+/// Returns the TTL to mint with (`min(requested, policy_ttl_ceiling)` — the requested value was
+/// already clamped to the server max, so this is the full `min(requested, ceiling, server_max)` of
+/// REQUIRED #2a), or the error [`Response`] to return. The decision gates + bounds the TTL ONLY; it
+/// never rewrites the capability's scope/holder/action/resource (REQUIRED #2b/#3c).
+#[allow(clippy::too_many_arguments)]
+async fn overlay_flow_gate(
+    auth: &Auth,
+    principal: Option<&crate::auth::VerifiedPrincipal>,
+    holder: &cose::TokenPublicKey,
+    member_cred: Option<&str>,
+    action: boatramp_core::overlay_policy::FlowAction,
+    service: &str,
+    requested_ttl: u64,
+    now: u64,
+) -> Result<u64, Response> {
+    use crate::auth::FlowPolicyLoad;
+    use boatramp_core::overlay_policy::{Decision, FlowContext, HolderPrincipal};
+
+    let holder_hex = holder.to_hex();
+    // (1) Build the holder principal from an optional, holder-bound member credential.
+    let holder_principal = match member_cred {
+        None => HolderPrincipal::key_only(holder_hex.clone()),
+        Some(cred) => {
+            let verified = match auth.verify_overlay_member_token(cred, now).await {
+                Ok(v) => v,
+                // An INVALID credential (bad sig / expired / wrong-kind / unknown role) → 400:
+                // reject loudly rather than silently falling back to a key-only principal.
+                Err(err) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid overlay-member credential: {err}\n"),
+                    )
+                        .into_response());
+                }
+            };
+            // REQUIRED #3b — bind `member_key == holder_pubkey`: a credential vouching for a
+            // DIFFERENT key must not lend its role/scope to THIS holder. Canonicalize both sides
+            // through `TokenPublicKey` so an encoding difference can't defeat the compare.
+            let bound = cose::TokenPublicKey::from_hex(&verified.member_key)
+                .map(|k| k.to_hex() == holder_hex)
+                .unwrap_or(false);
+            if !bound {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "overlay-member credential is not bound to this holder key \
+                     (member_key != holder_pubkey)\n",
+                )
+                    .into_response());
+            }
+            HolderPrincipal {
+                key: holder_hex.clone(),
+                role: Some(verified.role.as_str().to_string()),
+                scope: Some(verified.scope),
+                enrolled: Some(true),
+            }
+        }
+    };
+
+    // (2) Load the flow policy (fenced + fail-closed four-state). A mint is a write, so pass
+    // `is_write = true` to force a shared-mode read-through to the live store.
+    match auth.overlay_flow_policy(true).await {
+        // Feature off (absent / confirmed-empty) → allow at the requested TTL (preserve today's
+        // behavior).
+        FlowPolicyLoad::Off => Ok(requested_ttl),
+        // Store unreachable → fail closed (deny). NEVER treated as absent→allow.
+        FlowPolicyLoad::Unavailable => {
+            tracing::warn!("overlay flow policy unreadable; denying the mint (fail-closed)");
+            Err(overlay_flow_denied())
+        }
+        // Stored-but-corrupt → fail closed (deny-all).
+        FlowPolicyLoad::Corrupt => {
+            tracing::warn!("overlay flow policy is corrupt; denying the mint (fail-closed)");
+            Err(overlay_flow_denied())
+        }
+        // (3) Present → evaluate.
+        FlowPolicyLoad::Present(fp) => {
+            let requestor = principal
+                .map(|p| p.subject.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "anonymous".to_string());
+            let ctx = FlowContext {
+                requestor,
+                now,
+                src_ip: None,
+                ttl_requested: requested_ttl,
+            };
+            let outcome = fp.evaluate(&holder_principal, action, service, &ctx);
+            match outcome.decision {
+                Decision::Allow { ttl_ceiling } => {
+                    // REQUIRED #2a — the policy only pulls the TTL DOWN; `requested_ttl` is already
+                    // server-clamped, so this is `min(requested, ceiling, server_max)`.
+                    Ok(ttl_ceiling
+                        .map(|c| requested_ttl.min(c))
+                        .unwrap_or(requested_ttl))
+                }
+                Decision::Deny => Err(overlay_flow_denied()),
+            }
+        }
+    }
+}
+
 /// `POST /api/overlay/dial` request: resolve `service` + mint a dial capability bound to the
 /// caller's overlay identity (`holder_pubkey`, `ed25519:<hex>`).
 #[derive(Deserialize)]
@@ -638,6 +756,12 @@ pub(super) struct OverlayDialRequest {
     pub(super) holder_pubkey: String,
     #[serde(default)]
     pub(super) ttl_secs: Option<u64>,
+    /// An OPTIONAL root-signed `overlay-member` credential for the holder (overlay follow-up #3):
+    /// when present it is verified + bound (`member_key == holder_pubkey`) and its role/scope
+    /// populate the flow-policy `Overlay::Holder` principal. Absent ⇒ a key-only holder (no
+    /// role/scope attributes → default-deny-safe against a role-gated flow permit).
+    #[serde(default)]
+    pub(super) overlay_member: Option<String>,
 }
 
 /// `POST /api/overlay/dial` response: the resolved topology + the minted capability.
@@ -668,6 +792,8 @@ struct OverlayServiceEntry {
 pub(super) async fn overlay_dial(
     Extension(issuer): Extension<Issuer>,
     Extension(directory): Extension<OverlayDirectory>,
+    Extension(auth): Extension<Auth>,
+    principal: Option<Extension<crate::auth::VerifiedPrincipal>>,
     Json(request): Json<OverlayDialRequest>,
 ) -> Response {
     if let Some(forbidden) = assert_overlay_dial_is_overlay_write() {
@@ -716,7 +842,26 @@ pub(super) async fn overlay_dial(
     }
     // MEDIUM-D — clamp the requested lifetime to the server cap (an offline-verified dial cap has no
     // revocation, so an unbounded TTL is a standing risk).
-    let ttl = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
+    let clamped = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
+    // Overlay follow-up #3 — the per-flow access gate, AFTER the RBAC `Overlay·Write` assert +
+    // holder parse, BEFORE mint. It can only DENY or SHRINK the TTL; it never rewrites scope/holder
+    // (the cap below is still bound to THIS holder + THIS one service). A 403 here is short + non-
+    // enumerable (no policy diagnostics — REQUIRED #6).
+    let ttl = match overlay_flow_gate(
+        &auth,
+        principal.as_ref().map(|Extension(p)| p),
+        &holder,
+        request.overlay_member.as_deref(),
+        boatramp_core::overlay_policy::FlowAction::Dial,
+        &request.service,
+        clamped,
+        now,
+    )
+    .await
+    {
+        Ok(ttl) => ttl,
+        Err(resp) => return resp,
+    };
     match cose::mint_overlay_dial(&holder, &request.service, ttl, now, &*signer).await {
         Ok(token) => (
             StatusCode::CREATED,
@@ -743,6 +888,11 @@ pub(super) struct OverlayExposeRequest {
     pub(super) holder_pubkey: String,
     #[serde(default)]
     pub(super) ttl_secs: Option<u64>,
+    /// An OPTIONAL root-signed `overlay-member` credential for the holder (overlay follow-up #3) —
+    /// verified + bound to `holder_pubkey`, its role/scope populate the flow-policy principal.
+    /// Absent ⇒ a key-only holder. Mirrors [`OverlayDialRequest::overlay_member`].
+    #[serde(default)]
+    pub(super) overlay_member: Option<String>,
 }
 
 /// `POST /api/overlay/expose` response: the ingress relay to dial OUT to + the minted publish
@@ -769,6 +919,8 @@ struct OverlayExposeResponse {
 pub(super) async fn overlay_expose(
     Extension(issuer): Extension<Issuer>,
     Extension(directory): Extension<OverlayDirectory>,
+    Extension(auth): Extension<Auth>,
+    principal: Option<Extension<crate::auth::VerifiedPrincipal>>,
     Json(request): Json<OverlayExposeRequest>,
 ) -> Response {
     if let Some(forbidden) = assert_overlay_expose_is_overlay_admin() {
@@ -813,8 +965,26 @@ pub(super) async fn overlay_expose(
     // MEDIUM-D (mirrors dial) — clamp the requested lifetime to the server cap. An overlay-publish
     // cap is offline-verified (no revocation), and the relay bounds a parked registration by the
     // cap's expiry, so an unbounded TTL is the same standing risk as an unbounded dial cap.
-    let ttl = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
+    let clamped = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
     let now = now_unix();
+    // Overlay follow-up #3 — the per-flow access gate (mirrors dial), AFTER the `Overlay·Admin`
+    // assert + holder parse, BEFORE mint. Deny-or-shrink-TTL only; the minted publish cap stays
+    // bound to THIS holder + THIS one service name. 403 is short + non-enumerable (REQUIRED #6).
+    let ttl = match overlay_flow_gate(
+        &auth,
+        principal.as_ref().map(|Extension(p)| p),
+        &holder,
+        request.overlay_member.as_deref(),
+        boatramp_core::overlay_policy::FlowAction::Expose,
+        &request.service,
+        clamped,
+        now,
+    )
+    .await
+    {
+        Ok(ttl) => ttl,
+        Err(resp) => return resp,
+    };
     match cose::mint_overlay_publish(&holder, &request.service, ttl, now, &*signer).await {
         Ok(token) => (
             StatusCode::CREATED,
@@ -1626,6 +1796,291 @@ pub(super) async fn put_authz_policy(
     }
 }
 
+/// Defense-in-depth (mirrors [`assert_overlay_dial_is_overlay_write`]): re-derive that the overlay
+/// flow-policy routes are gated **`System·Admin`** INSIDE each handler (overlay follow-up #3,
+/// REQUIRED #6), so a router/table refactor cannot silently drop the gate down to an `Overlay·*`
+/// tier — which would turn the policy-enumeration `GET`/`test` surfaces into a readable oracle, or
+/// let a non-node-admin edit the gate.
+fn assert_overlay_policy_is_system_admin(method: &str, path: &str) -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required(method, path) {
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay flow-policy administration requires System·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `PUT /api/overlay/policy` response: the new version + a one-time CLIFF warning when this PUT
+/// stored the FIRST policy (the gate just went from OFF to default-deny).
+#[derive(Serialize)]
+struct OverlayPolicyPutResponse {
+    /// The new optimistic-concurrency version (also returned as the `ETag`).
+    version: String,
+    /// Present only when this PUT turned the gate ON for the first time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+/// Return the stored overlay flow policy (Cedar TEXT), or an empty body when none is stored (the
+/// gate is off). Gated `System·Admin`. The `ETag` carries the version for a subsequent `PUT`'s
+/// `If-Match` (optimistic concurrency), exactly like the RBAC policy surface.
+pub(super) async fn get_overlay_policy(State(deploy): State<DeployStore>) -> Response {
+    if let Some(forbidden) = assert_overlay_policy_is_system_admin("GET", "/api/overlay/policy") {
+        return forbidden;
+    }
+    match deploy.get_overlay_flow_policy_versioned().await {
+        Ok((stored, version)) => {
+            let body = stored
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
+            let mut resp = (StatusCode::OK, body).into_response();
+            set_policy_etag(&mut resp, &version);
+            resp
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Replace the overlay flow policy (Cedar TEXT body) with optimistic concurrency. **Validated on
+/// PUT** (REQUIRED #5): the body must parse, pass the temporal screen (only a single `not_after`
+/// upper bound), and type-check against the flow schema, or `400` with the error verbatim — so a
+/// malformed/complex policy can never be stored. An EMPTY body turns the gate OFF (stored empty).
+/// `If-Match` (the version from a prior `GET`'s `ETag`) makes the write conditional — a stale
+/// version → `409`. Gated `System·Admin`. When this PUT stores the FIRST policy, the response
+/// carries a CLIFF warning (the gate just became default-deny).
+pub(super) async fn put_overlay_policy(
+    State(deploy): State<DeployStore>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(forbidden) = assert_overlay_policy_is_system_admin("PUT", "/api/overlay/policy") {
+        return forbidden;
+    }
+    let bytes: Vec<u8> = if body.trim().is_empty() {
+        // Empty ⇒ clear the policy (feature off). Stored as empty bytes; no compile.
+        Vec::new()
+    } else {
+        // Validated-on-PUT: compile (parse + temporal screen + schema). 400 verbatim on failure.
+        if let Err(err) = boatramp_core::overlay_policy::FlowPolicy::compile(&body) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid overlay flow policy: {err}\n"),
+            )
+                .into_response();
+        }
+        body.into_bytes()
+    };
+    // Read the current value for the CLIFF-warning check + the no-If-Match CAS version.
+    let (current, current_version) = match deploy.get_overlay_flow_policy_versioned().await {
+        Ok(v) => v,
+        Err(err) => return deploy_error_response(err),
+    };
+    let was_off = current
+        .as_ref()
+        .map(|c| c.iter().all(u8::is_ascii_whitespace))
+        .unwrap_or(true);
+    let first_policy = was_off && !bytes.is_empty();
+    let if_match = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let expected = match if_match {
+        Some(raw) if raw != "*" => boatramp_core::deploy::PolicyVersion::from_header(raw),
+        _ => current_version,
+    };
+    match deploy
+        .set_overlay_flow_policy_if_match(&expected, &bytes)
+        .await
+    {
+        Ok(version) => {
+            let warning = first_policy.then(|| {
+                "stored the FIRST overlay flow policy — the mint gate is now ON and DEFAULT-DENY \
+                 within: every dial/expose mint NOT matched by a `permit` is denied. Preview with \
+                 `POST /api/overlay/policy/test` before relying on it."
+                    .to_string()
+            });
+            let mut resp = Json(OverlayPolicyPutResponse {
+                version: version.as_str().to_string(),
+                warning,
+            })
+            .into_response();
+            set_policy_etag(&mut resp, &version);
+            resp
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `POST /api/overlay/policy/test` request: a dry-run scenario (NO mint). Evaluates against the
+/// optional inline `policy` (pre-store preview) or, when omitted, the STORED policy.
+#[derive(Deserialize)]
+pub(super) struct OverlayPolicyTestRequest {
+    /// Cedar policy text to evaluate against (pre-store preview); omit to use the stored policy.
+    #[serde(default)]
+    policy: Option<String>,
+    /// The flow action to simulate: `dial` or `expose`.
+    action: String,
+    /// The target service name (the `Overlay::Service` uid).
+    service: String,
+    /// The holder key (the `Overlay::Holder` uid).
+    holder: String,
+    /// Optional holder attributes a bound member credential would supply (absent ⇒ key-only).
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    enrolled: Option<bool>,
+    /// Optional `requestor` for the context (defaults to `test`).
+    #[serde(default)]
+    requestor: Option<String>,
+    /// Optional `src_ip` for the context.
+    #[serde(default)]
+    src_ip: Option<String>,
+    /// The requested TTL (seconds) to evaluate.
+    ttl_requested: u64,
+    /// Optional `now` (Unix seconds) for a `not_after` bound; defaults to the server clock.
+    #[serde(default)]
+    now: Option<u64>,
+}
+
+/// `POST /api/overlay/policy/test` response: the dry-run decision + the deciding policies +
+/// diagnostics. Unlike the mint 403, this surface DOES expose the deciding policies/diagnostics —
+/// it is `System·Admin`-only (the policy author), so it is not an oracle for a lesser principal.
+#[derive(Serialize)]
+struct OverlayPolicyTestResponse {
+    /// `allow` or `deny`.
+    decision: String,
+    /// The policy-imposed TTL ceiling (seconds) on an allow, or `null` (no shrink / deny).
+    ttl_ceiling: Option<u64>,
+    /// The ids of the deciding policies (Cedar's `reason`).
+    deciding_policies: Vec<String>,
+    /// Evaluation diagnostics (errored conditions, etc.).
+    diagnostics: Vec<String>,
+    /// A human note about the policy posture (feature off / corrupt), when relevant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Dry-run the flow gate (NO mint). Gated `System·Admin`. Resolves the policy (inline preview or
+/// stored), builds the holder principal + context from the request, evaluates, and returns the
+/// decision + deciding policies + diagnostics. Mirrors the live gate's four-state posture: feature
+/// off ⇒ allow (ungated); corrupt stored policy ⇒ deny (fail-closed), both annotated in `note`.
+pub(super) async fn test_overlay_policy(
+    State(deploy): State<DeployStore>,
+    Json(req): Json<OverlayPolicyTestRequest>,
+) -> Response {
+    if let Some(forbidden) =
+        assert_overlay_policy_is_system_admin("POST", "/api/overlay/policy/test")
+    {
+        return forbidden;
+    }
+    use boatramp_core::overlay_policy::{
+        Decision, FlowAction, FlowContext, FlowPolicy, HolderPrincipal,
+    };
+    let action = match req.action.as_str() {
+        "dial" => FlowAction::Dial,
+        "expose" => FlowAction::Expose,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("action must be `dial` or `expose`, got `{other}`\n"),
+            )
+                .into_response();
+        }
+    };
+    // Resolve the policy to evaluate: the inline preview, else the stored four-state.
+    let fp = match &req.policy {
+        Some(src) if !src.trim().is_empty() => match FlowPolicy::compile(src) {
+            Ok(fp) => Some(fp),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid overlay flow policy: {err}\n"),
+                )
+                    .into_response();
+            }
+        },
+        _ => match deploy.get_overlay_flow_policy_versioned().await {
+            Ok((None, _)) => None,
+            Ok((Some(b), _)) if b.iter().all(u8::is_ascii_whitespace) => None,
+            Ok((Some(b), _)) => {
+                match std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| FlowPolicy::compile(s).ok())
+                {
+                    Some(fp) => Some(fp),
+                    None => {
+                        // Corrupt stored policy — mirror the live gate's fail-closed deny-all.
+                        return Json(OverlayPolicyTestResponse {
+                            decision: "deny".into(),
+                            ttl_ceiling: None,
+                            deciding_policies: Vec::new(),
+                            diagnostics: Vec::new(),
+                            note: Some(
+                                "stored flow policy is corrupt — the live gate fails closed \
+                                 (deny-all)"
+                                    .into(),
+                            ),
+                        })
+                        .into_response();
+                    }
+                }
+            }
+            Err(err) => return deploy_error_response(err),
+        },
+    };
+    let Some(fp) = fp else {
+        // Feature off (no policy / empty) — the mint would be allowed ungated.
+        return Json(OverlayPolicyTestResponse {
+            decision: "allow".into(),
+            ttl_ceiling: None,
+            deciding_policies: Vec::new(),
+            diagnostics: Vec::new(),
+            note: Some(
+                "no flow policy in effect (feature off) — the mint is allowed ungated".into(),
+            ),
+        })
+        .into_response();
+    };
+    let principal = HolderPrincipal {
+        key: req.holder.clone(),
+        role: req.role.clone(),
+        scope: req.scope.clone(),
+        enrolled: req.enrolled,
+    };
+    let ctx = FlowContext {
+        requestor: req.requestor.clone().unwrap_or_else(|| "test".to_string()),
+        now: req.now.unwrap_or_else(now_unix),
+        src_ip: req.src_ip.clone(),
+        ttl_requested: req.ttl_requested,
+    };
+    let outcome = fp.evaluate(&principal, action, &req.service, &ctx);
+    let (decision, ttl_ceiling) = match outcome.decision {
+        Decision::Allow { ttl_ceiling } => ("allow", ttl_ceiling),
+        Decision::Deny => ("deny", None),
+    };
+    Json(OverlayPolicyTestResponse {
+        decision: decision.to_string(),
+        ttl_ceiling,
+        deciding_policies: outcome.deciding_policies,
+        diagnostics: outcome.diagnostics,
+        note: None,
+    })
+    .into_response()
+}
+
 /// The extra trusted root anchors (make-before-break rotation).
 pub(super) async fn list_root_anchors(State(deploy): State<DeployStore>) -> Response {
     match deploy.list_root_anchors().await {
@@ -2249,5 +2704,555 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ===== Overlay follow-up #3: the per-flow access gate =====================================
+
+    use boatramp_core::overlay_policy::FlowAction;
+    use std::sync::Arc as StdArc;
+
+    /// An `Auth` over a fresh in-memory KV, optionally pre-seeded with a stored flow policy.
+    async fn auth_with_flow_policy(root: &LocalSigner, policy: Option<&str>) -> Auth {
+        let kv: StdArc<dyn KvStore> = StdArc::new(MemoryKv::new());
+        if let Some(p) = policy {
+            kv.put(
+                boatramp_core::authz::OVERLAY_FLOW_POLICY_KEY,
+                p.as_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+        }
+        Auth::with_key(root.public_key(), kv)
+    }
+
+    fn ed25519() -> LocalSigner {
+        LocalSigner::generate(TokenAlg::Ed25519)
+    }
+
+    fn test_principal() -> crate::auth::VerifiedPrincipal {
+        crate::auth::VerifiedPrincipal {
+            subject: "tok-1".into(),
+            roles: Vec::new(),
+        }
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// MINT-GATE — ALLOW when no policy is stored (feature off): the requested TTL is returned
+    /// untouched, preserving pre-feature behavior.
+    #[tokio::test]
+    async fn flow_gate_allows_when_policy_absent() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(&root, None).await;
+        let holder = ed25519().public_key();
+        let p = test_principal();
+        let ttl = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            3600,
+            now_unix(),
+        )
+        .await
+        .expect("no policy → allow");
+        assert_eq!(ttl, 3600, "feature off → allow at the requested ttl");
+    }
+
+    /// MINT-GATE — DENY (403, non-enumerable body) when a policy is stored and no `permit` matches.
+    /// MUTATION-RED: if the Deny arm were turned into an allow, `unwrap_err` would panic.
+    #[tokio::test]
+    async fn flow_gate_denies_when_stored_and_no_permit() {
+        let root = ed25519();
+        // Permits only svc/other → svc/db is denied by default-deny.
+        let auth = auth_with_flow_policy(
+            &root,
+            Some(r#"permit(principal, action, resource == Overlay::Service::"svc/other");"#),
+        )
+        .await;
+        let holder = ed25519().public_key();
+        let p = test_principal();
+        let err = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            3600,
+            now_unix(),
+        )
+        .await
+        .expect_err("a stored policy with no matching permit must DENY");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // REQUIRED #6 — the 403 body is short + non-enumerable (no policy names / diagnostics).
+        let body = body_string(err).await;
+        assert_eq!(body.trim(), "flow denied by policy");
+        assert!(
+            !body.contains("svc/") && !body.contains("policy0"),
+            "the mint 403 must not enumerate policy detail: {body:?}"
+        );
+    }
+
+    /// MINT-GATE — ALLOW when a stored policy permits; the returned TTL is the requested one.
+    #[tokio::test]
+    async fn flow_gate_allows_when_stored_and_permit() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(&root, Some("permit(principal, action, resource);")).await;
+        let holder = ed25519().public_key();
+        let p = test_principal();
+        let ttl = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            3600,
+            now_unix(),
+        )
+        .await
+        .expect("a matching permit → allow");
+        assert_eq!(ttl, 3600);
+    }
+
+    /// REQUIRED #2a — TTL = min(requested, policy_ceiling): a policy that allows only ttl ≤ 300
+    /// pulls a 3600s request DOWN to 300; a request already within the cap is honored as-is.
+    #[tokio::test]
+    async fn flow_gate_ttl_is_min_of_requested_and_policy_ceiling() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(
+            &root,
+            Some(r#"permit(principal, action, resource) when { context.ttl_requested <= 300 };"#),
+        )
+        .await;
+        let holder = ed25519().public_key();
+        let p = test_principal();
+        let shrunk = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            3600,
+            now_unix(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shrunk, 300, "the policy ceiling must pull the ttl DOWN");
+        let within = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            120,
+            now_unix(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            within, 120,
+            "a request within the cap is honored, never raised"
+        );
+    }
+
+    /// HOLDER-BOUND — a member credential bound to the holder lends its role (a role-gated permit
+    /// then matches); a key-only holder is default-deny-safe; a cred for a DIFFERENT key is 400;
+    /// an invalid (foreign-signed) cred is 400 — never silently downgraded to key-only.
+    #[tokio::test]
+    async fn flow_gate_member_cred_bind_and_rejections() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(
+            &root,
+            Some(
+                r#"permit(principal, action, resource) when { principal has role && principal.role == "node" };"#,
+            ),
+        )
+        .await;
+        let holder_signer = ed25519();
+        let holder = holder_signer.public_key();
+        let p = test_principal();
+        let now = now_unix();
+
+        // Bound cred (role node) → the role-gated permit matches → allow.
+        let cred =
+            cose::mint_overlay_member(&holder, OverlayMemberRole::Node, "svc/db", 300, now, &root)
+                .await
+                .unwrap();
+        let ttl = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            Some(&cred),
+            FlowAction::Dial,
+            "svc/db",
+            120,
+            now,
+        )
+        .await
+        .expect("a bound member cred lends its role → allow");
+        assert_eq!(ttl, 120);
+
+        // Key-only (no cred) → role ABSENT → default-deny-safe (403).
+        let err = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            120,
+            now,
+        )
+        .await
+        .expect_err("a key-only holder must not satisfy a role-gated permit");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        // Cred for a DIFFERENT key → 400 (member_key != holder) — REQUIRED #3b.
+        let other = ed25519().public_key();
+        let cred_other =
+            cose::mint_overlay_member(&other, OverlayMemberRole::Node, "svc/db", 300, now, &root)
+                .await
+                .unwrap();
+        let err = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            Some(&cred_other),
+            FlowAction::Dial,
+            "svc/db",
+            120,
+            now,
+        )
+        .await
+        .expect_err("a cred bound to a different key must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid cred (foreign signer) → 400, not silent key-only.
+        let stranger = ed25519();
+        let bad = cose::mint_overlay_member(
+            &holder,
+            OverlayMemberRole::Node,
+            "svc/db",
+            300,
+            now,
+            &stranger,
+        )
+        .await
+        .unwrap();
+        let err = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            Some(&bad),
+            FlowAction::Dial,
+            "svc/db",
+            120,
+            now,
+        )
+        .await
+        .expect_err("an invalid member cred must be rejected (400), never silent key-only");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// FOUR-STATE (gate level) — a stored-but-corrupt policy fails CLOSED (403), never allow. (The
+    /// read-error → Unavailable → deny case is exercised in `auth`'s four-state test with a failing
+    /// KV; both corrupt and unreadable must deny.)
+    #[tokio::test]
+    async fn flow_gate_fails_closed_on_corrupt_policy() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(&root, Some("this is not a cedar policy")).await;
+        let holder = ed25519().public_key();
+        let p = test_principal();
+        let err = overlay_flow_gate(
+            &auth,
+            Some(&p),
+            &holder,
+            None,
+            FlowAction::Dial,
+            "svc/db",
+            300,
+            now_unix(),
+        )
+        .await
+        .expect_err("a corrupt stored policy must fail closed (deny)");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A trivial storage for a KV-only `DeployStore` (the policy surfaces touch only the KV).
+    struct NullStorage;
+    #[async_trait::async_trait]
+    impl boatramp_core::Storage for NullStorage {
+        async fn get(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::unsupported("null"))
+        }
+        async fn head(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> std::result::Result<(), boatramp_core::StorageError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn deploy_store() -> DeployStore {
+        DeployStore::new(StdArc::new(NullStorage), StdArc::new(MemoryKv::new()))
+    }
+
+    /// PUT HANDLER — validated-on-PUT (a malformed or recurring-temporal policy → 400), the first
+    /// stored policy surfaces the default-deny CLIFF warning, and a GET round-trips the text.
+    #[tokio::test]
+    async fn put_overlay_policy_validates_warns_and_round_trips() {
+        let deploy = deploy_store();
+
+        // Malformed → 400 (validated on PUT), nothing stored.
+        let resp = put_overlay_policy(
+            State(deploy.clone()),
+            axum::http::HeaderMap::new(),
+            "not cedar".to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A recurring/complex temporal condition → 400 (REQUIRED #5).
+        let resp = put_overlay_policy(
+            State(deploy.clone()),
+            axum::http::HeaderMap::new(),
+            r#"permit(principal, action, resource) when { context.now > 1000 };"#.to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A valid FIRST policy → 200 + the cliff warning.
+        let resp = put_overlay_policy(
+            State(deploy.clone()),
+            axum::http::HeaderMap::new(),
+            "permit(principal, action, resource);".to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("warning") && body.to_lowercase().contains("default-deny"),
+            "the FIRST stored policy must surface the default-deny cliff warning: {body}"
+        );
+
+        // GET round-trips the stored text.
+        let resp = get_overlay_policy(State(deploy.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_string(resp).await;
+        assert!(text.contains("permit(principal, action, resource);"));
+    }
+
+    /// TEST HANDLER — the dry-run reflects the stored policy (deny), accepts an inline preview
+    /// policy, and NEVER mints. Also surfaces the feature-off note when no policy is stored.
+    #[tokio::test]
+    async fn test_overlay_policy_dry_run() {
+        let deploy = deploy_store();
+        let holder = ed25519().public_key().to_hex();
+
+        // Feature off → allow (ungated), with a note.
+        let resp = test_overlay_policy(
+            State(deploy.clone()),
+            Json(OverlayPolicyTestRequest {
+                policy: None,
+                action: "dial".into(),
+                service: "svc/db".into(),
+                holder: holder.clone(),
+                role: None,
+                scope: None,
+                enrolled: None,
+                requestor: None,
+                src_ip: None,
+                ttl_requested: 3600,
+                now: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("\"allow\""));
+
+        // Store a deny-shaped policy, then the dry-run reports deny with the deciding policy id.
+        put_overlay_policy(
+            State(deploy.clone()),
+            axum::http::HeaderMap::new(),
+            r#"permit(principal, action, resource == Overlay::Service::"svc/other");"#.to_string(),
+        )
+        .await;
+        let resp = test_overlay_policy(
+            State(deploy.clone()),
+            Json(OverlayPolicyTestRequest {
+                policy: None,
+                action: "dial".into(),
+                service: "svc/db".into(),
+                holder,
+                role: None,
+                scope: None,
+                enrolled: None,
+                requestor: None,
+                src_ip: None,
+                ttl_requested: 3600,
+                now: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains("\"deny\""));
+    }
+
+    /// NARROW-ONLY (full handler) — with a `permit`-all policy + a resolvable directory, a dial
+    /// mints a 201 whose capability is bound to THIS holder and scoped to THIS one service: the
+    /// flow decision gates/bounds the TTL ONLY, it never rewrites scope/holder (REQUIRED #2b/#3c).
+    #[tokio::test]
+    async fn flow_gate_allow_mints_cap_with_unchanged_scope_and_holder() {
+        let root = ed25519();
+        let root_pub = root.public_key();
+        let auth = auth_with_flow_policy(&root, Some("permit(principal, action, resource);")).await;
+        let holder_hex = ed25519().public_key().to_hex();
+        let directory = OverlayDirectory::from_entries([(
+            "svc/db".to_string(),
+            OverlayTarget {
+                relay: "1.2.3.4:9100".into(),
+                relay_id: "ed25519:aa".into(),
+                egress_id: "ed25519:bb".into(),
+                client_auth: "capability-only".into(),
+            },
+        )]);
+        let resp = overlay_dial(
+            Extension(Issuer(Some(StdArc::new(root)))),
+            Extension(directory),
+            Extension(auth),
+            Some(Extension(test_principal())),
+            Json(OverlayDialRequest {
+                service: "svc/db".into(),
+                holder_pubkey: holder_hex.clone(),
+                ttl_secs: Some(120),
+                overlay_member: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = v["token"].as_str().expect("a minted token");
+        let dial = cose::verify_overlay_dial(token, &root_pub, now_unix()).unwrap();
+        assert_eq!(
+            dial.scope, "svc/db",
+            "the policy must NOT rewrite the cap's scope"
+        );
+        assert_eq!(
+            dial.holder, holder_hex,
+            "the policy must NOT rewrite the cap's holder"
+        );
+    }
+
+    /// A deny policy at the full handler → 403 with the flow-denied body (end-to-end).
+    #[tokio::test]
+    async fn overlay_dial_denied_by_flow_policy_returns_403() {
+        let root = ed25519();
+        let auth = auth_with_flow_policy(
+            &root,
+            Some(r#"permit(principal, action, resource == Overlay::Service::"svc/other");"#),
+        )
+        .await;
+        let holder_hex = ed25519().public_key().to_hex();
+        let directory = OverlayDirectory::from_entries([(
+            "svc/db".to_string(),
+            OverlayTarget {
+                relay: "1.2.3.4:9100".into(),
+                relay_id: "ed25519:aa".into(),
+                egress_id: "ed25519:bb".into(),
+                client_auth: "capability-only".into(),
+            },
+        )]);
+        let resp = overlay_dial(
+            Extension(Issuer(Some(StdArc::new(root)))),
+            Extension(directory),
+            Extension(auth),
+            Some(Extension(test_principal())),
+            Json(OverlayDialRequest {
+                service: "svc/db".into(),
+                holder_pubkey: holder_hex,
+                ttl_secs: Some(120),
+                overlay_member: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(resp).await.trim(), "flow denied by policy");
+    }
+
+    /// SYSTEM·ADMIN gating — the three policy routes resolve to `System·Admin` (NOT an `Overlay·*`
+    /// tier), and the in-handler tripwire agrees. A lesser `Overlay·*` right is a different
+    /// resource, so it cannot satisfy the policy routes.
+    #[test]
+    fn overlay_policy_routes_are_system_admin_gated() {
+        use boatramp_core::authz::{Action, Resource, Right};
+        for (m, path) in [
+            ("GET", "/api/overlay/policy"),
+            ("PUT", "/api/overlay/policy"),
+            ("POST", "/api/overlay/policy/test"),
+        ] {
+            let r = Right::required(m, path).expect("mapped");
+            assert_eq!(r.resource, Resource::System, "{m} {path} resource");
+            assert_eq!(r.target, None, "{m} {path} target");
+            assert_eq!(r.action, Action::Admin, "{m} {path} action");
+            assert!(
+                assert_overlay_policy_is_system_admin(m, path).is_none(),
+                "the in-handler tripwire must admit the System·Admin route {m} {path}"
+            );
+        }
+        // The overlay dial/services tiers are a DIFFERENT resource (Overlay), so they cannot
+        // satisfy the System·Admin policy routes — and vice versa (separate authority).
+        assert_eq!(
+            Right::required("POST", "/api/overlay/dial")
+                .unwrap()
+                .resource,
+            Resource::Overlay
+        );
+        assert_eq!(
+            Right::required("GET", "/api/overlay/services")
+                .unwrap()
+                .resource,
+            Resource::Overlay
+        );
     }
 }

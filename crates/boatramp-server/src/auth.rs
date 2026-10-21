@@ -330,6 +330,48 @@ impl Auth {
         }
     }
 
+    /// Verify a root-signed **`overlay-member` credential** against the primary root, then — on
+    /// failure — the replicated rotation anchor set, returning the vouched member key/role/scope
+    /// (overlay follow-up #3). Modeled exactly on [`verify_overlay_enroll_token`](Self::verify_overlay_enroll_token):
+    /// the credential may have been minted under a distinct admission key trusted alongside the
+    /// admin-token root (a make-before-break rotation anchor). The caller MUST still bind the
+    /// returned `member_key` to the dialing/exposing holder key before trusting the attributes.
+    /// `Err` when auth is disabled or the credential verifies under no trusted anchor (bad
+    /// signature / expired / wrong kind / unknown role — all fail-closed).
+    pub async fn verify_overlay_member_token(
+        &self,
+        token: &str,
+        now: u64,
+    ) -> Result<cose::VerifiedOverlayMember, TokenError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(TokenError::Invalid("auth disabled".into()));
+        };
+        match cose::verify_overlay_member(token, &inner.public, now) {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                for anchor in inner.rotation_anchors().await {
+                    if let Ok(v) = cose::verify_overlay_member(token, &anchor, now) {
+                        return Ok(v);
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
+    /// Load the **overlay flow policy** for a mint decision, through the SAME MF-3-fenced,
+    /// fail-closed store the RBAC policy uses (overlay follow-up #3). Returns one of the four
+    /// states ([`FlowPolicyLoad`]). `is_write` should be `true` at a mint point (dial/expose are
+    /// POSTs), so a shared-mode node reads THROUGH to the live store rather than a possibly-stale
+    /// cache. When auth is **disabled** (dev) there is no fenced store and no principal, so the
+    /// gate is reported OFF (the dev control plane is already open).
+    pub async fn overlay_flow_policy(&self, is_write: bool) -> FlowPolicyLoad {
+        match self.inner.as_ref() {
+            None => FlowPolicyLoad::Off,
+            Some(inner) => inner.overlay_flow_policy(is_write).await,
+        }
+    }
+
     /// Like [`verify_bearer`](Self::verify_bearer), but returns the token's
     /// granted roles on success. `whoami` uses this so it reports an identity
     /// only for a token that is authentic, **unexpired, and unrevoked** — not for
@@ -355,7 +397,7 @@ impl Auth {
         path: &str,
         pop_proof: Option<&str>,
         body_hash: Option<String>,
-    ) -> Result<PrincipalKind, Reject> {
+    ) -> Result<(PrincipalKind, VerifiedPrincipal), Reject> {
         let inner = self
             .inner
             .as_ref()
@@ -363,7 +405,10 @@ impl Auth {
         // Endpoints not gated by a right (the OIDC→token exchange) authenticate
         // by other means; the router still requires *some* bearer to reach here.
         let Some(required) = Right::required(method, path) else {
-            return Ok(PrincipalKind::Tenant);
+            // Endpoints gated only by holding *some* bearer (the handler verifies it): no RBAC
+            // principal is derived here, so carry an empty one — these paths never reach the
+            // overlay mint gate (which reads the principal).
+            return Ok((PrincipalKind::Tenant, VerifiedPrincipal::empty()));
         };
         let now = now_unix();
         // A control-plane WRITE confirms its authz against the live store (never a stale cache) in
@@ -429,6 +474,15 @@ impl Auth {
                 overlay_deny_body(path).unwrap_or("token not authorized for this resource\n"),
             ));
         }
+        // The verified, RBAC-authorized principal — the token's authority id (`cti`) as the
+        // subject and its normalized granted roles. Stashed by `require_auth` as a request
+        // extension so a downstream mint handler (overlay dial/expose) can feed the flow-policy
+        // gate's `requestor` context WITHOUT re-verifying a credential (the structural gap this
+        // closes: `authorize` is the only place the principal is known, so it must hand it back).
+        let principal = VerifiedPrincipal {
+            subject: verified.cti.clone(),
+            roles: roles.clone(),
+        };
         // PLAN-system-principal P2 — derive the deployer's CLASS from the SAME verified, normalized
         // grants and the SAME compiled policy that just authorized the request: a token that
         // satisfies the node-global `System·Admin` right (`Resource::System`, no project scope,
@@ -440,7 +494,7 @@ impl Auth {
         // `run_as: deployer` cron would fire as system. Compiled out of shipped builds; the gate then
         // goes RED (a non-System·Admin deployer must classify as Tenant).
         if sysprincipal_mutation().as_deref() == Some("deploy_class_any_is_system") {
-            return Ok(PrincipalKind::System);
+            return Ok((PrincipalKind::System, principal));
         }
         let system_admin = Right::new(Resource::System, None, Action::Admin);
         let kind = if compiled.authorize(&roles, &system_admin) {
@@ -448,7 +502,7 @@ impl Auth {
         } else {
             PrincipalKind::Tenant
         };
-        Ok(kind)
+        Ok((kind, principal))
     }
 }
 
@@ -665,6 +719,58 @@ impl AuthInner {
             }
         }
     }
+
+    /// Load the **overlay flow policy** from `overlay/flow-policy` through the fenced authz store,
+    /// returning its four-state posture (overlay follow-up #3, REQUIRED #1). Unlike the RBAC
+    /// [`policy`](Self::policy) — whose absent/unreadable cases BOTH fall to the built-in default —
+    /// this gate is default-ALLOW when OFF, so the absent-vs-unreadable distinction is strict:
+    ///
+    /// - `Ok(None)` (absent) **or** `Ok(Some(empty))` (confirmed-empty) → [`FlowPolicyLoad::Off`]
+    ///   (feature off, preserve pre-feature behavior);
+    /// - `Ok(Some(bytes))` that compiles → [`FlowPolicyLoad::Present`] (evaluate it);
+    /// - `Ok(Some(bytes))` that does NOT compile → [`FlowPolicyLoad::Corrupt`] (fail-closed deny-all);
+    /// - `Err(_)` (store unreachable / partition / fence-miss read-through error) →
+    ///   [`FlowPolicyLoad::Unavailable`] (fail-closed DENY) — NEVER treated as absent→allow.
+    ///
+    /// A read error fails closed here regardless of single-writer vs shared mode: because the gate
+    /// is default-ALLOW when off, a read error that fell through to "absent" would silently flip a
+    /// deny-policy node to allow — the exact hole this strictness closes.
+    async fn overlay_flow_policy(&self, is_write: bool) -> FlowPolicyLoad {
+        let (store, via_read_through) = self.authz_read_store(is_write);
+        match store.get(authz::OVERLAY_FLOW_POLICY_KEY).await {
+            Ok(opt) => {
+                // A SUCCESSFUL read-through re-confirms the MF-3 fence (mirrors `policy`).
+                if via_read_through && let Some(s) = &self.shared {
+                    s.fence.confirm();
+                }
+                match opt {
+                    // Absent OR confirmed-empty → the gate is OFF (allow).
+                    None => FlowPolicyLoad::Off,
+                    Some(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => FlowPolicyLoad::Off,
+                    Some(bytes) => match std::str::from_utf8(&bytes)
+                        .map_err(|e| e.to_string())
+                        .and_then(|src| {
+                            boatramp_core::overlay_policy::FlowPolicy::compile(src)
+                                .map_err(|e| e.to_string())
+                        }) {
+                        Ok(fp) => FlowPolicyLoad::Present(Box::new(fp)),
+                        Err(err) => {
+                            // A STORED-but-corrupt policy fails closed to deny-all (NOT to the
+                            // RBAC brick-guard's "use the default" — there is no safe default to
+                            // fall to for an access gate).
+                            tracing::warn!(%err, "overlay/flow-policy is corrupt; failing closed (deny-all)");
+                            FlowPolicyLoad::Corrupt
+                        }
+                    },
+                }
+            }
+            Err(err) => {
+                // Store unreachable / partition → fail CLOSED (deny), NEVER absent→allow.
+                tracing::warn!(%err, "could not read overlay/flow-policy; failing closed (deny)");
+                FlowPolicyLoad::Unavailable
+            }
+        }
+    }
 }
 
 /// How long a shed (503) control-plane request should wait before retrying, in seconds. Mirrors the
@@ -789,12 +895,17 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
         .authorize(&bearer, &method, &path, pop_proof.as_deref(), body_hash)
         .await
     {
-        Ok(kind) => {
+        Ok((kind, principal)) => {
             // PLAN-system-principal P2: stash the SERVER-DERIVED deployer class as a request extension
             // for the deploy handler to capture onto `DeployMeta`. A client can neither set nor read
             // it (it is computed here from the verified rights, after authorization passed).
             let mut request = request;
             request.extensions_mut().insert(VerifiedDeployClass(kind));
+            // Also stash the verified principal (subject + granted roles) for the overlay mint
+            // gate's `requestor` context (overlay follow-up #3). Server-derived + server-only, like
+            // the class above — present only after authorization passed; absent when auth is
+            // disabled (the overlay handlers then treat the flow gate as off).
+            request.extensions_mut().insert(principal);
             next.run(request).await
         }
         Err(reject) => reject.into_response(),
@@ -807,6 +918,52 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
 /// client-settable. Absent when auth is disabled (dev), so a deploy then captures no class.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifiedDeployClass(pub PrincipalKind);
+
+/// The verified, RBAC-authorized API principal (overlay follow-up #3), derived in [`require_auth`]
+/// from the authorized token and carried as a request extension so the overlay dial/expose mint
+/// handlers can feed the flow-policy gate's `requestor` context. SERVER-DERIVED and server-only —
+/// never client-settable. Absent when auth is disabled (dev), so the overlay handlers then treat
+/// the flow gate as off.
+#[derive(Debug, Clone)]
+pub struct VerifiedPrincipal {
+    /// The token's authority/revocation id (`cti`) — a stable identifier of the principal, used as
+    /// the flow policy's `context.requestor`.
+    pub subject: String,
+    /// The principal's normalized granted roles (the same roles that just authorized the request).
+    /// Stashed for a later increment (role-aware flow conditions); increment 1's gate feeds only
+    /// `subject` into the Cedar context, so this is not yet read on the live path.
+    #[allow(dead_code)]
+    pub roles: Vec<authz::GrantedRole>,
+}
+
+impl VerifiedPrincipal {
+    /// An empty principal (no subject, no roles) — for a request gated only by holding some bearer
+    /// (the handler verifies it), where no RBAC principal is derived.
+    pub fn empty() -> Self {
+        Self {
+            subject: String::new(),
+            roles: Vec::new(),
+        }
+    }
+}
+
+/// The outcome of loading the overlay flow policy at the mint point — the **four states** that keep
+/// the gate fail-closed (overlay follow-up #3, REQUIRED #1). An absent or confirmed-empty policy is
+/// the feature being OFF (allow, preserving pre-feature behavior); a present policy is compiled +
+/// evaluated; a stored-but-corrupt policy fails closed to deny-all; a KV read error / partition
+/// fails closed to deny — the absent-vs-unreadable distinction is load-bearing and NEVER collapsed
+/// to absent→allow.
+pub enum FlowPolicyLoad {
+    /// No policy stored (absent key) or a confirmed-empty policy → the gate is OFF (allow).
+    Off,
+    /// A compiled, ready-to-evaluate flow policy.
+    Present(Box<boatramp_core::overlay_policy::FlowPolicy>),
+    /// A stored policy that failed to parse/compile → fail-closed DENY-ALL.
+    Corrupt,
+    /// The policy store was unreachable (read error / partition / fence-miss) → fail-closed DENY.
+    /// NEVER treated as absent→allow.
+    Unavailable,
+}
 
 /// Buffer a write request's body (when its declared length fits the PoP hash
 /// bound) so the auth layer can bind its hash, reconstructing the request from the
@@ -969,6 +1126,127 @@ mod tests {
         );
     }
 
+    /// `verify_overlay_member_token` accepts a root-signed `overlay-member` credential (returning the
+    /// vouched member key/role/scope) and rejects an expired one, a wrong-kind token, and a
+    /// foreign-signer credential — the anchor wiring the overlay mint gate relies on to trust a
+    /// presented holder's role/scope (overlay follow-up #3).
+    #[tokio::test]
+    async fn verify_overlay_member_token_accepts_valid_rejects_expired_wrong_kind_and_forged() {
+        use boatramp_core::cose::{OverlayMemberRole, mint_join, mint_overlay_member};
+        const NOW: u64 = 1_000_000;
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+        let auth = auth_with(&root, false);
+        let member = LocalSigner::generate(TokenAlg::Ed25519).public_key();
+
+        let cred = mint_overlay_member(&member, OverlayMemberRole::Node, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = auth
+            .verify_overlay_member_token(&cred, NOW + 10)
+            .await
+            .expect("a valid member credential verifies under the anchor");
+        assert_eq!(v.role, OverlayMemberRole::Node);
+        assert_eq!(v.scope, "svc/db");
+        assert_eq!(v.member_key, member.to_hex());
+
+        // Expired, wrong-kind, and foreign-signer credentials are all rejected (fail-closed).
+        assert!(
+            auth.verify_overlay_member_token(&cred, NOW + 10_000)
+                .await
+                .is_err()
+        );
+        let join = mint_join(300, NOW, &root).await.unwrap();
+        assert!(
+            auth.verify_overlay_member_token(&join, NOW + 10)
+                .await
+                .is_err()
+        );
+        let stranger = LocalSigner::generate(TokenAlg::Ed25519);
+        let forged = mint_overlay_member(
+            &member,
+            OverlayMemberRole::Node,
+            "svc/db",
+            300,
+            NOW,
+            &stranger,
+        )
+        .await
+        .unwrap();
+        assert!(
+            auth.verify_overlay_member_token(&forged, NOW + 10)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The overlay flow-policy load is FOUR states, fail-closed (overlay follow-up #3, REQUIRED #1).
+    /// The READ-ERROR case is the load-bearing, mutation-RED one: a store read error must fail
+    /// CLOSED (`Unavailable` / deny), NEVER collapse to `Off` (absent→allow) — if it did, a node
+    /// with a deny policy would silently flip to allow during a partition.
+    #[tokio::test]
+    async fn overlay_flow_policy_four_states_fail_closed() {
+        use boatramp_core::authz::OVERLAY_FLOW_POLICY_KEY;
+        let root = LocalSigner::generate(TokenAlg::Ed25519);
+
+        // (1) ABSENT (empty store) → Off (feature off → allow, preserving pre-feature behavior).
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let auth = Auth::with_key(root.public_key(), kv.clone());
+        assert!(
+            matches!(auth.overlay_flow_policy(true).await, FlowPolicyLoad::Off),
+            "an ABSENT policy must load as Off (feature off → allow)"
+        );
+
+        // (2) confirmed-EMPTY → Off (NOT deny — this is the explicit second off-state).
+        kv.put(OVERLAY_FLOW_POLICY_KEY, Vec::new()).await.unwrap();
+        assert!(
+            matches!(auth.overlay_flow_policy(true).await, FlowPolicyLoad::Off),
+            "a confirmed-EMPTY policy must load as Off, not deny"
+        );
+
+        // (3) PRESENT + valid → Present (evaluated).
+        kv.put(
+            OVERLAY_FLOW_POLICY_KEY,
+            b"permit(principal, action, resource);".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                auth.overlay_flow_policy(true).await,
+                FlowPolicyLoad::Present(_)
+            ),
+            "a valid stored policy must load as Present"
+        );
+
+        // (4) PRESENT + corrupt → Corrupt (fail-closed deny-all), NEVER Off.
+        kv.put(OVERLAY_FLOW_POLICY_KEY, b"this is not cedar".to_vec())
+            .await
+            .unwrap();
+        let corrupt = auth.overlay_flow_policy(true).await;
+        assert!(
+            matches!(corrupt, FlowPolicyLoad::Corrupt),
+            "a corrupt stored policy must fail closed (Corrupt/deny-all)"
+        );
+        assert!(
+            !matches!(corrupt, FlowPolicyLoad::Off),
+            "a corrupt policy must NEVER collapse to Off (allow)"
+        );
+
+        // (5) READ ERROR / partition → Unavailable (fail-closed DENY). MUTATION-RED: treating the
+        // Err arm as absent→Off would turn this RED.
+        let failing: Arc<dyn KvStore> = Arc::new(FailingKv);
+        let auth_err = Auth::with_key(root.public_key(), failing);
+        let load = auth_err.overlay_flow_policy(true).await;
+        assert!(
+            matches!(load, FlowPolicyLoad::Unavailable),
+            "a KV read error MUST fail closed (Unavailable/DENY)"
+        );
+        assert!(
+            !matches!(load, FlowPolicyLoad::Off),
+            "a read error must NEVER be treated as absent→Off (the absent→allow hole this closes)"
+        );
+    }
+
     /// Make-before-break root rotation: a token signed by a **new** root verifies
     /// only once that key is trusted as a rotation anchor (`auth/root/*`), while
     /// the **primary** root's tokens keep verifying throughout — so there is no
@@ -1017,7 +1295,10 @@ mod tests {
 
         let admin = cose::mint(&admin_claims(now), &root).await.unwrap();
         assert_eq!(
-            auth.authorize(&admin, "GET", PATH, None, None).await.ok(),
+            auth.authorize(&admin, "GET", PATH, None, None)
+                .await
+                .ok()
+                .map(|(k, _)| k),
             Some(PrincipalKind::System),
             "a global System·Admin deployer is captured as the system class"
         );
@@ -1040,7 +1321,8 @@ mod tests {
         assert_eq!(
             auth.authorize(&operator, "GET", PATH, None, None)
                 .await
-                .ok(),
+                .ok()
+                .map(|(k, _)| k),
             Some(PrincipalKind::Tenant),
             "an operator (System·Read, not System·Admin) is NOT the system class"
         );

@@ -139,6 +139,7 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET` | `/api/overlay/services` | `overlay` · `read` |
 | `POST` | `/api/overlay/dial` | `overlay` · `write` (mint a holder-bound dial capability) |
 | `POST` | `/api/overlay/expose` | `overlay` · `admin` — minting a **publish** capability claims a service name forward clients pin, strictly above dial's `overlay` · `write` |
+| `GET`/`PUT`/`POST` | `/api/overlay/policy[/test]` | `system` · `admin` — editing the overlay **flow policy** is a node-admin act, and `GET`/`test` are a policy-enumeration oracle, so all three sit at the top tier (**not** an `overlay·*` right). The flow policy is a *separate* gate that can only deny-or-shrink a mint `overlay·write`/`admin` already permits — a first step toward the per-name publish scoping the `overlay·admin` note above calls for. |
 | `POST`/`DELETE` | `/api/tokens[/<id>]` | `tokens` · `admin` |
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |

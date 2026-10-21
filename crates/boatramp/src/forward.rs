@@ -111,6 +111,17 @@ pub enum ForwardError {
          use a `--ticket` from `boatramp overlay grant` for a control-plane-less forward."
     )]
     Unauthorized,
+    /// 403 from the control plane carrying the FLOW-POLICY body (overlay follow-up #3): RBAC
+    /// passed — the token DOES hold `Overlay·Write` — but an operator-authored flow policy denied
+    /// this specific mint. Distinct from [`Unauthorized`](Self::Unauthorized) so the user is NOT
+    /// told to obtain a right they already have.
+    #[error(
+        "overlay forward denied by this cluster's flow policy — your token is authorized \
+         (`Overlay·Write`), but an operator access policy does not permit dialing this service \
+         (or not at this time/TTL). Ask an admin to review the overlay flow policy \
+         (`boatramp overlay policy ls` / `… test`)."
+    )]
+    FlowDenied,
     /// The eager startup preflight dial failed, so we refuse to bind a dead port (finding C).
     #[error("overlay preflight failed: {0}")]
     Preflight(String),
@@ -316,6 +327,13 @@ async fn resolve_via_control_plane(
         return Err(ForwardError::Unauthenticated);
     }
     if status.as_u16() == 403 {
+        // A 403 is EITHER a missing RBAC right OR a flow-policy denial (overlay follow-up #3).
+        // Read the body to tell them apart so we don't tell the user to get `Overlay·Write` they
+        // already hold. The flow-denied body is the server's short, non-enumerable marker.
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("flow denied by policy") {
+            return Err(ForwardError::FlowDenied);
+        }
         return Err(ForwardError::Unauthorized);
     }
     if !status.is_success() {

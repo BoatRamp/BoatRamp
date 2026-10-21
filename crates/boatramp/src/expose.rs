@@ -154,6 +154,17 @@ pub enum ExposeError {
          `boatramp overlay grant-expose` for a control-plane-less expose."
     )]
     Unauthorized,
+    /// 403 from the control plane carrying the FLOW-POLICY body (overlay follow-up #3): RBAC
+    /// passed — the token DOES hold `Overlay·Admin` — but an operator flow policy denied this
+    /// specific publish mint. Distinct from [`Unauthorized`](Self::Unauthorized) so the user is
+    /// NOT told to obtain a right they already have.
+    #[error(
+        "overlay expose denied by this cluster's flow policy — your token is authorized \
+         (`Overlay·Admin`), but an operator access policy does not permit publishing this service \
+         (or not at this time/TTL). Ask an admin to review the overlay flow policy \
+         (`boatramp overlay policy ls` / `… test`)."
+    )]
+    FlowDenied,
 }
 
 /// Parse an overlay identity given as bech32 (`bro1…`) or canonical hex (`ed25519:<hex>`).
@@ -289,6 +300,13 @@ async fn resolve_via_control_plane(
         return Err(ExposeError::Unauthenticated);
     }
     if status.as_u16() == 403 {
+        // A 403 is EITHER a missing RBAC right OR a flow-policy denial (overlay follow-up #3) —
+        // read the body to distinguish, so we don't tell the user to get `Overlay·Admin` they
+        // already hold. The flow-denied body is the server's short, non-enumerable marker.
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("flow denied by policy") {
+            return Err(ExposeError::FlowDenied);
+        }
         return Err(ExposeError::Unauthorized);
     }
     if !status.is_success() {

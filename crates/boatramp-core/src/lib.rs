@@ -29,6 +29,8 @@ pub mod crownjewel;
 /// never require mutating the global process environment.
 pub mod env;
 pub mod envelope;
+#[cfg(feature = "authz")]
+pub mod overlay_policy;
 // `compute` extends the wasm-clean `boatramp_types::compute` (re-exported within)
 // with the native control-plane layer: the `ComputeBackend` trait, the scheduler,
 // and the reconcile logic.

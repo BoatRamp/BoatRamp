@@ -43,6 +43,7 @@ the owning `(project, site)`.
 | `projectmeta/<proj>` | **mutable pointer** → the content hash of a project's current spec |
 | `owner/<kind>/<name>` | reverse index: a resource `(kind, name)` → its owning project (single-membership guard) |
 | `authz/policy` | the RBAC `AuthzPolicy` (roles → right templates); absent ⇒ the built-in default |
+| `overlay/flow-policy` | the operator-authored overlay **flow policy** (Cedar TEXT, the `Overlay` namespace) gating the dial/publish-cap mint; absent *or empty* ⇒ the gate is off (allow); corrupt or unreadable ⇒ fail-closed deny. Separate from `authz/policy` |
 | `authz/tokens/<id>` | `TokenMeta` for an issued token (label, roles, timestamps); keyed by its authority revocation id. The token itself is never stored |
 | `authz/revoked/<id>` | a revocation marker (presence ⇒ the token with that authority revocation id, and its attenuations, is revoked) |
 | `cert/<domain>` | a `StoredCert` (chain + key + expiry) — the cluster-managed cert store |

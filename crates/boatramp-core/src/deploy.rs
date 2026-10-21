@@ -337,6 +337,63 @@ pub async fn policy_set_if_match(
     Ok(PolicyVersion::of(Some(&new_bytes)))
 }
 
+/// Read the stored **overlay flow policy** (Cedar TEXT) and its [`PolicyVersion`] (ETag) from
+/// `kv`, at [`OVERLAY_FLOW_POLICY_KEY`](crate::authz::OVERLAY_FLOW_POLICY_KEY). `None` ⇒ no policy
+/// stored (the gate's feature is off). The bytes are returned RAW (the policy is Cedar text, not a
+/// serialized struct); the caller compiles them. The optimistic-concurrency version is the hash of
+/// the exact stored bytes — the `GET /api/overlay/policy` surface returns it as an `ETag`, and a
+/// subsequent `PUT` supplies it as `If-Match` (identical shape to the RBAC [`policy_read_versioned`]).
+pub async fn overlay_flow_policy_read_versioned(
+    kv: &dyn KvStore,
+) -> Result<(Option<Vec<u8>>, PolicyVersion), DeployError> {
+    let raw = kv.get(crate::authz::OVERLAY_FLOW_POLICY_KEY).await?;
+    let version = PolicyVersion::of(raw.as_deref());
+    Ok((raw, version))
+}
+
+/// Store the overlay flow policy (RAW Cedar text bytes) on `kv` IFF the stored policy still matches
+/// `expected` — a value-CAS on the prior bytes (optimistic concurrency / `If-Match`). A stale
+/// `expected`, or a concurrent edit landing in the read→CAS window, returns [`DeployError::Conflict`]
+/// so the caller re-reads and retries — closing the lost-edit race when two operators edit on
+/// different nodes. The caller validates the policy first (the route compiles it before storing).
+/// Returns the new version. Mirrors [`policy_set_if_match`] (minus the RBAC-only MF-1 seam).
+pub async fn overlay_flow_policy_set_if_match(
+    kv: &dyn KvStore,
+    expected: &PolicyVersion,
+    new_bytes: &[u8],
+) -> Result<PolicyVersion, DeployError> {
+    let current_raw = kv.get(crate::authz::OVERLAY_FLOW_POLICY_KEY).await?;
+    let current_version = PolicyVersion::of(current_raw.as_deref());
+    if current_version != *expected {
+        return Err(DeployError::Conflict(format!(
+            "overlay/flow-policy was modified concurrently (current version {current_version}); \
+             GET the current policy and retry the PUT with its If-Match"
+        )));
+    }
+    // A successful CAS through `CheckpointKv` advances the durable frontier before returning (the
+    // same durability the RBAC policy write gets), so a flow-gate tightening cannot be dropped by a
+    // self-heal trailing-tail quarantine.
+    let swapped = kv
+        .compare_and_swap(
+            crate::authz::OVERLAY_FLOW_POLICY_KEY,
+            current_raw.as_deref(),
+            new_bytes.to_vec(),
+        )
+        .await?;
+    if !swapped {
+        let now = PolicyVersion::of(
+            kv.get(crate::authz::OVERLAY_FLOW_POLICY_KEY)
+                .await?
+                .as_deref(),
+        );
+        return Err(DeployError::Conflict(format!(
+            "overlay/flow-policy was modified concurrently (current version {now}); GET the \
+             current policy and retry the PUT with its If-Match"
+        )));
+    }
+    Ok(PolicyVersion::of(Some(new_bytes)))
+}
+
 pub(crate) mod keys {
     //! The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]),
     //! so the persisted layout is legible at a glance instead of scattered through
@@ -3004,6 +3061,29 @@ impl DeployStore {
         let (_current, version) = self.get_authz_policy_versioned().await?;
         self.set_authz_policy_if_match(&version, policy).await?;
         Ok(())
+    }
+
+    /// Read the stored **overlay flow policy** (Cedar TEXT bytes) together with its
+    /// optimistic-concurrency [`PolicyVersion`] (ETag). `None` ⇒ no policy stored (the gate's
+    /// feature is off). Backs `GET /api/overlay/policy` and the `test` dry-run. Separate from the
+    /// RBAC policy — a distinct KV key, a distinct Cedar namespace (see [`crate::overlay_policy`]).
+    pub async fn get_overlay_flow_policy_versioned(
+        &self,
+    ) -> Result<(Option<Vec<u8>>, PolicyVersion), DeployError> {
+        overlay_flow_policy_read_versioned(self.kv.as_ref()).await
+    }
+
+    /// Store the overlay flow policy (RAW Cedar text bytes) IFF the stored policy still matches
+    /// `expected` (optimistic concurrency / `If-Match`). A stale `expected`, or a concurrent edit
+    /// in the read→CAS window, returns [`DeployError::Conflict`] (surfaced `409`). The caller
+    /// validates/compiles the policy first; the write rides the existing cache invalidation so
+    /// every node picks it up. Returns the new version.
+    pub async fn set_overlay_flow_policy_if_match(
+        &self,
+        expected: &PolicyVersion,
+        new_bytes: &[u8],
+    ) -> Result<PolicyVersion, DeployError> {
+        overlay_flow_policy_set_if_match(self.kv.as_ref(), expected, new_bytes).await
     }
 
     /// Trust an additional **root anchor** (`auth rotate-root`): a `TokenPublicKey`
@@ -8049,5 +8129,57 @@ mod tests {
 
         // A DIFFERENT fingerprint partition is a miss — an incompatible node never fetches.
         assert!(!store.has_aot_artifact("cafe", &wasm_hash).await.unwrap());
+    }
+
+    /// The overlay flow-policy storage (overlay follow-up #3): absent reads as `None` + the ABSENT
+    /// version; a set round-trips the RAW bytes + bumps the version; and a stale `If-Match`
+    /// conflicts (optimistic concurrency / CAS) — the shape the `PUT /api/overlay/policy` surface
+    /// relies on, mirroring the RBAC policy store.
+    #[tokio::test]
+    async fn overlay_flow_policy_versioned_round_trip_and_cas() {
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+
+        // Absent → None + the ABSENT sentinel version.
+        let (got, v0) = store.get_overlay_flow_policy_versioned().await.unwrap();
+        assert!(got.is_none());
+        assert_eq!(v0.as_str(), PolicyVersion::ABSENT);
+
+        // Store a policy against the ABSENT version → succeeds, bumps the version.
+        let body = b"permit(principal, action, resource);".to_vec();
+        let v1 = store
+            .set_overlay_flow_policy_if_match(&v0, &body)
+            .await
+            .unwrap();
+        assert_ne!(v1.as_str(), PolicyVersion::ABSENT);
+        let (got, cur) = store.get_overlay_flow_policy_versioned().await.unwrap();
+        assert_eq!(got.as_deref(), Some(body.as_slice()));
+        assert_eq!(cur, v1);
+
+        // A write against the STALE (now-superseded) v0 conflicts (lost-edit race closed).
+        let err = store
+            .set_overlay_flow_policy_if_match(
+                &v0,
+                b"permit(principal, action, resource);".to_vec().as_slice(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeployError::Conflict(_)),
+            "a stale If-Match must 409, got {err:?}"
+        );
+
+        // A write against the CURRENT version succeeds (and clearing with empty stores empty bytes,
+        // which the load path treats as the gate being off).
+        let _v2 = store
+            .set_overlay_flow_policy_if_match(&v1, b"")
+            .await
+            .unwrap();
+        let (got, _) = store.get_overlay_flow_policy_versioned().await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&b""[..]),
+            "an empty policy stores empty bytes (gate off)"
+        );
     }
 }

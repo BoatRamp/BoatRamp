@@ -264,6 +264,18 @@ impl Right {
         if path == "/api/overlay/services" || path.starts_with("/api/overlay/services/") {
             return Some(Self::new(Resource::Overlay, None, Action::Read));
         }
+        // Overlay flow-policy administration (overlay follow-up #3): the operator-authored Cedar
+        // policy that gates the dial/publish-cap mint. ALL THREE verbs — `GET`/`PUT`
+        // `/api/overlay/policy` and `POST /api/overlay/policy/test` — are gated **`System·Admin`**,
+        // NOT an `Overlay·*` tier (REQUIRED #6): editing the gate is a node-admin act, and the
+        // `GET`/`test` surfaces are a policy-enumeration oracle, so they must sit with `PUT` at the
+        // highest tier rather than a readable `Overlay·Read`. An explicit arm (above the deny-safe
+        // `_` default that resolves the same) so a route/table regression is visible, and each
+        // handler re-derives it defense-in-depth (`assert_overlay_policy_is_system_admin`). The
+        // exact `==` paths cannot collide with the `/api/overlay/services/` prefix matcher above.
+        if path == "/api/overlay/policy" || path == "/api/overlay/policy/test" {
+            return Some(Self::new(Resource::System, None, Action::Admin));
+        }
 
         // Attaching a host **without** an ownership proof (`domain add
         // --unverified`) is an admin-only override: it asserts ownership of an
@@ -1286,6 +1298,15 @@ impl AuthzPolicy {
 /// KV key for the RBAC policy document (`authz/policy`); absent ⇒ the built-in
 /// [`AuthzPolicy::default_policy`].
 pub const POLICY_KEY: &str = "authz/policy";
+
+/// KV key for the operator-authored **overlay flow policy** (overlay follow-up #3): a Cedar
+/// policy (TEXT, the `Overlay` namespace) that gates the overlay dial/publish-cap mint, separate
+/// from the RBAC policy at [`POLICY_KEY`]. **Four states, NOT three** — absent OR confirmed-empty
+/// ⇒ the gate is OFF (allow, preserving pre-feature behavior); a present policy ⇒ evaluate it
+/// (Cedar default-deny within); present but corrupt ⇒ fail-closed deny-all; a KV read ERROR /
+/// partition ⇒ fail-closed deny (NEVER treated as absent→allow). The distinction between an
+/// absent key and an unreadable store is load-bearing and MUST be preserved at the load path.
+pub const OVERLAY_FLOW_POLICY_KEY: &str = "overlay/flow-policy";
 
 /// KV key prefix for revocation markers — presence of `authz/revoked/<id>`
 /// means the token with authority revocation id `<id>` (and its attenuations)

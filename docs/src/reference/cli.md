@@ -578,6 +578,9 @@ Overlay forward-flow tooling (the server side is configured under
 | `ls` | List the cluster's overlay service directory (`GET /api/overlay/services`) — the services you can `forward` to. |
 | `resolve <name>` | Resolve one service name to its topology (relay + egress identities + relay posture). |
 | `grant <service>` | **Control-plane-less** path: mint a dial capability + a one-flag forward ticket (below). |
+| `policy ls` | Show the active overlay **flow policy** (Cedar text) + its version (`GET /api/overlay/policy`, `System·Admin`). |
+| `policy set <file>` | Replace the flow policy from a `.cedar` file (or `-` for stdin) (`PUT`, `System·Admin`); `--if-match <version>` for a conditional write, a validation failure prints the server's `400` verbatim, an empty file turns the gate off. |
+| `policy test` | Dry-run a dial/expose mint against the policy (`POST …/test`, `System·Admin`) — prints ALLOW/DENY + TTL ceiling + deciding policies; mints nothing. |
 
 **`overlay ls` / `resolve`** read the live directory over your boatramp token (`Overlay·Read`); they
 take `--server` (else `[publish].server`). This is the discovery that lets `boatramp forward svc/db`
@@ -596,6 +599,15 @@ entry: **enroll it only if the relay is `mutual-pin`** — a `capability-only` r
 enrollment, the ticket works as-is. Flags: `--relay <host:port>`, `--relay-id`/`--egress-id`,
 `--holder-pub <id>` (bind a client-generated identity; the ticket then carries no secret),
 `--ttl-secs <n>` (default 3600), `--config <path>`.
+
+**`overlay policy {ls,set,test}`** administers the cluster's overlay **flow policy** — the per-flow
+access gate that decides which dial/publish-cap mints the control plane will issue (**deny-or-shrink-TTL
+only**), separate from the RBAC that grants `Overlay·Write`/`Admin`. All three verbs need `System·Admin`
+and take `--server` (else `[publish].server`). `set` validates server-side (parse + schema + a single
+`not_after` upper bound); a malformed or recurring-temporal policy prints the server's `400` body
+verbatim, and the FIRST stored policy warns because the gate becomes default-deny. `test` takes
+`--action dial|expose --service <name>` (optionally `--holder`, `--role`, `--scope`, `--enrolled`,
+`--ttl-secs`) and previews the decision without minting — use it before relying on a new policy.
 
 ## `boatramp forward`
 

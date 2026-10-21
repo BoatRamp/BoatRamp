@@ -201,6 +201,68 @@ enum OverlayCommand {
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
+    /// Manage the cluster's **overlay flow policy** — the per-flow access gate that decides which
+    /// dial/publish-cap mints the control plane will issue (deny-or-shrink-TTL only), separate
+    /// from the RBAC that grants `Overlay·Write`/`Admin`. All three verbs are `System·Admin`.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCommand,
+    },
+}
+
+/// `boatramp overlay policy …` — administer the overlay flow policy (`System·Admin`).
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// Show the active overlay flow policy (Cedar text) + its version (`GET /api/overlay/policy`).
+    Ls {
+        /// boatramp server base URL (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
+    },
+    /// Replace the overlay flow policy from a `.cedar` file (or `-` for stdin)
+    /// (`PUT /api/overlay/policy`). Validated server-side (parse + schema + temporal screen); a
+    /// validation failure prints the server's `400` body verbatim. An EMPTY file turns the gate
+    /// OFF. Storing the FIRST policy surfaces a default-deny CLIFF warning.
+    Set {
+        /// Path to the `.cedar` policy file, or `-` to read the policy from stdin.
+        file: String,
+        /// Expected current version (the `version` from `policy ls`) for a conditional write; a
+        /// stale version → `409` (re-read + retry). Omit to overwrite the current value.
+        #[arg(long)]
+        if_match: Option<String>,
+        /// boatramp server base URL (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
+    },
+    /// Dry-run a dial/expose mint against the active (or a supplied) policy — NO capability is
+    /// minted (`POST /api/overlay/policy/test`). Prints ALLOW/DENY, the TTL ceiling, and the
+    /// deciding policies + diagnostics (a `System·Admin`-only authoring aid).
+    Test {
+        /// The flow action to simulate.
+        #[arg(long, value_parser = ["dial", "expose"])]
+        action: String,
+        /// The target service name (e.g. `svc/db`).
+        #[arg(long)]
+        service: String,
+        /// The holder key (`ed25519:<hex>` / `bro1…`); defaults to this operator's overlay id.
+        #[arg(long)]
+        holder: Option<String>,
+        /// Simulate a bound member credential's role (`node`/`device`/`workload`); absent ⇒ key-only.
+        #[arg(long)]
+        role: Option<String>,
+        /// Simulate a bound member credential's service scope; absent ⇒ key-only.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Simulate `enrolled = true` on the holder (a bound member credential was presented).
+        #[arg(long)]
+        enrolled: bool,
+        /// The requested TTL (seconds) to evaluate — the policy may shrink it.
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u64,
+        /// boatramp server base URL (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
+    },
 }
 
 /// A copy-pasteable **forward ticket**: everything `boatramp forward` needs to reach a service,
@@ -444,6 +506,35 @@ pub enum OverlayOutput {
     Directory { services: Vec<ServiceEntry> },
     /// `overlay resolve <name>` — one service's topology.
     Resolved(ServiceEntry),
+    /// `overlay policy ls` — the active flow policy (Cedar text) + its version.
+    FlowPolicy {
+        /// The Cedar policy text (empty when the gate is off / no policy stored).
+        policy: String,
+        /// The optimistic-concurrency version (echo back as `--if-match` on `set`).
+        version: String,
+    },
+    /// `overlay policy set` — the stored policy's new version + a possible default-deny warning.
+    FlowPolicyStored {
+        /// The new version.
+        version: String,
+        /// Present only when this `set` stored the FIRST policy (the gate just became default-deny).
+        warning: Option<String>,
+        /// Whether an empty policy was stored (the gate was turned OFF).
+        cleared: bool,
+    },
+    /// `overlay policy test` — a dry-run flow decision.
+    FlowPolicyTest {
+        /// `allow` or `deny`.
+        decision: String,
+        /// The policy-imposed TTL ceiling (seconds), if any.
+        ttl_ceiling: Option<u64>,
+        /// The deciding policy ids.
+        deciding_policies: Vec<String>,
+        /// Evaluation diagnostics.
+        diagnostics: Vec<String>,
+        /// A posture note (feature off / corrupt), if any.
+        note: Option<String>,
+    },
     /// `overlay pair` — a confirmed pairing: the peer's proven identity (pinned locally) plus the
     /// SAS the operators compared.
     Paired {
@@ -530,6 +621,58 @@ impl Rendered for OverlayOutput {
                 writeln!(w, "egress id:   {}", s.egress_id)?;
                 if !s.client_auth.is_empty() {
                     writeln!(w, "client auth: {}", s.client_auth)?;
+                }
+                Ok(())
+            }
+            Self::FlowPolicy { policy, version } => {
+                if policy.trim().is_empty() {
+                    writeln!(w, "# no overlay flow policy in effect (the gate is OFF)")?;
+                } else {
+                    write!(w, "{policy}")?;
+                    if !policy.ends_with('\n') {
+                        writeln!(w)?;
+                    }
+                }
+                writeln!(w, "# version: {version}")
+            }
+            Self::FlowPolicyStored {
+                version,
+                warning,
+                cleared,
+            } => {
+                if *cleared {
+                    writeln!(w, "overlay flow policy cleared (the gate is now OFF)")?;
+                } else {
+                    writeln!(w, "overlay flow policy stored")?;
+                }
+                writeln!(w, "# version: {version}")?;
+                if let Some(warn) = warning {
+                    writeln!(w, "# WARNING: {warn}")?;
+                }
+                Ok(())
+            }
+            Self::FlowPolicyTest {
+                decision,
+                ttl_ceiling,
+                deciding_policies,
+                diagnostics,
+                note,
+            } => {
+                writeln!(w, "decision: {decision}")?;
+                if let Some(c) = ttl_ceiling {
+                    writeln!(
+                        w,
+                        "ttl ceiling: {c} (the policy would shrink the requested TTL)"
+                    )?;
+                }
+                if !deciding_policies.is_empty() {
+                    writeln!(w, "deciding policies: {}", deciding_policies.join(", "))?;
+                }
+                for d in diagnostics {
+                    writeln!(w, "# diagnostic: {d}")?;
+                }
+                if let Some(n) = note {
+                    writeln!(w, "# {n}")?;
                 }
                 Ok(())
             }
@@ -656,6 +799,7 @@ pub async fn run(
             expect,
             timeout_secs,
         } => pair_run(listen, peer, identity, expect, timeout_secs).await,
+        OverlayCommand::Policy { cmd } => policy_run(cmd, config).await,
         OverlayCommand::Invite {
             role,
             scope,
@@ -1265,6 +1409,182 @@ pub(crate) struct ExposeResponseBody {
     /// posture when dialing OUT (capability-only ⇒ present no client cert).
     #[serde(default)]
     pub relay_client_auth: String,
+}
+
+/// The `POST /api/overlay/policy/test` request body (mirrors the server's `OverlayPolicyTestRequest`).
+#[derive(serde::Serialize)]
+struct FlowPolicyTestRequest {
+    action: String,
+    service: String,
+    holder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrolled: Option<bool>,
+    ttl_requested: u64,
+}
+
+/// The `POST /api/overlay/policy/test` response (mirrors the server's `OverlayPolicyTestResponse`).
+#[derive(serde::Deserialize)]
+struct FlowPolicyTestResponse {
+    decision: String,
+    ttl_ceiling: Option<u64>,
+    #[serde(default)]
+    deciding_policies: Vec<String>,
+    #[serde(default)]
+    diagnostics: Vec<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The `PUT /api/overlay/policy` response (mirrors the server's `OverlayPolicyPutResponse`).
+#[derive(serde::Deserialize)]
+struct FlowPolicyPutResponse {
+    version: String,
+    #[serde(default)]
+    warning: Option<String>,
+}
+
+/// Run an `overlay policy …` command (the `System·Admin`-gated flow-policy administration).
+async fn policy_run(
+    cmd: PolicyCommand,
+    config: &crate::config::ProjectConfig,
+) -> Result<OverlayOutput> {
+    match cmd {
+        PolicyCommand::Ls { server } => {
+            let (server, http) = crate::client::connect(server, config)
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let resp = http
+                .get(format!("{server}/api/overlay/policy"))
+                .send()
+                .await
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let version = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim_matches('"').to_string())
+                .unwrap_or_default();
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Error::Overlay(format!(
+                    "overlay policy ls refused ({}): {}",
+                    status.as_u16(),
+                    body.trim()
+                )));
+            }
+            Ok(OverlayOutput::FlowPolicy {
+                policy: body,
+                version,
+            })
+        }
+        PolicyCommand::Set {
+            file,
+            if_match,
+            server,
+        } => {
+            // Read the policy from a file, or stdin for `-`.
+            let policy = if file == "-" {
+                use std::io::Read as _;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| Error::Overlay(format!("reading policy from stdin: {e}")))?;
+                buf
+            } else {
+                std::fs::read_to_string(&file)
+                    .map_err(|e| Error::Overlay(format!("reading policy file `{file}`: {e}")))?
+            };
+            let (server, http) = crate::client::connect(server, config)
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let mut req = http
+                .put(format!("{server}/api/overlay/policy"))
+                .header("content-type", "text/plain")
+                .body(policy.clone());
+            if let Some(m) = &if_match {
+                req = req.header("if-match", m);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                // A 400 carries the server's verbatim validation message; surface it as-is.
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Overlay(format!(
+                    "overlay policy set refused ({}): {}",
+                    status.as_u16(),
+                    body.trim()
+                )));
+            }
+            let parsed: FlowPolicyPutResponse = resp
+                .json()
+                .await
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            Ok(OverlayOutput::FlowPolicyStored {
+                version: parsed.version,
+                warning: parsed.warning,
+                cleared: policy.trim().is_empty(),
+            })
+        }
+        PolicyCommand::Test {
+            action,
+            service,
+            holder,
+            role,
+            scope,
+            enrolled,
+            ttl_secs,
+            server,
+        } => {
+            // Default the holder to this operator's overlay identity (as `overlay id` prints).
+            let holder = match holder {
+                Some(h) => parse_id(&h)?.to_hex(),
+                None => operator_identity()?.id().to_hex(),
+            };
+            let (server, http) = crate::client::connect(server, config)
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let resp = http
+                .post(format!("{server}/api/overlay/policy/test"))
+                .json(&FlowPolicyTestRequest {
+                    action,
+                    service,
+                    holder,
+                    role,
+                    scope,
+                    // A bare flag can only express "enrolled" (true); absent ⇒ key-only (None).
+                    enrolled: enrolled.then_some(true),
+                    ttl_requested: ttl_secs,
+                })
+                .send()
+                .await
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Overlay(format!(
+                    "overlay policy test refused ({}): {}",
+                    status.as_u16(),
+                    body.trim()
+                )));
+            }
+            let parsed: FlowPolicyTestResponse = resp
+                .json()
+                .await
+                .map_err(|e| Error::Overlay(e.to_string()))?;
+            Ok(OverlayOutput::FlowPolicyTest {
+                decision: parsed.decision,
+                ttl_ceiling: parsed.ttl_ceiling,
+                deciding_policies: parsed.deciding_policies,
+                diagnostics: parsed.diagnostics,
+                note: parsed.note,
+            })
+        }
+    }
 }
 
 /// GET the overlay service directory from the control plane.
