@@ -1011,10 +1011,21 @@ async fn pair_run(
 ) -> Result<OverlayOutput> {
     use boatramp_overlay::{
         OverlayPeerPolicy, Role, VerifiedPeers, accept, dial, identity_fp, pair_dial_endpoint,
-        pair_handshake, server_endpoint,
+        server_endpoint,
     };
+    use boatramp_overlay_client::OverlayClient;
 
     let secret = load_identity(identity.as_deref())?;
+    // Build a pairing client over this identity — the handshake itself now runs through the SDK
+    // (dogfood). The client gets its OWN copy of the identity (the seed is zeroized, so not `Clone`);
+    // `secret` is kept here for the listener's accept-side `server_endpoint` (a server-role
+    // constructor outside the client SDK).
+    let client = OverlayClient::builder(
+        boatramp_overlay::OverlaySecret::from_seed_hex(secret.seed_hex().as_str())
+            .map_err(|e| Error::Overlay(e.to_string()))?,
+    )
+    .build()
+    .map_err(|e| Error::Overlay(e.to_string()))?;
     let deadline = std::time::Duration::from_secs(timeout_secs);
     let q = |e: boatramp_overlay::QuicError| Error::Overlay(e.to_string());
 
@@ -1040,7 +1051,8 @@ async fn pair_run(
                 .accept_bi()
                 .await
                 .map_err(|e| Error::Overlay(format!("accepting the pairing stream: {e}")))?;
-            let out = pair_handshake(&mut send, &mut recv, &secret, Role::Responder, deadline)
+            let out = client
+                .pair(&mut send, &mut recv, Role::Responder, deadline)
                 .await
                 .map_err(|e| Error::Overlay(format!("pairing handshake: {e}")))?;
             _hold = (ep, conn);
@@ -1058,7 +1070,8 @@ async fn pair_run(
                 .open_bi()
                 .await
                 .map_err(|e| Error::Overlay(format!("opening the pairing stream: {e}")))?;
-            let out = pair_handshake(&mut send, &mut recv, &secret, Role::Initiator, deadline)
+            let out = client
+                .pair(&mut send, &mut recv, Role::Initiator, deadline)
                 .await
                 .map_err(|e| Error::Overlay(format!("pairing handshake: {e}")))?;
             _hold = (ep, conn);

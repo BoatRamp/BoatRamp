@@ -45,5 +45,22 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# The crate carries two role families behind features so the embeddable client SDK
+# (`boatramp-overlay-client`) can link ONLY the client-edge and keep a ring-free,
+# platform-verifier-free graph (overlay follow-up #4):
+#   * `client` — the client-edge roles a program dials/forwards/exposes/pairs WITH:
+#     `forward_flow`, `run_published_service` (the exposer dials OUT — it is client-edge),
+#     `pair_handshake`/`VerifiedPeers`, and the dial/pair/peer QUIC endpoints. Default.
+#   * `server` — the relay/egress/control-plane + cluster-mesh roles a NODE serves:
+#     the forwarding/egress/ingress routers, the exposer registry, the dial gate, and the
+#     accept-side / mesh QUIC constructors. The `boatramp` CLI (`serve`) and
+#     `boatramp-cluster` (IU-9 mesh) opt into it.
+# All underlying dependencies (quinn/rustls/aws-lc-rs/…) are needed by the client edge too,
+# so the split is purely cfg-gated source — there are no per-feature dep sets.
+default = ["client"]
+client = []
+server = []
+
 [lints]
 workspace = true

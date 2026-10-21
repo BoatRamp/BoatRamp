@@ -16,10 +16,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use boatramp_core::cose::{TokenPublicKey, verify_overlay_publish};
-use boatramp_overlay::{
-    OverlayId, OverlayPeerPolicy, OverlaySecret, RegisterReject, client_endpoint,
-    client_endpoint_server_auth, run_published_service,
-};
+use boatramp_overlay::{OverlayId, OverlaySecret, RegisterReject};
+// The exposer runtime (dial-out registration + per-flow termination) now goes through the embeddable
+// client SDK (dogfood); the CLI keeps arg-parsing, identity/trust-root loading, the local preflight,
+// and the banner.
+use boatramp_overlay_client::{OverlayClient, OverlayClientError};
 use clap::Args;
 
 /// Arguments for `boatramp expose`.
@@ -165,6 +166,20 @@ pub enum ExposeError {
          (`boatramp overlay policy ls` / `… test`)."
     )]
     FlowDenied,
+}
+
+impl From<OverlayClientError> for ExposeError {
+    fn from(e: OverlayClientError) -> Self {
+        // Preserve the pre-SDK mapping: an endpoint-build failure is `Quic`/`Identity`; a reverse-
+        // ingress transport failure is routed through `map_net_error` by the caller, so a bare `Net`
+        // reaching here (no relay context) degrades to a registration-rejected message.
+        match e {
+            OverlayClientError::Quic(q) => Self::Quic(q),
+            OverlayClientError::Identity(i) => Self::Identity(i),
+            OverlayClientError::Io(io) => Self::Io(io),
+            other => Self::RegistrationRejected(other.to_string()),
+        }
+    }
 }
 
 /// Parse an overlay identity given as bech32 (`bro1…`) or canonical hex (`ed25519:<hex>`).
@@ -467,19 +482,16 @@ pub async fn run(
     // before any network round-trip or the "published" banner.
     preflight_capability(&token, &trust_root, &service, &secret.id())?;
 
-    // One dial-only endpoint pinning the relay. Capability-only ⇒ present NO client cert (the relay is
-    // AcceptAny at TLS; the registration handshake proves our identity). Mutual-pin ⇒ present our cert.
-    let endpoint = if capability_only {
-        client_endpoint_server_auth(&OverlayPeerPolicy::Pin(relay_id))?
-    } else {
-        client_endpoint(&secret, &OverlayPeerPolicy::Pin(relay_id))?
-    };
+    // One overlay client pinning the relay (built behind the SDK). Capability-only ⇒ present NO client
+    // cert (the relay is AcceptAny at TLS; the registration handshake proves our identity). Mutual-pin
+    // ⇒ present our cert.
+    let client = OverlayClient::builder(secret)
+        .relay(relay, relay_id)
+        .capability_only(capability_only)
+        .build()?;
 
-    let service_for_backend = service.clone();
     let service_banner = service.clone();
-    let resolve_backend = move |s: &str| (s == service_for_backend.as_str()).then_some(local);
-
-    // `run_published_service` dials + registers, fires `ready` (the banner) ONLY after a confirmed
+    // `serve_egress` dials + registers, fires `ready` (the banner) ONLY after a confirmed
     // registration, then serves each inbound flow until the relay connection drops.
     let ready = move || {
         eprintln!(
@@ -487,24 +499,19 @@ pub async fn run(
              relay-blind E2EE) — ready, Ctrl-C to stop"
         );
     };
-    let outcome = run_published_service(
-        &endpoint,
-        relay,
-        relay_id,
-        &secret,
-        service.clone(),
-        token,
-        resolve_backend,
-        trust_root,
-        true,
-        ready,
-    )
-    .await;
+    let outcome = client
+        .serve_egress(&service, local, &token, trust_root, ready)
+        .await;
 
-    outcome.map_err(|e| match map_net_error(relay, e) {
-        // Fill in the service name for a name-collision (map_net_error can't see it).
-        ExposeError::NameTaken(_) => ExposeError::NameTaken(service),
-        other => other,
+    outcome.map_err(|e| match e {
+        // The reverse-ingress transport error carries the registration verdict — map it as before,
+        // filling in the service name for a name-collision (map_net_error can't see it).
+        OverlayClientError::Net(net) => match map_net_error(relay, net) {
+            ExposeError::NameTaken(_) => ExposeError::NameTaken(service),
+            other => other,
+        },
+        // A builder/config error can't arise here (the relay is set), but stay total + actionable.
+        other => ExposeError::from(other),
     })
 }
 

@@ -86,7 +86,17 @@ project-export = ["sql-postgres", "fs", "boatramp-node/project-export"]
 # forwards connections into the cluster over the relay-blind overlay fabric.
 # `dep:async-trait` is for the `LiveExposers` impl bridging the shared reverse-ingress registry into
 # the control-plane overlay directory (serve.rs); it is an `#[async_trait]` trait on boatramp-server.
-overlay = ["dep:boatramp-overlay", "boatramp-node/overlay", "dep:async-trait"]
+# Pulls BOTH: `boatramp-overlay-client` (the embeddable client SDK the `forward`/`expose`/`pair`
+# subcommands dogfood) AND `boatramp-overlay` with its `server` feature (the relay/egress/ingress
+# roles `serve` stands up). `boatramp-overlay`'s default `client` feature stays on too, so the CLI
+# gets the full client+server surface.
+overlay = [
+  "dep:boatramp-overlay",
+  "boatramp-overlay/server",
+  "dep:boatramp-overlay-client",
+  "boatramp-node/overlay",
+  "dep:async-trait",
+]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]
@@ -336,6 +346,9 @@ boatramp-server.workspace = true
 # The overlay network fabric — backs the `boatramp forward` client-edge (behind
 # the `overlay` feature; pulls quinn, so a lean build can opt out).
 boatramp-overlay = { workspace = true, optional = true }
+# The embeddable overlay client SDK: the single-source client-edge the `forward`/`expose`/`pair`
+# subcommands consume (dogfood). Behind the `overlay` feature.
+boatramp-overlay-client = { workspace = true, optional = true }
 # The node config model (moved out of the binary so it is a library value the
 # serve path and embedders share). Feature flags below forward to its matching
 # cfg markers so config parsing stays consistent per feature.

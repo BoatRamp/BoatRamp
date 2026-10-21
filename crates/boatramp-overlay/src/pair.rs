@@ -646,6 +646,9 @@ mod tests {
         );
     }
 
+    // Uses the accept-side `server_endpoint` + `accept` (server-gated), so this transport test builds
+    // only with the `server` feature; the pure pairing-handshake tests above are client-buildable.
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn pair_over_loopback_quic_direct_dial() {
         // The direct-dial transport: one peer listens (server_endpoint under AcceptAny), the other

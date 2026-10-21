@@ -1554,6 +1554,7 @@ dependencies = [
  "boatramp-mcp",
  "boatramp-node",
  "boatramp-overlay",
+ "boatramp-overlay-client",
  "boatramp-rpktls",
  "boatramp-server",
  "boatramp-storage",
@@ -1892,6 +1893,15 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "boatramp-overlay-client"
+version = "0.42.0"
+dependencies = [
+ "boatramp-overlay",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -7383,6 +7393,14 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
+name = "overlay-embed"
+version = "0.0.0"
+dependencies = [
+ "boatramp-overlay-client",
+ "tokio",
+]
 
 [[package]]
 name = "owo-colors"

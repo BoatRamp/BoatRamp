@@ -1,0 +1,27 @@
+# Example HOST binary embedding the boatramp overlay client SDK (overlay follow-up #4, SDK inc1):
+# bind a local TCP port, and forward each accepted connection into the cluster over the relay-blind
+# overlay to an in-cluster service — the shape a native app (or `boatramp forward`) uses. Depends ONLY
+# on `boatramp-overlay-client` + a minimal tokio. A HOST workspace member (unlike the wasm example
+# guests, which must be excluded for their target): so `cargo build --workspace` /
+# `cargo clippy --workspace --all-targets` (the merge gate) compiles it automatically — the SDK's
+# standalone ring-free graph is proven separately via `cargo tree -p boatramp-overlay-client`. Not
+# published (`publish = false`).
+[package]
+name = "overlay-embed"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+boatramp-overlay-client = { workspace = true }
+# A minimal tokio — just the runtime + the primitives the listener/forward path needs (NOT the
+# CLI/server's fs/process/signal/io-std).
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "macros",
+] }
+
+[lints]
+workspace = true

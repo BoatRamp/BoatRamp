@@ -15,7 +15,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use boatramp_overlay_proto::{OverlayPeerPolicy, OverlaySecret, wire};
-use boatramp_rpktls::{RpkTls, TrustSet};
+// `RpkTls` is used by the shared `rpk_tls` helper (which the client dial endpoints build on);
+// `TrustSet` is only the server/mesh accept-side return, so it is server-gated.
+use boatramp_rpktls::RpkTls;
+#[cfg(feature = "server")]
+use boatramp_rpktls::TrustSet;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 
@@ -151,6 +155,7 @@ pub fn pair_dial_endpoint() -> Result<Endpoint, QuicError> {
 
 /// An accept-only endpoint bound to `bind` under `policy` (a relay/ingress or
 /// egress/terminator).
+#[cfg(feature = "server")]
 pub fn server_endpoint(
     secret: &OverlaySecret,
     policy: &OverlayPeerPolicy,
@@ -168,6 +173,7 @@ pub fn server_endpoint(
 /// (mutual-pin) relay the set IS the TLS-layer gate; for the permissive `AcceptAny`
 /// (capability-only) relay it is the empty server-auth-only set — admitting a key records the
 /// overlay's live membership in it while the capability gate stays the data-plane authorization.
+#[cfg(feature = "server")]
 pub fn server_endpoint_with_trust(
     secret: &OverlaySecret,
     policy: &OverlayPeerPolicy,
@@ -210,6 +216,7 @@ pub fn peer_endpoint(
 /// live trust set) and is the base socket for [`dial_mesh_peer`]. This is the IU-9 seam: boatramp's
 /// own cluster mesh rides overlay QUIC while reusing its existing mesh identity + trust **verbatim**,
 /// so a replicated join / rotation / revocation is honored live with no second identity domain.
+#[cfg(feature = "server")]
 pub fn mesh_endpoint(tls: &RpkTls, bind: SocketAddr) -> Result<Endpoint, QuicError> {
     let sc = quic_server_config(tls.server()?)?;
     Ok(Endpoint::server(sc, bind)?)
@@ -218,6 +225,7 @@ pub fn mesh_endpoint(tls: &RpkTls, bind: SocketAddr) -> Result<Endpoint, QuicErr
 /// Dial mesh `peer` (a cluster `NodeId`) at `addr` over a [`mesh_endpoint`], pinning the connection
 /// to that peer's trusted key(s) from the live trust set carried by `tls`. An untrusted or unknown
 /// peer fails the mutual-auth handshake rather than completing an unauthenticated dial.
+#[cfg(feature = "server")]
 pub async fn dial_mesh_peer(
     endpoint: &Endpoint,
     tls: &RpkTls,
@@ -236,6 +244,11 @@ pub async fn dial(endpoint: &Endpoint, addr: SocketAddr) -> Result<Connection, Q
 
 /// Accept the next inbound connection on `endpoint` and complete its handshake.
 /// Returns `Ok(None)` when the endpoint is closed.
+///
+/// Defined unconditionally (NOT `server`-gated): the shared direct-path promotion
+/// ([`crate::direct::negotiate_direct`], reachable from the client edge) accepts the hole-punched
+/// link with it. The crate-root `accept` re-export is server-only, but the function stays reachable
+/// as `quic::accept` for the promotion path.
 pub async fn accept(endpoint: &Endpoint) -> Result<Option<Connection>, QuicError> {
     match endpoint.accept().await {
         Some(incoming) => Ok(Some(incoming.accept()?.await?)),
@@ -243,7 +256,9 @@ pub async fn accept(endpoint: &Endpoint) -> Result<Option<Connection>, QuicError
     }
 }
 
-#[cfg(test)]
+// Every endpoint test drives an accept-side handshake (relay/egress/mesh), so the test module
+// builds only with the `server` feature; the client-only build compiles the lib alone.
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use boatramp_overlay_proto::OverlayPeerPolicy::{Allowlist, Pin};

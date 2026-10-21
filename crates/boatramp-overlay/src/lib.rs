@@ -28,19 +28,41 @@ pub use circuit::{
 };
 pub use direct::{PathMode, negotiate_direct};
 pub use e2ee::{SpliceError, establish, splice};
+// Client-edge + shared surface: the dialing/forwarding/exposing client roles and the wire types the
+// client half of the registration protocol parses (`RegisterReject`, carried in `NetError`). Always
+// available — this is what the embeddable `boatramp-overlay-client` SDK links against.
+pub use net::{NetError, RegisterReject, forward_flow, run_published_service};
+// Server/relay/control-plane roles (overlay follow-up #4): the forwarding/egress/ingress routers,
+// the exposer registry, and the relay client-auth posture. Behind `server` so the client SDK never
+// links them.
+#[cfg(feature = "server")]
 pub use net::{
-    ExposerRegistry, NetError, RegisterReject, RelayClientAuth, forward_flow, forward_relay,
-    run_egress_router, run_forwarding_router, run_ingress_router, run_published_service,
-    terminate_one,
+    ExposerRegistry, RelayClientAuth, forward_relay, run_egress_router, run_forwarding_router,
+    run_ingress_router, terminate_one,
 };
 pub use pair::{PairError, VerifiedPeer, VerifiedPeers, pair_handshake};
+// The dial/publish trust-root type that appears in `run_published_service`'s (and `terminate_one`'s)
+// public signature — re-exported so a consumer (the `boatramp-overlay-client` SDK, `boatramp expose`)
+// names it through this one crate rather than reaching into `boatramp-core`.
+pub use boatramp_core::cose::TokenPublicKey;
+// Client/shared QUIC endpoints: dial-only, pairing-dial, and the dial+accept peer socket the
+// direct-path promotion hole-punch needs.
 pub use quic::{
-    QuicError, accept, client_endpoint, client_endpoint_server_auth, dial, dial_mesh_peer,
-    mesh_endpoint, pair_dial_endpoint, peer_endpoint, server_endpoint, server_endpoint_with_trust,
+    QuicError, client_endpoint, client_endpoint_server_auth, dial, pair_dial_endpoint,
+    peer_endpoint,
 };
-// Re-export the rpktls types the mesh transport (IU-9) builds endpoints from, and quinn itself, so
-// a consumer (e.g. boatramp-cluster's overlay mesh transport) depends on this one integration crate.
+// Server/mesh QUIC constructors (accept-side + the IU-9 cluster-mesh seam). Behind `server`.
+#[cfg(feature = "server")]
+pub use quic::{
+    accept, dial_mesh_peer, mesh_endpoint, server_endpoint, server_endpoint_with_trust,
+};
+// Re-export the rpktls types the mesh transport (IU-9) builds endpoints from so a server consumer
+// (e.g. boatramp-cluster's overlay mesh transport) depends on this one integration crate. Behind
+// `server` — the client edge never touches the mesh identity/trust-set types.
+#[cfg(feature = "server")]
 pub use boatramp_rpktls::{PeerId, RpkTls, TrustSet};
+// quinn itself stays available to the client edge: the SDK holds a `quinn::Endpoint` for its dial
+// socket, and a consumer may name the connection/stream types.
 pub use quinn;
 
 // Re-export the pure-core types a consumer (e.g. the `boatramp forward` CLI) needs, so it can

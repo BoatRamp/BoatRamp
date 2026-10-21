@@ -14,6 +14,7 @@
 //! for a native OS client library can wrap [`forward_flow`]; the `boatramp forward` CLI (IU-10)
 //! calls [`forward_flow`] directly with the accepted connection.
 
+#[cfg(feature = "server")]
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,11 +22,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::time::Duration;
 
-use boatramp_core::cose::{TokenPublicKey, verify_overlay_publish};
+// `TokenPublicKey` is the dial trust-root both the client-edge terminator (`terminate_stream`, via
+// `run_published_service`) and the server-side gate verify against; `verify_overlay_publish` is only
+// the relay's registration path (`register_exposer`), so it is server-gated.
+use boatramp_core::cose::TokenPublicKey;
+#[cfg(feature = "server")]
+use boatramp_core::cose::verify_overlay_publish;
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
-use boatramp_overlay_proto::dial::{
-    DialReject, DialRequest, DialVerdict, authorize_dial, authorize_dial_capability_only,
-};
+// `authorize_dial` is shared (the client-edge terminator re-authorizes end-to-end); the
+// capability-only variant is only the relay's `gate_dial`, so it is server-gated.
+#[cfg(feature = "server")]
+use boatramp_overlay_proto::dial::authorize_dial_capability_only;
+use boatramp_overlay_proto::dial::{DialReject, DialRequest, DialVerdict, authorize_dial};
 use boatramp_overlay_proto::e2ee::{Opener, Role, Sealer};
 use boatramp_overlay_proto::ice::Signal;
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
@@ -129,6 +137,8 @@ async fn read_msg<T: DeserializeOwned>(r: &mut (impl AsyncRead + Unpin)) -> Resu
 }
 
 /// The raw-public-key identity the peer presented at the TLS layer (its SPKI = the overlay id).
+/// Only the relay's dial gate (mutual-pin) and registration path read it, so it is server-gated.
+#[cfg(feature = "server")]
 fn peer_identity(conn: &Connection) -> Result<OverlayId, NetError> {
     let any = conn.peer_identity().ok_or(NetError::NoPeerIdentity)?;
     let certs = any
@@ -387,6 +397,7 @@ where
 /// The posture is set EXPLICITLY from `[overlay] client_auth` — never inferred from an empty
 /// allowlist (that empty→open inference was the fail-closed→fail-open-on-omission footgun the
 /// reviewer flagged).
+#[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayClientAuth {
     /// The relay required + pinned the client's raw-public-key cert (an `Allowlist` endpoint), so it
@@ -406,6 +417,7 @@ pub enum RelayClientAuth {
 /// terminator's E2EE-proven re-authz. In BOTH cases a dial with no valid, in-scope, unexpired
 /// capability is refused here. Shared by the egress-forwarding ([`forward_relay`]) and
 /// exposer-forwarding ([`forward_resolved`]) paths so the gate can never drift between them.
+#[cfg(feature = "server")]
 fn gate_dial(
     request: &DialRequest,
     client: &Connection,
@@ -429,6 +441,7 @@ fn gate_dial(
 /// `(addr, identity, encryption_required)`; `trust_root` verifies the dial capability. `client_auth`
 /// selects whether the relay can also prove holder-binding (mutual-pin) or defers it to the egress
 /// (capability-only); in BOTH cases a dial with no valid in-scope capability is refused here.
+#[cfg(feature = "server")]
 pub async fn forward_relay<F>(
     client: Connection,
     trust_root: &TokenPublicKey,
@@ -495,6 +508,7 @@ where
 }
 
 /// Forward bytes in both directions between the client and egress streams, blind.
+#[cfg(feature = "server")]
 async fn bridge(
     mut client_recv: quinn::RecvStream,
     mut client_send: quinn::SendStream,
@@ -533,6 +547,7 @@ async fn bridge(
 /// `scope == request.service` check binds the capability scope to a service the egress actually
 /// serves — a capability for a different service cannot be redeemed here even under a misrouting
 /// relay, because `request.service` must be one this egress fronts AND the scope must authorize it.
+#[cfg(feature = "server")]
 pub async fn terminate_one<F>(
     conn: Connection,
     secret: &OverlaySecret,
@@ -666,6 +681,7 @@ where
 /// `endpoint`'s own peer policy (`Allowlist` ⇒ `MutualPin`, `AcceptAny` ⇒ `CapabilityOnly`). Runs
 /// until the endpoint is closed; each connection is handled on its own task, so one slow flow never
 /// blocks the accept loop. This is the server side of [`forward_flow`].
+#[cfg(feature = "server")]
 pub async fn run_forwarding_router<F>(
     endpoint: Endpoint,
     trust_root: TokenPublicKey,
@@ -700,6 +716,7 @@ pub async fn run_forwarding_router<F>(
 /// service resolves to via `resolve_backend` (this egress's own service→backend map). Every dial is
 /// independently authorized against `trust_root` + the E2EE-proven client identity (zero-trust,
 /// HIGH-1) and anchored to a served service (HIGH-A). Runs until the endpoint is closed.
+#[cfg(feature = "server")]
 pub async fn run_egress_router<F>(
     endpoint: Endpoint,
     secret: OverlaySecret,
@@ -799,6 +816,7 @@ enum RegisterResult {
 }
 
 /// The first control frame on a relay bi-stream.
+#[cfg(feature = "server")]
 enum IngressFrame {
     /// An exposer registering a service (reverse ingress).
     Register(RegisterRequest),
@@ -810,6 +828,7 @@ enum IngressFrame {
 /// The bare-`DialRequest` wire the existing client-edge sends is unchanged — a `Register` frame is
 /// distinguished by its required `register` discriminator (tried first; it never matches a dial, and a
 /// dial never matches it).
+#[cfg(feature = "server")]
 async fn read_ingress_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<IngressFrame, NetError> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
@@ -828,6 +847,7 @@ async fn read_ingress_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<IngressF
 }
 
 /// One parked exposer registration.
+#[cfg(feature = "server")]
 struct ExposerEntry {
     /// The parked connection to the exposer (it dialed OUT; its register task holds it open). An
     /// `open_bi` on a clone surfaces a new accepted stream at the exposer's serve loop.
@@ -850,11 +870,13 @@ struct ExposerEntry {
 /// address, so the not-an-open-proxy property holds exactly as for the static-egress path. In-memory
 /// and single-node for increment 1 (KV-backed multi-replica registration + heartbeat/TTL reaping are
 /// later increments). Cheap to clone (an `Arc` handle).
+#[cfg(feature = "server")]
 #[derive(Clone, Default)]
 pub struct ExposerRegistry {
     inner: Arc<Mutex<BTreeMap<String, ExposerEntry>>>,
 }
 
+#[cfg(feature = "server")]
 impl ExposerRegistry {
     /// An empty registry.
     #[must_use]
@@ -959,6 +981,7 @@ impl ExposerRegistry {
 /// registered, capability-verified exposer connection (never a client-named address).
 /// Send a registration rejection to the exposer, drain the connection (bounded), and return the
 /// refusal as an error for the relay's logs.
+#[cfg(feature = "server")]
 async fn refuse_registration(
     send: &mut SendStream,
     conn: &Connection,
@@ -969,6 +992,7 @@ async fn refuse_registration(
     Err(NetError::RegistrationRejected(reason))
 }
 
+#[cfg(feature = "server")]
 async fn register_exposer(
     conn: Connection,
     mut send: SendStream,
@@ -1042,6 +1066,7 @@ async fn register_exposer(
 /// also bridges to a registered reverse-ingress exposer by opening a per-flow bi-stream down its parked
 /// connection. The client only ever names a SERVICE; both targets are relay-controlled, so the
 /// not-an-open-proxy property holds for the exposer path exactly as for the egress path.
+#[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 async fn forward_resolved<F>(
     client: Connection,
@@ -1113,6 +1138,7 @@ where
 /// dialed to a configured egress. The first control frame on each connection selects the path — a
 /// `Register` frame (exposer) vs a `DialRequest` (forward client). Used when a relay opts into
 /// accepting exposed services; `secret` is the relay's identity for the registration handshake.
+#[cfg(feature = "server")]
 pub async fn run_ingress_router<F>(
     endpoint: Endpoint,
     secret: OverlaySecret,
@@ -1159,6 +1185,7 @@ pub async fn run_ingress_router<F>(
 
 /// Accept the first bi-stream + control frame on an ingress connection and dispatch to the
 /// registration (exposer) or forwarding (client) path.
+#[cfg(feature = "server")]
 async fn handle_ingress_connection<F>(
     conn: Connection,
     relay_secret: &OverlaySecret,
@@ -1301,7 +1328,10 @@ where
     Ok(())
 }
 
-#[cfg(test)]
+// The integration tests drive full relay↔egress↔client verticals, so they exercise the server roles
+// and build only when the `server` feature is on (the usual `--all-features` / `--features server`
+// test run). A client-only `cargo test -p boatramp-overlay` compiles the lib and skips them.
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
     use boatramp_core::cose::mint_overlay_dial;

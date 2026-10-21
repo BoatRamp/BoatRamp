@@ -36,7 +36,9 @@ http = [
 # RPC rides the overlay fabric (boatramp-overlay) instead of HTTP, reusing the
 # mesh's RFC 7250 raw-public-key identity + live trust set verbatim. Builds on
 # `http` (shares the peer directory, the client-write authorizer, and MeshTls).
-overlay = ["http", "dep:boatramp-overlay"]
+# Needs the `server` feature: the mesh uses the accept-side / mesh QUIC constructors
+# (`mesh_endpoint`, `dial_mesh_peer`, `accept`), which live behind `boatramp-overlay/server`.
+overlay = ["http", "dep:boatramp-overlay", "boatramp-overlay/server"]
 
 [dependencies]
 boatramp-core.workspace = true

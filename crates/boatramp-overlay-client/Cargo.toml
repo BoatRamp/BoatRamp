@@ -1,0 +1,55 @@
+[package]
+name = "boatramp-overlay-client"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Embeddable client SDK for the boatramp overlay fabric — a lean, linkable crate external programs use to dial, forward, expose, and pair over the relay-blind overlay (client-edge only; no relay/egress/control-plane roles)."
+
+# Linkable three ways: a normal Rust `lib`, a `staticlib` for a native app to link, and a `cdylib`
+# the increment-2 C-ABI / UniFFI mobile bindings (iOS/Android) build on. This increment is the
+# host-buildable Rust core only; the C-ABI surface + mobile CI land in SDK increment 2.
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+# The client edge is the whole crate; `client` exists so the standalone build turns off
+# boatramp-overlay's server roles (`--no-default-features --features client`) and keeps the graph
+# ring-free / platform-verifier-free. Default-on so a plain `cargo build -p boatramp-overlay-client`
+# is already the lean client build.
+default = ["client"]
+client = ["boatramp-overlay/client"]
+
+[dependencies]
+# The overlay runtime, CLIENT EDGE ONLY: `default-features = false` drops the `server` roles so the
+# relay/egress/control-plane + cluster-mesh code (and the rpktls mesh re-exports) are never linked.
+# Specified by path (not `workspace = true`) because Cargo forbids a workspace-inherited dependency
+# from overriding `default-features`, and the whole point of this crate is to turn them off.
+boatramp-overlay = { path = "../boatramp-overlay", version = "0.42.0", default-features = false, features = [
+  "client",
+] }
+# The SDK's OWN minimal tokio: just the runtime + the primitives the splice/forward path needs. NOT
+# `fs`/`process`/`signal`/`io-std` (a server/CLI concern) — a native app embedding this brings its
+# own runtime shape.
+tokio = { version = "1", default-features = false, features = [
+  "rt",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "sync",
+  "time",
+  "macros",
+] }
+# A stable, versioned error vocabulary for the SDK. `thiserror` only — anyhow is banned in CI and is
+# the wrong choice for a library's public error type anyway.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

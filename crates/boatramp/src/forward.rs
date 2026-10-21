@@ -18,10 +18,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use boatramp_overlay::{
-    DialRequest, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, client_endpoint,
-    client_endpoint_server_auth, forward_flow,
-};
+use boatramp_overlay::{OverlayId, OverlaySecret, PathMode};
+// The overlay mechanics now go through the embeddable client SDK (dogfood); the CLI keeps only
+// arg-parsing, identity loading, discovery, and the banners.
+use boatramp_overlay_client::{OverlayClient, OverlayClientError};
 use clap::Args;
 use tokio::net::TcpListener;
 
@@ -148,34 +148,19 @@ const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// authorization + egress reachability end to end, so a misconfigured forward fails loudly and
 /// immediately instead of as a silently dead bound port. The local side is already closed, so the
 /// flow sends an immediate Fin — the backend observes a single bare connect that closes with no
-/// application bytes (a one-off cost for a definitely-working tunnel). Reusing this connection for the
-/// first client would require splitting `forward_flow` into establish/splice phases; a clean single
-/// preflight connect/close is the simpler, reviewer-accepted choice.
+/// application bytes (a one-off cost for a definitely-working tunnel). Driven over the SDK's generic
+/// [`OverlayClient::forward_stream`] with a pre-closed in-memory stream — the same relay-pinned
+/// `PathMode::Relay` dial a real client makes, just with no payload.
 async fn preflight_dial(
-    endpoint: &boatramp_overlay::quinn::Endpoint,
+    client: &OverlayClient,
     relay: SocketAddr,
-    secret: &OverlaySecret,
-    egress_id: OverlayId,
     service: &str,
     token: &str,
     capability_only: bool,
 ) -> Result<(), ForwardError> {
     let (near, far) = tokio::io::duplex(1);
     drop(near); // the local side is already closed → the preflight flow sends an immediate Fin
-    let request = DialRequest {
-        service: service.to_string(),
-        token: token.to_string(),
-        e2ee: true,
-    };
-    let flow = forward_flow(
-        far,
-        endpoint,
-        relay,
-        secret,
-        egress_id,
-        request,
-        PathMode::Relay,
-    );
+    let flow = client.forward_stream(far, service, token, PathMode::Relay);
     let outcome = match tokio::time::timeout(PREFLIGHT_TIMEOUT, flow).await {
         Ok(r) => r.map_err(|e| e.to_string()),
         Err(_) => Err(format!(
@@ -192,6 +177,19 @@ async fn preflight_dial(
         return Err(ForwardError::Preflight(cause));
     }
     Ok(())
+}
+
+impl From<OverlayClientError> for ForwardError {
+    fn from(e: OverlayClientError) -> Self {
+        // Preserve the pre-SDK error mapping: an endpoint-build failure is still a `Quic`/`Identity`
+        // error; anything else from the client surfaces through the generic transport channel.
+        match e {
+            OverlayClientError::Quic(q) => Self::Quic(q),
+            OverlayClientError::Identity(i) => Self::Identity(i),
+            OverlayClientError::Io(io) => Self::Io(io),
+            other => Self::Preflight(other.to_string()),
+        }
+    }
 }
 
 impl From<crate::overlay::Error> for ForwardError {
@@ -399,28 +397,20 @@ pub async fn run(
     let relay_id = parse_id(&relay_id_spec)?;
     let egress_id = parse_id(&egress_id_spec)?;
 
-    // One dial-only endpoint pinning the relay, reused for every accepted connection. A capability-only
-    // relay is server-auth-only at TLS (it requests no client cert), so present NONE; a mutual-pin
-    // relay pins our RPK cert, so present it. (The E2EE identity to the egress is unaffected either
-    // way — it rides the sealed handshake, not the relay TLS.)
-    let endpoint = if capability_only {
-        client_endpoint_server_auth(&OverlayPeerPolicy::Pin(relay_id))?
-    } else {
-        client_endpoint(&secret, &OverlayPeerPolicy::Pin(relay_id))?
-    };
+    // One overlay client — a dial-only relay-pinned endpoint reused for every accepted connection,
+    // built behind the SDK. A capability-only relay is server-auth-only at TLS (it requests no client
+    // cert), so present NONE; a mutual-pin relay pins our RPK cert, so present it. (The E2EE identity
+    // to the egress is unaffected either way — it rides the sealed handshake, not the relay TLS.)
+    let client = OverlayClient::builder(secret)
+        .relay(relay, relay_id)
+        .egress(egress_id)
+        .capability_only(capability_only)
+        .path_mode(PathMode::PreferDirect)
+        .build()?;
 
     // Finding C — eager preflight BEFORE bind + banner: validate the whole dial path so a
     // misconfigured forward fails loudly and immediately rather than as a silently dead port.
-    preflight_dial(
-        &endpoint,
-        relay,
-        &secret,
-        egress_id,
-        &service,
-        &token,
-        capability_only,
-    )
-    .await?;
+    preflight_dial(&client, relay, &service, &token, capability_only).await?;
 
     let listener = TcpListener::bind(&args.local).await?;
     let bound = listener.local_addr()?;
@@ -429,7 +419,7 @@ pub async fn run(
         "boatramp forward: {bound} → {service} via relay {relay} (overlay, relay-blind E2EE) — ready, Ctrl-C to stop"
     );
 
-    let secret = Arc::new(secret);
+    let client = Arc::new(client);
     let token = Arc::new(token);
     let service = Arc::new(service);
     // The preflight above already proved the path, but a cap can expire or a backend can drop between
@@ -439,27 +429,14 @@ pub async fn run(
 
     loop {
         let (sock, _peer) = listener.accept().await?;
-        let endpoint = endpoint.clone();
-        let secret = Arc::clone(&secret);
+        let client = Arc::clone(&client);
         let token = Arc::clone(&token);
         let service = Arc::clone(&service);
         let first_failure = Arc::clone(&first_failure);
         tokio::spawn(async move {
-            let request = DialRequest {
-                service: (*service).clone(),
-                token: (*token).clone(),
-                e2ee: true,
-            };
-            if let Err(e) = forward_flow(
-                sock,
-                &endpoint,
-                relay,
-                &secret,
-                egress_id,
-                request,
-                PathMode::PreferDirect,
-            )
-            .await
+            if let Err(e) = client
+                .forward_socket(sock, &service, &token, PathMode::PreferDirect)
+                .await
             {
                 if first_failure.swap(true, Ordering::Relaxed) {
                     tracing::warn!(error = %e, "overlay forward connection failed");
@@ -597,7 +574,7 @@ mod tests {
     async fn ticket_drives_a_live_forward_to_the_backend() {
         use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
         use boatramp_overlay::{
-            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
+            DialRequest, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
             run_egress_router, run_forwarding_router, server_endpoint,
         };
         use std::collections::BTreeSet;
@@ -754,7 +731,7 @@ mod tests {
     async fn directory_resolve_and_mint_drives_a_live_forward() {
         use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
         use boatramp_overlay::{
-            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
+            DialRequest, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
             run_egress_router, run_forwarding_router, server_endpoint,
         };
         use boatramp_server::{OverlayDirectory, OverlayTarget};
@@ -882,7 +859,7 @@ mod tests {
     async fn capability_only_relay_admits_a_never_enrolled_client_end_to_end() {
         use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
         use boatramp_overlay::{
-            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
+            DialRequest, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
             client_endpoint_server_auth, forward_flow, run_egress_router, run_forwarding_router,
             server_endpoint,
         };
