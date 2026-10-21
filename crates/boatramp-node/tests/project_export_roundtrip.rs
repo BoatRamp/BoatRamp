@@ -887,6 +887,10 @@ async fn project_export_roundtrip_driver_live() {
                 ImportOptions {
                     apply: true,
                     force: true,
+                    // Same-process re-import into the project's own populated store — opt in to
+                    // replacing an existing target (env-clone uses a fresh target and needs no
+                    // overwrite).
+                    overwrite: true,
                     identity: IdentityChoice::Fresh,
                     ..Default::default()
                 },
@@ -977,6 +981,13 @@ async fn project_export_cross_tenant_leak_gate() {
     use boatramp_storage::fs::FsStorage;
     use bytes::Bytes;
     use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    // A `siteconfig/<hash>` body is content-addressed (hash == sha256(body)); the import-side
+    // fail-closed check verifies that, so the legit clone must seed a REAL content address.
+    fn siteconfig_key(body: &[u8]) -> String {
+        format!("siteconfig/{}", hex::encode(Sha256::digest(body)))
+    }
 
     async fn put_blob(store: &dyn Storage, key: &str, data: &[u8]) {
         let data = data.to_vec();
@@ -1000,6 +1011,47 @@ async fn project_export_cross_tenant_leak_gate() {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Hand-craft a v2 bundle carrying ONLY a KV slice with the given entries (bypassing the
+    /// export-side scope filter) — models a crafted/tampered bundle crossing the trust boundary,
+    /// for the import-direction (HIGH-1) checks. `source` is the bundle's declared source project
+    /// (set it == the import target so the re-key is a no-op and the crafted keys reach the
+    /// import-side filter verbatim).
+    fn craft_kv_bundle(source: &str, entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        use boatramp_core::kv::KvDumpEntry;
+        use boatramp_node::project_bundle::{self, MemberKind, MemberSpec, SourceInfo};
+        let kv_entries: Vec<KvDumpEntry> = entries
+            .iter()
+            .map(|(k, v)| KvDumpEntry {
+                key: k.clone(),
+                value: v.clone(),
+                version: 1,
+            })
+            .collect();
+        let kv_bytes = boatramp_core::kv_dump::encode_dump(&kv_entries, 0);
+        let td = tempfile::tempdir().unwrap();
+        let tmp = td.path().join("kv");
+        std::fs::write(&tmp, &kv_bytes).unwrap();
+        let specs = vec![MemberSpec {
+            path: project_bundle::KV_MEMBER_PATH.to_string(),
+            kind: MemberKind::Kv,
+            pg: None,
+        }];
+        let mut out: Vec<u8> = Vec::new();
+        project_bundle::write_bundle_streaming(
+            &mut out,
+            0,
+            false,
+            SourceInfo {
+                project: source.to_string(),
+                site: None,
+            },
+            specs,
+            |_spec| Ok(tmp.clone()),
+        )
+        .unwrap();
+        out
+    }
+
     // A value that exists ONLY in globex's data / the global crown jewels — if any of it ever
     // appears in acme's export or an imported target, a tenant boundary leaked.
     const GLOBEX_SENTINEL: &[u8] = b"GLOBEX_ONLY_CROWN_JEWEL_SENTINEL_9e3af17c";
@@ -1018,10 +1070,19 @@ async fn project_export_cross_tenant_leak_gate() {
     )
     .await
     .unwrap();
-    kv.put("project/acme/site/web", b"HASHACME".to_vec())
+    // A real content-addressed site config: the pointer stores the body's sha256, the body
+    // lives at `siteconfig/<that-hash>`. Both must survive a legit clone (and the body must
+    // pass the import-side content-address check).
+    let acme_site_body = b"{\"acme\":\"site config body\"}".to_vec();
+    let acme_site_key = siteconfig_key(&acme_site_body);
+    let acme_site_hash = acme_site_key
+        .strip_prefix("siteconfig/")
+        .unwrap()
+        .to_string();
+    kv.put("project/acme/site/web", acme_site_hash.clone().into_bytes())
         .await
         .unwrap();
-    kv.put("siteconfig/HASHACME", b"{...acme site config...}".to_vec())
+    kv.put(&acme_site_key, acme_site_body.clone())
         .await
         .unwrap();
 
@@ -1162,8 +1223,8 @@ async fn project_export_cross_tenant_leak_gate() {
         "acme's owned keyspace restored"
     );
     assert!(
-        tgt_keys.iter().any(|k| k == "siteconfig/HASHACME"),
-        "acme's referenced site-config body carried + restored"
+        tgt_keys.contains(&acme_site_key),
+        "acme's referenced (content-addressed) site-config body carried + restored"
     );
     assert!(
         !tgt_keys.iter().any(|k| k.contains("globex")),
@@ -1215,6 +1276,132 @@ async fn project_export_cross_tenant_leak_gate() {
         assert!(
             !contains(&body, GLOBEX_SENTINEL),
             "globex sentinel bytes found inside target blob {k:?}"
+        );
+    }
+
+    // === MEDIUM-1(a): a second import into the now-POPULATED target is REFUSED without
+    //     `overwrite`, and proceeds WITH it. (A fresh target needs no overwrite — proven by
+    //     the import above, which ran against the then-empty `tgt`.) ===
+    {
+        let mut src = futures::io::Cursor::new(bundle.clone());
+        let refused = tgt
+            .import(
+                "acme",
+                &mut src,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "re-import into a populated target must be refused without overwrite"
+        );
+    }
+    {
+        let mut src = futures::io::Cursor::new(bundle.clone());
+        tgt.import(
+            "acme",
+            &mut src,
+            ImportOptions {
+                apply: true,
+                force: true,
+                overwrite: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("re-import into a populated target succeeds WITH overwrite");
+    }
+
+    // === IMPORT-trust direction (HIGH-1): a crafted bundle whose KV slice carries a foreign
+    //     tenant / global / poisoned key is REFUSED fail-closed, and the target is left
+    //     untouched. source == target ("acme") ⇒ the re-key is a no-op, so the crafted keys
+    //     reach the import-side scope filter verbatim. ===
+    // (label, KV entries to plant) — one crafted bundle per case.
+    type CraftedCase = (&'static str, Vec<(String, Vec<u8>)>);
+    let malicious_sets: Vec<CraftedCase> = vec![
+        (
+            "another tenant's project key",
+            vec![
+                ("project/acme/config/tenancy".into(), b"{}".to_vec()),
+                ("project/globex/secret/x".into(), GLOBEX_SENTINEL.to_vec()),
+            ],
+        ),
+        (
+            "a global TLS cert",
+            vec![("cert/evil.example.com".into(), GLOBAL_SENTINEL.to_vec())],
+        ),
+        (
+            "a global routing record",
+            vec![(
+                "domain/evil.example.com".into(),
+                br#"{"project":"acme"}"#.to_vec(),
+            )],
+        ),
+        (
+            "a node daemon config",
+            vec![("daemonconfig/evil".into(), b"x".to_vec())],
+        ),
+        (
+            "an unreferenced siteconfig",
+            vec![("siteconfig/deadbeef".into(), b"orphan".to_vec())],
+        ),
+        (
+            "a POISONED siteconfig (body != content-address)",
+            vec![
+                ("project/acme/site/web".into(), b"deadbeef".to_vec()),
+                (
+                    "siteconfig/deadbeef".into(),
+                    b"not-the-preimage-of-deadbeef".to_vec(),
+                ),
+            ],
+        ),
+    ];
+    for (what, entries) in &malicious_sets {
+        let crafted = craft_kv_bundle("acme", entries);
+        let mt_tmp = tempfile::tempdir().unwrap();
+        let mt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(mt_tmp.path().join("blobs")));
+        let mt_work = mt_tmp.path().join("work");
+        std::fs::create_dir_all(&mt_work).unwrap();
+        let mt = NodeProjectExport::new(
+            BTreeMap::new(),
+            DeployStore::new(mt_blobs.clone(), mt_kv.clone()),
+            mt_kv.clone(),
+            mt_blobs.clone(),
+            mt_work,
+        );
+        let mut src = futures::io::Cursor::new(crafted);
+        let res = mt
+            .import(
+                "acme",
+                &mut src,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "import of a bundle carrying {what} MUST be refused (fail-closed)"
+        );
+        // Fail-closed BEFORE writing: the target KV holds NONE of the crafted foreign/global keys.
+        let after = mt_kv.list_prefix("").await.unwrap();
+        assert!(
+            !after.iter().any(|k| k.contains("globex")
+                || k.starts_with("cert/")
+                || k.starts_with("domain/")
+                || k.starts_with("daemonconfig/")
+                || k.starts_with("siteconfig/")),
+            "a refused import ({what}) must not have written any foreign/global/siteconfig key"
         );
     }
 

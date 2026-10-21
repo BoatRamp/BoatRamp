@@ -2617,10 +2617,13 @@ fn transport_key_from_headers(headers: &HeaderMap) -> Option<Vec<u8>> {
         .filter(|b| !b.is_empty())
 }
 
-/// Export a project to a `BRPROJ` bundle, streamed as the response body
-/// (`System·Admin`). The bundle is written to a node temp file, then streamed and
-/// unlinked (the open fd keeps it readable until the stream ends, so it is cleaned up
-/// even on a client disconnect). `501` when no export driver is wired.
+/// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`System·Admin`).
+/// The driver writes the bundle straight into an in-memory pipe whose read half is the
+/// response body — the node never stages the whole bundle to a temp file (peak staging is
+/// bounded to the largest single member). `501` when no export driver is wired. Because bytes
+/// start flowing immediately, a driver failure after the first bytes cannot change the
+/// already-sent `200`; the bundle's per-member SHA-256 makes a truncated bundle fail loud on
+/// import.
 pub(super) async fn project_export(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     headers: HeaderMap,
@@ -2669,6 +2672,9 @@ pub(super) async fn project_export(
     use tokio_util::compat::TokioAsyncWriteCompatExt;
     let (dup_w, dup_r) = tokio::io::duplex(128 * 1024);
     let project_for_task = q.project.clone();
+    // FOLLOW-UP (LOW-2, release hardening): this export task is detached. If the client
+    // disconnects, the duplex read half drops and the driver's sink write errors out, which
+    // unwinds the stream; an explicit abort-on-disconnect handle would make that tidier.
     tokio::spawn(async move {
         let mut sink = dup_w.compat_write();
         if let Err(e) = cap.export(&project_for_task, &export_opts, &mut sink).await {
@@ -2703,8 +2709,9 @@ pub(super) async fn project_export(
 }
 
 /// `POST /api/project-import` query: the project + import flags (`apply` executes vs a
-/// dry-run plan; `force` overlays a non-empty control-plane KV; `allow_schema_skew`
-/// proceeds past a Postgres schema-ledger fingerprint mismatch).
+/// dry-run plan; `force` overlays a non-empty control-plane KV store-wide; `overwrite` allows
+/// replacing a target PROJECT that already holds its own data; `allow_schema_skew` proceeds
+/// past a Postgres schema-ledger fingerprint mismatch).
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ProjectImportQuery {
     project: String,
@@ -2714,6 +2721,10 @@ pub(super) struct ProjectImportQuery {
     force: bool,
     #[serde(default)]
     allow_schema_skew: bool,
+    /// Replace an existing target project (one that already has owned KV/blob data). Default
+    /// `false` ⇒ refuse a populated target, so a clone into a fresh target is the safe default.
+    #[serde(default)]
+    overwrite: bool,
     /// `fresh` (default — mint own identity, drop source-sealed secrets) or `adopt`
     /// (install the bundle's KEK for a same-environment recovery; requires the
     /// transport-key header).
@@ -2725,10 +2736,12 @@ fn default_identity() -> String {
     "fresh".to_string()
 }
 
-/// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body
-/// is streamed to a node temp file (never buffered whole), then handed to the driver;
-/// dry-run unless `?apply=true`. Returns the import report JSON. `501` when no driver is
-/// wired, `409` on a schema skew / KV commingle refusal.
+/// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body is
+/// STREAMED straight into the driver (never staged whole to a node temp file; peak staging is
+/// bounded to the largest single member) and restored in a single forward pass; dry-run unless
+/// `?apply=true`. Returns the import report JSON. `501` when no driver is wired, `409` on a
+/// schema skew / KV commingle refusal. NOTE: an import aborted mid-stream may have partially
+/// applied earlier members — full atomicity awaits the inc2 shadow-restore.
 pub(super) async fn project_import(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     Query(q): Query<ProjectImportQuery>,
@@ -2780,6 +2793,7 @@ pub(super) async fn project_import(
         apply: q.apply,
         force: q.force,
         allow_schema_skew: q.allow_schema_skew,
+        overwrite: q.overwrite,
         identity,
     };
     // Stream the request body straight into the driver — no stage-to-temp: the node never

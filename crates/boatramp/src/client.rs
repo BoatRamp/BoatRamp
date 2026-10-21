@@ -916,8 +916,8 @@ impl ControlPlane {
     /// non-2xx — `409` schema-skew / KV-commingle refusal, `501` no driver — is surfaced
     /// verbatim as [`ClientError::Refused`].
     // Each argument is a distinct import knob the API exposes (apply/force/allow-schema-skew/
-    // identity/transport-key); a wrapper struct would only move the same fields the single CLI
-    // caller already unpacks, so mirror the API surface directly.
+    // overwrite/identity/transport-key); a wrapper struct would only move the same fields the
+    // single CLI caller already unpacks, so mirror the API surface directly.
     #[allow(clippy::too_many_arguments)]
     pub async fn project_import(
         &self,
@@ -926,6 +926,7 @@ impl ControlPlane {
         apply: bool,
         force: bool,
         allow_schema_skew: bool,
+        overwrite: bool,
         identity: &str,
         transport_key: Option<Vec<u8>>,
     ) -> Result<String> {
@@ -948,6 +949,7 @@ impl ControlPlane {
                     "allow_schema_skew",
                     if allow_schema_skew { "true" } else { "false" },
                 ),
+                ("overwrite", if overwrite { "true" } else { "false" }),
                 ("identity", identity),
             ])
             .header("content-type", "application/octet-stream");

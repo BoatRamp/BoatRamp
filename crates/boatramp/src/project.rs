@@ -154,6 +154,10 @@ enum ProjectCommand {
         /// bundle and the target.
         #[arg(long)]
         allow_schema_skew: bool,
+        /// Replace an EXISTING target project (one that already holds its own KV/blob data).
+        /// Default off — a clone into a fresh target is the safe default; this is opt-in.
+        #[arg(long)]
+        overwrite: bool,
         /// Identity decision: `fresh` (default — the target mints its own identity and
         /// source-sealed secrets are dropped) or `adopt` (install the bundle's KEK for a
         /// same-environment recovery; requires a transport key).
@@ -742,6 +746,7 @@ pub async fn run(
             apply,
             force,
             allow_schema_skew,
+            overwrite,
             identity,
             transport_key_file,
         } => {
@@ -760,6 +765,7 @@ pub async fn run(
                     apply,
                     force,
                     allow_schema_skew,
+                    overwrite,
                     &identity,
                     transport_key,
                 )

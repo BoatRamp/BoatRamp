@@ -207,3 +207,7 @@ bytes.workspace = true
 futures.workspace = true
 # Reading an invoke response body in the migrate function-step live gate (the S2 context-gate probe).
 http-body-util.workspace = true
+# Content-address a seeded `siteconfig/<hash>` in the cross-tenant leak gate (the import-side
+# fail-closed check verifies `key == sha256(body)`).
+sha2.workspace = true
+hex.workspace = true

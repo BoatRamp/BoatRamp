@@ -715,15 +715,14 @@ fn peek_format_version(manifest_json: &str) -> Result<u32, BundleError> {
 /// any bytes `restore` leaves unread so the hash + count cover the WHOLE member), then VERIFY
 /// the streamed size + SHA-256 against what the member declared. A mismatch is the loud
 /// reject — a corrupt/truncated member never reaches the next restore step.
-fn verify_member<Rd, F>(
-    body: &mut Rd,
+fn verify_member<F>(
+    body: &mut dyn Read,
     spec: &MemberSpec,
     expected_size: u64,
     expected_sha: &str,
     restore: &mut F,
 ) -> Result<(), BundleError>
 where
-    Rd: Read,
     F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
 {
     let mut counting = HashingReader::new(body);
@@ -747,6 +746,65 @@ where
         });
     }
     Ok(())
+}
+
+/// VERIFY-THEN-APPLY one member: stream `body` into a bounded temp under `stage_dir` while
+/// hashing + counting, VERIFY the staged temp's size + SHA-256 against the declared values
+/// FIRST, and only then hand the verified temp to `restore(spec, &temp)`. The temp is deleted
+/// after `restore` returns (or on a verification failure) — so a corrupt/truncated/tampered
+/// member is rejected before any restore applies it (closing the apply-then-verify window of
+/// the plain streaming reader), while staying O(largest member) on disk.
+fn stage_and_verify_member<F>(
+    body: &mut dyn Read,
+    spec: &MemberSpec,
+    expected_size: u64,
+    expected_sha: &str,
+    stage_dir: &Path,
+    counter: &mut u64,
+    restore: &mut F,
+) -> Result<(), BundleError>
+where
+    F: FnMut(&MemberSpec, &Path) -> Result<(), BundleError>,
+{
+    let temp = stage_dir.join(format!("brimport-{counter}"));
+    *counter += 1;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    {
+        let mut f = io::BufWriter::new(std::fs::File::create(&temp)?);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = body.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total += n as u64;
+            f.write_all(&buf[..n])?;
+        }
+        f.flush()?;
+    }
+    let sha = hex::encode(hasher.finalize());
+    if total != expected_size {
+        let _ = std::fs::remove_file(&temp);
+        return Err(BundleError::SizeMismatch {
+            path: spec.path.clone(),
+            expected: expected_size,
+            actual: total,
+        });
+    }
+    if sha != expected_sha {
+        let _ = std::fs::remove_file(&temp);
+        return Err(BundleError::ChecksumMismatch {
+            path: spec.path.clone(),
+            expected: expected_sha.to_string(),
+            actual: sha,
+        });
+    }
+    // Verified — NOW apply the staged temp, then free it.
+    let r = restore(spec, &temp);
+    let _ = std::fs::remove_file(&temp);
+    r
 }
 
 /// Read a bundle from `src` in a SINGLE FORWARD PASS, handing each member to `restore` as it
@@ -778,13 +836,58 @@ where
 /// exactly as [`read_bundle_streaming`] does.
 pub fn read_bundle_streaming_with_head<R, H, F>(
     src: R,
-    mut on_head: H,
+    on_head: H,
     mut restore: F,
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
     H: FnMut(bool, &SourceInfo),
     F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
+{
+    read_bundle_core(src, on_head, |spec, size, sha, body| {
+        verify_member(body, spec, size, sha, &mut restore)
+    })
+}
+
+/// VERIFY-THEN-APPLY single-pass reader: like [`read_bundle_streaming_with_head`] but each
+/// member is staged to a bounded temp under `stage_dir` and its size + SHA-256 are VERIFIED
+/// from that temp BEFORE `restore(spec, &verified_temp)` is called (and the temp is freed
+/// after). This closes the apply-then-verify window — a corrupt/tampered member is rejected
+/// before it is applied — while keeping staging bounded to the largest single member. Reads v1
+/// and v2 bundles. NOTE: an import aborted mid-stream may still have applied EARLIER members;
+/// full atomicity awaits the inc2 shadow-restore.
+pub fn read_bundle_streaming_staged<R, H, F>(
+    src: R,
+    stage_dir: &Path,
+    on_head: H,
+    mut restore: F,
+) -> Result<Vec<MemberSpec>, BundleError>
+where
+    R: Read,
+    H: FnMut(bool, &SourceInfo),
+    F: FnMut(&MemberSpec, &Path) -> Result<(), BundleError>,
+{
+    let mut counter = 0u64;
+    read_bundle_core(src, on_head, |spec, size, sha, body| {
+        stage_and_verify_member(body, spec, size, sha, stage_dir, &mut counter, &mut restore)
+    })
+}
+
+/// The shared single-forward-pass bundle parse (v1 + v2) behind
+/// [`read_bundle_streaming_with_head`] and [`read_bundle_streaming_staged`]. Peeks the MANIFEST
+/// version, calls `on_head(data_only, source)` once, then for each member calls
+/// `per_member(spec, size, sha, body)` — where `size`/`sha` are the member's declared integrity
+/// values (inline v1 manifest / v2 sidecar) and `body` is the raw member reader. Enforces the
+/// v2 declared order + sidecar pairing and the v1 manifest completeness, exactly as before.
+fn read_bundle_core<R, H, M>(
+    src: R,
+    mut on_head: H,
+    mut per_member: M,
+) -> Result<Vec<MemberSpec>, BundleError>
+where
+    R: Read,
+    H: FnMut(bool, &SourceInfo),
+    M: FnMut(&MemberSpec, u64, &str, &mut dyn Read) -> Result<(), BundleError>,
 {
     let mut ar = tar::Archive::new(src);
     let mut entries = ar.entries()?;
@@ -822,7 +925,7 @@ where
                 kind: mm.kind,
                 pg: mm.pg.clone(),
             };
-            verify_member(&mut entry, &spec, mm.size, &mm.sha256, &mut restore)?;
+            per_member(&spec, mm.size, &mm.sha256, &mut entry)?;
             seen.insert(path);
             restored.push(spec);
         }
@@ -874,7 +977,7 @@ where
                     spec.path
                 )));
             }
-            verify_member(&mut entry, spec, meta.size, &meta.sha256, &mut restore)?;
+            per_member(spec, meta.size, &meta.sha256, &mut entry)?;
             restored.push(spec.clone());
         }
         if let Some((mp, _)) = pending_meta.take() {
@@ -1460,6 +1563,116 @@ mod tests {
         assert!(
             mutant_peak > largest + 4096,
             "so the bounded-staging assertion above is genuinely RED under that mutation"
+        );
+    }
+
+    #[test]
+    fn read_bundle_streaming_staged_verifies_before_apply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A tampered v2 bundle: the sidecar lies about the member's SHA. The STAGED reader must
+        // reject it, and crucially must NOT call `restore` (apply) for the bad member — the
+        // verify-THEN-apply guarantee (MEDIUM-1(b)).
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let manifest = StreamManifest {
+                magic: BUNDLE_MAGIC.to_string(),
+                format_version: BUNDLE_FORMAT_VERSION_V2,
+                created_at: 0,
+                data_only: true,
+                source: SourceInfo {
+                    project: "x".to_string(),
+                    site: None,
+                },
+                members: vec![MemberSpec {
+                    path: "sql/app.pgc".to_string(),
+                    kind: MemberKind::PgDump,
+                    pg: None,
+                }],
+            };
+            append_bytes(
+                &mut b,
+                MANIFEST_PATH,
+                0,
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let meta = MemberMeta {
+                size: 3,
+                sha256: "00".repeat(32), // deliberately wrong
+            };
+            append_bytes(
+                &mut b,
+                "sql/app.pgc.brmeta",
+                0,
+                &serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            append_bytes(&mut b, "sql/app.pgc", 0, b"abc").unwrap();
+            b.finish().unwrap();
+        }
+        let td = tempfile::tempdir().unwrap();
+        let applied = AtomicUsize::new(0);
+        let r = read_bundle_streaming_staged(
+            buf.as_slice(),
+            td.path(),
+            |_d, _s| {},
+            |_spec, _temp| {
+                applied.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(r, Err(BundleError::ChecksumMismatch { .. })),
+            "got {r:?}"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            0,
+            "restore (apply) must NOT run for a member that fails verification"
+        );
+
+        // A clean v2 bundle: `restore` runs ONCE with the verified temp carrying the exact bytes.
+        let stage = td.path().join("gen");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut good: Vec<u8> = Vec::new();
+        write_bundle_streaming(
+            &mut good,
+            0,
+            true,
+            SourceInfo {
+                project: "x".to_string(),
+                site: None,
+            },
+            vec![MemberSpec {
+                path: KV_MEMBER_PATH.to_string(),
+                kind: MemberKind::Kv,
+                pg: None,
+            }],
+            |_s| {
+                let p = stage.join("m");
+                std::fs::write(&p, b"BRKVDUMP-OK").unwrap();
+                Ok(p)
+            },
+        )
+        .unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        read_bundle_streaming_staged(
+            good.as_slice(),
+            td.path(),
+            |_d, _s| {},
+            |spec, temp| {
+                seen.borrow_mut()
+                    .push((spec.path.clone(), std::fs::read(temp).unwrap()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen.into_inner(),
+            vec![("kv.brkvdump".to_string(), b"BRKVDUMP-OK".to_vec())],
+            "a verified member is applied from its staged temp with the exact bytes"
         );
     }
 }

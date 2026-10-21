@@ -1028,6 +1028,44 @@ impl ProjectExport for NodeProjectExport {
         opts: ImportOptions,
     ) -> Result<ImportReport, Perr> {
         check_project_slug(project)?;
+
+        // MEDIUM-1(a): refuse a clone into a TARGET PROJECT that already holds its own data
+        // (owned KV prefixes OR blob scope) unless `overwrite` is set — a clone into a FRESH
+        // target is the safe default; replacing a populated project is opt-in. This is distinct
+        // from `force` (the store-wide KV commingle override); env-clone creates a fresh target,
+        // so this does not break it.
+        if !opts.overwrite {
+            for prefix in
+                boatramp_core::project_export::project_owned_prefixes(ProjectRef::new(project))
+            {
+                if !self
+                    .kv
+                    .list_prefix(&prefix)
+                    .await
+                    .map_err(other)?
+                    .is_empty()
+                {
+                    return Err(Perr::Other(format!(
+                        "import refused: target project {project:?} already has control-plane \
+                         data under {prefix:?}; pass overwrite=true to replace an existing \
+                         project (a clone into a fresh target needs no overwrite)"
+                    )));
+                }
+            }
+            if !self
+                .blobs
+                .list(&blob_project_prefix(project))
+                .await
+                .map_err(other)?
+                .is_empty()
+            {
+                return Err(Perr::Other(format!(
+                    "import refused: target project {project:?} already has blobs; pass \
+                     overwrite=true to replace an existing project"
+                )));
+            }
+        }
+
         let session = self
             .work_dir
             .join(format!("import-{project}-{}", now_secs()));
@@ -1036,10 +1074,14 @@ impl ProjectExport for NodeProjectExport {
 
         // Bridge: the async feeder pumps the caller's bundle stream into a bounded byte
         // channel → `ChannelReader` → the sync v2 single-pass reader (in a blocking task).
-        // The reader's restore closure stages ONE member to a bounded temp then hands it to
-        // the async servicer (which owns `self`) and BLOCKS until it finishes — so disk never
-        // holds more than the largest single member, and the members are restored in the v2
-        // declared (restore) order. Reads v2 and legacy v1 bundles alike.
+        // `read_bundle_streaming_staged` stages ONE member to a bounded temp, VERIFIES its
+        // size + SHA-256 FIRST, then hands the verified temp to the async servicer (which owns
+        // `self`); the restore closure BLOCKS on the servicer until it finishes — so disk never
+        // holds more than the largest single member, members are restored in the v2 declared
+        // (restore) order, and a corrupt/tampered member is rejected BEFORE it is applied
+        // (MEDIUM-1(b): verify-then-apply). Reads v2 and legacy v1 bundles alike. (An import
+        // aborted mid-stream may still have applied EARLIER members — full atomicity awaits the
+        // inc2 shadow-restore; see the restore-order contract below.)
         let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ImportMsg>(1);
         let reader = ChannelReader::new(byte_rx);
@@ -1047,7 +1089,6 @@ impl ProjectExport for NodeProjectExport {
         let req_tx_task = req_tx.clone();
         let read_handle = tokio::task::spawn_blocking(
             move || -> Result<Vec<MemberSpec>, project_bundle::BundleError> {
-                let mut idx = 0usize;
                 let head_tx = req_tx_task.clone();
                 let on_head = move |data_only: bool, source: &SourceInfo| {
                     // Surfaced before any member: the servicer needs the source project (to
@@ -1057,40 +1098,20 @@ impl ProjectExport for NodeProjectExport {
                         source_project: source.project.clone(),
                     });
                 };
-                project_bundle::read_bundle_streaming_with_head(
+                project_bundle::read_bundle_streaming_staged(
                     reader,
+                    &stage_dir_task,
                     on_head,
-                    |spec, _size, body| {
-                        // Stage this member to a bounded temp. Reading `body` to completion
-                        // here is what drives the v2 reader's own per-member SHA-256 + size
-                        // verification (a corrupt/truncated member is caught LOUD at its end).
-                        let temp = stage_dir_task.join(format!("m{idx}"));
-                        idx += 1;
-                        {
-                            let mut f = std::io::BufWriter::new(
-                                std::fs::File::create(&temp)
-                                    .map_err(project_bundle::BundleError::Io)?,
-                            );
-                            let mut buf = [0u8; 64 * 1024];
-                            loop {
-                                let n = body
-                                    .read(&mut buf)
-                                    .map_err(project_bundle::BundleError::Io)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                f.write_all(&buf[..n])
-                                    .map_err(project_bundle::BundleError::Io)?;
-                            }
-                            f.flush().map_err(project_bundle::BundleError::Io)?;
-                        }
-                        // Hand to the servicer and wait, so the NEXT member is not read (nor its
-                        // temp created) until this one is restored + freed.
+                    |spec, temp| {
+                        // The member is already staged + size/SHA-VERIFIED at `temp`. Hand it to
+                        // the servicer and wait, so the NEXT member is not read (nor applied)
+                        // until this one is done; the staged temp is freed by the reader after
+                        // this returns.
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         req_tx_task
                             .blocking_send(ImportMsg::Member {
                                 spec: spec.clone(),
-                                temp: temp.clone(),
+                                temp: temp.to_path_buf(),
                                 reply: reply_tx,
                             })
                             .map_err(|_| {
@@ -1111,6 +1132,10 @@ impl ProjectExport for NodeProjectExport {
         drop(req_tx); // only the blocking reader keeps the request channel alive now
 
         // Async feeder: pump the caller's bundle stream into the blocking reader.
+        // FOLLOW-UP (LOW-1, release hardening): there is no per-member / total byte cap yet —
+        // a hostile bundle could stream unbounded bytes (bounded in memory + to one member on
+        // disk, but not in total). A cap belongs here (reject past a configured ceiling) when
+        // the hardening pass lands.
         let feeder = async {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -1160,7 +1185,8 @@ impl ProjectExport for NodeProjectExport {
                                 &mut saw_identity,
                             )
                             .await;
-                        let _ = tokio::fs::remove_file(&temp).await;
+                        // The staged temp is owned + freed by the reader after `reply`; do not
+                        // delete it here (it is still being read for a blob restore above).
                         match r {
                             Ok(()) => {
                                 let _ = reply.send(Ok(()));
@@ -1748,6 +1774,18 @@ impl NodeProjectExport {
                     source_project,
                     project,
                 );
+                // HIGH-1: SYMMETRIC, FAIL-CLOSED tenancy enforcement on the trust boundary —
+                // the mirror of the export-side scope filter. After re-key, EVERY surviving key
+                // MUST be under the target's owned prefixes (the one exception is a referenced,
+                // content-verified `siteconfig/<hash>`); anything else (another tenant's
+                // `project/…`, a global `cert/`/`domain/`/`wildcard/`, a node `daemonconfig/`, a
+                // reserved `_cp/`/`_inval/`, or a poisoned siteconfig) ABORTS the import — a
+                // crafted bundle must never write node-wide outside the target's scope.
+                boatramp_core::project_export::enforce_target_scoped_kv(
+                    &decoded.entries,
+                    ProjectRef::new(project),
+                )
+                .map_err(Perr::Other)?;
                 if opts.apply {
                     match boatramp_core::kv_dump::apply_import(
                         self.kv.as_ref(),

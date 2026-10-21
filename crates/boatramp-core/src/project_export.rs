@@ -21,6 +21,7 @@
 use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncWrite};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::project::ProjectRef;
 
@@ -155,6 +156,73 @@ pub fn rekey_owned_key(key: &str, source: &str, target: &str) -> String {
     key.to_string()
 }
 
+/// Import-side SYMMETRIC, FAIL-CLOSED tenancy enforcement on the control-plane KV slice — the
+/// mirror of the export-side [`scope_entries_to_project`], applied AFTER the slice has been
+/// re-keyed to the TARGET project ([`rekey_entries_to_target`]) and BEFORE it is written.
+///
+/// A bundle crosses a TRUST boundary and its KV slice carries only a plaintext integrity SHA
+/// (integrity, **not** authenticity), so a crafted/tampered slice must never be trusted to
+/// write OUTSIDE the target's own scope. The export side filters; without this the import side
+/// would fail-OPEN — [`rekey_owned_key`] only rewrites keys under the SOURCE's owned prefixes,
+/// so any other key (`project/<other-tenant>/…`, a global `cert/`/`domain/`/`wildcard/`, a node
+/// `daemonconfig/`, a reserved `_cp/`/`_inval/`, an unreferenced `siteconfig/…`) would pass
+/// through unchanged and be written node-wide — a cross-tenant KV overwrite / routing hijack /
+/// cert replacement / siteconfig poisoning.
+///
+/// Every entry MUST therefore be EITHER:
+///   - under the TARGET's owned prefixes ([`project_owns_key`]); OR
+///   - a content-addressed `siteconfig/<hash>` body that is BOTH (a) referenced by one of the
+///     target's own just-imported `project/<target>/site/` pointers in this slice, AND (b)
+///     content-verified — `key == siteconfig/<sha256(body)>` — so an attacker cannot plant a
+///     mismatched body at a victim's hash.
+///
+/// Any other entry ABORTS the import LOUD, returning a message naming the offending key
+/// (fail-closed, matching the blob re-key's refuse stance). A legitimate clone's own re-keyed
+/// slice is entirely target-owned (plus its own content-correct site configs), so it passes.
+pub fn enforce_target_scoped_kv(
+    entries: &[crate::kv::KvDumpEntry],
+    target: ProjectRef<'_>,
+) -> Result<(), String> {
+    // Site-config hashes legitimately referenced by the TARGET's own site pointers in this slice.
+    let site_pointer_prefix = format!("project/{target}/site/");
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in entries {
+        if e.key.starts_with(&site_pointer_prefix)
+            && let Ok(hash) = std::str::from_utf8(&e.value)
+        {
+            let hash = hash.trim();
+            if !hash.is_empty() {
+                referenced.insert(crate::deploy::keys::site_config_blob(hash));
+            }
+        }
+    }
+    for e in entries {
+        if project_owns_key(&e.key, target) {
+            continue;
+        }
+        if referenced.contains(&e.key) {
+            // Content-address check: the body MUST hash to the key's embedded hash.
+            let computed =
+                crate::deploy::keys::site_config_blob(&hex::encode(Sha256::digest(&e.value)));
+            if computed == e.key {
+                continue;
+            }
+            return Err(format!(
+                "control-plane KV import refused: site-config body for {:?} does not match its \
+                 content-address (expected key {computed:?}) — refusing a poisoned siteconfig",
+                e.key
+            ));
+        }
+        return Err(format!(
+            "control-plane KV import refused: entry {:?} is outside the target project {target}'s \
+             owned scope after re-key — a bundle must not carry another tenant's or a global \
+             (routing / TLS / daemon) control-plane key",
+            e.key
+        ));
+    }
+    Ok(())
+}
+
 /// Flags for an export. `Debug` is implemented by hand to **redact** the transport key so
 /// it can never reach a log line.
 #[derive(Clone, Default)]
@@ -226,6 +294,12 @@ pub struct ImportOptions {
     /// and the target (a `--data-only` restore into a schema-skewed target). Default
     /// `false` ⇒ REFUSE on skew.
     pub allow_schema_skew: bool,
+    /// Replace an EXISTING target project (one that already holds data under its own owned
+    /// KV prefixes or blob scope). Default `false` ⇒ REFUSE such a target, so a clone into a
+    /// FRESH target is the safe default and overwriting a populated project is opt-in. Note
+    /// this is distinct from `force`, which overlays a non-pristine KV destination store-wide;
+    /// `overwrite` is scoped to the TARGET PROJECT's own data.
+    pub overwrite: bool,
     /// Adopt the source identity (recovery) or mint fresh (a different environment).
     pub identity: IdentityChoice,
 }
@@ -236,6 +310,7 @@ impl std::fmt::Debug for ImportOptions {
             .field("apply", &self.apply)
             .field("force", &self.force)
             .field("allow_schema_skew", &self.allow_schema_skew)
+            .field("overwrite", &self.overwrite)
             .field("identity", &self.identity)
             .finish()
     }
@@ -459,5 +534,72 @@ mod tests {
         assert_eq!(slice[0].key, "project/acme/secret/x");
         rekey_entries_to_target(&mut slice, "acme", "beta");
         assert_eq!(slice[0].key, "project/beta/secret/x");
+    }
+
+    /// GATE (HIGH-1 import-direction, symmetric fail-closed): after re-key, the import-side
+    /// [`enforce_target_scoped_kv`] ACCEPTS a slice that is entirely target-owned plus a
+    /// referenced, content-correct `siteconfig/<hash>`, and REFUSES any foreign-tenant / global
+    /// / reserved / unreferenced / poisoned key. The mutation that drops this refuse (skipping
+    /// the import-side filter) is exactly the fail-OPEN cross-tenant-overwrite bug it guards.
+    #[test]
+    fn import_enforce_accepts_target_scope_and_refuses_foreign_or_poisoned() {
+        let target = ProjectRef::new("acme");
+        let site_body = b"{\"acme\":\"site\"}";
+        let site_hash = hex::encode(Sha256::digest(site_body));
+        let site_key = crate::deploy::keys::site_config_blob(&site_hash);
+
+        // A fully legitimate re-keyed slice: owned keys + the site pointer + its content-correct
+        // body — ACCEPTED.
+        let ok = vec![
+            e("project/acme/config/tenancy", b"{}"),
+            e("project/acme/secret/api-key", b"sealed"),
+            e("graphql/acme/subgraph/u", b"sdl"),
+            e("hapq/acme/op", b"op"),
+            e("managed-sql-cred/acme/pg", b"cred"),
+            e("project/acme/site/web", site_hash.as_bytes()),
+            e(&site_key, site_body),
+        ];
+        assert!(
+            enforce_target_scoped_kv(&ok, target).is_ok(),
+            "a fully target-owned + content-correct slice must be accepted"
+        );
+
+        // Each of these, mixed into an otherwise-legit slice, must ABORT the import.
+        for (what, bad) in [
+            ("another tenant", e("project/globex/secret/x", b"foreign")),
+            (
+                "a sibling-prefix project",
+                e("project/acmecorp/secret/x", b"neighbour"),
+            ),
+            ("a global TLS key", e("cert/acme.example.com", b"TLS")),
+            (
+                "a global routing record",
+                e("domain/acme.example.com", b"{}"),
+            ),
+            ("a wildcard routing record", e("wildcard/.acme.dev", b"{}")),
+            ("a node daemon config", e("daemonconfig/deadbeef", b"cfg")),
+            ("a reserved coordination key", e("_cp/leader", b"node-1")),
+            (
+                "an unreferenced siteconfig",
+                e("siteconfig/orphanhash", b"body"),
+            ),
+        ] {
+            let mut slice = vec![e("project/acme/config/tenancy", b"{}"), bad];
+            assert!(
+                enforce_target_scoped_kv(&slice, target).is_err(),
+                "import must refuse {what}"
+            );
+            slice.clear();
+        }
+
+        // A POISONED siteconfig: referenced by the target's pointer but body != content-address.
+        let poisoned = vec![
+            e("project/acme/site/web", b"deadbeef"),
+            e("siteconfig/deadbeef", b"not-the-preimage"),
+        ];
+        assert!(
+            enforce_target_scoped_kv(&poisoned, target).is_err(),
+            "import must refuse a siteconfig whose body does not hash to its key"
+        );
     }
 }
