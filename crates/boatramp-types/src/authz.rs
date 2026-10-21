@@ -253,6 +253,18 @@ impl Right {
         if path == "/api/overlay/invite" {
             return Some(Self::new(Resource::Overlay, None, Action::Admin));
         }
+        // Overlay pairing-rendezvous MINT (the self-serve `boatramp overlay pair-code` path, overlay
+        // follow-up #2 inc2): minting a single-use `bropair1` code stands up a relay rendezvous keyed
+        // to this cluster's ingress relay, so — like `expose`'s name claim and `invite`'s admission —
+        // it is gated `Overlay·Admin`, the owner-grade tier strictly above dial's `Overlay·Write`
+        // (redemption itself is unauthenticated by design — the SAS backstops it — and happens at the
+        // relay, never here). `Action::Admin` also satisfies the lower read/write (`Right::satisfies`),
+        // and the built-in `admin` role covers it via `Resource::ALL`. Re-derived defense-in-depth
+        // in-handler (`assert_overlay_pair_code_is_overlay_admin`) so a route-table refactor can't
+        // silently drop it to the dial tier.
+        if path == "/api/overlay/pair-code" {
+            return Some(Self::new(Resource::Overlay, None, Action::Admin));
+        }
         // Overlay forward-flow discovery. Minting a dial capability (the self-serve
         // `boatramp forward svc/<name>` path) is `Overlay·Write` — it grants a holder-bound,
         // scope-checked capability the egress still verifies; listing/resolving the service
@@ -3204,6 +3216,47 @@ mod tests {
             assert!(
                 !policy.rights_for(&[grant]).allows(&invite),
                 "a non-admin principal (role {role}) must be REFUSED overlay invite",
+            );
+        }
+    }
+
+    /// Overlay pairing-rendezvous mint (`/api/overlay/pair-code`, follow-up #2 inc2) is `Overlay·Admin`
+    /// — the owner-grade tier strictly above dial's `Overlay·Write` — and a dial-only principal must
+    /// NOT reach it; only the `admin` role does over the real default policy. (Mutation-RED: dropping
+    /// the route arm to the deny-safe `System·Admin` default, or weakening it to `Overlay·Write`, trips
+    /// this.)
+    #[test]
+    fn overlay_pair_code_requires_overlay_admin_not_dial_write() {
+        let pair_code = Right::required("POST", "/api/overlay/pair-code")
+            .expect("POST /api/overlay/pair-code must require a token (never public)");
+        assert_eq!(
+            pair_code,
+            Right::new(Resource::Overlay, None, Action::Admin),
+            "POST /api/overlay/pair-code must be gated Overlay·Admin",
+        );
+        // A dial-only grant must NOT be able to mint a pairing rendezvous code.
+        assert!(
+            !Right::new(Resource::Overlay, None, Action::Write).satisfies(&pair_code),
+            "Overlay·Write (dial) must NOT satisfy the Overlay·Admin pair-code gate",
+        );
+        assert!(Right::new(Resource::Overlay, None, Action::Admin).satisfies(&pair_code));
+
+        // Over the real default policy: only the `admin` role reaches pair-code.
+        let policy = AuthzPolicy::default_policy();
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::global("admin")])
+                .allows(&pair_code),
+            "the admin role must reach Overlay·Admin via Resource::ALL",
+        );
+        for grant in [
+            GrantedRole::scoped("publisher", "default/site"),
+            GrantedRole::global("operator"),
+        ] {
+            let role = grant.name.clone();
+            assert!(
+                !policy.rights_for(&[grant]).allows(&pair_code),
+                "a non-admin principal (role {role}) must be REFUSED overlay pair-code",
             );
         }
     }

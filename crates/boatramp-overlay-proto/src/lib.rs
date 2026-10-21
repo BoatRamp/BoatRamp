@@ -40,6 +40,7 @@ pub mod dial;
 pub mod e2ee;
 pub mod ice;
 pub mod identity;
+pub mod pair_code;
 pub mod pairing;
 pub mod peer_policy;
 pub mod sas;
@@ -50,6 +51,7 @@ pub use dial::{DialReject, DialRequest, DialVerdict, authorize_dial};
 pub use e2ee::{E2eeError, HybridInitiator, Opener, Role, Sealer, Session, hybrid_respond};
 pub use ice::{Candidate, CandidateKind, CandidateSet, Signal};
 pub use identity::{OverlayId, OverlayIdError, OverlaySecret};
+pub use pair_code::{PAIR_RENDEZVOUS_ID_LEN, PairCode, PairCodeError};
 pub use pairing::{
     PAIR_NONCE_LEN, PAIR_ROLE_INITIATOR, PAIR_ROLE_RESPONDER, pair_commit, pair_commit_verify,
 };

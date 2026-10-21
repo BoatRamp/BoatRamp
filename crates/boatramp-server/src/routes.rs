@@ -289,6 +289,11 @@ pub fn router_with_fast(
         // a possession proof, then trusts the key in the relay's live set).
         .route("/api/overlay/invite", post(overlay_invite))
         .route("/api/overlay/enroll", post(overlay_enroll))
+        // Overlay pairing rendezvous (follow-up #2 inc2): mint a single-use, short-TTL `bropair1`
+        // code so two NAT'd peers meet through the ingress relay, bridged blind (`Overlay·Admin`,
+        // the owner-grade tier — standing up a rendezvous at the relay). Redemption is unauthenticated
+        // by design (the SAS backstops it) and happens at the relay, not the control plane.
+        .route("/api/overlay/pair-code", post(overlay_pair_code))
         // Overlay flow-policy administration (overlay follow-up #3): the operator-authored Cedar
         // policy that gates the dial/publish-cap mint (deny-or-shrink-TTL). GET/PUT the policy and
         // dry-run `test` it — ALL gated `System·Admin` in `authz::Right::required` (the GET/test

@@ -135,9 +135,9 @@ pub(crate) use control_api::{
     delete_secret, delete_tenant_secret, get_authz_policy, get_overlay_policy, kv_checkpoint,
     kv_export, kv_import, kv_status, list_email_profiles, list_root_anchors, list_secrets,
     list_tenant_secrets, list_tokens, node_version, overlay_dial, overlay_enroll, overlay_expose,
-    overlay_invite, overlay_services, put_authz_policy, put_overlay_policy, remove_root_anchor,
-    revoke_token, set_email_profile, set_secret, set_tenant_secret, show_email_profile,
-    test_overlay_policy,
+    overlay_invite, overlay_pair_code, overlay_services, put_authz_policy, put_overlay_policy,
+    remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
+    show_email_profile, test_overlay_policy,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;

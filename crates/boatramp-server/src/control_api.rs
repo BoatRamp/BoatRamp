@@ -1003,6 +1003,123 @@ pub(super) async fn overlay_expose(
     }
 }
 
+/// Length of a pairing rendezvous id (bytes). MUST match
+/// `boatramp_overlay_proto::PAIR_RENDEZVOUS_ID_LEN` — `boatramp-server` deliberately carries no
+/// overlay-transport dep, so the constant is mirrored here and the CLI's `PairCode::new` re-validates
+/// the length when it assembles the `bropair1` code from this response (a mismatch fails loudly there).
+const OVERLAY_PAIR_RENDEZVOUS_ID_LEN: usize = 16;
+
+/// Default lifetime of a minted pairing rendezvous code when the request omits one (5 minutes): a
+/// pairing code is a short-lived meeting credential — minutes, not the hours a dial cap lives.
+const DEFAULT_OVERLAY_PAIR_CODE_TTL_SECS: u64 = 300;
+
+/// Hard ceiling on a pairing rendezvous code's lifetime (10 minutes): the relay-blind rendezvous is
+/// unauthenticated on the redeem side (the SAS backstops it), so a code must not stand open for long —
+/// clamped well below the dial/publish/enroll server cap.
+const MAX_OVERLAY_PAIR_CODE_TTL_SECS: u64 = 600;
+
+/// Defense-in-depth (mirrors [`assert_overlay_expose_is_overlay_admin`]): re-derive that `POST
+/// /api/overlay/pair-code` is gated `Overlay·Admin` INSIDE the handler, so a router/table refactor
+/// that drops it (or weakens it to `Overlay·Write`) cannot silently let a non-admin mint a pairing
+/// rendezvous code — minting one stands up a relay rendezvous slot keyed to this cluster's relay.
+fn assert_overlay_pair_code_is_overlay_admin() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/overlay/pair-code") {
+        Some(right)
+            if right.resource == Resource::Overlay
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay pair-code requires Overlay·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `POST /api/overlay/pair-code` request: mint a single-use, short-TTL pairing rendezvous code so two
+/// peers that cannot direct-dial each other (both NAT'd) can meet THROUGH this cluster's ingress
+/// relay. No role/scope — the redeeming peer is by design NOT membership-gated (the SAS backstops it);
+/// the `Overlay·Admin` gate is on this MINT (who may stand up a rendezvous at the relay).
+#[derive(Deserialize)]
+pub(super) struct OverlayPairCodeRequest {
+    /// Optional TTL in seconds; omitted ⇒ [`DEFAULT_OVERLAY_PAIR_CODE_TTL_SECS`], clamped to
+    /// [`MAX_OVERLAY_PAIR_CODE_TTL_SECS`] (a pairing code is a minutes-long meeting credential).
+    #[serde(default)]
+    pub(super) ttl_secs: Option<u64>,
+}
+
+/// `POST /api/overlay/pair-code` response: the rendezvous id + the ingress relay to meet at. The CLI
+/// assembles these into the copy-pasteable `bropair1…` code (`boatramp-server` carries no bech32 dep,
+/// mirroring how the dial endpoint returns JSON the CLI packs into a `brfwd1…` ticket).
+#[derive(Serialize)]
+struct OverlayPairCodeResponse {
+    /// The relay/ingress `host:port` both peers dial to meet.
+    relay: String,
+    /// The relay's overlay identity both peers pin (`ed25519:<hex>`).
+    relay_id: String,
+    /// The single-use rendezvous id (hex of [`OVERLAY_PAIR_RENDEZVOUS_ID_LEN`] bytes) — the relay's
+    /// registry key both the park and the redeem present.
+    rendezvous: String,
+    /// The code's expiry (Unix seconds).
+    expires_at: u64,
+}
+
+/// Mint a single-use pairing rendezvous code (self-serve `boatramp overlay pair-code`). Gated
+/// `Overlay·Admin` — minting one stands up a relay rendezvous keyed to this cluster's ingress relay,
+/// an owner-grade act (the same tier as `expose`/`invite`). `404` when this node runs no ingress relay
+/// accepting rendezvous (`[overlay] accept_exposed`), mirroring `overlay_expose`. The code is NOT a
+/// signed capability (so no root key is needed): its security is the short TTL + the relay's single-use
+/// redemption + the relay-blind bridge + the out-of-band SAS — never a secret the relay verifies.
+pub(super) async fn overlay_pair_code(
+    Extension(directory): Extension<OverlayDirectory>,
+    Json(request): Json<OverlayPairCodeRequest>,
+) -> Response {
+    if let Some(forbidden) = assert_overlay_pair_code_is_overlay_admin() {
+        return forbidden;
+    }
+    // The ingress relay the peers meet at — the SAME relay `expose` dials OUT to. Present only when
+    // this node runs an ingress relay (`[overlay] accept_exposed`); otherwise there is nowhere to meet.
+    let Some(relay) = directory.expose_relay() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this node runs no overlay ingress relay to host a pairing rendezvous (set \
+             `[overlay] accept_exposed = true` on a relay node)\n",
+        )
+            .into_response();
+    };
+    let ttl = request
+        .ttl_secs
+        .unwrap_or(DEFAULT_OVERLAY_PAIR_CODE_TTL_SECS)
+        .min(MAX_OVERLAY_PAIR_CODE_TTL_SECS);
+    // The rendezvous id is high-entropy platform randomness — infeasible to guess, so the matching
+    // park/redeem is the whole mechanism and the Overlay·Admin mint controls who may obtain one.
+    let mut rendezvous = [0u8; OVERLAY_PAIR_RENDEZVOUS_ID_LEN];
+    if getrandom::getrandom(&mut rendezvous).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to generate a pairing rendezvous id\n",
+        )
+            .into_response();
+    }
+    let now = now_unix();
+    (
+        StatusCode::CREATED,
+        Json(OverlayPairCodeResponse {
+            relay: relay.relay.clone(),
+            relay_id: relay.relay_id.clone(),
+            rendezvous: hex::encode(rendezvous),
+            expires_at: now.saturating_add(ttl),
+        }),
+    )
+        .into_response()
+}
+
 /// Default lifetime of a minted `overlay-enroll` invitation when the request omits one (1 hour) —
 /// an enrollment invitation MUST be time-bounded (like the cluster join token), and a short
 /// admission window bounds how long a leaked (unspent) invitation stays redeemable.
@@ -2517,6 +2634,57 @@ mod tests {
         assert!(
             assert_overlay_invite_is_overlay_admin().is_none(),
             "POST /api/overlay/invite must be gated Overlay·Admin"
+        );
+        assert!(
+            assert_overlay_pair_code_is_overlay_admin().is_none(),
+            "POST /api/overlay/pair-code must be gated Overlay·Admin"
+        );
+    }
+
+    /// `overlay_pair_code` is `404` on a node running no ingress relay (nowhere to meet) and `201`
+    /// with an expose relay configured — returning the relay topology + a fresh rendezvous id, the
+    /// TTL clamped to the short pairing ceiling. No root key is needed (the code is not signed).
+    #[tokio::test]
+    async fn overlay_pair_code_404_without_relay_and_201_with_relay() {
+        // No ingress relay → 404 (nowhere to host the rendezvous).
+        let resp = overlay_pair_code(
+            Extension(OverlayDirectory::default()),
+            Json(OverlayPairCodeRequest { ttl_secs: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // With an expose relay → 201, carrying the relay + a fresh rendezvous id.
+        let directory = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+        }));
+        let resp = overlay_pair_code(
+            Extension(directory),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: Some(u64::MAX), // clamped to the short pairing ceiling
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["relay"], "203.0.113.9:9100");
+        assert_eq!(v["relay_id"], "ed25519:aa");
+        // The rendezvous id is hex of the fixed-length nonce.
+        let rvz = v["rendezvous"].as_str().unwrap();
+        assert_eq!(rvz.len(), OVERLAY_PAIR_RENDEZVOUS_ID_LEN * 2);
+        assert!(hex::decode(rvz).is_ok());
+        // The TTL was clamped to the short pairing ceiling (not the 24h dial cap).
+        let now = now_unix();
+        let exp = v["expires_at"].as_u64().unwrap();
+        assert!(
+            exp <= now + MAX_OVERLAY_PAIR_CODE_TTL_SECS + 2,
+            "pair-code TTL must be clamped to the short pairing ceiling"
         );
     }
 

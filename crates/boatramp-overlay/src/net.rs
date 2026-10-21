@@ -106,6 +106,8 @@ pub enum NetError {
     UnresolvedService(String),
     #[error("service registration refused by the relay: {0:?}")]
     RegistrationRejected(RegisterReject),
+    #[error("pairing rendezvous refused by the relay: {0:?}")]
+    PairRejected(PairReject),
 }
 
 /// Current unix time (seconds).
@@ -820,6 +822,10 @@ enum RegisterResult {
 enum IngressFrame {
     /// An exposer registering a service (reverse ingress).
     Register(RegisterRequest),
+    /// An accepter parking a pairing rendezvous (overlay follow-up #2, inc2).
+    PairPark(PairParkRequest),
+    /// A dialer redeeming a parked pairing rendezvous.
+    PairRedeem(PairRedeemRequest),
     /// A forward client dialing a service.
     Dial(DialRequest),
 }
@@ -838,10 +844,22 @@ async fn read_ingress_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<IngressF
     }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
+    // Try each discriminated frame first (each carries a required tag field a bare DialRequest lacks,
+    // and vice versa); the bare-DialRequest wire the existing client-edge sends is unchanged.
     if let Ok(reg) = serde_json::from_slice::<RegisterRequest>(&buf)
         && reg.register == REGISTER_TAG
     {
         return Ok(IngressFrame::Register(reg));
+    }
+    if let Ok(park) = serde_json::from_slice::<PairParkRequest>(&buf)
+        && park.pair_park == PAIR_PARK_TAG
+    {
+        return Ok(IngressFrame::PairPark(park));
+    }
+    if let Ok(redeem) = serde_json::from_slice::<PairRedeemRequest>(&buf)
+        && redeem.pair_redeem == PAIR_REDEEM_TAG
+    {
+        return Ok(IngressFrame::PairRedeem(redeem));
     }
     Ok(IngressFrame::Dial(serde_json::from_slice(&buf)?))
 }
@@ -1145,6 +1163,7 @@ pub async fn run_ingress_router<F>(
     trust_root: TokenPublicKey,
     client_auth: RelayClientAuth,
     registry: ExposerRegistry,
+    rendezvous: PairRendezvous,
     resolve: F,
 ) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
@@ -1165,6 +1184,7 @@ pub async fn run_ingress_router<F>(
         let trust_root = trust_root.clone();
         let resolve = resolve.clone();
         let registry = registry.clone();
+        let rendezvous = rendezvous.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_ingress_connection(
@@ -1173,6 +1193,7 @@ pub async fn run_ingress_router<F>(
                 &trust_root,
                 client_auth,
                 &registry,
+                &rendezvous,
                 &resolve,
             )
             .await
@@ -1184,14 +1205,16 @@ pub async fn run_ingress_router<F>(
 }
 
 /// Accept the first bi-stream + control frame on an ingress connection and dispatch to the
-/// registration (exposer) or forwarding (client) path.
+/// registration (exposer), pairing-rendezvous (park/redeem), or forwarding (client) path.
 #[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_ingress_connection<F>(
     conn: Connection,
     relay_secret: &OverlaySecret,
     trust_root: &TokenPublicKey,
     client_auth: RelayClientAuth,
     registry: &ExposerRegistry,
+    rendezvous: &PairRendezvous,
     resolve: &F,
 ) -> Result<(), NetError>
 where
@@ -1208,6 +1231,8 @@ where
         IngressFrame::Register(req) => {
             register_exposer(conn, send, recv, req, relay_secret, trust_root, registry).await
         }
+        IngressFrame::PairPark(req) => park_rendezvous(conn, send, recv, req, rendezvous).await,
+        IngressFrame::PairRedeem(req) => redeem_rendezvous(conn, send, recv, req, rendezvous).await,
         IngressFrame::Dial(req) => {
             forward_resolved(
                 conn,
@@ -1325,6 +1350,311 @@ where
             }
         });
     }
+    Ok(())
+}
+
+// ======================================================================================
+// Pairing rendezvous (`boatramp overlay pair` over the relay): meet two NAT'd peers blind.
+//
+// The structural SIBLING of reverse ingress. Two peers that cannot direct-dial each other both dial
+// the SAME cluster relay OUTBOUND under a shared single-use `bropair1` rendezvous id: the ACCEPTER
+// parks (the relay holds its connection, keyed by the id), the DIALER redeems (the relay matches the
+// two, opens a per-flow bi-stream DOWN the parked connection, and bridges it to the dialer's stream,
+// BLIND). The commit-then-reveal SAS pairing handshake (`pair::pair_handshake`) then runs end-to-end
+// over the bridge — accepter = Responder, dialer = Initiator — UNCHANGED, so the relay holds no keys/
+// nonces/SAS and a tampering/misrouting relay is still caught by the SAS divergence it defends against.
+//
+// Hardening: the rendezvous id is SINGLE-USE (a redeem CONSUMES the parked entry; a second redeem
+// finds nothing) and short-TTL (a parked entry expires in minutes, and a never-redeemed park is reaped
+// so it cannot hold a slot); the ingress accept loop's `MAX_INFLIGHT_FLOWS` Semaphore bounds concurrent
+// rendezvous exactly as it bounds forward/expose flows, and `HANDSHAKE_TIMEOUT` bounds the pre-park
+// first-frame phase (a half-open connection cannot park a slot). The `Overlay·Admin` gate lives on the
+// control-plane MINT (who may obtain a rendezvous), never on redemption — the unpaired peer is by
+// design not membership-gated; the SAS backstops it.
+// ======================================================================================
+
+/// The discriminator marking a [`PairParkRequest`] frame (the accepter PARKING at the relay), so the
+/// ingress router tells it from a `Register`/`Dial`/`PairRedeem` first frame without changing the wire.
+const PAIR_PARK_TAG: &str = "overlay-pair-park";
+/// The discriminator marking a [`PairRedeemRequest`] frame (the dialer REDEEMING a parked rendezvous).
+const PAIR_REDEEM_TAG: &str = "overlay-pair-redeem";
+
+/// How long a parked pairing rendezvous lives at the relay before it is reaped (minutes): long enough
+/// for an operator to share the `bropair1` code and the peer to redeem it, short enough that a leaked/
+/// abandoned code cannot stand open. Bounds a never-redeemed park's hold on a `MAX_INFLIGHT_FLOWS`
+/// Semaphore slot (the park connection is force-closed once this elapses with no redeem).
+#[cfg(feature = "server")]
+const PAIR_RENDEZVOUS_TTL_SECS: u64 = 300;
+
+/// What a peer sends as the FIRST control frame to PARK a pairing rendezvous (the accepter side).
+/// Distinguished from a `DialRequest`/`RegisterRequest`/`PairRedeemRequest` by its required
+/// `pair_park` discriminator (a dial/register/redeem frame never carries it, and vice versa).
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct PairParkRequest {
+    /// Always [`PAIR_PARK_TAG`].
+    pair_park: String,
+    /// The rendezvous id (the relay's registry key) — the core of a `bropair1` code.
+    code: Vec<u8>,
+}
+
+/// What a peer sends as the FIRST control frame to REDEEM a parked pairing rendezvous (the dialer
+/// side). The relay matches `code` to a parked accepter and bridges the two streams blind; the
+/// remaining bytes on THIS stream are the end-to-end pairing handshake, which the relay forwards
+/// untouched.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct PairRedeemRequest {
+    /// Always [`PAIR_REDEEM_TAG`].
+    pair_redeem: String,
+    /// The rendezvous id to redeem — must match a live parked entry.
+    code: Vec<u8>,
+}
+
+/// Why a pairing park/redeem was refused by the relay (returned to the peer).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum PairReject {
+    /// A live rendezvous is ALREADY parked under this id (first-park-wins; never a silent takeover) —
+    /// returned to a PARK.
+    CodeInUse,
+    /// No live parked rendezvous for this id — never parked, already redeemed (single-use), or expired
+    /// — returned to a REDEEM.
+    UnknownOrSpent,
+}
+
+/// The relay's verdict on a pairing park/redeem (the first frame back to the peer).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+enum PairResult {
+    /// Parked / matched — proceed to the handshake.
+    Ok,
+    /// Refused — the peer has its reason.
+    Rejected(PairReject),
+}
+
+/// Client-side: PARK at `relay` for a pairing rendezvous under `code` (the accepter). Dials the relay
+/// (server-auth, pinning it — the parker is NOT membership-gated), sends the park request, and on the
+/// relay's `Ok` accepts the ONE bridged pairing stream the relay opens DOWN this connection when a
+/// dialer redeems the code. Returns the held [`Connection`] (keep it alive for the handshake) plus the
+/// bridged `(send, recv)` to run `pair_handshake(Responder)` over. The wait for a redeemer is bounded
+/// by the relay's rendezvous TTL (it force-closes the parked connection when the TTL elapses with no
+/// redeem, surfacing here as a connection error).
+pub async fn pair_relay_park(
+    relay: &Endpoint,
+    relay_addr: SocketAddr,
+    code: Vec<u8>,
+) -> Result<(Connection, SendStream, RecvStream), NetError> {
+    let conn = quic::dial(relay, relay_addr).await?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(
+        &mut send,
+        &PairParkRequest {
+            pair_park: PAIR_PARK_TAG.to_string(),
+            code,
+        },
+    )
+    .await?;
+    match read_msg::<PairResult>(&mut recv).await? {
+        PairResult::Ok => {}
+        PairResult::Rejected(reason) => return Err(NetError::PairRejected(reason)),
+    }
+    // The relay opens the bridged pairing stream down this connection only once a dialer redeems the
+    // code; `accept_bi` unblocks on the relay's first bridged write (the dialer's handshake offer).
+    let (bridged_send, bridged_recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    Ok((conn, bridged_send, bridged_recv))
+}
+
+/// Client-side: REDEEM a parked pairing rendezvous `code` at `relay` (the dialer). Dials the relay
+/// (server-auth, pinning it), sends the redeem request, and on the relay's `Ok` returns the held
+/// [`Connection`] + the `(send, recv)` the relay bridges to the parked accepter — run
+/// `pair_handshake(Initiator)` over them. A refusal (`UnknownOrSpent`) is single-use/TTL/typo —
+/// fail-closed.
+pub async fn pair_relay_redeem(
+    relay: &Endpoint,
+    relay_addr: SocketAddr,
+    code: Vec<u8>,
+) -> Result<(Connection, SendStream, RecvStream), NetError> {
+    let conn = quic::dial(relay, relay_addr).await?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(
+        &mut send,
+        &PairRedeemRequest {
+            pair_redeem: PAIR_REDEEM_TAG.to_string(),
+            code,
+        },
+    )
+    .await?;
+    match read_msg::<PairResult>(&mut recv).await? {
+        PairResult::Ok => {}
+        PairResult::Rejected(reason) => return Err(NetError::PairRejected(reason)),
+    }
+    Ok((conn, send, recv))
+}
+
+/// One parked pairing rendezvous.
+#[cfg(feature = "server")]
+struct PairEntry {
+    /// The parked accepter connection (it dialed OUT; its park task holds it open). A `redeem` opens a
+    /// per-flow bi-stream down a clone and bridges the dialer to it, blind.
+    conn: Connection,
+    /// When this parked rendezvous expires (Unix seconds): single-use TTL — a redeem after this, or of
+    /// an already-consumed id, finds nothing.
+    expires_at: u64,
+}
+
+/// A relay-side registry of parked pairing rendezvous, keyed by the single-use rendezvous id. The
+/// SIBLING of [`ExposerRegistry`]: a parked peer is an OUTBOUND-dialed, held connection, and a redeem
+/// opens a per-flow bi-stream DOWN it and bridges blind — the relay never dials a peer-named address,
+/// so the not-an-open-proxy property holds. Unlike the exposer registry a rendezvous is SINGLE-USE
+/// (consumed on redeem) and short-TTL; in-memory and single-node for this increment (KV-durable
+/// restart-survival is a later increment). Cheap to clone (an `Arc` handle).
+#[cfg(feature = "server")]
+#[derive(Clone, Default)]
+pub struct PairRendezvous {
+    inner: Arc<Mutex<BTreeMap<Vec<u8>, PairEntry>>>,
+}
+
+#[cfg(feature = "server")]
+impl PairRendezvous {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `entry` is still a live rendezvous at `now`: its connection is open AND unexpired.
+    fn entry_live(entry: &PairEntry, now: u64) -> bool {
+        entry.conn.close_reason().is_none() && now < entry.expires_at
+    }
+
+    /// Try to PARK `conn` under `code` until `expires_at` (FIRST-PARK-WINS): refuse if a LIVE entry
+    /// already holds the id — never a silent takeover. A dead/expired entry is replaced. `true` on
+    /// success.
+    async fn try_park(&self, code: Vec<u8>, conn: Connection, expires_at: u64, now: u64) -> bool {
+        let mut map = self.inner.lock().await;
+        if let Some(existing) = map.get(&code)
+            && Self::entry_live(existing, now)
+        {
+            return false; // a live rendezvous already holds this id
+        }
+        map.insert(code, PairEntry { conn, expires_at });
+        true
+    }
+
+    /// REDEEM (CONSUME — single-use) the live parked connection for `code`, REMOVING it so a second
+    /// redeem of the same id finds nothing. `None` if no live parked entry exists (never parked,
+    /// already redeemed, or expired); a dead/expired entry is pruned.
+    async fn redeem(&self, code: &[u8], now: u64) -> Option<Connection> {
+        let mut map = self.inner.lock().await;
+        match map.get(code) {
+            Some(e) if Self::entry_live(e, now) => map.remove(code).map(|e| e.conn),
+            Some(_) => {
+                map.remove(code); // prune the dead/expired entry
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Release `code` IFF the stored entry is still `conn` — so a newer re-park of the id (or a redeem
+    /// that already consumed it) is never clobbered when the older park task finally exits.
+    async fn release(&self, code: &[u8], conn: &Connection) {
+        let mut map = self.inner.lock().await;
+        if let Some(existing) = map.get(code)
+            && existing.conn.stable_id() == conn.stable_id()
+        {
+            map.remove(code);
+        }
+    }
+
+    /// Whether a live rendezvous is currently parked under `code` at `now` (test/diagnostic helper).
+    pub async fn is_parked(&self, code: &[u8], now: u64) -> bool {
+        let map = self.inner.lock().await;
+        map.get(code).is_some_and(|e| Self::entry_live(e, now))
+    }
+}
+
+/// Relay pairing: PARK one accepter under its rendezvous id. No relay E2EE handshake — the relay is
+/// blind; the rendezvous id (the `bropair1` code's core) is the only credential, and the SAS backstops
+/// the pairing. Parks the connection, acks, then HOLDS it (bounded by the rendezvous TTL) so a redeem
+/// can open the bridged pairing stream down it; on the TTL with no redeem it force-closes the parked
+/// connection (freeing the Semaphore slot the accept loop holds) and releases the id.
+#[cfg(feature = "server")]
+async fn park_rendezvous(
+    conn: Connection,
+    mut send: SendStream,
+    _recv: RecvStream,
+    req: PairParkRequest,
+    registry: &PairRendezvous,
+) -> Result<(), NetError> {
+    if req.code.is_empty() {
+        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::CodeInUse)).await;
+        return Err(NetError::Stream("empty pairing rendezvous id".into()));
+    }
+    let now = now_unix();
+    let expires_at = now.saturating_add(PAIR_RENDEZVOUS_TTL_SECS);
+    if !registry
+        .try_park(req.code.clone(), conn.clone(), expires_at, now)
+        .await
+    {
+        // A live rendezvous already holds this id — first-park-wins, never a silent takeover.
+        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::CodeInUse)).await;
+        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+        return Err(NetError::PairRejected(PairReject::CodeInUse));
+    }
+    write_msg(&mut send, &PairResult::Ok).await?;
+    tracing::info!("overlay relay: pairing rendezvous parked");
+    // Hold until the connection drops (the accepter finished the bridged handshake and closed, or
+    // aborted) OR the TTL elapses with no redeem — then force-close to free the accept-loop slot.
+    if timeout(
+        std::time::Duration::from_secs(PAIR_RENDEZVOUS_TTL_SECS),
+        conn.closed(),
+    )
+    .await
+    .is_err()
+    {
+        conn.close(0u32.into(), b"pair rendezvous expired");
+    }
+    registry.release(&req.code, &conn).await;
+    Ok(())
+}
+
+/// Relay pairing: REDEEM a parked rendezvous for the dialer. Matches `code` to a live parked accepter
+/// connection (CONSUMING it — single-use), opens a per-flow bi-stream DOWN the parked connection, and
+/// bridges the dialer's stream to it BLIND. The end-to-end pairing handshake flows through untouched;
+/// the relay holds no keys/nonces/SAS. An unmatched id is refused (`UnknownOrSpent`).
+#[cfg(feature = "server")]
+async fn redeem_rendezvous(
+    client: Connection,
+    mut client_send: SendStream,
+    client_recv: RecvStream,
+    req: PairRedeemRequest,
+    registry: &PairRendezvous,
+) -> Result<(), NetError> {
+    let Some(parked) = registry.redeem(&req.code, now_unix()).await else {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::UnknownOrSpent),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::UnknownOrSpent));
+    };
+    // Open a per-flow bi-stream DOWN the parked accepter connection; bridge the dialer to it, blind.
+    let (parked_send, parked_recv) = parked
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(&mut client_send, &PairResult::Ok).await?;
+    tracing::info!("overlay relay: pairing rendezvous matched (bridging blind)");
+    bridge(client_recv, client_send, parked_recv, parked_send).await?;
+    let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
     Ok(())
 }
 
@@ -2123,6 +2453,17 @@ mod tests {
         root_pub: TokenPublicKey,
         registry: ExposerRegistry,
     ) -> SocketAddr {
+        spawn_ingress_relay_with_rendezvous(relay, root_pub, registry, PairRendezvous::new())
+    }
+
+    /// As [`spawn_ingress_relay`], but with a caller-supplied [`PairRendezvous`] so the pairing tests
+    /// can share + inspect the relay's rendezvous registry.
+    fn spawn_ingress_relay_with_rendezvous(
+        relay: &OverlaySecret,
+        root_pub: TokenPublicKey,
+        registry: ExposerRegistry,
+        rendezvous: PairRendezvous,
+    ) -> SocketAddr {
         let relay_ep =
             quic::server_endpoint(relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = relay_ep.local_addr().unwrap();
@@ -2133,6 +2474,7 @@ mod tests {
             root_pub,
             RelayClientAuth::CapabilityOnly,
             registry,
+            rendezvous,
             |_s: &str| None::<(SocketAddr, OverlayId, bool)>,
         ));
         addr
@@ -2861,5 +3203,467 @@ mod tests {
                 "the failure must be an IdentityMismatch (fail-closed E2EE pin), got: {err}"
             );
         }
+    }
+
+    // ---- Pairing rendezvous (overlay follow-up #2, inc2) ----
+
+    use crate::pair::pair_handshake;
+    use boatramp_overlay_proto::e2ee::Role;
+
+    /// Wait (bounded) until a rendezvous `code` is live in the relay's registry.
+    async fn await_parked(rendezvous: &PairRendezvous, code: &[u8]) -> bool {
+        for _ in 0..100 {
+            if rendezvous.is_parked(code, now_unix()).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    const PAIR_DL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Full rendezvous "done": two peers that never direct-dial each other meet THROUGH the relay —
+    /// the accepter PARKS a `bropair1` rendezvous id, the dialer REDEEMS it, the relay matches + bridges
+    /// BLIND, and the commit-then-reveal SAS pairing handshake runs end-to-end over the bridge. Both
+    /// derive the SAME SAS and learn each other's E2EE-proven identity (the inc1 handshake assertions,
+    /// now over the relay-bridged transport). This is the whole increment, over the served relay role.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_peers_pair_through_the_relay_rendezvous_and_derive_the_same_sas() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let (relay_id, accepter_id, dialer_id) = (relay.id(), accepter.id(), dialer.id());
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_rendezvous(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+        );
+        let code = vec![0xABu8; 16];
+
+        // Accepter: park the code, then run the handshake as Responder over the bridged stream.
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await; // hold the parked connection until the dialer finishes
+            out
+        });
+
+        assert!(
+            await_parked(&rendezvous, &code).await,
+            "the accepter must park the rendezvous at the relay"
+        );
+
+        // Dialer: redeem the code, then run the handshake as Initiator over the matched stream.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) = pair_relay_redeem(&ep, relay_addr, code.clone())
+            .await
+            .unwrap();
+        let (sas_d, peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"paired");
+
+        let (sas_a, peer_a) = acc.await.unwrap();
+        assert_eq!(sas_a.bits(), sas_d.bits(), "both ends derive the same SAS");
+        assert_eq!(sas_a.words(), sas_d.words());
+        assert_eq!(
+            peer_a, dialer_id,
+            "the accepter learned the dialer's proven id"
+        );
+        assert_eq!(
+            peer_d, accepter_id,
+            "the dialer learned the accepter's proven id"
+        );
+        // Single-use: the matched rendezvous was consumed on redeem.
+        assert!(
+            !rendezvous.is_parked(&code, now_unix()).await,
+            "a redeemed rendezvous must be consumed (single-use)"
+        );
+    }
+
+    /// Single-use (mutation-RED against dropping the `map.remove` in `PairRendezvous::redeem`): a
+    /// SECOND redeem of an already-redeemed rendezvous id is refused `UnknownOrSpent` — the parked
+    /// entry was consumed by the first redeem, never re-served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_redeem_of_a_spent_pairing_code_is_refused() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_rendezvous(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+        );
+        let code = vec![0x11u8; 16];
+
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let _ = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL).await;
+            conn.closed().await;
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+
+        // First redeem consumes the rendezvous.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let first = pair_relay_redeem(&ep, relay_addr, code.clone()).await;
+        assert!(
+            first.is_ok(),
+            "the first redeem must match the parked rendezvous"
+        );
+
+        // Second redeem of the SAME id finds nothing — refused.
+        let ep2 = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let second = pair_relay_redeem(&ep2, relay_addr, code.clone()).await;
+        assert!(
+            matches!(
+                second,
+                Err(NetError::PairRejected(PairReject::UnknownOrSpent))
+            ),
+            "a second redeem of a spent rendezvous must be refused, got {second:?}"
+        );
+        let _ = acc.await;
+    }
+
+    /// Registry invariants (mutation-RED, no transport): single-use consumption, the short TTL, and
+    /// first-park-wins. `redeem` with `now >= expires_at` finds nothing (TTL), a redeem CONSUMES a live
+    /// entry so a second finds nothing (single-use), and a second LIVE park of a held id is refused
+    /// (first-park-wins — never a silent takeover). Drives the registry directly with explicit `now`.
+    #[tokio::test]
+    async fn pairing_rendezvous_registry_enforces_single_use_ttl_and_first_park_wins() {
+        // A throwaway, still-open connection just to key the registry (never bridged in this unit
+        // test). Both endpoints + both connection handles are held alive for the test's duration, so
+        // the returned connection reports `close_reason().is_none()` (live).
+        async fn dummy_conn() -> Connection {
+            let secret = OverlaySecret::generate().unwrap();
+            let server =
+                quic::server_endpoint(&secret, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = server.local_addr().unwrap();
+            let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let srv_conn = quic::accept(&server).await.unwrap().unwrap();
+                let _ = conn_tx.send(srv_conn.clone());
+                let _hold = (server, srv_conn); // keep the server endpoint + conn alive
+                std::future::pending::<()>().await;
+            });
+            let client = quic::pair_dial_endpoint().unwrap();
+            let client_conn = quic::dial(&client, addr).await.unwrap();
+            tokio::spawn(async move {
+                let _hold = (client, client_conn); // keep the client endpoint + conn alive
+                std::future::pending::<()>().await;
+            });
+            conn_rx.await.unwrap()
+        }
+
+        let reg = PairRendezvous::new();
+        let code = vec![0x42u8; 16];
+
+        // TTL: a parked entry is not live at/after its expiry, so a redeem then finds nothing.
+        let c1 = dummy_conn().await;
+        assert!(reg.try_park(code.clone(), c1, 100, 50).await, "fresh park");
+        assert!(reg.is_parked(&code, 99).await, "parked before expiry");
+        assert!(!reg.is_parked(&code, 100).await, "NOT live at expiry (TTL)");
+        assert!(
+            reg.redeem(&code, 100).await.is_none(),
+            "an expired rendezvous must not be redeemable (TTL)"
+        );
+
+        // Single-use: a redeem of a live entry CONSUMES it; a second redeem finds nothing.
+        let c2 = dummy_conn().await;
+        assert!(
+            reg.try_park(code.clone(), c2, 1000, 50).await,
+            "re-park after prune"
+        );
+        assert!(
+            reg.redeem(&code, 60).await.is_some(),
+            "first redeem matches"
+        );
+        assert!(
+            reg.redeem(&code, 60).await.is_none(),
+            "a consumed rendezvous must not be redeemable again (single-use)"
+        );
+
+        // First-park-wins: a second LIVE park of a held id is refused (never a silent takeover).
+        let c3 = dummy_conn().await;
+        assert!(
+            reg.try_park(code.clone(), c3, 1000, 50).await,
+            "park the id"
+        );
+        let c4 = dummy_conn().await;
+        assert!(
+            !reg.try_park(code.clone(), c4, 1000, 60).await,
+            "a second live park of a held id must be refused (first-park-wins)"
+        );
+    }
+
+    /// Relay-blind: the relay bridges CIPHERTEXT ONLY. A capturing relay tees every bridged byte in
+    /// both directions; after the two peers pair end-to-end over it, the derived SAS (words + digits +
+    /// raw bits) appears NOWHERE in the captured stream — the relay holds no keys/nonces/SAS and cannot
+    /// recover it. (The SAS is never transmitted; the revealed nonces that derive it ride SEALED phase-B
+    /// records. A mutation that leaked either in cleartext over the bridge would surface them here.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pairing_relay_bridges_ciphertext_only_never_the_sas() {
+        use std::collections::HashMap;
+
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let code = vec![0x5Au8; 16];
+
+        // A capturing relay: park connections keyed by code; on a redeem, open a stream down the parked
+        // connection and bridge both directions while TEEING every byte into `capture`.
+        let relay_ep =
+            quic::server_endpoint(&relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let capture: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let parked: Arc<Mutex<HashMap<Vec<u8>, Connection>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let capture = capture.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                    let parked = parked.clone();
+                    let capture = capture.clone();
+                    tokio::spawn(async move {
+                        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                        let frame = read_ingress_frame(&mut recv).await.unwrap();
+                        match frame {
+                            IngressFrame::PairPark(req) => {
+                                parked.lock().await.insert(req.code, conn.clone());
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                conn.closed().await; // hold the parked connection open
+                            }
+                            IngressFrame::PairRedeem(req) => {
+                                // Find the parked accepter (bounded retry for arrival ordering).
+                                let mut target = None;
+                                for _ in 0..100 {
+                                    if let Some(c) = parked.lock().await.get(&req.code).cloned() {
+                                        target = Some(c);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                                let target = target.expect("a parked accepter for the code");
+                                let (mut ps, mut pr) = target.open_bi().await.unwrap();
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                // Blind TEE-bridge: copy both ways, appending every byte to `capture`.
+                                let cap_c2e = capture.clone();
+                                let c2e = async {
+                                    let mut buf = [0u8; 8192];
+                                    while let Ok(Some(n)) = recv.read(&mut buf).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        cap_c2e.lock().await.extend_from_slice(&buf[..n]);
+                                        if ps.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    let _ = ps.finish();
+                                };
+                                let cap_e2c = capture.clone();
+                                let e2c = async {
+                                    let mut buf = [0u8; 8192];
+                                    while let Ok(Some(n)) = pr.read(&mut buf).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        cap_e2c.lock().await.extend_from_slice(&buf[..n]);
+                                        if send.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    let _ = send.finish();
+                                };
+                                tokio::join!(c2e, e2c);
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            });
+        }
+
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await;
+            out
+        });
+        // Give the accepter time to park before redeeming.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) = pair_relay_redeem(&ep, relay_addr, code.clone())
+            .await
+            .unwrap();
+        let (sas_d, _peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"paired");
+        let (sas_a, _peer_a) = acc.await.unwrap();
+
+        assert_eq!(
+            sas_a.bits(),
+            sas_d.bits(),
+            "pairing completed through the capturing relay"
+        );
+        let seen = capture.lock().await.clone();
+        assert!(
+            !seen.is_empty(),
+            "the relay must have bridged the handshake bytes"
+        );
+        // The derived SAS — in any rendering — never crosses the wire, so it is absent from what the
+        // relay saw. A relay that could read the handshake would be able to surface these.
+        for needle in [sas_d.words(), sas_d.digits()] {
+            assert!(
+                !contains_subslice(&seen, needle.as_bytes()),
+                "the relay must NOT see the SAS `{needle}` in the bridged ciphertext"
+            );
+        }
+        assert!(
+            !contains_subslice(&seen, sas_d.bits()),
+            "the relay must NOT see the raw SAS bits in the bridged ciphertext"
+        );
+    }
+
+    /// Whether `haystack` contains `needle` as a contiguous subslice.
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Tampering/misrouting relay → the SAS diverges (the inc1 MITM guarantee, now over the rendezvous
+    /// transport). An ACTIVE relay that cannot relay ciphertext (it has no session keys) can only run
+    /// TWO separate pairing legs — Initiator toward the parked accepter, Responder toward the dialer.
+    /// The accepter and the dialer then derive SAS codes from two DIFFERENT transcripts, so the
+    /// out-of-band comparison DIVERGES and the humans catch the man-in-the-middle. Each also proves it
+    /// paired with the relay M (not the other peer), so neither pins the intended partner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mitm_rendezvous_relay_makes_the_two_peers_sas_diverge() {
+        let mitm = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let (mitm_id, mitm_pub_seed) = (mitm.id(), mitm.seed_hex().to_string());
+        let relay_id = mitm_id; // the peers pin the relay (= the MITM) at TLS; the SAS is their only cross-check
+        let (accepter_id, dialer_id) = (accepter.id(), dialer.id());
+        let code = vec![0x77u8; 16];
+
+        let relay_ep =
+            quic::server_endpoint(&mitm, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        // The MITM relay: park the accepter, run a pairing leg with it AS A PEER (Initiator); on a
+        // redeem, run a SECOND pairing leg with the dialer (Responder). It bridges NOTHING (it cannot —
+        // it has no session keys), so the two legs are independent handshakes.
+        {
+            let parked: Arc<Mutex<std::collections::HashMap<Vec<u8>, Connection>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            tokio::spawn(async move {
+                while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                    let parked = parked.clone();
+                    let mitm_seed = mitm_pub_seed.clone();
+                    tokio::spawn(async move {
+                        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                        match read_ingress_frame(&mut recv).await.unwrap() {
+                            IngressFrame::PairPark(req) => {
+                                parked.lock().await.insert(req.code, conn.clone());
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                // Leg A: M dials a stream down the parked accepter conn and pairs with it
+                                // as the Initiator.
+                                let (mut ps, mut pr) = conn.open_bi().await.unwrap();
+                                let m = OverlaySecret::from_seed_hex(&mitm_seed).unwrap();
+                                let _ =
+                                    pair_handshake(&mut ps, &mut pr, &m, Role::Initiator, PAIR_DL)
+                                        .await;
+                                conn.closed().await;
+                            }
+                            IngressFrame::PairRedeem(_req) => {
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                // Leg B: M pairs with the dialer as the Responder over the dialer stream.
+                                let m = OverlaySecret::from_seed_hex(&mitm_seed).unwrap();
+                                let _ = pair_handshake(
+                                    &mut send,
+                                    &mut recv,
+                                    &m,
+                                    Role::Responder,
+                                    PAIR_DL,
+                                )
+                                .await;
+                                conn.closed().await;
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            });
+        }
+
+        // Accepter parks and pairs (Responder) with whoever opens the bridged stream — which is M.
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await;
+            out
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Dialer redeems and pairs (Initiator) — also with M.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) = pair_relay_redeem(&ep, relay_addr, code.clone())
+            .await
+            .unwrap();
+        let (sas_d, peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"done");
+        let (sas_a, peer_a) = acc.await.unwrap();
+
+        // Each paired with M, not the intended partner — so neither learned the other's id.
+        assert_eq!(
+            peer_a, mitm_id,
+            "the accepter paired with the MITM relay, not the dialer"
+        );
+        assert_eq!(
+            peer_d, mitm_id,
+            "the dialer paired with the MITM relay, not the accepter"
+        );
+        assert_ne!(mitm_id, accepter_id);
+        assert_ne!(mitm_id, dialer_id);
+        // The two human-visible SAS codes DIVERGE — the out-of-band comparison catches the MITM.
+        assert_ne!(
+            sas_a.bits(),
+            sas_d.bits(),
+            "an active MITM rendezvous relay yields diverging SAS codes — the comparison catches it"
+        );
     }
 }

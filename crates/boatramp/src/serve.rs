@@ -1063,9 +1063,9 @@ async fn spawn_overlay_roles(
 )> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
-        ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
-        run_egress_router, run_forwarding_router, run_ingress_router, server_endpoint,
-        server_endpoint_with_trust,
+        ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret, PairRendezvous, PathMode,
+        RelayClientAuth, run_egress_router, run_forwarding_router, run_ingress_router,
+        server_endpoint, server_endpoint_with_trust,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1246,13 +1246,18 @@ async fn spawn_overlay_roles(
                 trust_root: trust_spec.clone(),
                 client_auth: client_auth_str.to_string(),
             });
-            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services)");
+            // The pairing rendezvous (overlay follow-up #2, inc2) shares this ingress relay: NAT'd
+            // peers meet here under a single-use `bropair1` code, bridged blind — the same park-and-
+            // bridge machinery as reverse ingress. In-memory + single-node this increment.
+            let rendezvous = PairRendezvous::new();
+            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services + pairing rendezvous)");
             tokio::spawn(run_ingress_router(
                 ep,
                 relay_secret,
                 trust,
                 client_auth,
                 registry,
+                rendezvous,
                 resolve,
             ));
         } else {
