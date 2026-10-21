@@ -929,9 +929,21 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             let dir = sql_cfg
                 .and_then(|c| c.dir.clone())
                 .unwrap_or_else(|| data_dir.join("handlers-sql"));
-            driver = driver.with_libsql(std::sync::Arc::new(
-                boatramp_storage::LibsqlSqlBackends::local(dir),
-            ));
+            let libsql_backends = boatramp_storage::LibsqlSqlBackends::local(dir);
+            // inc2: sweep any stale `*.shadow_*` left by a crash mid-import — the atomic
+            // shadow-restore's RAII drop-guard only fires in-process, so a crash would otherwise
+            // orphan the in-flight shadow DB. Safe at startup (no import is in flight yet).
+            match libsql_backends.sweep_stale_shadows() {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        swept = n,
+                        "project-export: removed stale libsql import shadows"
+                    )
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "project-export: stale-shadow sweep failed"),
+            }
+            driver = driver.with_libsql(std::sync::Arc::new(libsql_backends));
         }
         Some(Arc::new(driver) as Arc<dyn boatramp_core::project_export::ProjectExport>)
     };

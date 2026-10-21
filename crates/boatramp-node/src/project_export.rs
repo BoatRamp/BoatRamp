@@ -80,6 +80,20 @@ fn now_secs() -> u64 {
 /// bound (one member on disk) is what the format's streaming guarantee rests on.
 const STREAM_BYTE_CHANNEL: usize = 16;
 
+/// The chunk size (bytes) for a `ChunkedTrailer` member — inc2 default #6: a **64 MiB** constant,
+/// not operator-tunable. Overridable only in tests (so a chunked round-trip is fast) via
+/// [`NodeProjectExport::with_chunk_size`].
+pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Defense-in-depth per-member import ceiling (inc2 default #6 / the inc1 LOW-1 follow-up): a
+/// hostile bundle must not stream unbounded bytes into one member. A generous default (a real
+/// member is far smaller), tightenable in tests via [`NodeProjectExport::with_import_caps`].
+const DEFAULT_IMPORT_MEMBER_CAP: u64 = 256 * 1024 * 1024 * 1024; // 256 GiB
+
+/// Defense-in-depth whole-bundle import ceiling (inc2 default #6 / inc1 LOW-1): the feeder aborts
+/// once the TOTAL bytes streamed from the source exceed this, so a bundle can't stream forever.
+const DEFAULT_IMPORT_TOTAL_CAP: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-mutation-gated in the merge gate)
 // ---------------------------------------------------------------------------
@@ -407,6 +421,12 @@ pub struct NodeProjectExport {
     pg_client_image: Option<String>,
     /// MySQL counterpart — overrides the computed `mysql:<maj.min>` client image.
     mysql_client_image: Option<String>,
+    /// The chunk size for a `ChunkedTrailer` member (default [`DEFAULT_CHUNK_SIZE`]; test override).
+    chunk_size: usize,
+    /// Per-member import byte ceiling (default [`DEFAULT_IMPORT_MEMBER_CAP`]).
+    import_member_cap: u64,
+    /// Whole-bundle import byte ceiling (default [`DEFAULT_IMPORT_TOTAL_CAP`]).
+    import_total_cap: u64,
 }
 
 impl NodeProjectExport {
@@ -436,7 +456,28 @@ impl NodeProjectExport {
             connect_timeout_secs: 10,
             pg_client_image: None,
             mysql_client_image: None,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            import_member_cap: DEFAULT_IMPORT_MEMBER_CAP,
+            import_total_cap: DEFAULT_IMPORT_TOTAL_CAP,
         }
+    }
+
+    /// Override the chunk size for `ChunkedTrailer` members (TEST ONLY — production uses the
+    /// [`DEFAULT_CHUNK_SIZE`] 64 MiB constant). A small size makes a chunked round-trip test
+    /// produce multiple `.part` entries without a large fixture.
+    #[must_use]
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// Override the import byte ceilings (TEST ONLY — production uses the generous defaults). Lets
+    /// a test prove the per-member / total caps reject an over-large bundle cheaply.
+    #[must_use]
+    pub fn with_import_caps(mut self, member_cap: u64, total_cap: u64) -> Self {
+        self.import_member_cap = member_cap;
+        self.import_total_cap = total_cap;
+        self
     }
 
     /// Supply an operator override for the ephemeral SQL-client images (the `pg_dump`/`mysqldump`/
@@ -871,25 +912,231 @@ enum StageJob {
     Blob { key: String },
 }
 
-/// The export stager's request: "stage the member at `path`, reply with its temp path".
+/// The export stager's request: "produce the member at `path`". `chunked` selects a
+/// [`StageReply::Chunked`] body stream (ChunkedTrailer framing — O(chunk), no temp) vs a
+/// [`StageReply::Sidecar`] staged temp (Sidecar framing).
 struct StageReq {
     path: String,
-    reply: tokio::sync::oneshot::Sender<Result<PathBuf, ()>>,
+    chunked: bool,
+    reply: tokio::sync::oneshot::Sender<StageReply>,
 }
 
-/// The import servicer's request, sent by the blocking v2 reader as it streams.
+/// The stager's reply to a [`StageReq`].
+enum StageReply {
+    /// A Sidecar member staged whole to this bounded temp (the writer appends then deletes it).
+    Sidecar(PathBuf),
+    /// A ChunkedTrailer member's body — the writer reads this receiver straight through
+    /// `append_member_chunked` (O(chunk)); `poison` is set by the producer task on error so a
+    /// premature channel close becomes a loud IO error (never a silently-truncated member).
+    Chunked {
+        rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        poison: Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// Production failed — fail the writer (the specific error is surfaced by the stager).
+    Err,
+}
+
+/// A started chunked-member body producer: the body-channel receiver, the `poison` flag the
+/// producer sets on error, and its `JoinHandle` (awaited by the stager so a producer error fails
+/// the export). Returned by [`NodeProjectExport::open_chunked_producer`].
+type ChunkedProducer = (
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<Result<(), Perr>>,
+);
+
+/// A synchronous [`Read`] over a chunked member's body channel (export) that distinguishes a
+/// CLEAN end-of-stream from a PRODUCER FAILURE: on channel close it returns an IO error iff the
+/// shared `poison` flag is set (the producer errored), so `append_member_chunked` never writes a
+/// valid trailer over a short/incomplete member.
+struct ChunkedBodyReader {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    poison: Arc<std::sync::atomic::AtomicBool>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChunkedBodyReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.buf.len() {
+            match self.rx.blocking_recv() {
+                Some(chunk) if !chunk.is_empty() => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Some(_) => continue,
+                None => {
+                    if self.poison.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(std::io::Error::other("export member producer failed"));
+                    }
+                    return Ok(0); // clean EOF
+                }
+            }
+        }
+        let n = std::cmp::min(out.len(), self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// The import servicer's request, sent by the blocking atomic reader as it streams.
 enum ImportMsg {
     /// The bundle head (surfaced before any member) — the source project + data-only flag.
     Head {
         data_only: bool,
         source_project: String,
     },
-    /// A member staged to `temp`; the servicer restores it then replies so the reader may
-    /// advance (one member staged at a time ⇒ O(largest member)).
+    /// A Sidecar member staged + size/SHA-verified at `temp`; the servicer restores it then
+    /// replies so the reader may advance (one member staged at a time ⇒ O(largest member)).
     Member {
         spec: MemberSpec,
         temp: PathBuf,
         reply: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    /// Begin a ChunkedTrailer member: the servicer opens the sink (a libsql shadow, or a staging
+    /// temp for a blob/KV member) and drains `body_rx` into it, replying once opened.
+    ChunkBegin {
+        spec: MemberSpec,
+        body_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    /// Finish the in-flight ChunkedTrailer member: `verified` is whether the trailer matched —
+    /// COMMIT the sink on true, DROP it on false (the reader then raises the loud mismatch).
+    ChunkFinish {
+        verified: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+}
+
+/// The blocking atomic reader's [`BundleRestorer`](project_bundle::BundleRestorer) — it bridges the
+/// sync reader to the async servicer over the `req` channel (for sidecar members + chunk
+/// begin/finish) and a per-member `body` channel (for chunk bytes). It also enforces the
+/// per-member import byte CAP (inc2 default #6 / inc1 LOW-1): a sidecar member's staged size and a
+/// chunked member's streamed total are both checked against `member_cap`, so one hostile member
+/// can't stream unbounded bytes.
+struct ImportBridge {
+    req_tx: tokio::sync::mpsc::Sender<ImportMsg>,
+    /// The in-flight chunked member's body channel (between begin and finish).
+    body_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Bytes streamed into the in-flight chunked member so far (for the per-member cap).
+    chunked_bytes: u64,
+    member_cap: u64,
+}
+
+impl ImportBridge {
+    fn gone() -> project_bundle::BundleError {
+        project_bundle::BundleError::MalformedStream("import servicer gone".into())
+    }
+    fn over_cap(cap: u64) -> project_bundle::BundleError {
+        project_bundle::BundleError::MalformedStream(format!(
+            "import refused: a member exceeds the per-member byte cap of {cap} bytes"
+        ))
+    }
+}
+
+impl project_bundle::BundleRestorer for ImportBridge {
+    fn restore_sidecar(
+        &mut self,
+        spec: &MemberSpec,
+        temp: &std::path::Path,
+    ) -> Result<(), project_bundle::BundleError> {
+        if let Ok(m) = std::fs::metadata(temp)
+            && m.len() > self.member_cap
+        {
+            return Err(Self::over_cap(self.member_cap));
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.req_tx
+            .blocking_send(ImportMsg::Member {
+                spec: spec.clone(),
+                temp: temp.to_path_buf(),
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::gone())?;
+        match reply_rx.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(project_bundle::BundleError::MalformedStream(
+                "import restore aborted".into(),
+            )),
+        }
+    }
+
+    fn begin_chunked(&mut self, spec: &MemberSpec) -> Result<(), project_bundle::BundleError> {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.req_tx
+            .blocking_send(ImportMsg::ChunkBegin {
+                spec: spec.clone(),
+                body_rx,
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::gone())?;
+        self.body_tx = Some(body_tx);
+        self.chunked_bytes = 0;
+        match reply_rx.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(project_bundle::BundleError::MalformedStream(
+                "import chunk begin aborted".into(),
+            )),
+        }
+    }
+
+    fn write_chunk(
+        &mut self,
+        _spec: &MemberSpec,
+        buf: &[u8],
+    ) -> Result<(), project_bundle::BundleError> {
+        self.chunked_bytes = self.chunked_bytes.saturating_add(buf.len() as u64);
+        if self.chunked_bytes > self.member_cap {
+            return Err(Self::over_cap(self.member_cap));
+        }
+        match self.body_tx.as_ref() {
+            Some(tx) => tx.blocking_send(buf.to_vec()).map_err(|_| {
+                project_bundle::BundleError::MalformedStream("chunk sink closed".into())
+            }),
+            None => Err(project_bundle::BundleError::MalformedStream(
+                "write_chunk without begin".into(),
+            )),
+        }
+    }
+
+    fn finish_chunked(
+        &mut self,
+        _spec: &MemberSpec,
+        verified: bool,
+    ) -> Result<(), project_bundle::BundleError> {
+        // Drop the body channel → EOF to the servicer's drain, THEN ask it to commit/abort.
+        self.body_tx = None;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.req_tx
+            .blocking_send(ImportMsg::ChunkFinish {
+                verified,
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::gone())?;
+        match reply_rx.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(project_bundle::BundleError::MalformedStream(
+                "import chunk finish aborted".into(),
+            )),
+        }
+    }
+}
+
+/// The servicer's in-flight chunked-member sink, held between `ChunkBegin` and `ChunkFinish`.
+enum ChunkState {
+    /// A libsql member streaming into an atomic shadow DB (committed-or-dropped at finish).
+    Libsql {
+        shadow: boatramp_storage::sql_libsql::DumpShadow,
+        feed_err: Option<Perr>,
+    },
+    /// A blob/KV member staged to a bounded temp, then restored via the SAME `restore_member`
+    /// (re-key / scope-enforce) as a sidecar member at finish — framing is never a tenancy bypass.
+    Staged {
+        spec: MemberSpec,
+        temp: PathBuf,
+        write_err: Option<Perr>,
     },
 }
 
@@ -926,11 +1173,13 @@ impl ProjectExport for NodeProjectExport {
         //    still turn it into an error status.)
         let (specs, jobs, source) = self.plan_export(project, opts, created_at).await?;
 
-        // 2. STREAM: run the sync v2 writer in a blocking task, bridged to (a) the caller's
-        //    async `sink` over a bounded byte channel + drain, and (b) the async stager over a
-        //    one-slot request channel. `write_bundle_streaming` stages → appends → deletes ONE
-        //    member at a time, so the transient on-disk staging never exceeds the largest
-        //    single member — never the whole bundle (the env-clone disk-fill fix).
+        // 2. STREAM: run the sync v3 writer in a blocking task, bridged to (a) the caller's async
+        //    `sink` over a bounded byte channel + drain, and (b) the async stager over a one-slot
+        //    request channel. `write_bundle_streaming_v3` dispatches each member by framing: a
+        //    Sidecar member is staged → appended → deleted (O(largest-member)); a ChunkedTrailer
+        //    member's body is piped STRAIGHT through `append_member_chunked` in `chunk_size` pieces
+        //    with NO temp (O(chunk) — the libsql `.dump` + large-blob streaming win over inc1).
+        let chunk_size = self.chunk_size;
         let (byte_tx, mut byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
         let (stage_tx, mut stage_rx) = tokio::sync::mpsc::channel::<StageReq>(1);
         let writer_out = ChannelWriter { tx: byte_tx };
@@ -939,55 +1188,104 @@ impl ProjectExport for NodeProjectExport {
         let source_for_task = source.clone();
         let write_handle =
             tokio::task::spawn_blocking(move || -> Result<(), project_bundle::BundleError> {
-                project_bundle::write_bundle_streaming(
+                let request = |path: &str,
+                               chunked: bool|
+                 -> Result<StageReply, project_bundle::BundleError> {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    stage_tx_task
+                        .blocking_send(StageReq {
+                            path: path.to_string(),
+                            chunked,
+                            reply: reply_tx,
+                        })
+                        .map_err(|_| {
+                            project_bundle::BundleError::MalformedStream(
+                                "export stager gone".into(),
+                            )
+                        })?;
+                    reply_rx.blocking_recv().map_err(|_| {
+                        project_bundle::BundleError::MalformedStream("export stager dropped".into())
+                    })
+                };
+                project_bundle::write_bundle_streaming_v3(
                     writer_out,
                     created_at,
                     data_only,
                     source_for_task,
                     specs_for_task,
-                    |spec| {
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        stage_tx_task
-                            .blocking_send(StageReq {
-                                path: spec.path.clone(),
-                                reply: reply_tx,
-                            })
-                            .map_err(|_| {
-                                project_bundle::BundleError::MalformedStream(
-                                    "export stager gone".into(),
-                                )
-                            })?;
-                        match reply_rx.blocking_recv() {
-                            Ok(Ok(tmp)) => Ok(tmp),
-                            _ => Err(project_bundle::BundleError::MalformedStream(
-                                "export staging failed".into(),
-                            )),
-                        }
+                    chunk_size,
+                    // Sidecar: ask the stager to stage the member to a temp.
+                    |spec| match request(&spec.path, false)? {
+                        StageReply::Sidecar(tmp) => Ok(tmp),
+                        _ => Err(project_bundle::BundleError::MalformedStream(
+                            "export staging failed".into(),
+                        )),
+                    },
+                    // ChunkedTrailer: ask the stager to START a body producer; read it straight through.
+                    |spec| match request(&spec.path, true)? {
+                        StageReply::Chunked { rx, poison } => Ok(Box::new(ChunkedBodyReader {
+                            rx,
+                            poison,
+                            buf: Vec::new(),
+                            pos: 0,
+                        })
+                            as Box<dyn Read>),
+                        _ => Err(project_bundle::BundleError::MalformedStream(
+                            "export chunked member open failed".into(),
+                        )),
                     },
                 )
             });
         drop(stage_tx); // only the blocking task keeps the request channel alive now
 
-        // Async stager: produce each requested member to a bounded temp, using `self`.
+        // Async stager: produce each requested member, using `self`. A Sidecar member is staged to
+        // a bounded temp; a ChunkedTrailer member spawns a producer task that streams its body
+        // (libsql `.dump` / blob get) into a bounded channel the writer drains. Producer handles
+        // are collected and awaited after the writer finishes, so a producer error FAILS the export
+        // (and poisons the body stream so no valid trailer is written over a short member).
         let stager = async {
             let mut idx = 0usize;
+            let mut producers: Vec<tokio::task::JoinHandle<Result<(), Perr>>> = Vec::new();
             while let Some(req) = stage_rx.recv().await {
-                let res = match jobs.get(&req.path) {
-                    Some(job) => self.stage_job(project, job, &stage_dir, idx).await,
-                    None => Err(Perr::Other(format!(
-                        "export: internal error — no stage job for member {:?}",
-                        req.path
-                    ))),
-                };
-                idx += 1;
-                match res {
-                    Ok(tmp) => {
-                        let _ = req.reply.send(Ok(tmp));
+                let job = jobs.get(&req.path);
+                if req.chunked {
+                    match self.open_chunked_producer(job) {
+                        Ok((rx, poison, handle)) => {
+                            producers.push(handle);
+                            let _ = req.reply.send(StageReply::Chunked { rx, poison });
+                        }
+                        Err(e) => {
+                            let _ = req.reply.send(StageReply::Err);
+                            return Err::<(), Perr>(e);
+                        }
                     }
-                    Err(e) => {
-                        let _ = req.reply.send(Err(()));
-                        return Err::<(), Perr>(e);
+                } else {
+                    let res = match job {
+                        Some(job) => self.stage_job(project, job, &stage_dir, idx).await,
+                        None => Err(Perr::Other(format!(
+                            "export: internal error — no stage job for member {:?}",
+                            req.path
+                        ))),
+                    };
+                    idx += 1;
+                    match res {
+                        Ok(tmp) => {
+                            let _ = req.reply.send(StageReply::Sidecar(tmp));
+                        }
+                        Err(e) => {
+                            let _ = req.reply.send(StageReply::Err);
+                            return Err::<(), Perr>(e);
+                        }
                     }
+                }
+            }
+            // The writer has finished (channel closed) and fully drained every producer; surface
+            // any producer error now (a failed dump/blob-get is an export failure).
+            for h in producers {
+                match h.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(je) => return Err(other(je)),
                 }
             }
             Ok(())
@@ -1072,16 +1370,15 @@ impl ProjectExport for NodeProjectExport {
         let stage_dir = session.join("stage");
         tokio::fs::create_dir_all(&stage_dir).await.map_err(other)?;
 
-        // Bridge: the async feeder pumps the caller's bundle stream into a bounded byte
-        // channel → `ChannelReader` → the sync v2 single-pass reader (in a blocking task).
-        // `read_bundle_streaming_staged` stages ONE member to a bounded temp, VERIFIES its
-        // size + SHA-256 FIRST, then hands the verified temp to the async servicer (which owns
-        // `self`); the restore closure BLOCKS on the servicer until it finishes — so disk never
-        // holds more than the largest single member, members are restored in the v2 declared
-        // (restore) order, and a corrupt/tampered member is rejected BEFORE it is applied
-        // (MEDIUM-1(b): verify-then-apply). Reads v2 and legacy v1 bundles alike. (An import
-        // aborted mid-stream may still have applied EARLIER members — full atomicity awaits the
-        // inc2 shadow-restore; see the restore-order contract below.)
+        // Bridge: the async feeder pumps the caller's bundle stream into a bounded byte channel →
+        // `ChannelReader` → the sync v1/v2/v3 ATOMIC reader (in a blocking task). The `ImportBridge`
+        // restorer hands a Sidecar member (staged + size/SHA-VERIFIED at a bounded temp) to the
+        // async servicer and BLOCKS until it finishes (verify-then-apply, O(largest member)); a
+        // ChunkedTrailer member streams begin/chunk/finish to the servicer, which applies a libsql
+        // member into an ATOMIC shadow (committed only on a verified trailer — nothing partial ever
+        // reaches live) and stages a blob/KV member to a temp restored via the SAME re-key/enforce
+        // as a sidecar member. Reads v1, v2 AND v3 bundles.
+        let member_cap = self.import_member_cap;
         let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ImportMsg>(1);
         let reader = ChannelReader::new(byte_rx);
@@ -1098,46 +1395,30 @@ impl ProjectExport for NodeProjectExport {
                         source_project: source.project.clone(),
                     });
                 };
-                project_bundle::read_bundle_streaming_staged(
+                let mut bridge = ImportBridge {
+                    req_tx: req_tx_task,
+                    body_tx: None,
+                    chunked_bytes: 0,
+                    member_cap,
+                };
+                project_bundle::read_bundle_streaming_atomic(
                     reader,
                     &stage_dir_task,
                     on_head,
-                    |spec, temp| {
-                        // The member is already staged + size/SHA-VERIFIED at `temp`. Hand it to
-                        // the servicer and wait, so the NEXT member is not read (nor applied)
-                        // until this one is done; the staged temp is freed by the reader after
-                        // this returns.
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        req_tx_task
-                            .blocking_send(ImportMsg::Member {
-                                spec: spec.clone(),
-                                temp: temp.to_path_buf(),
-                                reply: reply_tx,
-                            })
-                            .map_err(|_| {
-                                project_bundle::BundleError::MalformedStream(
-                                    "import servicer gone".into(),
-                                )
-                            })?;
-                        match reply_rx.blocking_recv() {
-                            Ok(Ok(())) => Ok(()),
-                            _ => Err(project_bundle::BundleError::MalformedStream(
-                                "import restore aborted".into(),
-                            )),
-                        }
-                    },
+                    &mut bridge,
                 )
             },
         );
         drop(req_tx); // only the blocking reader keeps the request channel alive now
 
-        // Async feeder: pump the caller's bundle stream into the blocking reader.
-        // FOLLOW-UP (LOW-1, release hardening): there is no per-member / total byte cap yet —
-        // a hostile bundle could stream unbounded bytes (bounded in memory + to one member on
-        // disk, but not in total). A cap belongs here (reject past a configured ceiling) when
-        // the hardening pass lands.
+        // Async feeder: pump the caller's bundle stream into the blocking reader, enforcing the
+        // whole-bundle byte CAP (inc2 default #6 / inc1 LOW-1) so a hostile bundle can't stream
+        // forever (memory is already bounded by the channel + one member on disk; this bounds the
+        // TOTAL).
+        let total_cap = self.import_total_cap;
         let feeder = async {
             let mut buf = vec![0u8; 64 * 1024];
+            let mut total: u64 = 0;
             loop {
                 let n = src
                     .read(&mut buf)
@@ -1145,6 +1426,12 @@ impl ProjectExport for NodeProjectExport {
                     .map_err(|e| Perr::Other(format!("import body read failed: {e}")))?;
                 if n == 0 {
                     break;
+                }
+                total = total.saturating_add(n as u64);
+                if total > total_cap {
+                    return Err(Perr::Other(format!(
+                        "import refused: bundle exceeds the total byte cap of {total_cap} bytes"
+                    )));
                 }
                 if byte_tx.send(buf[..n].to_vec()).await.is_err() {
                     break; // the reader stopped (error / early finish) — nothing more to feed
@@ -1154,7 +1441,10 @@ impl ProjectExport for NodeProjectExport {
             Ok::<(), Perr>(())
         };
 
-        // Async servicer: restore each staged member using `self`, in arrival (restore) order.
+        // Async servicer: restore each member using `self`, in arrival (restore) order. A Sidecar
+        // member goes through `restore_member`; a ChunkedTrailer member opens a sink on
+        // `ChunkBegin` (a libsql shadow, or a staging temp for a blob/KV member), drains its body
+        // INLINE, and commits/drops it on `ChunkFinish`.
         let servicer = async {
             let mut report = ImportReport {
                 dry_run: !opts.apply,
@@ -1163,6 +1453,8 @@ impl ProjectExport for NodeProjectExport {
             let mut data_only = false;
             let mut source_project = String::new();
             let mut saw_identity = false;
+            let mut pending_chunk: Option<ChunkState> = None;
+            let mut chunk_idx = 0usize;
             while let Some(msg) = req_rx.recv().await {
                 match msg {
                     ImportMsg::Head {
@@ -1185,8 +1477,6 @@ impl ProjectExport for NodeProjectExport {
                                 &mut saw_identity,
                             )
                             .await;
-                        // The staged temp is owned + freed by the reader after `reply`; do not
-                        // delete it here (it is still being read for a blob restore above).
                         match r {
                             Ok(()) => {
                                 let _ = reply.send(Ok(()));
@@ -1194,6 +1484,174 @@ impl ProjectExport for NodeProjectExport {
                             Err(e) => {
                                 let _ = reply.send(Err(()));
                                 return Err::<_, Perr>(e);
+                            }
+                        }
+                    }
+                    ImportMsg::ChunkBegin {
+                        spec,
+                        mut body_rx,
+                        reply,
+                    } => {
+                        // Open the sink for this chunked member by kind, reply so the reader may
+                        // stream, then drain the body INLINE into the sink (feeding until EOF).
+                        match spec.kind {
+                            MemberKind::Libsql => {
+                                let site = match site_from_libsql_member(&spec.path) {
+                                    Some(s) => s,
+                                    None => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "bad libsql member path {:?}",
+                                            spec.path
+                                        )));
+                                    }
+                                };
+                                let Some(libsql) = self.libsql.as_ref() else {
+                                    let _ = reply.send(Err(()));
+                                    return Err(Perr::Unavailable(
+                                        "bundle carries a libsql member but this node has no local \
+                                         libsql backend to restore it into"
+                                            .into(),
+                                    ));
+                                };
+                                let qsite = ProjectRef::new(project).qualified(site);
+                                if opts.apply {
+                                    match libsql.begin_dump_shadow(&qsite, "", opts.overwrite).await
+                                    {
+                                        Ok(mut shadow) => {
+                                            let _ = reply.send(Ok(()));
+                                            let mut feed_err = None;
+                                            while let Some(chunk) = body_rx.recv().await {
+                                                if feed_err.is_none()
+                                                    && let Err(e) = shadow.feed(&chunk).await
+                                                {
+                                                    feed_err = Some(other(e));
+                                                }
+                                            }
+                                            pending_chunk =
+                                                Some(ChunkState::Libsql { shadow, feed_err });
+                                        }
+                                        Err(e) => {
+                                            let _ = reply.send(Err(()));
+                                            return Err(other(e));
+                                        }
+                                    }
+                                } else {
+                                    // Dry-run: don't open a shadow — just drain + count.
+                                    let _ = reply.send(Ok(()));
+                                    while body_rx.recv().await.is_some() {}
+                                    report.libsql_databases += 1;
+                                    pending_chunk = None;
+                                }
+                            }
+                            MemberKind::Blob | MemberKind::Kv => {
+                                // Stage the chunk stream to a bounded temp, then restore it via the
+                                // SAME `restore_member` (re-key / enforce) as a sidecar member.
+                                let temp = stage_dir.join(format!("chunk-{chunk_idx}"));
+                                chunk_idx += 1;
+                                match tokio::fs::File::create(&temp).await {
+                                    Ok(mut f) => {
+                                        let _ = reply.send(Ok(()));
+                                        use tokio::io::AsyncWriteExt as _;
+                                        let mut write_err = None;
+                                        while let Some(chunk) = body_rx.recv().await {
+                                            if write_err.is_none()
+                                                && let Err(e) = f.write_all(&chunk).await
+                                            {
+                                                write_err = Some(other(e));
+                                            }
+                                        }
+                                        if write_err.is_none()
+                                            && let Err(e) = f.flush().await
+                                        {
+                                            write_err = Some(other(e));
+                                        }
+                                        drop(f);
+                                        pending_chunk = Some(ChunkState::Staged {
+                                            spec,
+                                            temp,
+                                            write_err,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(other(e));
+                                    }
+                                }
+                            }
+                            _ => {
+                                let _ = reply.send(Err(()));
+                                return Err(Perr::Unavailable(
+                                    "chunked pg/mysql import is a later (live-gated) stage; this \
+                                     bundle's chunked member kind is not wired here"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    ImportMsg::ChunkFinish { verified, reply } => {
+                        let state = pending_chunk.take();
+                        let res: Result<(), Perr> = match state {
+                            Some(ChunkState::Libsql { shadow, feed_err }) => {
+                                if let Some(e) = feed_err {
+                                    drop(shadow); // RAII: tear down the shadow
+                                    Err(e)
+                                } else if !verified {
+                                    drop(shadow); // abort: nothing reaches live; reader raises the mismatch
+                                    Ok(())
+                                } else {
+                                    match self
+                                        .libsql
+                                        .as_ref()
+                                        .expect("libsql shadow implies a libsql backend")
+                                        .commit_dump_shadow(shadow)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            report.libsql_databases += 1;
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(other(e)),
+                                    }
+                                }
+                            }
+                            Some(ChunkState::Staged {
+                                spec,
+                                temp,
+                                write_err,
+                            }) => {
+                                let r = if let Some(e) = write_err {
+                                    Err(e)
+                                } else if !verified {
+                                    Ok(()) // abort: drop the temp below; reader raises the mismatch
+                                } else {
+                                    self.restore_member(
+                                        project,
+                                        data_only,
+                                        &source_project,
+                                        &spec,
+                                        &temp,
+                                        &opts,
+                                        &mut report,
+                                        &mut saw_identity,
+                                    )
+                                    .await
+                                };
+                                let _ = tokio::fs::remove_file(&temp).await;
+                                r
+                            }
+                            None => {
+                                // A dry-run libsql chunk (no sink opened) — nothing to commit.
+                                Ok(())
+                            }
+                        };
+                        match res {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(()));
+                                return Err(e);
                             }
                         }
                     }
@@ -1329,11 +1787,11 @@ impl NodeProjectExport {
                                 Perr::Other(format!("wrapping the identity container: {e}"))
                             })?;
                     ordered.push((
-                        MemberSpec {
-                            path: IDENTITY_MEMBER_PATH.to_string(),
-                            kind: MemberKind::Identity,
-                            pg: None,
-                        },
+                        MemberSpec::sidecar(
+                            IDENTITY_MEMBER_PATH.to_string(),
+                            MemberKind::Identity,
+                            None,
+                        ),
                         StageJob::Identity { container },
                     ));
                 }
@@ -1373,14 +1831,16 @@ impl NodeProjectExport {
             .map_err(other)?;
         for meta in blob_metas {
             let member_path = format!("blobs/{}", meta.key);
-            ordered.push((
-                MemberSpec {
-                    path: member_path,
-                    kind: MemberKind::Blob,
-                    pg: None,
-                },
-                StageJob::Blob { key: meta.key },
-            ));
+            // A blob whose KNOWN size exceeds the chunk threshold is framed ChunkedTrailer so the
+            // EXPORT streams its body straight through `append_member_chunked` (O(chunk), no
+            // whole-object temp — the inc2 win over inc1's stage-the-whole-blob); a small or
+            // unknown-size blob stays Sidecar (inc1's staged verify-before-apply, unchanged).
+            let spec = if meta.size.is_some_and(|s| s > self.chunk_size as u64) {
+                MemberSpec::chunked(member_path, MemberKind::Blob, None)
+            } else {
+                MemberSpec::sidecar(member_path, MemberKind::Blob, None)
+            };
+            ordered.push((spec, StageJob::Blob { key: meta.key }));
         }
 
         // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
@@ -1391,15 +1851,17 @@ impl NodeProjectExport {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
                 ordered.push((
-                    MemberSpec {
-                        path: pg_member_path(db),
-                        kind: MemberKind::PgDump,
-                        pg: Some(PgMemberInfo {
+                    // Sidecar in this build (staged temp + `pg_restore`); the pg shadow+chunked
+                    // path is the separate live-gated Stage C, which flips this to `chunked`.
+                    MemberSpec::sidecar(
+                        pg_member_path(db),
+                        MemberKind::PgDump,
+                        Some(PgMemberInfo {
                             server_version_num,
                             client_image: image.clone(),
                             schema_fingerprint,
                         }),
-                    },
+                    ),
                     StageJob::Pg {
                         conn,
                         image,
@@ -1410,15 +1872,17 @@ impl NodeProjectExport {
                 let (conn, image, version) = self.resolve_mysql(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
                 ordered.push((
-                    MemberSpec {
-                        path: mysql_member_path(db),
-                        kind: MemberKind::MysqlDump,
-                        pg: Some(PgMemberInfo {
+                    // Sidecar in this build (staged temp + `mysql` restore); the mysql
+                    // shadow+chunked path is the separate live-gated Stage D.
+                    MemberSpec::sidecar(
+                        mysql_member_path(db),
+                        MemberKind::MysqlDump,
+                        Some(PgMemberInfo {
                             server_version_num: version,
                             client_image: image.clone(),
                             schema_fingerprint,
                         }),
-                    },
+                    ),
                     StageJob::Mysql {
                         conn,
                         image,
@@ -1443,11 +1907,14 @@ impl NodeProjectExport {
                     continue; // a site that never wrote SQL — nothing to snapshot
                 }
                 ordered.push((
-                    MemberSpec {
-                        path: libsql_member_path(project, &site),
-                        kind: MemberKind::Libsql,
-                        pg: None,
-                    },
+                    // ChunkedTrailer: the libsql member is a streamed `.dump` SQL text (inc2
+                    // default #4 — true O(chunk), NOT a staged VACUUM-INTO file), piped straight
+                    // through `append_member_chunked`; the import applies it into an atomic shadow.
+                    MemberSpec::chunked(
+                        libsql_member_path(project, &site),
+                        MemberKind::Libsql,
+                        None,
+                    ),
                     StageJob::Libsql { qsite },
                 ));
             }
@@ -1458,11 +1925,7 @@ impl NodeProjectExport {
         //     routing, personas, sealed secrets), so it is not even staged for data-only. ---
         if !data_only {
             ordered.push((
-                MemberSpec {
-                    path: KV_MEMBER_PATH.to_string(),
-                    kind: MemberKind::Kv,
-                    pg: None,
-                },
+                MemberSpec::sidecar(KV_MEMBER_PATH.to_string(), MemberKind::Kv, None),
                 StageJob::Kv { created_at },
             ));
         }
@@ -1478,6 +1941,68 @@ impl NodeProjectExport {
                 site: None,
             },
         ))
+    }
+
+    /// Start a producer task for a ChunkedTrailer member, returning its body-channel receiver, a
+    /// `poison` flag the producer sets on error (so a premature channel close is a loud IO error,
+    /// never a silently-truncated member), and its `JoinHandle` (awaited by the stager — a producer
+    /// error FAILS the export). The body streams O(chunk): the libsql `.dump` (bounded by one
+    /// statement) or the blob get (bounded by one chunk), NEVER staging the whole member to disk.
+    fn open_chunked_producer(&self, job: Option<&StageJob>) -> Result<ChunkedProducer, Perr> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
+        let poison = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poison2 = poison.clone();
+        let handle = match job {
+            Some(StageJob::Libsql { qsite }) => {
+                let libsql = self.libsql.clone().ok_or_else(|| {
+                    Perr::Other("internal: libsql chunked job with no libsql backend".into())
+                })?;
+                let qsite = qsite.clone();
+                tokio::spawn(async move {
+                    let r = libsql
+                        .dump_database(&qsite, "", &body_tx)
+                        .await
+                        .map_err(other);
+                    if r.is_err() {
+                        poison2.store(true, SeqCst);
+                    }
+                    drop(body_tx); // EOF the reader AFTER the poison store
+                    r
+                })
+            }
+            Some(StageJob::Blob { key }) => {
+                let blobs = self.blobs.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let r: Result<(), Perr> = async {
+                        let obj = blobs.get(&key).await.map_err(other)?;
+                        let mut body = obj.body;
+                        while let Some(chunk) = body.next().await {
+                            let chunk = chunk.map_err(other)?;
+                            body_tx
+                                .send(chunk.as_ref().to_vec())
+                                .await
+                                .map_err(|_| Perr::Other("export blob body sink closed".into()))?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if r.is_err() {
+                        poison2.store(true, SeqCst);
+                    }
+                    drop(body_tx);
+                    r
+                })
+            }
+            _ => {
+                return Err(Perr::Other(
+                    "export: chunked framing is wired only for libsql + large blobs in this build"
+                        .into(),
+                ));
+            }
+        };
+        Ok((body_rx, poison, handle))
     }
 
     /// Produce ONE member's bytes into a bounded staging temp (`stage_dir/m{idx}`), returning
@@ -1738,8 +2263,11 @@ impl NodeProjectExport {
                 })?;
                 let qsite = ProjectRef::new(project).qualified(site);
                 if opts.apply {
+                    // Sidecar libsql (a v1/v2 VACUUM-INTO member) → atomic shadow+rename,
+                    // overwrite-gated. A v3 chunked libsql member takes the streamed-shadow path in
+                    // the servicer, never this arm.
                     libsql
-                        .restore_snapshot(&qsite, "", temp)
+                        .restore_snapshot(&qsite, "", temp, opts.overwrite)
                         .await
                         .map_err(other)?;
                 }

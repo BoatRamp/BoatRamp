@@ -470,7 +470,7 @@ async fn project_export_roundtrip_libsql() {
     // --- IMPORT: restore_snapshot into a FRESH store (no-clobber + integrity_check) ---
     let tgt_dir = tempfile::tempdir().expect("tgt dir");
     let tgt = LibsqlSqlBackends::local(tgt_dir.path());
-    tgt.restore_snapshot(&qsite, "", &member_file)
+    tgt.restore_snapshot(&qsite, "", &member_file, false)
         .await
         .expect("restore_snapshot");
 
@@ -502,15 +502,268 @@ async fn project_export_roundtrip_libsql() {
         .collect();
     assert_eq!(got, expect, "restored rows match the source");
 
-    // --- no-clobber: a second restore over the now-populated target must refuse ---
+    // --- no-clobber: a second restore over the now-populated target must refuse without
+    //     overwrite (the shadow restore's overwrite gate, replacing the v1 no-clobber) ---
     assert!(
-        tgt.restore_snapshot(&qsite, "", &member_file)
+        tgt.restore_snapshot(&qsite, "", &member_file, false)
             .await
             .is_err(),
         "restore_snapshot must refuse to overwrite a non-empty destination"
     );
 
     println!("PROJECT EXPORT LIBSQL ROUNDTRIP OK");
+}
+
+/// **§4b — the no-Docker ATOMICITY gate (chunked `.dump` libsql through the real driver).** Drives
+/// `NodeProjectExport::export` → `import` for a libsql-only project: the export streams the site's
+/// database as a ChunkedTrailer `.dump` member (v3), and the import applies it into an ATOMIC
+/// shadow DB that is `std::fs::rename`d over live only when the trailing SHA verified. Proves BOTH:
+///  (1) a clean round-trip restores the rows and leaves NO `*.shadow_*` residue (commit); and
+///  (2) corruption → ALL-OR-NOTHING: a bundle whose libsql member is tampered (so its streamed
+///      bytes no longer match the trailer) imported with `overwrite=true` ABORTS, the target's
+///      pre-existing SENTINEL rows SURVIVE (live is never renamed-over), and no shadow is left.
+///
+/// RED mutations: dropping the trailer-verify (commit-always) promotes the corrupt shadow → the
+/// sentinel assertion fails; a non-atomic restore (apply straight onto live) → the sentinel is gone.
+#[tokio::test]
+async fn project_export_roundtrip_libsql_chunked_atomic() {
+    use boatramp_core::Storage;
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_export::{
+        ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
+    };
+    use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::sql_libsql::LibsqlSqlBackends;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn byte_find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+    fn shadow_residue(dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p
+                        .file_name()
+                        .and_then(|x| x.to_str())
+                        .is_some_and(|x| x.contains(".shadow_"))
+                    {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    let project = "acme";
+    let site = "blog";
+    const MARKER: &str = "SRCMARKER_UNIQUE_9z7q";
+
+    // --- SOURCE: a libsql-only project with one site DB (+ a KV site pointer so list_sites finds
+    //     it). A small chunk size makes the `.dump` span several `.part` entries. ---
+    let src_tmp = tempfile::tempdir().unwrap();
+    let src_libsql_dir = src_tmp.path().join("handlers-sql");
+    let src_backends = Arc::new(LibsqlSqlBackends::local(&src_libsql_dir));
+    {
+        let db: Arc<dyn SqlBackend> = src_backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "INSERT INTO t VALUES (?1,?2),(?3,?4)",
+            &[
+                SqlValue::Integer(1),
+                SqlValue::Text(MARKER.into()),
+                SqlValue::Integer(2),
+                SqlValue::Text("beta".into()),
+            ],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let src_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    // A `current/<site>` pointer so `DeployStore::list_sites` enumerates the site.
+    src_kv
+        .put("project/acme/current/blog", b"dep1".to_vec())
+        .await
+        .unwrap();
+    let src_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(src_tmp.path().join("blobs")));
+    let src_work = src_tmp.path().join("work");
+    std::fs::create_dir_all(&src_work).unwrap();
+    let drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(src_blobs.clone(), src_kv.clone()),
+        src_kv.clone(),
+        src_blobs.clone(),
+        src_work,
+    )
+    .with_libsql(src_backends.clone())
+    .with_chunk_size(4096);
+
+    // EXPORT (FULL) → a v3 bundle with a ChunkedTrailer libsql member.
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        drv.export(project, &ExportOptions::default(), &mut sink)
+            .await
+            .expect("export");
+        sink.into_inner()
+    };
+    assert!(
+        byte_find(&bundle, b"\"format_version\": 3").is_some(),
+        "the bundle is v3 (a chunked libsql member is present)"
+    );
+    assert!(
+        byte_find(&bundle, b"libsql/acme/blog/default.sqlite.part00000").is_some(),
+        "the libsql member is framed as chunked `.part` entries"
+    );
+    assert!(
+        byte_find(&bundle, b"libsql/acme/blog/default.sqlite.brtrailer").is_some(),
+        "the chunked libsql member carries a trailing `.brtrailer`"
+    );
+
+    // --- IMPORT (1): clean round-trip into a FRESH target via the atomic shadow. ---
+    let tgt_tmp = tempfile::tempdir().unwrap();
+    let tgt_libsql_dir = tgt_tmp.path().join("handlers-sql");
+    let tgt_backends = Arc::new(LibsqlSqlBackends::local(&tgt_libsql_dir));
+    let tgt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let tgt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tgt_tmp.path().join("blobs")));
+    let tgt_work = tgt_tmp.path().join("work");
+    std::fs::create_dir_all(&tgt_work).unwrap();
+    let tgt_drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(tgt_blobs.clone(), tgt_kv.clone()),
+        tgt_kv.clone(),
+        tgt_blobs.clone(),
+        tgt_work,
+    )
+    .with_libsql(tgt_backends.clone());
+    {
+        let mut src = futures::io::Cursor::new(bundle.clone());
+        let report = tgt_drv
+            .import(
+                project,
+                &mut src,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean import");
+        assert!(report.libsql_databases >= 1, "a libsql db was restored");
+    }
+    // Rows restored + NO shadow residue (the commit cleaned up).
+    {
+        let db: Arc<dyn SqlBackend> = tgt_backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx
+            .query("SELECT id, v FROM t ORDER BY id", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0][1], SqlValue::Text(MARKER.into()));
+    }
+    assert_eq!(
+        shadow_residue(&tgt_libsql_dir),
+        0,
+        "no *.shadow_* residue after a committed chunked import"
+    );
+
+    // --- IMPORT (2): corruption → ALL-OR-NOTHING. Pre-seed the target with a SENTINEL, tamper the
+    //     bundle's libsql `.dump` so its bytes no longer hash to the trailer, import overwrite=true
+    //     → abort; sentinel survives; no shadow residue. ---
+    let cor_tmp = tempfile::tempdir().unwrap();
+    let cor_libsql_dir = cor_tmp.path().join("handlers-sql");
+    let cor_backends = Arc::new(LibsqlSqlBackends::local(&cor_libsql_dir));
+    {
+        let db: Arc<dyn SqlBackend> = cor_backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("CREATE TABLE sentinel(v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute("INSERT INTO sentinel VALUES ('SURVIVOR')", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // Flip one byte of the source marker inside the chunked `.dump` (a `.part` body). The member's
+    // streamed bytes now differ from the (unchanged) trailer SHA → the atomic reader aborts.
+    let mut corrupt = bundle.clone();
+    let at = byte_find(&corrupt, MARKER.as_bytes()).expect("marker present in the dump stream");
+    corrupt[at + MARKER.len() - 1] ^= 0x01; // 'z' → '{' : still valid SQL text, wrong bytes
+    let cor_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let cor_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(cor_tmp.path().join("blobs")));
+    let cor_work = cor_tmp.path().join("work");
+    std::fs::create_dir_all(&cor_work).unwrap();
+    let cor_drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(cor_blobs.clone(), cor_kv.clone()),
+        cor_kv.clone(),
+        cor_blobs.clone(),
+        cor_work,
+    )
+    .with_libsql(cor_backends.clone());
+    {
+        let mut src = futures::io::Cursor::new(corrupt);
+        let res = cor_drv
+            .import(
+                project,
+                &mut src,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: true, // the target libsql db exists (sentinel)
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "a tampered chunked libsql member must ABORT the import"
+        );
+    }
+    // The SENTINEL survives (live was never renamed-over), and no shadow residue remains.
+    {
+        let db: Arc<dyn SqlBackend> = cor_backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx.query("SELECT v FROM sentinel", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![vec![SqlValue::Text("SURVIVOR".into())]],
+            "the aborted corrupt import left the live target untouched (atomic)"
+        );
+        // The tampered import's table `t` never reached live.
+        let mut tx = db.begin().await.unwrap();
+        assert!(
+            tx.query("SELECT 1 FROM t", &[]).await.is_err(),
+            "the corrupt import's table must NOT exist on the live target"
+        );
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(
+        shadow_residue(&cor_libsql_dir),
+        0,
+        "the aborted corrupt import left no *.shadow_* residue"
+    );
+
+    println!("PROJECT EXPORT LIBSQL CHUNKED ATOMIC OK");
 }
 
 /// **Live MySQL export/import round-trip** (Tier-2 / nightly — needs a Docker daemon AND a
@@ -973,15 +1226,22 @@ async fn project_export_cross_tenant_leak_gate() {
 
     use boatramp_core::deploy::DeployStore;
     use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::ProjectRef;
     use boatramp_core::project_export::{
         ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
     };
+    use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
     use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
     use boatramp_node::project_export::NodeProjectExport;
     use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::sql_libsql::LibsqlSqlBackends;
     use bytes::Bytes;
     use futures::StreamExt;
     use sha2::{Digest, Sha256};
+
+    fn byte_find(hay: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+    }
 
     // A `siteconfig/<hash>` body is content-addressed (hash == sha256(body)); the import-side
     // fail-closed check verifies that, so the legit clone must seed a REAL content address.
@@ -1031,11 +1291,11 @@ async fn project_export_cross_tenant_leak_gate() {
         let td = tempfile::tempdir().unwrap();
         let tmp = td.path().join("kv");
         std::fs::write(&tmp, &kv_bytes).unwrap();
-        let specs = vec![MemberSpec {
-            path: project_bundle::KV_MEMBER_PATH.to_string(),
-            kind: MemberKind::Kv,
-            pg: None,
-        }];
+        let specs = vec![MemberSpec::sidecar(
+            project_bundle::KV_MEMBER_PATH.to_string(),
+            MemberKind::Kv,
+            None,
+        )];
         let mut out: Vec<u8> = Vec::new();
         project_bundle::write_bundle_streaming(
             &mut out,
@@ -1047,6 +1307,47 @@ async fn project_export_cross_tenant_leak_gate() {
             },
             specs,
             |_spec| Ok(tmp.clone()),
+        )
+        .unwrap();
+        out
+    }
+
+    /// Hand-build a v3 bundle carrying ONLY a KV slice framed as a CHUNKED member (`.part*` +
+    /// `.brtrailer`, bypassing the export-side scope filter), to prove framing is NOT a tenancy
+    /// bypass: the import must run `enforce_target_scoped_kv` on a chunked KV member exactly as on a
+    /// sidecar one. A deliberately small `chunk_size` splits the slice into several parts; the
+    /// trailer is self-consistent (a crafted-but-valid bundle), so the ONLY thing that can refuse it
+    /// is the scope enforce — which it must.
+    fn craft_chunked_bundle(source: &str, entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        use boatramp_core::kv::KvDumpEntry;
+        use boatramp_node::project_bundle::{self, MemberKind, MemberSpec, SourceInfo};
+        let kv_entries: Vec<KvDumpEntry> = entries
+            .iter()
+            .map(|(k, v)| KvDumpEntry {
+                key: k.clone(),
+                value: v.clone(),
+                version: 1,
+            })
+            .collect();
+        let kv_bytes = boatramp_core::kv_dump::encode_dump(&kv_entries, 0);
+        let specs = vec![MemberSpec::chunked(
+            project_bundle::KV_MEMBER_PATH.to_string(),
+            MemberKind::Kv,
+            None,
+        )];
+        let mut out: Vec<u8> = Vec::new();
+        project_bundle::write_bundle_streaming_v3(
+            &mut out,
+            0,
+            false,
+            SourceInfo {
+                project: source.to_string(),
+                site: None,
+            },
+            specs,
+            8, // tiny chunk size ⇒ the crafted KV slice spans multiple `.part` entries
+            |_spec| unreachable!("the crafted bundle has no sidecar member"),
+            |_spec| Ok(Box::new(std::io::Cursor::new(kv_bytes.clone())) as Box<dyn std::io::Read>),
         )
         .unwrap();
         out
@@ -1149,16 +1450,46 @@ async fn project_export_cross_tenant_leak_gate() {
         GLOBEX_SENTINEL,
     )
     .await;
+    // A LARGE acme blob (> the test chunk size) → export frames it ChunkedTrailer; its re-key on
+    // import must behave EXACTLY as a sidecar blob's. Its body carries only an acme-only marker
+    // (never a cross-tenant sentinel), so the byte-scan over the bundle stays meaningful.
+    const ACME_BIG_MARKER: &[u8] = b"ACME_BIG_BLOB_MARKER_4a9f_";
+    let big_blob: Vec<u8> = ACME_BIG_MARKER.iter().cycle().take(4096).copied().collect();
+    put_blob(blobs.as_ref(), "hblob/acme/web/c/big.bin", &big_blob).await;
+
+    // A libsql binding: a source site DB (+ a `current/<site>` pointer so the export enumerates it)
+    // so the bundle carries a CHUNKED libsql `.dump` member whose target-SITE re-key must hold on a
+    // rename import.
+    let src_libsql_dir = src_tmp.path().join("handlers-sql");
+    let src_libsql = Arc::new(LibsqlSqlBackends::local(&src_libsql_dir));
+    {
+        let db: Arc<dyn SqlBackend> = src_libsql.database("acme", "blog", "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute("INSERT INTO t VALUES (1,'acme-libsql-row')", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    kv.put("project/acme/current/blog", b"dep1".to_vec())
+        .await
+        .unwrap();
 
     let work = src_tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
+    // A small chunk size so the 4 KiB blob + the libsql `.dump` are framed as several `.part`
+    // entries (inc2 default #6 chunk size is 64 MiB; `with_chunk_size` is the test override).
     let drv = NodeProjectExport::new(
         BTreeMap::new(),
         DeployStore::new(blobs.clone(), kv.clone()),
         kv.clone(),
         blobs.clone(),
         work,
-    );
+    )
+    .with_libsql(src_libsql.clone())
+    .with_chunk_size(1024);
 
     // === EXPORT acme (FULL) into a buffer ===
     let bundle = {
@@ -1187,10 +1518,28 @@ async fn project_export_cross_tenant_leak_gate() {
         "global crown-jewel sentinel bytes LEAKED into acme's export bundle"
     );
 
+    // The bundle is v3 and BOTH the large blob and the libsql `.dump` are framed as chunked
+    // `.part` members (so the chunked re-key + atomic restore paths are actually exercised).
+    assert!(
+        byte_find(&bundle, b"\"format_version\": 3"),
+        "a chunked member makes the bundle v3"
+    );
+    assert!(
+        byte_find(&bundle, b"blobs/hblob/acme/web/c/big.bin.part00000"),
+        "the large acme blob is framed ChunkedTrailer"
+    );
+    assert!(
+        byte_find(&bundle, b"libsql/acme/blog/default.sqlite.part00000"),
+        "the libsql member is framed ChunkedTrailer (streamed `.dump`)"
+    );
+
     // === IMPORT into a fresh SAME-NAME target store ===
     let tgt_tmp = tempfile::tempdir().unwrap();
     let tgt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
     let tgt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tgt_tmp.path().join("blobs")));
+    let tgt_libsql = Arc::new(LibsqlSqlBackends::local(
+        tgt_tmp.path().join("handlers-sql"),
+    ));
     let tgt_work = tgt_tmp.path().join("work");
     std::fs::create_dir_all(&tgt_work).unwrap();
     let tgt = NodeProjectExport::new(
@@ -1199,7 +1548,8 @@ async fn project_export_cross_tenant_leak_gate() {
         tgt_kv.clone(),
         tgt_blobs.clone(),
         tgt_work,
-    );
+    )
+    .with_libsql(tgt_libsql.clone());
     {
         let mut source = futures::io::Cursor::new(bundle.clone());
         tgt.import(
@@ -1261,6 +1611,19 @@ async fn project_export_cross_tenant_leak_gate() {
             .any(|k| k == "hblob/acme/web/c/logo.png"),
         "acme's blob restored under its own scope"
     );
+    // The CHUNKED (large) blob restored under acme's scope with its bytes intact — the chunked
+    // re-key lands it in the target scope exactly as a sidecar blob.
+    assert!(
+        tgt_blob_keys
+            .iter()
+            .any(|k| k == "hblob/acme/web/c/big.bin"),
+        "the chunked large blob restored under hblob/acme/"
+    );
+    assert_eq!(
+        read_blob(tgt_blobs.as_ref(), "hblob/acme/web/c/big.bin").await,
+        big_blob,
+        "the chunked blob round-trips byte-for-byte"
+    );
     assert!(
         !tgt_blob_keys.iter().any(|k| k.contains("globex")),
         "NO globex blob in the target"
@@ -1276,6 +1639,20 @@ async fn project_export_cross_tenant_leak_gate() {
         assert!(
             !contains(&body, GLOBEX_SENTINEL),
             "globex sentinel bytes found inside target blob {k:?}"
+        );
+    }
+
+    // The CHUNKED libsql member restored into the target under acme's qualified site identity (the
+    // atomic shadow swapped in), with its row intact.
+    {
+        let db: Arc<dyn SqlBackend> = tgt_libsql.database("acme", "blog", "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx.query("SELECT v FROM t", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![vec![SqlValue::Text("acme-libsql-row".into())]],
+            "the chunked libsql `.dump` member restored under acme's scope"
         );
     }
 
@@ -1362,53 +1739,61 @@ async fn project_export_cross_tenant_leak_gate() {
             ],
         ),
     ];
+    // Each crafted case is run with BOTH a Sidecar KV member AND a CHUNKED KV member — framing must
+    // NOT be a tenancy-barrier bypass: `enforce_target_scoped_kv` runs regardless of framing, so a
+    // chunked crafted member aborts fail-closed exactly as a sidecar one (writing nothing foreign).
     for (what, entries) in &malicious_sets {
-        let crafted = craft_kv_bundle("acme", entries);
-        let mt_tmp = tempfile::tempdir().unwrap();
-        let mt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        let mt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(mt_tmp.path().join("blobs")));
-        let mt_work = mt_tmp.path().join("work");
-        std::fs::create_dir_all(&mt_work).unwrap();
-        let mt = NodeProjectExport::new(
-            BTreeMap::new(),
-            DeployStore::new(mt_blobs.clone(), mt_kv.clone()),
-            mt_kv.clone(),
-            mt_blobs.clone(),
-            mt_work,
-        );
-        let mut src = futures::io::Cursor::new(crafted);
-        let res = mt
-            .import(
-                "acme",
-                &mut src,
-                ImportOptions {
-                    apply: true,
-                    force: true,
-                    identity: IdentityChoice::Fresh,
-                    ..Default::default()
-                },
-            )
-            .await;
-        assert!(
-            res.is_err(),
-            "import of a bundle carrying {what} MUST be refused (fail-closed)"
-        );
-        // Fail-closed BEFORE writing: the target KV holds NONE of the crafted foreign/global keys.
-        let after = mt_kv.list_prefix("").await.unwrap();
-        assert!(
-            !after.iter().any(|k| k.contains("globex")
-                || k.starts_with("cert/")
-                || k.starts_with("domain/")
-                || k.starts_with("daemonconfig/")
-                || k.starts_with("siteconfig/")),
-            "a refused import ({what}) must not have written any foreign/global/siteconfig key"
-        );
+        for (framing, crafted) in [
+            ("sidecar", craft_kv_bundle("acme", entries)),
+            ("chunked", craft_chunked_bundle("acme", entries)),
+        ] {
+            let mt_tmp = tempfile::tempdir().unwrap();
+            let mt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let mt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(mt_tmp.path().join("blobs")));
+            let mt_work = mt_tmp.path().join("work");
+            std::fs::create_dir_all(&mt_work).unwrap();
+            let mt = NodeProjectExport::new(
+                BTreeMap::new(),
+                DeployStore::new(mt_blobs.clone(), mt_kv.clone()),
+                mt_kv.clone(),
+                mt_blobs.clone(),
+                mt_work,
+            );
+            let mut src = futures::io::Cursor::new(crafted);
+            let res = mt
+                .import(
+                    "acme",
+                    &mut src,
+                    ImportOptions {
+                        apply: true,
+                        force: true,
+                        identity: IdentityChoice::Fresh,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                res.is_err(),
+                "import of a {framing} bundle carrying {what} MUST be refused (fail-closed)"
+            );
+            // Fail-closed: the target KV holds NONE of the crafted foreign/global keys.
+            let after = mt_kv.list_prefix("").await.unwrap();
+            assert!(
+                !after.iter().any(|k| k.contains("globex")
+                    || k.starts_with("cert/")
+                    || k.starts_with("domain/")
+                    || k.starts_with("daemonconfig/")
+                    || k.starts_with("siteconfig/")),
+                "a refused {framing} import ({what}) must not have written any foreign/global key"
+            );
+        }
     }
 
     // === RENAME variant: import acme's bundle AS `acmeclone` ===
     let rn_tmp = tempfile::tempdir().unwrap();
     let rn_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
     let rn_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(rn_tmp.path().join("blobs")));
+    let rn_libsql = Arc::new(LibsqlSqlBackends::local(rn_tmp.path().join("handlers-sql")));
     let rn_work = rn_tmp.path().join("work");
     std::fs::create_dir_all(&rn_work).unwrap();
     let rn = NodeProjectExport::new(
@@ -1417,7 +1802,8 @@ async fn project_export_cross_tenant_leak_gate() {
         rn_kv.clone(),
         rn_blobs.clone(),
         rn_work,
-    );
+    )
+    .with_libsql(rn_libsql.clone());
     {
         let mut source = futures::io::Cursor::new(bundle.clone());
         rn.import(
@@ -1469,6 +1855,29 @@ async fn project_export_cross_tenant_leak_gate() {
         !rn_keys.iter().any(|k| k.contains("globex")),
         "NO globex key in the renamed target"
     );
+
+    // The CHUNKED libsql member's target-SITE re-key holds on a rename: the db lands under the
+    // TARGET project's qualified identity (`acmeclone/blog`), and NO source-scope (`acme/blog`)
+    // libsql file survives — framing (chunked `.dump`) is not a re-key bypass.
+    assert!(
+        rn_libsql.local_database_exists(&ProjectRef::new("acmeclone").qualified("blog"), ""),
+        "the chunked libsql member restored under the TARGET (acmeclone) qualified site"
+    );
+    assert!(
+        !rn_libsql.local_database_exists(&ProjectRef::new("acme").qualified("blog"), ""),
+        "NO source-scope (acme) libsql db may survive a rename import"
+    );
+    {
+        let db: Arc<dyn SqlBackend> = rn_libsql.database("acmeclone", "blog", "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx.query("SELECT v FROM t", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![vec![SqlValue::Text("acme-libsql-row".into())]],
+            "the renamed libsql db carries the source row under the target scope"
+        );
+    }
 
     println!("PROJECT EXPORT CROSS-TENANT LEAK GATE OK");
 }

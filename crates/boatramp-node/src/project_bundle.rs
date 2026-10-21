@@ -443,18 +443,127 @@ pub const BUNDLE_FORMAT_VERSION_V2: u32 = 2;
 /// `<path>`, so a single-pass reader learns them before the body arrives.
 pub const META_SUFFIX: &str = ".brmeta";
 
-/// The upfront-knowable identity of a bundle member — what the v2 MANIFEST lists, in restore
-/// order. Carries no size/SHA (those travel in the member's [`MemberMeta`] sidecar), so the
-/// MANIFEST can be written before any member is produced.
+// ============================================================================
+// Format v3 — chunked members with a TRAILING trailer (inc2)
+//
+// v2 removed the whole-bundle-staging coupling (each member's size+SHA moved to a per-member
+// leading `.brmeta` sidecar), but a member still had to be STAGED WHOLE to a temp before its
+// sidecar could be written (the sidecar carries the size+SHA, computed by reading the staged
+// temp). For an engine dump that can be many GB — a `pg_dump`/`.dump` SQL stream — that whole
+// member landed on `work_dir`, which is the env-clone disk-fill risk v2 only halved.
+//
+// v3 adds a SECOND framing, `ChunkedTrailer`, for the large/streamed kinds. Instead of a
+// leading sidecar + a single body entry, a chunked member is a run of fixed-size `.part{N}`
+// tar entries followed by a `.brtrailer` (the size+SHA, AFTER the data). The producer hashes +
+// counts WHILE streaming each chunk out (no stat, no whole-member temp); the reader hashes +
+// counts WHILE reading, comparing to the trailer at the end — O(chunk) on BOTH sides. Small
+// kinds (Identity, Kv, small blobs) stay `Sidecar` (keeping v2's verify-before-apply free).
+//
+// Read-compat is total: the v3 reader [`read_bundle_streaming_atomic`] reads v1, v2 AND v3; a
+// v2 manifest (no `framing` field) deserializes with `framing = Sidecar` via `#[serde(default)]`.
+// Write-forward: the driver emits v3 ONLY when at least one member is chunked (else v2, so a
+// bundle an inc1 node can still read stays v2); an inc1 node handed a v3 bundle loud-rejects it
+// as [`BundleError::BadVersion`] (the v1/v2 reader's final dispatch arm), never a silent misread.
+// ============================================================================
+
+/// The **chunked** bundle format version (see the section comment above). Emitted when at least
+/// one member uses [`MemberFraming::ChunkedTrailer`]; a v3 reader reads v1 + v2 + v3.
+pub const BUNDLE_FORMAT_VERSION_V3: u32 = 3;
+
+/// The suffix of a chunked member's TRAILING trailer entry. For a chunked member at `<path>`, its
+/// trailer is `<path>.brtrailer` — a tiny JSON [`MemberTrailer`] (size + SHA-256) written AFTER
+/// the member's `.part{N}` chunks, so the reader verifies integrity once the whole member has
+/// streamed (the chunked analogue of the v2 leading [`MemberMeta`] sidecar).
+pub const TRAILER_SUFFIX: &str = ".brtrailer";
+
+/// The infix of a chunked member's data-part tar entries. Chunk `N` of a member at `<path>` is the
+/// entry `<path>.part{N:05}` (zero-padded, monotonic from `00000`).
+pub const PART_INFIX: &str = ".part";
+
+/// The tar-entry path of chunk `n` of a chunked member at `base`.
+fn chunk_part_path(base: &str, n: u32) -> String {
+    format!("{base}{PART_INFIX}{n:05}")
+}
+
+/// The tar-entry path of a chunked member's trailer.
+fn chunk_trailer_path(base: &str) -> String {
+    format!("{base}{TRAILER_SUFFIX}")
+}
+
+/// How a bundle member's bytes are framed in the tar. `Sidecar` (the default, and the only v2
+/// framing) is a leading [`MemberMeta`] `.brmeta` then a single body entry; `ChunkedTrailer` is a
+/// run of `.part{N}` entries then a trailing [`MemberTrailer`] `.brtrailer` (v3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberFraming {
+    /// Leading `.brmeta` sidecar + one body entry (v2 shape). The default, so a v2 manifest with
+    /// no `framing` field deserializes to this.
+    #[default]
+    Sidecar,
+    /// A run of `.part{N:05}` data entries + a trailing `.brtrailer` (v3 shape) — O(chunk) both
+    /// sides, for the large/streamed kinds (SQL dumps, large blobs).
+    ChunkedTrailer,
+}
+
+impl MemberFraming {
+    /// Whether this is the default [`Sidecar`](Self::Sidecar) framing (used by
+    /// `skip_serializing_if` so a v2/sidecar manifest stays byte-identical to the pre-v3 form).
+    fn is_sidecar(&self) -> bool {
+        matches!(self, MemberFraming::Sidecar)
+    }
+}
+
+/// The upfront-knowable identity of a bundle member — what the v2/v3 MANIFEST lists, in restore
+/// order. Carries no size/SHA (those travel in the member's [`MemberMeta`] sidecar or
+/// [`MemberTrailer`]), so the MANIFEST can be written before any member is produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberSpec {
     /// The member's tar-entry path (relative, no traversal).
     pub path: String,
     /// Which engine produced it.
     pub kind: MemberKind,
+    /// How the member's bytes are framed (v3). Absent in a v2 manifest ⇒ [`MemberFraming::Sidecar`]
+    /// (`#[serde(default)]`), which is what makes a v2 bundle deserialize into a v3 reader for free;
+    /// a `Sidecar` member is omitted from a serialized manifest (`skip_serializing_if`) so a
+    /// no-chunked (v2) bundle's manifest is byte-identical to the pre-v3 form.
+    #[serde(default, skip_serializing_if = "MemberFraming::is_sidecar")]
+    pub framing: MemberFraming,
     /// Postgres/MySQL provenance (only for `PgDump`/`MysqlDump` members).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg: Option<PgMemberInfo>,
+}
+
+impl MemberSpec {
+    /// A `Sidecar`-framed member spec (the common case; v2 shape).
+    pub fn sidecar(path: String, kind: MemberKind, pg: Option<PgMemberInfo>) -> Self {
+        Self {
+            path,
+            kind,
+            framing: MemberFraming::Sidecar,
+            pg,
+        }
+    }
+
+    /// A `ChunkedTrailer`-framed member spec (a large/streamed member; v3 shape).
+    pub fn chunked(path: String, kind: MemberKind, pg: Option<PgMemberInfo>) -> Self {
+        Self {
+            path,
+            kind,
+            framing: MemberFraming::ChunkedTrailer,
+            pg,
+        }
+    }
+}
+
+/// A chunked member's `.brtrailer`: the size + SHA-256 of the whole member, written AFTER its
+/// `.part{N}` chunks so a streaming producer need never stat or buffer the member (the chunked
+/// analogue of the v2 leading [`MemberMeta`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberTrailer {
+    /// The member's exact byte length (sum of all `.part{N}` chunk bytes).
+    pub size: u64,
+    /// Hex SHA-256 of the member bytes — verified against the streamed bytes as the trailer is read.
+    pub sha256: String,
 }
 
 /// The **v2 MANIFEST** — the first tar entry: the ordered member LIST plus bundle metadata.
@@ -477,7 +586,10 @@ pub struct StreamManifest {
 }
 
 impl StreamManifest {
-    /// Loud-reject a foreign or wrong-version bundle (magic + version MUST be v2).
+    /// Loud-reject a foreign or wrong-version bundle (magic + version MUST be v2 or v3). The one
+    /// `StreamManifest` struct serves both the v2 (sidecar-only) and v3 (some chunked) forms — a
+    /// v3 manifest differs only in `format_version = 3` and a `framing` field on its chunked
+    /// members (absent ⇒ `Sidecar`), so a v2 manifest validates and round-trips unchanged.
     fn validate(&self) -> Result<(), BundleError> {
         if self.magic != BUNDLE_MAGIC {
             return Err(BundleError::BadMagic {
@@ -485,10 +597,12 @@ impl StreamManifest {
                 found: self.magic.clone(),
             });
         }
-        if self.format_version != BUNDLE_FORMAT_VERSION_V2 {
+        if self.format_version != BUNDLE_FORMAT_VERSION_V2
+            && self.format_version != BUNDLE_FORMAT_VERSION_V3
+        {
             return Err(BundleError::BadVersion {
                 found: self.format_version,
-                supported: BUNDLE_FORMAT_VERSION_V2,
+                supported: BUNDLE_FORMAT_VERSION_V3,
             });
         }
         Ok(())
@@ -526,10 +640,14 @@ pub struct BundleStreamWriter<W: Write> {
 }
 
 impl<W: Write> BundleStreamWriter<W> {
-    /// Begin a v2 bundle on `out`, writing the MANIFEST (the ordered member list) first.
-    /// `specs` is every member in restore order; each must then be supplied, in that order,
-    /// via [`append_member`](Self::append_member), and the bundle closed with
-    /// [`finish`](Self::finish).
+    /// Begin a streamable bundle on `out`, writing the MANIFEST (the ordered member list) first.
+    /// `specs` is every member in restore order; each must then be supplied, in that order, via
+    /// [`append_member`](Self::append_member) (Sidecar framing) or
+    /// [`append_member_chunked`](Self::append_member_chunked) (ChunkedTrailer framing) to match
+    /// the spec's declared framing, and the bundle closed with [`finish`](Self::finish). The
+    /// MANIFEST declares [`BUNDLE_FORMAT_VERSION_V3`] when ANY member is chunked, else
+    /// [`BUNDLE_FORMAT_VERSION_V2`] — so a bundle with no chunked member is byte-identical to the
+    /// pre-v3 v2 form (an inc1 node can still read it).
     pub fn new(
         out: W,
         created_at: u64,
@@ -540,9 +658,17 @@ impl<W: Write> BundleStreamWriter<W> {
         for s in &specs {
             validate_member_path(&s.path)?;
         }
+        let format_version = if specs
+            .iter()
+            .any(|s| s.framing == MemberFraming::ChunkedTrailer)
+        {
+            BUNDLE_FORMAT_VERSION_V3
+        } else {
+            BUNDLE_FORMAT_VERSION_V2
+        };
         let manifest = StreamManifest {
             magic: BUNDLE_MAGIC.to_string(),
-            format_version: BUNDLE_FORMAT_VERSION_V2,
+            format_version,
             created_at,
             data_only,
             source,
@@ -559,6 +685,31 @@ impl<W: Write> BundleStreamWriter<W> {
         })
     }
 
+    /// Pop + validate the next declared member, asserting it matches `(path, kind, framing)` — the
+    /// shared front of [`append_member`](Self::append_member) and
+    /// [`append_member_chunked`](Self::append_member_chunked). An out-of-order, unexpected, or
+    /// wrong-framing append is refused loud.
+    fn next_expected(
+        &mut self,
+        path: &str,
+        kind: MemberKind,
+        framing: MemberFraming,
+    ) -> Result<(), BundleError> {
+        let expected = self.remaining.pop_front().ok_or_else(|| {
+            BundleError::MalformedStream(format!(
+                "append of {path:?} but the MANIFEST declared no more members"
+            ))
+        })?;
+        if expected.path != path || expected.kind != kind || expected.framing != framing {
+            return Err(BundleError::MalformedStream(format!(
+                "append of ({path:?}, {kind:?}, {framing:?}) does not match the next declared \
+                 member ({:?}, {:?}, {:?})",
+                expected.path, expected.kind, expected.framing
+            )));
+        }
+        validate_member_path(path)
+    }
+
     /// Append the next member, whose bytes are staged at `src` (a bounded temp). Writes the
     /// member's `.brmeta` sidecar (size + SHA-256, read from `src`) then the member data,
     /// both streamed from `src` (never buffered whole). The `path`/`kind` MUST match the next
@@ -569,19 +720,7 @@ impl<W: Write> BundleStreamWriter<W> {
         kind: MemberKind,
         src: &Path,
     ) -> Result<(), BundleError> {
-        let expected = self.remaining.pop_front().ok_or_else(|| {
-            BundleError::MalformedStream(format!(
-                "append of {path:?} but the MANIFEST declared no more members"
-            ))
-        })?;
-        if expected.path != path || expected.kind != kind {
-            return Err(BundleError::MalformedStream(format!(
-                "append of ({path:?}, {kind:?}) does not match the next declared member \
-                 ({:?}, {:?})",
-                expected.path, expected.kind
-            )));
-        }
-        validate_member_path(path)?;
+        self.next_expected(path, kind, MemberFraming::Sidecar)?;
 
         // Pass 1: size (stat) + SHA-256 (one streamed read) → the sidecar, BEFORE the body.
         let size = std::fs::metadata(src)?.len();
@@ -610,6 +749,73 @@ impl<W: Write> BundleStreamWriter<W> {
         header.set_mode(0o600);
         header.set_mtime(self.created_at);
         self.builder.append_data(&mut header, path, &mut f)?;
+        Ok(())
+    }
+
+    /// Append the next member as a run of `chunk_size`-byte `.part{N}` tar entries followed by a
+    /// `.brtrailer` ([`MemberTrailer`]: size + SHA-256). Streams `body` through, hashing + counting
+    /// WHILE writing each chunk — it NEVER stats or buffers the whole member (at most one
+    /// `chunk_size` buffer lives at a time), so a producer that yields a `&mut dyn Read` over an
+    /// engine dump (the libsql `.dump` stream, `pg_dump` stdout) is written in O(chunk) disk +
+    /// memory. The `path`/`kind` MUST match the next declared member AND its framing MUST be
+    /// [`MemberFraming::ChunkedTrailer`] — an out-of-order, unexpected, or wrong-framing append is
+    /// refused loud. `chunk_size` must be non-zero.
+    pub fn append_member_chunked(
+        &mut self,
+        path: &str,
+        kind: MemberKind,
+        body: &mut dyn Read,
+        chunk_size: usize,
+    ) -> Result<(), BundleError> {
+        self.next_expected(path, kind, MemberFraming::ChunkedTrailer)?;
+        let chunk_size = chunk_size.max(1);
+
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut part: u32 = 0;
+        let mut buf = vec![0u8; chunk_size];
+        loop {
+            // Fill a whole chunk buffer (a single `read` may short-read), so every `.part{N}` but
+            // the last is exactly `chunk_size` — a stable, predictable chunking the reader asserts.
+            let mut filled = 0usize;
+            while filled < chunk_size {
+                let n = body.read(&mut buf[filled..])?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break; // clean EOF on a chunk boundary — no trailing empty part
+            }
+            hasher.update(&buf[..filled]);
+            total += filled as u64;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(filled as u64);
+            header.set_mode(0o600);
+            header.set_mtime(self.created_at);
+            self.builder
+                .append_data(&mut header, chunk_part_path(path, part), &buf[..filled])?;
+            part = part.checked_add(1).ok_or_else(|| {
+                BundleError::MalformedStream(format!("chunked member {path:?} exceeded 2^32 parts"))
+            })?;
+            if filled < chunk_size {
+                break; // short final chunk ⇒ EOF
+            }
+        }
+
+        // The TRAILING trailer: size + SHA-256 of the whole streamed member, AFTER the chunks.
+        let trailer = MemberTrailer {
+            size: total,
+            sha256: hex::encode(hasher.finalize()),
+        };
+        let trailer_json = serde_json::to_vec(&trailer)?;
+        append_bytes(
+            &mut self.builder,
+            &chunk_trailer_path(path),
+            self.created_at,
+            &trailer_json,
+        )?;
         Ok(())
     }
 
@@ -654,6 +860,49 @@ where
         // of whether the append succeeded.
         let _ = std::fs::remove_file(&tmp);
         appended?;
+    }
+    writer.finish()
+}
+
+/// Stream a v3-capable bundle to `out`, dispatching each member by its [`MemberFraming`] — the
+/// chunked-aware superset of [`write_bundle_streaming`] the export driver uses. For a `Sidecar`
+/// member, `stage(spec)` stages it to a bounded temp (returned path), which is appended then
+/// deleted (the inc1 O(largest-member) footprint, unchanged); for a `ChunkedTrailer` member,
+/// `open(spec)` yields a `Box<dyn Read>` over the member's bytes (an engine dump stream) that is
+/// piped STRAIGHT through [`append_member_chunked`](BundleStreamWriter::append_member_chunked) in
+/// `chunk_size` pieces — NO temp, O(chunk) disk + memory. The MANIFEST is v3 iff any member is
+/// chunked (else v2 — see [`BundleStreamWriter::new`]).
+#[allow(clippy::too_many_arguments)] // the bundle head (created_at/data_only/source) + both
+// producers + chunk_size are each load-bearing; grouping them into a struct would only hide them.
+pub fn write_bundle_streaming_v3<W, S, O>(
+    out: W,
+    created_at: u64,
+    data_only: bool,
+    source: SourceInfo,
+    specs: Vec<MemberSpec>,
+    chunk_size: usize,
+    mut stage: S,
+    mut open: O,
+) -> Result<(), BundleError>
+where
+    W: Write,
+    S: FnMut(&MemberSpec) -> Result<PathBuf, BundleError>,
+    O: FnMut(&MemberSpec) -> Result<Box<dyn Read>, BundleError>,
+{
+    let mut writer = BundleStreamWriter::new(out, created_at, data_only, source, specs.clone())?;
+    for spec in &specs {
+        match spec.framing {
+            MemberFraming::Sidecar => {
+                let tmp = stage(spec)?;
+                let appended = writer.append_member(&spec.path, spec.kind, &tmp);
+                let _ = std::fs::remove_file(&tmp);
+                appended?;
+            }
+            MemberFraming::ChunkedTrailer => {
+                let mut body = open(spec)?;
+                writer.append_member_chunked(&spec.path, spec.kind, body.as_mut(), chunk_size)?;
+            }
+        }
     }
     writer.finish()
 }
@@ -920,11 +1169,7 @@ where
                 .iter()
                 .find(|m| m.path == path)
                 .ok_or_else(|| BundleError::UnexpectedMember(path.clone()))?;
-            let spec = MemberSpec {
-                path: mm.path.clone(),
-                kind: mm.kind,
-                pg: mm.pg.clone(),
-            };
+            let spec = MemberSpec::sidecar(mm.path.clone(), mm.kind, mm.pg.clone());
             per_member(&spec, mm.size, &mm.sha256, &mut entry)?;
             seen.insert(path);
             restored.push(spec);
@@ -993,6 +1238,304 @@ where
         });
     }
     Ok(restored)
+}
+
+/// The restore policy the v3-capable single-pass reader [`read_bundle_streaming_atomic`] drives,
+/// one method per member shape. The format layer owns the PARSE + the per-member integrity VERIFY;
+/// the implementor (the import driver) owns the APPLY (where a member is re-keyed to the target,
+/// scope-enforced, and committed) — so a chunked member and a sidecar member of the same kind route
+/// through the SAME driver re-key/enforce, framing being a transport detail, never a tenancy bypass.
+///
+/// A `Sidecar` member arrives fully staged + size/SHA-VERIFIED at a bounded temp
+/// ([`restore_sidecar`](Self::restore_sidecar)) — verify-THEN-apply, exactly as the v2 staged
+/// reader. A `ChunkedTrailer` member streams: [`begin_chunked`](Self::begin_chunked) opens the sink
+/// (a shadow DB / a staging temp / a blob put), [`write_chunk`](Self::write_chunk) feeds each chunk
+/// as it arrives (the reader hashes + counts), and [`finish_chunked`](Self::finish_chunked) is told
+/// whether the TRAILING trailer matched — COMMIT the sink only on `verified`, else DROP it, so a
+/// corrupt/truncated/tampered chunked member applies NOTHING to live (the inc2 atomic shadow).
+pub trait BundleRestorer {
+    /// Apply a `Sidecar` member already staged + verified at `temp` (freed by the reader after
+    /// this returns).
+    fn restore_sidecar(&mut self, spec: &MemberSpec, temp: &Path) -> Result<(), BundleError>;
+    /// Open the sink for a `ChunkedTrailer` member, before its first chunk (e.g. create the shadow
+    /// DB / the staging temp). A failure here aborts the import before any byte is applied.
+    fn begin_chunked(&mut self, spec: &MemberSpec) -> Result<(), BundleError>;
+    /// Feed the next slice of a chunked member's bytes to the open sink (called repeatedly, in
+    /// order, for each chunk the reader streams).
+    fn write_chunk(&mut self, spec: &MemberSpec, buf: &[u8]) -> Result<(), BundleError>;
+    /// Finish a chunked member: `verified` is whether the streamed bytes matched the trailer's
+    /// size + SHA-256. COMMIT-swap the sink on `true`; DROP it (nothing applied to live) on `false`.
+    fn finish_chunked(&mut self, spec: &MemberSpec, verified: bool) -> Result<(), BundleError>;
+}
+
+/// The **v3-capable atomic single-pass reader** — the inc2 superset of
+/// [`read_bundle_streaming_staged`]. Reads v1, v2 AND v3 bundles in one forward pass, dispatching
+/// each member to `restorer` by its [`MemberFraming`]: a `Sidecar` member is staged to a bounded
+/// temp under `stage_dir` and size/SHA-VERIFIED BEFORE [`restore_sidecar`](BundleRestorer::restore_sidecar)
+/// (verify-then-apply, unchanged from v2); a `ChunkedTrailer` member streams chunk-by-chunk through
+/// [`begin_chunked`](BundleRestorer::begin_chunked) / [`write_chunk`](BundleRestorer::write_chunk)
+/// (the reader hashing + counting, NEVER staging the whole member) and is committed by
+/// [`finish_chunked`](BundleRestorer::finish_chunked) ONLY when the TRAILING trailer matched — so a
+/// corrupt/truncated chunked member applies nothing (atomic). `on_head(data_only, source)` fires
+/// once after the MANIFEST, before any member. Enforces the v2/v3 declared order + per-member
+/// framing + the v1 completeness, exactly as [`read_bundle_core`].
+pub fn read_bundle_streaming_atomic<R, H>(
+    src: R,
+    stage_dir: &Path,
+    mut on_head: H,
+    restorer: &mut dyn BundleRestorer,
+) -> Result<Vec<MemberSpec>, BundleError>
+where
+    R: Read,
+    H: FnMut(bool, &SourceInfo),
+{
+    let mut ar = tar::Archive::new(src);
+    let mut entries = ar.entries()?;
+
+    // 1. The MANIFEST (first entry), peeked for its version.
+    let mut first = entries
+        .next()
+        .ok_or_else(|| BundleError::MissingManifest(MANIFEST_PATH.to_string()))??;
+    let fpath = first.path()?.to_string_lossy().into_owned();
+    if fpath != MANIFEST_PATH {
+        return Err(BundleError::MissingManifest(MANIFEST_PATH.to_string()));
+    }
+    let mut manifest_json = String::new();
+    first.read_to_string(&mut manifest_json)?;
+    let version = peek_format_version(&manifest_json)?;
+    let mut counter = 0u64;
+    let mut restored: Vec<MemberSpec> = Vec::new();
+
+    if version == BUNDLE_FORMAT_VERSION {
+        // --- v1: inline size/SHA in the manifest; members matched by path (any order), all
+        //     Sidecar-framed (v1 predates chunking). ---
+        let manifest: Manifest = serde_json::from_str(&manifest_json)?;
+        manifest.validate()?;
+        on_head(manifest.data_only, &manifest.source);
+        let mut seen: HashSet<String> = HashSet::new();
+        for entry in entries {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            validate_member_path(&path)?;
+            let mm = manifest
+                .members
+                .iter()
+                .find(|m| m.path == path)
+                .ok_or_else(|| BundleError::UnexpectedMember(path.clone()))?;
+            let spec = MemberSpec::sidecar(mm.path.clone(), mm.kind, mm.pg.clone());
+            stage_and_verify_member(
+                &mut entry,
+                &spec,
+                mm.size,
+                &mm.sha256,
+                stage_dir,
+                &mut counter,
+                &mut |s, t| restorer.restore_sidecar(s, t),
+            )?;
+            seen.insert(path);
+            restored.push(spec);
+        }
+        for m in &manifest.members {
+            if !seen.contains(&m.path) {
+                return Err(BundleError::MissingMember(m.path.clone()));
+            }
+        }
+    } else if version == BUNDLE_FORMAT_VERSION_V2 || version == BUNDLE_FORMAT_VERSION_V3 {
+        // --- v2/v3: the MANIFEST lists members in restore order; each is consumed per its framing
+        //     (Sidecar = `.brmeta` + body; ChunkedTrailer = `.part{N}` run + `.brtrailer`). ---
+        let manifest: StreamManifest = serde_json::from_str(&manifest_json)?;
+        manifest.validate()?;
+        on_head(manifest.data_only, &manifest.source);
+        for spec in manifest.members {
+            match spec.framing {
+                MemberFraming::Sidecar => {
+                    // The sidecar `<path>.brmeta` must come first, then the `<path>` body.
+                    let mut meta_entry = entries
+                        .next()
+                        .ok_or_else(|| BundleError::MissingMember(spec.path.clone()))??;
+                    let mpath = meta_entry.path()?.to_string_lossy().into_owned();
+                    let stripped = mpath.strip_suffix(META_SUFFIX).ok_or_else(|| {
+                        BundleError::MalformedStream(format!(
+                            "expected sidecar {:?} for member {:?}, found {mpath:?}",
+                            StreamManifest::meta_path(&spec.path),
+                            spec.path
+                        ))
+                    })?;
+                    if stripped != spec.path {
+                        return Err(BundleError::MalformedStream(format!(
+                            "sidecar {mpath:?} does not match the declared member {:?}",
+                            spec.path
+                        )));
+                    }
+                    let mut mbuf = String::new();
+                    meta_entry.read_to_string(&mut mbuf)?;
+                    let meta: MemberMeta = serde_json::from_str(&mbuf)?;
+
+                    let mut body_entry = entries
+                        .next()
+                        .ok_or_else(|| BundleError::MissingMember(spec.path.clone()))??;
+                    let bpath = body_entry.path()?.to_string_lossy().into_owned();
+                    validate_member_path(&bpath)?;
+                    if bpath != spec.path {
+                        return Err(BundleError::MalformedStream(format!(
+                            "member {bpath:?} out of declared order (MANIFEST expected {:?})",
+                            spec.path
+                        )));
+                    }
+                    stage_and_verify_member(
+                        &mut body_entry,
+                        &spec,
+                        meta.size,
+                        &meta.sha256,
+                        stage_dir,
+                        &mut counter,
+                        &mut |s, t| restorer.restore_sidecar(s, t),
+                    )?;
+                    restored.push(spec);
+                }
+                MemberFraming::ChunkedTrailer => {
+                    read_chunked_member(&mut entries, &spec, restorer)?;
+                    restored.push(spec);
+                }
+            }
+        }
+        // No tar entry may remain past the last declared member.
+        if let Some(extra) = entries.next() {
+            let extra = extra?;
+            let path = extra.path()?.to_string_lossy().into_owned();
+            return Err(BundleError::UnexpectedMember(path));
+        }
+    } else {
+        return Err(BundleError::BadVersion {
+            found: version,
+            supported: BUNDLE_FORMAT_VERSION_V3,
+        });
+    }
+    Ok(restored)
+}
+
+/// Consume one `ChunkedTrailer` member from `entries`: `begin_chunked`, stream each
+/// `<path>.part{N:05}` (monotonic from `00000`) through `write_chunk` while hashing + counting,
+/// then VERIFY the streamed size + SHA-256 against the `<path>.brtrailer` and `finish_chunked`
+/// (commit on match, drop on mismatch). Any parse/order/IO failure drops the sink (abort) and
+/// propagates, so a corrupt/truncated chunked member applies nothing to live.
+fn read_chunked_member<R: Read>(
+    entries: &mut tar::Entries<'_, R>,
+    spec: &MemberSpec,
+    restorer: &mut dyn BundleRestorer,
+) -> Result<(), BundleError> {
+    restorer.begin_chunked(spec)?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut next_part: u32 = 0;
+    // The trailer we expect to find after the last part; `None` until seen.
+    let mut outcome: Result<MemberTrailer, BundleError> =
+        Err(BundleError::MalformedStream(format!(
+            "chunked member {:?} ended before its {TRAILER_SUFFIX} trailer",
+            spec.path
+        )));
+    loop {
+        let entry = match entries.next() {
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                outcome = Err(BundleError::Io(e));
+                break;
+            }
+            None => break, // outcome stays "ended before trailer"
+        };
+        let mut entry = entry;
+        let epath = match entry.path() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                outcome = Err(BundleError::Io(e));
+                break;
+            }
+        };
+        if let Some(stripped) = epath.strip_suffix(TRAILER_SUFFIX) {
+            if stripped != spec.path {
+                outcome = Err(BundleError::MalformedStream(format!(
+                    "trailer {epath:?} does not match the chunked member {:?}",
+                    spec.path
+                )));
+                break;
+            }
+            let mut tbuf = String::new();
+            if let Err(e) = entry.read_to_string(&mut tbuf) {
+                outcome = Err(BundleError::Io(e));
+                break;
+            }
+            outcome = serde_json::from_str::<MemberTrailer>(&tbuf).map_err(BundleError::Json);
+            break;
+        }
+        // Otherwise it must be the NEXT expected `.part{N}` (monotonic, matching the member path).
+        let expected = chunk_part_path(&spec.path, next_part);
+        if epath != expected {
+            outcome = Err(BundleError::MalformedStream(format!(
+                "chunked member {:?}: expected chunk {expected:?}, found {epath:?} \
+                 (missing/out-of-order part or wrong member)",
+                spec.path
+            )));
+            break;
+        }
+        // Stream this part's bytes to the sink, hashing + counting the whole member.
+        let mut rbuf = [0u8; 64 * 1024];
+        let part_res: Result<(), BundleError> = loop {
+            match entry.read(&mut rbuf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => {
+                    hasher.update(&rbuf[..n]);
+                    total += n as u64;
+                    if let Err(e) = restorer.write_chunk(spec, &rbuf[..n]) {
+                        break Err(e);
+                    }
+                }
+                Err(e) => break Err(BundleError::Io(e)),
+            }
+        };
+        if let Err(e) = part_res {
+            outcome = Err(e);
+            break;
+        }
+        next_part = match next_part.checked_add(1) {
+            Some(v) => v,
+            None => {
+                outcome = Err(BundleError::MalformedStream(format!(
+                    "chunked member {:?} exceeded 2^32 parts",
+                    spec.path
+                )));
+                break;
+            }
+        };
+    }
+    match outcome {
+        Ok(trailer) => {
+            let actual = hex::encode(hasher.finalize());
+            let verified = total == trailer.size && actual == trailer.sha256;
+            // Tell the sink whether to commit or drop BEFORE raising a loud mismatch, so the
+            // shadow is torn down on a bad member even as the error propagates.
+            restorer.finish_chunked(spec, verified)?;
+            if total != trailer.size {
+                return Err(BundleError::SizeMismatch {
+                    path: spec.path.clone(),
+                    expected: trailer.size,
+                    actual: total,
+                });
+            }
+            if actual != trailer.sha256 {
+                return Err(BundleError::ChecksumMismatch {
+                    path: spec.path.clone(),
+                    expected: trailer.sha256,
+                    actual,
+                });
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Abort the sink (drop the shadow) on any streaming/parse failure, then surface it.
+            let _ = restorer.finish_chunked(spec, false);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1188,6 +1731,7 @@ mod tests {
                 MemberSpec {
                     path: IDENTITY_MEMBER_PATH.to_string(),
                     kind: MemberKind::Identity,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 },
                 b"IDENTITY-KEK-TRANSPORT".to_vec(),
@@ -1196,6 +1740,7 @@ mod tests {
                 MemberSpec {
                     path: "blobs/acme/obj1".to_string(),
                     kind: MemberKind::Blob,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 },
                 vec![0xAB; 4096],
@@ -1204,6 +1749,7 @@ mod tests {
                 MemberSpec {
                     path: "sql/app.pgc".to_string(),
                     kind: MemberKind::PgDump,
+                    framing: MemberFraming::Sidecar,
                     pg: Some(PgMemberInfo {
                         server_version_num: "160004".to_string(),
                         client_image: "pgvector/pgvector:pg16".to_string(),
@@ -1216,6 +1762,7 @@ mod tests {
                 MemberSpec {
                     path: KV_MEMBER_PATH.to_string(),
                     kind: MemberKind::Kv,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 },
                 b"BRKVDUMP\x01\x02\x03".to_vec(),
@@ -1351,6 +1898,7 @@ mod tests {
                 members: vec![MemberSpec {
                     path: "sql/app.pgc".to_string(),
                     kind: MemberKind::PgDump,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
             };
@@ -1403,6 +1951,7 @@ mod tests {
                 members: vec![MemberSpec {
                     path: "sql/app.pgc".to_string(),
                     kind: MemberKind::PgDump,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
             };
@@ -1431,11 +1980,13 @@ mod tests {
             MemberSpec {
                 path: "a".to_string(),
                 kind: MemberKind::Blob,
+                framing: MemberFraming::Sidecar,
                 pg: None,
             },
             MemberSpec {
                 path: "b".to_string(),
                 kind: MemberKind::Blob,
+                framing: MemberFraming::Sidecar,
                 pg: None,
             },
         ];
@@ -1507,6 +2058,7 @@ mod tests {
             .map(|i| MemberSpec {
                 path: format!("blobs/acme/obj{i}"),
                 kind: MemberKind::Blob,
+                framing: MemberFraming::Sidecar,
                 pg: None,
             })
             .collect();
@@ -1588,6 +2140,7 @@ mod tests {
                 members: vec![MemberSpec {
                     path: "sql/app.pgc".to_string(),
                     kind: MemberKind::PgDump,
+                    framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
             };
@@ -1648,6 +2201,7 @@ mod tests {
             vec![MemberSpec {
                 path: KV_MEMBER_PATH.to_string(),
                 kind: MemberKind::Kv,
+                framing: MemberFraming::Sidecar,
                 pg: None,
             }],
             |_s| {
@@ -1674,5 +2228,382 @@ mod tests {
             vec![("kv.brkvdump".to_string(), b"BRKVDUMP-OK".to_vec())],
             "a verified member is applied from its staged temp with the exact bytes"
         );
+    }
+
+    // ---- format v3 (chunked trailing-trailer members) -------------------------------------
+
+    /// A `BundleRestorer` that records exactly what the reader drove: sidecar applies, and each
+    /// chunked member's begin/write/finish — so a test can assert the commit-vs-drop decision and
+    /// the reassembled bytes, and that a chunked body is delivered chunk-by-chunk (never staged
+    /// whole by the format layer).
+    #[derive(Default)]
+    struct RecordingRestorer {
+        sidecars: Vec<(MemberSpec, Vec<u8>)>,
+        begins: Vec<String>,
+        finishes: Vec<(String, bool)>,
+        /// The in-flight chunked member's accumulated bytes (between begin and finish).
+        cur: Option<Vec<u8>>,
+        /// Committed chunked members: (spec, reassembled bytes) — only the `verified` ones.
+        committed_chunked: Vec<(MemberSpec, Vec<u8>)>,
+        /// The largest single `write_chunk` buffer seen (the format reader streams in ≤64 KiB
+        /// reads, never the whole member — this stays tiny even for a multi-MiB member).
+        max_write_buf: usize,
+    }
+
+    impl BundleRestorer for RecordingRestorer {
+        fn restore_sidecar(&mut self, spec: &MemberSpec, temp: &Path) -> Result<(), BundleError> {
+            self.sidecars.push((spec.clone(), std::fs::read(temp)?));
+            Ok(())
+        }
+        fn begin_chunked(&mut self, spec: &MemberSpec) -> Result<(), BundleError> {
+            self.begins.push(spec.path.clone());
+            self.cur = Some(Vec::new());
+            Ok(())
+        }
+        fn write_chunk(&mut self, _spec: &MemberSpec, buf: &[u8]) -> Result<(), BundleError> {
+            self.max_write_buf = self.max_write_buf.max(buf.len());
+            self.cur
+                .as_mut()
+                .expect("write_chunk between begin and finish")
+                .extend_from_slice(buf);
+            Ok(())
+        }
+        fn finish_chunked(&mut self, spec: &MemberSpec, verified: bool) -> Result<(), BundleError> {
+            self.finishes.push((spec.path.clone(), verified));
+            let bytes = self.cur.take().unwrap_or_default();
+            if verified {
+                self.committed_chunked.push((spec.clone(), bytes));
+            }
+            Ok(())
+        }
+    }
+
+    /// Count the `.part*` tar entries of a chunked member in a raw bundle, and the max part size —
+    /// the structural O(chunk) proof: a body > chunk_size is written as MULTIPLE bounded parts,
+    /// never one whole-member entry (nor a temp).
+    fn count_parts(bundle: &[u8], base: &str) -> (usize, u64) {
+        let mut ar = tar::Archive::new(bundle);
+        let mut n = 0usize;
+        let mut max = 0u64;
+        for e in ar.entries().unwrap() {
+            let e = e.unwrap();
+            let p = e.path().unwrap().to_string_lossy().into_owned();
+            if p.starts_with(&format!("{base}{PART_INFIX}")) {
+                n += 1;
+                max = max.max(e.header().size().unwrap());
+            }
+        }
+        (n, max)
+    }
+
+    #[test]
+    fn v3_chunked_round_trips_with_bounded_part_staging() {
+        // A chunked member whose body is 5× the chunk size → the writer emits 5 `.part` entries,
+        // each ≤ chunk_size (NEVER one whole-member entry), and the atomic reader streams them
+        // back chunk-by-chunk to a round-trip-exact reassembly, committing exactly once.
+        const CHUNK: usize = 4096;
+        let body: Vec<u8> = (0..CHUNK * 5).map(|i| (i % 251) as u8).collect();
+        let specs = vec![
+            MemberSpec::sidecar(KV_MEMBER_PATH.to_string(), MemberKind::Kv, None),
+            MemberSpec::chunked(
+                "libsql/acme/blog/default.sqlite".to_string(),
+                MemberKind::Libsql,
+                None,
+            ),
+        ];
+        let td = tempfile::tempdir().unwrap();
+        let kv_tmp = td.path().join("kv");
+        std::fs::write(&kv_tmp, b"BRKVDUMP-KV").unwrap();
+
+        let body_for_open = body.clone();
+        let mut bundle: Vec<u8> = Vec::new();
+        write_bundle_streaming_v3(
+            &mut bundle,
+            1_700_000_000,
+            false,
+            SourceInfo {
+                project: "acme".to_string(),
+                site: None,
+            },
+            specs.clone(),
+            CHUNK,
+            |_spec| Ok(kv_tmp.clone()),
+            |_spec| Ok(Box::new(io::Cursor::new(body_for_open.clone())) as Box<dyn Read>),
+        )
+        .unwrap();
+
+        // The bundle is v3 (a chunked member is present).
+        assert_eq!(read_manifest_version(&bundle), BUNDLE_FORMAT_VERSION_V3);
+        // Structural O(chunk) proof: 5 bounded parts, none larger than CHUNK.
+        let (parts, max_part) = count_parts(&bundle, "libsql/acme/blog/default.sqlite");
+        assert_eq!(parts, 5, "a 5×chunk body is written as 5 `.part` entries");
+        assert!(
+            max_part <= CHUNK as u64,
+            "no part exceeds the chunk size (never a whole-member entry): {max_part}"
+        );
+
+        // Read it back through the atomic reader.
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut r = RecordingRestorer::default();
+        let mut data_only = true;
+        let restored =
+            read_bundle_streaming_atomic(bundle.as_slice(), &stage, |d, _s| data_only = d, &mut r)
+                .unwrap();
+
+        assert!(!data_only);
+        assert_eq!(restored, specs, "both members restored in declared order");
+        // The KV sidecar applied once; the chunked member committed exactly once with verified.
+        assert_eq!(r.sidecars.len(), 1);
+        assert_eq!(r.sidecars[0].1, b"BRKVDUMP-KV");
+        assert_eq!(
+            r.begins,
+            vec!["libsql/acme/blog/default.sqlite".to_string()]
+        );
+        assert_eq!(
+            r.finishes,
+            vec![("libsql/acme/blog/default.sqlite".to_string(), true)],
+            "finish_chunked fired ONCE with verified=true (commit)"
+        );
+        assert_eq!(r.committed_chunked.len(), 1);
+        assert_eq!(
+            r.committed_chunked[0].1, body,
+            "the chunked member round-trips byte-for-byte"
+        );
+        // The format layer NEVER handed the restorer the whole member at once (O(chunk) read).
+        assert!(
+            r.max_write_buf <= 64 * 1024,
+            "reader streams in ≤64 KiB reads, never the whole member: {}",
+            r.max_write_buf
+        );
+
+        // MUTATION (RED): a writer that wrote the whole member as ONE part (whole-member staging)
+        // would make `parts == 1` and `max_part == CHUNK*5` — the two assertions above go RED.
+    }
+
+    #[test]
+    fn v3_chunked_trailer_mismatch_aborts_and_never_commits() {
+        // Hand-build a v3 bundle whose `.brtrailer` SHA lies — the atomic reader must raise a
+        // ChecksumMismatch AND tell the sink to DROP (finish_chunked verified=false), never commit.
+        let base = "libsql/acme/blog/default.sqlite";
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let manifest = StreamManifest {
+                magic: BUNDLE_MAGIC.to_string(),
+                format_version: BUNDLE_FORMAT_VERSION_V3,
+                created_at: 0,
+                data_only: true,
+                source: SourceInfo {
+                    project: "acme".to_string(),
+                    site: None,
+                },
+                members: vec![MemberSpec::chunked(
+                    base.to_string(),
+                    MemberKind::Libsql,
+                    None,
+                )],
+            };
+            append_bytes(
+                &mut b,
+                MANIFEST_PATH,
+                0,
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            append_bytes(
+                &mut b,
+                &chunk_part_path(base, 0),
+                0,
+                b"the real member bytes",
+            )
+            .unwrap();
+            let trailer = MemberTrailer {
+                size: 21,
+                sha256: "00".repeat(32), // deliberately wrong
+            };
+            append_bytes(
+                &mut b,
+                &chunk_trailer_path(base),
+                0,
+                &serde_json::to_vec(&trailer).unwrap(),
+            )
+            .unwrap();
+            b.finish().unwrap();
+        }
+        let td = tempfile::tempdir().unwrap();
+        let mut r = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic(buf.as_slice(), td.path(), |_d, _s| {}, &mut r);
+        assert!(
+            matches!(res, Err(BundleError::ChecksumMismatch { .. })),
+            "a lying trailer is a loud reject: {res:?}"
+        );
+        assert_eq!(
+            r.finishes,
+            vec![(base.to_string(), false)],
+            "finish_chunked fired with verified=false (DROP the shadow); commit NEVER fired"
+        );
+        assert!(
+            r.committed_chunked.is_empty(),
+            "no chunked member is committed when the trailer mismatches"
+        );
+    }
+
+    #[test]
+    fn v3_chunked_truncation_before_trailer_aborts() {
+        // A v3 bundle whose chunked member ends WITHOUT its `.brtrailer` (truncated) → the reader
+        // raises MalformedStream and drops the sink (finish_chunked verified=false).
+        let base = "libsql/acme/blog/default.sqlite";
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let manifest = StreamManifest {
+                magic: BUNDLE_MAGIC.to_string(),
+                format_version: BUNDLE_FORMAT_VERSION_V3,
+                created_at: 0,
+                data_only: true,
+                source: SourceInfo {
+                    project: "acme".to_string(),
+                    site: None,
+                },
+                members: vec![MemberSpec::chunked(
+                    base.to_string(),
+                    MemberKind::Libsql,
+                    None,
+                )],
+            };
+            append_bytes(
+                &mut b,
+                MANIFEST_PATH,
+                0,
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            append_bytes(
+                &mut b,
+                &chunk_part_path(base, 0),
+                0,
+                b"a chunk but no trailer",
+            )
+            .unwrap();
+            b.finish().unwrap(); // NO `.brtrailer`
+        }
+        let td = tempfile::tempdir().unwrap();
+        let mut r = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic(buf.as_slice(), td.path(), |_d, _s| {}, &mut r);
+        assert!(
+            matches!(res, Err(BundleError::MalformedStream(_))),
+            "a truncated chunked member (no trailer) is rejected: {res:?}"
+        );
+        assert_eq!(
+            r.finishes,
+            vec![(base.to_string(), false)],
+            "sink DROPPED on truncation"
+        );
+        assert!(r.committed_chunked.is_empty());
+    }
+
+    #[test]
+    fn atomic_reader_reads_v1_and_v2_but_an_inc1_node_loud_rejects_v3() {
+        // Read-compat: the v3 atomic reader reads a v1 AND a v2 bundle (all sidecar members).
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        // v1 bundle via write_bundle.
+        let kv = write_staging(&stage, "kv.bin", b"V1-KV");
+        let v1 = td.path().join("v1.brproj");
+        write_bundle(
+            &v1,
+            0,
+            true,
+            SourceInfo {
+                project: "acme".to_string(),
+                site: None,
+            },
+            &[StagedMember {
+                path: KV_MEMBER_PATH.to_string(),
+                kind: MemberKind::Kv,
+                source: kv,
+                pg: None,
+            }],
+        )
+        .unwrap();
+        let mut r1 = RecordingRestorer::default();
+        read_bundle_streaming_atomic(
+            io::BufReader::new(std::fs::File::open(&v1).unwrap()),
+            &stage,
+            |_d, _s| {},
+            &mut r1,
+        )
+        .unwrap();
+        assert_eq!(r1.sidecars.len(), 1);
+        assert_eq!(r1.sidecars[0].1, b"V1-KV");
+
+        // v2 bundle via write_bundle_streaming (all sidecar).
+        let gendir = td.path().join("gen");
+        std::fs::create_dir_all(&gendir).unwrap();
+        let mut v2: Vec<u8> = Vec::new();
+        write_bundle_streaming(
+            &mut v2,
+            0,
+            true,
+            SourceInfo {
+                project: "acme".to_string(),
+                site: None,
+            },
+            vec![MemberSpec::sidecar(
+                KV_MEMBER_PATH.to_string(),
+                MemberKind::Kv,
+                None,
+            )],
+            |_s| {
+                let p = gendir.join("m");
+                std::fs::write(&p, b"V2-KV").unwrap();
+                Ok(p)
+            },
+        )
+        .unwrap();
+        assert_eq!(read_manifest_version(&v2), BUNDLE_FORMAT_VERSION_V2);
+        let mut r2 = RecordingRestorer::default();
+        read_bundle_streaming_atomic(v2.as_slice(), &stage, |_d, _s| {}, &mut r2).unwrap();
+        assert_eq!(r2.sidecars[0].1, b"V2-KV");
+
+        // A v3 bundle (a chunked member) handed to the LEGACY v1/v2 reader → loud BadVersion
+        // (an inc1 node never silently misreads a v3 bundle).
+        let mut v3: Vec<u8> = Vec::new();
+        write_bundle_streaming_v3(
+            &mut v3,
+            0,
+            true,
+            SourceInfo {
+                project: "acme".to_string(),
+                site: None,
+            },
+            vec![MemberSpec::chunked(
+                "libsql/acme/blog/default.sqlite".to_string(),
+                MemberKind::Libsql,
+                None,
+            )],
+            16,
+            |_s| unreachable!("no sidecar member"),
+            |_s| Ok(Box::new(io::Cursor::new(b"hello v3 chunked".to_vec())) as Box<dyn Read>),
+        )
+        .unwrap();
+        assert_eq!(read_manifest_version(&v3), BUNDLE_FORMAT_VERSION_V3);
+        let legacy = read_bundle_streaming(v3.as_slice(), |_s, _sz, _b| Ok(()));
+        assert!(
+            matches!(legacy, Err(BundleError::BadVersion { found: 3, .. })),
+            "the legacy v1/v2 reader loud-rejects a v3 bundle: {legacy:?}"
+        );
+    }
+
+    /// Read the MANIFEST's `format_version` from a raw bundle (test helper).
+    fn read_manifest_version(bundle: &[u8]) -> u32 {
+        let mut ar = tar::Archive::new(bundle);
+        let mut first = ar.entries().unwrap().next().unwrap().unwrap();
+        let mut s = String::new();
+        first.read_to_string(&mut s).unwrap();
+        peek_format_version(&s).unwrap()
     }
 }

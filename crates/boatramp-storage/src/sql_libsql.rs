@@ -155,6 +155,77 @@ impl LibsqlSql {
         }
     }
 
+    /// Stream a logical `.dump` (SQL text) of this database into `tx`: the `CREATE TABLE`s first,
+    /// then per-table `INSERT`s (rows iterated ONE AT A TIME off a raw connection — bounded
+    /// memory, never a whole table materialized), then the `CREATE INDEX`/`TRIGGER`/`VIEW`s. Every
+    /// statement is a single `;`-terminated line; the stream is valid SQLite SQL text applied
+    /// statement-by-statement on restore. Backs [`LibsqlSqlBackends::dump_database`].
+    async fn dump_to(&self, tx: &tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), SqlError> {
+        async fn send(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, s: String) -> Result<(), SqlError> {
+            tx.send(s.into_bytes())
+                .await
+                .map_err(|_| SqlError::other("libsql dump sink closed"))
+        }
+        let conn = self.db.connect().map_err(SqlError::other)?;
+
+        // 1. Table DDL, in a stable order. Collect the table names (small) for the data pass.
+        let mut tables: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name",
+                    (),
+                )
+                .await
+                .map_err(SqlError::other)?;
+            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
+                let name = value_to_text(row.get_value(0).map_err(SqlError::other)?);
+                let sql = value_to_text(row.get_value(1).map_err(SqlError::other)?);
+                send(tx, format!("{sql};\n")).await?;
+                tables.push(name);
+            }
+        }
+
+        // 2. Per-table data, one row at a time (`INSERT INTO "t" VALUES (...);`).
+        for t in &tables {
+            let quoted = t.replace('"', "\"\"");
+            let mut rows = conn
+                .query(&format!("SELECT * FROM \"{quoted}\""), ())
+                .await
+                .map_err(SqlError::other)?;
+            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
+                let n = row.column_count();
+                let mut vals = String::new();
+                for i in 0..n {
+                    if i > 0 {
+                        vals.push(',');
+                    }
+                    push_sql_value(&mut vals, &row.get_value(i).map_err(SqlError::other)?);
+                }
+                send(tx, format!("INSERT INTO \"{quoted}\" VALUES ({vals});\n")).await?;
+            }
+        }
+
+        // 3. Index / trigger / view DDL (after data, so a trigger never fires during the load and
+        //    an index is built once on the full table).
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type IN ('index','trigger','view') \
+                     AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY type, name",
+                    (),
+                )
+                .await
+                .map_err(SqlError::other)?;
+            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
+                let sql = value_to_text(row.get_value(0).map_err(SqlError::other)?);
+                send(tx, format!("{sql};\n")).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Copy this database to `path` as a transactionally consistent snapshot
     /// (SQLite `VACUUM INTO`) — safe to run online against a live database.
     async fn vacuum_into(&self, path: &Path) -> Result<(), SqlError> {
@@ -930,18 +1001,21 @@ impl LibsqlSqlBackends {
         }
     }
 
-    /// **Place a snapshot into the local libsql store** for project IMPORT — the inverse
-    /// of [`Self::snapshot_into`]: copy the verified bundle file `src` into the database
-    /// `(site, name)`'s on-disk location, NO-CLOBBER (refuse a non-empty destination so a
-    /// restore never overwrites live data), then verify the placed file with
-    /// `PRAGMA integrity_check` and evict any cached handle so a reopen sees it. `site` is
-    /// the already project-qualified identity. Local single-node only (a remote sqld
-    /// namespace restore needs a server-side load API — refused).
+    /// **Place a snapshot into the local libsql store** for project IMPORT (the Sidecar-framed
+    /// libsql path — a v1/v2 bundle's VACUUM-INTO member). The inverse of [`Self::snapshot_into`],
+    /// now via an **atomic shadow + rename** (inc2): copy the verified bundle file `src` into a
+    /// FRESH `<live>.shadow_<ts>` beside the live path, `PRAGMA integrity_check` the shadow, then
+    /// `std::fs::rename(shadow, live)` (POSIX-atomic, same filesystem) and evict the cached handle.
+    /// On a bad copy the shadow is deleted and live is **never renamed-over**. Overwriting a
+    /// non-empty live database is gated on `overwrite` (replacing the v1 no-clobber); a fresh
+    /// target needs no `overwrite`. `site` is the already project-qualified identity. Local
+    /// single-node only (a remote sqld namespace restore needs a server-side load API — refused).
     pub async fn restore_snapshot(
         &self,
         site: &str,
         name: &str,
         src: &Path,
+        overwrite: bool,
     ) -> Result<(), SqlError> {
         let Mode::Local { dir } = &self.mode else {
             return Err(SqlError::other(
@@ -950,32 +1024,35 @@ impl LibsqlSqlBackends {
             ));
         };
         let canon = canonical_name(name);
-        let dst = Self::local_path(dir, site, canon);
-        // No-clobber: never overwrite a non-empty destination (a live tenant database).
-        if let Ok(meta) = std::fs::metadata(&dst)
+        let live = Self::resolve_local_path(dir, site, canon);
+        // Overwrite gate (replaces the v1 no-clobber): refuse a non-empty live unless `overwrite`.
+        if let Ok(meta) = std::fs::metadata(&live)
             && meta.len() > 0
+            && !overwrite
         {
             return Err(SqlError::other(format!(
                 "destination database already exists (refusing to overwrite): {}",
-                dst.display()
+                live.display()
             )));
         }
-        if let Some(parent) = dst.parent() {
+        if let Some(parent) = live.parent() {
             std::fs::create_dir_all(parent).map_err(SqlError::other)?;
         }
-        // Clear any zero-byte stub, then copy the snapshot into place.
-        let _ = std::fs::remove_file(&dst);
-        std::fs::copy(src, &dst).map_err(SqlError::other)?;
+        // Stage into a FRESH shadow beside live (never touch live until the atomic rename).
+        let shadow = shadow_path_for(&live);
+        remove_db_files(&shadow);
+        std::fs::copy(src, &shadow).map_err(SqlError::other)?;
 
-        // Verify the placed file is a sound SQLite database before accepting it.
-        let placed = LibsqlSql::open_local(&dst).await?;
+        // Verify the shadow is a sound SQLite database BEFORE the swap.
         let integrity = {
+            let placed = LibsqlSql::open_local(&shadow).await?;
             let mut tx = placed.begin_read_only().await?;
             let rows = tx.query("PRAGMA integrity_check", &[]).await?;
             tx.commit().await?;
             match rows.rows.first().and_then(|r| r.first()) {
                 Some(SqlValue::Text(s)) => s.clone(),
                 other => {
+                    remove_db_files(&shadow);
                     return Err(SqlError::other(format!(
                         "restored integrity_check returned an unexpected result: {other:?}"
                     )));
@@ -983,17 +1060,190 @@ impl LibsqlSqlBackends {
             }
         };
         if integrity != "ok" {
-            let _ = std::fs::remove_file(&dst);
+            remove_db_files(&shadow);
             return Err(SqlError::other(format!(
-                "restored integrity_check failed after copy: {integrity}"
+                "restored integrity_check failed on the shadow (live untouched): {integrity}"
             )));
         }
-        // Evict any cached backend keyed at this identity so a later open sees the file.
-        {
-            let mut cache = self.cache.lock().await;
-            cache.remove(&(site.to_string(), canon.to_string()));
+        // Verified — atomically swap the shadow in for live, then evict the cached handle.
+        self.finalize_shadow_swap(&shadow, &live, (site.to_string(), canon.to_string()))
+            .await
+    }
+
+    /// The common tail of every shadow restore: clear the shadow's transient sidecars and any
+    /// STALE live `-wal`/`-shm`/`-journal` (so the renamed-in file opens clean, never re-applying an
+    /// old live WAL), `std::fs::rename` the shadow main file over live (POSIX-atomic on one fs),
+    /// then evict the cached backend so a reopen sees the new inode.
+    async fn finalize_shadow_swap(
+        &self,
+        shadow_main: &Path,
+        live: &Path,
+        cache_key: (String, String),
+    ) -> Result<(), SqlError> {
+        for sfx in ["-wal", "-shm", "-journal"] {
+            remove_sidecar(shadow_main, sfx);
+            remove_sidecar(live, sfx);
         }
+        std::fs::rename(shadow_main, live).map_err(SqlError::other)?;
+        let mut cache = self.cache.lock().await;
+        cache.remove(&cache_key);
         Ok(())
+    }
+
+    /// **Stream a logical `.dump` of a local libsql database into `tx`** for project EXPORT — the
+    /// inc2 replacement for [`Self::snapshot_into`] on the chunked path (default #4: an in-process
+    /// `.dump` SQL-TEXT stream, NOT a VACUUM-INTO file). Emits, in order, the `CREATE TABLE`
+    /// statements, then per-table `INSERT`s (iterating rows one at a time — bounded memory, never
+    /// materializing a whole table), then the `CREATE INDEX`/`TRIGGER`/`VIEW`s. Each statement is a
+    /// `;`-terminated line pushed to the bounded `tx` so the caller chunks it O(chunk) with no
+    /// temp. Local single-node only (a remote sqld logical dump needs a server-side API — refused).
+    pub async fn dump_database(
+        &self,
+        site: &str,
+        name: &str,
+        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), SqlError> {
+        let Mode::Local { .. } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql logical dump is supported for local single-node databases only; a remote \
+                 sqld namespace dump is not yet supported",
+            ));
+        };
+        let src = self.open_one(site, name).await?;
+        src.dump_to(tx).await
+    }
+
+    /// **Begin an atomic shadow restore from a streamed `.dump`** (the inc2 no-Docker atomicity
+    /// path). Opens a FRESH `<live>.shadow_<ts>` libsql connection beside the live database; the
+    /// caller then [`feed`](DumpShadow::feed)s the `.dump` SQL bytes as they stream (applied
+    /// statement-by-statement against the shadow, so nothing touches live) and finishes with
+    /// [`commit_dump_shadow`](Self::commit_dump_shadow) (atomic rename-in) or by DROPPING the
+    /// handle (RAII tears the shadow down — abort, live untouched). Overwriting a non-empty live is
+    /// gated on `overwrite`. Local single-node only.
+    pub async fn begin_dump_shadow(
+        &self,
+        site: &str,
+        name: &str,
+        overwrite: bool,
+    ) -> Result<DumpShadow, SqlError> {
+        let Mode::Local { dir } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql shadow restore is supported for local single-node databases only",
+            ));
+        };
+        let canon = canonical_name(name);
+        let live = Self::resolve_local_path(dir, site, canon);
+        if let Ok(meta) = std::fs::metadata(&live)
+            && meta.len() > 0
+            && !overwrite
+        {
+            return Err(SqlError::other(format!(
+                "destination database already exists (refusing to overwrite): {}",
+                live.display()
+            )));
+        }
+        if let Some(parent) = live.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        let shadow = shadow_path_for(&live);
+        remove_db_files(&shadow);
+        // Open the shadow in DELETE journal mode (no persistent `-wal`/`-shm` sidecars to orphan
+        // across the rename), with FK + synchronous OFF for a fast bulk load (it is verified +
+        // renamed only on success).
+        let db = Builder::new_local(&shadow)
+            .build()
+            .await
+            .map_err(SqlError::other)?;
+        let conn = db.connect().map_err(SqlError::other)?;
+        run_pragma(&conn, "PRAGMA journal_mode=DELETE").await?;
+        run_pragma(&conn, "PRAGMA foreign_keys=OFF").await?;
+        run_pragma(&conn, "PRAGMA synchronous=OFF").await?;
+        Ok(DumpShadow {
+            live_path: live,
+            shadow_path: shadow,
+            conn: Some(conn),
+            _db: Some(db),
+            applier: SqlStatementApplier::default(),
+            cache_key: (site.to_string(), canon.to_string()),
+            armed: true,
+        })
+    }
+
+    /// COMMIT a [`DumpShadow`]: flush the trailing statement, `PRAGMA integrity_check` the shadow,
+    /// then atomically rename it over live + evict the cache. Call this ONLY after the trailing
+    /// trailer verified; on any failure the shadow is removed and live is never renamed-over.
+    pub async fn commit_dump_shadow(&self, mut shadow: DumpShadow) -> Result<(), SqlError> {
+        // Flush any buffered trailing statement + verify the shadow, on the DELETE-mode conn.
+        {
+            let conn = shadow
+                .conn
+                .as_ref()
+                .ok_or_else(|| SqlError::other("shadow connection already closed"))?;
+            shadow.applier.finish(conn).await?;
+            let mut rows = conn
+                .query("PRAGMA integrity_check", ())
+                .await
+                .map_err(SqlError::other)?;
+            let ok = match rows.next().await.map_err(SqlError::other)? {
+                Some(row) => match row.get_value(0).map_err(SqlError::other)? {
+                    LibsqlValue::Text(s) => s,
+                    other => {
+                        return Err(SqlError::other(format!(
+                            "shadow integrity_check returned an unexpected result: {other:?}"
+                        )));
+                    }
+                },
+                None => return Err(SqlError::other("shadow integrity_check returned no row")),
+            };
+            if ok != "ok" {
+                // Leave the RAII guard armed so the shadow is torn down when `shadow` drops.
+                return Err(SqlError::other(format!(
+                    "shadow integrity_check failed (live untouched): {ok}"
+                )));
+            }
+        }
+        // Close the shadow connection to release the file before the rename.
+        shadow.conn = None;
+        shadow._db = None;
+        // Atomic swap, then disarm the guard so Drop does NOT remove the now-live file.
+        let shadow_path = shadow.shadow_path.clone();
+        let live = shadow.live_path.clone();
+        let cache_key = shadow.cache_key.clone();
+        self.finalize_shadow_swap(&shadow_path, &live, cache_key)
+            .await?;
+        shadow.armed = false;
+        Ok(())
+    }
+
+    /// Sweep stale `*.shadow_*` libsql files left by a crash mid-shadow-restore (the RAII guard
+    /// only fires in-process). Recursively removes any `*.shadow_*` file (and its sidecars) under
+    /// the local data dir. A no-op for a remote backend. Call once at node startup.
+    pub fn sweep_stale_shadows(&self) -> std::io::Result<usize> {
+        let Mode::Local { dir } = &self.mode else {
+            return Ok(0);
+        };
+        let mut removed = 0usize;
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            let entries = match std::fs::read_dir(&d) {
+                Ok(e) => e,
+                Err(_) => continue, // a missing data dir is fine (nothing to sweep)
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if let Some(nm) = p.file_name().and_then(|n| n.to_str())
+                    && nm.contains(".shadow_")
+                    && std::fs::remove_file(&p).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// **Default-scope re-home** (v0.31.0 Finding 8): relocate a reserved-`default`-project site's
@@ -1212,6 +1462,173 @@ fn validate_site_ident(site: &str) -> Result<(), SqlError> {
         validate_db_name("site", segment)?;
     }
     Ok(())
+}
+
+/// An in-flight **atomic shadow restore** from a streamed libsql `.dump` (inc2). The caller
+/// [`feed`](Self::feed)s SQL bytes as they stream (applied statement-by-statement against a FRESH
+/// `<live>.shadow_<ts>` connection, so live is untouched), then either
+/// [`commit_dump_shadow`](LibsqlSqlBackends::commit_dump_shadow) renames the shadow over live, or
+/// the handle is DROPPED — the RAII guard then tears the shadow down (abort). Live is renamed-over
+/// ONLY on an explicit commit, so a corrupt/truncated/aborted stream applies NOTHING to live.
+pub struct DumpShadow {
+    live_path: PathBuf,
+    shadow_path: PathBuf,
+    /// The shadow connection (DELETE journal mode). `None` once closed (before the rename).
+    conn: Option<Connection>,
+    /// Keeps the shadow `Database` alive alongside `conn`.
+    _db: Option<Database>,
+    /// The incremental SQL-statement splitter/executor for the streamed `.dump`.
+    applier: SqlStatementApplier,
+    /// The (site, canonical-name) cache key to evict on a successful commit.
+    cache_key: (String, String),
+    /// While `true`, [`Drop`] removes the shadow (abort); set `false` by a successful commit so
+    /// the now-live file is kept.
+    armed: bool,
+}
+
+impl DumpShadow {
+    /// Feed the next slice of the streamed `.dump` into the shadow. Buffers across calls and
+    /// executes each complete `;`-terminated statement against the shadow connection as it is
+    /// seen — bounded by the largest single statement, never the whole member.
+    pub async fn feed(&mut self, bytes: &[u8]) -> Result<(), SqlError> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| SqlError::other("shadow connection already closed"))?;
+        self.applier.feed(conn, bytes).await
+    }
+}
+
+impl Drop for DumpShadow {
+    fn drop(&mut self) {
+        if self.armed {
+            // Close the connection first (release the file), then remove the shadow + its sidecars.
+            self.conn = None;
+            self._db = None;
+            remove_db_files(&self.shadow_path);
+        }
+    }
+}
+
+/// An incremental SQL-statement splitter + executor for a streamed libsql `.dump`. Scans the byte
+/// stream for a `;` that terminates a statement — tracking single-/double-quote string state at the
+/// BYTE level (every quote/`;` delimiter is ASCII, and a UTF-8 continuation byte is always ≥ 0x80,
+/// so arbitrary UTF-8 inside a quoted literal never confuses the scan) — and `execute_batch`es each
+/// complete statement against the shadow connection. `''`/`""` escapes net-toggle correctly, so the
+/// quote state at every `;` is accurate.
+#[derive(Default)]
+struct SqlStatementApplier {
+    /// Bytes of the current (incomplete) statement, accumulated across `feed` calls.
+    buf: Vec<u8>,
+    /// Inside a single-quoted string literal.
+    in_single: bool,
+    /// Inside a double-quoted identifier.
+    in_double: bool,
+}
+
+impl SqlStatementApplier {
+    async fn feed(&mut self, conn: &Connection, bytes: &[u8]) -> Result<(), SqlError> {
+        for &b in bytes {
+            self.buf.push(b);
+            match b {
+                b'\'' if !self.in_double => self.in_single = !self.in_single,
+                b'"' if !self.in_single => self.in_double = !self.in_double,
+                b';' if !self.in_single && !self.in_double => {
+                    self.exec_pending(conn).await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute (and clear) the accumulated statement. A blank/whitespace-only buffer is a no-op.
+    async fn exec_pending(&mut self, conn: &Connection) -> Result<(), SqlError> {
+        let stmt = std::mem::take(&mut self.buf);
+        let text = std::str::from_utf8(&stmt)
+            .map_err(|e| SqlError::other(format!("libsql .dump is not valid UTF-8: {e}")))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        conn.execute_batch(trimmed)
+            .await
+            .map(|_| ())
+            .map_err(SqlError::other)
+    }
+
+    /// Flush any trailing (non-`;`-terminated) statement at end of stream.
+    async fn finish(&mut self, conn: &Connection) -> Result<(), SqlError> {
+        self.exec_pending(conn).await
+    }
+}
+
+/// A `<live>.shadow_<nanos>_<pid>` path in the SAME directory as `live`, so a later `std::fs::rename`
+/// is a same-filesystem atomic swap. Matches the `*.shadow_*` pattern [`LibsqlSqlBackends::sweep_stale_shadows`] sweeps.
+fn shadow_path_for(live: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut s = live.as_os_str().to_os_string();
+    s.push(format!(".shadow_{nanos}_{}", std::process::id()));
+    PathBuf::from(s)
+}
+
+/// Remove one `<path><suffix>` sidecar (best-effort).
+fn remove_sidecar(path: &Path, suffix: &str) {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    let _ = std::fs::remove_file(PathBuf::from(s));
+}
+
+/// Remove a libsql database file and its `-wal`/`-shm`/`-journal` sidecars (best-effort).
+fn remove_db_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for sfx in ["-wal", "-shm", "-journal"] {
+        remove_sidecar(path, sfx);
+    }
+}
+
+/// The text of a libsql value that is known to be a name/DDL string (`sqlite_master` columns).
+fn value_to_text(v: LibsqlValue) -> String {
+    match v {
+        LibsqlValue::Text(s) => s,
+        LibsqlValue::Null => String::new(),
+        LibsqlValue::Integer(i) => i.to_string(),
+        LibsqlValue::Real(f) => format!("{f:?}"),
+        LibsqlValue::Blob(b) => String::from_utf8_lossy(&b).into_owned(),
+    }
+}
+
+/// Append a `.dump`-quoted SQL literal for `v` to `out`: `NULL`, an integer/real literal, a
+/// single-quoted string (`'` doubled), or a `X'<hex>'` blob literal.
+fn push_sql_value(out: &mut String, v: &LibsqlValue) {
+    match v {
+        LibsqlValue::Null => out.push_str("NULL"),
+        LibsqlValue::Integer(i) => out.push_str(&i.to_string()),
+        LibsqlValue::Real(f) => {
+            if f.is_finite() {
+                out.push_str(&format!("{f:?}"));
+            } else {
+                out.push_str("NULL"); // SQLite has no literal for NaN/±Inf
+            }
+        }
+        LibsqlValue::Text(s) => {
+            out.push('\'');
+            out.push_str(&s.replace('\'', "''"));
+            out.push('\'');
+        }
+        LibsqlValue::Blob(b) => {
+            out.push_str("X'");
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for &byte in b {
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            out.push('\'');
+        }
+    }
 }
 
 /// Fold a libsql binding `name` to its **canonical** spelling so the reserved
@@ -2217,9 +2634,9 @@ mod tests {
 
         // A target site with no data yet does not exist.
         assert!(!backends.local_database_exists("tgt", ""));
-        // Place the snapshot into the fresh target.
+        // Place the snapshot into the fresh target (no overwrite needed for a fresh target).
         backends
-            .restore_snapshot("tgt", "", &snap)
+            .restore_snapshot("tgt", "", &snap, false)
             .await
             .expect("restore into fresh target");
         assert!(backends.local_database_exists("tgt", ""));
@@ -2232,12 +2649,19 @@ mod tests {
             vec![SqlValue::Text("restored".into())]
         );
 
-        // No-clobber: a second restore into the now-non-empty target is refused.
+        // No-clobber: a second restore into the now-non-empty target is refused WITHOUT overwrite.
         let err = backends
-            .restore_snapshot("tgt", "", &snap)
+            .restore_snapshot("tgt", "", &snap, false)
             .await
             .expect_err("must refuse to overwrite a non-empty destination");
         assert!(matches!(&err, SqlError::Other(m) if m.contains("already exists")));
+
+        // ...and WITH overwrite=true it succeeds via the atomic shadow+rename (live replaced).
+        backends
+            .restore_snapshot("tgt", "", &snap, true)
+            .await
+            .expect("overwrite=true replaces the live db via shadow+rename");
+        assert!(backends.local_database_exists("tgt", ""));
     }
 
     /// Re-home refuses to clobber a non-empty destination (fail-closed; source intact).
@@ -2302,5 +2726,210 @@ mod tests {
                     && m.contains("operator step")),
             "got {err:?}"
         );
+    }
+
+    // ---- inc2: `.dump` generator + atomic shadow restore ----------------------------------
+
+    /// Count `*.shadow_*` files anywhere under `dir` (the atomicity-residue probe).
+    fn shadow_files(dir: &Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(".shadow_"))
+                    {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// The `.dump` generator streams a logical dump that the atomic shadow restore applies
+    /// statement-by-statement, rename-swaps into live, and leaves NO shadow residue — round-tripping
+    /// text (with an embedded quote + `;`), integer and blob values byte-for-byte.
+    #[tokio::test]
+    async fn dump_and_shadow_restore_round_trips_and_is_atomic() {
+        let src_dir = factory_dir("dump-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = Arc::new(LibsqlSqlBackends::local(src_dir.clone()));
+        // Seed the source default db (`{dir}/blog.db`) with awkward values: a quote + a `;`
+        // inside a text literal, and a blob — the splitter + value-quoting must survive these.
+        {
+            let db: Arc<dyn SqlBackend> = Arc::new(
+                LibsqlSql::open_local(&src_dir.join("blog.db"))
+                    .await
+                    .unwrap(),
+            );
+            put(
+                &db,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, b BLOB)",
+            )
+            .await;
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "INSERT INTO t VALUES (?1,?2,?3),(?4,?5,?6)",
+                &[
+                    SqlValue::Integer(1),
+                    SqlValue::Text("o'brien; DROP".into()),
+                    SqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                    SqlValue::Integer(2),
+                    SqlValue::Text("plain".into()),
+                    SqlValue::Null,
+                ],
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Stream the `.dump` and apply it into a FRESH target via the atomic shadow.
+        let tgt_dir = factory_dir("dump-tgt");
+        std::fs::create_dir_all(&tgt_dir).unwrap();
+        let tgt = LibsqlSqlBackends::local(tgt_dir.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let src2 = src.clone();
+        let dump = tokio::spawn(async move {
+            let r = src2.dump_database("blog", "", &tx).await;
+            drop(tx);
+            r
+        });
+        let mut shadow = tgt.begin_dump_shadow("blog", "", false).await.unwrap();
+        while let Some(chunk) = rx.recv().await {
+            shadow.feed(&chunk).await.unwrap();
+        }
+        tgt.commit_dump_shadow(shadow).await.unwrap();
+        dump.await.unwrap().expect("dump_database");
+
+        // Live has the data; NO shadow residue remains (atomic commit cleaned up).
+        let got: Arc<dyn SqlBackend> = Arc::new(
+            LibsqlSql::open_local(&tgt_dir.join("blog.db"))
+                .await
+                .unwrap(),
+        );
+        let rows = {
+            let mut t = got.begin().await.unwrap();
+            let r = t
+                .query("SELECT id, v, b FROM t ORDER BY id", &[])
+                .await
+                .unwrap();
+            t.commit().await.unwrap();
+            r.rows
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], SqlValue::Text("o'brien; DROP".into()));
+        assert_eq!(rows[0][2], SqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(rows[1][1], SqlValue::Text("plain".into()));
+        assert_eq!(rows[1][2], SqlValue::Null);
+        assert_eq!(
+            shadow_files(&tgt_dir),
+            0,
+            "no *.shadow_* residue after commit"
+        );
+
+        // MUTATION (RED): a value-quoting bug (e.g. not doubling the `'`) breaks the apply → the
+        // row count / value assertions fail; a splitter that cut on the in-literal `;` would too.
+    }
+
+    /// Dropping an in-flight [`DumpShadow`] WITHOUT committing tears the shadow down (RAII) and
+    /// leaves the live database byte-untouched — the atomicity guarantee: an aborted restore
+    /// applies NOTHING to live, and no `*.shadow_*` residue is left behind.
+    #[tokio::test]
+    async fn shadow_restore_drop_aborts_leaving_live_untouched() {
+        let dir = factory_dir("shadow-abort");
+        std::fs::create_dir_all(&dir).unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        // Pre-populate the LIVE target with a sentinel row.
+        {
+            let live: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+            put(&live, "CREATE TABLE sentinel(v TEXT)").await;
+            put(&live, "INSERT INTO sentinel VALUES ('SURVIVOR')").await;
+        }
+
+        // Begin a shadow restore (overwrite=true since live is non-empty), feed a partial dump,
+        // then DROP without committing.
+        {
+            let mut shadow = backends.begin_dump_shadow("blog", "", true).await.unwrap();
+            assert_eq!(
+                shadow_files(&dir),
+                1,
+                "a shadow file exists while in flight"
+            );
+            shadow
+                .feed(
+                    b"CREATE TABLE t(v TEXT);\nINSERT INTO t VALUES ('from the aborted import');\n",
+                )
+                .await
+                .unwrap();
+            // No commit — `shadow` drops here.
+        }
+
+        // The shadow is gone, and live still has ONLY the sentinel (never renamed-over).
+        assert_eq!(shadow_files(&dir), 0, "RAII drop removed the shadow");
+        let live: Arc<dyn SqlBackend> =
+            Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+        assert_eq!(
+            one(&live, "SELECT v FROM sentinel").await,
+            vec![SqlValue::Text("SURVIVOR".into())],
+            "the aborted restore left live untouched"
+        );
+        // The aborted import's table never reached live.
+        let mut t = live.begin().await.unwrap();
+        assert!(
+            t.query("SELECT v FROM t", &[]).await.is_err(),
+            "the aborted import's table must NOT exist on live"
+        );
+        t.rollback().await.unwrap();
+    }
+
+    /// `begin_dump_shadow` refuses to overwrite a non-empty live without `overwrite`, and allows it
+    /// with — the overwrite gate replacing the v1 no-clobber.
+    #[tokio::test]
+    async fn shadow_restore_overwrite_gate() {
+        let dir = factory_dir("shadow-gate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        {
+            let live: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+            put(&live, "CREATE TABLE t(v TEXT)").await;
+        }
+        match backends.begin_dump_shadow("blog", "", false).await {
+            Err(SqlError::Other(m)) => {
+                assert!(m.contains("already exists"), "unexpected refusal: {m}");
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+            Ok(_) => panic!("non-empty live must be refused without overwrite"),
+        }
+        // A refused begin created no shadow.
+        assert_eq!(shadow_files(&dir), 0);
+        // With overwrite, begin succeeds (shadow created); drop aborts it cleanly.
+        let shadow = backends.begin_dump_shadow("blog", "", true).await.unwrap();
+        drop(shadow);
+        assert_eq!(shadow_files(&dir), 0);
+    }
+
+    /// The startup sweep removes a stale `*.shadow_*` left by a crash mid-restore.
+    #[tokio::test]
+    async fn sweep_removes_stale_shadow_files() {
+        let dir = factory_dir("shadow-sweep");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("blog.db.shadow_123_456"), b"stale").unwrap();
+        std::fs::write(dir.join("sub").join("app.db.shadow_789_0"), b"stale").unwrap();
+        std::fs::write(dir.join("keep.db"), b"real").unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        let removed = backends.sweep_stale_shadows().unwrap();
+        assert_eq!(removed, 2, "both stale shadows swept (recursively)");
+        assert_eq!(shadow_files(&dir), 0);
+        assert!(dir.join("keep.db").exists(), "a real db is never swept");
     }
 }
