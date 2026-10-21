@@ -159,6 +159,55 @@ impl ApiClient {
             .map_err(|err| ApiError::Transport(err.to_string()))
     }
 
+    /// `GET path`, returning the raw text body AND the response's `ETag` header (quotes
+    /// trimmed), unlike [`get_text`](Self::get_text), which drops it. Backs the overlay
+    /// flow-policy editor's optimistic-concurrency round trip: this `ETag` is the version a
+    /// subsequent [`put_text_if_match`](Self::put_text_if_match) echoes back as `If-Match`, the
+    /// same CAS convention the RBAC policy editor would use.
+    pub async fn get_text_with_etag(&self, path: &str) -> ApiResult<(String, Option<String>)> {
+        let req = self.authed(RequestBuilder::new(&self.url(path)));
+        let resp = send(req).await?;
+        let etag = resp
+            .headers()
+            .get("etag")
+            .map(|v| v.trim_matches('"').to_string());
+        let body = resp
+            .text()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        Ok((body, etag))
+    }
+
+    /// `PUT path` with a raw TEXT `body` (not JSON — e.g. Cedar policy source) and an optional
+    /// `If-Match` header, deserializing a 2xx JSON response into `T`. Like
+    /// [`post_json_detailed`](Self::post_json_detailed) (and unlike [`put_json`](Self::put_json)/
+    /// [`check`]), a non-2xx (other than 401/403) reads the response BODY as text into
+    /// [`ApiError::Status`] — so the overlay flow-policy PUT's verbatim `400` Cedar compile error
+    /// (or a `409` naming the conflicting version) survives for the editor to render inline,
+    /// rather than collapsing to a bare status reason phrase.
+    pub async fn put_text_if_match<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &str,
+        if_match: Option<&str>,
+    ) -> ApiResult<T> {
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::PUT))
+            .header("content-type", "text/plain");
+        let req = match if_match {
+            Some(m) => req.header("if-match", m),
+            None => req,
+        };
+        let req = req
+            .body(body.to_string())
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        decode_json_or_err_body(resp).await
+    }
+
     /// `PUT path` with a JSON `body`, expecting a 2xx with no body (204).
     pub async fn put_json<B: Serialize>(&self, path: &str, body: &B) -> ApiResult<()> {
         let req = self

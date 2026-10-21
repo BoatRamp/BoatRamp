@@ -20,6 +20,7 @@ mod node_ops;
 mod observability;
 mod oidc;
 mod overlay;
+mod overlay_policy;
 mod project;
 mod project_transfer;
 mod store_migration;
@@ -28,6 +29,13 @@ mod verify;
 mod widgets;
 
 pub use api::{ApiClient, ApiError, ApiResult};
+/// Re-exported for the console's own integration tests (`tests/overlay_policy.rs`): the pure
+/// decision/shaping helpers + wire mirrors the overlay flow-policy editor's states are built from,
+/// kept out of the module's otherwise-private surface. Mirrors the `api` re-export above.
+pub use overlay_policy::{
+    FlowPolicyTestResponse, POLICY_PATH, TEST_PATH, TestRequest, explain_diagnostics,
+    needs_cliff_confirm,
+};
 
 use auth::{AuthProvider, LoginView, use_session};
 use config_editor::ConfigEditor;
@@ -39,6 +47,7 @@ use models::{FunctionSummary, WhoAmI};
 use monitoring::{Monitoring, NodeVersionBadge};
 use observability::{FunctionLogs, SiteObservability};
 use overlay::OverlayDirectory;
+use overlay_policy::OverlayPolicy;
 use project::ProjectSelector;
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
@@ -143,7 +152,7 @@ fn switch(route: Route) -> Html {
         Route::Functions => html! { <FunctionsPage /> },
         Route::Function { name } => html! { <FunctionPage name={name} /> },
         Route::Monitoring => html! { <Monitoring /> },
-        Route::Overlay => html! { <OverlayDirectory /> },
+        Route::Overlay => html! { <OverlayPage /> },
         Route::Maintenance => html! { <Maintenance /> },
         Route::Tokens => html! { <Tokens /> },
         Route::NotFound => html! { <Redirect<Route> to={Route::Sites} /> },
@@ -399,6 +408,56 @@ fn identity() -> Html {
         <span class="hidden text-xs text-slate-500 sm:inline" title="your roles">
             { roles }
         </span>
+    }
+}
+
+/// Which overlay tab is active (node-global, not project-scoped — see [`is_node_route`]).
+#[derive(Clone, Copy, PartialEq)]
+enum OverlayTab {
+    /// The read-only forward-flow service directory (`OverlayDirectory`).
+    Directory,
+    /// The `System·Admin`-gated flow-policy editor + explain view (`OverlayPolicy`, Stage B).
+    Policy,
+}
+
+/// The Overlay page: a title plus tabs for the directory and the flow-policy editor. Mirrors
+/// [`SiteDetail`]'s tab pattern.
+#[function_component(OverlayPage)]
+fn overlay_page() -> Html {
+    let tab = use_state(|| OverlayTab::Directory);
+
+    let tab_class = |active: bool| {
+        if active {
+            "border-b-2 border-sky-600 px-1 py-2 text-sm font-medium text-slate-900"
+        } else {
+            "border-b-2 border-transparent px-1 py-2 text-sm font-medium text-slate-500 \
+             hover:text-slate-800"
+        }
+    };
+    let select = |target: OverlayTab, tab: UseStateHandle<OverlayTab>| {
+        Callback::from(move |_: MouseEvent| tab.set(target))
+    };
+
+    html! {
+        <div>
+            <h2 class="mb-4 text-lg font-semibold text-slate-900">{ "Overlay" }</h2>
+            <div class="mb-6 flex gap-6 border-b border-slate-200">
+                <button onclick={select(OverlayTab::Directory, tab.clone())}
+                        class={tab_class(matches!(*tab, OverlayTab::Directory))}>
+                    { "Directory" }
+                </button>
+                <button onclick={select(OverlayTab::Policy, tab.clone())}
+                        class={tab_class(matches!(*tab, OverlayTab::Policy))}>
+                    { "Flow policy" }
+                </button>
+            </div>
+            {
+                match *tab {
+                    OverlayTab::Directory => html! { <OverlayDirectory /> },
+                    OverlayTab::Policy => html! { <OverlayPolicy /> },
+                }
+            }
+        </div>
     }
 }
 

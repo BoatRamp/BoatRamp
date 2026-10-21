@@ -90,6 +90,10 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# Test-only: construct a `web_sys::Response` from a mocked `fetch` override (the overlay
+# flow-policy editor's integration tests — no live server, no browser automation). Additive to
+# the main `web-sys` features above (cargo unions feature sets across normal + dev deps).
+web-sys = { version = "0.3", features = ["ResponseInit"] }
 
 [profile.release]
 # Smaller Wasm: optimize for size, fat LTO, no unwinding.
