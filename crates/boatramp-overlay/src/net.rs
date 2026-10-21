@@ -14,16 +14,17 @@
 //! for a native OS client library can wrap [`forward_flow`]; the `boatramp forward` CLI (IU-10)
 //! calls [`forward_flow`] directly with the accepted connection.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use boatramp_core::cose::TokenPublicKey;
+use boatramp_core::cose::{TokenPublicKey, verify_overlay_publish};
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
 use boatramp_overlay_proto::dial::{
-    DialRequest, DialVerdict, authorize_dial, authorize_dial_capability_only,
+    DialReject, DialRequest, DialVerdict, authorize_dial, authorize_dial_capability_only,
 };
 use boatramp_overlay_proto::e2ee::{Opener, Role, Sealer};
 use boatramp_overlay_proto::ice::Signal;
@@ -95,6 +96,8 @@ pub enum NetError {
     Identity(#[from] boatramp_overlay_proto::OverlayIdError),
     #[error("service `{0}` does not resolve to an egress")]
     UnresolvedService(String),
+    #[error("service registration refused by the relay: {0:?}")]
+    RegistrationRejected(RegisterReject),
 }
 
 /// Current unix time (seconds).
@@ -397,6 +400,30 @@ pub enum RelayClientAuth {
     CapabilityOnly,
 }
 
+/// Capability-gate a dial request at the relay under its client-auth posture. Mutual-pin binds the
+/// dialing peer's TLS-proven identity (a strictly-more-restrictive pre-filter); capability-only gates
+/// on the capability alone (signature/expiry/kind/scope/encryption) and defers holder-binding to the
+/// terminator's E2EE-proven re-authz. In BOTH cases a dial with no valid, in-scope, unexpired
+/// capability is refused here. Shared by the egress-forwarding ([`forward_relay`]) and
+/// exposer-forwarding ([`forward_resolved`]) paths so the gate can never drift between them.
+fn gate_dial(
+    request: &DialRequest,
+    client: &Connection,
+    trust_root: &TokenPublicKey,
+    client_auth: RelayClientAuth,
+    enc_required: bool,
+) -> Result<DialVerdict, NetError> {
+    Ok(match client_auth {
+        RelayClientAuth::MutualPin => {
+            let client_id = peer_identity(client)?;
+            authorize_dial(request, &client_id, trust_root, now_unix(), enc_required)
+        }
+        RelayClientAuth::CapabilityOnly => {
+            authorize_dial_capability_only(request, trust_root, now_unix(), enc_required)
+        }
+    })
+}
+
 /// Relay/ingress: accept one client connection, capability-gate the dial, and forward the sealed
 /// stream to the egress **blind**. `resolve` maps a requested service to its egress
 /// `(addr, identity, encryption_required)`; `trust_root` verifies the dial capability. `client_auth`
@@ -438,18 +465,11 @@ where
         return Err(NetError::UnresolvedService(request.service));
     };
 
-    // Capability gate. Mutual-pin additionally binds the proven TLS client id (a stronger pre-filter);
-    // capability-only has no client cert, so it defers holder-binding to the egress but STILL refuses
-    // a dial with no valid, in-scope, unexpired capability (CONDITION 1 — not a blind forwarder).
-    let verdict = match client_auth {
-        RelayClientAuth::MutualPin => {
-            let client_id = peer_identity(&client)?;
-            authorize_dial(&request, &client_id, trust_root, now_unix(), enc_required)
-        }
-        RelayClientAuth::CapabilityOnly => {
-            authorize_dial_capability_only(&request, trust_root, now_unix(), enc_required)
-        }
-    };
+    // Capability gate (shared with the reverse-ingress forwarding path via `gate_dial`). Mutual-pin
+    // additionally binds the proven TLS client id (a stronger pre-filter); capability-only has no
+    // client cert, so it defers holder-binding to the egress but STILL refuses a dial with no valid,
+    // in-scope, unexpired capability (CONDITION 1 — not a blind forwarder).
+    let verdict = gate_dial(&request, &client, trust_root, client_auth, enc_required)?;
     write_msg(&mut client_send, &verdict).await?;
     if !matches!(verdict, DialVerdict::Accept { .. }) {
         // Hold the connection so the Reject verdict delivers before it drops (bounded).
@@ -524,24 +544,72 @@ pub async fn terminate_one<F>(
 where
     F: Fn(&str) -> Option<SocketAddr>,
 {
-    // Bound the whole pre-authorization phase (bi-stream accept + E2EE handshake + the sealed
-    // dial-capability exchange) with a deadline (MEDIUM-B): the egress is reachable unauthenticated
-    // at the TLS layer, so a connection that stalls here must not park a task holding derived session
+    // Bound the bi-stream accept with a deadline (MEDIUM-B): the egress is reachable unauthenticated at
+    // the TLS layer, so a connection that completes TLS but never opens a stream must not park a task.
+    let (send, recv) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| NetError::Stream("terminator accept-bi timed out".into()))?
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    // Toward: the relay we were reached through — the routing hint for our host candidate (promotion).
+    let toward = conn.remote_address();
+    let result = terminate_stream(
+        send,
+        recv,
+        secret,
+        resolve_backend,
+        trust_root,
+        encryption_required,
+        path_mode,
+        toward,
+    )
+    .await;
+    // Hold the (relay) connection open until it has drained the final records and closes (bounded), so
+    // a relay-path flow's last bytes are delivered before this connection drops.
+    let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+    result
+}
+
+/// Terminate ONE accepted overlay flow (its bi-stream already accepted) over a backend: complete the
+/// E2EE handshake on the stream (learning the client identity), **independently authorize** the dial
+/// capability the client presents end-to-end (zero-trust, HIGH-1), anchor it to a served service
+/// (HIGH-A), and splice the session to the backend. The post-`accept_bi` body shared by the
+/// egress/terminator ([`terminate_one`], over a dialed-in connection) and the reverse-ingress exposer
+/// ([`run_published_service`], over a per-flow stream accepted on its parked outbound relay
+/// connection) — so the two share ONE authorization + splice path and can never drift.
+///
+/// Zero-trust (HIGH-1): the terminator never trusts the relay's gate as its authorization boundary.
+/// It reads the overlay-dial capability the client seals into the E2EE channel and verifies it HERE,
+/// against `trust_root` and the cryptographically proven (E2EE-learned) `client_id`, before connecting
+/// the backend. For the reverse-ingress exposer this is especially load-bearing: a compromised relay
+/// that bridges a stream to the exposer still cannot reach the local backend without a client dial
+/// capability the exposer itself verifies.
+#[allow(clippy::too_many_arguments)]
+async fn terminate_stream<F>(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    secret: &OverlaySecret,
+    resolve_backend: F,
+    trust_root: &TokenPublicKey,
+    encryption_required: bool,
+    path_mode: PathMode,
+    toward: SocketAddr,
+) -> Result<(), NetError>
+where
+    F: Fn(&str) -> Option<SocketAddr>,
+{
+    // Bound the pre-authorization phase (E2EE handshake + the sealed dial-capability exchange) with a
+    // deadline (MEDIUM-B): a connection that stalls here must not park a task holding derived session
     // keys indefinitely. The data phase, once authorized, runs with no deadline.
-    let (send, recv, sealer, opener, client_id, request) = timeout(HANDSHAKE_TIMEOUT, async {
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))?;
-        // The E2EE handshake learns the client identity (the responder does not pin it in advance);
-        // it is the identity the dial capability must be holder-bound to, and that direct-path
-        // promotion pins its link to.
+    let (send, recv, sealer, opener, client_id, request) = timeout(HANDSHAKE_TIMEOUT, async move {
+        // The E2EE handshake learns the client identity (the responder does not pin it in
+        // advance); it is the identity the dial capability must be holder-bound to, and that
+        // direct-path promotion pins its link to.
         let (session, client_id) =
             establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
         let (sealer, mut opener) = session.split();
         // Zero-trust: open the sealed dial capability the client presents end-to-end (the first
-        // record after the handshake); it is verified below against the trust root + the E2EE-proven
-        // client identity — not on the relay's say-so — before touching the backend.
+        // record after the handshake); it is verified below against the trust root + the
+        // E2EE-proven client identity — not on the relay's say-so — before touching the backend.
         let sealed = read_lp(&mut recv, MAX_DIAL_MSG).await?.ok_or_else(|| {
             NetError::Stream("client closed before presenting the dial capability".into())
         })?;
@@ -554,15 +622,12 @@ where
     .await
     .map_err(|_| NetError::Stream("handshake/dial-capability timed out".into()))??;
 
-    // HIGH-A: anchor authorization to the services THIS egress actually fronts. Resolve the requested
-    // service to a backend from the egress's own map; an unmapped service is refused here, so
-    // `authorize_dial`'s `scope == request.service` check binds the capability scope to a service the
-    // egress serves — never a string the client simply typed.
+    // HIGH-A: anchor authorization to the services THIS terminator actually fronts. Resolve the
+    // requested service to a backend from its own map; an unmapped service is refused here, so
+    // `authorize_dial`'s `scope == request.service` check binds the capability scope to a service this
+    // terminator serves — never a string the client simply typed.
     let Some(backend_addr) = resolve_backend(&request.service) else {
-        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
-        return Err(NetError::DialRejected(
-            boatramp_overlay_proto::dial::DialReject::ServiceNotAuthorized,
-        ));
+        return Err(NetError::DialRejected(DialReject::ServiceNotAuthorized));
     };
     match authorize_dial(
         &request,
@@ -572,17 +637,12 @@ where
         encryption_required,
     ) {
         DialVerdict::Accept { .. } => {}
-        DialVerdict::Reject(reason) => {
-            let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
-            return Err(NetError::DialRejected(reason));
-        }
+        DialVerdict::Reject(reason) => return Err(NetError::DialRejected(reason)),
     }
 
     let backend = tokio::net::TcpStream::connect(backend_addr).await?;
     let (br, bw) = backend.into_split();
     let owned = OverlaySecret::from_seed_hex(&secret.seed_hex())?;
-    // Toward: the relay we were reached through — the routing hint for our host candidate.
-    let toward = conn.remote_address();
     run_spliced_circuit_promotable(
         sealer,
         opener,
@@ -596,11 +656,7 @@ where
         path_mode,
         toward,
     )
-    .await?;
-    // Hold the (relay) connection open until it has drained the final records and closes (bounded),
-    // so a relay-path flow's last bytes are delivered before this connection drops.
-    let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
-    Ok(())
+    .await
 }
 
 /// Relay/ingress **serve loop** (IU-8): accept client connections on `endpoint` and, per connection,
@@ -689,6 +745,526 @@ pub async fn run_egress_router<F>(
             }
         });
     }
+}
+
+// ======================================================================================
+// Reverse ingress (`boatramp expose`): publish a LOCAL service INTO the cluster overlay.
+//
+// The structural inversion of forward: today the relay DIALS a dialable egress. For expose, the
+// exposer is behind NAT and undialable, so it DIALS the relay OUTBOUND and holds the connection open;
+// the relay parks it in a registry keyed by service; on each inbound `forward svc/<name>` the relay
+// opens a per-flow bi-stream DOWN the parked connection and bridges it to the client flow, blind.
+// E2EE stays end-to-end forward-client↔exposer (client = Initiator, exposer = Responder via
+// `terminate_stream`); reverse flows pin `PathMode::Relay` (a NAT'd exposer is undialable — no
+// promotion). The relay proves the exposer's holder-binding AT REGISTRATION (there is no downstream
+// party to defer to) via the E2EE handshake, working even under capability-only (AcceptAny) TLS.
+// ======================================================================================
+
+/// The discriminator value marking a [`RegisterRequest`] frame, so the relay can tell a registration
+/// from a bare [`DialRequest`] on the first control frame without changing the forward-client wire.
+const REGISTER_TAG: &str = "overlay-register";
+
+/// What an exposer sends as the FIRST control frame on its registration bi-stream (before the E2EE
+/// possession handshake). Distinguished from a forward client's bare [`DialRequest`] by the required
+/// `register` discriminator (a `DialRequest` has no such field, nor a `publish_cap`).
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct RegisterRequest {
+    /// Always [`REGISTER_TAG`].
+    register: String,
+    /// The EXACT service name to publish (must equal the publish capability's scope).
+    service: String,
+    /// The holder-bound overlay-publish capability (COSE), minted offline by the cluster root.
+    publish_cap: String,
+}
+
+/// Why a service registration was refused (returned to the exposer; mirrors [`DialReject`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum RegisterReject {
+    /// The publish capability did not verify (bad signature, expired, wrong kind).
+    InvalidCapability(String),
+    /// The capability's scope does not name the service being registered.
+    ScopeMismatch,
+    /// The capability's holder is not the registering exposer's E2EE-proven identity (a stolen
+    /// capability), or the holder key is not an overlay (Ed25519) identity.
+    HolderMismatch,
+    /// A live exposer already publishes this name (first-live-claim-wins; never a silent takeover).
+    NameTaken,
+}
+
+/// The relay's verdict on a registration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+enum RegisterResult {
+    Ok,
+    Rejected(RegisterReject),
+}
+
+/// The first control frame on a relay bi-stream.
+enum IngressFrame {
+    /// An exposer registering a service (reverse ingress).
+    Register(RegisterRequest),
+    /// A forward client dialing a service.
+    Dial(DialRequest),
+}
+
+/// Read and classify the first control frame: a registration (exposer) vs a dial (forward client).
+/// The bare-`DialRequest` wire the existing client-edge sends is unchanged — a `Register` frame is
+/// distinguished by its required `register` discriminator (tried first; it never matches a dial, and a
+/// dial never matches it).
+async fn read_ingress_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<IngressFrame, NetError> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let n = u32::from_be_bytes(len) as usize;
+    if n > MAX_DIAL_MSG {
+        return Err(NetError::TooLarge(n));
+    }
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).await?;
+    if let Ok(reg) = serde_json::from_slice::<RegisterRequest>(&buf)
+        && reg.register == REGISTER_TAG
+    {
+        return Ok(IngressFrame::Register(reg));
+    }
+    Ok(IngressFrame::Dial(serde_json::from_slice(&buf)?))
+}
+
+/// One parked exposer registration.
+struct ExposerEntry {
+    /// The parked connection to the exposer (it dialed OUT; its register task holds it open). An
+    /// `open_bi` on a clone surfaces a new accepted stream at the exposer's serve loop.
+    conn: Connection,
+    /// The exposer's E2EE-proven overlay identity (equals the publish capability's `cnf`). Diagnostic.
+    #[allow(dead_code)]
+    exposer_id: OverlayId,
+    /// The publish capability's expiry (Unix seconds): a registration never outlives its capability,
+    /// even before the connection itself drops.
+    expires_at: u64,
+}
+
+/// A relay-side registry of live reverse-ingress exposers: one parked, holder-verified QUIC connection
+/// per published service name. The forwarding router resolves a `svc/<name>` a client dials to a
+/// registered exposer connection and opens a per-flow bi-stream DOWN it — it NEVER dials a client-named
+/// address, so the not-an-open-proxy property holds exactly as for the static-egress path. In-memory
+/// and single-node for increment 1 (KV-backed multi-replica registration + heartbeat/TTL reaping are
+/// later increments). Cheap to clone (an `Arc` handle).
+#[derive(Clone, Default)]
+pub struct ExposerRegistry {
+    inner: Arc<Mutex<BTreeMap<String, ExposerEntry>>>,
+}
+
+impl ExposerRegistry {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `entry` is still serving at `now`: its connection is open AND its capability unexpired.
+    fn entry_live(entry: &ExposerEntry, now: u64) -> bool {
+        entry.conn.close_reason().is_none() && now < entry.expires_at
+    }
+
+    /// Resolve a service name to a LIVE exposer connection, pruning a dead/expired entry. `None` if no
+    /// exposer is currently publishing it.
+    pub async fn resolve(&self, service: &str, now: u64) -> Option<Connection> {
+        let mut map = self.inner.lock().await;
+        match map.get(service) {
+            Some(e) if Self::entry_live(e, now) => Some(e.conn.clone()),
+            Some(_) => {
+                map.remove(service); // prune the dead/expired entry
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Whether a live exposer currently publishes `service` (test/diagnostic helper).
+    pub async fn is_registered(&self, service: &str, now: u64) -> bool {
+        self.resolve(service, now).await.is_some()
+    }
+
+    /// Try to claim `service` for `entry` (FIRST-LIVE-CLAIM-WINS): refuse if a LIVE registration for
+    /// the name already exists — even with a valid capability, never a silent takeover. A dead/expired
+    /// entry is replaced. Returns `true` on success.
+    async fn try_claim(&self, service: &str, entry: ExposerEntry, now: u64) -> bool {
+        let mut map = self.inner.lock().await;
+        if let Some(existing) = map.get(service)
+            && Self::entry_live(existing, now)
+        {
+            return false; // the name is held by a live exposer
+        }
+        map.insert(service.to_string(), entry);
+        true
+    }
+
+    /// Release `service` IFF the stored entry is still `conn` — so a newer registration (a different
+    /// connection that re-claimed the name) is never clobbered when an older task's connection
+    /// finally closes.
+    async fn release(&self, service: &str, conn: &Connection) {
+        let mut map = self.inner.lock().await;
+        if let Some(existing) = map.get(service)
+            && existing.conn.stable_id() == conn.stable_id()
+        {
+            map.remove(service);
+        }
+    }
+}
+
+/// Relay reverse-ingress: admit one exposer registration. The E2EE handshake (learning the exposer's
+/// proven identity) runs FIRST — so every verdict below is a clean [`RegisterResult`] the exposer
+/// reads after its own handshake — then the relay binds the proven identity to the publish
+/// capability's holder (the load-bearing holder-binding), enforces scope + first-live-claim-wins, and
+/// PARKS the connection in `registry` until it drops.
+///
+/// SECURITY (the load-bearing control, Security-reviewed): expose has NO downstream party to defer
+/// holder-binding to (the exposer is terminal), so the RELAY proves the exposer's identity at
+/// registration. The E2EE handshake cryptographically proves the exposer controls SOME overlay key
+/// (`proven`); the relay then requires `verified.holder == proven` — exactly the holder-binding the
+/// dial gate applies, so a stolen publish capability presented by a different identity is refused. This
+/// works under capability-only (AcceptAny) TLS because the proof is at the E2EE layer, not the TLS
+/// layer. Name-collision is first-live-claim-wins; the relay only ever opens streams down a
+/// registered, capability-verified exposer connection (never a client-named address).
+/// Send a registration rejection to the exposer, drain the connection (bounded), and return the
+/// refusal as an error for the relay's logs.
+async fn refuse_registration(
+    send: &mut SendStream,
+    conn: &Connection,
+    reason: RegisterReject,
+) -> Result<(), NetError> {
+    let _ = write_msg(send, &RegisterResult::Rejected(reason.clone())).await;
+    let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+    Err(NetError::RegistrationRejected(reason))
+}
+
+async fn register_exposer(
+    conn: Connection,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    req: RegisterRequest,
+    relay_secret: &OverlaySecret,
+    trust_root: &TokenPublicKey,
+    registry: &ExposerRegistry,
+) -> Result<(), NetError> {
+    let now = now_unix();
+
+    // Complete the E2EE handshake first, LEARNING the exposer's cryptographically-proven identity
+    // (expect = None). Bounding it (MEDIUM-B): a half-open registration must not park a relay task.
+    let proven = timeout(HANDSHAKE_TIMEOUT, async {
+        let (_session, peer) = establish(
+            &mut send,
+            &mut recv,
+            relay_secret,
+            Role::Responder,
+            None,
+            None,
+        )
+        .await?;
+        Ok::<OverlayId, NetError>(peer)
+    })
+    .await
+    .map_err(|_| NetError::Stream("registration handshake timed out".into()))??;
+
+    // Verify the publish capability (signature + expiry + `br_kind == "overlay-publish"`).
+    let verified = match verify_overlay_publish(&req.publish_cap, trust_root, now) {
+        Ok(v) => v,
+        Err(e) => {
+            return refuse_registration(
+                &mut send,
+                &conn,
+                RegisterReject::InvalidCapability(e.to_string()),
+            )
+            .await;
+        }
+    };
+    // The scope must name EXACTLY the service being registered (no wildcard for a publish capability).
+    if verified.scope != req.service {
+        return refuse_registration(&mut send, &conn, RegisterReject::ScopeMismatch).await;
+    }
+    // HOLDER BINDING: the E2EE-proven identity must BE the capability's holder — a stolen capability
+    // presented by a different key is refused (and a non-Ed25519 holder key can never match).
+    if verified.holder != proven.to_hex() {
+        return refuse_registration(&mut send, &conn, RegisterReject::HolderMismatch).await;
+    }
+    // Claim the name (first-live-claim-wins): a second live registration of a published name is
+    // refused, never a silent takeover.
+    let entry = ExposerEntry {
+        conn: conn.clone(),
+        exposer_id: proven,
+        expires_at: verified.exp,
+    };
+    if !registry.try_claim(&req.service, entry, now).await {
+        return refuse_registration(&mut send, &conn, RegisterReject::NameTaken).await;
+    }
+
+    // Acknowledge, then hold the registration until the connection drops (then free the name).
+    write_msg(&mut send, &RegisterResult::Ok).await?;
+    tracing::info!(service = %req.service, exposer = ?proven, "overlay relay: exposer registered");
+    conn.closed().await;
+    registry.release(&req.service, &conn).await;
+    Ok(())
+}
+
+/// Relay forwarding for a dial, resolved against the exposer registry FIRST, then the static egress
+/// map. Mirrors [`forward_relay`] (same capability gate via [`gate_dial`], same blind [`bridge`]) but
+/// also bridges to a registered reverse-ingress exposer by opening a per-flow bi-stream down its parked
+/// connection. The client only ever names a SERVICE; both targets are relay-controlled, so the
+/// not-an-open-proxy property holds for the exposer path exactly as for the egress path.
+#[allow(clippy::too_many_arguments)]
+async fn forward_resolved<F>(
+    client: Connection,
+    mut client_send: SendStream,
+    client_recv: RecvStream,
+    request: DialRequest,
+    trust_root: &TokenPublicKey,
+    client_auth: RelayClientAuth,
+    registry: &ExposerRegistry,
+    resolve: &F,
+) -> Result<(), NetError>
+where
+    F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)>,
+{
+    enum Target {
+        Exposer(Connection),
+        Egress(SocketAddr, OverlayId),
+    }
+    // A registered exposer wins; else a statically-configured egress; else refuse (no open proxy).
+    let (target, enc_required) =
+        if let Some(conn) = registry.resolve(&request.service, now_unix()).await {
+            (Target::Exposer(conn), true) // reverse ingress is always end-to-end E2EE client↔exposer
+        } else if let Some((addr, id, enc)) = resolve(&request.service) {
+            (Target::Egress(addr, id), enc)
+        } else {
+            write_msg(
+                &mut client_send,
+                &DialVerdict::Reject(DialReject::ServiceNotAuthorized),
+            )
+            .await?;
+            let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+            return Err(NetError::UnresolvedService(request.service));
+        };
+
+    let verdict = gate_dial(&request, &client, trust_root, client_auth, enc_required)?;
+    write_msg(&mut client_send, &verdict).await?;
+    if !matches!(verdict, DialVerdict::Accept { .. }) {
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Ok(()); // refused — the client has its reason
+    }
+
+    match target {
+        // Reverse ingress: open a per-flow stream DOWN the parked exposer connection and bridge blind.
+        Target::Exposer(exposer_conn) => {
+            let (es, er) = exposer_conn
+                .open_bi()
+                .await
+                .map_err(|e| NetError::Stream(e.to_string()))?;
+            bridge(client_recv, client_send, er, es).await?;
+        }
+        // Static egress: dial it server-auth-only (blind) and bridge, exactly as `forward_relay`.
+        Target::Egress(egress_addr, egress_id) => {
+            let egress_ep = quic::client_endpoint_server_auth(&OverlayPeerPolicy::Pin(egress_id))?;
+            let egress_conn = quic::dial(&egress_ep, egress_addr).await?;
+            let (es, er) = egress_conn
+                .open_bi()
+                .await
+                .map_err(|e| NetError::Stream(e.to_string()))?;
+            bridge(client_recv, client_send, er, es).await?;
+        }
+    }
+    let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+    Ok(())
+}
+
+/// Relay/ingress **serve loop** supporting reverse ingress. Like [`run_forwarding_router`], but also
+/// accepts exposer REGISTRATIONS (`boatramp expose`) and parks them in `registry`, so a forward client
+/// dialing a registered `svc/<name>` is bridged DOWN the parked connection (relay-blind) rather than
+/// dialed to a configured egress. The first control frame on each connection selects the path — a
+/// `Register` frame (exposer) vs a `DialRequest` (forward client). Used when a relay opts into
+/// accepting exposed services; `secret` is the relay's identity for the registration handshake.
+pub async fn run_ingress_router<F>(
+    endpoint: Endpoint,
+    secret: OverlaySecret,
+    trust_root: TokenPublicKey,
+    client_auth: RelayClientAuth,
+    registry: ExposerRegistry,
+    resolve: F,
+) where
+    F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
+{
+    let seed = secret.seed_hex();
+    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_FLOWS));
+    loop {
+        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+            return;
+        };
+        let Ok(Some(conn)) = quic::accept(&endpoint).await else {
+            return;
+        };
+        // Each registration handshake needs its own OverlaySecret (not Clone — a zeroized seed).
+        let Ok(relay_secret) = OverlaySecret::from_seed_hex(&seed) else {
+            continue;
+        };
+        let trust_root = trust_root.clone();
+        let resolve = resolve.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = handle_ingress_connection(
+                conn,
+                &relay_secret,
+                &trust_root,
+                client_auth,
+                &registry,
+                &resolve,
+            )
+            .await
+            {
+                tracing::debug!(error = %e, "overlay relay: ingress connection ended with error");
+            }
+        });
+    }
+}
+
+/// Accept the first bi-stream + control frame on an ingress connection and dispatch to the
+/// registration (exposer) or forwarding (client) path.
+async fn handle_ingress_connection<F>(
+    conn: Connection,
+    relay_secret: &OverlaySecret,
+    trust_root: &TokenPublicKey,
+    client_auth: RelayClientAuth,
+    registry: &ExposerRegistry,
+    resolve: &F,
+) -> Result<(), NetError>
+where
+    F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)>,
+{
+    let (send, mut recv) = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| NetError::Stream("ingress accept-bi timed out".into()))?
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    let frame = timeout(HANDSHAKE_TIMEOUT, read_ingress_frame(&mut recv))
+        .await
+        .map_err(|_| NetError::Stream("ingress first-frame timed out".into()))??;
+    match frame {
+        IngressFrame::Register(req) => {
+            register_exposer(conn, send, recv, req, relay_secret, trust_root, registry).await
+        }
+        IngressFrame::Dial(req) => {
+            forward_resolved(
+                conn,
+                send,
+                recv,
+                req,
+                trust_root,
+                client_auth,
+                registry,
+                resolve,
+            )
+            .await
+        }
+    }
+}
+
+/// Reverse-ingress **exposer** (the `boatramp expose` runtime): dial the relay OUTBOUND, register
+/// `service` (proving holder-binding to the relay via the E2EE handshake), then hold the connection
+/// open and terminate each inbound per-flow stream the relay opens down it over the local backend.
+/// E2EE stays end-to-end client↔exposer (the exposer is the Responder in [`terminate_stream`]); the
+/// relay is blind. The path is pinned to the relay (`PathMode::Relay`) — a NAT'd exposer is undialable,
+/// so there is no direct-path promotion. `ready` fires ONCE, the instant registration succeeds and
+/// before serving begins — the CLI uses it to print the "published" banner only after a confirmed
+/// registration (a rejected name / expired capability fails loudly first). Returns when the relay
+/// connection drops (the service is no longer published) or on a registration failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_published_service<F, R>(
+    relay: &Endpoint,
+    relay_addr: SocketAddr,
+    relay_id: OverlayId,
+    secret: &OverlaySecret,
+    service: String,
+    publish_cap: String,
+    resolve_backend: F,
+    trust_root: TokenPublicKey,
+    encryption_required: bool,
+    ready: R,
+) -> Result<(), NetError>
+where
+    F: Fn(&str) -> Option<SocketAddr> + Clone + Send + Sync + 'static,
+    R: FnOnce(),
+{
+    let conn = quic::dial(relay, relay_addr).await?;
+
+    // --- registration ---
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(
+        &mut send,
+        &RegisterRequest {
+            register: REGISTER_TAG.to_string(),
+            service: service.clone(),
+            publish_cap,
+        },
+    )
+    .await?;
+    // Prove possession of the publish capability's holder key to the relay: the Initiator signs its
+    // KEM offer with THIS identity's key, and pins the relay (`expect = relay_id`). A relay that is
+    // not `relay_id` fails the handshake here.
+    timeout(HANDSHAKE_TIMEOUT, async {
+        establish(
+            &mut send,
+            &mut recv,
+            secret,
+            Role::Initiator,
+            Some(relay_id),
+            None,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| NetError::Stream("registration handshake timed out".into()))??;
+    match read_msg::<RegisterResult>(&mut recv).await? {
+        RegisterResult::Ok => {}
+        RegisterResult::Rejected(reason) => return Err(NetError::RegistrationRejected(reason)),
+    }
+    ready();
+
+    // --- serve: terminate each inbound per-flow stream over the local backend ---
+    let trust_root = Arc::new(trust_root);
+    let seed = secret.seed_hex();
+    let toward = conn.remote_address();
+    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_FLOWS));
+    loop {
+        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+            break;
+        };
+        let (flow_send, flow_recv) = match conn.accept_bi().await {
+            Ok(pair) => pair,
+            Err(_) => break, // the relay connection dropped — the service is no longer published
+        };
+        // Each flow needs its own OverlaySecret (not Clone — a zeroized seed).
+        let Ok(flow_secret) = OverlaySecret::from_seed_hex(&seed) else {
+            continue;
+        };
+        let resolve_backend = resolve_backend.clone();
+        let trust_root = Arc::clone(&trust_root);
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = terminate_stream(
+                flow_send,
+                flow_recv,
+                &flow_secret,
+                resolve_backend,
+                &trust_root,
+                encryption_required,
+                PathMode::Relay,
+                toward,
+            )
+            .await
+            {
+                tracing::debug!(error = %e, "overlay expose: flow ended with error");
+            }
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1471,6 +2047,438 @@ mod tests {
                 ))
             ),
             "the relay must refuse an unconfigured service even with a wildcard cap, got {res:?}"
+        );
+    }
+
+    // ---- Reverse ingress (`boatramp expose`) ----
+
+    /// Spin up a capability-only relay that ACCEPTS exposers, with an EMPTY static egress map — so the
+    /// registry is the only forwarding source (any reachable service was published, never configured).
+    fn spawn_ingress_relay(
+        relay: &OverlaySecret,
+        root_pub: TokenPublicKey,
+        registry: ExposerRegistry,
+    ) -> SocketAddr {
+        let relay_ep =
+            quic::server_endpoint(relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = relay_ep.local_addr().unwrap();
+        let relay_secret = OverlaySecret::from_seed_hex(&relay.seed_hex()).unwrap();
+        tokio::spawn(run_ingress_router(
+            relay_ep,
+            relay_secret,
+            root_pub,
+            RelayClientAuth::CapabilityOnly,
+            registry,
+            |_s: &str| None::<(SocketAddr, OverlayId, bool)>,
+        ));
+        addr
+    }
+
+    /// A TCP echo backend; returns its address.
+    async fn spawn_echo_backend() -> SocketAddr {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Run the exposer runtime for `service` → `backend` against a relay, returning the future (so a
+    /// test can either spawn it to stay live, or await it to assert a registration failure).
+    async fn run_exposer(
+        exposer: &OverlaySecret,
+        relay_addr: SocketAddr,
+        relay_id: OverlayId,
+        service: &str,
+        publish_cap: String,
+        backend: SocketAddr,
+        trust_root: TokenPublicKey,
+    ) -> Result<(), NetError> {
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let svc = service.to_string();
+        let svc_for_backend = svc.clone();
+        run_published_service(
+            &ep,
+            relay_addr,
+            relay_id,
+            exposer,
+            svc,
+            publish_cap,
+            move |s: &str| (s == svc_for_backend.as_str()).then_some(backend),
+            trust_root,
+            true,
+            || {},
+        )
+        .await
+    }
+
+    /// Wait (bounded) until `service` is live in the registry.
+    async fn await_registered(registry: &ExposerRegistry, service: &str) -> bool {
+        for _ in 0..100 {
+            if registry.is_registered(service, now_unix()).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Reverse-ingress "done": a LOCAL service PUBLISHED into the cluster via `run_published_service`
+    /// (the exposer dials the relay OUTBOUND, registers under a holder-proven publish capability) is
+    /// reachable by a cluster-side `forward_flow svc/db` through the SAME relay's `run_ingress_router`
+    /// — the relay opens a per-flow stream DOWN the parked connection and bridges it to the client,
+    /// blind. End-to-end E2EE client↔exposer, capability-gated at BOTH the dial (client) and the
+    /// publish (exposer). This is the whole inversion, over the served roles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expose_registers_and_a_forward_reaches_the_published_backend() {
+        use boatramp_core::cose::mint_overlay_publish;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = OverlaySecret::generate().unwrap(); // dial + publish trust root
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let exposer = OverlaySecret::generate().unwrap();
+        let (relay_id, exposer_id) = (relay.id(), exposer.id());
+        let root_pub = root.id().to_public();
+
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        let relay_addr = spawn_ingress_relay(&relay, root_pub.clone(), registry.clone());
+
+        // Exposer publishes svc/db (holder = the exposer's own identity).
+        let publish_cap = mint_overlay_publish(
+            &exposer.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer = OverlaySecret::from_seed_hex(&exposer.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer,
+                    relay_addr,
+                    relay_id,
+                    "svc/db",
+                    publish_cap,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/db").await,
+            "the exposer must register svc/db with the relay"
+        );
+
+        // Forward client: capability-gated dial to svc/db, pinning the EXPOSER as the E2EE peer.
+        let dial_cap = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                exposer_id,
+                DialRequest {
+                    service: "svc/db".into(),
+                    token: dial_cap,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+        app.write_all(b"reach the exposed local service")
+            .await
+            .unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.read_to_end(&mut got),
+        )
+        .await
+        .expect("the exposed backend echoes through the registry in time")
+        .unwrap();
+        assert_eq!(got, b"reach the exposed local service");
+        let _ = fwd.await;
+    }
+
+    /// Negative (a): a registration with NO valid / WRONG-service publish capability is refused. A cap
+    /// whose scope names a different service → `ScopeMismatch`; a bogus (unsigned) cap →
+    /// `InvalidCapability`. (Without the scope/verify checks this would register, so the gate is
+    /// load-bearing — the relay would otherwise publish an unauthorized name.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_with_a_wrong_scope_or_bogus_publish_cap_is_refused() {
+        use boatramp_core::cose::mint_overlay_publish;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let exposer = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        let relay_addr = spawn_ingress_relay(&relay, root_pub.clone(), registry.clone());
+
+        // (a1) A VALID cap, but scoped to svc/other while registering svc/db.
+        let wrong_scope = mint_overlay_publish(
+            &exposer.id().to_public(),
+            "svc/other",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let res = run_exposer(
+            &exposer,
+            relay_addr,
+            relay_id,
+            "svc/db",
+            wrong_scope,
+            backend_addr,
+            root_pub.clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::RegistrationRejected(
+                    RegisterReject::ScopeMismatch
+                ))
+            ),
+            "a publish cap scoped to a different service must be refused, got {res:?}"
+        );
+
+        // (a2) A bogus (unsigned) publish cap.
+        let res2 = run_exposer(
+            &exposer,
+            relay_addr,
+            relay_id,
+            "svc/db",
+            "not-a-cose-publish-capability".into(),
+            backend_addr,
+            root_pub.clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                res2,
+                Err(NetError::RegistrationRejected(
+                    RegisterReject::InvalidCapability(_)
+                ))
+            ),
+            "a bogus publish cap must be refused, got {res2:?}"
+        );
+        // Neither registration landed → the name is NOT published.
+        assert!(
+            !registry.is_registered("svc/db", now_unix()).await,
+            "a refused registration must not publish the name"
+        );
+    }
+
+    /// Negative (b), the HOLDER-BINDING core: a VALID publish cap minted for holder X, but presented by
+    /// a DIFFERENT identity Y (a stolen capability), is refused. The relay's E2EE handshake proves Y's
+    /// identity; `verified.holder (X) != proven (Y)` → `HolderMismatch`. Without the holder check a
+    /// stolen cap would let any identity publish the name — this is the load-bearing control.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_with_a_stolen_cap_whose_holder_is_not_the_presenter_is_refused() {
+        use boatramp_core::cose::mint_overlay_publish;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let holder = OverlaySecret::generate().unwrap(); // the cap is minted FOR this identity
+        let thief = OverlaySecret::generate().unwrap(); // but THIS identity presents it
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        let relay_addr = spawn_ingress_relay(&relay, root_pub.clone(), registry.clone());
+
+        // A legitimately-minted cap, holder = `holder`, scope svc/db.
+        let stolen = mint_overlay_publish(
+            &holder.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        // `thief` presents it — the handshake proves `thief`, which is not the cap's holder.
+        let res = run_exposer(
+            &thief,
+            relay_addr,
+            relay_id,
+            "svc/db",
+            stolen,
+            backend_addr,
+            root_pub,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::RegistrationRejected(
+                    RegisterReject::HolderMismatch
+                ))
+            ),
+            "a stolen publish cap presented by a non-holder identity must be refused, got {res:?}"
+        );
+        assert!(
+            !registry.is_registered("svc/db", now_unix()).await,
+            "a stolen-cap registration must not publish the name"
+        );
+    }
+
+    /// Negative (c), name-collision: while one holder's registration is LIVE, a SECOND register of the
+    /// same name — even with its OWN valid, holder-bound publish cap — is refused (`NameTaken`),
+    /// first-live-claim-wins, never a silent takeover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_live_registration_of_a_published_name_is_refused() {
+        use boatramp_core::cose::mint_overlay_publish;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let exposer1 = OverlaySecret::generate().unwrap();
+        let exposer2 = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        let relay_addr = spawn_ingress_relay(&relay, root_pub.clone(), registry.clone());
+
+        let cap1 = mint_overlay_publish(
+            &exposer1.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let cap2 = mint_overlay_publish(
+            &exposer2.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+
+        // First exposer registers and STAYS live.
+        {
+            let exposer1 = OverlaySecret::from_seed_hex(&exposer1.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer1,
+                    relay_addr,
+                    relay_id,
+                    "svc/db",
+                    cap1,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/db").await,
+            "the first exposer must register svc/db"
+        );
+
+        // Second exposer, its OWN valid cap, same name, while the first is live → NameTaken.
+        let res = run_exposer(
+            &exposer2,
+            relay_addr,
+            relay_id,
+            "svc/db",
+            cap2,
+            backend_addr,
+            root_pub,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::RegistrationRejected(RegisterReject::NameTaken))
+            ),
+            "a second live registration of a published name must be refused, got {res:?}"
+        );
+    }
+
+    /// Negative (d), not-an-open-proxy: a forward to a name that is neither registered NOR statically
+    /// configured is refused (`ServiceNotAuthorized`) — EVEN with a valid wildcard dial cap. The relay
+    /// never opens a stream to a client-named target; only a registered, cap-verified exposer (or a
+    /// configured egress) is reachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_to_an_unregistered_name_is_refused_no_open_proxy() {
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let root_pub = root.id().to_public();
+        let registry = ExposerRegistry::new(); // nothing registered
+        let relay_addr = spawn_ingress_relay(&relay, root_pub, registry);
+
+        // A VALID WILDCARD dial cap — authorizes any service — yet the relay refuses an unknown name.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "*",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let res = forward_flow(
+            app_far,
+            &client_ep,
+            relay_addr,
+            &client,
+            egress_id,
+            DialRequest {
+                service: "svc/never-published".into(),
+                token,
+                e2ee: true,
+            },
+            PathMode::Relay,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(DialReject::ServiceNotAuthorized))
+            ),
+            "a forward to an unregistered name must be refused (no open proxy), got {res:?}"
         );
     }
 }

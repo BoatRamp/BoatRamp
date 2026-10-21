@@ -733,8 +733,8 @@ async fn spawn_overlay_roles(
 ) -> Result<boatramp_server::OverlayDirectory> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
-        OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, run_egress_router,
-        run_forwarding_router, server_endpoint,
+        ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
+        run_egress_router, run_forwarding_router, run_ingress_router, server_endpoint,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -879,8 +879,26 @@ async fn spawn_overlay_roles(
             .map_err(|e| Error::ClusterStartup(format!("[overlay] relay listen {bind}: {e}")))?;
         let trust = trust_root.clone();
         let resolve = move |s: &str| routes.get(s).copied();
-        tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress");
-        tokio::spawn(run_forwarding_router(ep, trust, client_auth, resolve));
+        // Reverse ingress (`boatramp expose`): when the relay opts into `accept_exposed`, run the
+        // ingress router (which ALSO admits exposer registrations into an in-memory registry and
+        // bridges forward clients down a parked exposer connection). Otherwise the forward-only relay.
+        if ov.accept_exposed.unwrap_or(false) {
+            let relay_secret = OverlaySecret::from_seed_hex(&secret.seed_hex())
+                .map_err(|e| Error::ClusterStartup(format!("[overlay] identity: {e}")))?;
+            let registry = ExposerRegistry::new();
+            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services)");
+            tokio::spawn(run_ingress_router(
+                ep,
+                relay_secret,
+                trust,
+                client_auth,
+                registry,
+                resolve,
+            ));
+        } else {
+            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress");
+            tokio::spawn(run_forwarding_router(ep, trust, client_auth, resolve));
+        }
     }
     Ok(boatramp_server::OverlayDirectory::from_entries(directory)
         .with_max_dial_ttl(ov.max_dial_ttl_secs))

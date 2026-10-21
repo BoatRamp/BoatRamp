@@ -18,7 +18,7 @@
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 
-use boatramp_core::cose::{TokenPublicKey, mint_overlay_dial};
+use boatramp_core::cose::{TokenPublicKey, mint_overlay_dial, mint_overlay_publish};
 use boatramp_overlay::{OverlayId, OverlaySecret};
 
 use crate::output::Rendered;
@@ -38,6 +38,8 @@ pub enum Error {
 
 /// Magic prefix for a forward ticket (mirrors the cluster join ticket's `brjoin1`).
 const TICKET_MAGIC: &str = "brfwd1";
+/// Magic prefix for an **expose ticket** (the reverse-ingress analog of the forward ticket).
+const EXPOSE_TICKET_MAGIC: &str = "brexp1";
 
 /// `boatramp overlay …` — admin tooling for the overlay forward-flow feature.
 #[derive(Args, Debug)]
@@ -72,6 +74,35 @@ enum OverlayCommand {
         #[arg(long)]
         holder_pub: Option<String>,
         /// Capability lifetime in seconds (an overlay-dial capability must be time-bounded).
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u64,
+        /// Path to the config holding the root signer (`[serve.signer]` / `auth_root_private_key`).
+        #[arg(long, default_value = "boatramp.cfg")]
+        config: std::path::PathBuf,
+    },
+    /// Mint an overlay-publish capability for `service` and emit a one-flag EXPOSE ticket for
+    /// `boatramp expose --ticket` (the reverse-ingress analog of `grant`).
+    ///
+    /// Offline: signs with the cluster root key resolved from the config (or
+    /// `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`), the same signer `token mint`/`grant` use. The ticket also
+    /// carries the cluster trust root's PUBLIC key, which the exposer needs to independently verify
+    /// each incoming forward client's dial capability (zero-trust — the exposer is the terminator).
+    GrantExpose {
+        /// The in-cluster service to publish AS (e.g. `svc/db`); must match the relay's registry key
+        /// and the exposer's `expose <local> as svc/<name>`.
+        service: String,
+        /// The relay/ingress socket address the exposer will dial OUT to (`host:port`).
+        #[arg(long)]
+        relay: String,
+        /// The relay's overlay identity to pin (`ed25519:<hex>` or `bro1…`).
+        #[arg(long)]
+        relay_id: String,
+        /// Bind the capability to an exposer identity it already generated (its public
+        /// `ed25519:<hex>`/`bro1…`); the ticket then carries no secret and the exposer supplies
+        /// `--identity`. Omit to have the grant generate the exposer identity and embed its seed.
+        #[arg(long)]
+        holder_pub: Option<String>,
+        /// Capability lifetime in seconds (an overlay-publish capability must be time-bounded).
         #[arg(long, default_value_t = 3600)]
         ttl_secs: u64,
         /// Path to the config holding the root signer (`[serve.signer]` / `auth_root_private_key`).
@@ -157,6 +188,69 @@ impl ForwardTicket {
     }
 }
 
+/// A copy-pasteable **expose ticket**: everything `boatramp expose` needs to publish a local service
+/// into the cluster, bundled into one magic-prefixed base64url(JSON) blob (the reverse-ingress analog
+/// of [`ForwardTicket`]). No `egress_id` — the exposer IS the egress. It DOES carry the cluster
+/// `trust_root` public key, because the exposer (the terminator) independently verifies each incoming
+/// forward client's dial capability against it (zero-trust). Self-describing, but the relay still
+/// verifies the publish capability against its own trust root on use — a forged ticket buys nothing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExposeTicket {
+    /// The relay/ingress `host:port` to dial OUT to.
+    pub relay: String,
+    /// The relay's overlay identity to pin (and prove the relay with in the registration handshake).
+    pub relay_id: String,
+    /// The in-cluster service name to publish AS (authoritative; equals the capability's scope).
+    pub service: String,
+    /// The holder-bound overlay-publish capability (COSE).
+    pub token: String,
+    /// The cluster trust root's PUBLIC key (`ed25519:`/`es256:` tagged hex) — the exposer verifies
+    /// each incoming forward client's dial capability against this (zero-trust terminator).
+    pub trust_root: String,
+    /// The exposer's overlay identity seed (`ed25519:<hex>`) — present ONLY when the grant generated
+    /// the identity (convenience mode). **Secret.** Absent in `--holder-pub` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+impl ExposeTicket {
+    /// Encode to `brexp1.<base64url(json)>`.
+    pub fn encode(&self) -> Result<String> {
+        let json = serde_json::to_vec(self).map_err(|e| Error::Overlay(e.to_string()))?;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        Ok(format!("{EXPOSE_TICKET_MAGIC}.{b64}"))
+    }
+
+    /// Decode a `brexp1.…` ticket, rejecting a bad prefix or empty required fields.
+    pub fn decode(blob: &str) -> Result<Self> {
+        let b64 = blob
+            .trim()
+            .strip_prefix(EXPOSE_TICKET_MAGIC)
+            .and_then(|r| r.strip_prefix('.'))
+            .ok_or_else(|| {
+                Error::Overlay(format!(
+                    "not an expose ticket (expected `{EXPOSE_TICKET_MAGIC}.…`)"
+                ))
+            })?;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|e| Error::Overlay(format!("malformed expose ticket: {e}")))?;
+        let t: Self = serde_json::from_slice(&json)
+            .map_err(|e| Error::Overlay(format!("malformed expose ticket: {e}")))?;
+        if t.relay.is_empty()
+            || t.relay_id.is_empty()
+            || t.service.is_empty()
+            || t.token.is_empty()
+            || t.trust_root.is_empty()
+        {
+            return Err(Error::Overlay(
+                "expose ticket is missing a required field".into(),
+            ));
+        }
+        Ok(t)
+    }
+}
+
 /// The result of an `overlay` command (emitted via [`crate::output`]).
 #[derive(serde::Serialize)]
 pub enum OverlayOutput {
@@ -169,6 +263,17 @@ pub enum OverlayOutput {
         /// The exact `[overlay] allowed_clients` entry to add on the relay node.
         enroll: String,
         /// Whether the ticket carries the client's secret seed (convenience mode).
+        secret_ticket: bool,
+    },
+    /// `overlay grant-expose` — the expose ticket plus the relay enrollment the admin must apply.
+    ExposeGranted {
+        /// The `brexp1.…` ticket for the exposer to redeem with `expose --ticket`.
+        ticket: String,
+        /// The exposer's overlay identity (`ed25519:<hex>`) to enroll in the relay (mutual-pin only).
+        client_id: String,
+        /// The exact `[overlay] allowed_clients` entry to add on the relay node (mutual-pin only).
+        enroll: String,
+        /// Whether the ticket carries the exposer's secret seed (convenience mode).
         secret_ticket: bool,
     },
     /// `overlay id` — this operator's overlay identity.
@@ -254,6 +359,35 @@ impl Rendered for OverlayOutput {
                     "# and reload; a capability-only relay needs NO enrollment — the ticket works as-is."
                 )?;
                 writeln!(w, "#   client id: {client_id}")?;
+                writeln!(w, "#   allowed_clients entry (mutual-pin only): {enroll}")
+            }
+            Self::ExposeGranted {
+                ticket,
+                client_id,
+                enroll,
+                secret_ticket,
+            } => {
+                writeln!(w, "{ticket}")?;
+                writeln!(w)?;
+                if *secret_ticket {
+                    writeln!(
+                        w,
+                        "# This ticket embeds the exposer's private seed — treat it as a secret."
+                    )?;
+                }
+                writeln!(
+                    w,
+                    "# Redeem on the exposer:   boatramp expose <local-addr> as <service> --ticket <ticket>"
+                )?;
+                writeln!(
+                    w,
+                    "# If the relay is mutual-pin, enroll this exposer id in [overlay] allowed_clients"
+                )?;
+                writeln!(
+                    w,
+                    "# and reload; a capability-only relay needs NO enrollment — the ticket works as-is."
+                )?;
+                writeln!(w, "#   exposer id: {client_id}")?;
                 writeln!(w, "#   allowed_clients entry (mutual-pin only): {enroll}")
             }
         }
@@ -350,6 +484,57 @@ pub async fn run(
                 secret_ticket,
             })
         }
+        OverlayCommand::GrantExpose {
+            service,
+            relay,
+            relay_id,
+            holder_pub,
+            ttl_secs,
+            config,
+        } => {
+            // Validate the pinned relay id up front (fail before signing on a typo).
+            let _ = parse_id(&relay_id)?;
+
+            // The exposer identity: bind a supplied public key (ticket carries no secret), or
+            // generate one and embed its seed (convenience).
+            let (holder, client_id, identity) = match &holder_pub {
+                Some(pub_spec) => {
+                    let id = parse_id(pub_spec)?;
+                    (id.to_public(), id.to_hex(), None)
+                }
+                None => {
+                    let secret =
+                        OverlaySecret::generate().map_err(|e| Error::Overlay(e.to_string()))?;
+                    let id = secret.id();
+                    (
+                        id.to_public(),
+                        id.to_hex(),
+                        Some(secret.seed_hex().to_string()),
+                    )
+                }
+            };
+
+            // Mint the publish capability AND capture the signer's public key as the trust root the
+            // exposer will verify incoming dial capabilities against (zero-trust terminator).
+            let (token, trust_root) = mint_publish(&holder, &service, ttl_secs, &config).await?;
+            let secret_ticket = identity.is_some();
+            let ticket = ExposeTicket {
+                relay,
+                relay_id,
+                service,
+                token,
+                trust_root,
+                identity,
+            }
+            .encode()?;
+            let enroll = format!("\"{client_id}\"");
+            Ok(OverlayOutput::ExposeGranted {
+                ticket,
+                client_id,
+                enroll,
+                secret_ticket,
+            })
+        }
     }
 }
 
@@ -371,6 +556,29 @@ async fn mint_dial(
     mint_overlay_dial(holder, service, ttl_secs, now, &*signer)
         .await
         .map_err(|e| Error::Overlay(format!("minting dial capability: {e}")))
+}
+
+/// Mint a holder-bound overlay-PUBLISH capability for `service`, signed offline by the root signer
+/// resolved from `config` (the same cluster root key as `token`/`grant`). Returns the capability AND
+/// the signer's public key (the trust root the exposer verifies incoming dial capabilities against).
+async fn mint_publish(
+    holder: &TokenPublicKey,
+    service: &str,
+    ttl_secs: u64,
+    config: &std::path::Path,
+) -> Result<(String, String)> {
+    let signer = crate::token::resolve_signer(config)
+        .await
+        .map_err(|e| Error::Signer(e.to_string()))?;
+    let trust_root = signer.public_key().to_hex();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let token = mint_overlay_publish(holder, service, ttl_secs, now, &*signer)
+        .await
+        .map_err(|e| Error::Overlay(format!("minting publish capability: {e}")))?;
+    Ok((token, trust_root))
 }
 
 /// The operator's overlay identity key path: `$XDG_CONFIG_HOME/boatramp/overlay.key`, else
@@ -501,5 +709,46 @@ mod tests {
         // A ticket missing a required field is refused.
         let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"relay\":\"\",\"relay_id\":\"x\",\"egress_id\":\"y\",\"service\":\"s\",\"token\":\"t\"}");
         assert!(ForwardTicket::decode(&format!("brfwd1.{bad}")).is_err());
+    }
+
+    #[test]
+    fn expose_ticket_round_trips() {
+        let t = ExposeTicket {
+            relay: "10.0.0.1:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            service: "svc/db".into(),
+            token: "PUBLISHCOSE".into(),
+            trust_root: "es256:beef".into(),
+            identity: Some("ed25519:cc".into()),
+        };
+        let blob = t.encode().unwrap();
+        assert!(blob.starts_with("brexp1."));
+        let back = ExposeTicket::decode(&blob).unwrap();
+        assert_eq!(back.relay, "10.0.0.1:9100");
+        assert_eq!(back.service, "svc/db");
+        assert_eq!(back.token, "PUBLISHCOSE");
+        assert_eq!(back.trust_root, "es256:beef");
+        assert_eq!(back.identity.as_deref(), Some("ed25519:cc"));
+    }
+
+    #[test]
+    fn expose_ticket_rejects_garbage_and_a_forward_ticket() {
+        assert!(ExposeTicket::decode("not-a-ticket").is_err());
+        assert!(ExposeTicket::decode("brexp1.@@@@").is_err());
+        // A forward ticket is not an expose ticket (distinct magic).
+        let fwd = ForwardTicket {
+            relay: "1.2.3.4:5".into(),
+            relay_id: "ed25519:aa".into(),
+            egress_id: "ed25519:bb".into(),
+            service: "svc/db".into(),
+            token: "t".into(),
+            identity: None,
+        }
+        .encode()
+        .unwrap();
+        assert!(ExposeTicket::decode(&fwd).is_err());
+        // Missing the required trust_root is refused.
+        let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"relay\":\"a:1\",\"relay_id\":\"x\",\"service\":\"s\",\"token\":\"t\",\"trust_root\":\"\"}");
+        assert!(ExposeTicket::decode(&format!("brexp1.{bad}")).is_err());
     }
 }

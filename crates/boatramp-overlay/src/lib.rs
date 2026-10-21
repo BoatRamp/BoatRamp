@@ -28,8 +28,9 @@ pub use circuit::{
 pub use direct::{PathMode, negotiate_direct};
 pub use e2ee::{SpliceError, establish, splice};
 pub use net::{
-    NetError, RelayClientAuth, forward_flow, forward_relay, run_egress_router,
-    run_forwarding_router, terminate_one,
+    ExposerRegistry, NetError, RegisterReject, RelayClientAuth, forward_flow, forward_relay,
+    run_egress_router, run_forwarding_router, run_ingress_router, run_published_service,
+    terminate_one,
 };
 pub use quic::{
     QuicError, accept, client_endpoint, client_endpoint_server_auth, dial, dial_mesh_peer,
