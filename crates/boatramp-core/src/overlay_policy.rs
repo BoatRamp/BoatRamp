@@ -16,10 +16,16 @@
 //!   attribute simply does not apply (Cedar skips an erroring condition), which is default-deny
 //!   safe.
 //! - **Action** `Overlay::Action::"dial"` / `"expose"`.
-//! - **Resource** `Overlay::Service` — uid = the service name (e.g. `svc/db`).
-//! - **Context** `{ requestor: String, now: Long, ttl_requested: Long, src_ip?: String }` — the
-//!   API principal that asked (`requestor`), the current time, and the clamped requested TTL. (A
-//!   `src_ip` slot is declared for a later increment; the mint point does not populate it yet.)
+//! - **Resource** `Overlay::Service` — uid = the service name (e.g. `svc/db`); `Service` is a member
+//!   of `Overlay::Node` (increment 2 Stage A) — the serving node's overlay identity (the dial
+//!   target's `egress_id` / the expose relay's `relay_id`), mint-resolved and threaded in via
+//!   [`FlowContext::node`]. A policy may therefore scope a rule to a node
+//!   (`resource in Overlay::Node::"<id>"`), a service (`resource == Overlay::Service::"<name>"`), or
+//!   both; an unmatched/absent node simply fails to permit (default-deny-safe).
+//! - **Context** `{ requestor: String, now: Long, ttl_requested: Long }` — the API principal that
+//!   asked (`requestor`), the current time, and the clamped requested TTL. (The owner dropped
+//!   source-IP conditions — the fabric reaches services by identity, not IP — so there is no
+//!   `src_ip` slot; the grammar has no way to write an IP rule.)
 //!
 //! # Decision
 //! [`FlowPolicy::evaluate`] returns [`Decision::Allow`] (with an optional `ttl_ceiling`) or
@@ -79,7 +85,8 @@ namespace Overlay {
     scope?: String,
     enrolled?: Bool,
   };
-  entity Service;
+  entity Node;
+  entity Service in [Node];
   action "dial", "expose" appliesTo {
     principal: [Holder],
     resource: [Service],
@@ -87,7 +94,6 @@ namespace Overlay {
       requestor: String,
       now: Long,
       ttl_requested: Long,
-      src_ip?: String,
     }
   };
 }
@@ -176,8 +182,13 @@ pub struct FlowContext {
     pub requestor: String,
     /// The current time (Unix seconds) — the value a `not_after` bound compares against.
     pub now: u64,
-    /// The source IP, if the caller populated it (unused at the mint point this increment).
-    pub src_ip: Option<String>,
+    /// The resolved overlay identity of the node serving the target service — the dial target's
+    /// `egress_id` / the expose relay's `relay_id` (increment 2 Stage A). [`FlowPolicy::evaluate`]
+    /// attaches it as the `Overlay::Service` entity's ONE parent (`Overlay::Node::"<id>"`), so a
+    /// policy may scope a rule to `resource in Overlay::Node::"<id>"`. `None` (e.g. an admin
+    /// dry-run preview that supplies no node) ⇒ the Service entity has no parent — a node-scoped
+    /// rule then simply never matches (default-deny-safe).
+    pub node: Option<String>,
     /// The requested TTL (seconds), already clamped to the server maximum by the caller.
     pub ttl_requested: u64,
 }
@@ -340,15 +351,33 @@ impl FlowPolicy {
             attrs.insert("enrolled".into(), RestrictedExpression::new_bool(enrolled));
         }
         let principal_entity = Entity::new(principal_uid.clone(), attrs, HashSet::new())?;
-        let resource_entity = Entity::new(resource_uid.clone(), HashMap::new(), HashSet::new())?;
+        // Node-scoping (increment 2 Stage A): when the mint gate resolved a concrete serving node
+        // (`ctx.node` — the dial target's `egress_id` / the expose relay's `relay_id`), attach
+        // `Overlay::Node::"<id>"` as the Service entity's ONE parent, so a policy can scope a rule
+        // with `resource in Overlay::Node::"<id>"` (and still combine with / fall back to a
+        // `resource == Overlay::Service::"<name>"` check). Absent ⇒ no parent — a node-scoped rule
+        // then simply never matches (composes for free with the gate's default-deny-safe posture).
+        let mut resource_parents = HashSet::new();
+        let mut node_entity = None;
+        if let Some(node_id) = &ctx.node {
+            let node_uid = uid("Node", node_id);
+            node_entity = Some(Entity::new(
+                node_uid.clone(),
+                HashMap::new(),
+                HashSet::new(),
+            )?);
+            resource_parents.insert(node_uid);
+        }
+        let resource_entity = Entity::new(resource_uid.clone(), HashMap::new(), resource_parents)?;
         // Both action entities (no hierarchy) so an `action in [Overlay::Action::"dial", …]` form
         // resolves against known entities as well as the `action == …` form.
         let dial = Entity::new(uid("Action", "dial"), HashMap::new(), HashSet::new())?;
         let expose = Entity::new(uid("Action", "expose"), HashMap::new(), HashSet::new())?;
-        let entities =
-            Entities::from_entities(vec![principal_entity, resource_entity, dial, expose], None)?;
+        let mut all_entities = vec![principal_entity, resource_entity, dial, expose];
+        all_entities.extend(node_entity);
+        let entities = Entities::from_entities(all_entities, None)?;
 
-        let mut pairs = vec![
+        let pairs = vec![
             (
                 "requestor".to_string(),
                 RestrictedExpression::new_string(ctx.requestor.clone()),
@@ -362,12 +391,6 @@ impl FlowPolicy {
                 RestrictedExpression::new_long(clamp_i64(ttl)),
             ),
         ];
-        if let Some(ip) = &ctx.src_ip {
-            pairs.push((
-                "src_ip".to_string(),
-                RestrictedExpression::new_string(ip.clone()),
-            ));
-        }
         let context = Context::from_pairs(pairs)?;
 
         let request = Request::new(principal_uid, action_uid, resource_uid, context, None)?;
@@ -544,7 +567,7 @@ mod tests {
         FlowContext {
             requestor: "tok-1".into(),
             now: 1_000_000,
-            src_ip: None,
+            node: None,
             ttl_requested: ttl,
         }
     }
@@ -685,6 +708,30 @@ mod tests {
     }
 
     #[test]
+    fn node_scoped_permit_matches_resolved_node() {
+        // A policy scoped to node "n-A": a mint whose RESOLVED node IS "n-A" must Allow; a
+        // DIFFERENT resolved node ("n-B") must Deny — proving `ctx.node` reaches the Service
+        // entity's Cedar parent.
+        let src = r#"permit(principal, action, resource in Overlay::Node::"n-A");"#;
+        let fp = FlowPolicy::compile(src).unwrap();
+        let mut c = ctx(3600);
+        c.node = Some("n-A".into());
+        assert_eq!(
+            fp.evaluate(&key_only(), FlowAction::Dial, "svc/db", &c)
+                .decision,
+            Decision::Allow { ttl_ceiling: None },
+            "a node-scoped permit must match when the resolved node IS the scoped node"
+        );
+        c.node = Some("n-B".into());
+        assert_eq!(
+            fp.evaluate(&key_only(), FlowAction::Dial, "svc/db", &c)
+                .decision,
+            Decision::Deny,
+            "a node-scoped permit must NOT match a DIFFERENT resolved node"
+        );
+    }
+
+    #[test]
     fn rbac_entity_types_do_not_validate_against_the_flow_schema() {
         // A policy referencing the RBAC namespace (`BR::…`) must fail to compile — the two
         // authorizers share no entity types (separate-namespace invariant).
@@ -697,6 +744,22 @@ mod tests {
                 FlowPolicyError::Validation(_) | FlowPolicyError::Parse(_)
             ),
             "an RBAC-namespace policy must not validate against the flow schema, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_resource_isolated_from_rbac() {
+        // The new `Overlay::Node` resource-group type lives ONLY in the flow schema's own
+        // namespace — a policy referencing `BR::Node` (the RBAC namespace) must still fail to
+        // validate (two-authorizer isolation extends to the new type, not just Holder/Service).
+        let err = FlowPolicy::compile(r#"permit(principal, action, resource in BR::Node::"n-A");"#)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowPolicyError::Validation(_) | FlowPolicyError::Parse(_)
+            ),
+            "a BR::Node-referencing policy must not validate against the flow schema, got {err:?}"
         );
     }
 

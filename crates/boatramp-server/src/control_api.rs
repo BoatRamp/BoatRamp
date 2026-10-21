@@ -651,6 +651,12 @@ fn overlay_flow_denied() -> Response {
 /// already clamped to the server max, so this is the full `min(requested, ceiling, server_max)` of
 /// REQUIRED #2a), or the error [`Response`] to return. The decision gates + bounds the TTL ONLY; it
 /// never rewrites the capability's scope/holder/action/resource (REQUIRED #2b/#3c).
+///
+/// `node` is the RESOLVED overlay identity of the service's serving node (the dial target's
+/// `egress_id` / the expose relay's `relay_id`, already resolved by the caller before this gate
+/// runs) — increment 2 Stage A. It only SCOPES the mint-gate decision, via the flow schema's
+/// `Overlay::Node` parent on the `Service` resource (mint-only, narrow-only, like the rest of this
+/// gate): it is never looked up again and never affects the minted capability itself.
 #[allow(clippy::too_many_arguments)]
 async fn overlay_flow_gate(
     auth: &Auth,
@@ -659,6 +665,7 @@ async fn overlay_flow_gate(
     member_cred: Option<&str>,
     action: boatramp_core::overlay_policy::FlowAction,
     service: &str,
+    node: &str,
     requested_ttl: u64,
     now: u64,
 ) -> Result<u64, Response> {
@@ -730,7 +737,7 @@ async fn overlay_flow_gate(
             let ctx = FlowContext {
                 requestor,
                 now,
-                src_ip: None,
+                node: Some(node.to_string()),
                 ttl_requested: requested_ttl,
             };
             let outcome = fp.evaluate(&holder_principal, action, service, &ctx);
@@ -854,6 +861,7 @@ pub(super) async fn overlay_dial(
         request.overlay_member.as_deref(),
         boatramp_core::overlay_policy::FlowAction::Dial,
         &request.service,
+        &target.egress_id,
         clamped,
         now,
     )
@@ -977,6 +985,7 @@ pub(super) async fn overlay_expose(
         request.overlay_member.as_deref(),
         boatramp_core::overlay_policy::FlowAction::Expose,
         &request.service,
+        &relay.relay_id,
         clamped,
         now,
     )
@@ -2141,9 +2150,10 @@ pub(super) struct OverlayPolicyTestRequest {
     /// Optional `requestor` for the context (defaults to `test`).
     #[serde(default)]
     requestor: Option<String>,
-    /// Optional `src_ip` for the context.
+    /// Optional resolved node id to preview a node-scoped rule against (the `Overlay::Node` the
+    /// `Service` resource would be scoped under); omit for a service-only preview.
     #[serde(default)]
-    src_ip: Option<String>,
+    node: Option<String>,
     /// The requested TTL (seconds) to evaluate.
     ttl_requested: u64,
     /// Optional `now` (Unix seconds) for a `not_after` bound; defaults to the server clock.
@@ -2259,7 +2269,7 @@ pub(super) async fn test_overlay_policy(
     let ctx = FlowContext {
         requestor: req.requestor.clone().unwrap_or_else(|| "test".to_string()),
         now: req.now.unwrap_or_else(now_unix),
-        src_ip: req.src_ip.clone(),
+        node: req.node.clone(),
         ttl_requested: req.ttl_requested,
     };
     let outcome = fp.evaluate(&principal, action, &req.service, &ctx);
@@ -3108,6 +3118,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             3600,
             now_unix(),
         )
@@ -3136,6 +3147,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             3600,
             now_unix(),
         )
@@ -3165,6 +3177,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             3600,
             now_unix(),
         )
@@ -3192,6 +3205,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             3600,
             now_unix(),
         )
@@ -3205,6 +3219,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             120,
             now_unix(),
         )
@@ -3246,6 +3261,7 @@ mod tests {
             Some(&cred),
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             120,
             now,
         )
@@ -3261,6 +3277,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             120,
             now,
         )
@@ -3281,6 +3298,7 @@ mod tests {
             Some(&cred_other),
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             120,
             now,
         )
@@ -3307,6 +3325,7 @@ mod tests {
             Some(&bad),
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             120,
             now,
         )
@@ -3331,6 +3350,7 @@ mod tests {
             None,
             FlowAction::Dial,
             "svc/db",
+            "n-irrelevant",
             300,
             now_unix(),
         )
@@ -3451,7 +3471,7 @@ mod tests {
                 scope: None,
                 enrolled: None,
                 requestor: None,
-                src_ip: None,
+                node: None,
                 ttl_requested: 3600,
                 now: None,
             }),
@@ -3478,7 +3498,7 @@ mod tests {
                 scope: None,
                 enrolled: None,
                 requestor: None,
-                src_ip: None,
+                node: None,
                 ttl_requested: 3600,
                 now: None,
             }),
@@ -3567,6 +3587,80 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(resp).await.trim(), "flow denied by policy");
+    }
+
+    /// NODE-SCOPED (full handler, increment 2 Stage A) — a policy scoped to one node's overlay
+    /// identity mints a dial that resolves to THAT node, and 403s a dial that resolves to a
+    /// DIFFERENT node — proving the RESOLVED node id (the dial target's `egress_id`) is what
+    /// actually reaches the gate's entity construction, not just that some node is attached.
+    #[tokio::test]
+    async fn overlay_dial_node_scoped_policy_gates_by_resolved_node() {
+        const POLICY: &str =
+            r#"permit(principal, action, resource in Overlay::Node::"ed25519:match-node");"#;
+        let holder_hex = ed25519().public_key().to_hex();
+
+        // svc/db resolves to the node the policy scopes to → mints.
+        let root1 = ed25519();
+        let auth1 = auth_with_flow_policy(&root1, Some(POLICY)).await;
+        let directory1 = OverlayDirectory::from_entries([(
+            "svc/db".to_string(),
+            OverlayTarget {
+                relay: "1.2.3.4:9100".into(),
+                relay_id: "ed25519:aa".into(),
+                egress_id: "ed25519:match-node".into(),
+                client_auth: "capability-only".into(),
+            },
+        )]);
+        let resp = overlay_dial(
+            Extension(Issuer(Some(StdArc::new(root1)))),
+            Extension(directory1),
+            Extension(auth1),
+            Some(Extension(test_principal())),
+            Json(OverlayDialRequest {
+                service: "svc/db".into(),
+                holder_pubkey: holder_hex.clone(),
+                ttl_secs: Some(120),
+                overlay_member: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a dial resolving to the SAME node the policy scopes to must mint"
+        );
+
+        // svc/other resolves to a DIFFERENT node → the node-scoped permit does not apply → 403.
+        let root2 = ed25519();
+        let auth2 = auth_with_flow_policy(&root2, Some(POLICY)).await;
+        let directory2 = OverlayDirectory::from_entries([(
+            "svc/other".to_string(),
+            OverlayTarget {
+                relay: "1.2.3.4:9100".into(),
+                relay_id: "ed25519:aa".into(),
+                egress_id: "ed25519:other-node".into(),
+                client_auth: "capability-only".into(),
+            },
+        )]);
+        let resp = overlay_dial(
+            Extension(Issuer(Some(StdArc::new(root2)))),
+            Extension(directory2),
+            Extension(auth2),
+            Some(Extension(test_principal())),
+            Json(OverlayDialRequest {
+                service: "svc/other".into(),
+                holder_pubkey: holder_hex,
+                ttl_secs: Some(120),
+                overlay_member: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a dial resolving to a DIFFERENT node must not satisfy the node-scoped permit"
+        );
         assert_eq!(body_string(resp).await.trim(), "flow denied by policy");
     }
 
