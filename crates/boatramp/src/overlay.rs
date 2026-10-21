@@ -1132,7 +1132,9 @@ async fn pair_run(
             out
         }
         // Relay rendezvous INITIATOR: the positional arg is a `bropair1…` code — redeem it.
-        (None, None, Some(ref p)) if p.trim().starts_with("bropair1") => {
+        // Lowercase-normalize the discriminator (INFO-3) so a pasted UPPERCASE bech32m code (which
+        // decodes fine) routes to redeem instead of falling through to the direct-dial addr parse.
+        (None, None, Some(ref p)) if p.trim().to_ascii_lowercase().starts_with("bropair1") => {
             let (relay_addr, code) = decode_code(p)?;
             let ep =
                 client_endpoint_server_auth(&OverlayPeerPolicy::Pin(code.relay_id)).map_err(q)?;

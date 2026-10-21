@@ -15,8 +15,12 @@
 //! calls [`forward_flow`] directly with the accepted connection.
 
 #[cfg(feature = "server")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "server")]
+use std::net::IpAddr;
 use std::net::SocketAddr;
+#[cfg(feature = "server")]
+use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
@@ -43,6 +47,8 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "server")]
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::timeout;
 
@@ -74,6 +80,30 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// admits (MEDIUM-B). Bounds the task/connection count a flood — unauthenticated at the egress —
 /// can pin; the accept loop backpressures past this. High enough not to throttle a busy node.
 const MAX_INFLIGHT_FLOWS: usize = 1024;
+
+/// Max concurrently in-flight PRE-CLASSIFICATION ingress connections — the [`run_ingress_router`]
+/// accept-loop bound (HIGH-1). A connection holds a handshake slot only for `accept_bi` + reading the
+/// first control frame (bounded by [`HANDSHAKE_TIMEOUT`]), then swaps to the budget its frame KIND
+/// draws from and releases this slot. Distinct from the flow budget so the swap is clean; generous
+/// (= the flow budget) because the hold is short.
+#[cfg(feature = "server")]
+const MAX_INFLIGHT_HANDSHAKES: usize = MAX_INFLIGHT_FLOWS;
+
+/// Max concurrently PARKED pairing rendezvous — a SEPARATE budget from the forward/expose
+/// [`MAX_INFLIGHT_FLOWS`] flows (HIGH-1). PARK is the first UNAUTHENTICATED path to a multi-minute
+/// permit hold (≤ the rendezvous TTL; register/dial are capability-gated before their hold), so a PARK
+/// must never draw from the production flow budget — otherwise an unauthenticated park flood starves
+/// forward dials + exposer registrations. Deliberately ≪ the flow budget: a relay serves at most a
+/// handful of concurrent human-driven pairings, so 64 is ample for real use yet cannot dominate.
+#[cfg(feature = "server")]
+const PAIR_MAX_PARKED: usize = 64;
+
+/// Max concurrent parked rendezvous per SOURCE IP (HIGH-1 secondary bound). One host rarely parks more
+/// than one or two rendezvous at once, so a small per-IP cap stops a single source from eating the
+/// whole [`PAIR_MAX_PARKED`] budget. (Peers behind one NAT share a public IP; this caps CONCURRENT —
+/// not total — parks, each ≤ the TTL, a reasonable secondary floor beneath the global budget.)
+#[cfg(feature = "server")]
+const PAIR_MAX_PARKED_PER_IP: u32 = 3;
 
 /// A forwarded-flow failure.
 #[derive(Debug, thiserror::Error)]
@@ -1168,10 +1198,72 @@ pub async fn run_ingress_router<F>(
 ) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
 {
+    run_ingress_router_with_budgets(
+        endpoint,
+        secret,
+        trust_root,
+        client_auth,
+        registry,
+        rendezvous,
+        resolve,
+        IngressBudgets::DEFAULT,
+    )
+    .await;
+}
+
+/// The admission budgets a [`run_ingress_router`] loop enforces. The KEY separation (HIGH-1) is that
+/// PARK draws from `parked` (+ the per-IP cap), NEVER from `flows` — so an unauthenticated park flood
+/// can never exhaust the forward/expose flow budget. Parameterized so tests can drive the separation
+/// with tiny budgets; production uses [`IngressBudgets::DEFAULT`].
+#[cfg(feature = "server")]
+#[derive(Clone, Copy)]
+struct IngressBudgets {
+    /// Concurrent pre-classification connections (the accept-loop bound; short, ≤ `HANDSHAKE_TIMEOUT`).
+    handshakes: usize,
+    /// Concurrent forward/expose/redeem FLOWS (`Register`/`Dial`/`PairRedeem`).
+    flows: usize,
+    /// Concurrent PARKED rendezvous (`PairPark`) — SEPARATE from `flows`.
+    parked: usize,
+    /// Concurrent parked rendezvous per source IP.
+    parked_per_ip: u32,
+}
+
+#[cfg(feature = "server")]
+impl IngressBudgets {
+    const DEFAULT: Self = Self {
+        handshakes: MAX_INFLIGHT_HANDSHAKES,
+        flows: MAX_INFLIGHT_FLOWS,
+        parked: PAIR_MAX_PARKED,
+        parked_per_ip: PAIR_MAX_PARKED_PER_IP,
+    };
+}
+
+/// [`run_ingress_router`] with explicit [`IngressBudgets`]. The accept loop holds a short HANDSHAKE
+/// slot per connection (released the instant the frame is classified and swapped to its own budget):
+/// `PairPark` → the SEPARATE `parked` budget (+ per-IP cap), held for the park's ≤TTL life;
+/// `Register`/`Dial`/`PairRedeem` → the `flows` budget, held for the flow's life. So a park never
+/// draws from — and a park flood can never starve — the forward/expose flow budget (HIGH-1).
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn run_ingress_router_with_budgets<F>(
+    endpoint: Endpoint,
+    secret: OverlaySecret,
+    trust_root: TokenPublicKey,
+    client_auth: RelayClientAuth,
+    registry: ExposerRegistry,
+    rendezvous: PairRendezvous,
+    resolve: F,
+    budgets: IngressBudgets,
+) where
+    F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
+{
     let seed = secret.seed_hex();
-    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_FLOWS));
+    let handshake_limiter = Arc::new(Semaphore::new(budgets.handshakes));
+    let flow_limiter = Arc::new(Semaphore::new(budgets.flows));
+    let park_limiter = Arc::new(Semaphore::new(budgets.parked));
+    let park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>> = Arc::new(StdMutex::new(HashMap::new()));
     loop {
-        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+        let Ok(hs_permit) = Arc::clone(&handshake_limiter).acquire_owned().await else {
             return;
         };
         let Ok(Some(conn)) = quic::accept(&endpoint).await else {
@@ -1185,15 +1277,22 @@ pub async fn run_ingress_router<F>(
         let resolve = resolve.clone();
         let registry = registry.clone();
         let rendezvous = rendezvous.clone();
+        let flow_limiter = Arc::clone(&flow_limiter);
+        let park_limiter = Arc::clone(&park_limiter);
+        let park_by_ip = Arc::clone(&park_by_ip);
         tokio::spawn(async move {
-            let _permit = permit;
             if let Err(e) = handle_ingress_connection(
                 conn,
+                hs_permit,
                 &relay_secret,
                 &trust_root,
                 client_auth,
                 &registry,
                 &rendezvous,
+                flow_limiter,
+                park_limiter,
+                park_by_ip,
+                budgets.parked_per_ip,
                 &resolve,
             )
             .await
@@ -1204,17 +1303,24 @@ pub async fn run_ingress_router<F>(
     }
 }
 
-/// Accept the first bi-stream + control frame on an ingress connection and dispatch to the
-/// registration (exposer), pairing-rendezvous (park/redeem), or forwarding (client) path.
+/// Accept the first bi-stream + control frame on an ingress connection (holding the short handshake
+/// slot `hs_permit`), then SWAP to the budget the frame kind draws from — releasing the handshake slot
+/// — and dispatch. `PairPark` takes a SEPARATE park budget (never the flow budget, HIGH-1);
+/// `Register`/`Dial`/`PairRedeem` take the flow budget.
 #[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_ingress_connection<F>(
     conn: Connection,
+    hs_permit: OwnedSemaphorePermit,
     relay_secret: &OverlaySecret,
     trust_root: &TokenPublicKey,
     client_auth: RelayClientAuth,
     registry: &ExposerRegistry,
     rendezvous: &PairRendezvous,
+    flow_limiter: Arc<Semaphore>,
+    park_limiter: Arc<Semaphore>,
+    park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>>,
+    parked_per_ip: u32,
     resolve: &F,
 ) -> Result<(), NetError>
 where
@@ -1227,13 +1333,45 @@ where
     let frame = timeout(HANDSHAKE_TIMEOUT, read_ingress_frame(&mut recv))
         .await
         .map_err(|_| NetError::Stream("ingress first-frame timed out".into()))??;
+    // Swap the handshake slot for the frame's own budget. PARK takes the SEPARATE park budget; every
+    // flow kind takes the flow budget. The handshake slot is released the instant the swap is made.
     match frame {
+        IngressFrame::PairPark(req) => {
+            park_admit_and_run(
+                conn,
+                send,
+                recv,
+                req,
+                rendezvous,
+                hs_permit,
+                &park_limiter,
+                &park_by_ip,
+                parked_per_ip,
+            )
+            .await
+        }
         IngressFrame::Register(req) => {
+            let _flow = flow_limiter
+                .acquire_owned()
+                .await
+                .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
+            drop(hs_permit);
             register_exposer(conn, send, recv, req, relay_secret, trust_root, registry).await
         }
-        IngressFrame::PairPark(req) => park_rendezvous(conn, send, recv, req, rendezvous).await,
-        IngressFrame::PairRedeem(req) => redeem_rendezvous(conn, send, recv, req, rendezvous).await,
+        IngressFrame::PairRedeem(req) => {
+            let _flow = flow_limiter
+                .acquire_owned()
+                .await
+                .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
+            drop(hs_permit);
+            redeem_rendezvous(conn, send, recv, req, rendezvous).await
+        }
         IngressFrame::Dial(req) => {
+            let _flow = flow_limiter
+                .acquire_owned()
+                .await
+                .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
+            drop(hs_permit);
             forward_resolved(
                 conn,
                 send,
@@ -1412,9 +1550,15 @@ struct PairRedeemRequest {
 /// Why a pairing park/redeem was refused by the relay (returned to the peer).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum PairReject {
+    /// The rendezvous id was empty or not exactly `PAIR_RENDEZVOUS_ID_LEN` bytes (a malformed code —
+    /// distinct from a collision, so an empty/garbage code is never reported as `CodeInUse`).
+    InvalidCode,
     /// A live rendezvous is ALREADY parked under this id (first-park-wins; never a silent takeover) —
     /// returned to a PARK.
     CodeInUse,
+    /// The relay's parked-rendezvous budget (global or per-source-IP) is full — returned to a PARK.
+    /// Unauthenticated PARK is bounded SEPARATELY from the forward/expose flow budget (HIGH-1).
+    TooManyParked,
     /// No live parked rendezvous for this id — never parked, already redeemed (single-use), or expired
     /// — returned to a REDEEM.
     UnknownOrSpent,
@@ -1580,11 +1724,100 @@ impl PairRendezvous {
     }
 }
 
+/// An RAII reservation of one per-source-IP parked-rendezvous slot: decrements the source's count on
+/// drop, so the per-IP cap tracks CONCURRENT parks exactly over the park's lifetime.
+#[cfg(feature = "server")]
+struct ParkIpGuard {
+    map: Arc<StdMutex<HashMap<IpAddr, u32>>>,
+    ip: IpAddr,
+}
+
+#[cfg(feature = "server")]
+impl Drop for ParkIpGuard {
+    fn drop(&mut self) {
+        let Ok(mut m) = self.map.lock() else { return };
+        if let Some(c) = m.get_mut(&self.ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Reserve one parked-rendezvous slot for `ip` if the source is under `cap`, returning an RAII guard
+/// that releases it on drop. `None` when the source already holds `cap` concurrent parks. A sync
+/// `std::sync::Mutex` (held only for the tiny increment/decrement — never across an `.await`) so the
+/// guard's `Drop` can release it.
+#[cfg(feature = "server")]
+fn try_reserve_park_ip(
+    map: &Arc<StdMutex<HashMap<IpAddr, u32>>>,
+    ip: IpAddr,
+    cap: u32,
+) -> Option<ParkIpGuard> {
+    let mut m = map.lock().ok()?;
+    let c = m.entry(ip).or_insert(0);
+    if *c >= cap {
+        return None;
+    }
+    *c += 1;
+    drop(m);
+    Some(ParkIpGuard {
+        map: Arc::clone(map),
+        ip,
+    })
+}
+
+/// Admit a PARK onto the SEPARATE park budget, then run it (HIGH-1). Rejects — releasing the handshake
+/// slot and NEVER touching the forward/expose flow budget — a malformed id (`InvalidCode`), a source
+/// over its per-IP cap, or a full global park budget (both `TooManyParked`). On admission it swaps the
+/// handshake slot for the park permit + the per-IP reservation (both held for the park's life).
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn park_admit_and_run(
+    conn: Connection,
+    mut send: SendStream,
+    recv: RecvStream,
+    req: PairParkRequest,
+    registry: &PairRendezvous,
+    hs_permit: OwnedSemaphorePermit,
+    park_limiter: &Arc<Semaphore>,
+    park_by_ip: &Arc<StdMutex<HashMap<IpAddr, u32>>>,
+    parked_per_ip: u32,
+) -> Result<(), NetError> {
+    // INFO-2 — a rendezvous id is exactly PAIR_RENDEZVOUS_ID_LEN bytes; an empty/garbage id is an
+    // `InvalidCode` (never reported as a collision), and bounding the key size bounds a flood's map.
+    if req.code.len() != boatramp_overlay_proto::PAIR_RENDEZVOUS_ID_LEN {
+        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::InvalidCode)).await;
+        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+        return Err(NetError::PairRejected(PairReject::InvalidCode));
+    }
+    // Per-source-IP concurrent-park cap (secondary bound): one source cannot eat the whole budget.
+    let ip = conn.remote_address().ip();
+    let Some(ip_guard) = try_reserve_park_ip(park_by_ip, ip, parked_per_ip) else {
+        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::TooManyParked)).await;
+        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+        return Err(NetError::PairRejected(PairReject::TooManyParked));
+    };
+    // The SEPARATE park budget (HIGH-1): `try_acquire` — never block (a blocked park would pile up on
+    // the handshake budget) — so a full budget rejects cleanly instead of waiting.
+    let Ok(park_permit) = Arc::clone(park_limiter).try_acquire_owned() else {
+        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::TooManyParked)).await;
+        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+        return Err(NetError::PairRejected(PairReject::TooManyParked));
+    };
+    // Admitted: release the handshake slot — the park now holds ONLY the park budget + the per-IP slot.
+    drop(hs_permit);
+    park_rendezvous(conn, send, recv, req, registry, park_permit, ip_guard).await
+}
+
 /// Relay pairing: PARK one accepter under its rendezvous id. No relay E2EE handshake — the relay is
 /// blind; the rendezvous id (the `bropair1` code's core) is the only credential, and the SAS backstops
-/// the pairing. Parks the connection, acks, then HOLDS it (bounded by the rendezvous TTL) so a redeem
-/// can open the bridged pairing stream down it; on the TTL with no redeem it force-closes the parked
-/// connection (freeing the Semaphore slot the accept loop holds) and releases the id.
+/// the pairing. Admission (budget + per-IP + code-length) already passed in [`park_admit_and_run`];
+/// here it parks the connection, acks, then HOLDS it (bounded by the rendezvous TTL) so a redeem can
+/// open the bridged pairing stream down it. The `_park_permit` + `_ip_guard` are held for the whole
+/// park and released the instant it ends; on the TTL with no redeem the parked connection is
+/// force-closed and the id released.
 #[cfg(feature = "server")]
 async fn park_rendezvous(
     conn: Connection,
@@ -1592,11 +1825,12 @@ async fn park_rendezvous(
     _recv: RecvStream,
     req: PairParkRequest,
     registry: &PairRendezvous,
+    park_permit: OwnedSemaphorePermit,
+    ip_guard: ParkIpGuard,
 ) -> Result<(), NetError> {
-    if req.code.is_empty() {
-        let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::CodeInUse)).await;
-        return Err(NetError::Stream("empty pairing rendezvous id".into()));
-    }
+    // Hold the park budget + per-IP reservation for the whole park; both release on return.
+    let _park_permit = park_permit;
+    let _ip_guard = ip_guard;
     let now = now_unix();
     let expires_at = now.saturating_add(PAIR_RENDEZVOUS_TTL_SECS);
     if !registry
@@ -1611,7 +1845,7 @@ async fn park_rendezvous(
     write_msg(&mut send, &PairResult::Ok).await?;
     tracing::info!("overlay relay: pairing rendezvous parked");
     // Hold until the connection drops (the accepter finished the bridged handshake and closed, or
-    // aborted) OR the TTL elapses with no redeem — then force-close to free the accept-loop slot.
+    // aborted) OR the TTL elapses with no redeem — then force-close to free the park-budget slot.
     if timeout(
         std::time::Duration::from_secs(PAIR_RENDEZVOUS_TTL_SECS),
         conn.closed(),
@@ -1637,6 +1871,17 @@ async fn redeem_rendezvous(
     req: PairRedeemRequest,
     registry: &PairRendezvous,
 ) -> Result<(), NetError> {
+    // INFO-2 — a rendezvous id is exactly PAIR_RENDEZVOUS_ID_LEN bytes; reject a malformed one up front
+    // (distinct from `UnknownOrSpent`) rather than treating it as a miss.
+    if req.code.len() != boatramp_overlay_proto::PAIR_RENDEZVOUS_ID_LEN {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::InvalidCode),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::InvalidCode));
+    }
     let Some(parked) = registry.redeem(&req.code, now_unix()).await else {
         write_msg(
             &mut client_send,
@@ -2457,18 +2702,36 @@ mod tests {
     }
 
     /// As [`spawn_ingress_relay`], but with a caller-supplied [`PairRendezvous`] so the pairing tests
-    /// can share + inspect the relay's rendezvous registry.
+    /// can share + inspect the relay's rendezvous registry. Production admission budgets.
     fn spawn_ingress_relay_with_rendezvous(
         relay: &OverlaySecret,
         root_pub: TokenPublicKey,
         registry: ExposerRegistry,
         rendezvous: PairRendezvous,
     ) -> SocketAddr {
+        spawn_ingress_relay_with_budgets(
+            relay,
+            root_pub,
+            registry,
+            rendezvous,
+            IngressBudgets::DEFAULT,
+        )
+    }
+
+    /// As [`spawn_ingress_relay_with_rendezvous`], but with explicit [`IngressBudgets`] so the HIGH-1
+    /// tests can drive the park-vs-flow budget separation and the per-IP cap with tiny budgets.
+    fn spawn_ingress_relay_with_budgets(
+        relay: &OverlaySecret,
+        root_pub: TokenPublicKey,
+        registry: ExposerRegistry,
+        rendezvous: PairRendezvous,
+        budgets: IngressBudgets,
+    ) -> SocketAddr {
         let relay_ep =
             quic::server_endpoint(relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = relay_ep.local_addr().unwrap();
         let relay_secret = OverlaySecret::from_seed_hex(&relay.seed_hex()).unwrap();
-        tokio::spawn(run_ingress_router(
+        tokio::spawn(run_ingress_router_with_budgets(
             relay_ep,
             relay_secret,
             root_pub,
@@ -2476,6 +2739,7 @@ mod tests {
             registry,
             rendezvous,
             |_s: &str| None::<(SocketAddr, OverlayId, bool)>,
+            budgets,
         ));
         addr
     }
@@ -3664,6 +3928,179 @@ mod tests {
             sas_a.bits(),
             sas_d.bits(),
             "an active MITM rendezvous relay yields diverging SAS codes — the comparison catches it"
+        );
+    }
+
+    // ---- HIGH-1: park budget is SEPARATE from the forward/expose flow budget ----
+
+    /// Anti-hollow (HIGH-1): an unauthenticated PARK flood CANNOT starve the forward/expose flow
+    /// budget. With `flows = parked = 1`, a held park fills the PARK budget; a forward dial STILL
+    /// succeeds (returns its verdict) because it draws from the SEPARATE flow budget. MUTATION-RED:
+    /// make a park draw from the flow budget (`flow_limiter` in place of `park_limiter` in
+    /// `park_admit_and_run`) and the held park consumes the one flow slot → the forward dial never
+    /// gets a flow permit → `handle_ingress_connection` never reads its request → `forward_flow` hangs
+    /// → the timeout below fires → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_park_flood_does_not_starve_the_forward_flow_budget() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        // flows = parked = 1: the single park fills the PARK budget; the forward must draw from the
+        // (untouched) flow budget. handshakes = 8 so the accept loop is never the bottleneck.
+        let relay_addr = spawn_ingress_relay_with_budgets(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            IngressBudgets {
+                handshakes: 8,
+                flows: 1,
+                parked: 1,
+                parked_per_ip: 4,
+            },
+        );
+        let code = vec![0xC0u8; 16];
+
+        // Hold a park (never redeemed): it occupies the one PARK slot for its TTL.
+        let code_a = code.clone();
+        let _park = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let _ = pair_relay_park(&ep, relay_addr, code_a).await; // blocks waiting for a redeem
+        });
+        assert!(
+            await_parked(&rendezvous, &code).await,
+            "the park must occupy the PARK budget"
+        );
+
+        // A forward dial to an UNCONFIGURED service: with the separate budgets it still gets a flow
+        // permit and the relay returns ServiceNotAuthorized — promptly, well within the timeout.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/none",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/none".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            ),
+        )
+        .await
+        .expect("the forward dial must get a flow permit despite the saturated PARK budget");
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(DialReject::ServiceNotAuthorized))
+            ),
+            "the forward dial draws from the separate flow budget and is handled, got {res:?}"
+        );
+    }
+
+    /// Per-source-IP cap (HIGH-1 secondary bound): a single source cannot park more than
+    /// `parked_per_ip` concurrent rendezvous. With the cap at 2, two held parks from loopback succeed,
+    /// and the THIRD from the same IP is refused `TooManyParked`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_per_source_ip_park_cap_rejects_beyond_the_limit() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        // Global budget is generous (8) so the per-IP cap (2) is the binding constraint.
+        let relay_addr = spawn_ingress_relay_with_budgets(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            IngressBudgets {
+                handshakes: 8,
+                flows: 8,
+                parked: 8,
+                parked_per_ip: 2,
+            },
+        );
+
+        // Two distinct codes parked from loopback (both held, never redeemed) — within the cap.
+        for i in 0..2u8 {
+            let code = vec![i; 16];
+            let _held = tokio::spawn(async move {
+                let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+                let _ = pair_relay_park(&ep, relay_addr, code).await;
+            });
+        }
+        // Wait until both are live in the registry.
+        for i in 0..2u8 {
+            assert!(
+                await_parked(&rendezvous, &[i; 16]).await,
+                "park #{i} from loopback must be admitted (under the per-IP cap)"
+            );
+        }
+
+        // The THIRD park from the SAME IP is refused — the per-IP cap, not the global budget.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let third = pair_relay_park(&ep, relay_addr, vec![99u8; 16]).await;
+        assert!(
+            matches!(
+                third,
+                Err(NetError::PairRejected(PairReject::TooManyParked))
+            ),
+            "the 3rd concurrent park from one IP must be refused TooManyParked, got {third:?}"
+        );
+    }
+
+    /// INFO-2: a wrong-length rendezvous id is rejected `InvalidCode` at BOTH park and redeem — never
+    /// parked, never treated as a collision or a miss. (Bounds a flood's registry-key size too.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrong_length_rendezvous_code_is_rejected_on_park_and_redeem() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_rendezvous(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous,
+        );
+
+        // PARK with a 3-byte (not 16) id → InvalidCode.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let park = pair_relay_park(&ep, relay_addr, vec![1, 2, 3]).await;
+        assert!(
+            matches!(park, Err(NetError::PairRejected(PairReject::InvalidCode))),
+            "a wrong-length id must be refused InvalidCode on park, got {park:?}"
+        );
+
+        // REDEEM with a wrong-length id → InvalidCode (distinct from UnknownOrSpent).
+        let ep2 = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let redeem = pair_relay_redeem(&ep2, relay_addr, vec![1, 2, 3]).await;
+        assert!(
+            matches!(redeem, Err(NetError::PairRejected(PairReject::InvalidCode))),
+            "a wrong-length id must be refused InvalidCode on redeem, got {redeem:?}"
         );
     }
 }
