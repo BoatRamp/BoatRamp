@@ -1158,6 +1158,99 @@ pub fn verify_overlay_publish(
     Ok(VerifiedOverlayPublish { holder, scope, exp })
 }
 
+/// Token kind: an **overlay-pairing-park capability** (overlay pairing PARK per-relay operator
+/// config) — the structural mirror of [`KIND_OVERLAY_PUBLISH`] for the AUTHENTICATED pairing-park
+/// mode: a relay operator may choose to require a parking accepter to present one of these and prove
+/// possession, exactly as `register_exposer` requires an overlay-publish capability. A relay in OPEN
+/// mode (the default) never checks for one. Unlike an overlay-publish capability this carries no
+/// `scope` (a pairing park authorizes the holder to park, full stop — there is no service name to
+/// bind it to); only the holder-binding carries over. The exact `br_kind` check means an
+/// overlay-publish/-dial/any other capability can never be redeemed as a pairing-park capability, nor
+/// the reverse.
+pub const KIND_OVERLAY_PAIRING_PARK: &str = "overlay-pairing-park";
+
+/// The verified contents of an overlay-pairing-park capability ([`verify_overlay_pairing_park`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverlayPairingPark {
+    /// The holder key (`cnf`, `"<alg>:<hex>"`) the parking accepter must prove possession of — the
+    /// relay checks it equals the accepter's E2EE-proven overlay identity AT PARK TIME, exactly the
+    /// holder-binding [`verify_overlay_publish`]'s caller applies at registration.
+    pub holder: String,
+    /// The capability's expiry (Unix seconds) — always present (an overlay-pairing-park capability
+    /// MUST be time-bounded, like every other overlay capability).
+    pub exp: u64,
+}
+
+/// Mint an **overlay-pairing-park capability** (`br_kind = "overlay-pairing-park"`): a holder-key-
+/// bound, offline-verifiable `COSE_Sign1` CWT authorizing `holder` — the pairing ACCEPTER's overlay
+/// identity — to PARK a rendezvous at a relay whose operator has opted into AUTHENTICATED pairing-park
+/// (the owner's per-relay choice; OPEN mode, the default, never checks this), signed by the fleet
+/// `Signer` trust root with `iat = now`, `exp = now + ttl_secs`, and a `cti`. A relay in authenticated
+/// mode authorizes a park from it with [`verify_overlay_pairing_park`] plus a holder-key check against
+/// the parking peer's E2EE-proven identity — no control-plane round-trip, mirroring
+/// [`mint_overlay_publish`]/`register_exposer`. The holder's private key never leaves the holder; only
+/// its public half (`cnf`) is embedded.
+pub async fn mint_overlay_pairing_park(
+    holder: &TokenPublicKey,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_OVERLAY_PAIRING_PARK.to_string()),
+        )
+        .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder.to_hex()))
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an overlay-pairing-park capability against the fleet public key at `now_unix`: checks the
+/// COSE signature, the **mandatory** expiry, and `br_kind == "overlay-pairing-park"`, returning the
+/// bound holder key + expiry. Fail-closed: a forged/unsigned/expired/wrong-kind token never verifies,
+/// and an overlay-publish/-dial/any other kind presented here is rejected (domain separation). The
+/// caller MUST additionally confirm the returned `holder` equals the parking peer's E2EE-proven
+/// identity (holder binding) before honoring the park — exactly as `register_exposer` does for an
+/// overlay-publish capability.
+pub fn verify_overlay_pairing_park(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedOverlayPairingPark, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    // An overlay-pairing-park capability MUST be time-bounded (as publish/dial are): a token with no
+    // `exp` is refused rather than treated as immortal.
+    let exp = check_exp(&claims, now_unix)?.ok_or_else(|| {
+        TokenError::Claims("overlay-pairing-park capability has no expiry".into())
+    })?;
+    let mut kind = None;
+    let mut holder = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_CNF => holder = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_OVERLAY_PAIRING_PARK) {
+        return Err(TokenError::Claims(
+            "not an overlay-pairing-park capability".into(),
+        ));
+    }
+    let holder = holder.ok_or_else(|| {
+        TokenError::Claims("overlay-pairing-park capability has no holder".into())
+    })?;
+    Ok(VerifiedOverlayPairingPark { holder, exp })
+}
+
 /// A member's role in the boatramp overlay fabric — a **closed** scalar set carried by both an
 /// enrollment invitation ([`KIND_OVERLAY_ENROLL`]) and a membership credential ([`KIND_OVERLAY_MEMBER`]).
 /// Representing it as an enum (rather than a bare string) makes an invalid role unrepresentable at mint
@@ -3923,6 +4016,115 @@ mod tests {
                 Err(TokenError::Claims(_))
             ),
             "an overlay-publish token must not verify as an overlay-dial capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_pairing_park_round_trips_and_requires_an_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+
+        // A properly-minted capability (exp = now + ttl) verifies and carries holder + exp.
+        let good = mint_overlay_pairing_park(&holder_pub, 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_pairing_park(&good, &root_pub, NOW).unwrap();
+        assert_eq!(v.holder, holder_pub.to_hex());
+        assert_eq!(v.exp, NOW + 300);
+
+        // A token with NO `exp` claim — otherwise identical and correctly signed — is REFUSED: an
+        // overlay-pairing-park capability is never treated as immortal.
+        let no_exp = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_PAIRING_PARK.to_string()),
+            )
+            .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder_pub.to_hex()))
+            .build();
+        let no_exp = sign_claims(no_exp, &root).await.unwrap();
+        assert!(
+            matches!(
+                verify_overlay_pairing_park(&no_exp, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-pairing-park capability with no expiry must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_pairing_park_rejects_a_wrong_trust_root_and_an_expired_token() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let impostor = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+        let token = mint_overlay_pairing_park(&holder_pub, 300, NOW, &root)
+            .await
+            .unwrap();
+
+        // Verified against the WRONG root → the signature check fails.
+        assert!(
+            verify_overlay_pairing_park(&token, &impostor.public_key(), NOW).is_err(),
+            "a pairing-park capability from a different trust root must be refused"
+        );
+        // Evaluated past expiry → refused.
+        assert!(
+            verify_overlay_pairing_park(&token, &root.public_key(), NOW + 600).is_err(),
+            "an expired pairing-park capability must be refused"
+        );
+    }
+
+    /// Domain separation (the load-bearing `br_kind` check), BOTH ways: an overlay-PUBLISH/-DIAL token
+    /// never verifies as a pairing-park capability, and a pairing-park capability never verifies as a
+    /// publish/dial capability — so a capability minted for one purpose can never be redeemed as
+    /// another.
+    #[tokio::test]
+    async fn overlay_pairing_park_is_domain_separated_from_publish_and_dial() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let holder_pub = holder.public_key();
+
+        let dial = mint_overlay_dial(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let publish = mint_overlay_publish(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let park = mint_overlay_pairing_park(&holder_pub, 300, NOW, &root)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                verify_overlay_pairing_park(&dial, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-dial token must not verify as a pairing-park capability"
+        );
+        assert!(
+            matches!(
+                verify_overlay_pairing_park(&publish, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-publish token must not verify as a pairing-park capability"
+        );
+        assert!(
+            matches!(
+                verify_overlay_dial(&park, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "a pairing-park token must not verify as an overlay-dial capability"
+        );
+        assert!(
+            matches!(
+                verify_overlay_publish(&park, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "a pairing-park token must not verify as an overlay-publish capability"
         );
     }
 

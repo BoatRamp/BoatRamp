@@ -193,6 +193,12 @@ enum OverlayCommand {
         /// `overlay pair-code`.
         #[arg(long, value_name = "CODE", conflicts_with_all = ["listen", "peer"])]
         accept: Option<String>,
+        /// Only meaningful with `--accept`: present this holder-bound `overlay-pairing-park`
+        /// capability (from `overlay pair-code --accepter-pubkey`, the `park_cap` it prints) and prove
+        /// possession of it to the relay — REQUIRED when the relay's `pairing_park` config is
+        /// `"authenticated"`; omit for an OPEN-mode relay (today's default), where it is never sent.
+        #[arg(long, value_name = "CAP", requires = "accept")]
+        park_cap: Option<String>,
         /// Act as the INITIATOR over the human-typeable SHORT-CODE path: redeem this short code (e.g.
         /// `1234-5678`; separators optional) via the control plane's unauthenticated relay-topology
         /// lookup (`GET /api/overlay/pair-relay` — a short code carries no topology of its own), then
@@ -236,6 +242,14 @@ enum OverlayCommand {
         /// by design; the relay rate-limits + locks out online guessing on redeem.
         #[arg(long)]
         short: bool,
+        /// The ACCEPTER's overlay public key (`ed25519:<hex>`/`bro1…`, e.g. from their `overlay id`) —
+        /// REQUIRED when this cluster's relay runs AUTHENTICATED pairing-park (`[overlay]
+        /// pairing_park = "authenticated"`), in which case the mint ALSO returns a holder-bound
+        /// `overlay-pairing-park` capability bound to this key: give that capability to the accepter
+        /// alongside the code (they present it with `overlay pair --accept <code> --park-cap <cap>`).
+        /// Ignored (and optional) against an OPEN-mode relay (today's default).
+        #[arg(long, value_name = "PUBKEY")]
+        accepter_pubkey: Option<String>,
         /// boatramp server base URL (overrides `[publish].server`).
         #[arg(long, env = "BOATRAMP_SERVER")]
         server: Option<String>,
@@ -587,6 +601,11 @@ pub enum OverlayOutput {
         /// The human-typeable short-code alias (e.g. `"1234-5678"`), present only when `--short` was
         /// requested.
         short_code: Option<String>,
+        /// The holder-bound `overlay-pairing-park` capability (COSE), present only when this
+        /// cluster's relay runs AUTHENTICATED pairing-park (`--accepter-pubkey` was honored). Give it
+        /// to the accepter alongside the code: they present it with
+        /// `overlay pair --accept <code> --park-cap <cap>`.
+        park_cap: Option<String>,
     },
     /// `overlay pair` — a confirmed pairing: the peer's proven identity (pinned locally) plus the
     /// SAS the operators compared.
@@ -735,6 +754,7 @@ impl Rendered for OverlayOutput {
                 relay_id,
                 expires_at,
                 short_code,
+                park_cap,
             } => {
                 writeln!(w, "{code}")?;
                 writeln!(w)?;
@@ -745,10 +765,28 @@ impl Rendered for OverlayOutput {
                 )?;
                 writeln!(w, "#   relay:             {relay} ({relay_id})")?;
                 writeln!(w, "#   expires at (unix): {expires_at}")?;
-                writeln!(
-                    w,
-                    "# Park it (operator):  boatramp overlay pair --accept {code}"
-                )?;
+                match park_cap {
+                    None => {
+                        writeln!(
+                            w,
+                            "# Park it (operator):  boatramp overlay pair --accept {code}"
+                        )?;
+                    }
+                    Some(cap) => {
+                        writeln!(w)?;
+                        writeln!(
+                            w,
+                            "# AUTHENTICATED pairing-park: give the accepter this capability too (a \
+                             secret bound to their key — deliver it over a private channel):"
+                        )?;
+                        writeln!(w, "{cap}")?;
+                        writeln!(w)?;
+                        writeln!(
+                            w,
+                            "# Park it (accepter):  boatramp overlay pair --accept {code} --park-cap {cap}"
+                        )?;
+                    }
+                }
                 writeln!(w, "# Redeem it (peer):    boatramp overlay pair {code}")?;
                 if let Some(short) = short_code {
                     writeln!(w)?;
@@ -883,6 +921,7 @@ pub async fn run(
         OverlayCommand::Pair {
             listen,
             accept,
+            park_cap,
             short,
             peer,
             identity,
@@ -893,6 +932,7 @@ pub async fn run(
             pair_run(
                 listen,
                 accept,
+                park_cap,
                 short,
                 peer,
                 identity,
@@ -906,8 +946,9 @@ pub async fn run(
         OverlayCommand::PairCode {
             ttl_secs,
             short,
+            accepter_pubkey,
             server,
-        } => pair_code_run(ttl_secs, short, server, config).await,
+        } => pair_code_run(ttl_secs, short, accepter_pubkey, server, config).await,
         OverlayCommand::Policy { cmd } => policy_run(cmd, config).await,
         OverlayCommand::Invite {
             role,
@@ -1117,6 +1158,7 @@ fn decide_sas(sas: &SasCode, typed: &str) -> ConfirmOutcome {
 async fn pair_run(
     listen: Option<String>,
     accept_code: Option<String>,
+    park_cap: Option<String>,
     short_code: Option<String>,
     peer: Option<String>,
     identity: Option<String>,
@@ -1128,7 +1170,7 @@ async fn pair_run(
     use boatramp_overlay::{
         OverlayPeerPolicy, PairCode, Role, ShortCode, VerifiedPeers, accept,
         client_endpoint_server_auth, dial, identity_fp, pair_dial_endpoint, pair_relay_park,
-        pair_relay_redeem, pair_relay_redeem_short, server_endpoint,
+        pair_relay_park_authenticated, pair_relay_redeem, pair_relay_redeem_short, server_endpoint,
     };
     use boatramp_overlay_client::OverlayClient;
 
@@ -1176,9 +1218,27 @@ async fn pair_run(
                 code.relay_addr,
                 secret.id().to_bech32()
             );
-            let (conn, mut send, mut recv) = pair_relay_park(&ep, relay_addr, code.rendezvous)
+            // AUTHENTICATED pairing-park (owner decision, per-relay operator config): when the
+            // operator supplied a `--park-cap`, present it and prove possession to the relay — EXACTLY
+            // the holder-binding the exposer-registration path already applies. Omitted ⇒ the OPEN-mode
+            // flow, byte-for-byte unchanged.
+            let (conn, mut send, mut recv) = match park_cap {
+                Some(cap) => pair_relay_park_authenticated(
+                    &ep,
+                    relay_addr,
+                    code.relay_id,
+                    code.rendezvous,
+                    &secret,
+                    cap,
+                )
                 .await
-                .map_err(|e| Error::Overlay(format!("relay rendezvous (park): {e}")))?;
+                .map_err(|e| {
+                    Error::Overlay(format!("relay rendezvous (authenticated park): {e}"))
+                })?,
+                None => pair_relay_park(&ep, relay_addr, code.rendezvous)
+                    .await
+                    .map_err(|e| Error::Overlay(format!("relay rendezvous (park): {e}")))?,
+            };
             let out = client
                 .pair(&mut send, &mut recv, Role::Responder, deadline)
                 .await
@@ -1323,6 +1383,10 @@ struct PairCodeRequestBody {
     /// ALSO mint a human-typeable short-code alias (overlay follow-up #2 inc3).
     #[serde(default)]
     short: bool,
+    /// The accepter's overlay pubkey to bind an `overlay-pairing-park` capability to — only
+    /// meaningful (and required) against an AUTHENTICATED-pairing-park relay; ignored in OPEN mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepter_pubkey: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1335,16 +1399,24 @@ struct PairCodeResponseBody {
     /// The grouped short-code alias (e.g. `"1234-5678"`), present only when `short` was requested.
     #[serde(default)]
     short_code: Option<String>,
+    /// The holder-bound `overlay-pairing-park` capability (COSE), present only when this cluster's
+    /// relay runs AUTHENTICATED pairing-park (`accepter_pubkey` was supplied and honored).
+    #[serde(default)]
+    park_cap: Option<String>,
 }
 
 /// Run `overlay pair-code`: mint a single-use pairing rendezvous code at the control plane
 /// (`Overlay·Admin`) and assemble the copy-pasteable `bropair1…` the operator shares with the new
 /// peer. The server returns the relay topology + a fresh rendezvous id; the CLI packs them into the
 /// bech32m code (the overlay analog of assembling a `brfwd1…` ticket from the dial response). With
-/// `short`, also prints the server-minted human-typeable short-code alias.
+/// `short`, also prints the server-minted human-typeable short-code alias. With `accepter_pubkey` (
+/// REQUIRED against an AUTHENTICATED-pairing-park relay), the response ALSO carries a holder-bound
+/// `overlay-pairing-park` capability — printed alongside the code for the operator to hand to the
+/// accepter, who presents it with `overlay pair --accept <code> --park-cap <cap>`.
 async fn pair_code_run(
     ttl_secs: u64,
     short: bool,
+    accepter_pubkey: Option<String>,
     server: Option<String>,
     config: &crate::config::ProjectConfig,
 ) -> Result<OverlayOutput> {
@@ -1354,7 +1426,11 @@ async fn pair_code_run(
         crate::client::connect(server, config).map_err(|e| Error::Overlay(e.to_string()))?;
     let resp = http
         .post(format!("{server}/api/overlay/pair-code"))
-        .json(&PairCodeRequestBody { ttl_secs, short })
+        .json(&PairCodeRequestBody {
+            ttl_secs,
+            short,
+            accepter_pubkey,
+        })
         .send()
         .await
         .map_err(|e| Error::Overlay(e.to_string()))?;
@@ -1384,6 +1460,7 @@ async fn pair_code_run(
         relay_id: body.relay_id,
         expires_at: body.expires_at,
         short_code: body.short_code,
+        park_cap: body.park_cap,
     })
 }
 

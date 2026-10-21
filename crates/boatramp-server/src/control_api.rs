@@ -1066,6 +1066,13 @@ pub(super) struct OverlayPairCodeRequest {
     /// `false` (the default) keeps the response unchanged (`bropair1…` only).
     #[serde(default)]
     pub(super) short: bool,
+    /// The ACCEPTER's overlay public key (`ed25519:<hex>`/`bro1…`) — REQUIRED when this cluster's
+    /// relay runs AUTHENTICATED pairing-park (`[overlay] pairing_park = "authenticated"`), in which
+    /// case it is ALSO minted a holder-bound `overlay-pairing-park` capability bound to this key
+    /// (mirrors `OverlayExposeRequest::holder_pubkey`). Ignored (and optional) when the relay is in
+    /// OPEN mode (the default) — no capability is minted.
+    #[serde(default)]
+    pub(super) accepter_pubkey: Option<String>,
 }
 
 /// `POST /api/overlay/pair-code` response: the rendezvous id + the ingress relay to meet at. The CLI
@@ -1086,20 +1093,33 @@ struct OverlayPairCodeResponse {
     /// when `short` was requested AND this node's relay can mint one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     short_code: Option<String>,
+    /// The holder-bound `overlay-pairing-park` capability (COSE), present ONLY when this cluster's
+    /// relay runs AUTHENTICATED pairing-park — the accepter must present it (and prove possession) to
+    /// park. Absent in OPEN mode (the default): the relay never checks for one, so none is minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park_cap: Option<String>,
 }
 
 /// Mint a single-use pairing rendezvous code (self-serve `boatramp overlay pair-code`). Gated
 /// `Overlay·Admin` — minting one stands up a relay rendezvous keyed to this cluster's ingress relay,
 /// an owner-grade act (the same tier as `expose`/`invite`). `404` when this node runs no ingress relay
-/// accepting rendezvous (`[overlay] accept_exposed`), mirroring `overlay_expose`. The code is NOT a
-/// signed capability (so no root key is needed): its security is the short TTL + the relay's single-use
-/// redemption + the relay-blind bridge + the out-of-band SAS — never a secret the relay verifies.
+/// accepting rendezvous (`[overlay] accept_exposed`), mirroring `overlay_expose`. The code itself is
+/// NEVER a signed capability: its security is the short TTL + the relay's single-use redemption + the
+/// relay-blind bridge + the out-of-band SAS — never a secret the relay verifies.
 ///
 /// With `short: true`, ALSO mints a human-typeable short-code alias (overlay follow-up #2 inc3) into
 /// the SAME shared alias table the relay's short-redeem handler resolves against — an INDEPENDENT
 /// random alias for the rendezvous id (never a truncation of it), rate-limited + lockout-guarded at the
 /// relay against online guessing (see `boatramp_overlay::net::PairGuessLimiter`).
+///
+/// When this cluster's relay runs AUTHENTICATED pairing-park (`[overlay] pairing_park =
+/// "authenticated"`, the owner's per-relay operator choice), this ALSO mints a holder-bound
+/// `overlay-pairing-park` capability for the `accepter_pubkey` the request supplies — mirrors
+/// `overlay_expose`'s holder validation + mint (ed25519-only, server-TTL-clamped) — needing a root
+/// signer (`501` without one). Skipped entirely in OPEN mode (the default): no signer is required and
+/// no capability is minted, exactly as before this feature existed.
 pub(super) async fn overlay_pair_code(
+    Extension(issuer): Extension<Issuer>,
     Extension(directory): Extension<OverlayDirectory>,
     Json(request): Json<OverlayPairCodeRequest>,
 ) -> Response {
@@ -1120,6 +1140,54 @@ pub(super) async fn overlay_pair_code(
         .ttl_secs
         .unwrap_or(DEFAULT_OVERLAY_PAIR_CODE_TTL_SECS)
         .min(MAX_OVERLAY_PAIR_CODE_TTL_SECS);
+    let now = now_unix();
+    // AUTHENTICATED pairing-park (the owner's per-relay operator choice): ALSO mint a holder-bound
+    // `overlay-pairing-park` capability for the accepter, bound to the pubkey the operator supplies at
+    // mint time — mirrors `overlay_expose`'s holder validation + mint. Skipped entirely in OPEN mode
+    // (the default): the code is then NOT a signed capability, exactly as before this feature existed.
+    let park_cap = if relay.pairing_park == PairingParkMode::Authenticated {
+        let Some(accepter_pubkey) = request.accepter_pubkey.as_deref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this relay requires `accepter_pubkey` (AUTHENTICATED pairing-park)\n",
+            )
+                .into_response();
+        };
+        let holder = match cose::TokenPublicKey::from_hex(accepter_pubkey) {
+            Ok(h) => h,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid accepter_pubkey: {err}\n"),
+                )
+                    .into_response();
+            }
+        };
+        // INFO-2 (mirrors `overlay_expose`) — an overlay identity is ed25519-only; an es256 holder
+        // would yield a silently-unusable capability (the park handshake can't present it).
+        if holder.alg() != cose::TokenAlg::Ed25519 {
+            return (
+                StatusCode::BAD_REQUEST,
+                "accepter_pubkey must be an ed25519 overlay identity (es256 keys cannot park)\n",
+            )
+                .into_response();
+        }
+        let Some(signer) = &issuer.0 else {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "this node has no root private key and cannot mint pairing-park capabilities\n",
+            )
+                .into_response();
+        };
+        match cose::mint_overlay_pairing_park(&holder, ttl, now, &**signer).await {
+            Ok(token) => Some(token),
+            Err(err) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+        }
+    } else {
+        None
+    };
     // The rendezvous id is high-entropy platform randomness — infeasible to guess, so the matching
     // park/redeem is the whole mechanism and the Overlay·Admin mint controls who may obtain one.
     let mut rendezvous = [0u8; OVERLAY_PAIR_RENDEZVOUS_ID_LEN];
@@ -1130,7 +1198,6 @@ pub(super) async fn overlay_pair_code(
         )
             .into_response();
     }
-    let now = now_unix();
     let expires_at = now.saturating_add(ttl);
 
     let short_code = if request.short {
@@ -1163,6 +1230,7 @@ pub(super) async fn overlay_pair_code(
             rendezvous: hex::encode(rendezvous),
             expires_at,
             short_code,
+            park_cap,
         }),
     )
         .into_response()
@@ -2737,10 +2805,12 @@ mod tests {
     async fn overlay_pair_code_404_without_relay_and_201_with_relay() {
         // No ingress relay → 404 (nowhere to host the rendezvous).
         let resp = overlay_pair_code(
+            Extension(Issuer(None)),
             Extension(OverlayDirectory::default()),
             Json(OverlayPairCodeRequest {
                 ttl_secs: None,
                 short: false,
+                accepter_pubkey: None,
             }),
         )
         .await;
@@ -2753,12 +2823,15 @@ mod tests {
             trust_root: "ed25519:root".into(),
             client_auth: "capability-only".into(),
             pair_short_codes: None,
+            pairing_park: PairingParkMode::Open,
         }));
         let resp = overlay_pair_code(
+            Extension(Issuer(None)),
             Extension(directory),
             Json(OverlayPairCodeRequest {
                 ttl_secs: Some(u64::MAX), // clamped to the short pairing ceiling
                 short: false,
+                accepter_pubkey: None,
             }),
         )
         .await;
@@ -2784,6 +2857,11 @@ mod tests {
         assert!(
             v.get("short_code").is_none(),
             "short_code must be omitted when `short` was not requested"
+        );
+        // OPEN mode (the default) never mints a pairing-park capability.
+        assert!(
+            v.get("park_cap").is_none(),
+            "park_cap must be omitted in OPEN mode"
         );
     }
 
@@ -2817,12 +2895,15 @@ mod tests {
             pair_short_codes: Some(std::sync::Arc::new(StubShortCodeMint {
                 result: Ok(("12345678".into(), "1234-5678".into())),
             })),
+            pairing_park: PairingParkMode::Open,
         }));
         let resp = overlay_pair_code(
+            Extension(Issuer(None)),
             Extension(directory),
             Json(OverlayPairCodeRequest {
                 ttl_secs: None,
                 short: true,
+                accepter_pubkey: None,
             }),
         )
         .await;
@@ -2842,16 +2923,126 @@ mod tests {
             pair_short_codes: Some(std::sync::Arc::new(StubShortCodeMint {
                 result: Err("exhausted short-code collision retries".into()),
             })),
+            pairing_park: PairingParkMode::Open,
         }));
         let resp2 = overlay_pair_code(
+            Extension(Issuer(None)),
             Extension(directory2),
             Json(OverlayPairCodeRequest {
                 ttl_secs: None,
                 short: true,
+                accepter_pubkey: None,
             }),
         )
         .await;
         assert_eq!(resp2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// AUTHENTICATED pairing-park (the owner's per-relay operator choice): with no `accepter_pubkey`
+    /// → `400` (the relay requires one to bind the capability to); with a non-ed25519 pubkey → `400`
+    /// (mirrors `overlay_expose`'s holder-alg check — an es256 key can never present the park
+    /// handshake); with no root signer on this node → `501` (mirrors `overlay_expose`'s no-signer
+    /// case) — never a silently-unsigned/weaker capability.
+    #[tokio::test]
+    async fn overlay_pair_code_authenticated_mode_validates_before_minting() {
+        let root: StdArc<dyn Signer> = StdArc::new(ed25519());
+        let accepter_hex = ed25519().public_key().to_hex();
+        let directory = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+            pair_short_codes: None,
+            pairing_park: PairingParkMode::Authenticated,
+        }));
+
+        // No `accepter_pubkey` → 400.
+        let resp = overlay_pair_code(
+            Extension(Issuer(Some(root.clone()))),
+            Extension(directory.clone()),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: false,
+                accepter_pubkey: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A non-ed25519 `accepter_pubkey` → 400.
+        let es256_hex = LocalSigner::generate(TokenAlg::Es256).public_key().to_hex();
+        let resp = overlay_pair_code(
+            Extension(Issuer(Some(root.clone()))),
+            Extension(directory.clone()),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: false,
+                accepter_pubkey: Some(es256_hex),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A valid ed25519 `accepter_pubkey`, but no root signer on this node → 501.
+        let resp = overlay_pair_code(
+            Extension(Issuer(None)),
+            Extension(directory),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: false,
+                accepter_pubkey: Some(accepter_hex),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// AUTHENTICATED pairing-park, the happy path: with a signer + a valid ed25519 `accepter_pubkey`,
+    /// the mint ALSO returns a `park_cap` — a holder-bound `overlay-pairing-park` capability that
+    /// verifies against this node's root and is bound to EXACTLY the supplied accepter key, TTL-
+    /// clamped to the same short pairing ceiling as the code itself. OPEN mode (tested above) never
+    /// returns this field.
+    #[tokio::test]
+    async fn overlay_pair_code_authenticated_mode_mints_a_holder_bound_park_cap() {
+        let root = ed25519();
+        let root_pub = root.public_key();
+        let accepter_pub = ed25519().public_key();
+        let directory = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+            pair_short_codes: None,
+            pairing_park: PairingParkMode::Authenticated,
+        }));
+        let resp = overlay_pair_code(
+            Extension(Issuer(Some(StdArc::new(root)))),
+            Extension(directory),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: Some(u64::MAX), // clamped to the short pairing ceiling, like the code itself
+                short: false,
+                accepter_pubkey: Some(accepter_pub.to_hex()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cap = v["park_cap"].as_str().expect("a minted park_cap");
+        let now = now_unix();
+        let verified = cose::verify_overlay_pairing_park(cap, &root_pub, now)
+            .expect("the minted park_cap must verify against this node's root");
+        assert_eq!(
+            verified.holder,
+            accepter_pub.to_hex(),
+            "the park_cap must be bound to EXACTLY the supplied accepter_pubkey"
+        );
+        assert!(
+            verified.exp <= now + MAX_OVERLAY_PAIR_CODE_TTL_SECS + 2,
+            "the park_cap's TTL must be clamped to the short pairing ceiling"
+        );
     }
 
     /// `GET /api/overlay/pair-relay`: `404` with no relay role, `200` with `{relay, relay_id}` when
@@ -2867,6 +3058,7 @@ mod tests {
             trust_root: "ed25519:root".into(),
             client_auth: "capability-only".into(),
             pair_short_codes: None,
+            pairing_park: PairingParkMode::Open,
         }));
         let resp = overlay_pair_relay(Extension(directory)).await;
         assert_eq!(resp.status(), StatusCode::OK);

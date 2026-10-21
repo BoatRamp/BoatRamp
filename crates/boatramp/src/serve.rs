@@ -1093,8 +1093,9 @@ async fn spawn_overlay_roles(
     use boatramp_overlay::{
         ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret,
         PAIR_SHORT_CODE_DIGITS_DEFAULT, PAIR_SHORT_CODE_DIGITS_MAX, PAIR_SHORT_CODE_DIGITS_MIN,
-        PairRendezvous, PairShortCodes, PathMode, RelayClientAuth, run_egress_router,
-        run_forwarding_router, run_ingress_router, server_endpoint, server_endpoint_with_trust,
+        PairRendezvous, PairShortCodes, PairingParkMode, PathMode, RelayClientAuth,
+        run_egress_router, run_forwarding_router, run_ingress_router, server_endpoint,
+        server_endpoint_with_trust,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1256,6 +1257,26 @@ async fn spawn_overlay_roles(
         // ingress router (which ALSO admits exposer registrations into an in-memory registry and
         // bridges forward clients down a parked exposer connection). Otherwise the forward-only relay.
         if ov.accept_exposed.unwrap_or(false) {
+            // Per-relay operator choice for the pairing PARK service (owner decision): OPEN (the
+            // default) keeps today's unauthenticated park unchanged; AUTHENTICATED requires the
+            // parking accepter to present a holder-bound `overlay-pairing-park` capability + prove
+            // possession, exactly like `accept_exposed`'s exposer-registration path. A HARD ERROR on
+            // an unknown value (never silently falls back to open — the same discipline as
+            // `client_auth`).
+            let pairing_park = match ov.pairing_park.as_deref() {
+                None | Some("open") => PairingParkMode::Open,
+                Some("authenticated") => PairingParkMode::Authenticated,
+                Some(other) => {
+                    return Err(Error::ClusterStartup(format!(
+                        "[overlay] pairing_park {other:?} is unknown (want \"open\" or \
+                         \"authenticated\")"
+                    )));
+                }
+            };
+            let pairing_park_server = match pairing_park {
+                PairingParkMode::Open => boatramp_server::PairingParkMode::Open,
+                PairingParkMode::Authenticated => boatramp_server::PairingParkMode::Authenticated,
+            };
             let relay_secret = OverlaySecret::from_seed_hex(&secret.seed_hex())
                 .map_err(|e| Error::ClusterStartup(format!("[overlay] identity: {e}")))?;
             let registry = ExposerRegistry::new();
@@ -1291,8 +1312,9 @@ async fn spawn_overlay_roles(
                     store: short_codes.clone(),
                     digits: short_code_digits,
                 })),
+                pairing_park: pairing_park_server,
             });
-            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services + pairing rendezvous)");
+            tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, ?pairing_park, "overlay: serving relay/ingress (accepting exposed services + pairing rendezvous)");
             tokio::spawn(run_ingress_router(
                 ep,
                 relay_secret,
@@ -1303,6 +1325,7 @@ async fn spawn_overlay_roles(
                 short_codes,
                 short_code_digits,
                 resolve,
+                pairing_park,
             ));
         } else {
             tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress");

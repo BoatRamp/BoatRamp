@@ -2308,6 +2308,21 @@ pub trait PairShortCodeMint: Send + Sync {
     ) -> Result<(String, String), String>;
 }
 
+/// Whether a relay's pairing PARK service is offered OPEN (unauthenticated, the default) or
+/// AUTHENTICATED (requires a holder-bound `overlay-pairing-park` capability + possession proof) — the
+/// owner's per-relay operator choice (`[overlay] pairing_park`). Mirrors
+/// `boatramp_overlay::net::PairingParkMode`, the type the relay's park handler actually enforces;
+/// kept as its own small type here so `boatramp-server` stays free of the overlay-transport deps (the
+/// same split as [`LiveExposers`]/[`PairShortCodeMint`] bridging the real `boatramp-overlay` types).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PairingParkMode {
+    /// Unauthenticated park (today's behavior) — the DEFAULT.
+    #[default]
+    Open,
+    /// Park requires a holder-bound `overlay-pairing-park` capability + a proven-possession match.
+    Authenticated,
+}
+
 /// This node's ingress-relay self-topology for the self-serve PUBLISH path
 /// (`POST /api/overlay/expose`): the relay an exposer dials OUT to, plus the cluster trust root the
 /// exposer verifies each incoming forward client's dial capability against (zero-trust terminator).
@@ -2329,6 +2344,10 @@ pub struct ExposeRelay {
     /// mint a short code into the relay's own alias table. `None` would mean no relay topology either
     /// (this struct wouldn't exist), so in practice this is always `Some` when `ExposeRelay` is.
     pub pair_short_codes: Option<std::sync::Arc<dyn PairShortCodeMint>>,
+    /// This relay's operator-chosen pairing-PARK mode (`[overlay] pairing_park`, default `Open`) — so
+    /// `overlay_pair_code` knows whether to ALSO mint an `overlay-pairing-park` capability alongside
+    /// the rendezvous code.
+    pub pairing_park: PairingParkMode,
 }
 
 /// The overlay forward-flow **service directory**: a service name → the relay + egress a dial to it
@@ -2546,6 +2565,7 @@ mod overlay_directory_tests {
             trust_root: "ed25519:root".into(),
             client_auth: "capability-only".into(),
             pair_short_codes: None,
+            pairing_park: PairingParkMode::Open,
         }));
         let relay = directory.expose_relay().expect("expose relay present");
         assert_eq!(relay.relay, "relay.example:9000");

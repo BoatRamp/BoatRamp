@@ -27,11 +27,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // `TokenPublicKey` is the dial trust-root both the client-edge terminator (`terminate_stream`, via
-// `run_published_service`) and the server-side gate verify against; `verify_overlay_publish` is only
-// the relay's registration path (`register_exposer`), so it is server-gated.
+// `run_published_service`) and the server-side gate verify against; `verify_overlay_publish`/
+// `verify_overlay_pairing_park` are only the relay's registration/park paths (`register_exposer`/
+// `park_rendezvous`), so they are server-gated.
 use boatramp_core::cose::TokenPublicKey;
 #[cfg(feature = "server")]
-use boatramp_core::cose::verify_overlay_publish;
+use boatramp_core::cose::{verify_overlay_pairing_park, verify_overlay_publish};
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
 // `authorize_dial` is shared (the client-edge terminator re-authorizes end-to-end); the
 // capability-only variant is only the relay's `gate_dial`, so it is server-gated.
@@ -1226,6 +1227,7 @@ pub async fn run_ingress_router<F>(
     short_codes: PairShortCodes,
     short_code_digits: usize,
     resolve: F,
+    pairing_park: PairingParkMode,
 ) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
 {
@@ -1240,6 +1242,7 @@ pub async fn run_ingress_router<F>(
         short_code_digits,
         resolve,
         IngressBudgets::DEFAULT,
+        pairing_park,
     )
     .await;
 }
@@ -1301,6 +1304,7 @@ async fn run_ingress_router_with_budgets<F>(
     short_code_digits: usize,
     resolve: F,
     budgets: IngressBudgets,
+    pairing_park: PairingParkMode,
 ) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
 {
@@ -1352,6 +1356,7 @@ async fn run_ingress_router_with_budgets<F>(
                 park_limiter,
                 park_by_ip,
                 budgets.parked_per_ip,
+                pairing_park,
                 &resolve,
             )
             .await
@@ -1386,6 +1391,7 @@ async fn handle_ingress_connection<F>(
     park_limiter: Arc<Semaphore>,
     park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>>,
     parked_per_ip: u32,
+    pairing_park: PairingParkMode,
     resolve: &F,
 ) -> Result<(), NetError>
 where
@@ -1413,6 +1419,9 @@ where
                 &park_limiter,
                 &park_by_ip,
                 parked_per_ip,
+                pairing_park,
+                relay_secret,
+                trust_root,
             )
             .await
         }
@@ -1599,6 +1608,23 @@ where
 // design not membership-gated; the SAS backstops it.
 // ======================================================================================
 
+/// A relay's per-relay operator choice for the pairing PARK service (`[overlay] pairing_park`,
+/// default [`PairingParkMode::Open`]): OPEN keeps today's behavior unchanged (unauthenticated park,
+/// bounded by the existing park budget + per-IP cap, the SAS as the trust anchor); AUTHENTICATED
+/// additionally requires the parking peer to present a holder-bound `overlay-pairing-park` capability
+/// and prove possession — EXACTLY the holder-binding [`register_exposer`] applies to an
+/// overlay-publish capability — before the connection is parked. REDEEM is unauthenticated in BOTH
+/// modes (the unpaired dialer is, by design, not membership-gated; the SAS backstops it).
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PairingParkMode {
+    /// Unauthenticated park (today's behavior) — the DEFAULT.
+    #[default]
+    Open,
+    /// Park requires a holder-bound `overlay-pairing-park` capability + a proven-possession match.
+    Authenticated,
+}
+
 /// The discriminator marking a [`PairParkRequest`] frame (the accepter PARKING at the relay), so the
 /// ingress router tells it from a `Register`/`Dial`/`PairRedeem` first frame without changing the wire.
 const PAIR_PARK_TAG: &str = "overlay-pair-park";
@@ -1648,6 +1674,11 @@ struct PairParkRequest {
     pair_park: String,
     /// The rendezvous id (the relay's registry key) — the core of a `bropair1` code.
     code: Vec<u8>,
+    /// The holder-bound `overlay-pairing-park` capability (COSE), presented ONLY when the relay's
+    /// operator-chosen [`PairingParkMode`] is `Authenticated` (an OPEN-mode relay never reads this).
+    /// Absent (the default, `#[serde(default)]`) in open mode — the existing wire is unchanged.
+    #[serde(default)]
+    park_cap: Option<String>,
 }
 
 /// What a peer sends as the FIRST control frame to REDEEM a parked pairing rendezvous (the dialer
@@ -1697,6 +1728,14 @@ pub enum PairReject {
     /// within the rolling window — returned ONLY to a short-code REDEEM, checked BEFORE the code is
     /// even resolved (so an over-budget source is refused even for a code that would otherwise hit).
     TooManyAttempts,
+    /// AUTHENTICATED park only: no `park_cap` was presented, or it failed to verify (bad signature,
+    /// expired, wrong `br_kind`) — mirrors [`RegisterReject::InvalidCapability`]. Carries a short
+    /// description for the peer's own logs.
+    InvalidCapability(String),
+    /// AUTHENTICATED park only: the presented capability's holder is not the parking peer's
+    /// E2EE-proven identity (a stolen/misdirected capability) — mirrors
+    /// [`RegisterReject::HolderMismatch`], the load-bearing holder-binding control.
+    HolderMismatch,
 }
 
 /// The relay's verdict on a pairing park/redeem (the first frame back to the peer).
@@ -1730,6 +1769,7 @@ pub async fn pair_relay_park(
         &PairParkRequest {
             pair_park: PAIR_PARK_TAG.to_string(),
             code,
+            park_cap: None, // open mode — unchanged wire
         },
     )
     .await?;
@@ -1739,6 +1779,64 @@ pub async fn pair_relay_park(
     }
     // The relay opens the bridged pairing stream down this connection only once a dialer redeems the
     // code; `accept_bi` unblocks on the relay's first bridged write (the dialer's handshake offer).
+    let (bridged_send, bridged_recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    Ok((conn, bridged_send, bridged_recv))
+}
+
+/// Client-side: PARK at `relay` for a pairing rendezvous under `code` in AUTHENTICATED mode (overlay
+/// pairing-park per-relay operator config): presents a holder-bound `overlay-pairing-park` capability
+/// and proves possession of it to the relay via the E2EE handshake — mirrors
+/// [`run_published_service`]'s registration possession proof EXACTLY — BEFORE the relay parks the
+/// connection. `secret` is the accepter's own overlay identity (the capability's holder); `relay_id`
+/// pins the relay (a MITM relay fails the handshake), exactly as the exposer registration path pins
+/// it. Otherwise identical to [`pair_relay_park`]: on the relay's `Ok` it accepts the ONE bridged
+/// pairing stream the relay opens down this connection when a dialer redeems the code. A relay that
+/// refuses the capability (missing / invalid / wrong-holder) surfaces as
+/// `NetError::PairRejected(PairReject::InvalidCapability(_) | PairReject::HolderMismatch)`.
+pub async fn pair_relay_park_authenticated(
+    relay: &Endpoint,
+    relay_addr: SocketAddr,
+    relay_id: OverlayId,
+    code: Vec<u8>,
+    secret: &OverlaySecret,
+    park_cap: String,
+) -> Result<(Connection, SendStream, RecvStream), NetError> {
+    let conn = quic::dial(relay, relay_addr).await?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(
+        &mut send,
+        &PairParkRequest {
+            pair_park: PAIR_PARK_TAG.to_string(),
+            code,
+            park_cap: Some(park_cap),
+        },
+    )
+    .await?;
+    // Prove possession of the pairing-park capability's holder key to the relay (mirrors the exposer
+    // registration handshake): sign the KEM offer with THIS identity's key, pinning the relay.
+    timeout(HANDSHAKE_TIMEOUT, async {
+        establish(
+            &mut send,
+            &mut recv,
+            secret,
+            Role::Initiator,
+            Some(relay_id),
+            None,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| NetError::Stream("pairing-park handshake timed out".into()))??;
+    match read_msg::<PairResult>(&mut recv).await? {
+        PairResult::Ok => {}
+        PairResult::Rejected(reason) => return Err(NetError::PairRejected(reason)),
+    }
     let (bridged_send, bridged_recv) = conn
         .accept_bi()
         .await
@@ -1952,6 +2050,9 @@ async fn park_admit_and_run(
     park_limiter: &Arc<Semaphore>,
     park_by_ip: &Arc<StdMutex<HashMap<IpAddr, u32>>>,
     parked_per_ip: u32,
+    pairing_park: PairingParkMode,
+    relay_secret: &OverlaySecret,
+    trust_root: &TokenPublicKey,
 ) -> Result<(), NetError> {
     // INFO-2 — a rendezvous id is exactly PAIR_RENDEZVOUS_ID_LEN bytes; an empty/garbage id is an
     // `InvalidCode` (never reported as a collision), and bounding the key size bounds a flood's map.
@@ -1976,30 +2077,112 @@ async fn park_admit_and_run(
     };
     // Admitted: release the handshake slot — the park now holds ONLY the park budget + the per-IP slot.
     drop(hs_permit);
-    park_rendezvous(conn, send, recv, req, registry, park_permit, ip_guard).await
+    park_rendezvous(
+        conn,
+        send,
+        recv,
+        req,
+        registry,
+        park_permit,
+        ip_guard,
+        pairing_park,
+        relay_secret,
+        trust_root,
+    )
+    .await
 }
 
-/// Relay pairing: PARK one accepter under its rendezvous id. No relay E2EE handshake — the relay is
-/// blind; the rendezvous id (the `bropair1` code's core) is the only credential, and the SAS backstops
-/// the pairing. Admission (budget + per-IP + code-length) already passed in [`park_admit_and_run`];
-/// here it parks the connection, acks, then HOLDS it (bounded by the rendezvous TTL) so a redeem can
-/// open the bridged pairing stream down it. The `_park_permit` + `_ip_guard` are held for the whole
-/// park and released the instant it ends; on the TTL with no redeem the parked connection is
-/// force-closed and the id released.
+/// Relay pairing: PARK one accepter under its rendezvous id. In OPEN mode (the default) there is NO
+/// relay E2EE handshake at this stage — the relay is blind; the rendezvous id (the `bropair1` code's
+/// core) is the only credential, and the SAS backstops the pairing. In AUTHENTICATED mode (the
+/// operator's per-relay choice), the parking peer must present a holder-bound `overlay-pairing-park`
+/// capability that verifies (checked FIRST — cheap and local, so a capless/bogus park never waits on
+/// a handshake) and then complete an E2EE possession handshake whose proven identity equals the
+/// capability's holder — EXACTLY the holder-binding [`register_exposer`] applies to an overlay-publish
+/// capability — before the connection is ever parked. Admission (budget + per-IP + code-length)
+/// already passed in [`park_admit_and_run`]; here it (authenticates if required, then) parks the
+/// connection, acks, then HOLDS it (bounded by the rendezvous TTL) so a redeem can open the bridged
+/// pairing stream down it. The `_park_permit` + `_ip_guard` are held for the whole park (including the
+/// authentication phase) and released the instant it ends; on the TTL with no redeem the parked
+/// connection is force-closed and the id released.
 #[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
 async fn park_rendezvous(
     conn: Connection,
     mut send: SendStream,
-    _recv: RecvStream,
+    mut recv: RecvStream,
     req: PairParkRequest,
     registry: &PairRendezvous,
     park_permit: OwnedSemaphorePermit,
     ip_guard: ParkIpGuard,
+    pairing_park: PairingParkMode,
+    relay_secret: &OverlaySecret,
+    trust_root: &TokenPublicKey,
 ) -> Result<(), NetError> {
     // Hold the park budget + per-IP reservation for the whole park; both release on return.
     let _park_permit = park_permit;
     let _ip_guard = ip_guard;
     let now = now_unix();
+
+    if pairing_park == PairingParkMode::Authenticated {
+        // AUTHENTICATED PARK (owner decision: per-relay open-vs-authenticated pairing-park). Verify the
+        // presented capability FIRST — a cheap, purely local signature/expiry/kind check — so a parker
+        // with no cap at all (or an obviously-bogus one) is refused INSTANTLY, never left waiting on a
+        // handshake that will never arrive (an absent-cap park must not hold a budget slot for
+        // HANDSHAKE_TIMEOUT). Only once the capability verifies does the relay run the E2EE possession
+        // handshake and require its holder to equal the E2EE-proven identity — EXACTLY the holder-
+        // binding mechanism `register_exposer` applies to an overlay-publish capability (same
+        // `establish(Role::Responder, expect=None)` → compare `verified.holder == proven`).
+        let Some(cap) = req.park_cap.as_deref() else {
+            let reason = PairReject::InvalidCapability(
+                "this relay requires an overlay-pairing-park capability".into(),
+            );
+            let _ = write_msg(&mut send, &PairResult::Rejected(reason.clone())).await;
+            let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+            return Err(NetError::PairRejected(reason));
+        };
+        let verified = match verify_overlay_pairing_park(cap, trust_root, now) {
+            Ok(v) => v,
+            Err(e) => {
+                let reason = PairReject::InvalidCapability(e.to_string());
+                let _ = write_msg(&mut send, &PairResult::Rejected(reason.clone())).await;
+                let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+                return Err(NetError::PairRejected(reason));
+            }
+        };
+        let proven = match timeout(HANDSHAKE_TIMEOUT, async {
+            let (_session, peer, _sas) = establish(
+                &mut send,
+                &mut recv,
+                relay_secret,
+                Role::Responder,
+                None,
+                None,
+            )
+            .await?;
+            Ok::<OverlayId, NetError>(peer)
+        })
+        .await
+        {
+            Ok(Ok(peer)) => peer,
+            _ => {
+                let reason = PairReject::InvalidCapability(
+                    "pairing-park possession handshake failed or timed out".into(),
+                );
+                let _ = write_msg(&mut send, &PairResult::Rejected(reason.clone())).await;
+                let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+                return Err(NetError::PairRejected(reason));
+            }
+        };
+        // HOLDER BINDING: the E2EE-proven identity must BE the capability's holder — a stolen/
+        // misdirected capability presented by a different key is refused.
+        if verified.holder != proven.to_hex() {
+            let _ = write_msg(&mut send, &PairResult::Rejected(PairReject::HolderMismatch)).await;
+            let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+            return Err(NetError::PairRejected(PairReject::HolderMismatch));
+        }
+    }
+
     let expires_at = now.saturating_add(PAIR_RENDEZVOUS_TTL_SECS);
     if !registry
         .try_park(req.code.clone(), conn.clone(), expires_at, now)
@@ -3260,6 +3443,31 @@ mod tests {
         short_code_digits: usize,
         budgets: IngressBudgets,
     ) -> SocketAddr {
+        spawn_ingress_relay_with_pairing_park_mode(
+            relay,
+            root_pub,
+            registry,
+            rendezvous,
+            short_codes,
+            short_code_digits,
+            budgets,
+            PairingParkMode::Open,
+        )
+    }
+
+    /// As [`spawn_ingress_relay_with_budgets`], but with an explicit [`PairingParkMode`] so the
+    /// authenticated-pairing-park tests can stand up a relay that requires the capability.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_ingress_relay_with_pairing_park_mode(
+        relay: &OverlaySecret,
+        root_pub: TokenPublicKey,
+        registry: ExposerRegistry,
+        rendezvous: PairRendezvous,
+        short_codes: PairShortCodes,
+        short_code_digits: usize,
+        budgets: IngressBudgets,
+        pairing_park: PairingParkMode,
+    ) -> SocketAddr {
         let relay_ep =
             quic::server_endpoint(relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = relay_ep.local_addr().unwrap();
@@ -3275,6 +3483,7 @@ mod tests {
             short_code_digits,
             |_s: &str| None::<(SocketAddr, OverlayId, bool)>,
             budgets,
+            pairing_park,
         ));
         addr
     }
@@ -4089,6 +4298,178 @@ mod tests {
         assert!(
             !rendezvous.is_parked(&code, now_unix()).await,
             "a redeemed rendezvous must be consumed (single-use)"
+        );
+    }
+
+    // ---- Overlay pairing PARK: open-vs-authenticated per-relay operator config ----
+
+    /// Baseline (today's behavior, UNCHANGED): a relay explicitly configured for OPEN pairing-park
+    /// admits a park presenting NO capability at all — exactly as before this feature existed.
+    /// MUTATION-RED: if the `pairing_park == Authenticated` guard were dropped (always requiring a
+    /// cap), an open-mode relay would refuse this uncapped park → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_mode_park_is_unauthenticated_as_before() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_pairing_park_mode(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
+            IngressBudgets::DEFAULT,
+            PairingParkMode::Open,
+        );
+        let code = vec![0x11u8; 16];
+
+        // Park in the background (it only RETURNS once a dialer redeems — `accept_bi` blocks until
+        // then — so the admission itself is proven by the registry going live, not by this future
+        // resolving).
+        let code_a = code.clone();
+        tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let _ = pair_relay_park(&ep, relay_addr, code_a).await;
+        });
+        assert!(
+            await_parked(&rendezvous, &code).await,
+            "an OPEN-mode relay must admit an uncapped park into its registry"
+        );
+    }
+
+    /// The load-bearing AUTHENTICATED-park gate: a relay configured for AUTHENTICATED pairing-park
+    /// REFUSES a park presenting no capability (`InvalidCapability`), and ADMITS a park presenting a
+    /// VALID holder-bound capability + a matching possession proof — with the redeem side STILL
+    /// unauthenticated (the SAS backstops it in both modes). MUTATION-RED: skip the cap verify in the
+    /// authenticated park path (treat any/no capability as valid) → the no-cap park would ADMIT
+    /// instead of refuse → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticated_park_requires_a_valid_pairing_park_cap() {
+        use boatramp_core::cose::mint_overlay_pairing_park;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let (relay_id, accepter_id) = (relay.id(), accepter.id());
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_pairing_park_mode(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
+            IngressBudgets::DEFAULT,
+            PairingParkMode::Authenticated,
+        );
+
+        // (a) NO capability presented → refused `InvalidCapability`, instantly (no cap ⇒ no handshake
+        // need even be attempted) — never silently admitted.
+        let no_cap_code = vec![0x22u8; 16];
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let res = pair_relay_park(&ep, relay_addr, no_cap_code.clone()).await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::PairRejected(PairReject::InvalidCapability(_)))
+            ),
+            "an AUTHENTICATED relay must refuse an uncapped park, got {res:?}"
+        );
+        assert!(
+            !rendezvous.is_parked(&no_cap_code, now_unix()).await,
+            "a refused park must never be registered"
+        );
+
+        // (b) A VALID holder-bound cap, presented by its OWN holder + a matching possession proof,
+        // is ADMITTED. Full round trip through to a successful (still-unauthenticated) REDEEM.
+        let cap =
+            mint_overlay_pairing_park(&accepter.id().to_public(), 300, now_unix(), &root.signer())
+                .await
+                .unwrap();
+        let code = vec![0x33u8; 16];
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park_authenticated(&ep, relay_addr, relay_id, code_a, &accepter, cap)
+                    .await
+                    .unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await;
+            out
+        });
+        assert!(
+            await_parked(&rendezvous, &code).await,
+            "a validly-capped park must be admitted and registered"
+        );
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) = pair_relay_redeem(&ep, relay_addr, code.clone())
+            .await
+            .expect("REDEEM stays unauthenticated even against an AUTHENTICATED-park relay");
+        let (_sas_d, peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"paired");
+        let (_sas_a, peer_a) = acc.await.unwrap();
+        assert_eq!(peer_a, dialer.id());
+        assert_eq!(peer_d, accepter_id);
+    }
+
+    /// Holder-binding (the load-bearing control, mirrors `register_with_a_stolen_cap_whose_holder_is_
+    /// not_the_presenter_is_refused`): a VALID pairing-park cap minted for holder X, but presented
+    /// (with a real possession proof) by a DIFFERENT identity Y, is refused `HolderMismatch`. The
+    /// relay's E2EE handshake proves Y's identity; `verified.holder (X) != proven (Y)` → refused.
+    /// MUTATION-RED: drop the `verified.holder != proven` check → the stolen cap would be accepted →
+    /// RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticated_park_rejects_a_cap_bound_to_a_different_key() {
+        use boatramp_core::cose::mint_overlay_pairing_park;
+
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let holder = OverlaySecret::generate().unwrap(); // the cap is minted FOR this identity
+        let thief = OverlaySecret::generate().unwrap(); // but THIS identity presents it
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let rendezvous = PairRendezvous::new();
+        let relay_addr = spawn_ingress_relay_with_pairing_park_mode(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
+            IngressBudgets::DEFAULT,
+            PairingParkMode::Authenticated,
+        );
+
+        let stolen =
+            mint_overlay_pairing_park(&holder.id().to_public(), 300, now_unix(), &root.signer())
+                .await
+                .unwrap();
+        let code = vec![0x44u8; 16];
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let res =
+            pair_relay_park_authenticated(&ep, relay_addr, relay_id, code.clone(), &thief, stolen)
+                .await;
+        assert!(
+            matches!(res, Err(NetError::PairRejected(PairReject::HolderMismatch))),
+            "a cap minted for a different holder must be refused, got {res:?}"
+        );
+        assert!(
+            !rendezvous.is_parked(&code, now_unix()).await,
+            "a holder-mismatched park must never be registered"
         );
     }
 

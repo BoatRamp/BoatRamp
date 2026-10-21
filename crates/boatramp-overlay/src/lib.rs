@@ -32,17 +32,20 @@ pub use e2ee::{SpliceError, establish, splice};
 // client half of the registration protocol parses (`RegisterReject`, carried in `NetError`). Always
 // available — this is what the embeddable `boatramp-overlay-client` SDK links against.
 pub use net::{
-    NetError, PairReject, RegisterReject, forward_flow, pair_relay_park, pair_relay_redeem,
-    pair_relay_redeem_short, run_published_service,
+    NetError, PairReject, RegisterReject, forward_flow, pair_relay_park,
+    pair_relay_park_authenticated, pair_relay_redeem, pair_relay_redeem_short,
+    run_published_service,
 };
 // Server/relay/control-plane roles (overlay follow-up #4): the forwarding/egress/ingress routers,
 // the exposer registry, the pairing rendezvous (follow-up #2 inc2), the pairing SHORT-CODE alias
-// table (follow-up #2 inc3), and the relay client-auth posture. Behind `server` so the client SDK
-// never links them.
+// table (follow-up #2 inc3), the relay client-auth posture, and the per-relay open-vs-authenticated
+// pairing-park mode (overlay pairing PARK operator config). Behind `server` so the client SDK never
+// links them.
 #[cfg(feature = "server")]
 pub use net::{
-    ExposerRegistry, PairRendezvous, PairShortCodeError, PairShortCodes, RelayClientAuth,
-    forward_relay, run_egress_router, run_forwarding_router, run_ingress_router, terminate_one,
+    ExposerRegistry, PairRendezvous, PairShortCodeError, PairShortCodes, PairingParkMode,
+    RelayClientAuth, forward_relay, run_egress_router, run_forwarding_router, run_ingress_router,
+    terminate_one,
 };
 pub use pair::{PairError, VerifiedPeer, VerifiedPeers, pair_handshake};
 // The dial/publish trust-root type that appears in `run_published_service`'s (and `terminate_one`'s)

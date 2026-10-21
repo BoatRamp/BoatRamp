@@ -287,6 +287,17 @@ pub struct OverlayServeConfig {
     /// (`K = 10^8 ≈ 2^26.6`), floor 7, ceiling 10 (clamped). Independent of `accept_exposed` — read
     /// only when a relay actually mints/redeems a short code.
     pub pair_short_code_digits: Option<usize>,
+    /// Per-relay operator choice for the pairing PARK service (owner decision: "the relay manager
+    /// should choose, per relay, whether PARK is offered as an OPEN or AUTHENTICATED service"):
+    /// `"open"` (the DEFAULT) keeps today's behavior — an unauthenticated park, bounded only by the
+    /// existing park budget + per-IP cap, with the human-compared SAS as the trust anchor;
+    /// `"authenticated"` additionally requires the parking accepter to present a holder-bound
+    /// `overlay-pairing-park` capability and prove possession, exactly like `accept_exposed`'s
+    /// exposer-registration path (`register_exposer`). REDEEM stays unauthenticated in BOTH modes —
+    /// the unpaired dialer is, by design, not membership-gated; the SAS backstops it. Read only when a
+    /// relay actually runs the pairing rendezvous (the same `accept_exposed` ingress-router branch
+    /// `pair_short_code_digits` shares).
+    pub pairing_park: Option<String>,
     /// Bind an **egress/terminator** here (UDP/QUIC). Unset ⇒ this node runs no egress.
     pub egress_listen: Option<SocketAddr>,
     /// Egress service map: a service name → the local backend it fronts. Used when `egress_listen`
