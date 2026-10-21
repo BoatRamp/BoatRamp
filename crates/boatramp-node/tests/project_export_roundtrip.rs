@@ -837,28 +837,40 @@ async fn project_export_roundtrip_driver_live() {
     assert_eq!(code, 0, "seed source table");
     let expect = "1:alpha\n2:beta";
 
-    // EXPORT through the driver (full) — exercises resolve_pg + run_sql_client(pg_dump).
-    let bundle = driver
-        .export(
-            "default",
-            &ExportOptions {
-                data_only: false,
-                include_identity: false,
-                transport_key: None,
-            },
-        )
-        .await
-        .expect("driver export");
-    let manifest = project_bundle::read_manifest(&bundle).expect("read manifest");
+    // EXPORT through the driver (full) — exercises resolve_pg + run_sql_client(pg_dump),
+    // STREAMED into an in-memory buffer (models the HTTP response the handler wires the sink
+    // to; no bundle temp file).
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(
+                "default",
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: false,
+                    transport_key: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("driver export");
+        sink.into_inner()
+    };
+    // Read the streamed v2 bundle back to confirm the expected members are present.
+    let mut kinds: Vec<MemberKind> = Vec::new();
+    project_bundle::read_bundle_streaming(bundle.as_slice(), |spec, _sz, body| {
+        let mut v = Vec::new();
+        std::io::Read::read_to_end(body, &mut v).map_err(project_bundle::BundleError::Io)?;
+        kinds.push(spec.kind);
+        Ok(())
+    })
+    .expect("read back the streamed bundle");
     assert!(
-        manifest
-            .members
-            .iter()
-            .any(|m| m.kind == MemberKind::PgDump),
+        kinds.contains(&MemberKind::PgDump),
         "driver export staged a pg dump member"
     );
     assert!(
-        manifest.members.iter().any(|m| m.kind == MemberKind::Kv),
+        kinds.contains(&MemberKind::Kv),
         "driver export staged the control-plane KV slice"
     );
 
@@ -866,19 +878,22 @@ async fn project_export_roundtrip_driver_live() {
     // `force` overlays the (non-empty, same-process) KV; identity Fresh (no identity member).
     let (code, _) = psql(backend.as_ref(), &image, &src, "DROP TABLE brdrv_rt").await;
     assert_eq!(code, 0, "drop before restore");
-    let report = driver
-        .import(
-            "default",
-            &bundle,
-            ImportOptions {
-                apply: true,
-                force: true,
-                identity: IdentityChoice::Fresh,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("driver import");
+    let report = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                "default",
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("driver import")
+    };
     assert!(
         report.pg_databases >= 1,
         "driver import restored at least one pg database"
@@ -927,4 +942,346 @@ fn parse_pg_url_handles_the_common_shapes() {
         Some(("u".into(), "a:b".into(), "h".into(), 5432, "db".into()))
     );
     assert_eq!(parse_pg_url("not-a-url"), None);
+}
+
+/// **≥2-TENANT cross-tenant LEAK gate** (merge gate — no Docker, no DB server: in-memory KV
+/// + filesystem blobs; the pg/mysql/libsql members self-skip because the fixture declares no
+/// SQL bindings). Drives the REAL streaming `NodeProjectExport::export` / `import`.
+///
+/// A single-tenant fixture is structurally blind to a leak, so this seeds TWO projects
+/// (`acme`, `globex`) each with their own KV + blobs, PLUS global "crown-jewel" keyspaces
+/// (`cert/`, `domain/`, `daemonconfig/`, `_cp/`) that belong to neither — all in ONE shared
+/// store. It then exports `acme` and asserts that ZERO bytes belonging to `globex` or the
+/// global crown jewels appear in the bundle or in an imported target, checked BOTH by key
+/// membership AND by a raw byte-scan for a globex-only sentinel; and a project-RENAME import
+/// proves every re-keyed blob lands ONLY in the target scope, with no source-scope (`acme`)
+/// key surviving.
+///
+/// Mutations that turn this RED: exporting the whole KV store instead of
+/// `scope_entries_to_project` (globex/cert bytes appear in the bundle — byte-scan + key
+/// membership fail); listing blobs under `hblob/` instead of `hblob/acme/` (globex blob
+/// bytes appear); or dropping the per-blob `target_blob_key` re-key / fail-closed check (a
+/// renamed import keeps a source-scope `hblob/acme/` key).
+#[tokio::test]
+async fn project_export_cross_tenant_leak_gate() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_export::{
+        ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
+    };
+    use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    async fn put_blob(store: &dyn Storage, key: &str, data: &[u8]) {
+        let data = data.to_vec();
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok::<Bytes, StorageError>(Bytes::from(data)) })
+                .boxed();
+        store
+            .put(key, stream, PutMeta { content_type: None })
+            .await
+            .expect("seed blob");
+    }
+    async fn read_blob(store: &dyn Storage, key: &str) -> Vec<u8> {
+        let mut body = store.get(key).await.expect("get blob").body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(chunk.expect("blob chunk").as_ref());
+        }
+        out
+    }
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // A value that exists ONLY in globex's data / the global crown jewels — if any of it ever
+    // appears in acme's export or an imported target, a tenant boundary leaked.
+    const GLOBEX_SENTINEL: &[u8] = b"GLOBEX_ONLY_CROWN_JEWEL_SENTINEL_9e3af17c";
+    const GLOBAL_SENTINEL: &[u8] = b"GLOBAL_TLS_PRIVATE_KEY_SENTINEL_7c1d44b0";
+
+    let src_tmp = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+
+    // --- acme's OWNED control-plane keyspace (travels) ---
+    kv.put("project/acme/config/tenancy", b"{\"acme\":true}".to_vec())
+        .await
+        .unwrap();
+    kv.put(
+        "project/acme/secret/api-key",
+        b"acme-sealed-secret".to_vec(),
+    )
+    .await
+    .unwrap();
+    kv.put("project/acme/site/web", b"HASHACME".to_vec())
+        .await
+        .unwrap();
+    kv.put("siteconfig/HASHACME", b"{...acme site config...}".to_vec())
+        .await
+        .unwrap();
+
+    // --- globex's OWNED keyspace (must NEVER travel in acme's export) ---
+    kv.put("project/globex/config/tenancy", GLOBEX_SENTINEL.to_vec())
+        .await
+        .unwrap();
+    kv.put(
+        "project/globex/secret/api-key",
+        [GLOBEX_SENTINEL, b"-sealed"].concat(),
+    )
+    .await
+    .unwrap();
+    kv.put("project/globex/site/web", b"HASHGLOBEX".to_vec())
+        .await
+        .unwrap();
+    kv.put("siteconfig/HASHGLOBEX", GLOBEX_SENTINEL.to_vec())
+        .await
+        .unwrap();
+    // sibling-prefix over-capture guard: `acmecorp` is NOT `acme`.
+    kv.put("project/acmecorp/secret/s", GLOBEX_SENTINEL.to_vec())
+        .await
+        .unwrap();
+
+    // --- GLOBAL crown jewels / node state (belong to NO project; must NEVER travel) ---
+    kv.put("cert/acme.example.com", GLOBAL_SENTINEL.to_vec())
+        .await
+        .unwrap();
+    kv.put("cert/globex.example.com", GLOBAL_SENTINEL.to_vec())
+        .await
+        .unwrap();
+    kv.put("domain/acme.example.com", br#"{"project":"acme"}"#.to_vec())
+        .await
+        .unwrap();
+    kv.put("daemonconfig/deadbeef", b"node-config".to_vec())
+        .await
+        .unwrap();
+    kv.put("_cp/leader", b"node-1".to_vec()).await.unwrap();
+
+    // --- blobs for BOTH tenants (globex's body carries the sentinel) ---
+    let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(src_tmp.path().join("blobs")));
+    put_blob(
+        blobs.as_ref(),
+        "hblob/acme/web/c/logo.png",
+        b"ACME-LOGO-PNG-BYTES",
+    )
+    .await;
+    put_blob(
+        blobs.as_ref(),
+        "hblob/acme/web/c/page.html",
+        b"<h1>acme</h1>",
+    )
+    .await;
+    put_blob(
+        blobs.as_ref(),
+        "hblob/globex/web/c/secret.bin",
+        GLOBEX_SENTINEL,
+    )
+    .await;
+    // sibling-prefix blob guard.
+    put_blob(
+        blobs.as_ref(),
+        "hblob/acmecorp/web/c/x.bin",
+        GLOBEX_SENTINEL,
+    )
+    .await;
+
+    let work = src_tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(blobs.clone(), kv.clone()),
+        kv.clone(),
+        blobs.clone(),
+        work,
+    );
+
+    // === EXPORT acme (FULL) into a buffer ===
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        drv.export(
+            "acme",
+            &ExportOptions {
+                data_only: false,
+                ..Default::default()
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export acme");
+        sink.into_inner()
+    };
+
+    // RAW BYTE-SCAN: neither the globex-only sentinel nor the global crown-jewel sentinel may
+    // appear ANYWHERE in acme's bundle bytes (KV slice, blob bodies, manifest — all of it).
+    assert!(
+        !contains(&bundle, GLOBEX_SENTINEL),
+        "globex-only sentinel bytes LEAKED into acme's export bundle"
+    );
+    assert!(
+        !contains(&bundle, GLOBAL_SENTINEL),
+        "global crown-jewel sentinel bytes LEAKED into acme's export bundle"
+    );
+
+    // === IMPORT into a fresh SAME-NAME target store ===
+    let tgt_tmp = tempfile::tempdir().unwrap();
+    let tgt_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let tgt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tgt_tmp.path().join("blobs")));
+    let tgt_work = tgt_tmp.path().join("work");
+    std::fs::create_dir_all(&tgt_work).unwrap();
+    let tgt = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(tgt_blobs.clone(), tgt_kv.clone()),
+        tgt_kv.clone(),
+        tgt_blobs.clone(),
+        tgt_work,
+    );
+    {
+        let mut source = futures::io::Cursor::new(bundle.clone());
+        tgt.import(
+            "acme",
+            &mut source,
+            ImportOptions {
+                apply: true,
+                force: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("import acme");
+    }
+
+    // KEY MEMBERSHIP on the target KV: acme's keyspace present; ZERO globex / global keys.
+    let tgt_keys = tgt_kv.list_prefix("").await.unwrap();
+    assert!(
+        tgt_keys.iter().any(|k| k == "project/acme/config/tenancy"),
+        "acme's owned keyspace restored"
+    );
+    assert!(
+        tgt_keys.iter().any(|k| k == "siteconfig/HASHACME"),
+        "acme's referenced site-config body carried + restored"
+    );
+    assert!(
+        !tgt_keys.iter().any(|k| k.contains("globex")),
+        "NO globex key may appear in the imported target"
+    );
+    assert!(
+        !tgt_keys.iter().any(|k| k == "siteconfig/HASHGLOBEX"),
+        "globex's site-config body must NOT travel"
+    );
+    assert!(
+        !tgt_keys.iter().any(|k| k == "project/acmecorp/secret/s"),
+        "a sibling-prefix project is not over-captured"
+    );
+    assert!(
+        !tgt_keys.iter().any(|k| k.starts_with("cert/")
+            || k.starts_with("domain/")
+            || k.starts_with("wildcard/")
+            || k.starts_with("daemonconfig/")
+            || k.starts_with("_cp/")),
+        "NO global crown-jewel / routing / node key may appear in the imported target"
+    );
+
+    // BLOB MEMBERSHIP + raw byte-scan on the TARGET store: only acme's blobs, under hblob/acme/.
+    let tgt_blob_keys: Vec<String> = tgt_blobs
+        .list("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert!(
+        tgt_blob_keys
+            .iter()
+            .any(|k| k == "hblob/acme/web/c/logo.png"),
+        "acme's blob restored under its own scope"
+    );
+    assert!(
+        !tgt_blob_keys.iter().any(|k| k.contains("globex")),
+        "NO globex blob in the target"
+    );
+    assert!(
+        !tgt_blob_keys
+            .iter()
+            .any(|k| k.starts_with("hblob/acmecorp/")),
+        "a sibling-prefix blob scope is not over-captured"
+    );
+    for k in &tgt_blob_keys {
+        let body = read_blob(tgt_blobs.as_ref(), k).await;
+        assert!(
+            !contains(&body, GLOBEX_SENTINEL),
+            "globex sentinel bytes found inside target blob {k:?}"
+        );
+    }
+
+    // === RENAME variant: import acme's bundle AS `acmeclone` ===
+    let rn_tmp = tempfile::tempdir().unwrap();
+    let rn_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let rn_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(rn_tmp.path().join("blobs")));
+    let rn_work = rn_tmp.path().join("work");
+    std::fs::create_dir_all(&rn_work).unwrap();
+    let rn = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(rn_blobs.clone(), rn_kv.clone()),
+        rn_kv.clone(),
+        rn_blobs.clone(),
+        rn_work,
+    );
+    {
+        let mut source = futures::io::Cursor::new(bundle.clone());
+        rn.import(
+            "acmeclone",
+            &mut source,
+            ImportOptions {
+                apply: true,
+                force: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("rename import");
+    }
+
+    // Every re-keyed blob lands ONLY under the TARGET scope; no source-scope (`acme`) key.
+    let rn_blob_keys: Vec<String> = rn_blobs
+        .list("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
+    assert!(
+        !rn_blob_keys.is_empty(),
+        "the rename import restored acme's blob under the new project name"
+    );
+    for k in &rn_blob_keys {
+        assert!(
+            k.starts_with("hblob/acmeclone/"),
+            "re-keyed blob {k:?} must land under the TARGET scope hblob/acmeclone/"
+        );
+        assert!(
+            !k.starts_with("hblob/acme/"),
+            "NO source-scope (acme) blob key may survive a rename import"
+        );
+    }
+    let rn_keys = rn_kv.list_prefix("").await.unwrap();
+    assert!(
+        rn_keys.iter().any(|k| k.starts_with("project/acmeclone/")),
+        "KV re-keyed to the TARGET project on rename"
+    );
+    assert!(
+        !rn_keys.iter().any(|k| k.starts_with("project/acme/")),
+        "NO source-scope (acme) KV key may survive a rename import"
+    );
+    assert!(
+        !rn_keys.iter().any(|k| k.contains("globex")),
+        "NO globex key in the renamed target"
+    );
+
+    println!("PROJECT EXPORT CROSS-TENANT LEAK GATE OK");
 }

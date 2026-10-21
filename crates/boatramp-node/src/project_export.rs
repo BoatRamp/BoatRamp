@@ -28,11 +28,14 @@
 //! container backend's `run_ephemeral` is `Unsupported`.
 #![cfg(feature = "project-export")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use sha2::{Digest, Sha256};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -56,7 +59,7 @@ use crate::pg_client::{
     pg_dump_invocation, pg_restore_invocation,
 };
 use crate::project_bundle::{
-    self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, PgMemberInfo, SourceInfo, StagedMember,
+    self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
 };
 
 type Perr = ProjectExportError;
@@ -71,6 +74,11 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Bound of the in-flight byte channel bridging the blocking v2 tar reader/writer to the
+/// async sink/source. A handful of ~tar-block writes — small, fixed memory; the staging
+/// bound (one member on disk) is what the format's streaming guarantee rests on.
+const STREAM_BYTE_CHANNEL: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-mutation-gated in the merge gate)
@@ -183,18 +191,32 @@ fn data_only_skew_blocks(src_fp: Option<&str>, tgt_fp: Option<&str>) -> bool {
     !matches!((src_fp, tgt_fp), (Some(s), Some(t)) if s == t)
 }
 
-/// The `(from, to)` directory pair to rename so extracted blob keys
-/// `hblob/{source}/…` become `hblob/{target}/…` (re-qualified to the TARGET project on
-/// import), or `None` when `source == target` (no re-key needed). `extract_blobs` is the
-/// directory the `blobs/` members were extracted into.
-fn blob_rekey_dirs(extract_blobs: &Path, source: &str, target: &str) -> Option<(PathBuf, PathBuf)> {
-    if source == target {
-        return None;
-    }
-    Some((
-        extract_blobs.join("hblob").join(source),
-        extract_blobs.join("hblob").join(target),
-    ))
+/// Re-qualify ONE streamed blob member to the TARGET project's scope — the per-blob,
+/// forward-pass analogue of the v1 whole-directory rename, and THE tenancy-critical seam of
+/// the streaming import. A blob member path is `blobs/hblob/{source}/{site}/{container}/…`;
+/// this strips the `blobs/` wrapper and rewrites the leading `hblob/{source}/` segment to
+/// `hblob/{target}/`, returning the TARGET-scope storage key `hblob/{target}/…`.
+///
+/// **Fail-closed.** A member whose key is NOT under `hblob/{source}/` is REFUSED (never
+/// silently `put` under a foreign scope), and the key is only ever rebuilt as
+/// `hblob/{target}/…` — so every imported object lands in the target project's scope and no
+/// source-scope (or other-tenant) key can survive a rename. This mirrors the C1 KV re-key
+/// (`rekey_owned_key`) at the blob layer; a leak here shipped a CRITICAL once, so the mapping
+/// is explicit and total, not best-effort.
+fn target_blob_key(member_path: &str, source: &str, target: &str) -> Result<String, Perr> {
+    let src_key = member_path.strip_prefix("blobs/").ok_or_else(|| {
+        Perr::Other(format!(
+            "blob member path {member_path:?} is missing its 'blobs/' prefix"
+        ))
+    })?;
+    let src_pref = format!("hblob/{source}/");
+    let rest = src_key.strip_prefix(&src_pref).ok_or_else(|| {
+        Perr::Other(format!(
+            "blob member {src_key:?} is not under the source project scope {src_pref:?}; \
+             refusing to import a wrong-scope blob (cross-tenant isolation)"
+        ))
+    })?;
+    Ok(format!("hblob/{target}/{rest}"))
 }
 
 /// The blob-store key prefix covering a project's objects.
@@ -757,9 +779,128 @@ impl SqlEndpoint {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming bridge — the sync `project_bundle` tar reader/writer runs in a
+// `spawn_blocking` task and talks to the async driver (which owns `self` and the
+// caller's async sink/source) over bounded channels. No `block_on` is nested on a
+// runtime thread, so this is deadlock-free on BOTH the current-thread and the
+// multi-thread tokio runtime; the channel bounds keep the bundle from ever buffering
+// in memory, and each member is staged/restored one at a time (O(largest member)).
+// ---------------------------------------------------------------------------
+
+/// A synchronous [`Write`] that forwards each write to an async drain over a bounded
+/// channel — the bridge from the blocking v2 tar writer to the caller's async `sink`.
+/// A full channel backpressures the blocking writer, so the bundle never buffers in memory.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx.blocking_send(buf.to_vec()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "export sink closed")
+        })?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A synchronous [`Read`] fed by an async feeder over a bounded channel — the bridge from
+/// the caller's async `src` to the blocking v2 single-pass reader. Bounded memory; `None`
+/// from the channel is clean EOF.
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.buf.len() {
+            match self.rx.blocking_recv() {
+                Some(chunk) if !chunk.is_empty() => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Some(_) => continue, // skip an empty chunk rather than mistaking it for EOF
+                None => return Ok(0), // all senders dropped ⇒ EOF
+            }
+        }
+        let n = std::cmp::min(out.len(), self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// One member staged on disk by the export driver, computed just-in-time by the async stager
+/// when the blocking v2 writer requests it. Carries only what the stager's `self`-driven work
+/// needs; the big bytes land in a bounded temp the writer deletes right after appending.
+enum StageJob {
+    /// The passphrase-wrapped identity transport container (already produced at plan time).
+    Identity { container: Vec<u8> },
+    /// The control-plane KV logical slice — scanned + project-scoped + encoded at stage time.
+    Kv { created_at: u64 },
+    /// A Postgres `pg_dump` into a staging temp.
+    Pg {
+        conn: PgConnection,
+        image: String,
+        data_only: bool,
+    },
+    /// A MySQL `mysqldump` into a staging temp.
+    Mysql {
+        conn: MysqlConnection,
+        image: String,
+        data_only: bool,
+    },
+    /// A libsql `VACUUM INTO` snapshot of the project-qualified site DB.
+    Libsql { qsite: String },
+    /// A single blob object, streamed from the source store into a staging temp.
+    Blob { key: String },
+}
+
+/// The export stager's request: "stage the member at `path`, reply with its temp path".
+struct StageReq {
+    path: String,
+    reply: tokio::sync::oneshot::Sender<Result<PathBuf, ()>>,
+}
+
+/// The import servicer's request, sent by the blocking v2 reader as it streams.
+enum ImportMsg {
+    /// The bundle head (surfaced before any member) — the source project + data-only flag.
+    Head {
+        data_only: bool,
+        source_project: String,
+    },
+    /// A member staged to `temp`; the servicer restores it then replies so the reader may
+    /// advance (one member staged at a time ⇒ O(largest member)).
+    Member {
+        spec: MemberSpec,
+        temp: PathBuf,
+        reply: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+}
+
 #[async_trait]
 impl ProjectExport for NodeProjectExport {
-    async fn export(&self, project: &str, opts: &ExportOptions) -> Result<PathBuf, Perr> {
+    async fn export(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        sink: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<(), Perr> {
         check_project_slug(project)?;
         // A data-only bundle carries NO control-plane / identity material at all, so the
         // two flags are mutually exclusive — refuse the contradiction rather than silently
@@ -771,50 +912,380 @@ impl ProjectExport for NodeProjectExport {
                     .into(),
             ));
         }
-        // Bound once so the downstream uses (incl. the spawned bundle-write task) are a
-        // plain `Copy` of the flag, not a borrow of `opts`.
         let data_only = opts.data_only;
         let created_at = now_secs();
         let session = self.work_dir.join(format!("export-{project}-{created_at}"));
-        let stage = session.join("stage");
-        tokio::fs::create_dir_all(&stage).await.map_err(other)?;
-        let mut staged: Vec<StagedMember> = Vec::new();
+        let stage_dir = session.join("stage");
+        tokio::fs::create_dir_all(&stage_dir).await.map_err(other)?;
 
-        // --- control-plane KV slice (FULL export only) ---
-        // A `--data-only` bundle carries application data (pg/mysql rows + libsql + blobs)
-        // ONLY — never the control-plane KV slice (RBAC, routing, personas, sealed
-        // secrets). Staging it here even for data-only would physically place
-        // identity/RBAC/secret bytes inside a "data-only" artifact (a cross-environment
-        // leak), even though the import side skips restoring it. Fail safe: don't stage it.
-        if !data_only {
-            self.deploy.checkpoint().await.map_err(other)?;
-            // Scope the control-plane KV slice to THIS project (C1 cross-tenant isolation): scan
-            // the store, keep ONLY the project's owned keyspace + the site-config bodies it
-            // references, and drop every other tenant's material plus the global TLS/routing/daemon
-            // keyspaces (fail-closed). A whole-store dump here would ship every tenant's sealed
-            // secrets, TLS private keys and DB credentials inside a single-project bundle.
-            let all = boatramp_core::kv_dump::scan_dumpable(self.kv.as_ref())
-                .await
-                .map_err(other)?;
-            let scoped = boatramp_core::project_export::scope_entries_to_project(
-                all,
-                ProjectRef::new(project),
-            );
-            let kv_bytes = boatramp_core::kv_dump::encode_dump(&scoped, created_at);
-            let kv_path = stage.join("kv.brkvdump");
-            tokio::fs::write(&kv_path, &kv_bytes).await.map_err(other)?;
-            staged.push(StagedMember {
-                path: KV_MEMBER_PATH.to_string(),
-                kind: MemberKind::Kv,
-                source: kv_path,
-                pg: None,
+        // 1. PLAN: enumerate every member up front — version-detect each pg/mysql DB, list the
+        //    project's blobs + sites — in the v2 RESTORE order (identity → blobs → pg → mysql
+        //    → libsql → KV). The v2 MANIFEST lists these before any member body exists, so the
+        //    member SET is decided here; each member's BIG bytes are produced later, one at a
+        //    time, by the stager. (A failure here is before the first byte, so the handler can
+        //    still turn it into an error status.)
+        let (specs, jobs, source) = self.plan_export(project, opts, created_at).await?;
+
+        // 2. STREAM: run the sync v2 writer in a blocking task, bridged to (a) the caller's
+        //    async `sink` over a bounded byte channel + drain, and (b) the async stager over a
+        //    one-slot request channel. `write_bundle_streaming` stages → appends → deletes ONE
+        //    member at a time, so the transient on-disk staging never exceeds the largest
+        //    single member — never the whole bundle (the env-clone disk-fill fix).
+        let (byte_tx, mut byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
+        let (stage_tx, mut stage_rx) = tokio::sync::mpsc::channel::<StageReq>(1);
+        let writer_out = ChannelWriter { tx: byte_tx };
+        let stage_tx_task = stage_tx.clone();
+        let specs_for_task = specs.clone();
+        let source_for_task = source.clone();
+        let write_handle =
+            tokio::task::spawn_blocking(move || -> Result<(), project_bundle::BundleError> {
+                project_bundle::write_bundle_streaming(
+                    writer_out,
+                    created_at,
+                    data_only,
+                    source_for_task,
+                    specs_for_task,
+                    |spec| {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        stage_tx_task
+                            .blocking_send(StageReq {
+                                path: spec.path.clone(),
+                                reply: reply_tx,
+                            })
+                            .map_err(|_| {
+                                project_bundle::BundleError::MalformedStream(
+                                    "export stager gone".into(),
+                                )
+                            })?;
+                        match reply_rx.blocking_recv() {
+                            Ok(Ok(tmp)) => Ok(tmp),
+                            _ => Err(project_bundle::BundleError::MalformedStream(
+                                "export staging failed".into(),
+                            )),
+                        }
+                    },
+                )
             });
+        drop(stage_tx); // only the blocking task keeps the request channel alive now
+
+        // Async stager: produce each requested member to a bounded temp, using `self`.
+        let stager = async {
+            let mut idx = 0usize;
+            while let Some(req) = stage_rx.recv().await {
+                let res = match jobs.get(&req.path) {
+                    Some(job) => self.stage_job(project, job, &stage_dir, idx).await,
+                    None => Err(Perr::Other(format!(
+                        "export: internal error — no stage job for member {:?}",
+                        req.path
+                    ))),
+                };
+                idx += 1;
+                match res {
+                    Ok(tmp) => {
+                        let _ = req.reply.send(Ok(tmp));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(()));
+                        return Err::<(), Perr>(e);
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        // Async drain: forward the bundle bytes to the caller's sink as they are produced.
+        let drain = async {
+            while let Some(chunk) = byte_rx.recv().await {
+                sink.write_all(&chunk)
+                    .await
+                    .map_err(|e| Perr::Other(format!("export sink write failed: {e}")))?;
+            }
+            sink.flush()
+                .await
+                .map_err(|e| Perr::Other(format!("export sink flush failed: {e}")))?;
+            Ok::<(), Perr>(())
+        };
+
+        let (stage_res, drain_res, write_res) = tokio::join!(stager, drain, write_handle);
+        let _ = tokio::fs::remove_dir_all(&session).await;
+
+        // Error precedence: a staging failure is the most specific cause, a writer/bundle
+        // error next, a sink error last.
+        stage_res?;
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(be)) => return Err(other(be)),
+            Err(je) => return Err(other(je)),
+        }
+        drain_res?;
+        Ok(())
+    }
+
+    async fn import(
+        &self,
+        project: &str,
+        src: &mut (dyn futures::io::AsyncRead + Send + Unpin),
+        opts: ImportOptions,
+    ) -> Result<ImportReport, Perr> {
+        check_project_slug(project)?;
+        let session = self
+            .work_dir
+            .join(format!("import-{project}-{}", now_secs()));
+        let stage_dir = session.join("stage");
+        tokio::fs::create_dir_all(&stage_dir).await.map_err(other)?;
+
+        // Bridge: the async feeder pumps the caller's bundle stream into a bounded byte
+        // channel → `ChannelReader` → the sync v2 single-pass reader (in a blocking task).
+        // The reader's restore closure stages ONE member to a bounded temp then hands it to
+        // the async servicer (which owns `self`) and BLOCKS until it finishes — so disk never
+        // holds more than the largest single member, and the members are restored in the v2
+        // declared (restore) order. Reads v2 and legacy v1 bundles alike.
+        let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ImportMsg>(1);
+        let reader = ChannelReader::new(byte_rx);
+        let stage_dir_task = stage_dir.clone();
+        let req_tx_task = req_tx.clone();
+        let read_handle = tokio::task::spawn_blocking(
+            move || -> Result<Vec<MemberSpec>, project_bundle::BundleError> {
+                let mut idx = 0usize;
+                let head_tx = req_tx_task.clone();
+                let on_head = move |data_only: bool, source: &SourceInfo| {
+                    // Surfaced before any member: the servicer needs the source project (to
+                    // re-key each member to the TARGET) and the data-only flag.
+                    let _ = head_tx.blocking_send(ImportMsg::Head {
+                        data_only,
+                        source_project: source.project.clone(),
+                    });
+                };
+                project_bundle::read_bundle_streaming_with_head(
+                    reader,
+                    on_head,
+                    |spec, _size, body| {
+                        // Stage this member to a bounded temp. Reading `body` to completion
+                        // here is what drives the v2 reader's own per-member SHA-256 + size
+                        // verification (a corrupt/truncated member is caught LOUD at its end).
+                        let temp = stage_dir_task.join(format!("m{idx}"));
+                        idx += 1;
+                        {
+                            let mut f = std::io::BufWriter::new(
+                                std::fs::File::create(&temp)
+                                    .map_err(project_bundle::BundleError::Io)?,
+                            );
+                            let mut buf = [0u8; 64 * 1024];
+                            loop {
+                                let n = body
+                                    .read(&mut buf)
+                                    .map_err(project_bundle::BundleError::Io)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                f.write_all(&buf[..n])
+                                    .map_err(project_bundle::BundleError::Io)?;
+                            }
+                            f.flush().map_err(project_bundle::BundleError::Io)?;
+                        }
+                        // Hand to the servicer and wait, so the NEXT member is not read (nor its
+                        // temp created) until this one is restored + freed.
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        req_tx_task
+                            .blocking_send(ImportMsg::Member {
+                                spec: spec.clone(),
+                                temp: temp.clone(),
+                                reply: reply_tx,
+                            })
+                            .map_err(|_| {
+                                project_bundle::BundleError::MalformedStream(
+                                    "import servicer gone".into(),
+                                )
+                            })?;
+                        match reply_rx.blocking_recv() {
+                            Ok(Ok(())) => Ok(()),
+                            _ => Err(project_bundle::BundleError::MalformedStream(
+                                "import restore aborted".into(),
+                            )),
+                        }
+                    },
+                )
+            },
+        );
+        drop(req_tx); // only the blocking reader keeps the request channel alive now
+
+        // Async feeder: pump the caller's bundle stream into the blocking reader.
+        let feeder = async {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = src
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| Perr::Other(format!("import body read failed: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                if byte_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break; // the reader stopped (error / early finish) — nothing more to feed
+                }
+            }
+            drop(byte_tx);
+            Ok::<(), Perr>(())
+        };
+
+        // Async servicer: restore each staged member using `self`, in arrival (restore) order.
+        let servicer = async {
+            let mut report = ImportReport {
+                dry_run: !opts.apply,
+                ..Default::default()
+            };
+            let mut data_only = false;
+            let mut source_project = String::new();
+            let mut saw_identity = false;
+            while let Some(msg) = req_rx.recv().await {
+                match msg {
+                    ImportMsg::Head {
+                        data_only: d,
+                        source_project: s,
+                    } => {
+                        data_only = d;
+                        source_project = s;
+                    }
+                    ImportMsg::Member { spec, temp, reply } => {
+                        let r = self
+                            .restore_member(
+                                project,
+                                data_only,
+                                &source_project,
+                                &spec,
+                                &temp,
+                                &opts,
+                                &mut report,
+                                &mut saw_identity,
+                            )
+                            .await;
+                        let _ = tokio::fs::remove_file(&temp).await;
+                        match r {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(()));
+                                return Err::<_, Perr>(e);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok((report, data_only, saw_identity))
+        };
+
+        let (feed_res, serv_res, read_res) = tokio::join!(feeder, servicer, read_handle);
+
+        // Error precedence: a restore failure is the most specific cause; a bundle-integrity
+        // error (SHA / size / order / truncation) next; a body-read error last. On ANY error
+        // skip the post-stream steps (fresh-drop etc.) so a half-stream never half-finishes.
+        let (mut report, data_only, saw_identity) = match serv_res {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&session).await;
+                return Err(e);
+            }
+        };
+        match read_res {
+            Ok(Ok(_specs)) => {}
+            Ok(Err(be)) => {
+                let _ = tokio::fs::remove_dir_all(&session).await;
+                return Err(other(be));
+            }
+            Err(je) => {
+                let _ = tokio::fs::remove_dir_all(&session).await;
+                return Err(other(je));
+            }
+        }
+        if let Err(e) = feed_res {
+            let _ = tokio::fs::remove_dir_all(&session).await;
+            return Err(e);
         }
 
-        // --- identity transport container (`--include-identity` only) ---
-        // Carries the project KEK (passphrase-wrapped) so an `--identity adopt` recovery can
-        // unseal the KV slice's sealed secrets. Local envelope only: a Vault KEK can't be
-        // extracted, and `none` has nothing to carry.
+        // --- post-stream steps (only after a clean, fully-verified pass) ---
+
+        // A `--data-only` bundle carries app data only; record that KV was not restored.
+        if data_only {
+            report
+                .notes
+                .push("control-plane KV (identity/RBAC/routing) NOT imported: --data-only".into());
+        }
+
+        // `adopt` requires the bundle to carry an identity member. For a FULL bundle this is
+        // enforced earlier (at the KV member, before any sealed KV byte is written); this
+        // final check also covers a bundle with no KV member (e.g. data-only + adopt).
+        if matches!(opts.identity, IdentityChoice::Adopt { .. }) && !saw_identity {
+            let _ = tokio::fs::remove_dir_all(&session).await;
+            return Err(Perr::Other(
+                "--identity adopt requires a bundle exported with --include-identity \
+                 (no identity member present); use --identity fresh to import a bundle \
+                 without identity"
+                    .into(),
+            ));
+        }
+
+        // --- fresh identity: drop the source sealed-secret keyspace (Ask-4c) ---
+        // A `fresh` import of a FULL bundle just restored the SOURCE's KEK-sealed secrets
+        // (operator/app + per-tenant), which can never unseal under this node's own
+        // (different) KEK. Drop them so the target starts clean and re-provisions — making
+        // "zero source-sealed artifacts that unwrap" a POSITIVE absence rather than
+        // present-but-inert. Only for a FULL bundle (data-only carries no KV/secrets) and
+        // only when applying.
+        if matches!(opts.identity, IdentityChoice::Fresh) && !data_only && opts.apply {
+            let prefixes =
+                boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
+            let mut dropped = 0usize;
+            for prefix in &prefixes {
+                for key in self.kv.list_prefix(prefix).await.map_err(other)? {
+                    self.kv.delete_checkpointed(&key).await.map_err(other)?;
+                    dropped += 1;
+                }
+            }
+            report.notes.push(format!(
+                "identity: --fresh dropped {dropped} source-sealed secret key(s); re-provision \
+                 secrets + the managed-DB credential on the target"
+            ));
+        }
+
+        // Operational prerequisites after a FULL control-plane restore — the portable bundle
+        // deliberately carries no function/component CODE (deploy artifacts live in blob storage,
+        // not this slice), no TLS private keys and no global routing ownership. Surface the
+        // follow-up steps so the target is not silently half-restored.
+        if !data_only {
+            report.notes.push(
+                "post-import: re-deploy function/component code (deploy artifacts are not \
+                 bundled), re-verify + re-attach the project's domains, and let ACME re-issue TLS \
+                 certs (routing + certs are intentionally not carried in a portable bundle)"
+                    .into(),
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(&session).await;
+        Ok(report)
+    }
+}
+
+impl NodeProjectExport {
+    /// Enumerate every bundle member UP FRONT, in the v2 RESTORE order (identity → blobs → pg
+    /// → mysql → libsql → KV), returning the ordered [`MemberSpec`] list the v2 MANIFEST
+    /// declares, a per-member [`StageJob`] (how to produce each one's bytes later), and the
+    /// bundle [`SourceInfo`]. Version-detects each pg/mysql DB (so the manifest can carry its
+    /// provenance), lists the project's blobs + sites, and checkpoints the KV frontier for a
+    /// full export — all CHEAP relative to the member bodies, which are produced one at a time
+    /// by [`stage_job`](Self::stage_job) during the stream.
+    async fn plan_export(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        created_at: u64,
+    ) -> Result<(Vec<MemberSpec>, HashMap<String, StageJob>, SourceInfo), Perr> {
+        let data_only = opts.data_only;
+        let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
+
+        // --- identity transport container (`--include-identity` only) — FIRST (an adopt
+        //     import must install the KEK before the KV slice). Local envelope only. ---
         if opts.include_identity {
             let transport_key = opts
                 .transport_key
@@ -831,16 +1302,14 @@ impl ProjectExport for NodeProjectExport {
                             .map_err(|e| {
                                 Perr::Other(format!("wrapping the identity container: {e}"))
                             })?;
-                    let id_path = stage.join("identity.brid");
-                    tokio::fs::write(&id_path, &container)
-                        .await
-                        .map_err(other)?;
-                    staged.push(StagedMember {
-                        path: IDENTITY_MEMBER_PATH.to_string(),
-                        kind: MemberKind::Identity,
-                        source: id_path,
-                        pg: None,
-                    });
+                    ordered.push((
+                        MemberSpec {
+                            path: IDENTITY_MEMBER_PATH.to_string(),
+                            kind: MemberKind::Identity,
+                            pg: None,
+                        },
+                        StageJob::Identity { container },
+                    ));
                 }
                 Some(IdentityEnvelope::Vault) => {
                     return Err(Perr::Other(
@@ -861,65 +1330,81 @@ impl ProjectExport for NodeProjectExport {
             }
         }
 
+        // Checkpoint the durable KV frontier BEFORE we enumerate (full export only), so the
+        // KV slice staged later reflects a consistent frontier.
+        if !data_only {
+            self.deploy.checkpoint().await.map_err(other)?;
+        }
+
+        // --- blobs: enumerate the project's objects (metadata only; bodies stream later). A
+        //     blob key is `hblob/{project}/…`; the member path wraps it as `blobs/{key}`
+        //     (identical to the v1 layout), so the import re-keys the leading project segment
+        //     to the TARGET on the way back in. ---
+        let blob_metas = self
+            .blobs
+            .list(&blob_project_prefix(project))
+            .await
+            .map_err(other)?;
+        for meta in blob_metas {
+            let member_path = format!("blobs/{}", meta.key);
+            ordered.push((
+                MemberSpec {
+                    path: member_path,
+                    kind: MemberKind::Blob,
+                    pg: None,
+                },
+                StageJob::Blob { key: meta.key },
+            ));
+        }
+
         // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
         for (db, cfg) in &self.databases {
-            // A binding is dumpable here iff it is compute-backed (managed) OR names an
-            // external DSN env var; a `libsql` binding's per-site DBs go through the
-            // authoritative site enumeration below instead.
             let dumpable =
                 cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) || !cfg.url_env.is_empty();
             if kind_is_postgres(&cfg.kind) && dumpable {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
-                let inv = pg_dump_invocation(&conn, data_only);
-                let out = stage.join(format!("{db}.pgc"));
-                let code = self
-                    .run_sql_client(&image, &inv.argv, &inv.env, None, &out)
-                    .await?;
-                if code != 0 {
-                    return Err(Perr::Other(format!("pg_dump for {db:?} exited {code}")));
-                }
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
-                staged.push(StagedMember {
-                    path: pg_member_path(db),
-                    kind: MemberKind::PgDump,
-                    source: out,
-                    pg: Some(PgMemberInfo {
-                        server_version_num,
-                        client_image: image,
-                        schema_fingerprint,
-                    }),
-                });
+                ordered.push((
+                    MemberSpec {
+                        path: pg_member_path(db),
+                        kind: MemberKind::PgDump,
+                        pg: Some(PgMemberInfo {
+                            server_version_num,
+                            client_image: image.clone(),
+                            schema_fingerprint,
+                        }),
+                    },
+                    StageJob::Pg {
+                        conn,
+                        image,
+                        data_only,
+                    },
+                ));
             } else if kind_is_mysql(&cfg.kind) && dumpable {
                 let (conn, image, version) = self.resolve_mysql(project, db, cfg).await?;
-                let inv = mysqldump_invocation(&conn, data_only);
-                let out = stage.join(format!("{db}.sql"));
-                let code = self
-                    .run_sql_client(&image, &inv.argv, &inv.env, None, &out)
-                    .await?;
-                if code != 0 {
-                    return Err(Perr::Other(format!("mysqldump for {db:?} exited {code}")));
-                }
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
-                staged.push(StagedMember {
-                    path: mysql_member_path(db),
-                    kind: MemberKind::MysqlDump,
-                    source: out,
-                    pg: Some(PgMemberInfo {
-                        server_version_num: version,
-                        client_image: image,
-                        schema_fingerprint,
-                    }),
-                });
+                ordered.push((
+                    MemberSpec {
+                        path: mysql_member_path(db),
+                        kind: MemberKind::MysqlDump,
+                        pg: Some(PgMemberInfo {
+                            server_version_num: version,
+                            client_image: image.clone(),
+                            schema_fingerprint,
+                        }),
+                    },
+                    StageJob::Mysql {
+                        conn,
+                        image,
+                        data_only,
+                    },
+                ));
             }
-            // A `libsql` binding (or a binding with neither compute nor url_env) is handled
-            // by the per-site libsql enumeration below — nothing to do in this loop.
         }
 
-        // --- libsql snapshots: enumerate the project's sites AUTHORITATIVELY from the
-        //     deploy store (never a filesystem walk), and snapshot each site's embedded
-        //     default libsql DB that actually exists on disk. A managed-pg/external
-        //     project has no local libsql backend wired (`self.libsql` is `None`), so its
-        //     sites are skipped here and go through the pg path instead. ---
+        // --- libsql snapshots: enumerate the project's sites AUTHORITATIVELY from the deploy
+        //     store (never a filesystem walk), one member per site whose embedded default DB
+        //     exists on disk. ---
         if let Some(libsql) = &self.libsql {
             let sites = self
                 .deploy
@@ -931,321 +1416,336 @@ impl ProjectExport for NodeProjectExport {
                 if !libsql.local_database_exists(&qsite, "") {
                     continue; // a site that never wrote SQL — nothing to snapshot
                 }
-                let dest = stage.join(format!("libsql-{}.sqlite", sanitize(&site)));
-                libsql
-                    .snapshot_into(&qsite, "", &dest)
-                    .await
-                    .map_err(other)?;
-                staged.push(StagedMember {
-                    path: libsql_member_path(project, &site),
-                    kind: MemberKind::Libsql,
-                    source: dest,
-                    pg: None,
-                });
+                ordered.push((
+                    MemberSpec {
+                        path: libsql_member_path(project, &site),
+                        kind: MemberKind::Libsql,
+                        pg: None,
+                    },
+                    StageJob::Libsql { qsite },
+                ));
             }
         }
 
-        // --- blobs: migrate the project prefix into a staging FsStorage ---
-        let blob_stage = stage.join("blobs");
-        tokio::fs::create_dir_all(&blob_stage)
-            .await
-            .map_err(other)?;
-        let dest: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&blob_stage));
-        let opts = boatramp_storage::blob_migrate::MigrateOptions {
-            prefix: blob_project_prefix(project),
-            ..Default::default()
-        };
-        boatramp_storage::blob_migrate::migrate(self.blobs.clone(), dest, &opts)
-            .await
-            .map_err(other)?;
+        // --- control-plane KV slice (FULL export only) — LAST in restore order. A
+        //     `--data-only` bundle carries application data ONLY, never the KV slice (RBAC,
+        //     routing, personas, sealed secrets), so it is not even staged for data-only. ---
+        if !data_only {
+            ordered.push((
+                MemberSpec {
+                    path: KV_MEMBER_PATH.to_string(),
+                    kind: MemberKind::Kv,
+                    pg: None,
+                },
+                StageJob::Kv { created_at },
+            ));
+        }
 
-        // --- assemble the tar (sync; walk staged blobs into members, then write) ---
-        let bundle = self
-            .work_dir
-            .join(format!("export-{project}-{created_at}.brproj"));
-        let bundle_for_task = bundle.clone();
-        let source = SourceInfo {
-            project: project.to_string(),
-            site: None,
-        };
-        let blob_stage_for_task = blob_stage.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), project_bundle::BundleError> {
-            let mut members = staged;
-            // Blob members: every file staged under blobs/ becomes `blobs/<relpath>`.
-            collect_blob_members(&blob_stage_for_task, &mut members)?;
-            project_bundle::write_bundle(
-                &bundle_for_task,
-                created_at,
-                data_only,
-                source,
-                &members,
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(other)?
-        .map_err(other)?;
-
-        // Best-effort cleanup of the staging tree (the bundle file remains for the caller).
-        let _ = tokio::fs::remove_dir_all(&session).await;
-        Ok(bundle)
+        let specs: Vec<MemberSpec> = ordered.iter().map(|(s, _)| s.clone()).collect();
+        let jobs: HashMap<String, StageJob> =
+            ordered.into_iter().map(|(s, j)| (s.path, j)).collect();
+        Ok((
+            specs,
+            jobs,
+            SourceInfo {
+                project: project.to_string(),
+                site: None,
+            },
+        ))
     }
 
-    /// The node data-dir work area — the API handler stages an incoming bundle here
-    /// (node-private), never in world-readable `/tmp`.
-    fn staging_root(&self) -> PathBuf {
-        self.work_dir.clone()
-    }
-
-    async fn import(
+    /// Produce ONE member's bytes into a bounded staging temp (`stage_dir/m{idx}`), returning
+    /// its path. The v2 writer appends the temp then deletes it immediately, so at most one
+    /// member is ever staged on disk (the O(largest-member) footprint).
+    async fn stage_job(
         &self,
         project: &str,
-        bundle: &Path,
-        opts: ImportOptions,
-    ) -> Result<ImportReport, Perr> {
-        check_project_slug(project)?;
-        let session = self
-            .work_dir
-            .join(format!("import-{project}-{}", now_secs()));
-        let extract = session.join("extract");
-        tokio::fs::create_dir_all(&extract).await.map_err(other)?;
+        job: &StageJob,
+        stage_dir: &Path,
+        idx: usize,
+    ) -> Result<PathBuf, Perr> {
+        let tmp = stage_dir.join(format!("m{idx}"));
+        match job {
+            StageJob::Identity { container } => {
+                tokio::fs::write(&tmp, container).await.map_err(other)?;
+            }
+            StageJob::Kv { created_at } => {
+                // Scope the control-plane KV slice to THIS project (C1 cross-tenant isolation):
+                // keep ONLY the project's owned keyspace + the site-config bodies it references,
+                // dropping every other tenant's material and the global TLS/routing/daemon keys
+                // (fail-closed).
+                let all = boatramp_core::kv_dump::scan_dumpable(self.kv.as_ref())
+                    .await
+                    .map_err(other)?;
+                let scoped = boatramp_core::project_export::scope_entries_to_project(
+                    all,
+                    ProjectRef::new(project),
+                );
+                let kv_bytes = boatramp_core::kv_dump::encode_dump(&scoped, *created_at);
+                tokio::fs::write(&tmp, &kv_bytes).await.map_err(other)?;
+            }
+            StageJob::Pg {
+                conn,
+                image,
+                data_only,
+            } => {
+                let inv = pg_dump_invocation(conn, *data_only);
+                let code = self
+                    .run_sql_client(image, &inv.argv, &inv.env, None, &tmp)
+                    .await?;
+                if code != 0 {
+                    return Err(Perr::Other(format!("pg_dump exited {code}")));
+                }
+            }
+            StageJob::Mysql {
+                conn,
+                image,
+                data_only,
+            } => {
+                let inv = mysqldump_invocation(conn, *data_only);
+                let code = self
+                    .run_sql_client(image, &inv.argv, &inv.env, None, &tmp)
+                    .await?;
+                if code != 0 {
+                    return Err(Perr::Other(format!("mysqldump exited {code}")));
+                }
+            }
+            StageJob::Libsql { qsite } => {
+                let libsql = self.libsql.as_ref().ok_or_else(|| {
+                    Perr::Other("internal error: libsql stage job with no libsql backend".into())
+                })?;
+                libsql.snapshot_into(qsite, "", &tmp).await.map_err(other)?;
+            }
+            StageJob::Blob { key } => {
+                // Stream the object from the source store straight into the temp — never
+                // buffer the whole object in memory.
+                let obj = self.blobs.get(key).await.map_err(other)?;
+                let mut body = obj.body;
+                let mut f = tokio::fs::File::create(&tmp).await.map_err(other)?;
+                use tokio::io::AsyncWriteExt as _;
+                while let Some(chunk) = body.next().await {
+                    let chunk = chunk.map_err(other)?;
+                    f.write_all(chunk.as_ref()).await.map_err(other)?;
+                }
+                f.flush().await.map_err(other)?;
+            }
+        }
+        Ok(tmp)
+    }
 
-        let bundle_owned = bundle.to_path_buf();
-        let extract_for_task = extract.clone();
-        let manifest = tokio::task::spawn_blocking(move || {
-            project_bundle::extract_and_verify(&bundle_owned, &extract_for_task)
-        })
-        .await
-        .map_err(other)?
-        .map_err(other)?;
-
-        let mut report = ImportReport {
-            dry_run: !opts.apply,
-            ..Default::default()
-        };
-
-        // --- identity (adopt only; BEFORE the restore so the KV slice's sealed secrets
-        // unseal under the installed KEK). `fresh` installs nothing and drops the source
-        // sealed-secret keyspace after the KV restore (below). ---
-        if let IdentityChoice::Adopt { transport_key } = &opts.identity {
-            let Some(id_member) = manifest
-                .members
-                .iter()
-                .find(|m| m.kind == MemberKind::Identity)
-            else {
-                return Err(Perr::Other(
-                    "--identity adopt requires a bundle exported with --include-identity \
-                     (no identity member present); use --identity fresh to import a bundle \
-                     without identity"
-                        .into(),
-                ));
-            };
-            match self.identity_source.as_ref() {
-                Some(IdentityEnvelope::Local { kek_file }) => {
-                    let container = tokio::fs::read(extract.join(&id_member.path))
-                        .await
-                        .map_err(other)?;
-                    let payload =
-                        boatramp_server::envelope::transport_unwrap(&container, transport_key)
-                            .map_err(|e| {
-                                Perr::Other(format!(
-                                    "opening the identity container (wrong transport key?): {e}"
-                                ))
-                            })?;
-                    let kek = parse_identity_payload(&payload)?;
-                    // No-clobber: never adopt OVER a different live KEK — adopt is recovery
-                    // onto a fresh node, not cloning one env's identity onto another.
-                    match tokio::fs::read(kek_file).await {
-                        Ok(existing) if existing != kek => {
-                            return Err(Perr::Other(format!(
-                                "refusing to adopt: this node already holds a DIFFERENT KEK at \
-                                 {} — adopt is for recovery onto a fresh node; use --identity \
-                                 fresh to import into a different environment",
-                                kek_file.display()
-                            )));
-                        }
-                        Ok(_) => { /* identical KEK already present — idempotent */ }
-                        Err(_) => {
-                            if opts.apply {
-                                write_kek_file(kek_file, &kek).await?;
+    /// Restore ONE streamed member (already staged at `temp`) into the TARGET `project`,
+    /// routed by `spec.kind`. Mutates `report`; tracks whether an identity member has been
+    /// seen (`saw_identity`) so an `adopt` import can be refused before the KV slice is
+    /// written if the bundle carries no identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_member(
+        &self,
+        project: &str,
+        data_only: bool,
+        source_project: &str,
+        spec: &MemberSpec,
+        temp: &Path,
+        opts: &ImportOptions,
+        report: &mut ImportReport,
+        saw_identity: &mut bool,
+    ) -> Result<(), Perr> {
+        match spec.kind {
+            MemberKind::Identity => {
+                *saw_identity = true;
+                match &opts.identity {
+                    IdentityChoice::Adopt { transport_key } => {
+                        match self.identity_source.as_ref() {
+                            Some(IdentityEnvelope::Local { kek_file }) => {
+                                let container = tokio::fs::read(temp).await.map_err(other)?;
+                                let payload = boatramp_server::envelope::transport_unwrap(
+                                    &container,
+                                    transport_key,
+                                )
+                                .map_err(|e| {
+                                    Perr::Other(format!(
+                                        "opening the identity container (wrong transport key?): {e}"
+                                    ))
+                                })?;
+                                let kek = parse_identity_payload(&payload)?;
+                                // No-clobber: never adopt OVER a different live KEK.
+                                match tokio::fs::read(kek_file).await {
+                                    Ok(existing) if existing != kek => {
+                                        return Err(Perr::Other(format!(
+                                            "refusing to adopt: this node already holds a DIFFERENT \
+                                         KEK at {} — adopt is for recovery onto a fresh node; use \
+                                         --identity fresh to import into a different environment",
+                                            kek_file.display()
+                                        )));
+                                    }
+                                    Ok(_) => { /* identical KEK already present — idempotent */ }
+                                    Err(_) => {
+                                        if opts.apply {
+                                            write_kek_file(kek_file, &kek).await?;
+                                        }
+                                    }
+                                }
+                                report
+                                    .notes
+                                    .push("identity: adopted the source KEK (recovery)".into());
+                            }
+                            Some(IdentityEnvelope::Vault) | Some(IdentityEnvelope::None) | None => {
+                                return Err(Perr::Other(
+                                "--identity adopt installs a local KEK from the bundle, but this \
+                                 node's secrets envelope is not local; for a Vault recovery point \
+                                 [secrets.vault] at the same key, or use --identity fresh"
+                                    .into(),
+                            ));
                             }
                         }
                     }
-                    report
-                        .notes
-                        .push("identity: adopted the source KEK (recovery)".into());
+                    IdentityChoice::Fresh => {
+                        report.notes.push(
+                            "identity: bundle carries an identity member, but --identity fresh \
+                             was selected; the source KEK was NOT installed"
+                                .into(),
+                        );
+                    }
                 }
-                Some(IdentityEnvelope::Vault) | Some(IdentityEnvelope::None) | None => {
+            }
+            MemberKind::Blob => {
+                // RE-QUALIFY to the TARGET project's scope, FAIL-CLOSED — the tenancy-critical
+                // seam. Every imported object lands under `hblob/{project}/`; a wrong-scope
+                // member is refused, so no source-scope (or other-tenant) key can survive a
+                // rename.
+                let target_key = target_blob_key(&spec.path, source_project, project)?;
+                report.blobs += 1;
+                if opts.apply {
+                    // Stream the staged member into the target key via the `Storage::put`
+                    // byte-stream path (reuses `FsStorage`'s streaming get) — the whole blob is
+                    // never buffered in memory.
+                    let staged_dir = temp.parent().ok_or_else(|| {
+                        Perr::Other("blob staging temp has no parent directory".into())
+                    })?;
+                    let staged_name = temp
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| Perr::Other("blob staging temp has no file name".into()))?;
+                    let staged = boatramp_storage::FsStorage::new(staged_dir);
+                    let obj = staged.get(staged_name).await.map_err(other)?;
+                    self.blobs
+                        .put(
+                            &target_key,
+                            obj.body,
+                            boatramp_core::PutMeta { content_type: None },
+                        )
+                        .await
+                        .map_err(other)?;
+                }
+            }
+            MemberKind::PgDump => {
+                let db = db_from_pg_member(&spec.path)
+                    .ok_or_else(|| Perr::Other(format!("bad pg member path {:?}", spec.path)))?;
+                let cfg = self.databases.get(db).ok_or_else(|| {
+                    Perr::Other(format!("import: no database named {db:?} on this node"))
+                })?;
+                let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
+                if data_only {
+                    let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
+                    let tgt_fp = self.schema_fingerprint(project, db).await;
+                    if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
+                        report.schema_skew.push(db.to_string());
+                        if !opts.allow_schema_skew {
+                            return Err(Perr::SchemaSkew(vec![db.to_string()]));
+                        }
+                    }
+                }
+                if opts.apply {
+                    let inv = pg_restore_invocation(&conn, data_only);
+                    let devnull = temp.with_extension("restore.out");
+                    let code = self
+                        .run_sql_client(&image, &inv.argv, &inv.env, Some(temp), &devnull)
+                        .await?;
+                    let _ = tokio::fs::remove_file(&devnull).await;
+                    if code != 0 {
+                        return Err(Perr::Other(format!("pg_restore for {db:?} exited {code}")));
+                    }
+                }
+                report.pg_databases += 1;
+            }
+            MemberKind::MysqlDump => {
+                let db = db_from_mysql_member(&spec.path)
+                    .ok_or_else(|| Perr::Other(format!("bad mysql member path {:?}", spec.path)))?;
+                let cfg = self.databases.get(db).ok_or_else(|| {
+                    Perr::Other(format!("import: no database named {db:?} on this node"))
+                })?;
+                let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
+                if data_only {
+                    let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
+                    let tgt_fp = self.schema_fingerprint(project, db).await;
+                    if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
+                        report.schema_skew.push(db.to_string());
+                        if !opts.allow_schema_skew {
+                            return Err(Perr::SchemaSkew(vec![db.to_string()]));
+                        }
+                    }
+                }
+                if opts.apply {
+                    let inv = mysql_restore_invocation(&conn, data_only);
+                    let devnull = temp.with_extension("myrestore.out");
+                    let code = self
+                        .run_sql_client(&image, &inv.argv, &inv.env, Some(temp), &devnull)
+                        .await?;
+                    let _ = tokio::fs::remove_file(&devnull).await;
+                    if code != 0 {
+                        return Err(Perr::Other(format!(
+                            "mysql restore for {db:?} exited {code}"
+                        )));
+                    }
+                }
+                report.pg_databases += 1;
+            }
+            MemberKind::Libsql => {
+                let Some(libsql) = &self.libsql else {
+                    return Err(Perr::Unavailable(
+                        "bundle carries libsql members but this node has no local libsql backend \
+                         to restore them into"
+                            .into(),
+                    ));
+                };
+                let site = site_from_libsql_member(&spec.path).ok_or_else(|| {
+                    Perr::Other(format!("bad libsql member path {:?}", spec.path))
+                })?;
+                let qsite = ProjectRef::new(project).qualified(site);
+                if opts.apply {
+                    libsql
+                        .restore_snapshot(&qsite, "", temp)
+                        .await
+                        .map_err(other)?;
+                }
+                report.libsql_databases += 1;
+            }
+            MemberKind::Kv => {
+                if data_only {
+                    // A data-only bundle should not carry a KV slice; ignore one if present
+                    // (the post-stream note records that KV is not imported for data-only).
+                    return Ok(());
+                }
+                // `adopt` must have installed the source KEK (from an identity member that
+                // precedes the KV slice in v2 restore order) BEFORE any sealed KV byte is
+                // written — otherwise the sealed secrets could never unseal. Refuse here,
+                // fail-closed, if adopt was requested without an identity member.
+                if matches!(opts.identity, IdentityChoice::Adopt { .. }) && !*saw_identity {
                     return Err(Perr::Other(
-                        "--identity adopt installs a local KEK from the bundle, but this node's \
-                         secrets envelope is not local; for a Vault recovery point \
-                         [secrets.vault] at the same key, or use --identity fresh"
+                        "--identity adopt requires a bundle exported with --include-identity \
+                         (no identity member present); use --identity fresh to import a bundle \
+                         without identity"
                             .into(),
                     ));
                 }
-            }
-        }
-
-        // Order: blobs -> pg/libsql -> kv.
-
-        // --- blobs ---
-        let blob_src_dir = extract.join("blobs");
-        if blob_src_dir.exists() {
-            // RE-QUALIFY blob keys to the TARGET project. The bundle's blob members are
-            // keyed `hblob/{source_project}/{site}/…`; the FsStorage maps a file's path to
-            // its key verbatim, so renaming the `{source_project}` segment directory to the
-            // target's re-keys every object at once — `hblob/{source}/…` → `hblob/{target}/…`.
-            // A no-op when source == target; on a project RENAME (preview-a → preview-b)
-            // this lands the objects in the TARGET's scope instead of commingling under the
-            // source's. (`project` is a validated slug, so the join cannot traverse.)
-            if let Some((from, to)) =
-                blob_rekey_dirs(&blob_src_dir, &manifest.source.project, project)
-                && from.exists()
-            {
-                if let Some(parent) = to.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(other)?;
-                }
-                tokio::fs::rename(&from, &to).await.map_err(other)?;
-            }
-            let src: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&blob_src_dir));
-            let bopts = boatramp_storage::blob_migrate::MigrateOptions {
-                dry_run: !opts.apply,
-                ..Default::default()
-            };
-            let rep = boatramp_storage::blob_migrate::migrate(src, self.blobs.clone(), &bopts)
-                .await
-                .map_err(other)?;
-            report.blobs = rep.copied_objects;
-        }
-
-        // --- pg: schema-skew check, then restore (apply) ---
-        for m in manifest.pg_members() {
-            let db = db_from_pg_member(&m.path)
-                .ok_or_else(|| Perr::Other(format!("bad pg member path {:?}", m.path)))?;
-            let cfg = self.databases.get(db).ok_or_else(|| {
-                Perr::Other(format!("import: no database named {db:?} on this node"))
-            })?;
-            let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
-
-            // Schema-ledger fingerprint SKEW check — for a `--data-only` import the data
-            // lands into the target's EXISTING schema, so we must PROVE the schemas agree
-            // (both fingerprints present AND equal). A mismatch OR a MISSING fingerprint on
-            // either side means "cannot prove compatibility" ⇒ fail CLOSED (require
-            // `--allow-schema-skew`). A full bundle carries its own schema, so no check.
-            if manifest.data_only {
-                let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
-                let tgt_fp = self.schema_fingerprint(project, db).await;
-                if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
-                    report.schema_skew.push(db.to_string());
-                    if !opts.allow_schema_skew {
-                        return Err(Perr::SchemaSkew(vec![db.to_string()]));
-                    }
-                }
-            }
-
-            if opts.apply {
-                let inv = pg_restore_invocation(&conn, manifest.data_only);
-                let member_file = extract.join(&m.path);
-                let devnull = session.join(format!("{db}.restore.out"));
-                let code = self
-                    .run_sql_client(&image, &inv.argv, &inv.env, Some(&member_file), &devnull)
-                    .await?;
-                if code != 0 {
-                    return Err(Perr::Other(format!("pg_restore for {db:?} exited {code}")));
-                }
-            }
-            report.pg_databases += 1;
-        }
-
-        // --- mysql: schema-skew check, then restore (apply) ---
-        for m in manifest
-            .members
-            .iter()
-            .filter(|m| m.kind == MemberKind::MysqlDump)
-        {
-            let db = db_from_mysql_member(&m.path)
-                .ok_or_else(|| Perr::Other(format!("bad mysql member path {:?}", m.path)))?;
-            let cfg = self.databases.get(db).ok_or_else(|| {
-                Perr::Other(format!("import: no database named {db:?} on this node"))
-            })?;
-            let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
-
-            // Schema-ledger fingerprint SKEW check — for a `--data-only` import the data
-            // lands into the target's EXISTING schema, so we must PROVE the schemas agree
-            // (both fingerprints present AND equal). A mismatch OR a MISSING fingerprint on
-            // either side means "cannot prove compatibility" ⇒ fail CLOSED (require
-            // `--allow-schema-skew`). A full bundle carries its own schema, so no check.
-            if manifest.data_only {
-                let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
-                let tgt_fp = self.schema_fingerprint(project, db).await;
-                if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
-                    report.schema_skew.push(db.to_string());
-                    if !opts.allow_schema_skew {
-                        return Err(Perr::SchemaSkew(vec![db.to_string()]));
-                    }
-                }
-            }
-
-            if opts.apply {
-                let inv = mysql_restore_invocation(&conn, manifest.data_only);
-                let member_file = extract.join(&m.path);
-                let devnull = session.join(format!("{db}.myrestore.out"));
-                let code = self
-                    .run_sql_client(&image, &inv.argv, &inv.env, Some(&member_file), &devnull)
-                    .await?;
-                if code != 0 {
-                    return Err(Perr::Other(format!(
-                        "mysql restore for {db:?} exited {code}"
-                    )));
-                }
-            }
-            report.pg_databases += 1;
-        }
-
-        // --- libsql members: place each verified snapshot into the target site's
-        //     embedded DB (no-clobber + integrity verify), re-qualifying the site under
-        //     the TARGET project. Requires the local libsql backend. ---
-        for m in manifest
-            .members
-            .iter()
-            .filter(|m| m.kind == MemberKind::Libsql)
-        {
-            let Some(libsql) = &self.libsql else {
-                return Err(Perr::Unavailable(
-                    "bundle carries libsql members but this node has no local libsql backend to \
-                     restore them into"
-                        .into(),
-                ));
-            };
-            let site = site_from_libsql_member(&m.path)
-                .ok_or_else(|| Perr::Other(format!("bad libsql member path {:?}", m.path)))?;
-            let qsite = ProjectRef::new(project).qualified(site);
-            if opts.apply {
-                libsql
-                    .restore_snapshot(&qsite, "", &extract.join(&m.path))
-                    .await
-                    .map_err(other)?;
-            }
-            report.libsql_databases += 1;
-        }
-
-        // --- control-plane KV (FULL bundles only; --data-only carries app data only) ---
-        if manifest.data_only {
-            report
-                .notes
-                .push("control-plane KV (identity/RBAC/routing) NOT imported: --data-only".into());
-        } else {
-            let kv_file = extract.join(KV_MEMBER_PATH);
-            if kv_file.exists() {
-                let bytes = tokio::fs::read(&kv_file).await.map_err(other)?;
+                let bytes = tokio::fs::read(temp).await.map_err(other)?;
                 let mut decoded = boatramp_core::kv_dump::decode_dump(&bytes).map_err(other)?;
                 // Re-qualify the control-plane slice to the TARGET project (matches the blob +
-                // libsql re-qualification above), so a project-rename import lands every owned key
-                // in the target's scope — and the --fresh drop below (keyed on the target) removes
-                // the right sealed keys rather than nothing.
+                // libsql re-qualification), so a project-rename import lands every owned key in
+                // the target's scope — and the --fresh drop (keyed on the target) removes the
+                // right sealed keys rather than nothing.
                 boatramp_core::project_export::rekey_entries_to_target(
                     &mut decoded.entries,
-                    &manifest.source.project,
+                    source_project,
                     project,
                 );
                 if opts.apply {
@@ -1281,88 +1781,56 @@ impl ProjectExport for NodeProjectExport {
                 }
             }
         }
-
-        // --- fresh identity: drop the source sealed-secret keyspace (Ask-4c) ---
-        // A `fresh` import of a FULL bundle just restored the SOURCE's KEK-sealed secrets
-        // (operator/app + per-tenant), which can never unseal under this node's own
-        // (different) KEK. Drop them so the target starts clean and re-provisions — making
-        // "zero source-sealed artifacts that unwrap" a POSITIVE absence rather than
-        // present-but-inert. Only for a FULL bundle (data-only carries no KV/secrets) and
-        // only when applying.
-        if matches!(opts.identity, IdentityChoice::Fresh) && !manifest.data_only && opts.apply {
-            let prefixes =
-                boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
-            let mut dropped = 0usize;
-            for prefix in &prefixes {
-                for key in self.kv.list_prefix(prefix).await.map_err(other)? {
-                    self.kv.delete_checkpointed(&key).await.map_err(other)?;
-                    dropped += 1;
-                }
-            }
-            report.notes.push(format!(
-                "identity: --fresh dropped {dropped} source-sealed secret key(s); re-provision \
-                 secrets + the managed-DB credential on the target"
-            ));
-        }
-
-        // Operational prerequisites after a FULL control-plane restore — the portable bundle
-        // deliberately carries no function/component CODE (deploy artifacts live in blob storage,
-        // not this slice), no TLS private keys and no global routing ownership. Surface the
-        // follow-up steps so the target is not silently half-restored.
-        if !manifest.data_only {
-            report.notes.push(
-                "post-import: re-deploy function/component code (deploy artifacts are not \
-                 bundled), re-verify + re-attach the project's domains, and let ACME re-issue TLS \
-                 certs (routing + certs are intentionally not carried in a portable bundle)"
-                    .into(),
-            );
-        }
-
-        let _ = tokio::fs::remove_dir_all(&session).await;
-        Ok(report)
-    }
-}
-
-/// Sanitize a member path into a flat staging filename.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-/// Walk `dir` recursively, adding each file as a bundle member at `blobs/<relpath>`.
-fn collect_blob_members(
-    dir: &Path,
-    members: &mut Vec<StagedMember>,
-) -> Result<(), project_bundle::BundleError> {
-    fn walk(base: &Path, dir: &Path, members: &mut Vec<StagedMember>) -> std::io::Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(base, &path, members)?;
-            } else {
-                let rel = path.strip_prefix(base).unwrap_or(&path);
-                let member_path = format!("blobs/{}", rel.to_string_lossy());
-                members.push(StagedMember {
-                    path: member_path,
-                    kind: MemberKind::Blob,
-                    source: path.clone(),
-                    pg: None,
-                });
-            }
-        }
         Ok(())
     }
-    walk(dir, dir, members).map_err(project_bundle::BundleError::Io)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive the streaming export into an in-memory buffer (the v2 bundle bytes) — the
+    /// in-process stand-in for the HTTP response the handler wires the sink to.
+    async fn export_to_buf(
+        drv: &NodeProjectExport,
+        project: &str,
+        opts: &ExportOptions,
+    ) -> Result<Vec<u8>, Perr> {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        drv.export(project, opts, &mut sink).await?;
+        Ok(sink.into_inner())
+    }
+
+    /// Read a v2 bundle buffer back into its `data_only` flag + every member (spec + bytes).
+    fn read_members(bytes: &[u8]) -> (bool, Vec<(MemberSpec, Vec<u8>)>) {
+        let mut data_only = false;
+        let mut got: Vec<(MemberSpec, Vec<u8>)> = Vec::new();
+        project_bundle::read_bundle_streaming_with_head(
+            bytes,
+            |d, _s| data_only = d,
+            |spec, _sz, body| {
+                let mut v = Vec::new();
+                body.read_to_end(&mut v)
+                    .map_err(project_bundle::BundleError::Io)?;
+                got.push((spec.clone(), v));
+                Ok(())
+            },
+        )
+        .expect("read back the exported v2 bundle");
+        (data_only, got)
+    }
+
+    /// Import a bundle buffer through the streaming driver — the in-process stand-in for the
+    /// HTTP request body the handler wires the source to.
+    async fn import_buf(
+        drv: &NodeProjectExport,
+        project: &str,
+        bytes: &[u8],
+        opts: ImportOptions,
+    ) -> Result<ImportReport, Perr> {
+        let mut src = futures::io::Cursor::new(bytes.to_vec());
+        drv.import(project, &mut src, opts).await
+    }
 
     #[test]
     fn kind_detection() {
@@ -1517,38 +1985,38 @@ mod tests {
         let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work);
 
         // FULL export carries the control-plane KV slice...
-        let full = drv
-            .export(
-                "acme",
-                &ExportOptions {
-                    data_only: false,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("full export");
-        let mf = project_bundle::read_manifest(&full).expect("read full manifest");
-        assert!(!mf.data_only, "full manifest is not data-only");
+        let full = export_to_buf(
+            &drv,
+            "acme",
+            &ExportOptions {
+                data_only: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("full export");
+        let (full_data_only, full_members) = read_members(&full);
+        assert!(!full_data_only, "full manifest is not data-only");
         assert!(
-            mf.members.iter().any(|m| m.kind == MemberKind::Kv),
+            full_members.iter().any(|(m, _)| m.kind == MemberKind::Kv),
             "a FULL bundle must carry the control-plane KV slice"
         );
 
         // ...a data-only export must NOT (the Ask-4(a) safety invariant).
-        let donly = drv
-            .export(
-                "acme",
-                &ExportOptions {
-                    data_only: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("data-only export");
-        let md = project_bundle::read_manifest(&donly).expect("read data-only manifest");
-        assert!(md.data_only, "data-only manifest flags data_only");
+        let donly = export_to_buf(
+            &drv,
+            "acme",
+            &ExportOptions {
+                data_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("data-only export");
+        let (donly_data_only, donly_members) = read_members(&donly);
+        assert!(donly_data_only, "data-only manifest flags data_only");
         assert!(
-            !md.members.iter().any(|m| m.kind == MemberKind::Kv),
+            !donly_members.iter().any(|(m, _)| m.kind == MemberKind::Kv),
             "a data-only bundle must NOT carry the control-plane KV slice (Ask-4a leak)"
         );
     }
@@ -1594,52 +2062,60 @@ mod tests {
         );
 
         // include-identity (full) → an Identity member that unwraps to the exact KEK.
-        let bundle = drv
-            .export(
-                "acme",
-                &ExportOptions {
-                    data_only: false,
-                    include_identity: true,
-                    transport_key: Some(pass.clone()),
-                },
-            )
-            .await
-            .expect("include-identity export");
-        let extract = tmp.path().join("ex-id");
-        let manifest = project_bundle::extract_and_verify(&bundle, &extract).expect("extract");
-        let idm = manifest
-            .members
+        let bundle = export_to_buf(
+            &drv,
+            "acme",
+            &ExportOptions {
+                data_only: false,
+                include_identity: true,
+                transport_key: Some(pass.clone()),
+            },
+        )
+        .await
+        .expect("include-identity export");
+        let (_do, members) = read_members(&bundle);
+        let (idspec, container) = members
             .iter()
-            .find(|m| m.kind == MemberKind::Identity)
+            .find(|(m, _)| m.kind == MemberKind::Identity)
             .expect("identity member present");
-        let container = std::fs::read(extract.join(&idm.path)).unwrap();
+        assert_eq!(
+            idspec.path, IDENTITY_MEMBER_PATH,
+            "identity member at the declared path"
+        );
         let payload =
-            boatramp_server::envelope::transport_unwrap(&container, &pass).expect("unwrap");
+            boatramp_server::envelope::transport_unwrap(container, &pass).expect("unwrap");
         assert_eq!(
             parse_identity_payload(&payload).unwrap(),
             kek,
             "the wrapped KEK round-trips"
         );
         assert!(
-            boatramp_server::envelope::transport_unwrap(&container, b"wrong").is_err(),
+            boatramp_server::envelope::transport_unwrap(container, b"wrong").is_err(),
             "wrong transport key cannot open the container"
         );
 
+        // The identity member is FIRST in the v2 restore order (an adopt import installs the
+        // KEK before the KV slice).
+        assert_eq!(
+            members.first().map(|(m, _)| m.kind),
+            Some(MemberKind::Identity),
+            "identity is the first member in restore order"
+        );
+
         // Default export → NO identity member.
-        let plain = drv
-            .export("acme", &ExportOptions::default())
+        let plain = export_to_buf(&drv, "acme", &ExportOptions::default())
             .await
             .expect("default export");
-        let ex2 = tmp.path().join("ex-plain");
-        let m2 = project_bundle::extract_and_verify(&plain, &ex2).unwrap();
+        let (_do2, m2) = read_members(&plain);
         assert!(
-            !m2.members.iter().any(|m| m.kind == MemberKind::Identity),
+            !m2.iter().any(|(m, _)| m.kind == MemberKind::Identity),
             "default bundle carries no identity member"
         );
 
         // Refusals: data-only+identity, missing transport key, and a Vault source.
         assert!(
-            drv.export(
+            export_to_buf(
+                &drv,
                 "acme",
                 &ExportOptions {
                     data_only: true,
@@ -1652,7 +2128,8 @@ mod tests {
             "data-only + include-identity is refused"
         );
         assert!(
-            drv.export(
+            export_to_buf(
+                &drv,
                 "acme",
                 &ExportOptions {
                     data_only: false,
@@ -1666,17 +2143,17 @@ mod tests {
         );
         let vault = mk("vault", Some(IdentityEnvelope::Vault));
         assert!(
-            vault
-                .export(
-                    "acme",
-                    &ExportOptions {
-                        data_only: false,
-                        include_identity: true,
-                        transport_key: Some(pass.clone()),
-                    },
-                )
-                .await
-                .is_err(),
+            export_to_buf(
+                &vault,
+                "acme",
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: true,
+                    transport_key: Some(pass.clone()),
+                },
+            )
+            .await
+            .is_err(),
             "include-identity on a Vault envelope is refused"
         );
     }
@@ -1731,17 +2208,17 @@ mod tests {
             kek_file: src_kek_file.clone(),
         });
         let pass = b"transport-pass".to_vec();
-        let bundle = src
-            .export(
-                "acme",
-                &ExportOptions {
-                    data_only: false,
-                    include_identity: true,
-                    transport_key: Some(pass.clone()),
-                },
-            )
-            .await
-            .expect("export with identity");
+        let bundle = export_to_buf(
+            &src,
+            "acme",
+            &ExportOptions {
+                data_only: false,
+                include_identity: true,
+                transport_key: Some(pass.clone()),
+            },
+        )
+        .await
+        .expect("export with identity");
 
         // Build a fresh target driver (empty KV, a kek_file path that does not yet exist).
         let target = |tag: &str| {
@@ -1766,20 +2243,20 @@ mod tests {
 
         // --- adopt: installs the KEK, keeps sealed secrets, never writes _cp/* ---
         let (adopt_drv, a_kv, a_kek) = target("a");
-        adopt_drv
-            .import(
-                "acme",
-                &bundle,
-                ImportOptions {
-                    apply: true,
-                    identity: IdentityChoice::Adopt {
-                        transport_key: pass.clone(),
-                    },
-                    ..Default::default()
+        import_buf(
+            &adopt_drv,
+            "acme",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                identity: IdentityChoice::Adopt {
+                    transport_key: pass.clone(),
                 },
-            )
-            .await
-            .expect("adopt import");
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("adopt import");
         assert_eq!(
             std::fs::read(&a_kek).unwrap(),
             kek,
@@ -1808,18 +2285,18 @@ mod tests {
 
         // --- fresh: installs NO KEK, drops the source sealed-secret keyspace ---
         let (fresh_drv, f_kv, f_kek) = target("f");
-        fresh_drv
-            .import(
-                "acme",
-                &bundle,
-                ImportOptions {
-                    apply: true,
-                    identity: IdentityChoice::Fresh,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("fresh import");
+        import_buf(
+            &fresh_drv,
+            "acme",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fresh import");
         assert!(!f_kek.exists(), "fresh installs no KEK");
         assert!(
             f_kv.get("project/acme/secret/api-key")
@@ -1859,43 +2336,62 @@ mod tests {
         );
 
         // --- adopt on a bundle WITHOUT an identity member is refused ---
-        let plain = src
-            .export("acme", &ExportOptions::default())
+        let plain = export_to_buf(&src, "acme", &ExportOptions::default())
             .await
             .expect("plain export");
-        let (no_id_drv, _k, _f) = target("n");
+        let (no_id_drv, no_id_kv, _f) = target("n");
         assert!(
-            no_id_drv
-                .import(
-                    "acme",
-                    &plain,
-                    ImportOptions {
-                        apply: true,
-                        identity: IdentityChoice::Adopt {
-                            transport_key: pass.clone(),
-                        },
-                        ..Default::default()
+            import_buf(
+                &no_id_drv,
+                "acme",
+                &plain,
+                ImportOptions {
+                    apply: true,
+                    identity: IdentityChoice::Adopt {
+                        transport_key: pass.clone(),
                     },
-                )
-                .await
-                .is_err(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err(),
             "adopt on a bundle with no identity member is refused"
+        );
+        // ...and refused BEFORE the sealed KV slice is written (the KV-member guard): no
+        // source-sealed secret landed on the target despite the plain bundle carrying one.
+        assert!(
+            no_id_kv
+                .get("project/acme/secret/api-key")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused adopt must not have written the source-sealed KV slice"
         );
     }
 
     #[test]
-    fn blob_rekey_only_on_project_rename() {
-        let dir = std::path::Path::new("/x/extract/blobs");
-        // Same project -> no re-key.
-        assert_eq!(blob_rekey_dirs(dir, "acme", "acme"), None);
-        // Rename -> move hblob/{source} -> hblob/{target}.
+    fn blob_rekey_lands_in_target_scope_and_fails_closed() {
+        // Same project → the member's own scope (no rename).
         assert_eq!(
-            blob_rekey_dirs(dir, "preview-a", "preview-b"),
-            Some((
-                dir.join("hblob").join("preview-a"),
-                dir.join("hblob").join("preview-b"),
-            ))
+            target_blob_key("blobs/hblob/acme/web/c/obj", "acme", "acme").unwrap(),
+            "hblob/acme/web/c/obj"
         );
+        // Rename → the object lands under the TARGET project's scope, never the source's.
+        let t = target_blob_key("blobs/hblob/preview-a/web/c/obj", "preview-a", "preview-b")
+            .expect("rename re-key");
+        assert_eq!(t, "hblob/preview-b/web/c/obj");
+        assert!(
+            !t.contains("preview-a"),
+            "NO source-scope segment survives a rename re-key"
+        );
+        // FAIL-CLOSED (the tenancy-critical mutation): a member NOT under the source project
+        // scope is REFUSED, never silently landed in a foreign scope — a sibling-prefix project
+        // (`acmecorp` vs `acme`) is not over-captured, and a bare key missing the `blobs/`
+        // wrapper is rejected.
+        assert!(target_blob_key("blobs/hblob/globex/secret/obj", "acme", "beta").is_err());
+        assert!(target_blob_key("blobs/hblob/acmecorp/x", "acme", "beta").is_err());
+        assert!(target_blob_key("hblob/acme/x", "acme", "beta").is_err());
+        assert!(target_blob_key("blobs/not-hblob/x", "acme", "beta").is_err());
     }
 
     #[test]

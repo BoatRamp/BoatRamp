@@ -2659,45 +2659,32 @@ pub(super) async fn project_export(
         include_identity: q.include_identity,
         transport_key,
     };
-    let path = match cap.export(&q.project, &export_opts).await {
-        Ok(p) => p,
-        Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
-            return (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response();
+    // Stream the bundle straight to the response body: the driver writes the `BRPROJ` tar
+    // into the write half of an in-memory pipe (bounded) as it produces each member, and the
+    // response body drains the read half — so the node's transient on-disk staging stays
+    // bounded to the LARGEST SINGLE MEMBER and the whole bundle is never buffered to a temp
+    // file (the env-clone disk-fill fix). Because the bytes start flowing immediately, a
+    // driver failure AFTER the first bytes cannot change the already-sent 200; the bundle's
+    // per-member SHA-256 + size make a truncated/partial bundle fail LOUD on import instead.
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    let (dup_w, dup_r) = tokio::io::duplex(128 * 1024);
+    let project_for_task = q.project.clone();
+    tokio::spawn(async move {
+        let mut sink = dup_w.compat_write();
+        if let Err(e) = cap.export(&project_for_task, &export_opts, &mut sink).await {
+            tracing::warn!(error = %e, project = %project_for_task, "project export stream failed");
         }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("project export failed: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("project export: cannot open bundle: {e}\n"),
-            )
-                .into_response();
-        }
-    };
-    // Unlink now; the open fd keeps the bytes readable until the stream drains (unix),
-    // so the temp bundle never leaks even if the client disconnects mid-download.
-    let _ = tokio::fs::remove_file(&path).await;
+        // Dropping `sink` closes the pipe's write half ⇒ the response body sees EOF.
+    });
     let stream = futures::stream::try_unfold(
-        (file, vec![0u8; 64 * 1024]),
-        |(mut file, mut buf)| async move {
+        (dup_r, vec![0u8; 64 * 1024]),
+        |(mut rd, mut buf)| async move {
             use tokio::io::AsyncReadExt;
-            let n = file.read(&mut buf).await?;
+            let n = rd.read(&mut buf).await?;
             if n == 0 {
                 Ok::<_, std::io::Error>(None)
             } else {
-                Ok(Some((
-                    bytes::Bytes::copy_from_slice(&buf[..n]),
-                    (file, buf),
-                )))
+                Ok(Some((bytes::Bytes::copy_from_slice(&buf[..n]), (rd, buf))))
             }
         },
     );
@@ -2767,75 +2754,6 @@ pub(super) async fn project_import(
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
     }
-    // Stream the request body to a bundle file under the node's PRIVATE staging dir
-    // (never world-readable `/tmp` — the bundle carries full DB dumps): the dir is
-    // created `0700`, the file `0600` + `O_EXCL` (`create_new`). Bounded memory.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let stage_dir = cap.staging_root().join("incoming");
-    if let Err(e) = tokio::fs::create_dir_all(&stage_dir).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("project import: cannot create staging dir: {e}\n"),
-        )
-            .into_response();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let tmp = stage_dir.join(format!("import-{}-{nanos}.brproj", q.project));
-    {
-        use futures::StreamExt;
-        use tokio::io::AsyncWriteExt;
-        let mut open = tokio::fs::OpenOptions::new();
-        open.write(true).create_new(true); // O_EXCL
-        #[cfg(unix)]
-        open.mode(0o600);
-        let mut f = match open.open(&tmp).await {
-            Ok(f) => f,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("project import: cannot stage bundle: {e}\n"),
-                )
-                    .into_response();
-            }
-        };
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("project import: body read failed: {e}\n"),
-                    )
-                        .into_response();
-                }
-            };
-            if let Err(e) = f.write_all(&chunk).await {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("project import: stage write failed: {e}\n"),
-                )
-                    .into_response();
-            }
-        }
-        if let Err(e) = f.flush().await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("project import: stage flush failed: {e}\n"),
-            )
-                .into_response();
-        }
-    }
     let identity = match q.identity.as_str() {
         "fresh" => boatramp_core::project_export::IdentityChoice::Fresh,
         "adopt" => match transport_key_from_headers(&headers) {
@@ -2864,8 +2782,16 @@ pub(super) async fn project_import(
         allow_schema_skew: q.allow_schema_skew,
         identity,
     };
-    let res = cap.import(&q.project, &tmp, opts).await;
-    let _ = tokio::fs::remove_file(&tmp).await;
+    // Stream the request body straight into the driver — no stage-to-temp: the node never
+    // holds the whole bundle (peak staging is bounded to the largest single member), and the
+    // bundle is restored in a single forward pass. `into_async_read` adapts axum's body
+    // byte-stream to the `futures::io::AsyncRead` the capability takes.
+    use futures::TryStreamExt;
+    let mut reader = body
+        .into_data_stream()
+        .map_err(std::io::Error::other)
+        .into_async_read();
+    let res = cap.import(&q.project, &mut reader, opts).await;
     match res {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(boatramp_core::project_export::ProjectExportError::SchemaSkew(dbs)) => (

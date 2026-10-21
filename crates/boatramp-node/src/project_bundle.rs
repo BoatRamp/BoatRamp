@@ -761,9 +761,29 @@ where
 /// members arrive in the MANIFEST's declared (restore) order, which is enforced; v1 members
 /// may arrive in any order and are matched by path (preserving v1 semantics). Returns the
 /// members restored, in the order they were handed to `restore`.
-pub fn read_bundle_streaming<R, F>(src: R, mut restore: F) -> Result<Vec<MemberSpec>, BundleError>
+pub fn read_bundle_streaming<R, F>(src: R, restore: F) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
+    F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
+{
+    read_bundle_streaming_with_head(src, |_data_only, _source| {}, restore)
+}
+
+/// Like [`read_bundle_streaming`], but also surfaces the bundle HEAD — the `data_only` flag
+/// and the [`SourceInfo`] — via `on_head`, called ONCE after the MANIFEST is parsed and
+/// validated, BEFORE any member is handed to `restore`. The import driver needs both ahead
+/// of the first member (to re-key each member to the TARGET project, and to branch the
+/// data-only vs full restore), and the v2 MANIFEST (like the v1 one) carries them before any
+/// member — so a single forward pass can learn them up front. Reads both v2 and v1 bundles,
+/// exactly as [`read_bundle_streaming`] does.
+pub fn read_bundle_streaming_with_head<R, H, F>(
+    src: R,
+    mut on_head: H,
+    mut restore: F,
+) -> Result<Vec<MemberSpec>, BundleError>
+where
+    R: Read,
+    H: FnMut(bool, &SourceInfo),
     F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
 {
     let mut ar = tar::Archive::new(src);
@@ -786,6 +806,7 @@ where
         // --- v1: inline size/SHA in the manifest; members matched by path (any order). ---
         let manifest: Manifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
+        on_head(manifest.data_only, &manifest.source);
         let mut seen: HashSet<String> = HashSet::new();
         for entry in entries {
             let mut entry = entry?;
@@ -814,6 +835,7 @@ where
         // --- v2: ordered `<path>.brmeta` sidecar then `<path>` data, in MANIFEST order. ---
         let manifest: StreamManifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
+        on_head(manifest.data_only, &manifest.source);
         let mut specs = manifest.members.iter();
         let mut pending_meta: Option<(String, MemberMeta)> = None;
         for entry in entries {

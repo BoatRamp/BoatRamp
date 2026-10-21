@@ -48,8 +48,10 @@ serde = { workspace = true, features = ["derive"] }
 # but a tiny dep so it stays unconditional (as with getrandom below).
 serde_json.workspace = true
 thiserror.workspace = true
-# Naming the detached reconcile `JoinHandle`s that `assemble` returns.
-tokio.workspace = true
+# Naming the detached reconcile `JoinHandle`s that `assemble` returns; `sync` adds the
+# bounded mpsc/oneshot channels the project-export streaming bridge uses to talk between
+# its blocking tar reader/writer task and the async driver.
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 # The blob-migration copy engine (`blob_migrate`) drives the `Storage` primitives with
 # bounded-concurrency `buffer_unordered` streams; a tiny, always-present dep.

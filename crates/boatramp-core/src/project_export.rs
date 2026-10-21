@@ -6,15 +6,20 @@
 //! [`ComputeExec`](crate::compute::ComputeExec) capability-trait pattern (a core trait,
 //! node-implemented, server-consumed via an axum `Extension`).
 //!
-//! The methods are **file-based** to stay object-safe and to keep the multi-gigabyte
-//! bundle off the heap: `export` writes a bundle file and returns its path (the handler
-//! streams it out then deletes it); `import` reads a bundle file (the handler streams
-//! the request body to a temp file first). The bundle format itself (the `BRPROJ` tar +
-//! MANIFEST) lives in `boatramp-node`.
-
-use std::path::{Path, PathBuf};
+//! The methods **stream** the bundle through an [`AsyncWrite`] / [`AsyncRead`] (format
+//! v2), so neither the exporting node nor the importing node ever stages the WHOLE
+//! bundle to disk: `export` writes the `BRPROJ` tar straight into `sink` (the handler
+//! wires that to the HTTP response body), producing + freeing each member just-in-time so
+//! the transient on-disk footprint is bounded to the LARGEST SINGLE MEMBER, never the
+//! whole bundle (the env-clone disk-fill fix); `import` reads the bundle straight from
+//! `src` (the handler wires that to the request body) in a single forward pass, restoring
+//! each member as it streams. The `futures::io` traits (not `tokio::io`) are used so the
+//! trait stays usable from this crate's wasm32 build, which has no tokio. The bundle
+//! format itself (the `BRPROJ` tar + MANIFEST, both v1 read-compat and the v2 streamable
+//! writer) lives in `boatramp-node`.
 
 use async_trait::async_trait;
+use futures::io::{AsyncRead, AsyncWrite};
 use serde::Serialize;
 
 use crate::project::ProjectRef;
@@ -285,31 +290,32 @@ pub enum ProjectExportError {
 /// The project export/import capability (see the module docs).
 #[async_trait]
 pub trait ProjectExport: Send + Sync {
-    /// Export `project` to a freshly-written bundle file, returning its path. The caller
-    /// (the API handler) streams the file to the response, then deletes it. `opts` selects
-    /// data-only vs full and whether to include the identity transport container.
+    /// Stream a `project` export bundle (`BRPROJ`, format v2) into `sink`. The caller (the
+    /// API handler) wires `sink` to the HTTP response body, so the bundle is produced and
+    /// sent member-by-member with a transient on-disk staging bounded to the largest single
+    /// member — never the whole bundle. `opts` selects data-only vs full and whether to
+    /// include the identity transport container. Because the bytes stream as they are
+    /// produced, a failure AFTER the first bytes cannot change an already-sent HTTP status;
+    /// the bundle's per-member size + SHA-256 make a truncated/partial bundle fail LOUD on
+    /// import instead.
     async fn export(
         &self,
         project: &str,
         opts: &ExportOptions,
-    ) -> Result<PathBuf, ProjectExportError>;
+        sink: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> Result<(), ProjectExportError>;
 
-    /// Import the bundle at `bundle` into `project`. Dry-run (plan only) unless
-    /// `opts.apply`. Returns a summary report.
+    /// Import a bundle streamed from `src` into `project`, in a single forward pass (reads
+    /// both the v2 streamable format and legacy v1 bundles — the reader dispatches on the
+    /// manifest version). Each member is restored as it streams, with a transient on-disk
+    /// staging bounded to the largest single member. Dry-run (plan only) unless `opts.apply`.
+    /// Returns a summary report.
     async fn import(
         &self,
         project: &str,
-        bundle: &Path,
+        src: &mut (dyn AsyncRead + Send + Unpin),
         opts: ImportOptions,
     ) -> Result<ImportReport, ProjectExportError>;
-
-    /// A node-private directory the API handler should stage an INCOMING import bundle
-    /// into (a bundle carries a full DB dump — it must never sit in world-readable
-    /// `/tmp`). The node implementation returns its own data-dir work area; the default
-    /// is the system temp dir (used only by a stub with no node context).
-    fn staging_root(&self) -> PathBuf {
-        std::env::temp_dir()
-    }
 }
 
 #[cfg(test)]

@@ -212,7 +212,7 @@ oidc = ["dep:jsonwebtoken"]
 # On-the-fly response compression, runtime-opt-in per site.
 # Pulls pure-Rust gzip/brotli stream encoders; off by default (the precompressed-
 # variant path needs no extra dependency).
-compression = ["dep:async-compression", "dep:tokio-util"]
+compression = ["dep:async-compression"]
 
 # HTTP/3 (QUIC) serving: a third listener transport feeding
 # the same router. Pulls quinn + h3; off by default. The QUIC handshake is
@@ -329,7 +329,10 @@ async-compression = { version = "0.4", default-features = false, features = [
   "gzip",
   "brotli",
 ], optional = true }
-tokio-util = { version = "0.7", features = ["io"], optional = true }
+# `io` (ReaderStream/StreamReader for compression) + `compat` (tokio⇄futures AsyncWrite
+# bridge for the project-export streaming response). Non-optional: the project-export
+# admin handlers (always compiled) stream the bundle through `compat`.
+tokio-util = { workspace = true, features = ["io", "compat"] }
 
 # HTTP/3 (`http3` feature): QUIC endpoint + the HTTP/3 layer + the rustls config
 # the QUIC crypto is built from. All optional.
