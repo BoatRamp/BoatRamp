@@ -661,6 +661,29 @@ pub(crate) struct DialResponseBody {
     pub token: String,
 }
 
+/// `POST /api/overlay/expose` request/response (CLI mirror of the server types) — the self-serve
+/// reverse-ingress publish path (`boatramp expose --server`).
+#[derive(serde::Serialize)]
+pub(crate) struct ExposeRequestBody {
+    pub service: String,
+    pub holder_pubkey: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ExposeResponseBody {
+    pub relay: String,
+    pub relay_id: String,
+    pub service: String,
+    pub token: String,
+    /// The cluster trust root's PUBLIC key — the exposer verifies incoming forward clients' dial
+    /// capabilities against it (zero-trust terminator).
+    pub trust_root: String,
+    /// The relay's client-auth posture ("capability-only" | "mutual-pin"); selects the exposer's TLS
+    /// posture when dialing OUT (capability-only ⇒ present no client cert).
+    #[serde(default)]
+    pub relay_client_auth: String,
+}
+
 /// GET the overlay service directory from the control plane.
 async fn fetch_directory(
     server: Option<String>,

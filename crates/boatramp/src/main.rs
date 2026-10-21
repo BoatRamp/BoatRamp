@@ -523,14 +523,21 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
-    // `expose` is a long-running overlay reverse-ingress (like `forward`). It consults no config —
-    // the ticket / explicit flags carry everything (topology + publish capability + trust root).
+    // `expose` is a long-running overlay reverse-ingress (like `forward`). The explicit-flag /
+    // `--ticket` paths carry everything; the self-serve `expose <local> as svc/<name>` path reads the
+    // project config (server URL + token) to resolve + mint over the control plane — so load it
+    // best-effort (a missing `project.cfg` is fine for the explicit paths).
     #[cfg(feature = "overlay")]
     if matches!(cli.command, Command::Expose(_)) {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.cfg"));
         let Command::Expose(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        expose::run(args).await?;
+        let config = config::ProjectConfig::load(&path, None).unwrap_or_default();
+        expose::run(args, &config).await?;
         return Ok(());
     }
 

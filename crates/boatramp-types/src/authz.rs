@@ -80,9 +80,11 @@ pub enum Resource {
     Cache,
     /// Node/system operations: metrics, prune, scrub, site listing.
     System,
-    /// Overlay forward-flow directory + dial minting (`/api/overlay/*`):
-    /// `Overlay·Read` lists/resolves the service directory; `Overlay·Write` mints a
-    /// holder-bound dial capability (self-serve `boatramp forward svc/<name>`).
+    /// Overlay forward-flow directory + dial/publish minting (`/api/overlay/*`), three tiers:
+    /// `Overlay·Read` lists/resolves the service directory; `Overlay·Write` mints a holder-bound
+    /// DIAL capability (self-serve `boatramp forward svc/<name>`); `Overlay·Admin` mints a holder-
+    /// bound PUBLISH capability (self-serve `boatramp expose --server`) — strictly higher, because
+    /// publishing CLAIMS a service name that cluster-side forward clients trust and pin.
     Overlay,
 }
 
@@ -220,6 +222,18 @@ impl Right {
             return Some(Self::new(Resource::Blobs, None, Action::Deploy));
         }
 
+        // Overlay reverse-ingress PUBLISH (the self-serve `boatramp expose --server` path): minting an
+        // overlay-PUBLISH capability CLAIMS a service NAME that cluster-side `forward` clients will
+        // trust and PIN as their E2EE peer, so it is gated STRICTLY HIGHER than dial's `Overlay·Write`
+        // — `Overlay·Admin`. Publishing a name others rely on is an owner-grade act; dialing an
+        // already-published service is not. `Action::Admin` also satisfies the lower read/write
+        // (`Right::satisfies`), and the built-in `admin` role covers it via `Resource::ALL`. Checked
+        // ABOVE the dial/services arms, and re-derived defense-in-depth in-handler
+        // (`assert_overlay_expose_is_overlay_admin`) so a route-table refactor can't silently drop the
+        // Admin gate down to Write.
+        if path == "/api/overlay/expose" {
+            return Some(Self::new(Resource::Overlay, None, Action::Admin));
+        }
         // Overlay forward-flow discovery. Minting a dial capability (the self-serve
         // `boatramp forward svc/<name>` path) is `Overlay·Write` — it grants a holder-bound,
         // scope-checked capability the egress still verifies; listing/resolving the service
@@ -3048,6 +3062,61 @@ mod tests {
                     .rights_for(&[GrantedRole::global("admin")])
                     .allows(&req),
                 "System·Admin (operator) must reach {path}"
+            );
+        }
+    }
+
+    /// Overlay expose (reverse-ingress PUBLISH, self-serve `boatramp expose --server`) is gated
+    /// `Overlay·Admin` — STRICTLY HIGHER than dial's `Overlay·Write` — because publishing CLAIMS a
+    /// service name that cluster-side forward clients trust and pin. The three overlay tiers must
+    /// stand in the Read < Write < Admin relation, and a token holding only `Overlay·Write` (enough
+    /// to dial) must NOT be able to publish. Admins reach it via `Resource::ALL`.
+    #[test]
+    fn overlay_expose_requires_overlay_admin_strictly_above_dial_write() {
+        let expose = Right::required("POST", "/api/overlay/expose")
+            .expect("POST /api/overlay/expose must require a token (never public)");
+        let dial = Right::required("POST", "/api/overlay/dial").unwrap();
+        let services = Right::required("GET", "/api/overlay/services").unwrap();
+
+        assert_eq!(
+            expose,
+            Right::new(Resource::Overlay, None, Action::Admin),
+            "POST /api/overlay/expose must be gated Overlay·Admin",
+        );
+        assert_eq!(dial, Right::new(Resource::Overlay, None, Action::Write));
+        assert_eq!(services, Right::new(Resource::Overlay, None, Action::Read));
+
+        // The crux: a grant that only lets you DIAL (Overlay·Write) must NOT let you PUBLISH.
+        assert!(
+            !Right::new(Resource::Overlay, None, Action::Write).satisfies(&expose),
+            "Overlay·Write (dial) must NOT satisfy the Overlay·Admin publish gate — publishing is \
+             strictly higher",
+        );
+        assert!(
+            !Right::new(Resource::Overlay, None, Action::Read).satisfies(&expose),
+            "Overlay·Read must NOT satisfy the Overlay·Admin publish gate",
+        );
+        // But Overlay·Admin satisfies ALL three tiers (Admin ≥ Write ≥ Read).
+        let admin = Right::new(Resource::Overlay, None, Action::Admin);
+        assert!(admin.satisfies(&expose) && admin.satisfies(&dial) && admin.satisfies(&services));
+
+        // Over the real default policy: only the `admin` role reaches publish (no tenant role does).
+        let policy = AuthzPolicy::default_policy();
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::global("admin")])
+                .allows(&expose),
+            "the admin role must reach Overlay·Admin via Resource::ALL",
+        );
+        for grant in [
+            GrantedRole::scoped("publisher", "default/site"),
+            GrantedRole::scoped("project_admin", "default"),
+            GrantedRole::global("operator"),
+        ] {
+            let role = grant.name.clone();
+            assert!(
+                !policy.rights_for(&[grant]).allows(&expose),
+                "a non-admin principal (role {role}) must be REFUSED overlay publish",
             );
         }
     }

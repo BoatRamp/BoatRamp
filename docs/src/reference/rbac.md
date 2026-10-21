@@ -29,7 +29,7 @@ does not satisfy any right on `site`.
 
 Three resources are target-scoped: `site` (target `<project>/<site>`), `project`
 (target `<project>`, since 0.2.0), and `secrets` (target `<project>`, since 0.3.10).
-The other five are global.
+The rest are global.
 
 | Resource | Scoped | Governs |
 | --- | --- | --- |
@@ -41,6 +41,7 @@ The other five are global.
 | `certs` | global | TLS certificate status. |
 | `cache` | global | Cache invalidation. |
 | `system` | global | Metrics, prune, scrub, site/project listing, cluster membership, authz policy. |
+| `overlay` | global | Overlay forward-flow discovery + capability minting (`/api/overlay/*`). Three tiers: `read` lists/resolves the service directory; `write` mints a holder-bound **dial** capability (self-serve `boatramp forward`); `admin` mints a holder-bound **publish** capability (self-serve `boatramp expose`) — strictly above `write`, because publishing claims a service name that forward clients trust and pin. Granted only via `admin` (or an explicit grant), never a default tenant role. |
 
 ## Default roles
 
@@ -135,6 +136,9 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET`/`DELETE` | `/api/compute/volumes[/<name>]` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
 | `GET`/`POST` | `/api/compute/{status,ipam,dns[/resolve],reconcile}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
 | `POST` | `/api/compute/maintenance/{set-health,restart,netdiag}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
+| `GET` | `/api/overlay/services` | `overlay` · `read` |
+| `POST` | `/api/overlay/dial` | `overlay` · `write` (mint a holder-bound dial capability) |
+| `POST` | `/api/overlay/expose` | `overlay` · `admin` — minting a **publish** capability claims a service name forward clients pin, strictly above dial's `overlay` · `write` |
 | `POST`/`DELETE` | `/api/tokens[/<id>]` | `tokens` · `admin` |
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |

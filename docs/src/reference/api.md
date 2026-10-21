@@ -174,14 +174,25 @@ See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
 ## Overlay
 
 The overlay forward-flow **discovery** surface — what backs self-serve
-[`boatramp forward svc/<name>`](./cli.md#boatramp-forward). An explicit right (not
-the deny-safe `System·Admin` default) so an operator role can self-serve without
-full node-admin. Present with the `overlay` feature.
+[`boatramp forward svc/<name>`](./cli.md#boatramp-forward) and
+[`boatramp expose --server`](./cli.md#boatramp-expose). Explicit rights (not the
+deny-safe `System·Admin` default) so an operator role can self-serve without full
+node-admin. Present with the `overlay` feature.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/overlay/dial` | Resolve a service to its relay/egress topology and mint a holder-bound dial capability for it (signed by the node's root issuer, still scope-verified at the egress). `Overlay·Write`. |
+| `POST` | `/api/overlay/expose` | Resolve this node's ingress-relay topology and mint a holder-bound **publish** capability for a service (self-serve `boatramp expose`). `Overlay·Admin` — strictly above dial's `Overlay·Write`, because publishing CLAIMS a name that forward clients trust and pin. |
 | `GET` | `/api/overlay/services` | List the overlay service directory — the services you can `forward` to. `Overlay·Read`. |
+
+The directory is a **merged view**: the static `[overlay]` routes ∪ the services
+currently published by live `boatramp expose` exposers (when this node runs an
+ingress relay accepting them). A dial to an exposed service resolves to an
+`egress_id` that is the exposer identity the relay **verified at registration**
+(holder-bound), delivered over this authenticated response; the forward client pins
+exactly that id as its end-to-end peer, so the QUIC data plane can never substitute
+the peer — a cross-wired flow fails the client's E2EE pin, never a silent
+cross-wire. A live exposer wins a name collision with a static route.
 
 The dial request names the service and the caller's overlay identity (an
 `ed25519:<hex>` holder key); `ttl_secs` is optional and clamped to the node's
@@ -205,8 +216,31 @@ The response is the resolved topology plus the minted capability:
 ```
 
 A node with no root private key cannot mint and returns `501`; an unknown service
-is `404`; a non-`ed25519` `holder_pubkey` is `400`. See the
-[`[overlay]`](./boatramp-cfg.md#overlay) serve roles.
+is `404`; a non-`ed25519` `holder_pubkey` is `400`.
+
+`POST /api/overlay/expose` mirrors `dial` for the reverse-ingress (publish)
+direction. The request names the service to publish and the caller's overlay
+identity; the response is this node's ingress-relay topology plus the minted
+publish capability and the cluster trust root the exposer verifies incoming forward
+clients against:
+
+```json
+{
+  "relay": "10.0.0.1:9100",
+  "relay_id": "ed25519:<relay-key>",
+  "service": "svc/db",
+  "token": "<minted publish capability>",
+  "trust_root": "ed25519:<cluster-root-pub>",
+  "relay_client_auth": "capability-only",
+  "expires_at": 1760000000
+}
+```
+
+A node with no root private key returns `501`; a node that runs no ingress relay
+accepting exposed services (`[overlay] accept_exposed`) returns `404`; a
+non-`ed25519` `holder_pubkey` is `400`. The relay still holder-binds and
+scope-verifies the publish capability at registration — this route only gates WHO
+may obtain one. See the [`[overlay]`](./boatramp-cfg.md#overlay) serve roles.
 
 ## Root anchors
 

@@ -87,7 +87,8 @@ flags unique to each command:
 | [`man`](#boatramp-completions-man) | Render the man page to stdout. |
 | [`cloudflare`](#boatramp-cloudflare) | Deploy to Cloudflare Containers natively over the REST API (`cluster` feature). |
 | [`forward`](#boatramp-forward) | Forward a local port to an in-cluster service over the overlay fabric (`overlay` feature). |
-| [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial capability + forward ticket (`overlay` feature). |
+| [`expose`](#boatramp-expose) | Publish a local service INTO the cluster over the overlay fabric — the reverse of `forward` (`overlay` feature). |
+| [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial/publish capability + ticket (`overlay` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
 [Errors & exit codes](./errors.md).
@@ -650,6 +651,51 @@ relay-blind flow that promotes to a direct link when one is reachable. The first
 startup is also surfaced loudly (on stderr, not just the log), with causes matched to the relay
 posture — a capability-only self-serve relay has no `allowed_clients`, so enrollment is never blamed
 there.
+
+## `boatramp expose`
+
+Publish a **local** service INTO the cluster over the overlay fabric — the reverse of `forward`. The
+exposer dials the relay OUTBOUND (so a NAT'd / undialable service can still be published) and holds
+the connection open; a cluster-side `boatramp forward svc/<name>` then reaches it, relay-blind and
+end-to-end encrypted. Requires the `overlay` feature.
+
+```
+boatramp expose 127.0.0.1:5432 as svc/db
+```
+
+The headline case is **self-serve**: give a local address and a service name and nothing else — the
+CLI uses your boatramp token to resolve this node's ingress-relay topology and mint a holder-bound
+**publish** capability via the control plane (`POST /api/overlay/expose`, `Overlay·Admin`), binding it
+to your persistent overlay identity (`~/.config/boatramp/overlay.key`), then registers. Zero
+hand-typed topology.
+
+**Publishing is gated higher than dialing.** Self-serve expose needs your boatramp token to hold
+`Overlay·Admin` — strictly above the `Overlay·Write` that `forward` needs — because publishing CLAIMS
+a service name that forward clients trust and pin as their encrypted peer. Admins have it via the
+`admin` role; a non-admin operator is granted it explicitly by an admin. If your token lacks it,
+`expose` fails with an actionable message (ask an admin for `Overlay·Admin`, or use a `--ticket`) —
+the `401` message names the real auth mechanism (`BOATRAMP_TOKEN` / `[publish].token`), never a
+phantom command.
+
+For deployments **without** a reachable control plane, a `--ticket` from
+[`overlay grant-expose`](#boatramp-overlay) or the explicit flags supply the same inputs by hand.
+
+| Flag | Meaning |
+| --- | --- |
+| `<local-addr>` | The local service to publish (e.g. `127.0.0.1:5432`) — what the exposer connects to per inbound flow. |
+| `<service>` | The in-cluster name to publish AS (e.g. `svc/db`), optionally after the literal `as`. With no `--ticket`/explicit flags it self-serves via the control plane. |
+| `--server <url>` | boatramp server for self-serve resolution (else `[publish].server`). |
+| `--ticket <blob>` | A `brexp1.…` expose ticket (control-plane-less). Conflicts with the explicit flags. |
+| `--relay <addr>` / `--relay-id <id>` / `--token <cap>` / `--token-file <path>` / `--trust-root <pub>` | The fully explicit escape hatch (the exposer verifies incoming dial capabilities against `--trust-root`). |
+| `--identity <seed\|path>` | Override the overlay identity (defaults to the persistent operator key; required with a `--holder-pub` ticket). |
+| `--capability-only` | Dial the relay server-auth-only (present no client cert) — for a **capability-only** relay reached via `--ticket`/explicit flags. Ignored on self-serve (the posture comes from the control plane, with a note on stderr if you pass it anyway). |
+
+A local preflight validates the publish capability (signature, scope, holder) before any network
+round-trip, so an expired / wrong-service / wrong-identity capability fails loudly and immediately.
+The `ready` banner prints only after a confirmed registration (a name already claimed by a live
+exposer fails first — names are first-live-claim-wins). The exposer is the terminator, so it
+independently authorizes each incoming forward client's dial capability against the cluster trust root
+(zero-trust, exactly like an in-cluster egress). Runs until interrupted (Ctrl-C).
 
 ## `boatramp operator`
 

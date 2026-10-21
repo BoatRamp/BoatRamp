@@ -553,9 +553,10 @@ pub(super) async fn create_join_token(
 /// Default lifetime of a minted overlay-dial capability (an overlay-dial cap MUST be time-bounded).
 const DEFAULT_OVERLAY_DIAL_TTL_SECS: u64 = 3600;
 
-/// Clamp a dial request's requested TTL (Security MEDIUM-D): an absent request defaults to
+/// Clamp a dial/publish request's requested TTL (Security MEDIUM-D): an absent request defaults to
 /// [`DEFAULT_OVERLAY_DIAL_TTL_SECS`], and any requested value is capped at the server `max` — so a
-/// caller cannot mint a near-immortal, irrevocable (offline-verified) dial capability.
+/// caller cannot mint a near-immortal, irrevocable (offline-verified) dial OR publish capability
+/// (both are offline-verified with no revocation, so the same TTL-bound applies).
 fn clamp_dial_ttl(requested: Option<u64>, max: u64) -> u64 {
     requested.unwrap_or(DEFAULT_OVERLAY_DIAL_TTL_SECS).min(max)
 }
@@ -577,6 +578,31 @@ fn assert_overlay_dial_is_overlay_write() -> Option<Response> {
             (
                 StatusCode::FORBIDDEN,
                 "overlay dial requires Overlay·Write\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Defense-in-depth (mirrors [`assert_overlay_dial_is_overlay_write`]): re-derive that `POST
+/// /api/overlay/expose` is gated `Overlay·Admin` INSIDE the handler, so a router/table refactor that
+/// drops it (or weakens it to `Overlay·Write`, the dial tier) cannot silently let a dial-only
+/// principal PUBLISH a service name — the strictly-higher bar is load-bearing (publishing claims a
+/// name forward clients trust + pin).
+fn assert_overlay_expose_is_overlay_admin() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/overlay/expose") {
+        Some(right)
+            if right.resource == Resource::Overlay
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay expose (publish) requires Overlay·Admin\n",
             )
                 .into_response(),
         ),
@@ -654,7 +680,12 @@ pub(super) async fn overlay_dial(
         )
             .into_response();
     };
-    let Some(target) = directory.resolve(&request.service) else {
+    let now = now_unix();
+    // Resolve over the MERGED directory (static `[overlay]` routes ∪ live reverse-ingress exposers):
+    // a dial to an EXPOSED service resolves to a target whose `egress_id` is the holder-bound exposer
+    // identity the relay verified AT REGISTRATION. A live exposer wins a name collision, so the
+    // `egress_id` the client pins matches the peer it will actually reach.
+    let Some(target) = directory.resolve_merged(&request.service, now).await else {
         return (
             StatusCode::NOT_FOUND,
             format!(
@@ -686,7 +717,6 @@ pub(super) async fn overlay_dial(
     // MEDIUM-D — clamp the requested lifetime to the server cap (an offline-verified dial cap has no
     // revocation, so an unbounded TTL is a standing risk).
     let ttl = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
-    let now = now_unix();
     match cose::mint_overlay_dial(&holder, &request.service, ttl, now, &*signer).await {
         Ok(token) => (
             StatusCode::CREATED,
@@ -704,6 +734,105 @@ pub(super) async fn overlay_dial(
     }
 }
 
+/// `POST /api/overlay/expose` request: resolve this node's ingress relay topology + mint an
+/// overlay-PUBLISH capability bound to the caller's overlay identity (`holder_pubkey`), so the
+/// exposer can register `service` with the relay (self-serve `boatramp expose --server`).
+#[derive(Deserialize)]
+pub(super) struct OverlayExposeRequest {
+    pub(super) service: String,
+    pub(super) holder_pubkey: String,
+    #[serde(default)]
+    pub(super) ttl_secs: Option<u64>,
+}
+
+/// `POST /api/overlay/expose` response: the ingress relay to dial OUT to + the minted publish
+/// capability + the cluster trust root (the exposer verifies incoming forward clients against it).
+/// The equivalent of an `ExposeTicket`'s fields, over an authenticated response.
+#[derive(Serialize)]
+struct OverlayExposeResponse {
+    relay: String,
+    relay_id: String,
+    service: String,
+    token: String,
+    trust_root: String,
+    /// The relay's client-auth posture — the exposer uses it to choose its TLS posture when dialing
+    /// OUT (capability-only ⇒ present no client cert). Mirrors dial's `relay_client_auth`.
+    relay_client_auth: String,
+    expires_at: u64,
+}
+
+/// Resolve this node's ingress relay topology and mint a holder-bound overlay-PUBLISH capability for
+/// `service`, signed by the node's root issuer (self-serve `boatramp expose --server`). Gated
+/// `Overlay·Admin` — STRICTLY HIGHER than dial's `Overlay·Write` — because publishing CLAIMS a name
+/// that cluster-side forward clients trust and pin; the relay still holder-binds + scope-verifies the
+/// capability AT REGISTRATION, so this route gates WHO may obtain one.
+pub(super) async fn overlay_expose(
+    Extension(issuer): Extension<Issuer>,
+    Extension(directory): Extension<OverlayDirectory>,
+    Json(request): Json<OverlayExposeRequest>,
+) -> Response {
+    if let Some(forbidden) = assert_overlay_expose_is_overlay_admin() {
+        return forbidden;
+    }
+    let Some(signer) = issuer.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node has no root private key and cannot mint publish capabilities\n",
+        )
+            .into_response();
+    };
+    // The ingress relay an exposer dials OUT to (+ the cluster trust root). Present only when this
+    // node runs an ingress relay accepting exposed services (`[overlay] accept_exposed`).
+    let Some(relay) = directory.expose_relay() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this node runs no overlay ingress relay accepting exposed services (set \
+             `[overlay] accept_exposed = true` on a relay node)\n",
+        )
+            .into_response();
+    };
+    let holder = match cose::TokenPublicKey::from_hex(&request.holder_pubkey) {
+        Ok(h) => h,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid holder_pubkey: {err}\n"),
+            )
+                .into_response();
+        }
+    };
+    // INFO-2 (mirrors dial) — an overlay identity is ed25519-only; an es256 holder would yield a
+    // silently-unusable cap (the registration handshake can't present it), so reject it early.
+    if holder.alg() != cose::TokenAlg::Ed25519 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "holder_pubkey must be an ed25519 overlay identity (es256 keys cannot publish)\n",
+        )
+            .into_response();
+    }
+    // MEDIUM-D (mirrors dial) — clamp the requested lifetime to the server cap. An overlay-publish
+    // cap is offline-verified (no revocation), and the relay bounds a parked registration by the
+    // cap's expiry, so an unbounded TTL is the same standing risk as an unbounded dial cap.
+    let ttl = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
+    let now = now_unix();
+    match cose::mint_overlay_publish(&holder, &request.service, ttl, now, &*signer).await {
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(OverlayExposeResponse {
+                relay: relay.relay.clone(),
+                relay_id: relay.relay_id.clone(),
+                service: request.service.clone(),
+                token,
+                trust_root: relay.trust_root.clone(),
+                relay_client_auth: relay.client_auth.clone(),
+                expires_at: now.saturating_add(ttl),
+            }),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
 /// `GET /api/overlay/services` — list the overlay service directory (`Overlay·Read`).
 pub(super) async fn overlay_services(
     Extension(directory): Extension<OverlayDirectory>,
@@ -711,14 +840,18 @@ pub(super) async fn overlay_services(
     if let Some(forbidden) = assert_overlay_services_is_overlay_read() {
         return forbidden;
     }
+    // The MERGED directory (static `[overlay]` routes ∪ live reverse-ingress exposers) — so
+    // `boatramp overlay ls` / `forward` discovery sees currently-published `expose` services too.
     let services: Vec<OverlayServiceEntry> = directory
-        .iter()
+        .list_merged(now_unix())
+        .await
+        .into_iter()
         .map(|(service, t)| OverlayServiceEntry {
-            service: service.clone(),
-            relay: t.relay.clone(),
-            relay_id: t.relay_id.clone(),
-            egress_id: t.egress_id.clone(),
-            client_auth: t.client_auth.clone(),
+            service,
+            relay: t.relay,
+            relay_id: t.relay_id,
+            egress_id: t.egress_id,
+            client_auth: t.client_auth,
         })
         .collect();
     Json(services).into_response()

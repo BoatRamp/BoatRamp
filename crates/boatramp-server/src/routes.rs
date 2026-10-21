@@ -278,6 +278,9 @@ pub fn router_with_fast(
             "/api/overlay/services",
             axum::routing::get(overlay_services),
         )
+        // Overlay reverse-ingress self-serve publish: mint an overlay-PUBLISH capability + return the
+        // ingress relay topology (`Overlay·Admin`, strictly above dial's `Overlay·Write`).
+        .route("/api/overlay/expose", post(overlay_expose))
         // Rotate this node's mesh key (make-before-break). Admin-scoped via the
         // deny-safe `Right::required` default for `/api/cluster/*`.
         .route("/api/cluster/rotate-key", post(cluster_rotate_key))

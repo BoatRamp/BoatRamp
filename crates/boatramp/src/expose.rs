@@ -64,9 +64,16 @@ pub struct ExposeArgs {
     /// Dial the relay server-auth-only (present NO client certificate) — for a **capability-only**
     /// relay, where the registration's E2EE handshake (not a TLS pin) proves the exposer's identity.
     /// The common expose case (a NAT'd exposer needs no pre-enrollment). Omit for a mutual-pin relay
-    /// (the exposer presents its cert and must be in the relay's `allowed_clients`).
+    /// (the exposer presents its cert and must be in the relay's `allowed_clients`). Ignored on
+    /// self-serve (the posture is taken from the control plane).
     #[arg(long)]
     pub capability_only: bool,
+    /// boatramp server base URL for self-serve resolution (overrides `[publish].server`). With
+    /// neither `--ticket` nor `--relay`, `boatramp expose <local> as svc/<name>` resolves the relay
+    /// topology + mints the publish capability over the control plane (`POST /api/overlay/expose`,
+    /// `Overlay·Admin`), authenticated by your boatramp token — zero hand-typed topology.
+    #[arg(long, env = "BOATRAMP_SERVER")]
+    pub server: Option<String>,
 }
 
 /// An `expose` failure.
@@ -128,6 +135,25 @@ pub enum ExposeError {
     /// Parsing the supplied trust root failed.
     #[error("trust root `{spec}`: {cause}")]
     BadTrustRoot { spec: String, cause: String },
+    /// Self-serve discovery (resolve + mint over the control plane) failed for a non-auth reason.
+    #[error("overlay discovery: {0}")]
+    Discovery(String),
+    /// 401 from the control plane — authentication, not authorization. The message names the REAL
+    /// auth mechanism (the operator's boatramp token), never a phantom command.
+    #[error(
+        "your boatramp token is missing, invalid, or expired — set a valid, unexpired token in \
+         `BOATRAMP_TOKEN` or `[publish].token` (ask an admin to mint one if needed) and try again."
+    )]
+    Unauthenticated,
+    /// 403 from the control plane — authenticated but lacks `Overlay·Admin` (publish is strictly above
+    /// dial's `Overlay·Write`). Kept actionable: name the right + the control-plane-less fallback.
+    #[error(
+        "not authorized to self-serve overlay EXPOSE — publishing a service claims a name others \
+         trust, so it needs the `Overlay·Admin` right (strictly above dial's `Overlay·Write`).\n  \
+         Ask an admin to grant you `Overlay·Admin`, or use a `--ticket` from \
+         `boatramp overlay grant-expose` for a control-plane-less expose."
+    )]
+    Unauthorized,
 }
 
 /// Parse an overlay identity given as bech32 (`bro1…`) or canonical hex (`ed25519:<hex>`).
@@ -230,6 +256,78 @@ fn resolve_params(args: &ExposeArgs) -> Result<ResolvedExpose, ExposeError> {
     }
 }
 
+/// Self-serve resolution (mirrors `forward`'s `resolve_via_control_plane`): resolve this node's
+/// ingress relay topology AND mint a holder-bound overlay-PUBLISH capability over the control plane,
+/// authenticated by the operator's own boatramp token + persistent overlay identity. This is the
+/// headline `boatramp expose <local> as svc/<name>` path — zero hand-typed topology, and no per-expose
+/// ticket once the operator's token carries `Overlay·Admin`.
+async fn resolve_via_control_plane(
+    args: &ExposeArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<ResolvedExpose, ExposeError> {
+    let service = resolve_service_arg(&args.service).ok_or(ExposeError::NoTarget)?;
+    // The operator's persistent overlay identity — the SAME key `forward` self-serve uses. The publish
+    // capability is minted holder-bound to THIS identity, which the exposer then registers with.
+    let secret =
+        crate::overlay::operator_identity().map_err(|e| ExposeError::Discovery(e.to_string()))?;
+    let holder_pubkey = secret.id().to_hex();
+    let (server, http) = crate::client::connect(args.server.clone(), config)
+        .map_err(|e| ExposeError::Discovery(e.to_string()))?;
+    let resp = http
+        .post(format!("{server}/api/overlay/expose"))
+        .json(&crate::overlay::ExposeRequestBody {
+            service: service.clone(),
+            holder_pubkey,
+        })
+        .send()
+        .await
+        .map_err(|e| ExposeError::Discovery(e.to_string()))?;
+    // Split 401 (authentication — fix your token) vs 403 (missing `Overlay·Admin` — ask an admin /
+    // use a ticket), mirroring forward; any other non-success carries the server's actionable body.
+    let status = resp.status();
+    if status.as_u16() == 401 {
+        return Err(ExposeError::Unauthenticated);
+    }
+    if status.as_u16() == 403 {
+        return Err(ExposeError::Unauthorized);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        return Err(ExposeError::Discovery(if body.is_empty() {
+            format!("control plane returned {status} exposing `{service}`")
+        } else {
+            format!("control plane returned {status} exposing `{service}`: {body}")
+        }));
+    }
+    let resp: crate::overlay::ExposeResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| ExposeError::Discovery(e.to_string()))?;
+    // On self-serve the server's posture is authoritative; a passed `--capability-only` is ignored —
+    // say so rather than silently dropping it (mirrors forward finding E).
+    if args.capability_only {
+        eprintln!(
+            "boatramp expose: --capability-only ignored on self-serve; posture is taken from the \
+             control plane"
+        );
+    }
+    let relay = resp
+        .relay
+        .parse::<SocketAddr>()
+        .map_err(|_| ExposeError::Discovery(format!("bad relay address `{}`", resp.relay)))?;
+    Ok(ResolvedExpose {
+        relay,
+        relay_id: resp.relay_id,
+        service: resp.service, // authoritative (equals the publish capability's scope)
+        token: resp.token,
+        trust_root: resp.trust_root,
+        identity: secret.seed_hex().to_string(),
+        // The relay told us its posture; a capability-only relay is server-auth-only at TLS.
+        capability_only: resp.relay_client_auth == "capability-only",
+    })
+}
+
 /// Current unix time (seconds).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -306,8 +404,18 @@ fn map_net_error(relay: SocketAddr, e: boatramp_overlay::NetError) -> ExposeErro
 }
 
 /// Run the exposer until interrupted (or the relay connection drops).
-pub async fn run(args: ExposeArgs) -> Result<(), ExposeError> {
-    let resolved = resolve_params(&args)?;
+pub async fn run(
+    args: ExposeArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<(), ExposeError> {
+    // Precedence (mirrors `forward`): an explicit `--ticket` or `--relay` is the control-plane-less
+    // escape hatch; otherwise `expose <local> as svc/<name>` self-serves through the control plane
+    // (resolve the ingress relay + mint the publish capability, authenticated by the operator token).
+    let resolved = if args.ticket.is_some() || args.relay.is_some() {
+        resolve_params(&args)?
+    } else {
+        resolve_via_control_plane(&args, config).await?
+    };
     let ResolvedExpose {
         relay,
         relay_id: relay_id_spec,

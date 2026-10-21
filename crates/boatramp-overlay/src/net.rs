@@ -832,8 +832,12 @@ struct ExposerEntry {
     /// The parked connection to the exposer (it dialed OUT; its register task holds it open). An
     /// `open_bi` on a clone surfaces a new accepted stream at the exposer's serve loop.
     conn: Connection,
-    /// The exposer's E2EE-proven overlay identity (equals the publish capability's `cnf`). Diagnostic.
-    #[allow(dead_code)]
+    /// The exposer's E2EE-proven overlay identity, set ONCE at registration from the holder-binding
+    /// (`register_exposer` requires `verified.holder == proven`, so this equals the publish
+    /// capability's signed `cnf`). THE load-bearing pinning value: the control plane publishes THIS as
+    /// the directory's `egress_id` over its authenticated response, and a forward client pins it as its
+    /// E2EE `expect`. The data-plane relay never rewrites it, so it cannot influence what a forward
+    /// client pins (see [`ExposerRegistry::exposer_id`]).
     exposer_id: OverlayId,
     /// The publish capability's expiry (Unix seconds): a registration never outlives its capability,
     /// even before the connection itself drops.
@@ -880,6 +884,36 @@ impl ExposerRegistry {
     /// Whether a live exposer currently publishes `service` (test/diagnostic helper).
     pub async fn is_registered(&self, service: &str, now: u64) -> bool {
         self.resolve(service, now).await.is_some()
+    }
+
+    /// The holder-bound overlay identity of the LIVE exposer publishing `service` (the value verified
+    /// AT REGISTRATION via the holder-binding), or `None` if no live exposer publishes it.
+    ///
+    /// THE pinning seam (increment 2). The co-located control plane shares this registry and returns
+    /// this identity as the `egress_id` of `POST /api/overlay/dial` for an exposed service, over its
+    /// AUTHENTICATED response; the forward client pins THAT id as its E2EE `expect`. The value is set
+    /// once at registration from the E2EE-proven, signature-bound holder key and is never rewritten on
+    /// the data path — so the QUIC relay (the data plane) cannot influence what a forward client pins.
+    /// If the relay later cross-wires a flow to a DIFFERENT exposer, the client's E2EE handshake fails
+    /// closed (`IdentityMismatch`); it is never a silent cross-wire.
+    pub async fn exposer_id(&self, service: &str, now: u64) -> Option<OverlayId> {
+        let map = self.inner.lock().await;
+        match map.get(service) {
+            Some(e) if Self::entry_live(e, now) => Some(e.exposer_id),
+            _ => None,
+        }
+    }
+
+    /// Every LIVE exposer as `(service, exposer_id)` at `now` — the holder-bound identities the relay
+    /// verified at registration. The control plane merges these into the service directory
+    /// (`GET /api/overlay/services`); each entry's `exposer_id` is the id a forward client pins (see
+    /// [`ExposerRegistry::exposer_id`]). Service-ordered (the map is a `BTreeMap`).
+    pub async fn live_exposers(&self, now: u64) -> Vec<(String, OverlayId)> {
+        let map = self.inner.lock().await;
+        map.iter()
+            .filter(|(_, e)| Self::entry_live(e, now))
+            .map(|(svc, e)| (svc.clone(), e.exposer_id))
+            .collect()
     }
 
     /// Try to claim `service` for `entry` (FIRST-LIVE-CLAIM-WINS): refuse if a LIVE registration for
@@ -2480,5 +2514,322 @@ mod tests {
             ),
             "a forward to an unregistered name must be refused (no open proxy), got {res:?}"
         );
+    }
+
+    // ---- The PINNING constraint (increment 2): the forward client pins the exposer identity the
+    // control plane published (the registration-verified `exposer_id`), delivered over the
+    // AUTHENTICATED control-plane response — never a data-plane relay-asserted value. ----
+
+    /// PINNING (a): a (zero-flag) forward to an exposed service pins the CONTROL-PLANE-returned
+    /// exposer id and reaches the exposer. The exposer registers svc/db under a holder-bound publish
+    /// capability; the forward client pins the id the shared `ExposerRegistry` resolves for svc/db —
+    /// which is EXACTLY the `egress_id` the authenticated `POST /api/overlay/dial` returns (the
+    /// co-located control plane shares this registry) — and the flow reaches the exposed backend.
+    /// Proves the registration-verified `exposer_id` is the correct E2EE pin, end-to-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exposed_forward_pins_the_control_plane_exposer_id_and_reaches_it() {
+        use boatramp_core::cose::mint_overlay_publish;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let exposer = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+
+        let backend_addr = spawn_echo_backend().await;
+        let registry = ExposerRegistry::new();
+        let relay_addr = spawn_ingress_relay(&relay, root_pub.clone(), registry.clone());
+
+        let publish_cap = mint_overlay_publish(
+            &exposer.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer = OverlaySecret::from_seed_hex(&exposer.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer,
+                    relay_addr,
+                    relay_id,
+                    "svc/db",
+                    publish_cap,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(
+            await_registered(&registry, "svc/db").await,
+            "the exposer must register svc/db"
+        );
+
+        // Source the pin EXACTLY as the authenticated control plane does — from the SHARED registry.
+        // This value IS the `egress_id` `POST /api/overlay/dial` returns for the exposed service.
+        let pinned = registry
+            .exposer_id("svc/db", now_unix())
+            .await
+            .expect("the directory resolves the exposed service to its holder-bound exposer id");
+
+        let dial_cap = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                pinned,
+                DialRequest {
+                    service: "svc/db".into(),
+                    token: dial_cap,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+        app.write_all(b"reach the control-plane-pinned exposer")
+            .await
+            .unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.read_to_end(&mut got),
+        )
+        .await
+        .expect("the control-plane-pinned exposer echoes in time")
+        .unwrap();
+        assert_eq!(got, b"reach the control-plane-pinned exposer");
+        let _ = fwd.await;
+    }
+
+    /// PINNING (b): a relay that CROSS-WIRES a flow to a DIFFERENT exposer than the directory
+    /// published fails the client's E2EE pin — fail-closed, never a silent cross-wire. Exposer A
+    /// registers svc/db, so the shared registry (the directory source) publishes A's holder-bound id.
+    /// A SEPARATE, MISROUTING relay accepts the client's svc/db dial but bridges blind to a DIFFERENT
+    /// exposer B serving the same backend. A **positive control** proves the relay really reaches B
+    /// (pinning the DATA-PLANE target B succeeds — which is exactly the silent cross-wire we must
+    /// prevent); then pinning the CONTROL-PLANE-published id (A, from the registry) makes the client's
+    /// E2EE handshake with B fail `IdentityMismatch`. So a forward MUST pin the control-plane id, and
+    /// the QUIC data plane can never substitute the peer. (Were the pinned id taken from the relay/
+    /// data path instead of the authenticated control-plane response, the cross-wire would succeed —
+    /// which is precisely the impersonation this test rules out.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_cross_wiring_to_a_different_exposer_fails_the_e2ee_pin() {
+        use boatramp_core::cose::mint_overlay_publish;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let ingress = OverlaySecret::generate().unwrap(); // the honest ingress relay A registers with
+        let mis = OverlaySecret::generate().unwrap(); // the MISROUTING relay the client dials
+        let exposer_a = OverlaySecret::generate().unwrap();
+        let exposer_b = OverlaySecret::generate().unwrap();
+        let (ingress_id, mis_id, exposer_b_id) = (ingress.id(), mis.id(), exposer_b.id());
+        let root_pub = root.id().to_public();
+
+        let backend_addr = spawn_echo_backend().await;
+
+        // Exposer A registers svc/db with the HONEST ingress relay → the registry (the DIRECTORY
+        // SOURCE) publishes A's holder-bound id for svc/db.
+        let registry = ExposerRegistry::new();
+        let ingress_addr = spawn_ingress_relay(&ingress, root_pub.clone(), registry.clone());
+        let publish_cap = mint_overlay_publish(
+            &exposer_a.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        {
+            let exposer_a = OverlaySecret::from_seed_hex(&exposer_a.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(async move {
+                let _ = run_exposer(
+                    &exposer_a,
+                    ingress_addr,
+                    ingress_id,
+                    "svc/db",
+                    publish_cap,
+                    backend_addr,
+                    root_pub,
+                )
+                .await;
+            });
+        }
+        assert!(await_registered(&registry, "svc/db").await);
+        let published = registry
+            .exposer_id("svc/db", now_unix())
+            .await
+            .expect("the directory published svc/db → exposer A");
+        assert_eq!(
+            published,
+            exposer_a.id(),
+            "the directory publishes exposer A's holder-bound id"
+        );
+
+        // Exposer B: a DIFFERENT identity serving the SAME backend for svc/db (a plain egress).
+        let egress_ep =
+            quic::server_endpoint(&exposer_b, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let exposer_b_addr = egress_ep.local_addr().unwrap();
+        {
+            let exposer_b = OverlaySecret::from_seed_hex(&exposer_b.seed_hex()).unwrap();
+            let root_pub = root_pub.clone();
+            tokio::spawn(run_egress_router(
+                egress_ep,
+                exposer_b,
+                move |s: &str| (s == "svc/db").then_some(backend_addr),
+                root_pub,
+                true,
+                PathMode::Relay,
+            ));
+        }
+
+        // A MISROUTING relay: it accepts the client's svc/db dial but bridges blind to exposer B, NOT
+        // to the registered exposer A the directory published.
+        let mis_ep =
+            quic::server_endpoint(&mis, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mis_addr = mis_ep.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&mis_ep).await {
+                tokio::spawn(async move {
+                    let Ok((mut cs, mut cr)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    let Ok(_req) = read_msg::<DialRequest>(&mut cr).await else {
+                        return;
+                    };
+                    if write_msg(&mut cs, &DialVerdict::Accept { scope: "*".into() })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(ep) = quic::client_endpoint_server_auth(&Pin(exposer_b_id)) else {
+                        return;
+                    };
+                    let Ok(ec) = quic::dial(&ep, exposer_b_addr).await else {
+                        return;
+                    };
+                    let Ok((es, er)) = ec.open_bi().await else {
+                        return;
+                    };
+                    let _ = bridge(cr, cs, er, es).await;
+                });
+            }
+        });
+
+        let dial_cap = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_seed = client.seed_hex();
+
+        // Positive control — pin the DATA-PLANE target (exposer B's id). The flow SUCCEEDS: the relay
+        // really reaches B, so pinning B (a value the data plane could assert) would be a SILENT
+        // cross-wire. This is the attack the control-plane pin must prevent.
+        {
+            let client = OverlaySecret::from_seed_hex(&client_seed).unwrap();
+            let client_ep = quic::client_endpoint_server_auth(&Pin(mis_id)).unwrap();
+            let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+            let dial_cap = dial_cap.clone();
+            let fwd = tokio::spawn(async move {
+                forward_flow(
+                    app_far,
+                    &client_ep,
+                    mis_addr,
+                    &client,
+                    exposer_b_id,
+                    DialRequest {
+                        service: "svc/db".into(),
+                        token: dial_cap,
+                        e2ee: true,
+                    },
+                    PathMode::Relay,
+                )
+                .await
+            });
+            app.write_all(b"the data-plane target would echo if pinned")
+                .await
+                .unwrap();
+            app.shutdown().await.unwrap();
+            let mut got = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                app.read_to_end(&mut got),
+            )
+            .await
+            .expect("the data-plane target echoes — the relay really reaches exposer B")
+            .unwrap();
+            assert_eq!(got, b"the data-plane target would echo if pinned");
+            let _ = fwd.await;
+        }
+
+        // The real property — pin the CONTROL-PLANE-published id (A). The client's E2EE handshake with
+        // B (whom the relay cross-wired to) fails CLOSED on the pin: IdentityMismatch, no bytes cross.
+        {
+            let client = OverlaySecret::from_seed_hex(&client_seed).unwrap();
+            let client_ep = quic::client_endpoint_server_auth(&Pin(mis_id)).unwrap();
+            let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+            let fwd = tokio::spawn(async move {
+                forward_flow(
+                    app_far,
+                    &client_ep,
+                    mis_addr,
+                    &client,
+                    published, // the control-plane-published id (A), not the data-plane target (B)
+                    DialRequest {
+                        service: "svc/db".into(),
+                        token: dial_cap,
+                        e2ee: true,
+                    },
+                    PathMode::Relay,
+                )
+                .await
+            });
+            let _ = app
+                .write_all(b"must never reach a cross-wired exposer")
+                .await;
+            drop(app);
+            let outcome = fwd.await.unwrap();
+            let err = outcome.expect_err(
+                "pinning the control-plane id MUST fail closed when the relay cross-wires to a \
+                 different exposer",
+            );
+            assert!(
+                matches!(err, NetError::Splice(_)),
+                "the failure must be the E2EE pin (not a transport/dial error), got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("pinned identity"),
+                "the failure must be an IdentityMismatch (fail-closed E2EE pin), got: {err}"
+            );
+        }
     }
 }

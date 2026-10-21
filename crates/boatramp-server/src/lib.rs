@@ -134,7 +134,7 @@ pub(crate) use control_api::{
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
     delete_secret, delete_tenant_secret, get_authz_policy, kv_checkpoint, kv_export, kv_import,
     kv_status, list_email_profiles, list_root_anchors, list_secrets, list_tenant_secrets,
-    list_tokens, node_version, overlay_dial, overlay_services, put_authz_policy,
+    list_tokens, node_version, overlay_dial, overlay_expose, overlay_services, put_authz_policy,
     remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
     show_email_profile,
 };
@@ -2274,14 +2274,55 @@ impl HandlerRuntime {
 /// unbounded TTL is a standing risk — the dial route clamps every request to this (Security MEDIUM-D).
 pub const DEFAULT_MAX_DIAL_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// A live view of this node's reverse-ingress exposers (`boatramp expose`), shared from the overlay
+/// relay role so the control plane can MERGE currently-published services into the directory
+/// (increment 2). The `egress_id` each target carries is the exposer identity the relay VERIFIED AT
+/// REGISTRATION (holder-bound) — the id a forward client pins over the AUTHENTICATED control-plane
+/// response; it is **never** a data-plane-asserted value. Implemented by the `boatramp` binary over
+/// the shared `ExposerRegistry`, so `boatramp-server` stays free of the overlay-transport deps.
+#[async_trait::async_trait]
+pub trait LiveExposers: Send + Sync {
+    /// Every live exposed service as a resolvable `(service, target)` at `now_unix`, service-ordered.
+    async fn live_targets(&self, now_unix: u64) -> Vec<(String, OverlayTarget)>;
+    /// Resolve one exposed service to its target, or `None` if no live exposer publishes it.
+    async fn resolve_target(&self, service: &str, now_unix: u64) -> Option<OverlayTarget>;
+}
+
+/// This node's ingress-relay self-topology for the self-serve PUBLISH path
+/// (`POST /api/overlay/expose`): the relay an exposer dials OUT to, plus the cluster trust root the
+/// exposer verifies each incoming forward client's dial capability against (zero-trust terminator).
+/// `Some` only when this node runs an ingress relay accepting exposed services
+/// (`[overlay] accept_exposed`).
+#[derive(Clone)]
+pub struct ExposeRelay {
+    /// The relay/ingress `host:port` an exposer dials OUT to (and registers over).
+    pub relay: String,
+    /// The relay's overlay identity the exposer pins (`ed25519:<hex>`).
+    pub relay_id: String,
+    /// The cluster trust root's PUBLIC key (`<alg>:<hex>`) — the exposer verifies each incoming
+    /// forward client's dial capability against it (zero-trust).
+    pub trust_root: String,
+    /// The relay's client-auth posture ("capability-only" | "mutual-pin").
+    pub client_auth: String,
+}
+
 /// The overlay forward-flow **service directory**: a service name → the relay + egress a dial to it
 /// uses. Built from `[overlay] routes` at serve setup and read by the `/api/overlay/*` handlers to
-/// resolve a self-serve `boatramp forward svc/<name>` and mint its dial capability.
+/// resolve a self-serve `boatramp forward svc/<name>` and mint its dial capability. When this node
+/// runs an ingress relay accepting exposed services, it also carries a live view of the reverse-
+/// ingress [`LiveExposers`], so the directory is a MERGED view = static `[overlay]` routes ∪ the
+/// currently-published exposers (a live exposer WINS a name collision, matching the data-plane
+/// forwarding where a registered exposer takes precedence over a static egress).
 #[derive(Default, Clone)]
 pub struct OverlayDirectory {
     services: std::collections::BTreeMap<String, OverlayTarget>,
     /// Server cap on a minted dial cap's TTL (seconds); `None` ⇒ [`DEFAULT_MAX_DIAL_TTL_SECS`].
     max_dial_ttl: Option<u64>,
+    /// A live view of reverse-ingress exposers, merged into dial resolution + the directory listing.
+    /// `None` unless this node runs an ingress relay accepting exposed services.
+    exposers: Option<Arc<dyn LiveExposers>>,
+    /// This node's ingress-relay self-topology for `POST /api/overlay/expose` (self-serve publish).
+    expose_relay: Option<ExposeRelay>,
 }
 
 /// One overlay service target: where a dial to it goes.
@@ -2305,6 +2346,8 @@ impl OverlayDirectory {
         Self {
             services: entries.into_iter().collect(),
             max_dial_ttl: None,
+            exposers: None,
+            expose_relay: None,
         }
     }
     /// Set the server cap on a minted dial cap's TTL (from `[overlay] max_dial_ttl_secs`; `None` keeps
@@ -2314,24 +2357,173 @@ impl OverlayDirectory {
         self.max_dial_ttl = secs;
         self
     }
-    /// The effective TTL cap a dial request is clamped to.
+    /// Attach the live reverse-ingress exposer view (from the overlay relay role), so the directory
+    /// merges currently-published services into dial resolution + listing (increment 2).
+    #[must_use]
+    pub fn with_exposers(mut self, exposers: Option<Arc<dyn LiveExposers>>) -> Self {
+        self.exposers = exposers;
+        self
+    }
+    /// Attach this node's ingress-relay self-topology for `POST /api/overlay/expose` (self-serve
+    /// publish). `None` ⇒ this node runs no ingress relay accepting exposed services, so expose 404s.
+    #[must_use]
+    pub fn with_expose_relay(mut self, relay: Option<ExposeRelay>) -> Self {
+        self.expose_relay = relay;
+        self
+    }
+    /// This node's ingress-relay self-topology for the self-serve PUBLISH path, if any.
+    #[must_use]
+    pub fn expose_relay(&self) -> Option<&ExposeRelay> {
+        self.expose_relay.as_ref()
+    }
+    /// The effective TTL cap a dial/publish request is clamped to.
     #[must_use]
     pub fn max_dial_ttl_secs(&self) -> u64 {
         self.max_dial_ttl.unwrap_or(DEFAULT_MAX_DIAL_TTL_SECS)
     }
-    /// Resolve a service name to its target.
+    /// Resolve a STATIC service name to its target (the `[overlay] routes` only — not the live
+    /// exposers). Use [`resolve_merged`](Self::resolve_merged) for the full directory.
     #[must_use]
     pub fn resolve(&self, service: &str) -> Option<&OverlayTarget> {
         self.services.get(service)
     }
-    /// Every `(service, target)`, service-ordered — for the directory listing.
+    /// Every STATIC `(service, target)`, service-ordered (the `[overlay] routes` only).
     pub fn iter(&self) -> impl Iterator<Item = (&String, &OverlayTarget)> {
         self.services.iter()
     }
-    /// Whether the directory carries no services (no `[overlay] routes` configured).
+    /// Resolve a service over the MERGED directory = static routes ∪ live exposers. A LIVE exposer
+    /// WINS a name collision (matching the data-plane forwarding, where a registered exposer takes
+    /// precedence over a static egress — so the `egress_id` a forward client pins matches the peer it
+    /// actually reaches). The returned target's `egress_id` for an exposed service is the holder-bound
+    /// identity the relay verified at registration.
+    pub async fn resolve_merged(&self, service: &str, now_unix: u64) -> Option<OverlayTarget> {
+        if let Some(exposers) = &self.exposers
+            && let Some(target) = exposers.resolve_target(service, now_unix).await
+        {
+            return Some(target);
+        }
+        self.services.get(service).cloned()
+    }
+    /// The MERGED directory listing = static routes ∪ live exposers, service-ordered (a live exposer
+    /// overlays a static route of the same name).
+    pub async fn list_merged(&self, now_unix: u64) -> Vec<(String, OverlayTarget)> {
+        let mut map: std::collections::BTreeMap<String, OverlayTarget> = self.services.clone();
+        if let Some(exposers) = &self.exposers {
+            for (service, target) in exposers.live_targets(now_unix).await {
+                map.insert(service, target);
+            }
+        }
+        map.into_iter().collect()
+    }
+    /// Whether the STATIC directory carries no services (no `[overlay] routes` configured). Does not
+    /// consider live exposers.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.services.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod overlay_directory_tests {
+    use super::*;
+
+    /// A mock live-exposer view standing in for the shared `ExposerRegistry` — the `egress_id` each
+    /// target carries is what the real registry returns as the holder-bound, registration-verified id.
+    struct MockExposers(Vec<(String, OverlayTarget)>);
+
+    #[async_trait::async_trait]
+    impl LiveExposers for MockExposers {
+        async fn live_targets(&self, _now_unix: u64) -> Vec<(String, OverlayTarget)> {
+            self.0.clone()
+        }
+        async fn resolve_target(&self, service: &str, _now_unix: u64) -> Option<OverlayTarget> {
+            self.0
+                .iter()
+                .find(|(s, _)| s == service)
+                .map(|(_, t)| t.clone())
+        }
+    }
+
+    fn target(egress_id: &str) -> OverlayTarget {
+        OverlayTarget {
+            relay: "relay.example:9000".into(),
+            relay_id: "ed25519:relay".into(),
+            egress_id: egress_id.into(),
+            client_auth: "capability-only".into(),
+        }
+    }
+
+    /// The MERGED directory surfaces the LIVE exposer's `egress_id` (the pinning value the control
+    /// plane returns to a forward client), and a live exposer WINS a name collision with a static
+    /// route — matching the data-plane forwarding where a registered exposer beats a static egress, so
+    /// the id a client pins matches the peer it actually reaches.
+    #[tokio::test]
+    async fn merged_directory_surfaces_live_exposer_egress_id_and_wins_collisions() {
+        let directory =
+            OverlayDirectory::from_entries([("svc/db".to_string(), target("ed25519:STATIC"))])
+                .with_exposers(Some(Arc::new(MockExposers(vec![
+                    ("svc/live".to_string(), target("ed25519:EXPOSER")),
+                    ("svc/db".to_string(), target("ed25519:EXPOSER_WINS")),
+                ]))));
+
+        // resolve_merged: an exposed service resolves to the EXPOSER-published egress id; a collision
+        // resolves to the live exposer, NEVER the static egress.
+        assert_eq!(
+            directory
+                .resolve_merged("svc/live", 0)
+                .await
+                .unwrap()
+                .egress_id,
+            "ed25519:EXPOSER"
+        );
+        assert_eq!(
+            directory
+                .resolve_merged("svc/db", 0)
+                .await
+                .unwrap()
+                .egress_id,
+            "ed25519:EXPOSER_WINS",
+            "a live exposer must win a name collision with a static route"
+        );
+        assert!(directory.resolve_merged("svc/absent", 0).await.is_none());
+
+        // A static-only directory (no exposers attached) still resolves its static routes.
+        let static_only =
+            OverlayDirectory::from_entries([("svc/db".to_string(), target("ed25519:STATIC"))]);
+        assert_eq!(
+            static_only
+                .resolve_merged("svc/db", 0)
+                .await
+                .unwrap()
+                .egress_id,
+            "ed25519:STATIC"
+        );
+
+        // list_merged overlays the live exposer onto the static route, service-ordered.
+        let listed = directory.list_merged(0).await;
+        let names: Vec<&str> = listed.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(names, vec!["svc/db", "svc/live"]);
+        let db = listed.iter().find(|(s, _)| s == "svc/db").unwrap();
+        assert_eq!(
+            db.1.egress_id, "ed25519:EXPOSER_WINS",
+            "the merged listing must show the live exposer's egress id for a collided name"
+        );
+    }
+
+    /// The `POST /api/overlay/expose` relay topology round-trips through the directory builder.
+    #[test]
+    fn expose_relay_topology_is_carried_when_set() {
+        let directory = OverlayDirectory::default();
+        assert!(directory.expose_relay().is_none());
+        let directory = directory.with_expose_relay(Some(ExposeRelay {
+            relay: "relay.example:9000".into(),
+            relay_id: "ed25519:relay".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+        }));
+        let relay = directory.expose_relay().expect("expose relay present");
+        assert_eq!(relay.relay, "relay.example:9000");
+        assert_eq!(relay.trust_root, "ed25519:root");
     }
 }
 

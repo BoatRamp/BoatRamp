@@ -721,6 +721,61 @@ fn load_overlay_identity(spec: Option<&str>) -> Result<boatramp_overlay::Overlay
     }
 }
 
+/// A [`boatramp_server::LiveExposers`] view over the shared reverse-ingress [`ExposerRegistry`]: the
+/// control-plane directory merges currently-published `expose` services, rendering each as a target
+/// whose `egress_id` is the HOLDER-BOUND exposer identity the relay verified AT REGISTRATION (the
+/// pinning value the authenticated `POST /api/overlay/dial` returns) — never a data-plane-asserted
+/// one. Carries this relay's self-topology for the rendered targets. Shares the SAME `ExposerRegistry`
+/// handle the ingress router registers into (an `Arc` clone), so the view is always live.
+#[cfg(feature = "overlay")]
+struct OverlayExposerDirectory {
+    registry: boatramp_overlay::ExposerRegistry,
+    relay: String,
+    relay_id: String,
+    client_auth: String,
+}
+
+#[cfg(feature = "overlay")]
+impl OverlayExposerDirectory {
+    /// Render a live exposer identity as a directory target. The `egress_id` is the holder-bound id
+    /// the relay verified at registration — the id a forward client pins as its E2EE `expect`.
+    fn target_for(
+        &self,
+        exposer_id: boatramp_overlay::OverlayId,
+    ) -> boatramp_server::OverlayTarget {
+        boatramp_server::OverlayTarget {
+            relay: self.relay.clone(),
+            relay_id: self.relay_id.clone(),
+            egress_id: exposer_id.to_hex(),
+            client_auth: self.client_auth.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "overlay")]
+#[async_trait::async_trait]
+impl boatramp_server::LiveExposers for OverlayExposerDirectory {
+    async fn live_targets(&self, now_unix: u64) -> Vec<(String, boatramp_server::OverlayTarget)> {
+        self.registry
+            .live_exposers(now_unix)
+            .await
+            .into_iter()
+            .map(|(service, exposer_id)| (service, self.target_for(exposer_id)))
+            .collect()
+    }
+
+    async fn resolve_target(
+        &self,
+        service: &str,
+        now_unix: u64,
+    ) -> Option<boatramp_server::OverlayTarget> {
+        self.registry
+            .exposer_id(service, now_unix)
+            .await
+            .map(|exposer_id| self.target_for(exposer_id))
+    }
+}
+
 /// Stand up this node's overlay forward-flow serve roles from `[overlay]` (the server side of
 /// `boatramp forward`): a relay/ingress (`relay_listen`) that capability-gates client dials and
 /// forwards them blind to the routed egress, and/or an egress/terminator (`egress_listen`) that
@@ -791,6 +846,11 @@ async fn spawn_overlay_roles(
     // the service DIRECTORY (service → {this relay's endpoint + id, the route's egress id}) that the
     // control-plane `/api/overlay/*` routes serve for self-serve `boatramp forward svc/<name>`.
     let mut directory: Vec<(String, boatramp_server::OverlayTarget)> = Vec::new();
+    // The live reverse-ingress view + this node's expose-relay topology, set only when the relay opts
+    // into accepting exposed services (`accept_exposed`); merged into the control-plane directory so
+    // the self-serve forward/expose paths see currently-published services.
+    let mut exposers: Option<std::sync::Arc<dyn boatramp_server::LiveExposers>> = None;
+    let mut expose_relay: Option<boatramp_server::ExposeRelay> = None;
     if let Some(bind) = ov.relay_listen {
         let mut clients = BTreeSet::new();
         for c in &ov.allowed_clients {
@@ -886,6 +946,22 @@ async fn spawn_overlay_roles(
             let relay_secret = OverlaySecret::from_seed_hex(&secret.seed_hex())
                 .map_err(|e| Error::ClusterStartup(format!("[overlay] identity: {e}")))?;
             let registry = ExposerRegistry::new();
+            // Share the SAME registry handle (an `Arc`) with the control plane: the directory's live
+            // view + the expose relay topology for `POST /api/overlay/expose`. The directory publishes
+            // each live exposer's HOLDER-BOUND `exposer_id` (set at registration) as the pinned
+            // egress id — the data-plane relay never rewrites it, so it cannot steer the pin.
+            exposers = Some(std::sync::Arc::new(OverlayExposerDirectory {
+                registry: registry.clone(),
+                relay: bind.to_string(),
+                relay_id: relay_id_hex.clone(),
+                client_auth: client_auth_str.to_string(),
+            }));
+            expose_relay = Some(boatramp_server::ExposeRelay {
+                relay: bind.to_string(),
+                relay_id: relay_id_hex.clone(),
+                trust_root: trust_spec.clone(),
+                client_auth: client_auth_str.to_string(),
+            });
             tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services)");
             tokio::spawn(run_ingress_router(
                 ep,
@@ -901,7 +977,9 @@ async fn spawn_overlay_roles(
         }
     }
     Ok(boatramp_server::OverlayDirectory::from_entries(directory)
-        .with_max_dial_ttl(ov.max_dial_ttl_secs))
+        .with_max_dial_ttl(ov.max_dial_ttl_secs)
+        .with_exposers(exposers)
+        .with_expose_relay(expose_relay))
 }
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
