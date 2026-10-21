@@ -41,7 +41,7 @@ The rest are global.
 | `certs` | global | TLS certificate status. |
 | `cache` | global | Cache invalidation. |
 | `system` | global | Metrics, prune, scrub, site/project listing, cluster membership, authz policy. |
-| `overlay` | global | Overlay forward-flow discovery + capability minting (`/api/overlay/*`). Three tiers: `read` lists/resolves the service directory; `write` mints a holder-bound **dial** capability (self-serve `boatramp forward`); `admin` mints a holder-bound **publish** capability (self-serve `boatramp expose`) — strictly above `write`, because publishing claims a service name that forward clients trust and pin. Granted only via `admin` (or an explicit grant), never a default tenant role. |
+| `overlay` | global | Overlay forward-flow discovery + capability minting (`/api/overlay/*`). Three tiers: `read` lists/resolves the service directory; `write` mints a holder-bound **dial** capability (self-serve `boatramp forward`); `admin` mints a holder-bound **publish** capability (self-serve `boatramp expose`) — strictly above `write`, because publishing claims a service name that forward clients trust and pin. Granted only via `admin` (or an explicit grant), never a default tenant role. **`admin` is coarse: it may mint a publish capability for ANY service name, and a live exposer shadows a static route of the same name — so an `overlay·admin` holder can reroute or capture any service's forward-client traffic. Treat it as near-admin trust and keep it admin-only until per-name publish scoping exists.** |
 
 ## Default roles
 
