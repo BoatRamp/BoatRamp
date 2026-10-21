@@ -282,6 +282,11 @@ pub struct OverlayServeConfig {
     /// registration is holder-bound to an `overlay-publish` capability the relay verifies against
     /// `trust_root`; first-live-claim-wins on the name.
     pub accept_exposed: Option<bool>,
+    /// Digit count for the human-typeable pairing SHORT CODE a relay can mint alongside a `bropair1…`
+    /// code (overlay follow-up #2 inc3, `boatramp overlay pair-code --short`): default 8
+    /// (`K = 10^8 ≈ 2^26.6`), floor 7, ceiling 10 (clamped). Independent of `accept_exposed` — read
+    /// only when a relay actually mints/redeems a short code.
+    pub pair_short_code_digits: Option<usize>,
     /// Bind an **egress/terminator** here (UDP/QUIC). Unset ⇒ this node runs no egress.
     pub egress_listen: Option<SocketAddr>,
     /// Egress service map: a service name → the local backend it fronts. Used when `egress_listen`

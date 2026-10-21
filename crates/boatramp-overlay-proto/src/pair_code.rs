@@ -172,6 +172,135 @@ impl PairCode {
     }
 }
 
+/// Floor on the operator-configurable short-code digit count (`[overlay] pair_short_code_digits`):
+/// below this the entropy (`10^digits`) falls too close to the rate-limited per-attempt guess bound
+/// to be meaningfully stronger than brute force within the rate-limit window.
+pub const PAIR_SHORT_CODE_DIGITS_MIN: usize = 7;
+/// Ceiling on the configurable short-code digit count: beyond this it is no longer "short" — the
+/// whole point is a human-typeable handful of digits.
+pub const PAIR_SHORT_CODE_DIGITS_MAX: usize = 10;
+/// The default short-code digit count: `K = 10^8 ≈ 2^26.6` — rendered as two groups of four
+/// (`NNNN-NNNN`), stronger per-online-attempt than the 24-bit SAS once the relay's guess-rate limiter
+/// (`F_ip`/`F_global` over the rolling window) is applied.
+pub const PAIR_SHORT_CODE_DIGITS_DEFAULT: usize = 8;
+
+/// A failure constructing or parsing a [`ShortCode`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ShortCodeError {
+    /// The (separator-stripped) input was not exactly the expected digit count — covers both a
+    /// too-short and a too-long input; NEVER silently truncated to fit.
+    #[error("short code must be exactly {expected} digits (got {got})")]
+    WrongLength { expected: usize, got: usize },
+    /// The (separator-stripped) input contained a non-ASCII-digit character, or was empty.
+    #[error("short code must contain only decimal digits")]
+    NonDigit,
+    /// The requested digit count falls outside [`PAIR_SHORT_CODE_DIGITS_MIN`]..=
+    /// [`PAIR_SHORT_CODE_DIGITS_MAX`].
+    #[error("short code digit count {digits} is out of range")]
+    DigitsOutOfRange { digits: usize },
+    /// A numeric value does not fit within the requested digit count (`value >= 10^digits`).
+    #[error("short code value does not fit the requested digit count")]
+    ValueOutOfRange,
+}
+
+/// A human-typeable pairing **short code**: an INDEPENDENT random alias for a [`PairCode`]'s
+/// 128-bit rendezvous id — never a truncation or derivation of it (so leaking the short code reveals
+/// nothing about the strong id it resolves to; see the module docs on the relay's `PairShortCodes`
+/// alias table, `boatramp-overlay::net`). Digits only (no bech32/wordlist), rendered grouped in
+/// 4-digit blocks (`NNNN-NNNN` at the default 8 digits) so it reads unambiguously on a numeric
+/// keypad and stays visually distinct from the word-based [`crate::sas::SasCode`].
+///
+/// Low-entropy by design (`10^digits`, e.g. `2^26.6` at the default 8 digits) — far weaker than the
+/// 128-bit rendezvous id or the 24-bit SAS, so it is used ONLY by the dialer/redeem side (the accepter
+/// still parks the full strong id — no low-entropy surface on park) and the relay MUST rate-limit +
+/// lock out online guessing (`PairGuessLimiter` in `boatramp-overlay::net`). A guessed hit is only a
+/// race-to-redeem; the out-of-band SAS still catches a MITM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortCode {
+    /// The exact decimal-digit string (no separators) — the relay's `PairShortCodes` registry key.
+    digits: String,
+}
+
+impl ShortCode {
+    /// Strip whitespace and `-` separators from `input` (copy-paste/typing convenience).
+    fn strip_separators(input: &str) -> String {
+        input
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect()
+    }
+
+    /// Format `value` as a zero-padded decimal [`ShortCode`] of exactly `digits` characters. The
+    /// mint path (relay-side `PairShortCodes::insert_unique`) draws `value` uniformly from
+    /// `0..10^digits` and calls this. Fails closed on an out-of-range digit count or a value that
+    /// does not fit it.
+    pub fn from_value(value: u64, digits: usize) -> Result<Self, ShortCodeError> {
+        if !(PAIR_SHORT_CODE_DIGITS_MIN..=PAIR_SHORT_CODE_DIGITS_MAX).contains(&digits) {
+            return Err(ShortCodeError::DigitsOutOfRange { digits });
+        }
+        let modulus = 10u64
+            .checked_pow(digits as u32)
+            .ok_or(ShortCodeError::DigitsOutOfRange { digits })?;
+        if value >= modulus {
+            return Err(ShortCodeError::ValueOutOfRange);
+        }
+        Ok(Self {
+            digits: format!("{value:0digits$}"),
+        })
+    }
+
+    /// Parse user/wire input back to a short code of EXACTLY `expected_digits` digits: strips
+    /// spaces/dashes first, then fails closed on a wrong length (too short OR too long — never
+    /// silently truncated to fit) or any non-digit character. Mirrors
+    /// [`crate::sas::SasCode::from_words`]'s reject discipline: a mistyped/garbled code never
+    /// silently maps to a different short code.
+    pub fn parse(input: &str, expected_digits: usize) -> Result<Self, ShortCodeError> {
+        let stripped = Self::strip_separators(input);
+        if stripped.len() != expected_digits {
+            return Err(ShortCodeError::WrongLength {
+                expected: expected_digits,
+                got: stripped.len(),
+            });
+        }
+        if !stripped.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ShortCodeError::NonDigit);
+        }
+        Ok(Self { digits: stripped })
+    }
+
+    /// Strip spaces/dashes and reject a non-digit/empty result, WITHOUT asserting a specific digit
+    /// count — for a caller that does not know (and should not have to guess) the relay's configured
+    /// `pair_short_code_digits` up front (e.g. the CLI redeem path), which defers the AUTHORITATIVE
+    /// exact-length check to the relay itself. Prefer [`ShortCode::parse`] whenever the expected
+    /// count IS known (the relay's own redeem handler; these unit tests).
+    pub fn normalize(input: &str) -> Result<String, ShortCodeError> {
+        let stripped = Self::strip_separators(input);
+        if stripped.is_empty() || !stripped.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ShortCodeError::NonDigit);
+        }
+        Ok(stripped)
+    }
+
+    /// The bare digit string (no separators) — what the relay's registry keys on and what travels
+    /// over the wire.
+    #[must_use]
+    pub fn digits(&self) -> &str {
+        &self.digits
+    }
+
+    /// The grouped, human-typeable rendering: 4-digit blocks joined by `-` (e.g. `"1234-5678"` at 8
+    /// digits; a digit count not a multiple of 4 gets a shorter trailing group).
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.digits
+            .as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).expect("ascii digits are valid utf-8"))
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +352,98 @@ mod tests {
             PairCode::decode(&short),
             Err(PairCodeError::Malformed(_))
         ));
+    }
+
+    // ---- ShortCode ----
+
+    #[test]
+    fn short_code_round_trips_through_render_and_parse() {
+        let code = ShortCode::from_value(12_345_678, 8).unwrap();
+        assert_eq!(code.digits(), "12345678");
+        assert_eq!(code.render(), "1234-5678");
+        let back = ShortCode::parse(&code.render(), 8).unwrap();
+        assert_eq!(back, code);
+        // Separators are optional on parse — the bare digit string round-trips too.
+        let bare = ShortCode::parse(code.digits(), 8).unwrap();
+        assert_eq!(bare, code);
+    }
+
+    #[test]
+    fn short_code_rejects_wrong_length() {
+        // Too short.
+        assert_eq!(
+            ShortCode::parse("1234567", 8),
+            Err(ShortCodeError::WrongLength {
+                expected: 8,
+                got: 7
+            })
+        );
+        // Too long — NEVER silently truncated to fit.
+        assert_eq!(
+            ShortCode::parse("123456789", 8),
+            Err(ShortCodeError::WrongLength {
+                expected: 8,
+                got: 9
+            })
+        );
+        // Separators don't change the underlying digit count: "1234-567" is still 7 digits.
+        assert_eq!(
+            ShortCode::parse("1234-567", 8),
+            Err(ShortCodeError::WrongLength {
+                expected: 8,
+                got: 7
+            })
+        );
+    }
+
+    #[test]
+    fn short_code_rejects_non_digit() {
+        // Right length (8) after stripping separators, but a non-digit character.
+        assert_eq!(
+            ShortCode::parse("1234-56ab", 8),
+            Err(ShortCodeError::NonDigit)
+        );
+        // Empty input is caught by the length check first (expected 8, got 0) — still fail-closed.
+        assert_eq!(
+            ShortCode::parse("", 8),
+            Err(ShortCodeError::WrongLength {
+                expected: 8,
+                got: 0
+            })
+        );
+    }
+
+    #[test]
+    fn short_code_from_value_rejects_out_of_range() {
+        assert_eq!(
+            ShortCode::from_value(0, 6),
+            Err(ShortCodeError::DigitsOutOfRange { digits: 6 })
+        );
+        assert_eq!(
+            ShortCode::from_value(0, 11),
+            Err(ShortCodeError::DigitsOutOfRange { digits: 11 })
+        );
+        // A value that does not fit the requested digit count.
+        assert_eq!(
+            ShortCode::from_value(100_000_000, 8),
+            Err(ShortCodeError::ValueOutOfRange)
+        );
+    }
+
+    #[test]
+    fn short_code_render_groups_in_fours_with_a_short_trailing_group() {
+        assert_eq!(ShortCode::from_value(1, 7).unwrap().render(), "0000-001");
+        assert_eq!(
+            ShortCode::from_value(1, 10).unwrap().render(),
+            "0000-0000-01"
+        );
+    }
+
+    #[test]
+    fn short_code_normalize_strips_separators_without_asserting_a_length() {
+        assert_eq!(ShortCode::normalize("1234-5678").unwrap(), "12345678");
+        assert_eq!(ShortCode::normalize(" 123 456 ").unwrap(), "123456");
+        assert_eq!(ShortCode::normalize("12-ab"), Err(ShortCodeError::NonDigit));
+        assert_eq!(ShortCode::normalize("--"), Err(ShortCodeError::NonDigit));
     }
 }

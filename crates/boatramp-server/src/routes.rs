@@ -294,6 +294,11 @@ pub fn router_with_fast(
         // the owner-grade tier — standing up a rendezvous at the relay). Redemption is unauthenticated
         // by design (the SAS backstops it) and happens at the relay, not the control plane.
         .route("/api/overlay/pair-code", post(overlay_pair_code))
+        // Pairing SHORT-CODE relay-topology lookup (overlay follow-up #2 inc3): UNAUTHENTICATED (see
+        // `authz::Right::required` — a short-code dialer presents no credential yet), returns only
+        // `{relay, relay_id}` — the same non-secret topology every authenticated mint already hands
+        // back. SECURITY REVIEW: flagged as a NEW unauthenticated endpoint.
+        .route("/api/overlay/pair-relay", get(overlay_pair_relay))
         // Overlay flow-policy administration (overlay follow-up #3): the operator-authored Cedar
         // policy that gates the dial/publish-cap mint (deny-or-shrink-TTL). GET/PUT the policy and
         // dry-run `test` it — ALL gated `System·Admin` in `authz::Right::required` (the GET/test

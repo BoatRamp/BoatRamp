@@ -776,6 +776,34 @@ impl boatramp_server::LiveExposers for OverlayExposerDirectory {
     }
 }
 
+/// A [`boatramp_server::PairShortCodeMint`] bridge over the shared [`boatramp_overlay::PairShortCodes`]
+/// alias table (overlay follow-up #2 inc3): lets `POST /api/overlay/pair-code --short` mint into the
+/// SAME table this relay's short-redeem handler resolves against (an `Arc` clone, mirroring how
+/// [`OverlayExposerDirectory`] shares the `ExposerRegistry`). Mints with REAL platform randomness
+/// ([`boatramp_overlay::PairShortCodes::mint`]) at this relay's configured `digits` count.
+#[cfg(feature = "overlay")]
+struct OverlayPairShortCodeMint {
+    store: boatramp_overlay::PairShortCodes,
+    digits: usize,
+}
+
+#[cfg(feature = "overlay")]
+#[async_trait::async_trait]
+impl boatramp_server::PairShortCodeMint for OverlayPairShortCodeMint {
+    async fn mint(
+        &self,
+        rendezvous_id: Vec<u8>,
+        expires_at: u64,
+        now_unix: u64,
+    ) -> std::result::Result<(String, String), String> {
+        self.store
+            .mint(self.digits, rendezvous_id, expires_at, now_unix)
+            .await
+            .map(|code| (code.digits().to_string(), code.render()))
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Freshness window (seconds) for an overlay enrollment possession proof — bounds how long a
 /// captured (pre-spend) proof stays presentable. Matches the cluster join path's skew.
 #[cfg(feature = "overlay")]
@@ -1063,9 +1091,10 @@ async fn spawn_overlay_roles(
 )> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
-        ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret, PairRendezvous, PathMode,
-        RelayClientAuth, run_egress_router, run_forwarding_router, run_ingress_router,
-        server_endpoint, server_endpoint_with_trust,
+        ExposerRegistry, OverlayId, OverlayPeerPolicy, OverlaySecret,
+        PAIR_SHORT_CODE_DIGITS_DEFAULT, PAIR_SHORT_CODE_DIGITS_MAX, PAIR_SHORT_CODE_DIGITS_MIN,
+        PairRendezvous, PairShortCodes, PathMode, RelayClientAuth, run_egress_router,
+        run_forwarding_router, run_ingress_router, server_endpoint, server_endpoint_with_trust,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1240,16 +1269,29 @@ async fn spawn_overlay_roles(
                 relay_id: relay_id_hex.clone(),
                 client_auth: client_auth_str.to_string(),
             }));
+            // The pairing rendezvous (overlay follow-up #2, inc2) shares this ingress relay: NAT'd
+            // peers meet here under a single-use `bropair1` code, bridged blind — the same park-and-
+            // bridge machinery as reverse ingress. In-memory + single-node this increment.
+            let rendezvous = PairRendezvous::new();
+            // The pairing SHORT-CODE alias table (overlay follow-up #2 inc3): a human-typeable
+            // alternative to `bropair1…`, shared with the control plane so `POST /api/overlay/pair-code
+            // --short` mints into the SAME table this relay's short-redeem handler resolves against.
+            // `pair_short_code_digits` is operator-tunable (floor/ceiling enforced), default 8.
+            let short_codes = PairShortCodes::new();
+            let short_code_digits = ov
+                .pair_short_code_digits
+                .unwrap_or(PAIR_SHORT_CODE_DIGITS_DEFAULT)
+                .clamp(PAIR_SHORT_CODE_DIGITS_MIN, PAIR_SHORT_CODE_DIGITS_MAX);
             expose_relay = Some(boatramp_server::ExposeRelay {
                 relay: bind.to_string(),
                 relay_id: relay_id_hex.clone(),
                 trust_root: trust_spec.clone(),
                 client_auth: client_auth_str.to_string(),
+                pair_short_codes: Some(std::sync::Arc::new(OverlayPairShortCodeMint {
+                    store: short_codes.clone(),
+                    digits: short_code_digits,
+                })),
             });
-            // The pairing rendezvous (overlay follow-up #2, inc2) shares this ingress relay: NAT'd
-            // peers meet here under a single-use `bropair1` code, bridged blind — the same park-and-
-            // bridge machinery as reverse ingress. In-memory + single-node this increment.
-            let rendezvous = PairRendezvous::new();
             tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress (accepting exposed services + pairing rendezvous)");
             tokio::spawn(run_ingress_router(
                 ep,
@@ -1258,6 +1300,8 @@ async fn spawn_overlay_roles(
                 client_auth,
                 registry,
                 rendezvous,
+                short_codes,
+                short_code_digits,
                 resolve,
             ));
         } else {

@@ -217,6 +217,19 @@ impl Right {
             return None;
         }
 
+        // Overlay pairing SHORT-CODE relay-topology lookup (overlay follow-up #2 inc3): the dialer
+        // redeeming a human-typeable short code has NO credential at all yet (the short code itself
+        // carries no topology, unlike a `bropair1…` code, which embeds it) — so this read is
+        // UNAUTHENTICATED at the RBAC layer, exactly like `/api/overlay/enroll` above. SECURITY
+        // REVIEW NOTE: this is a NEW unauthenticated endpoint — it returns only the relay socket +
+        // relay identity (the same relay topology every `expose`/`pair-code` client already learns
+        // from an authenticated mint response), never a secret, so exposing it to an unauthenticated
+        // caller is a deliberate, narrow disclosure, not a capability grant. Note the `==`: the
+        // sibling `/api/overlay/pair-code` (minting) stays `Overlay·Admin` below.
+        if path == "/api/overlay/pair-relay" {
+            return None;
+        }
+
         // First-token bootstrap: the caller presents a single-use, operator-set
         // *bootstrap secret* (verified by the handler), not an admin bearer — so
         // this exact path is unauthenticated at the RBAC layer. Note the `==`: the
@@ -3259,5 +3272,23 @@ mod tests {
                 "a non-admin principal (role {role}) must be REFUSED overlay pair-code",
             );
         }
+    }
+
+    /// Overlay pairing SHORT-CODE relay-topology lookup (`/api/overlay/pair-relay`, overlay follow-up
+    /// #2 inc3) is RBAC-unauthenticated — the exact `None` of `/api/overlay/enroll`/`/api/cluster/join`
+    /// — distinct from its sibling MINT path (`/api/overlay/pair-code`), which stays `Overlay·Admin`.
+    #[test]
+    fn overlay_pair_relay_topology_lookup_is_unauthenticated() {
+        assert_eq!(
+            Right::required("GET", "/api/overlay/pair-relay"),
+            None,
+            "GET /api/overlay/pair-relay must be RBAC-unauthenticated (no right), like /api/overlay/enroll",
+        );
+        // The sibling MINT path is UNCHANGED — still Overlay·Admin.
+        assert_eq!(
+            Right::required("POST", "/api/overlay/pair-code"),
+            Some(Right::new(Resource::Overlay, None, Action::Admin)),
+            "the sibling pair-code MINT path must stay Overlay·Admin",
+        );
     }
 }

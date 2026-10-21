@@ -193,9 +193,15 @@ enum OverlayCommand {
         /// `overlay pair-code`.
         #[arg(long, value_name = "CODE", conflicts_with_all = ["listen", "peer"])]
         accept: Option<String>,
+        /// Act as the INITIATOR over the human-typeable SHORT-CODE path: redeem this short code (e.g.
+        /// `1234-5678`; separators optional) via the control plane's unauthenticated relay-topology
+        /// lookup (`GET /api/overlay/pair-relay` — a short code carries no topology of its own), then
+        /// the relay's rate-limited short-redeem. Mint one with `overlay pair-code --short`.
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["listen", "accept", "peer"])]
+        short: Option<String>,
         /// Act as the INITIATOR: either a peer `host:port` to DIRECT-DIAL (the address the responder is
         /// listening on), or a `bropair1…` rendezvous code to REDEEM through the cluster relay.
-        #[arg(value_name = "PEER_OR_CODE", conflicts_with = "listen")]
+        #[arg(value_name = "PEER_OR_CODE", conflicts_with_all = ["listen", "short"])]
         peer: Option<String>,
         /// The overlay identity to pair AS: a tagged seed (`ed25519:<hex>`) or a key-file path.
         /// Omit to use this operator's persistent identity (as `overlay id`).
@@ -210,6 +216,11 @@ enum OverlayCommand {
         /// peer to redeem a parked rendezvous is bounded separately by the relay's rendezvous TTL).
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+        /// boatramp server base URL (overrides `[publish].server`) — used ONLY by the `--short` path,
+        /// to look up the relay topology (`GET /api/overlay/pair-relay`); every other transport needs
+        /// no control-plane call.
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
     },
     /// Mint a single-use, short-TTL PAIRING rendezvous code (`bropair1…`) so two peers that cannot
     /// direct-dial each other (both NAT'd) can meet through the cluster relay, which bridges their
@@ -220,6 +231,11 @@ enum OverlayCommand {
         /// Code lifetime in seconds (a pairing code is short-lived — minutes; the server clamps it).
         #[arg(long, default_value_t = 300)]
         ttl_secs: u64,
+        /// ALSO mint a human-typeable pairing SHORT CODE (e.g. `1234-5678`) aliasing the same
+        /// rendezvous — easier to read aloud / type on a second device than `bropair1…`. Low-entropy
+        /// by design; the relay rate-limits + locks out online guessing on redeem.
+        #[arg(long)]
+        short: bool,
         /// boatramp server base URL (overrides `[publish].server`).
         #[arg(long, env = "BOATRAMP_SERVER")]
         server: Option<String>,
@@ -568,6 +584,9 @@ pub enum OverlayOutput {
         relay_id: String,
         /// The code's expiry (Unix seconds).
         expires_at: u64,
+        /// The human-typeable short-code alias (e.g. `"1234-5678"`), present only when `--short` was
+        /// requested.
+        short_code: Option<String>,
     },
     /// `overlay pair` — a confirmed pairing: the peer's proven identity (pinned locally) plus the
     /// SAS the operators compared.
@@ -715,6 +734,7 @@ impl Rendered for OverlayOutput {
                 relay,
                 relay_id,
                 expires_at,
+                short_code,
             } => {
                 writeln!(w, "{code}")?;
                 writeln!(w)?;
@@ -729,7 +749,20 @@ impl Rendered for OverlayOutput {
                     w,
                     "# Park it (operator):  boatramp overlay pair --accept {code}"
                 )?;
-                writeln!(w, "# Redeem it (peer):    boatramp overlay pair {code}")
+                writeln!(w, "# Redeem it (peer):    boatramp overlay pair {code}")?;
+                if let Some(short) = short_code {
+                    writeln!(w)?;
+                    writeln!(
+                        w,
+                        "# Human-typeable short code (an INDEPENDENT alias — low-entropy, rate-limited \
+                         + lockout-guarded at the relay; the SAS still catches a MITM): {short}"
+                    )?;
+                    writeln!(
+                        w,
+                        "# Redeem it (peer):    boatramp overlay pair --short {short}"
+                    )?;
+                }
+                Ok(())
             }
             Self::Paired {
                 peer_id,
@@ -850,14 +883,31 @@ pub async fn run(
         OverlayCommand::Pair {
             listen,
             accept,
+            short,
             peer,
             identity,
             expect,
             timeout_secs,
-        } => pair_run(listen, accept, peer, identity, expect, timeout_secs).await,
-        OverlayCommand::PairCode { ttl_secs, server } => {
-            pair_code_run(ttl_secs, server, config).await
+            server,
+        } => {
+            pair_run(
+                listen,
+                accept,
+                short,
+                peer,
+                identity,
+                expect,
+                timeout_secs,
+                server,
+                config,
+            )
+            .await
         }
+        OverlayCommand::PairCode {
+            ttl_secs,
+            short,
+            server,
+        } => pair_code_run(ttl_secs, short, server, config).await,
         OverlayCommand::Policy { cmd } => policy_run(cmd, config).await,
         OverlayCommand::Invite {
             role,
@@ -1063,17 +1113,22 @@ fn decide_sas(sas: &SasCode, typed: &str) -> ConfirmOutcome {
 /// rendezvous for NAT'd peers), run the SAS pairing handshake, confirm the SAS out-of-band
 /// (fail-closed), and pin the peer on a positive match. The handshake is identical on every
 /// transport; only how the two bi-stream halves are established differs.
+#[allow(clippy::too_many_arguments)]
 async fn pair_run(
     listen: Option<String>,
     accept_code: Option<String>,
+    short_code: Option<String>,
     peer: Option<String>,
     identity: Option<String>,
     expect: Option<String>,
     timeout_secs: u64,
+    server: Option<String>,
+    config: &crate::config::ProjectConfig,
 ) -> Result<OverlayOutput> {
     use boatramp_overlay::{
-        OverlayPeerPolicy, PairCode, Role, VerifiedPeers, accept, client_endpoint_server_auth,
-        dial, identity_fp, pair_dial_endpoint, pair_relay_park, pair_relay_redeem, server_endpoint,
+        OverlayPeerPolicy, PairCode, Role, ShortCode, VerifiedPeers, accept,
+        client_endpoint_server_auth, dial, identity_fp, pair_dial_endpoint, pair_relay_park,
+        pair_relay_redeem, pair_relay_redeem_short, server_endpoint,
     };
     use boatramp_overlay_client::OverlayClient;
 
@@ -1110,9 +1165,9 @@ async fn pair_run(
     // Hold the endpoint + connection alive through the (possibly interactive) confirm, so the final
     // sealed reveal reaches the peer and the stream is not reset early.
     let _hold;
-    let (sas, peer_id) = match (accept_code, listen, peer) {
+    let (sas, peer_id) = match (accept_code, listen, peer, short_code) {
         // Relay rendezvous RESPONDER: park the code at the relay and wait for the NAT'd peer to redeem.
-        (Some(code_s), _, _) => {
+        (Some(code_s), _, _, _) => {
             let (relay_addr, code) = decode_code(&code_s)?;
             let ep =
                 client_endpoint_server_auth(&OverlayPeerPolicy::Pin(code.relay_id)).map_err(q)?;
@@ -1134,7 +1189,9 @@ async fn pair_run(
         // Relay rendezvous INITIATOR: the positional arg is a `bropair1…` code — redeem it.
         // Lowercase-normalize the discriminator (INFO-3) so a pasted UPPERCASE bech32m code (which
         // decodes fine) routes to redeem instead of falling through to the direct-dial addr parse.
-        (None, None, Some(ref p)) if p.trim().to_ascii_lowercase().starts_with("bropair1") => {
+        (None, None, Some(ref p), None)
+            if p.trim().to_ascii_lowercase().starts_with("bropair1") =>
+        {
             let (relay_addr, code) = decode_code(p)?;
             let ep =
                 client_endpoint_server_auth(&OverlayPeerPolicy::Pin(code.relay_id)).map_err(q)?;
@@ -1148,8 +1205,26 @@ async fn pair_run(
             _hold = (ep, conn);
             out
         }
+        // Relay rendezvous INITIATOR over the SHORT-CODE path: no topology is embedded in a short
+        // code, so fetch this cluster's relay topology first (unauthenticated —
+        // `GET /api/overlay/pair-relay`), then redeem the normalized digit string at the relay.
+        (None, None, None, Some(code_s)) => {
+            let digits = ShortCode::normalize(&code_s)
+                .map_err(|e| Error::Overlay(format!("pairing short code: {e}")))?;
+            let (relay_addr, relay_id) = fetch_pair_relay(server.clone(), config).await?;
+            let ep = client_endpoint_server_auth(&OverlayPeerPolicy::Pin(relay_id)).map_err(q)?;
+            let (conn, mut send, mut recv) = pair_relay_redeem_short(&ep, relay_addr, digits)
+                .await
+                .map_err(|e| Error::Overlay(format!("relay rendezvous (short redeem): {e}")))?;
+            let out = client
+                .pair(&mut send, &mut recv, Role::Initiator, deadline)
+                .await
+                .map_err(|e| Error::Overlay(format!("pairing handshake: {e}")))?;
+            _hold = (ep, conn);
+            out
+        }
         // Direct-dial RESPONDER: listen for a dialer.
-        (None, Some(bind), _) => {
+        (None, Some(bind), _, None) => {
             let addr = bind
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| Error::Overlay(format!("--listen `{bind}`: {e}")))?;
@@ -1175,7 +1250,7 @@ async fn pair_run(
             out
         }
         // Direct-dial INITIATOR: the positional arg is a peer `host:port`.
-        (None, None, Some(addr_s)) => {
+        (None, None, Some(addr_s), None) => {
             let addr = addr_s
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| Error::Overlay(format!("peer address `{addr_s}`: {e}")))?;
@@ -1194,11 +1269,19 @@ async fn pair_run(
             _hold = (ep, conn);
             out
         }
-        (None, None, None) => {
+        (None, None, None, None) => {
             return Err(Error::Overlay(
-                "specify a transport: `--listen <addr>` or a peer `<addr>` (direct), or \
-                 `--accept <bropair1…>` or a `<bropair1…>` code (relay rendezvous)"
+                "specify a transport: `--listen <addr>` or a peer `<addr>` (direct), \
+                 `--accept <bropair1…>` or a `<bropair1…>` code (relay rendezvous), or \
+                 `--short <code>` (short-code relay rendezvous)"
                     .into(),
+            ));
+        }
+        // Unreachable via the CLI (clap's `conflicts_with_all` refuses `--short` alongside
+        // `--listen`/`peer` before this function is ever called) — exhaustiveness only.
+        _ => {
+            return Err(Error::Overlay(
+                "`--short` cannot be combined with `--listen` or a peer address".into(),
             ));
         }
     };
@@ -1237,6 +1320,9 @@ async fn pair_run(
 #[derive(serde::Serialize)]
 struct PairCodeRequestBody {
     ttl_secs: u64,
+    /// ALSO mint a human-typeable short-code alias (overlay follow-up #2 inc3).
+    #[serde(default)]
+    short: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -1246,14 +1332,19 @@ struct PairCodeResponseBody {
     /// Hex of the single-use rendezvous id the relay keys the park/redeem on.
     rendezvous: String,
     expires_at: u64,
+    /// The grouped short-code alias (e.g. `"1234-5678"`), present only when `short` was requested.
+    #[serde(default)]
+    short_code: Option<String>,
 }
 
 /// Run `overlay pair-code`: mint a single-use pairing rendezvous code at the control plane
 /// (`Overlay·Admin`) and assemble the copy-pasteable `bropair1…` the operator shares with the new
 /// peer. The server returns the relay topology + a fresh rendezvous id; the CLI packs them into the
-/// bech32m code (the overlay analog of assembling a `brfwd1…` ticket from the dial response).
+/// bech32m code (the overlay analog of assembling a `brfwd1…` ticket from the dial response). With
+/// `short`, also prints the server-minted human-typeable short-code alias.
 async fn pair_code_run(
     ttl_secs: u64,
+    short: bool,
     server: Option<String>,
     config: &crate::config::ProjectConfig,
 ) -> Result<OverlayOutput> {
@@ -1263,7 +1354,7 @@ async fn pair_code_run(
         crate::client::connect(server, config).map_err(|e| Error::Overlay(e.to_string()))?;
     let resp = http
         .post(format!("{server}/api/overlay/pair-code"))
-        .json(&PairCodeRequestBody { ttl_secs })
+        .json(&PairCodeRequestBody { ttl_secs, short })
         .send()
         .await
         .map_err(|e| Error::Overlay(e.to_string()))?;
@@ -1292,7 +1383,53 @@ async fn pair_code_run(
         relay: body.relay,
         relay_id: body.relay_id,
         expires_at: body.expires_at,
+        short_code: body.short_code,
     })
+}
+
+/// `GET /api/overlay/pair-relay` response (CLI mirror of the server type).
+#[derive(serde::Deserialize)]
+struct PairRelayResponseBody {
+    relay: String,
+    relay_id: String,
+}
+
+/// Fetch this cluster's pairing ingress-relay topology (self-serve `overlay pair --short <code>`).
+/// UNAUTHENTICATED at the control plane (no RBAC right — the short-code dialer has no credential at
+/// all yet); the route still sits behind the auth middleware's bare-bearer-PRESENCE check (exactly
+/// like `/api/overlay/enroll`), so an EMPTY placeholder bearer is presented — never verified for this
+/// exempted path.
+async fn fetch_pair_relay(
+    server: Option<String>,
+    config: &crate::config::ProjectConfig,
+) -> Result<(std::net::SocketAddr, OverlayId)> {
+    let server =
+        crate::client::resolve_server(server, config).map_err(|e| Error::Overlay(e.to_string()))?;
+    let http = crate::client::http_client(Some(""));
+    let resp = http
+        .get(format!("{server}/api/overlay/pair-relay"))
+        .send()
+        .await
+        .map_err(|e| Error::Overlay(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Overlay(format!(
+            "overlay pair-relay lookup refused ({}): {}",
+            status.as_u16(),
+            body.trim()
+        )));
+    }
+    let body: PairRelayResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| Error::Overlay(e.to_string()))?;
+    let addr = body
+        .relay
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| Error::Overlay(format!("pair-relay address `{}`: {e}", body.relay)))?;
+    let relay_id = parse_id(&body.relay_id)?;
+    Ok((addr, relay_id))
 }
 
 /// Gather the operator's confirmation of the derived `sas`, fail-closed.

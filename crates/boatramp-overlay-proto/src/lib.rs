@@ -51,7 +51,10 @@ pub use dial::{DialReject, DialRequest, DialVerdict, authorize_dial};
 pub use e2ee::{E2eeError, HybridInitiator, Opener, Role, Sealer, Session, hybrid_respond};
 pub use ice::{Candidate, CandidateKind, CandidateSet, Signal};
 pub use identity::{OverlayId, OverlayIdError, OverlaySecret};
-pub use pair_code::{PAIR_RENDEZVOUS_ID_LEN, PairCode, PairCodeError};
+pub use pair_code::{
+    PAIR_RENDEZVOUS_ID_LEN, PAIR_SHORT_CODE_DIGITS_DEFAULT, PAIR_SHORT_CODE_DIGITS_MAX,
+    PAIR_SHORT_CODE_DIGITS_MIN, PairCode, PairCodeError, ShortCode, ShortCodeError,
+};
 pub use pairing::{
     PAIR_NONCE_LEN, PAIR_ROLE_INITIATOR, PAIR_ROLE_RESPONDER, pair_commit, pair_commit_verify,
 };

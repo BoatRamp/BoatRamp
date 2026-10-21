@@ -135,9 +135,9 @@ pub(crate) use control_api::{
     delete_secret, delete_tenant_secret, get_authz_policy, get_overlay_policy, kv_checkpoint,
     kv_export, kv_import, kv_status, list_email_profiles, list_root_anchors, list_secrets,
     list_tenant_secrets, list_tokens, node_version, overlay_dial, overlay_enroll, overlay_expose,
-    overlay_invite, overlay_pair_code, overlay_services, put_authz_policy, put_overlay_policy,
-    remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
-    show_email_profile, test_overlay_policy,
+    overlay_invite, overlay_pair_code, overlay_pair_relay, overlay_services, put_authz_policy,
+    put_overlay_policy, remove_root_anchor, revoke_token, set_email_profile, set_secret,
+    set_tenant_secret, show_email_profile, test_overlay_policy,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
@@ -2289,6 +2289,25 @@ pub trait LiveExposers: Send + Sync {
     async fn resolve_target(&self, service: &str, now_unix: u64) -> Option<OverlayTarget>;
 }
 
+/// A mint hook for pairing SHORT-CODE aliases (overlay follow-up #2 inc3), shared from the overlay
+/// relay role so the control plane's `POST /api/overlay/pair-code` can mint one into the SAME alias
+/// table the relay's short-redeem handler resolves against. Implemented by the `boatramp` binary
+/// over the shared `boatramp_overlay::PairShortCodes`, so `boatramp-server` stays free of the
+/// overlay-transport deps (mirrors [`LiveExposers`] bridging `ExposerRegistry`).
+#[async_trait::async_trait]
+pub trait PairShortCodeMint: Send + Sync {
+    /// Mint + park a NEW short-code alias for `rendezvous_id` (the full 128-bit id, already parked /
+    /// about to be parked under the long `bropair1` path), expiring at `expires_at`. Returns the bare
+    /// digit string (the wire/registry key) and the grouped human-typeable rendering, or an error
+    /// description on exhausted collision retries.
+    async fn mint(
+        &self,
+        rendezvous_id: Vec<u8>,
+        expires_at: u64,
+        now_unix: u64,
+    ) -> Result<(String, String), String>;
+}
+
 /// This node's ingress-relay self-topology for the self-serve PUBLISH path
 /// (`POST /api/overlay/expose`): the relay an exposer dials OUT to, plus the cluster trust root the
 /// exposer verifies each incoming forward client's dial capability against (zero-trust terminator).
@@ -2305,6 +2324,11 @@ pub struct ExposeRelay {
     pub trust_root: String,
     /// The relay's client-auth posture ("capability-only" | "mutual-pin").
     pub client_auth: String,
+    /// The shared pairing SHORT-CODE mint hook (overlay follow-up #2 inc3) — present whenever this
+    /// node runs an ingress relay (set alongside the rest of this struct), so `overlay_pair_code` can
+    /// mint a short code into the relay's own alias table. `None` would mean no relay topology either
+    /// (this struct wouldn't exist), so in practice this is always `Some` when `ExposeRelay` is.
+    pub pair_short_codes: Option<std::sync::Arc<dyn PairShortCodeMint>>,
 }
 
 /// The overlay forward-flow **service directory**: a service name → the relay + egress a dial to it
@@ -2521,6 +2545,7 @@ mod overlay_directory_tests {
             relay_id: "ed25519:relay".into(),
             trust_root: "ed25519:root".into(),
             client_auth: "capability-only".into(),
+            pair_short_codes: None,
         }));
         let relay = directory.expose_relay().expect("expose relay present");
         assert_eq!(relay.relay, "relay.example:9000");

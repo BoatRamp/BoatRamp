@@ -15,7 +15,7 @@
 //! calls [`forward_flow`] directly with the accepted connection.
 
 #[cfg(feature = "server")]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(feature = "server")]
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -42,6 +42,11 @@ use boatramp_overlay_proto::e2ee::{Opener, Role, Sealer};
 use boatramp_overlay_proto::ice::Signal;
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
 use boatramp_overlay_proto::peer_policy::OverlayPeerPolicy;
+// The human-typeable short-code alias (overlay follow-up #2, inc3): the mint/alias-table side
+// (`PairShortCodes`) is relay-only — the client redeem path sends the plain digit string it already
+// has (see `pair_relay_redeem_short`), so it never needs the type itself.
+#[cfg(feature = "server")]
+use boatramp_overlay_proto::pair_code::ShortCode;
 use boatramp_overlay_proto::wire;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::Serialize;
@@ -871,6 +876,9 @@ enum IngressFrame {
     PairPark(PairParkRequest),
     /// A dialer redeeming a parked pairing rendezvous.
     PairRedeem(PairRedeemRequest),
+    /// A dialer redeeming a parked pairing rendezvous via its human-typeable short-code alias
+    /// (overlay follow-up #2 inc3).
+    PairRedeemShort(PairRedeemShortRequest),
     /// A forward client dialing a service.
     Dial(DialRequest),
 }
@@ -905,6 +913,11 @@ async fn read_ingress_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<IngressF
         && redeem.pair_redeem == PAIR_REDEEM_TAG
     {
         return Ok(IngressFrame::PairRedeem(redeem));
+    }
+    if let Ok(redeem_short) = serde_json::from_slice::<PairRedeemShortRequest>(&buf)
+        && redeem_short.pair_redeem_short == PAIR_REDEEM_SHORT_TAG
+    {
+        return Ok(IngressFrame::PairRedeemShort(redeem_short));
     }
     Ok(IngressFrame::Dial(serde_json::from_slice(&buf)?))
 }
@@ -1202,6 +1215,7 @@ where
 /// `Register` frame (exposer) vs a `DialRequest` (forward client). Used when a relay opts into
 /// accepting exposed services; `secret` is the relay's identity for the registration handshake.
 #[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ingress_router<F>(
     endpoint: Endpoint,
     secret: OverlaySecret,
@@ -1209,6 +1223,8 @@ pub async fn run_ingress_router<F>(
     client_auth: RelayClientAuth,
     registry: ExposerRegistry,
     rendezvous: PairRendezvous,
+    short_codes: PairShortCodes,
+    short_code_digits: usize,
     resolve: F,
 ) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
@@ -1220,6 +1236,8 @@ pub async fn run_ingress_router<F>(
         client_auth,
         registry,
         rendezvous,
+        short_codes,
+        short_code_digits,
         resolve,
         IngressBudgets::DEFAULT,
     )
@@ -1279,6 +1297,8 @@ async fn run_ingress_router_with_budgets<F>(
     client_auth: RelayClientAuth,
     registry: ExposerRegistry,
     rendezvous: PairRendezvous,
+    short_codes: PairShortCodes,
+    short_code_digits: usize,
     resolve: F,
     budgets: IngressBudgets,
 ) where
@@ -1290,6 +1310,10 @@ async fn run_ingress_router_with_budgets<F>(
     let register_limiter = Arc::new(Semaphore::new(budgets.register));
     let park_limiter = Arc::new(Semaphore::new(budgets.parked));
     let park_by_ip: Arc<StdMutex<HashMap<IpAddr, u32>>> = Arc::new(StdMutex::new(HashMap::new()));
+    // The short-code guess-rate limiter is NOT a concurrency budget (it never gates admission by
+    // slot count) — it is a separate, orthogonal rolling-window failure-rate gate shared across every
+    // short-redeem on this router, so it lives outside `IngressBudgets`.
+    let guess_limiter = Arc::new(PairGuessLimiter::default_production());
     loop {
         let Ok(hs_permit) = Arc::clone(&handshake_limiter).acquire_owned().await else {
             return;
@@ -1305,6 +1329,8 @@ async fn run_ingress_router_with_budgets<F>(
         let resolve = resolve.clone();
         let registry = registry.clone();
         let rendezvous = rendezvous.clone();
+        let short_codes = short_codes.clone();
+        let guess_limiter = Arc::clone(&guess_limiter);
         let flow_limiter = Arc::clone(&flow_limiter);
         let register_limiter = Arc::clone(&register_limiter);
         let park_limiter = Arc::clone(&park_limiter);
@@ -1318,6 +1344,9 @@ async fn run_ingress_router_with_budgets<F>(
                 client_auth,
                 &registry,
                 &rendezvous,
+                &short_codes,
+                &guess_limiter,
+                short_code_digits,
                 flow_limiter,
                 register_limiter,
                 park_limiter,
@@ -1349,6 +1378,9 @@ async fn handle_ingress_connection<F>(
     client_auth: RelayClientAuth,
     registry: &ExposerRegistry,
     rendezvous: &PairRendezvous,
+    short_codes: &PairShortCodes,
+    guess_limiter: &PairGuessLimiter,
+    short_code_digits: usize,
     flow_limiter: Arc<Semaphore>,
     register_limiter: Arc<Semaphore>,
     park_limiter: Arc<Semaphore>,
@@ -1401,6 +1433,26 @@ where
                 .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
             drop(hs_permit);
             redeem_rendezvous(conn, send, recv, req, rendezvous).await
+        }
+        IngressFrame::PairRedeemShort(req) => {
+            // Reuses the SAME flow budget as `PairRedeem`/`Dial` (never a fresh/unbounded path) — the
+            // inc2 HIGH-1 separation (park/register never drawn on by a flow) is preserved unchanged.
+            let _flow = flow_limiter
+                .acquire_owned()
+                .await
+                .map_err(|_| NetError::Stream("ingress flow budget closed".into()))?;
+            drop(hs_permit);
+            redeem_rendezvous_short(
+                conn,
+                send,
+                recv,
+                req,
+                rendezvous,
+                short_codes,
+                guess_limiter,
+                short_code_digits,
+            )
+            .await
         }
         IngressFrame::Dial(req) => {
             let _flow = flow_limiter
@@ -1552,6 +1604,9 @@ where
 const PAIR_PARK_TAG: &str = "overlay-pair-park";
 /// The discriminator marking a [`PairRedeemRequest`] frame (the dialer REDEEMING a parked rendezvous).
 const PAIR_REDEEM_TAG: &str = "overlay-pair-redeem";
+/// The discriminator marking a [`PairRedeemShortRequest`] frame (the dialer redeeming a parked
+/// rendezvous via its human-typeable SHORT-CODE alias — overlay follow-up #2 inc3).
+const PAIR_REDEEM_SHORT_TAG: &str = "overlay-pair-redeem-short";
 
 /// How long a parked pairing rendezvous lives at the relay before it is reaped (minutes): long enough
 /// for an operator to share the `bropair1` code and the peer to redeem it, short enough that a leaked/
@@ -1559,6 +1614,30 @@ const PAIR_REDEEM_TAG: &str = "overlay-pair-redeem";
 /// Semaphore slot (the park connection is force-closed once this elapses with no redeem).
 #[cfg(feature = "server")]
 const PAIR_RENDEZVOUS_TTL_SECS: u64 = 300;
+
+/// Rolling window (seconds) the short-code guess-rate limiter counts FAILED short-redeems over
+/// (`W` in the design math): `F_ip`/`F_global` failures within this many trailing seconds trip the
+/// per-IP/global lockout. 60s — long enough to catch a burst, short enough that an honest operator's
+/// later retry (after fixing a typo) is not punished for long.
+#[cfg(feature = "server")]
+const PAIR_SHORT_GUESS_WINDOW_SECS: u64 = 60;
+/// Per-source-IP cap on FAILED short-redeems within [`PAIR_SHORT_GUESS_WINDOW_SECS`] — the
+/// LOAD-BEARING bound (`F_ip` in the design math): `10` failed attempts gives `10 · 2^-26.6` chance of
+/// an online hit per window at the default 8-digit code, far below the 24-bit SAS's own
+/// per-online-attempt strength. A SUCCESSFUL redeem never increments this (an honest first try never
+/// trips it).
+#[cfg(feature = "server")]
+const PAIR_SHORT_GUESS_MAX_PER_IP: u32 = 10;
+/// Global cap on FAILED short-redeems within [`PAIR_SHORT_GUESS_WINDOW_SECS`] across ALL sources — a
+/// backstop (`F_global`) against a distributed guessing swarm that stays under the per-IP cap on any
+/// single source.
+#[cfg(feature = "server")]
+const PAIR_SHORT_GUESS_MAX_GLOBAL: u32 = 30;
+/// Bounded retries [`PairShortCodes::insert_unique`] spends regenerating a fresh random short code
+/// when a draw collides with a LIVE entry, before giving up (an exhausted-retries error — the mint
+/// path surfaces this as a `500`, never a silent weaker code).
+#[cfg(feature = "server")]
+const PAIR_SHORT_CODE_MINT_RETRIES: u32 = 8;
 
 /// What a peer sends as the FIRST control frame to PARK a pairing rendezvous (the accepter side).
 /// Distinguished from a `DialRequest`/`RegisterRequest`/`PairRedeemRequest` by its required
@@ -1583,6 +1662,20 @@ struct PairRedeemRequest {
     code: Vec<u8>,
 }
 
+/// What a peer sends as the FIRST control frame to REDEEM a parked pairing rendezvous via its
+/// human-typeable SHORT-CODE alias (overlay follow-up #2 inc3) — the dialer side, exactly like
+/// [`PairRedeemRequest`] but keyed on the low-entropy alias instead of the full 128-bit rendezvous id.
+/// The relay resolves `code` to the aliased rendezvous id (via [`PairShortCodes::resolve_and_take`])
+/// and then runs the EXACT SAME [`PairRendezvous::redeem`] + blind bridge as a full-id redeem — so
+/// single-use/TTL/consume semantics live in exactly one place.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct PairRedeemShortRequest {
+    /// Always [`PAIR_REDEEM_SHORT_TAG`].
+    pair_redeem_short: String,
+    /// The short-code digit string (separators already stripped by the caller) to resolve.
+    code: String,
+}
+
 /// Why a pairing park/redeem was refused by the relay (returned to the peer).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum PairReject {
@@ -1596,8 +1689,14 @@ pub enum PairReject {
     /// Unauthenticated PARK is bounded SEPARATELY from the forward/expose flow budget (HIGH-1).
     TooManyParked,
     /// No live parked rendezvous for this id — never parked, already redeemed (single-use), or expired
-    /// — returned to a REDEEM.
+    /// — returned to a REDEEM. ALSO returned for a short-code miss (no distinguishing oracle between a
+    /// wrong guess and an already-spent/unknown one — see [`PairReject::TooManyAttempts`] for the
+    /// SEPARATE short-code rate-limit rejection).
     UnknownOrSpent,
+    /// The source (by IP, or the relay-wide backstop) has exceeded the short-code guess-rate limit
+    /// within the rolling window — returned ONLY to a short-code REDEEM, checked BEFORE the code is
+    /// even resolved (so an over-budget source is refused even for a code that would otherwise hit).
+    TooManyAttempts,
 }
 
 /// The relay's verdict on a pairing park/redeem (the first frame back to the peer).
@@ -1666,6 +1765,39 @@ pub async fn pair_relay_redeem(
         &mut send,
         &PairRedeemRequest {
             pair_redeem: PAIR_REDEEM_TAG.to_string(),
+            code,
+        },
+    )
+    .await?;
+    match read_msg::<PairResult>(&mut recv).await? {
+        PairResult::Ok => {}
+        PairResult::Rejected(reason) => return Err(NetError::PairRejected(reason)),
+    }
+    Ok((conn, send, recv))
+}
+
+/// Client-side: REDEEM a parked pairing rendezvous via its human-typeable SHORT-CODE alias (overlay
+/// follow-up #2 inc3) at `relay` (the dialer). `code` is the bare digit string (separators already
+/// stripped — e.g. via [`boatramp_overlay_proto::pair_code::ShortCode::normalize`]). Otherwise
+/// identical to [`pair_relay_redeem`]: dials the relay, sends the short-redeem request, and on the
+/// relay's `Ok` returns the held [`Connection`] + the bridged `(send, recv)` to run
+/// `pair_handshake(Initiator)` over. The low entropy of a short code is backstopped at the relay by a
+/// guess-rate limiter — a refusal may be a genuine miss, an already-spent code, OR the caller's
+/// source having exceeded the guess-rate limit (`TooManyAttempts`); all fail-closed.
+pub async fn pair_relay_redeem_short(
+    relay: &Endpoint,
+    relay_addr: SocketAddr,
+    code: String,
+) -> Result<(Connection, SendStream, RecvStream), NetError> {
+    let conn = quic::dial(relay, relay_addr).await?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(
+        &mut send,
+        &PairRedeemShortRequest {
+            pair_redeem_short: PAIR_REDEEM_SHORT_TAG.to_string(),
             code,
         },
     )
@@ -1934,6 +2066,316 @@ async fn redeem_rendezvous(
         .map_err(|e| NetError::Stream(e.to_string()))?;
     write_msg(&mut client_send, &PairResult::Ok).await?;
     tracing::info!("overlay relay: pairing rendezvous matched (bridging blind)");
+    bridge(client_recv, client_send, parked_recv, parked_send).await?;
+    let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+    Ok(())
+}
+
+// ======================================================================================
+// Pairing SHORT CODES (overlay follow-up #2, inc3): a human-typeable alias for a `bropair1`
+// rendezvous.
+//
+// The `bropair1…` bech32m code is LONG — awkward to read aloud or type on a second device. A SHORT
+// code (default 8 decimal digits, grouped `NNNN-NNNN`) is easy to share, but LOW-ENTROPY
+// (`10^digits`), so it is used ONLY by the dialer/redeem side (the accepter still parks the full
+// 128-bit id — no low-entropy surface on park) and the relay MUST rate-limit + lock out online
+// guessing. The short code is an INDEPENDENT random ALIAS that resolves to the strong rendezvous id —
+// NEVER a truncation/derivation of it (leaking a short code reveals nothing about the strong id, and
+// the full `bropair1` path stays full-entropy and unthrottled). `PairShortCodes` is a sibling
+// alias-table alongside [`PairRendezvous`]; the short path resolves short→id then calls the EXISTING
+// [`PairRendezvous::redeem`] — single-use/consume/TTL logic stays in exactly ONE place.
+// ======================================================================================
+
+/// One short-code alias: which (strong) rendezvous id it resolves to, and when the alias itself
+/// expires (mirrors the aliased [`PairEntry`]'s TTL — the two are minted together).
+#[cfg(feature = "server")]
+struct ShortEntry {
+    /// The aliased rendezvous id — resolved then handed to the EXISTING [`PairRendezvous::redeem`].
+    rendezvous_id: Vec<u8>,
+    /// When this alias expires (Unix seconds); a resolve past this is treated as a miss and pruned.
+    expires_at: u64,
+}
+
+/// A failure minting a [`ShortCode`] alias.
+#[cfg(feature = "server")]
+#[derive(Debug, thiserror::Error)]
+pub enum PairShortCodeError {
+    /// The short code itself could not be built (digit count out of range / value overflow).
+    #[error(transparent)]
+    Code(#[from] boatramp_overlay_proto::pair_code::ShortCodeError),
+    /// Every draw within the bounded retry budget collided with a LIVE alias — give up rather than
+    /// loop forever or silently mint a weaker (shorter/predictable) code.
+    #[error("exhausted short-code collision retries")]
+    ExhaustedRetries,
+}
+
+/// A relay-side alias table mapping a human-typeable [`ShortCode`] to the strong rendezvous id it
+/// resolves to. The SIBLING of [`PairRendezvous`] (same `Arc<Mutex<BTreeMap<..>>>` shape), but it
+/// holds no connection — only the alias — so dropping/consuming an alias never affects the parked
+/// connection itself; only [`PairRendezvous::redeem`] does that. Cheap to clone (an `Arc` handle).
+#[cfg(feature = "server")]
+#[derive(Clone, Default)]
+pub struct PairShortCodes {
+    inner: Arc<Mutex<BTreeMap<String, ShortEntry>>>,
+}
+
+#[cfg(feature = "server")]
+impl PairShortCodes {
+    /// An empty alias table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn entry_live(entry: &ShortEntry, now: u64) -> bool {
+        now < entry.expires_at
+    }
+
+    /// Mint + park a NEW short-code alias for `rendezvous_id`, expiring at `expires_at`. `draw`
+    /// supplies raw randomness per attempt (injectable for deterministic tests; production mints via
+    /// [`PairShortCodes::mint`], which wires real platform entropy): a draw colliding with a LIVE
+    /// alias is regenerated, up to [`PAIR_SHORT_CODE_MINT_RETRIES`] times, before giving up — a
+    /// dead/expired alias is silently reused (never a park-style rejection; a short code is minted
+    /// fresh each time, so there is no "first-wins" semantic to preserve).
+    pub async fn insert_unique<R: FnMut() -> u64>(
+        &self,
+        mut draw: R,
+        digits: usize,
+        rendezvous_id: Vec<u8>,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<ShortCode, PairShortCodeError> {
+        let modulus = 10u64.checked_pow(digits as u32).ok_or(
+            boatramp_overlay_proto::pair_code::ShortCodeError::DigitsOutOfRange { digits },
+        )?;
+        for _ in 0..PAIR_SHORT_CODE_MINT_RETRIES {
+            let value = draw() % modulus;
+            let code = ShortCode::from_value(value, digits)?;
+            let mut map = self.inner.lock().await;
+            let collides = map
+                .get(code.digits())
+                .is_some_and(|e| Self::entry_live(e, now));
+            if !collides {
+                map.insert(
+                    code.digits().to_string(),
+                    ShortEntry {
+                        rendezvous_id,
+                        expires_at,
+                    },
+                );
+                return Ok(code);
+            }
+        }
+        Err(PairShortCodeError::ExhaustedRetries)
+    }
+
+    /// [`PairShortCodes::insert_unique`] wired to real platform randomness
+    /// ([`aws_lc_rs::rand::SystemRandom`] — the one platform RNG this crate already uses for the
+    /// pairing nonces, `crate::pair`). The production mint entry point; tests needing a deterministic
+    /// or colliding draw call `insert_unique` directly.
+    pub async fn mint(
+        &self,
+        digits: usize,
+        rendezvous_id: Vec<u8>,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<ShortCode, PairShortCodeError> {
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        self.insert_unique(
+            || {
+                let mut buf = [0u8; 8];
+                // `SystemRandom::fill` only fails on a platform entropy-source fault; on that rare
+                // failure the zeroed buffer still yields a (not-cryptographically-strong) draw rather
+                // than panicking the relay — `insert_unique`'s retry loop + collision check is the
+                // safety net, not this fallback.
+                let _ = rng.fill(&mut buf);
+                u64::from_le_bytes(buf)
+            },
+            digits,
+            rendezvous_id,
+            expires_at,
+            now,
+        )
+        .await
+    }
+
+    /// Resolve `digits` to its aliased rendezvous id, CONSUMING the alias (single-use — mirrors
+    /// [`PairRendezvous::redeem`]'s remove-on-hit). `None` on a miss (never minted, already resolved,
+    /// or expired); an expired entry is pruned.
+    pub async fn resolve_and_take(&self, digits: &str, now: u64) -> Option<Vec<u8>> {
+        let mut map = self.inner.lock().await;
+        match map.get(digits) {
+            Some(e) if Self::entry_live(e, now) => map.remove(digits).map(|e| e.rendezvous_id),
+            Some(_) => {
+                map.remove(digits); // prune the dead/expired alias
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Whether a live alias currently exists for `digits` at `now` (test/diagnostic helper).
+    pub async fn is_active(&self, digits: &str, now: u64) -> bool {
+        let map = self.inner.lock().await;
+        map.get(digits).is_some_and(|e| Self::entry_live(e, now))
+    }
+}
+
+/// A rolling-window counter of FAILED short-redeem attempts, per source IP, mirroring the existing
+/// [`ParkIpGuard`]'s sync-`std::sync::Mutex`-never-across-`.await` pattern (lazy prune on access —
+/// no background reaper task). Two tiers: a per-IP cap (`F_ip`, the LOAD-BEARING bound) and a global
+/// backstop (`F_global`) against a distributed guessing swarm that stays under the per-IP cap on any
+/// single source. A SUCCESSFUL redeem never records a failure — an honest first try never trips
+/// either cap.
+#[cfg(feature = "server")]
+struct PairGuessLimiter {
+    window_secs: u64,
+    max_per_ip: u32,
+    max_global: u32,
+    by_ip: StdMutex<HashMap<IpAddr, VecDeque<u64>>>,
+    global: StdMutex<VecDeque<u64>>,
+}
+
+#[cfg(feature = "server")]
+impl PairGuessLimiter {
+    /// A limiter with the given rolling window + per-IP/global failure caps.
+    fn new(window_secs: u64, max_per_ip: u32, max_global: u32) -> Self {
+        Self {
+            window_secs,
+            max_per_ip,
+            max_global,
+            by_ip: StdMutex::new(HashMap::new()),
+            global: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    /// The production limiter: [`PAIR_SHORT_GUESS_WINDOW_SECS`] /
+    /// [`PAIR_SHORT_GUESS_MAX_PER_IP`] / [`PAIR_SHORT_GUESS_MAX_GLOBAL`].
+    fn default_production() -> Self {
+        Self::new(
+            PAIR_SHORT_GUESS_WINDOW_SECS,
+            PAIR_SHORT_GUESS_MAX_PER_IP,
+            PAIR_SHORT_GUESS_MAX_GLOBAL,
+        )
+    }
+
+    /// Whether a NEW short-redeem attempt from `ip` at `now` is admitted — under BOTH the per-IP and
+    /// global rolling-window failure caps. MUST be checked BEFORE resolving the code (never after),
+    /// so a source already over budget is refused even for a code that WOULD otherwise hit. Lazily
+    /// prunes failures older than the rolling window first (never across an `.await` — both locks are
+    /// plain `std::sync::Mutex`, held only for this synchronous prune+compare).
+    fn admit(&self, ip: IpAddr, now: u64) -> bool {
+        let cutoff = now.saturating_sub(self.window_secs);
+        {
+            let Ok(mut g) = self.global.lock() else {
+                return false;
+            };
+            g.retain(|&t| t > cutoff);
+            if g.len() as u32 >= self.max_global {
+                return false;
+            }
+        }
+        let Ok(mut by_ip) = self.by_ip.lock() else {
+            return false;
+        };
+        let entry = by_ip.entry(ip).or_default();
+        entry.retain(|&t| t > cutoff);
+        (entry.len() as u32) < self.max_per_ip
+    }
+
+    /// Record a FAILED short-redeem attempt from `ip` at `now`. Called ONLY on a miss — a successful
+    /// resolve must NEVER call this (an honest first try never trips the limiter).
+    fn record_failure(&self, ip: IpAddr, now: u64) {
+        if let Ok(mut g) = self.global.lock() {
+            let cutoff = now.saturating_sub(self.window_secs);
+            g.retain(|&t| t > cutoff);
+            g.push_back(now);
+        }
+        if let Ok(mut by_ip) = self.by_ip.lock() {
+            let cutoff = now.saturating_sub(self.window_secs);
+            let entry = by_ip.entry(ip).or_default();
+            entry.retain(|&t| t > cutoff);
+            entry.push_back(now);
+        }
+    }
+}
+
+/// Relay pairing: REDEEM a parked rendezvous for the dialer via its human-typeable SHORT-CODE alias
+/// (overlay follow-up #2 inc3). Order (load-bearing): the guess-rate LOCKOUT is checked FIRST — before
+/// the code is even validated or resolved — so an over-budget source is refused even for a code that
+/// would otherwise hit; then a length mismatch against this relay's configured `short_code_digits` is
+/// an `InvalidCode` (malformed-request, never counted as a guess); only a well-formed code that MISSES
+/// resolution counts as a failed attempt (a successful resolve counts nothing). Short→id resolution
+/// hands off to the EXISTING [`PairRendezvous::redeem`] + [`bridge`] — single-use/TTL/consume and the
+/// blind bridge stay in exactly the same place the full-`bropair1` path uses.
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn redeem_rendezvous_short(
+    client: Connection,
+    mut client_send: SendStream,
+    client_recv: RecvStream,
+    req: PairRedeemShortRequest,
+    registry: &PairRendezvous,
+    short_codes: &PairShortCodes,
+    guess_limiter: &PairGuessLimiter,
+    short_code_digits: usize,
+) -> Result<(), NetError> {
+    let now = now_unix();
+    let ip = client.remote_address().ip();
+    // Lockout FIRST (mutation-RED guard: drop this check and a guess over budget would still succeed
+    // against a live code).
+    if !guess_limiter.admit(ip, now) {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::TooManyAttempts),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::TooManyAttempts));
+    }
+    // A malformed-length request is never a counted guess (mirrors the full-id path's `InvalidCode`,
+    // distinct from a miss).
+    if req.code.len() != short_code_digits || !req.code.bytes().all(|b| b.is_ascii_digit()) {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::InvalidCode),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::InvalidCode));
+    }
+    let Some(rendezvous_id) = short_codes.resolve_and_take(&req.code, now).await else {
+        // A genuine miss: count it, and return the SAME reject a spent/unknown FULL id would — no
+        // oracle distinguishing a wrong guess from an already-consumed code.
+        guess_limiter.record_failure(ip, now);
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::UnknownOrSpent),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::UnknownOrSpent));
+    };
+    // Resolved short→id: hand off to the EXISTING full-id redeem (single-use/consume/TTL stays in
+    // ONE place). A successful short-resolve does NOT count as a failure even if this second step
+    // somehow misses (e.g. a racing full-id redeem won first) — the short code itself was genuine.
+    let Some(parked) = registry.redeem(&rendezvous_id, now).await else {
+        write_msg(
+            &mut client_send,
+            &PairResult::Rejected(PairReject::UnknownOrSpent),
+        )
+        .await?;
+        let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
+        return Err(NetError::PairRejected(PairReject::UnknownOrSpent));
+    };
+    // Open a per-flow bi-stream DOWN the parked accepter connection; bridge the dialer to it, blind.
+    let (parked_send, parked_recv) = parked
+        .open_bi()
+        .await
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    write_msg(&mut client_send, &PairResult::Ok).await?;
+    tracing::info!("overlay relay: pairing rendezvous matched via short code (bridging blind)");
     bridge(client_recv, client_send, parked_recv, parked_send).await?;
     let _ = timeout(wire::DIRECT_DRAIN, client.closed()).await;
     Ok(())
@@ -2738,29 +3180,56 @@ mod tests {
     }
 
     /// As [`spawn_ingress_relay`], but with a caller-supplied [`PairRendezvous`] so the pairing tests
-    /// can share + inspect the relay's rendezvous registry. Production admission budgets.
+    /// can share + inspect the relay's rendezvous registry. Production admission budgets, a fresh
+    /// [`PairShortCodes`] table, and the default short-code digit count.
     fn spawn_ingress_relay_with_rendezvous(
         relay: &OverlaySecret,
         root_pub: TokenPublicKey,
         registry: ExposerRegistry,
         rendezvous: PairRendezvous,
     ) -> SocketAddr {
+        spawn_ingress_relay_with_short_codes(
+            relay,
+            root_pub,
+            registry,
+            rendezvous,
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
+        )
+    }
+
+    /// As [`spawn_ingress_relay_with_rendezvous`], but with a caller-supplied [`PairShortCodes`] alias
+    /// table (+ digit count) so the short-code tests can mint + inspect aliases directly. Production
+    /// admission budgets.
+    fn spawn_ingress_relay_with_short_codes(
+        relay: &OverlaySecret,
+        root_pub: TokenPublicKey,
+        registry: ExposerRegistry,
+        rendezvous: PairRendezvous,
+        short_codes: PairShortCodes,
+        short_code_digits: usize,
+    ) -> SocketAddr {
         spawn_ingress_relay_with_budgets(
             relay,
             root_pub,
             registry,
             rendezvous,
+            short_codes,
+            short_code_digits,
             IngressBudgets::DEFAULT,
         )
     }
 
-    /// As [`spawn_ingress_relay_with_rendezvous`], but with explicit [`IngressBudgets`] so the HIGH-1
+    /// As [`spawn_ingress_relay_with_short_codes`], but with explicit [`IngressBudgets`] so the HIGH-1
     /// tests can drive the park-vs-flow budget separation and the per-IP cap with tiny budgets.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_ingress_relay_with_budgets(
         relay: &OverlaySecret,
         root_pub: TokenPublicKey,
         registry: ExposerRegistry,
         rendezvous: PairRendezvous,
+        short_codes: PairShortCodes,
+        short_code_digits: usize,
         budgets: IngressBudgets,
     ) -> SocketAddr {
         let relay_ep =
@@ -2774,6 +3243,8 @@ mod tests {
             RelayClientAuth::CapabilityOnly,
             registry,
             rendezvous,
+            short_codes,
+            short_code_digits,
             |_s: &str| None::<(SocketAddr, OverlayId, bool)>,
             budgets,
         ));
@@ -3992,6 +4463,8 @@ mod tests {
             root_pub,
             ExposerRegistry::new(),
             rendezvous.clone(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
             IngressBudgets {
                 handshakes: 8,
                 flows: 1,
@@ -4084,6 +4557,8 @@ mod tests {
             root_pub.clone(),
             registry.clone(),
             PairRendezvous::new(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
             IngressBudgets {
                 handshakes: 8,
                 flows: 1,
@@ -4198,6 +4673,8 @@ mod tests {
             root_pub.clone(),
             registry.clone(),
             PairRendezvous::new(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
             IngressBudgets {
                 handshakes: 8,
                 flows: 1,
@@ -4327,6 +4804,8 @@ mod tests {
             root_pub,
             ExposerRegistry::new(),
             rendezvous.clone(),
+            PairShortCodes::new(),
+            boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT,
             IngressBudgets {
                 handshakes: 8,
                 flows: 8,
@@ -4395,6 +4874,641 @@ mod tests {
         assert!(
             matches!(redeem, Err(NetError::PairRejected(PairReject::InvalidCode))),
             "a wrong-length id must be refused InvalidCode on redeem, got {redeem:?}"
+        );
+    }
+
+    // ---- Pairing SHORT CODES (overlay follow-up #2 inc3) ----
+
+    /// Anti-hollow (mint collision uniqueness): with an injected deterministic draw that repeats the
+    /// SAME value on the first call of each mint, minting twice yields two DISTINCT active short
+    /// codes — the second mint's first draw collides with the still-live first code, forcing a
+    /// regenerate. MUTATION-RED: drop the `collides` check in `PairShortCodes::insert_unique` (always
+    /// insert on the first draw) and the second mint would silently reuse the SAME code, clobbering
+    /// the first alias's mapping — `assert_ne!` below goes RED.
+    #[tokio::test]
+    async fn short_code_mint_regenerates_on_collision_and_yields_distinct_codes() {
+        let codes = PairShortCodes::new();
+        let digits = 8;
+        let now = 1_000;
+        let expires = now + 300;
+
+        let first = codes
+            .insert_unique(|| 12_345_678, digits, vec![1u8; 16], expires, now)
+            .await
+            .unwrap();
+
+        // The second mint's draw sequence repeats the FIRST code's value once (the collision), then a
+        // distinct one on retry — modeling a real RNG that happens to draw the same value, then a
+        // fresh one on the next try.
+        let mut calls = 0u32;
+        let second = codes
+            .insert_unique(
+                || {
+                    calls += 1;
+                    if calls == 1 { 12_345_678 } else { 87_654_321 }
+                },
+                digits,
+                vec![2u8; 16],
+                expires,
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.digits(),
+            second.digits(),
+            "a draw colliding with a LIVE alias must regenerate to a DISTINCT code"
+        );
+        assert!(codes.is_active(first.digits(), now).await);
+        assert!(codes.is_active(second.digits(), now).await);
+    }
+
+    /// Anti-hollow (exhausted retries): a draw that ALWAYS collides (every attempt returns the same
+    /// value as an already-live alias) exhausts the bounded retry budget and errors — it never loops
+    /// forever, nor silently returns a colliding/weaker code.
+    #[tokio::test]
+    async fn short_code_mint_errors_after_exhausting_collision_retries() {
+        let codes = PairShortCodes::new();
+        let digits = 8;
+        let now = 1_000;
+        let expires = now + 300;
+        let _first = codes
+            .insert_unique(|| 11_111_111, digits, vec![1u8; 16], expires, now)
+            .await
+            .unwrap();
+        let result = codes
+            .insert_unique(|| 11_111_111, digits, vec![2u8; 16], expires, now)
+            .await;
+        assert!(
+            matches!(result, Err(PairShortCodeError::ExhaustedRetries)),
+            "an always-colliding draw must exhaust retries and error, got {result:?}"
+        );
+    }
+
+    /// Resolve-and-take semantics (unit, no transport): a live alias resolves ONCE (consuming it,
+    /// mirroring `PairRendezvous::redeem`'s remove-on-hit) and an expired alias is a miss (pruned).
+    #[tokio::test]
+    async fn short_codes_resolve_and_take_is_single_use_and_ttl_bound() {
+        let codes = PairShortCodes::new();
+        let code = codes
+            .insert_unique(|| 42, 8, vec![9u8; 16], 100, 50)
+            .await
+            .unwrap();
+        // Live before expiry; resolves to the aliased id and is consumed.
+        assert!(codes.is_active(code.digits(), 99).await);
+        assert_eq!(
+            codes.resolve_and_take(code.digits(), 99).await,
+            Some(vec![9u8; 16])
+        );
+        assert_eq!(
+            codes.resolve_and_take(code.digits(), 99).await,
+            None,
+            "a second resolve of the same alias must find nothing (single-use)"
+        );
+
+        // A fresh alias past its expiry is a miss (TTL), even though never resolved.
+        let expired = codes
+            .insert_unique(|| 43, 8, vec![7u8; 16], 100, 50)
+            .await
+            .unwrap();
+        assert_eq!(codes.resolve_and_take(expired.digits(), 100).await, None);
+    }
+
+    /// Full vertical: a human-typeable short code mints, redeems through the relay, and bridges the
+    /// SAME way the `bropair1` path does — the SAS pairing handshake completes end-to-end and both
+    /// sides derive the identical SAS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_peers_pair_through_the_short_code_rendezvous_and_derive_the_same_sas() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let (relay_id, accepter_id, dialer_id) = (relay.id(), accepter.id(), dialer.id());
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        let relay_addr = spawn_ingress_relay_with_short_codes(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+        );
+        let code = vec![0x5Cu8; 16];
+
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await;
+            out
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+
+        let now = now_unix();
+        let short = short_codes
+            .mint(digits, code.clone(), now + 300, now)
+            .await
+            .unwrap();
+
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) =
+            pair_relay_redeem_short(&ep, relay_addr, short.digits().to_string())
+                .await
+                .unwrap();
+        let (sas_d, peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"paired");
+
+        let (sas_a, peer_a) = acc.await.unwrap();
+        assert_eq!(sas_a.bits(), sas_d.bits(), "both ends derive the same SAS");
+        assert_eq!(peer_a, dialer_id);
+        assert_eq!(peer_d, accepter_id);
+    }
+
+    /// Single-use via the short path (rides the existing spent-redeem test): a short-redeem consumes
+    /// BOTH the alias and the underlying rendezvous — a second short-redeem of the SAME alias finds
+    /// nothing, the SAME `UnknownOrSpent` reject an already-spent FULL id gets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_short_redeem_consumes_the_underlying_rendezvous_single_use() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        let relay_addr = spawn_ingress_relay_with_short_codes(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+        );
+
+        let code = vec![0x5Eu8; 16];
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let _ = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL).await;
+            conn.closed().await;
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+        let now = now_unix();
+        let short = short_codes
+            .mint(digits, code.clone(), now + 300, now)
+            .await
+            .unwrap();
+        let digits_str = short.digits().to_string();
+
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let first = pair_relay_redeem_short(&ep, relay_addr, digits_str.clone()).await;
+        assert!(
+            first.is_ok(),
+            "the first short-redeem must match the parked rendezvous, got {first:?}"
+        );
+
+        let ep2 = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let second = pair_relay_redeem_short(&ep2, relay_addr, digits_str).await;
+        assert!(
+            matches!(
+                second,
+                Err(NetError::PairRejected(PairReject::UnknownOrSpent))
+            ),
+            "a second short-redeem of an already-consumed alias must be refused, got {second:?}"
+        );
+        assert!(
+            !rendezvous.is_parked(&code, now_unix()).await,
+            "the short path must consume the UNDERLYING rendezvous (rides PairRendezvous::redeem)"
+        );
+        let _ = acc.await;
+    }
+
+    /// Anti-hollow (no distinguishing oracle + only-misses-count): a WRONG short-redeem guess returns
+    /// the SAME `UnknownOrSpent` reject a spent/unknown id gets, and repeating it counts against the
+    /// per-IP guess budget — after `PAIR_SHORT_GUESS_MAX_PER_IP` such misses, the NEXT attempt is
+    /// locked out `TooManyAttempts` EVEN THOUGH it presents the correct, still-live short code (the
+    /// lockout check runs BEFORE the code is resolved). MUTATION-RED: drop the pre-resolve lockout
+    /// check in `redeem_rendezvous_short` and the final (correct-code) attempt below would succeed
+    /// despite the exhausted budget — the last assertion goes RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn short_redeem_lockout_after_f_ip_failures_blocks_even_a_live_code() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        let relay_addr = spawn_ingress_relay_with_short_codes(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+        );
+
+        let code = vec![0x9Au8; 16];
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let _ = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL).await;
+            conn.closed().await;
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+        let now = now_unix();
+        let short = short_codes
+            .mint(digits, code.clone(), now + 300, now)
+            .await
+            .unwrap();
+        let correct = short.digits().to_string();
+        // A same-length, guaranteed-different digit string (bump the last digit, wrapping).
+        let wrong = {
+            let mut chars: Vec<char> = correct.chars().collect();
+            let last = chars.last_mut().unwrap();
+            let d = last.to_digit(10).unwrap();
+            *last = std::char::from_digit((d + 1) % 10, 10).unwrap();
+            chars.into_iter().collect::<String>()
+        };
+
+        // F_ip wrong-code attempts from this source — each a genuine miss, each counted.
+        for i in 0..PAIR_SHORT_GUESS_MAX_PER_IP {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let res = pair_relay_redeem_short(&ep, relay_addr, wrong.clone()).await;
+            assert!(
+                matches!(res, Err(NetError::PairRejected(PairReject::UnknownOrSpent))),
+                "attempt {i}: a wrong guess must be refused UnknownOrSpent, got {res:?}"
+            );
+        }
+
+        // The source is now over budget: even the CORRECT, still-live short code is refused —
+        // checked BEFORE resolution, so the alias is untouched by the refusal.
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let res = pair_relay_redeem_short(&ep, relay_addr, correct).await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::PairRejected(PairReject::TooManyAttempts))
+            ),
+            "the source must be locked out after {PAIR_SHORT_GUESS_MAX_PER_IP} failed attempts, got {res:?}"
+        );
+        assert!(
+            short_codes.is_active(short.digits(), now_unix()).await,
+            "the live alias must be untouched — the lockout refused the attempt before resolving it"
+        );
+        let _ = acc.await;
+    }
+
+    /// Anti-hollow (successes never count): `PAIR_SHORT_GUESS_MAX_PER_IP + 1` back-to-back CORRECT
+    /// short-redeems (each a distinct, freshly-parked + freshly-minted alias) ALL succeed — if a
+    /// successful resolve incorrectly incremented the guess-rate limiter, the
+    /// `(PAIR_SHORT_GUESS_MAX_PER_IP + 1)`-th would be refused `TooManyAttempts` despite being correct.
+    /// MUTATION-RED: increment the limiter on a HIT (in addition to a miss) in
+    /// `redeem_rendezvous_short` and the final iteration's assertion goes RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successful_short_redeems_never_count_against_the_guess_limiter() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        let relay_addr = spawn_ingress_relay_with_short_codes(
+            &relay,
+            root_pub,
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+        );
+
+        for i in 0..(PAIR_SHORT_GUESS_MAX_PER_IP + 1) {
+            let code = vec![(i + 1) as u8; 16];
+            let code_a = code.clone();
+            // Fire-and-forget (mirrors the existing `_park` flood-test style), but hand the parked
+            // `Connection` back over a oneshot so the test can close it explicitly right after the
+            // redeem below — otherwise this source's PARK-budget slot (`PAIR_MAX_PARKED_PER_IP`)
+            // would stay held until the idle timeout, exhausting it well before 11 iterations.
+            let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+            let _park = tokio::spawn(async move {
+                let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+                let (conn, _send, _recv) = pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+                let _ = parked_tx.send(conn.clone());
+                conn.closed().await;
+            });
+            assert!(
+                await_parked(&rendezvous, &code).await,
+                "iteration {i}: the park must land"
+            );
+
+            let now = now_unix();
+            let short = short_codes
+                .mint(digits, code.clone(), now + 300, now)
+                .await
+                .unwrap();
+
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let res = pair_relay_redeem_short(&ep, relay_addr, short.digits().to_string()).await;
+            assert!(
+                res.is_ok(),
+                "iteration {i}: a correct short-redeem must succeed (successes never count), got {res:?}"
+            );
+            if let Ok((conn, _send, _recv)) = res {
+                conn.close(0u32.into(), b"done");
+            }
+            // Release this iteration's park-budget slot immediately (its rendezvous is already
+            // consumed) rather than waiting out the idle timeout.
+            if let Ok(parked_conn) = parked_rx.await {
+                parked_conn.close(0u32.into(), b"redeemed");
+            }
+        }
+    }
+
+    /// Anti-hollow (budget separation / "not a fresh path"): `PairRedeemShort` draws from the SAME
+    /// `flow_limiter` as `Dial`/`PairRedeem` — with `flows = 1`, one short-redeem's matched connection
+    /// (held open) fills the ENTIRE flow budget, so a concurrent forward dial CANNOT get a flow permit
+    /// while it is held (bounded-wait refusal below proves real contention — i.e. the short path is
+    /// genuinely capped by the shared budget, not sailing past it on its own pool). Releasing the held
+    /// connection frees the permit and the forward dial completes promptly — the sharing is fair
+    /// queueing, not a permanent lockout. MUTATION-RED: give `PairRedeemShort` its own semaphore
+    /// (never drawing from `flow_limiter`) and the forward dial would succeed IMMEDIATELY even while
+    /// "held" — the first (bounded-timeout) assertion goes RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_short_redeem_draws_from_the_shared_flow_budget_not_an_unbounded_path() {
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let root_pub = root.id().to_public();
+        let digits = boatramp_overlay_proto::PAIR_SHORT_CODE_DIGITS_DEFAULT;
+
+        let rendezvous = PairRendezvous::new();
+        let short_codes = PairShortCodes::new();
+        // flows = 1: the single short-redeem below fills the ENTIRE flow budget. handshakes/parked are
+        // generous so neither is the bottleneck.
+        let relay_addr = spawn_ingress_relay_with_budgets(
+            &relay,
+            root_pub.clone(),
+            ExposerRegistry::new(),
+            rendezvous.clone(),
+            short_codes.clone(),
+            digits,
+            IngressBudgets {
+                handshakes: 8,
+                flows: 1,
+                register: 8,
+                parked: 8,
+                parked_per_ip: 4,
+            },
+        );
+
+        let code = vec![0xF0u8; 16];
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let _ = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL).await;
+            conn.closed().await;
+        });
+        assert!(await_parked(&rendezvous, &code).await);
+        let now = now_unix();
+        let short = short_codes
+            .mint(digits, code.clone(), now + 300, now)
+            .await
+            .unwrap();
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (held_conn, _hs, _hr) =
+            pair_relay_redeem_short(&ep, relay_addr, short.digits().to_string())
+                .await
+                .expect("the short-redeem must match the live parked rendezvous");
+
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/none",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+
+        // While the short-redeem's connection is held, a forward dial CANNOT get a flow permit —
+        // bounded wait, so this proves real contention rather than hanging forever.
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/none".into(),
+                    token: token.clone(),
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a forward dial must NOT get a flow permit while the short-redeem holds the only one"
+        );
+
+        // Release the held short-redeem connection — the forward dial now gets its permit.
+        held_conn.close(0u32.into(), b"release");
+        let client_ep2 = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app2, app_far2) = tokio::io::duplex(64 * 1024);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            forward_flow(
+                app_far2,
+                &client_ep2,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/none".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            ),
+        )
+        .await
+        .expect("the forward dial must succeed once the short-redeem releases the flow permit");
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(DialReject::ServiceNotAuthorized))
+            ),
+            "got {res:?}"
+        );
+        let _ = acc.await;
+    }
+
+    /// Blindness (rides [`the_pairing_relay_bridges_ciphertext_only_never_the_sas`]): a capturing relay
+    /// tees every bridged byte, but the pairing still runs over the SHORT-redeem entry point — the
+    /// derived SAS (words + digits + raw bits) appears NOWHERE in what the relay saw, exactly as the
+    /// full `bropair1` path. The relay-blind bridge is the SAME code regardless of which entry point
+    /// matched the parked connection, so this also stands in for the design note that a short-code
+    /// hit is only ever a race-to-redeem — the SAS still catches a misrouting/tampering relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_short_redeem_relay_also_bridges_ciphertext_only_never_the_sas() {
+        use std::collections::HashMap;
+
+        let relay = OverlaySecret::generate().unwrap();
+        let accepter = OverlaySecret::generate().unwrap();
+        let dialer = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let code = vec![0x5Du8; 16];
+
+        // A capturing relay: park connections keyed by code; on a SHORT-redeem, open a stream down the
+        // (sole) parked connection and bridge both directions while TEEING every byte into `capture`.
+        let relay_ep =
+            quic::server_endpoint(&relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let capture: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let parked: Arc<Mutex<HashMap<Vec<u8>, Connection>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let capture = capture.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                    let parked = parked.clone();
+                    let capture = capture.clone();
+                    tokio::spawn(async move {
+                        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                        let frame = read_ingress_frame(&mut recv).await.unwrap();
+                        match frame {
+                            IngressFrame::PairPark(req) => {
+                                parked.lock().await.insert(req.code, conn.clone());
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                conn.closed().await; // hold the parked connection open
+                            }
+                            IngressFrame::PairRedeemShort(_req) => {
+                                // A single parked accepter in this test — the short-code→id resolution
+                                // itself is covered by the dedicated resolve/collision/lockout tests
+                                // above; this test is solely about the BRIDGE's blindness.
+                                let mut target = None;
+                                for _ in 0..100 {
+                                    if let Some(c) = parked.lock().await.values().next().cloned() {
+                                        target = Some(c);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                                let target = target.expect("a parked accepter");
+                                let (mut ps, mut pr) = target.open_bi().await.unwrap();
+                                write_msg(&mut send, &PairResult::Ok).await.unwrap();
+                                let cap_c2e = capture.clone();
+                                let c2e = async {
+                                    let mut buf = [0u8; 8192];
+                                    while let Ok(Some(n)) = recv.read(&mut buf).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        cap_c2e.lock().await.extend_from_slice(&buf[..n]);
+                                        if ps.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    let _ = ps.finish();
+                                };
+                                let cap_e2c = capture.clone();
+                                let e2c = async {
+                                    let mut buf = [0u8; 8192];
+                                    while let Ok(Some(n)) = pr.read(&mut buf).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        cap_e2c.lock().await.extend_from_slice(&buf[..n]);
+                                        if send.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    let _ = send.finish();
+                                };
+                                tokio::join!(c2e, e2c);
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            });
+        }
+
+        let code_a = code.clone();
+        let acc = tokio::spawn(async move {
+            let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+            let (conn, mut send, mut recv) =
+                pair_relay_park(&ep, relay_addr, code_a).await.unwrap();
+            let out = pair_handshake(&mut send, &mut recv, &accepter, Role::Responder, PAIR_DL)
+                .await
+                .unwrap();
+            conn.closed().await;
+            out
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (dconn, mut dsend, mut drecv) =
+            pair_relay_redeem_short(&ep, relay_addr, "ignored-by-this-mock".to_string())
+                .await
+                .unwrap();
+        let (sas_d, _peer_d) =
+            pair_handshake(&mut dsend, &mut drecv, &dialer, Role::Initiator, PAIR_DL)
+                .await
+                .unwrap();
+        dconn.close(0u32.into(), b"paired");
+        let (sas_a, _peer_a) = acc.await.unwrap();
+
+        assert_eq!(
+            sas_a.bits(),
+            sas_d.bits(),
+            "pairing completed through the capturing relay over the short-redeem entry"
+        );
+        let seen = capture.lock().await.clone();
+        assert!(
+            !seen.is_empty(),
+            "the relay must have bridged the handshake bytes"
+        );
+        for needle in [sas_d.words(), sas_d.digits()] {
+            assert!(
+                !contains_subslice(&seen, needle.as_bytes()),
+                "the relay must NOT see the SAS `{needle}` in the bridged ciphertext"
+            );
+        }
+        assert!(
+            !contains_subslice(&seen, sas_d.bits()),
+            "the relay must NOT see the raw SAS bits in the bridged ciphertext"
         );
     }
 }

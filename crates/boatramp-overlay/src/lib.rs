@@ -33,15 +33,16 @@ pub use e2ee::{SpliceError, establish, splice};
 // available — this is what the embeddable `boatramp-overlay-client` SDK links against.
 pub use net::{
     NetError, PairReject, RegisterReject, forward_flow, pair_relay_park, pair_relay_redeem,
-    run_published_service,
+    pair_relay_redeem_short, run_published_service,
 };
 // Server/relay/control-plane roles (overlay follow-up #4): the forwarding/egress/ingress routers,
-// the exposer registry, the pairing rendezvous (follow-up #2 inc2), and the relay client-auth
-// posture. Behind `server` so the client SDK never links them.
+// the exposer registry, the pairing rendezvous (follow-up #2 inc2), the pairing SHORT-CODE alias
+// table (follow-up #2 inc3), and the relay client-auth posture. Behind `server` so the client SDK
+// never links them.
 #[cfg(feature = "server")]
 pub use net::{
-    ExposerRegistry, PairRendezvous, RelayClientAuth, forward_relay, run_egress_router,
-    run_forwarding_router, run_ingress_router, terminate_one,
+    ExposerRegistry, PairRendezvous, PairShortCodeError, PairShortCodes, RelayClientAuth,
+    forward_relay, run_egress_router, run_forwarding_router, run_ingress_router, terminate_one,
 };
 pub use pair::{PairError, VerifiedPeer, VerifiedPeers, pair_handshake};
 // The dial/publish trust-root type that appears in `run_published_service`'s (and `terminate_one`'s)
@@ -72,5 +73,7 @@ pub use quinn;
 // depend on this one crate.
 pub use boatramp_overlay_proto::{
     DialRequest, DialVerdict, Fingerprint, OverlayId, OverlayIdError, OverlayPeerPolicy,
-    OverlaySecret, PAIR_RENDEZVOUS_ID_LEN, PairCode, PairCodeError, Role, SasCode, identity_fp,
+    OverlaySecret, PAIR_RENDEZVOUS_ID_LEN, PAIR_SHORT_CODE_DIGITS_DEFAULT,
+    PAIR_SHORT_CODE_DIGITS_MAX, PAIR_SHORT_CODE_DIGITS_MIN, PairCode, PairCodeError, Role, SasCode,
+    ShortCode, ShortCodeError, identity_fp,
 };

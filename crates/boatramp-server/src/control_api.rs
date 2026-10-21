@@ -1052,6 +1052,11 @@ pub(super) struct OverlayPairCodeRequest {
     /// [`MAX_OVERLAY_PAIR_CODE_TTL_SECS`] (a pairing code is a minutes-long meeting credential).
     #[serde(default)]
     pub(super) ttl_secs: Option<u64>,
+    /// ALSO mint a human-typeable pairing SHORT CODE (overlay follow-up #2 inc3) aliasing the same
+    /// rendezvous — an INDEPENDENT random alias, never a truncation/derivation of the strong id.
+    /// `false` (the default) keeps the response unchanged (`bropair1…` only).
+    #[serde(default)]
+    pub(super) short: bool,
 }
 
 /// `POST /api/overlay/pair-code` response: the rendezvous id + the ingress relay to meet at. The CLI
@@ -1068,6 +1073,10 @@ struct OverlayPairCodeResponse {
     rendezvous: String,
     /// The code's expiry (Unix seconds).
     expires_at: u64,
+    /// The human-typeable short-code alias, grouped for display (e.g. `"1234-5678"`), present only
+    /// when `short` was requested AND this node's relay can mint one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    short_code: Option<String>,
 }
 
 /// Mint a single-use pairing rendezvous code (self-serve `boatramp overlay pair-code`). Gated
@@ -1076,6 +1085,11 @@ struct OverlayPairCodeResponse {
 /// accepting rendezvous (`[overlay] accept_exposed`), mirroring `overlay_expose`. The code is NOT a
 /// signed capability (so no root key is needed): its security is the short TTL + the relay's single-use
 /// redemption + the relay-blind bridge + the out-of-band SAS — never a secret the relay verifies.
+///
+/// With `short: true`, ALSO mints a human-typeable short-code alias (overlay follow-up #2 inc3) into
+/// the SAME shared alias table the relay's short-redeem handler resolves against — an INDEPENDENT
+/// random alias for the rendezvous id (never a truncation of it), rate-limited + lockout-guarded at the
+/// relay against online guessing (see `boatramp_overlay::net::PairGuessLimiter`).
 pub(super) async fn overlay_pair_code(
     Extension(directory): Extension<OverlayDirectory>,
     Json(request): Json<OverlayPairCodeRequest>,
@@ -1108,13 +1122,78 @@ pub(super) async fn overlay_pair_code(
             .into_response();
     }
     let now = now_unix();
+    let expires_at = now.saturating_add(ttl);
+
+    let short_code = if request.short {
+        let Some(mint) = &relay.pair_short_codes else {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "this node's overlay relay cannot mint pairing short codes\n",
+            )
+                .into_response();
+        };
+        match mint.mint(rendezvous.to_vec(), expires_at, now).await {
+            Ok((_digits, rendered)) => Some(rendered),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to mint a pairing short code: {err}\n"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     (
         StatusCode::CREATED,
         Json(OverlayPairCodeResponse {
             relay: relay.relay.clone(),
             relay_id: relay.relay_id.clone(),
             rendezvous: hex::encode(rendezvous),
-            expires_at: now.saturating_add(ttl),
+            expires_at,
+            short_code,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /api/overlay/pair-relay` response: the ingress relay topology a pairing SHORT-CODE dialer
+/// needs to dial — a short code (unlike a `bropair1…` code) carries no topology of its own.
+#[derive(Serialize)]
+struct OverlayPairRelayResponse {
+    /// The relay/ingress `host:port` to dial.
+    relay: String,
+    /// The relay's overlay identity to pin (`ed25519:<hex>`).
+    relay_id: String,
+}
+
+/// Look up this cluster's pairing ingress-relay topology (self-serve `boatramp overlay pair --short`).
+///
+/// **SECURITY REVIEW NOTE — a NEW unauthenticated endpoint** (RBAC-exempt, like `/api/overlay/enroll`;
+/// see `authz::Right::required`): a short-code dialer has no credential at all yet, so this MUST be
+/// reachable with no token. It discloses only the relay socket + relay identity — the SAME topology
+/// every `Overlay·Admin` pair-code/expose mint already hands back over an authenticated response, and
+/// the SAME relay every `expose` client in this cluster already dials. It is non-secret topology, not a
+/// capability: it grants no dial/publish/pair rights by itself. `404` when this node runs no ingress
+/// relay (mirrors `overlay_pair_code`'s own 404).
+pub(super) async fn overlay_pair_relay(
+    Extension(directory): Extension<OverlayDirectory>,
+) -> Response {
+    let Some(relay) = directory.expose_relay() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this node runs no overlay ingress relay (set `[overlay] accept_exposed = true` on a \
+             relay node)\n",
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(OverlayPairRelayResponse {
+            relay: relay.relay.clone(),
+            relay_id: relay.relay_id.clone(),
         }),
     )
         .into_response()
@@ -2649,7 +2728,10 @@ mod tests {
         // No ingress relay → 404 (nowhere to host the rendezvous).
         let resp = overlay_pair_code(
             Extension(OverlayDirectory::default()),
-            Json(OverlayPairCodeRequest { ttl_secs: None }),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: false,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -2660,11 +2742,13 @@ mod tests {
             relay_id: "ed25519:aa".into(),
             trust_root: "ed25519:root".into(),
             client_auth: "capability-only".into(),
+            pair_short_codes: None,
         }));
         let resp = overlay_pair_code(
             Extension(directory),
             Json(OverlayPairCodeRequest {
                 ttl_secs: Some(u64::MAX), // clamped to the short pairing ceiling
+                short: false,
             }),
         )
         .await;
@@ -2686,6 +2770,104 @@ mod tests {
             exp <= now + MAX_OVERLAY_PAIR_CODE_TTL_SECS + 2,
             "pair-code TTL must be clamped to the short pairing ceiling"
         );
+        // No short code was requested — the field must be absent, not null.
+        assert!(
+            v.get("short_code").is_none(),
+            "short_code must be omitted when `short` was not requested"
+        );
+    }
+
+    /// A [`PairShortCodeMint`] test double — scripted success or failure, so the handler's `short`
+    /// branch is testable without the real `boatramp-overlay` alias table.
+    struct StubShortCodeMint {
+        result: std::result::Result<(String, String), String>,
+    }
+    #[async_trait::async_trait]
+    impl PairShortCodeMint for StubShortCodeMint {
+        async fn mint(
+            &self,
+            _rendezvous_id: Vec<u8>,
+            _expires_at: u64,
+            _now_unix: u64,
+        ) -> std::result::Result<(String, String), String> {
+            self.result.clone()
+        }
+    }
+
+    /// `short: true` mints a short code via the shared [`PairShortCodeMint`] hook and returns its
+    /// GROUPED rendering alongside the existing fields; a mint failure (exhausted collision retries)
+    /// surfaces as a `500`, never a silently-omitted field.
+    #[tokio::test]
+    async fn overlay_pair_code_short_true_mints_and_returns_the_short_code() {
+        let directory = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+            pair_short_codes: Some(std::sync::Arc::new(StubShortCodeMint {
+                result: Ok(("12345678".into(), "1234-5678".into())),
+            })),
+        }));
+        let resp = overlay_pair_code(
+            Extension(directory),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: true,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["short_code"], "1234-5678");
+
+        // A mint failure surfaces as a 500, not a silently-dropped field.
+        let directory2 = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+            pair_short_codes: Some(std::sync::Arc::new(StubShortCodeMint {
+                result: Err("exhausted short-code collision retries".into()),
+            })),
+        }));
+        let resp2 = overlay_pair_code(
+            Extension(directory2),
+            Json(OverlayPairCodeRequest {
+                ttl_secs: None,
+                short: true,
+            }),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `GET /api/overlay/pair-relay`: `404` with no relay role, `200` with `{relay, relay_id}` when
+    /// one is configured — the topology a short-code dialer needs, with NO credential presented.
+    #[tokio::test]
+    async fn overlay_pair_relay_404_without_relay_and_200_with_relay() {
+        let resp = overlay_pair_relay(Extension(OverlayDirectory::default())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let directory = OverlayDirectory::default().with_expose_relay(Some(ExposeRelay {
+            relay: "203.0.113.9:9100".into(),
+            relay_id: "ed25519:aa".into(),
+            trust_root: "ed25519:root".into(),
+            client_auth: "capability-only".into(),
+            pair_short_codes: None,
+        }));
+        let resp = overlay_pair_relay(Extension(directory)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["relay"], "203.0.113.9:9100");
+        assert_eq!(v["relay_id"], "ed25519:aa");
+        // It MUST NOT carry the trust root or any capability material — topology only.
+        assert!(v.get("trust_root").is_none());
     }
 
     use boatramp_core::cose::{LocalSigner, OverlayMemberRole, Signer, TokenAlg};
