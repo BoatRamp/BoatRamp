@@ -47,8 +47,8 @@ tokio = { version = "1", default-features = false, features = [
   "time",
   "macros",
 ] }
-# A stable, versioned error vocabulary for the SDK. `thiserror` only — anyhow is banned in CI and is
-# the wrong choice for a library's public error type anyway.
+# A stable, versioned error vocabulary for the SDK: typed `thiserror` enums only (the untyped-error
+# convenience crate is CI-banned and is the wrong choice for a library's public error type anyway).
 thiserror = { workspace = true }
 
 [lints]
