@@ -35,16 +35,27 @@ use crate::wire;
 ///
 /// **N = 24 (3 bytes).** An active man-in-the-middle wins only by driving its
 /// two independent handshake legs to transcripts whose SAS codes collide; with
-/// N uniformly-random bits that succeeds with probability `2^-N` per attempt.
-/// 24 bits gives `2^-24 ≈ 6·10⁻⁸` — one in ~16.7 million — which is the standard
-/// strength band for a one-shot, human-compared SAS (long enough that an online
-/// MITM cannot feasibly grind a match within a short pairing window, short
-/// enough to read aloud). 24 bits also renders cleanly in **both** required
-/// forms: exactly 3 bytes → 3 words (one byte per entry of a 256-word list), and
-/// a value in `0..=16_777_215` → 8 decimal digits for a keypad. A larger N would
-/// not materially change the human workflow; a smaller one weakens MITM
-/// detection. The pairing flow MUST require a positive match (fail-closed), never
-/// treat a mismatch as benign.
+/// N uniformly-random bits that succeeds with probability `2^-N` **per attempt**.
+/// 24 bits gives `2^-24 ≈ 6·10⁻⁸` — one in ~16.7 million — the standard strength
+/// band for a one-shot, human-compared SAS (short enough to read aloud, large
+/// enough that a `2^-24`-per-ONLINE-attempt MITM is infeasible within a pairing
+/// window). 24 bits also renders cleanly in **both** required forms: 3 bytes → 3
+/// words (one byte per entry of a 256-word list), and `0..=16_777_215` → 8 decimal
+/// digits for a keypad.
+///
+/// **CRITICAL — this `2^-24` strength holds ONLY if the pair handshake commits
+/// before it reveals.** The SAS is derived from the (public, un-committed) KEM
+/// transcript `SHA-256(offer ‖ reply ‖ init ‖ resp)`. A MITM acting as responder
+/// on a leg chooses its `reply` AFTER seeing the peer's offer, so it can complete
+/// the OTHER leg first, learn that leg's SAS (a fixed 24-bit target), then grind
+/// its own fresh ephemeral `reply` **offline** (~2^24 local keygen+hash ≈ minutes)
+/// until the two SAS collide — nothing forces it to fix its contribution before
+/// learning the target. The pairing protocol (feature-2 inc1) MUST therefore use
+/// commit-then-reveal (each side commits `H(contribution)` before any reveal, à la
+/// ZRTP / Bluetooth numeric-comparison), which restores `2^-24` PER-ONLINE-ATTEMPT.
+/// Without that commitment, N=24 is offline-grindable and the detection is far
+/// weaker than `2^-24`. The pairing flow MUST also require a positive match
+/// (fail-closed), never treat a mismatch as benign.
 pub const SAS_BITS: usize = 24;
 
 /// SAS length in bytes (`SAS_BITS / 8`).
