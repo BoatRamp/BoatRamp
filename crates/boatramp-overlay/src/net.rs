@@ -2641,10 +2641,10 @@ mod tests {
         let root = OverlaySecret::generate().unwrap();
         let client = OverlaySecret::generate().unwrap();
         let ingress = OverlaySecret::generate().unwrap(); // the honest ingress relay A registers with
-        let mis = OverlaySecret::generate().unwrap(); // the MISROUTING relay the client dials
+        let misrelay = OverlaySecret::generate().unwrap(); // the MISROUTING relay the client dials
         let exposer_a = OverlaySecret::generate().unwrap();
         let exposer_b = OverlaySecret::generate().unwrap();
-        let (ingress_id, mis_id, exposer_b_id) = (ingress.id(), mis.id(), exposer_b.id());
+        let (ingress_id, misrelay_id, exposer_b_id) = (ingress.id(), misrelay.id(), exposer_b.id());
         let root_pub = root.id().to_public();
 
         let backend_addr = spawn_echo_backend().await;
@@ -2708,11 +2708,11 @@ mod tests {
 
         // A MISROUTING relay: it accepts the client's svc/db dial but bridges blind to exposer B, NOT
         // to the registered exposer A the directory published.
-        let mis_ep =
-            quic::server_endpoint(&mis, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let mis_addr = mis_ep.local_addr().unwrap();
+        let misrelay_ep =
+            quic::server_endpoint(&misrelay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let misrelay_addr = misrelay_ep.local_addr().unwrap();
         tokio::spawn(async move {
-            while let Ok(Some(conn)) = quic::accept(&mis_ep).await {
+            while let Ok(Some(conn)) = quic::accept(&misrelay_ep).await {
                 tokio::spawn(async move {
                     let Ok((mut cs, mut cr)) = conn.accept_bi().await else {
                         return;
@@ -2756,14 +2756,14 @@ mod tests {
         // cross-wire. This is the attack the control-plane pin must prevent.
         {
             let client = OverlaySecret::from_seed_hex(&client_seed).unwrap();
-            let client_ep = quic::client_endpoint_server_auth(&Pin(mis_id)).unwrap();
+            let client_ep = quic::client_endpoint_server_auth(&Pin(misrelay_id)).unwrap();
             let (mut app, app_far) = tokio::io::duplex(64 * 1024);
             let dial_cap = dial_cap.clone();
             let fwd = tokio::spawn(async move {
                 forward_flow(
                     app_far,
                     &client_ep,
-                    mis_addr,
+                    misrelay_addr,
                     &client,
                     exposer_b_id,
                     DialRequest {
@@ -2795,13 +2795,13 @@ mod tests {
         // B (whom the relay cross-wired to) fails CLOSED on the pin: IdentityMismatch, no bytes cross.
         {
             let client = OverlaySecret::from_seed_hex(&client_seed).unwrap();
-            let client_ep = quic::client_endpoint_server_auth(&Pin(mis_id)).unwrap();
+            let client_ep = quic::client_endpoint_server_auth(&Pin(misrelay_id)).unwrap();
             let (mut app, app_far) = tokio::io::duplex(64 * 1024);
             let fwd = tokio::spawn(async move {
                 forward_flow(
                     app_far,
                     &client_ep,
-                    mis_addr,
+                    misrelay_addr,
                     &client,
                     published, // the control-plane-published id (A), not the data-plane target (B)
                     DialRequest {
