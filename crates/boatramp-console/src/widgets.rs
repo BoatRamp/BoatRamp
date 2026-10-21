@@ -112,6 +112,10 @@ pub struct TextFieldProps {
     /// Render with a monospace font (for hosts / hashes).
     #[prop_or_default]
     pub mono: bool,
+    /// The `<input>` `type` (default `"text"`) — e.g. `"number"` for a numeric field, which gets
+    /// the browser's own numeric keypad/stepper and input constraints instead of free text.
+    #[prop_or_default]
+    pub input_type: Option<AttrValue>,
     /// Emits the new string on every input event.
     pub on_change: Callback<String>,
 }
@@ -126,16 +130,20 @@ pub fn text_field(props: &TextFieldProps) -> Html {
         })
     };
     let font = if props.mono { "font-mono" } else { "" };
+    let input_type = props
+        .input_type
+        .clone()
+        .unwrap_or_else(|| AttrValue::from("text"));
     html! {
         <label class="block">
             <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <input value={props.value.clone()} placeholder={props.placeholder.clone()}
+            <input type={input_type} value={props.value.clone()} placeholder={props.placeholder.clone()}
                    oninput={on_input}
                    class={classes!(
                        "mt-1", "w-full", "rounded-md", "border", "border-slate-300",
                        "px-2.5", "py-1.5", "text-sm", "shadow-sm",
-                       "focus:border-sky-500", "focus:outline-none", "focus:ring-1",
-                       "focus:ring-sky-500", font
+                       "focus:border-sky-500", "focus:outline-none", "focus:ring-2",
+                       "focus:ring-sky-600", font
                    )} />
             if let Some(hint) = &props.hint {
                 <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
@@ -158,6 +166,13 @@ pub struct TextAreaFieldProps {
     /// Visible rows.
     #[prop_or(3)]
     pub rows: u32,
+    /// Set when the current value failed server-side validation — paired with `describedby`
+    /// pointing at the error node so assistive tech announces WHY, not just THAT it's invalid.
+    #[prop_or_default]
+    pub invalid: bool,
+    /// The `id` of an element describing the current error (only meaningful with `invalid`).
+    #[prop_or_default]
+    pub describedby: Option<AttrValue>,
     /// Emits the new string on every input event.
     pub on_change: Callback<String>,
 }
@@ -172,9 +187,11 @@ pub fn textarea_field(props: &TextAreaFieldProps) -> Html {
         <label class="block">
             <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
             <textarea value={props.value.clone()} rows={props.rows.to_string()} oninput={on_input}
+                      aria-invalid={props.invalid.to_string()}
+                      aria-describedby={props.describedby.clone()}
                       class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
                              font-mono shadow-sm focus:border-sky-500 focus:outline-none \
-                             focus:ring-1 focus:ring-sky-500" />
+                             focus:ring-2 focus:ring-sky-600" />
             if let Some(hint) = &props.hint {
                 <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
@@ -219,7 +236,7 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
         <label class={row}>
             <input type="checkbox" checked={props.checked} disabled={props.disabled}
                    onchange={on_change}
-                   class="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+                   class="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-sky-600 focus:ring-2 focus:ring-sky-600" />
             <span class="text-sm text-slate-700">{ &props.label }</span>
         </label>
     }
@@ -229,10 +246,10 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
 /// (ref-based / uncontrolled) inputs that don't go through [`TextField`]. Keeps
 /// every input's focus affordance consistent (an a11y must).
 pub const INPUT: &str = "w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
-     focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+     focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-600";
 /// Shared `<select>` classes (with the focus ring).
 pub const SELECT: &str = "rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
-     focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+     focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-600";
 
 /// A button's visual weight. The weight encodes blast radius so an operator can
 /// learn it: solid rose = irreversible, outline rose = reversible/row-level.
@@ -282,6 +299,11 @@ pub struct ButtonProps {
     /// Click handler.
     #[prop_or_default]
     pub onclick: Callback<MouseEvent>,
+    /// Forward a `NodeRef` to the rendered `<button>` (`ref` can't target a component directly in
+    /// Yew — see the compile-time error it gives) — e.g. to restore focus to a trigger after a
+    /// dialog it opened closes.
+    #[prop_or_default]
+    pub node_ref: NodeRef,
 }
 
 #[function_component(Button)]
@@ -295,12 +317,12 @@ pub fn button(props: &ButtonProps) -> Html {
         props.label.clone()
     };
     html! {
-        <button type="button" onclick={props.onclick.clone()}
+        <button type="button" ref={props.node_ref.clone()} onclick={props.onclick.clone()}
                 disabled={props.busy || props.disabled}
                 class={classes!(
                     "rounded-md", "px-3", "py-1.5", "text-sm", "font-medium",
                     "focus-visible:outline-none", "focus-visible:ring-2",
-                    "focus-visible:ring-sky-500", "focus-visible:ring-offset-2",
+                    "focus-visible:ring-sky-600", "focus-visible:ring-offset-2",
                     "disabled:opacity-50", "disabled:pointer-events-none",
                     props.variant.classes()
                 )}>
@@ -337,7 +359,7 @@ pub fn copy_button(props: &CopyButtonProps) -> Html {
         <button type="button" onclick={onclick}
                 class="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs font-medium \
                        text-slate-600 hover:bg-slate-50 focus-visible:outline-none \
-                       focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2">
+                       focus-visible:ring-2 focus-visible:ring-sky-600 focus-visible:ring-offset-2">
             { if *copied { "Copied" } else { "Copy" } }
         </button>
     }

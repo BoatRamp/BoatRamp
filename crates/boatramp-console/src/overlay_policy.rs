@@ -30,20 +30,26 @@
 //! Storing a FIRST policy (nothing was stored before) flips the mint gate from OFF (allow-all) to
 //! default-deny (every dial/expose NOT matched by a `permit` is denied) — the single most
 //! consequential edit this surface can make. [`needs_cliff_confirm`] detects that exact
-//! absent→present transition client-side, BEFORE issuing the `PUT`, and the editor blocks on an
-//! inline preview (never a bare `confirm()` — the preview embeds a live [`DryRunPanel`] against
-//! the draft so the operator can run their own identity/flow and see it still works before
-//! committing). The server's one-time `warning` (present only on the PUT that actually performs
-//! this transition) is then kept as a persistent post-save banner.
+//! absent→present transition client-side, BEFORE issuing the `PUT`, and the editor blocks on
+//! [`CliffDialog`] — a real (if hand-rolled) modal: focus moves into it the instant it mounts,
+//! Tab/Shift+Tab cycle within it, Escape cancels, and "Store it" stays disabled until the operator
+//! has both acknowledged the consequence AND run the embedded dry-run at least once against their
+//! own drafted policy. The server's one-time `warning` (present only on the PUT that actually
+//! performs this transition) — and a general "Policy saved." notice for every successful PUT — are
+//! lifted to [`OverlayPolicy`] (which does NOT remount on a reload, unlike [`PolicyEditor`]), so
+//! flipping the gate to default-deny doesn't destroy the one durable confirmation the operator
+//! gets of it.
 //!
 //! # ETag / `If-Match`
 //! `GET`'s `ETag` is held and echoed back as the next `PUT`'s `If-Match` (ETag → If-Match), so two
-//! concurrent editors racing a write get a `409` (surfaced inline, verbatim) rather than a lost
-//! write — never a blind clobber.
+//! concurrent editors racing a write get a `409` — surfaced as a dedicated "someone else changed
+//! it, reload first" banner (not a dead-end loop: re-Saving with the same stale `ETag` would just
+//! 409 again) — rather than a lost write.
 
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlSelectElement;
+use web_sys::{HtmlElement, HtmlSelectElement, KeyboardEvent};
 use yew::prelude::*;
 
 use crate::api::{ApiError, ApiResult};
@@ -146,6 +152,17 @@ fn note_says_corrupt(note: Option<&str>) -> bool {
     note.is_some_and(|n| n.contains("corrupt"))
 }
 
+/// Format a save/validate error for display: an `ApiError::Status`'s body IS the server's literal
+/// Cedar compile error (400) or conflict message (409) — shown verbatim, not wrapped in the
+/// generic `Display` impl's `"HTTP {code}: {body}"` prefix, which just adds noise once the banner
+/// around it already distinguishes which case this is.
+fn format_save_error(err: &ApiError) -> String {
+    match err {
+        ApiError::Status { body, .. } if !body.is_empty() => body.clone(),
+        other => other.to_string(),
+    }
+}
+
 // ===========================================================================
 // Load state
 // ===========================================================================
@@ -188,51 +205,70 @@ fn corruption_probe() -> TestRequest {
     }
 }
 
+/// Props for [`OverlayPolicy`].
+#[derive(Properties, PartialEq, Clone)]
+pub struct OverlayPolicyProps {
+    /// Reports whether the editor's draft currently has unsaved edits — `OverlayPage` (in
+    /// `lib.rs`) uses this to confirm before a tab switch would discard them.
+    #[prop_or_default]
+    pub on_dirty: Callback<bool>,
+}
+
 /// The overlay flow-policy editor + explain page. `System·Admin`-gated; a `403` renders the calm
 /// [`forbidden_note`] (never a client-side authz decision — the server's `403` is the only call).
 #[function_component(OverlayPolicy)]
-pub fn overlay_policy() -> Html {
+pub fn overlay_policy(props: &OverlayPolicyProps) -> Html {
     let session = use_session();
     let state = use_state(|| LoadState::Loading);
-    // Bump to re-fetch (initial load, Retry, and after a successful PUT — so the posture and the
-    // held `ETag` both come from a fresh GET rather than being hand-advanced client-side).
+    // Bump to re-fetch (initial load, Retry, a 409's "Reload", and after a successful PUT).
     let tick = use_state(|| 0u32);
+    // True only while a background refetch is in flight AND we already have a previous `Loaded`
+    // value on screen — so a reload after Save (or a 409's Reload) never flashes the full-page
+    // Spinner or resets scroll; the previous content stays up until the fresh GET lands.
+    let refreshing = use_state(|| false);
+    // Lifted OUT of `PolicyEditor` (which remounts via `key` on every reload) so neither is
+    // destroyed within a frame of a successful save — see the module doc.
+    let warning = use_state(|| Option::<String>::None);
+    let saved_notice = use_state(|| Option::<String>::None);
 
     {
         let state = state.clone();
         let session = session.clone();
         let tick_val = *tick;
+        let refreshing = refreshing.clone();
+        let have_loaded = matches!(&*state, LoadState::Loaded(_));
         use_effect_with(tick_val, move |_| {
-            state.set(LoadState::Loading);
+            if have_loaded {
+                refreshing.set(true);
+            } else {
+                state.set(LoadState::Loading);
+            }
             let client = session.client();
             let session = session.clone();
             let state = state.clone();
+            let refreshing = refreshing.clone();
             spawn_local(async move {
-                match client.get_text_with_etag(POLICY_PATH).await {
-                    Ok((body, etag)) => {
-                        if body.trim().is_empty() {
-                            state.set(LoadState::Loaded(Loaded::Empty { etag }));
-                            return;
-                        }
-                        match client
-                            .post_json_detailed::<TestRequest, FlowPolicyTestResponse>(
-                                TEST_PATH,
-                                &corruption_probe(),
-                            )
-                            .await
-                        {
-                            Ok(resp) if note_says_corrupt(resp.note.as_deref()) => {
-                                state
-                                    .set(LoadState::Loaded(Loaded::Corrupt { etag, stored: body }));
-                            }
-                            Ok(_) => {
-                                state
-                                    .set(LoadState::Loaded(Loaded::Present { etag, stored: body }));
-                            }
-                            Err(ApiError::Unauthorized) => session.sign_out(),
-                            Err(err) => state.set(LoadState::Error(err)),
-                        }
+                let outcome: ApiResult<Loaded> = async {
+                    let (body, etag) = client.get_text_with_etag(POLICY_PATH).await?;
+                    if body.trim().is_empty() {
+                        return Ok(Loaded::Empty { etag });
                     }
+                    let probe = client
+                        .post_json_detailed::<TestRequest, FlowPolicyTestResponse>(
+                            TEST_PATH,
+                            &corruption_probe(),
+                        )
+                        .await?;
+                    Ok(if note_says_corrupt(probe.note.as_deref()) {
+                        Loaded::Corrupt { etag, stored: body }
+                    } else {
+                        Loaded::Present { etag, stored: body }
+                    })
+                }
+                .await;
+                refreshing.set(false);
+                match outcome {
+                    Ok(loaded) => state.set(LoadState::Loaded(loaded)),
                     Err(ApiError::Unauthorized) => session.sign_out(),
                     Err(ApiError::Forbidden) => state.set(LoadState::Forbidden),
                     Err(err) => state.set(LoadState::Error(err)),
@@ -242,9 +278,25 @@ pub fn overlay_policy() -> Html {
         });
     }
 
+    // A plain re-fetch with no "a save just happened" semantics (initial Retry, 409's Reload).
     let reload = {
         let tick = tick.clone();
         Callback::from(move |()| tick.set(*tick + 1))
+    };
+    // A successful PUT reports its outcome here: always shows a durable "Policy saved." notice,
+    // and keeps the server's one-time cliff warning visible (if this PUT was the one that
+    // triggered it) for the rest of this mount — then re-fetches like any other reload.
+    let on_save_success = {
+        let warning = warning.clone();
+        let saved_notice = saved_notice.clone();
+        let reload = reload.clone();
+        Callback::from(move |cliff_warning: Option<String>| {
+            if let Some(w) = cliff_warning {
+                warning.set(Some(w));
+            }
+            saved_notice.set(Some("Policy saved.".to_string()));
+            reload.emit(());
+        })
     };
 
     match &*state {
@@ -254,7 +306,20 @@ pub fn overlay_policy() -> Html {
             <ErrorBanner message={err.to_string()} on_retry={Some(reload.clone())} />
         },
         LoadState::Loaded(loaded) => html! {
-            <PolicyEditor key={(*tick).to_string()} loaded={loaded.clone()} on_saved={reload.clone()} />
+            <>
+                if let Some(w) = &*warning {
+                    { warning_banner(w) }
+                }
+                if let Some(s) = &*saved_notice {
+                    { saved_notice_banner(s) }
+                }
+                if *refreshing {
+                    <p role="status" class="mb-2 text-xs text-slate-400">{ "Refreshing…" }</p>
+                }
+                <PolicyEditor key={(*tick).to_string()} loaded={loaded.clone()}
+                              on_saved={on_save_success.clone()} on_reload={reload.clone()}
+                              on_dirty={props.on_dirty.clone()} />
+            </>
         },
     }
 }
@@ -262,9 +327,9 @@ pub fn overlay_policy() -> Html {
 /// Shown when the token is valid but lacks `System·Admin`.
 fn forbidden_note() -> Html {
     html! {
-        <div role="status" aria-live="polite" class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+        <div role="status" class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
             <p class="text-sm font-medium text-amber-800">
-                { "You need node-admin to view or edit the overlay flow policy." }
+                { "You need System·Admin to view or edit the overlay flow policy." }
             </p>
             <p class="mt-1 text-sm text-amber-700">
                 { "Your token is valid but lacks " }
@@ -272,6 +337,26 @@ fn forbidden_note() -> Html {
                 { ". The GET/test surfaces here are a policy-enumeration oracle, so they sit at \
                    the same tier as editing the gate, not a lesser overlay role." }
             </p>
+        </div>
+    }
+}
+
+/// The server's one-time CLIFF warning (present only on the PUT that stored the first policy),
+/// kept visible for the rest of this mount rather than a transient toast.
+fn warning_banner(msg: &str) -> Html {
+    html! {
+        <div role="alert" class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+            <p class="text-sm text-amber-800 whitespace-pre-wrap">{ msg }</p>
+        </div>
+    }
+}
+
+/// A durable "it worked" notice for every successful save — lives on [`OverlayPolicy`], not the
+/// `key`-remounted [`PolicyEditor`], so flipping the gate doesn't erase it within a frame.
+fn saved_notice_banner(msg: &str) -> Html {
+    html! {
+        <div role="status" class="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3">
+            <p class="text-sm font-medium text-emerald-800">{ msg }</p>
         </div>
     }
 }
@@ -284,10 +369,15 @@ fn forbidden_note() -> Html {
 #[derive(Properties, PartialEq)]
 struct PolicyEditorProps {
     loaded: Loaded,
-    /// Re-fetch the outer posture (after a successful PUT) — a fresh GET re-derives
-    /// Empty/Present/Corrupt and hands back the new `ETag`, rather than hand-advancing either
-    /// client-side.
-    on_saved: Callback<()>,
+    /// A successful PUT reports its outcome (the server's optional one-time cliff `warning`) up
+    /// to `OverlayPolicy`, which shows the durable banners and re-fetches.
+    on_saved: Callback<Option<String>>,
+    /// A plain re-fetch with no "a save just happened" semantics — the 409-conflict banner's
+    /// "Reload" button.
+    on_reload: Callback<()>,
+    /// Reports the draft's dirty state up to `OverlayPage`.
+    #[prop_or_default]
+    on_dirty: Callback<bool>,
 }
 
 /// The save-in-flight / result indicator (mirrors `config_editor.rs`'s `SaveStatus`).
@@ -296,6 +386,9 @@ enum SaveStatus {
     Idle,
     Saving,
     Saved,
+    /// A `409`: someone else changed the policy since this editor loaded it. Re-sending the same
+    /// stale `If-Match` would just 409 again, so Save is disabled until a Reload.
+    Conflict(String),
     Error(String),
 }
 
@@ -312,21 +405,79 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
 
     let draft = use_state(|| stored.clone());
     let status = use_state(|| SaveStatus::Idle);
-    // The server's one-time cliff warning — once shown, kept for the rest of this mount (a
-    // "persistent post-save banner", not a toast that disappears on the next render).
-    let warning = use_state(|| Option::<String>::None);
-    // The blocking cliff-confirm panel (absent→present transition only; see `needs_cliff_confirm`).
     let pending_cliff = use_state(|| false);
+    let root_ref = use_node_ref();
+    let save_trigger_ref = use_node_ref();
+    let dialog_was_open = use_mut_ref(|| false);
 
     let dirty = *draft != stored;
 
-    // The actual PUT, shared by the normal Save path and the cliff-confirm's "Store it" button —
-    // the cliff panel never issues a DIFFERENT write than Save would have, it only gates when.
+    // Focus the remounted section's root on every mount. This component only ever (re)mounts on
+    // the initial load or right after a successful save (a fresh `key`); in both cases moving
+    // focus to the new content is the standard SPA "content changed" a11y pattern, so a screen
+    // reader announces the heading instead of focus silently sitting on a now-detached node.
+    {
+        let root_ref = root_ref.clone();
+        use_effect_with((), move |()| {
+            if let Some(el) = root_ref.cast::<HtmlElement>() {
+                let _ = el.focus();
+            }
+            || ()
+        });
+    }
+
+    // Report dirty state up to `OverlayPage` (confirms before a tab switch would discard it).
+    {
+        let on_dirty = props.on_dirty.clone();
+        use_effect_with(dirty, move |dirty| {
+            on_dirty.emit(*dirty);
+            || ()
+        });
+    }
+
+    // Restore focus to the Save button once the cliff dialog closes via Cancel/Escape — NOT after
+    // a successful confirm (the whole component remounts then, and the fresh mount's own
+    // focus-the-root effect above takes over). Guarded by `dialog_was_open` so this only fires on
+    // an actual true→false transition, never on the initial (always-false) render.
+    {
+        let save_trigger_ref = save_trigger_ref.clone();
+        let dialog_was_open = dialog_was_open.clone();
+        let open = *pending_cliff;
+        use_effect_with(open, move |open| {
+            let was_open = *dialog_was_open.borrow();
+            if was_open
+                && !*open
+                && let Some(el) = save_trigger_ref.cast::<HtmlElement>()
+            {
+                let _ = el.focus();
+            }
+            *dialog_was_open.borrow_mut() = *open;
+            || ()
+        });
+    }
+
+    // If the draft empties out WHILE the cliff dialog is open (the dialog is inline, not a true
+    // viewport-covering modal, so the textarea underneath stays editable), the absent→present
+    // transition it was warning about no longer applies: close it rather than leave a stale
+    // warning showing over a draft that would no longer trigger it.
+    {
+        let pending_cliff = pending_cliff.clone();
+        let was_pending = *pending_cliff;
+        let draft_val = (*draft).clone();
+        use_effect_with(draft_val, move |d| {
+            if was_pending && d.trim().is_empty() {
+                pending_cliff.set(false);
+            }
+            || ()
+        });
+    }
+
+    // The actual PUT, shared by the normal Save path and the cliff dialog's "Store it" button —
+    // the cliff dialog never issues a DIFFERENT write than Save would have, it only gates when.
     let do_put = {
         let session = session.clone();
         let draft = draft.clone();
         let status = status.clone();
-        let warning = warning.clone();
         let pending_cliff = pending_cliff.clone();
         let on_saved = props.on_saved.clone();
         let etag = etag.clone();
@@ -335,7 +486,6 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
             let session = session.clone();
             let body = (*draft).clone();
             let status = status.clone();
-            let warning = warning.clone();
             let pending_cliff = pending_cliff.clone();
             let on_saved = on_saved.clone();
             let if_match = etag.clone();
@@ -346,18 +496,19 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
                     .await;
                 match outcome {
                     Ok(resp) => {
-                        if let Some(w) = resp.warning {
-                            warning.set(Some(w));
-                        }
                         status.set(SaveStatus::Saved);
                         pending_cliff.set(false);
-                        on_saved.emit(());
+                        on_saved.emit(resp.warning);
                     }
                     Err(ApiError::Unauthorized) => session.sign_out(),
+                    Err(err @ ApiError::Status { code: 409, .. }) => {
+                        status.set(SaveStatus::Conflict(format_save_error(&err)));
+                        pending_cliff.set(false);
+                    }
                     Err(err) => {
-                        // Surfaced verbatim (400 Cedar compile error / 409 conflict) — see
+                        // Surfaced verbatim (400 Cedar compile error) — see
                         // `ApiClient::put_text_if_match`'s doc comment.
-                        status.set(SaveStatus::Error(err.to_string()));
+                        status.set(SaveStatus::Error(format_save_error(&err)));
                         pending_cliff.set(false);
                     }
                 }
@@ -386,23 +537,28 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
 
     let on_cancel_cliff = {
         let pending_cliff = pending_cliff.clone();
-        Callback::from(move |_: MouseEvent| pending_cliff.set(false))
+        Callback::from(move |()| pending_cliff.set(false))
     };
     let on_confirm_cliff = {
         let do_put = do_put.clone();
-        Callback::from(move |_: MouseEvent| do_put.emit(()))
+        Callback::from(move |()| do_put.emit(()))
+    };
+    let on_reload_click = {
+        let on_reload = props.on_reload.clone();
+        Callback::from(move |_: MouseEvent| on_reload.emit(()))
     };
 
+    const ERROR_ID: &str = "overlay-policy-draft-error";
+    let invalid = matches!(&*status, SaveStatus::Error(_));
+
     html! {
+        <div ref={root_ref} tabindex="-1">
         <Section title="Overlay flow policy"
-                 description="Operator-authored Cedar policy gating the overlay dial/publish-cap \
-                              mint — deny-or-shrink-TTL only; it can never widen what RBAC already \
+                 description="Operator-authored Cedar policy gating the overlay dial/expose mint \
+                              — deny-or-shrink-TTL only; it can never widen what RBAC already \
                               permitted.">
             if corrupt {
                 { corrupt_banner() }
-            }
-            if let Some(w) = &*warning {
-                { warning_banner(w) }
             }
             if stored_is_off && !corrupt {
                 { off_banner() }
@@ -410,43 +566,72 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
 
             <TextAreaField label="Policy (Cedar text)" value={(*draft).clone()} rows={16}
                            hint="Empty turns the mint gate OFF (every dial/expose allowed ungated)."
+                           invalid={invalid}
+                           describedby={invalid.then(|| AttrValue::from(ERROR_ID))}
                            on_change={on_draft_change} />
 
-            if let SaveStatus::Error(msg) = &*status {
-                <div role="alert" class="rounded-md border border-rose-200 bg-rose-50 px-3 py-2">
-                    <p class="text-sm text-rose-700 whitespace-pre-wrap">{ msg }</p>
-                </div>
+            {
+                match &*status {
+                    SaveStatus::Error(msg) => html! {
+                        <div id={ERROR_ID} role="alert"
+                             class="rounded-md border border-rose-200 bg-rose-50 px-3 py-2">
+                            <pre class="whitespace-pre-wrap font-mono text-sm text-rose-700">{ msg }</pre>
+                        </div>
+                    },
+                    SaveStatus::Conflict(msg) => html! {
+                        <div role="alert" class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2">
+                            <p class="text-sm text-amber-800">
+                                { "Someone else changed the policy since you loaded it — saving \
+                                   now would be rejected again. Reload to see their version \
+                                   before saving." }
+                            </p>
+                            <pre class="mt-1 whitespace-pre-wrap font-mono text-xs text-amber-700">{ msg }</pre>
+                            <div class="mt-2">
+                                <Button variant={BtnVariant::Secondary} label="Reload"
+                                        onclick={on_reload_click.clone()} />
+                            </div>
+                        </div>
+                    },
+                    _ => html! {},
+                }
             }
 
             if *pending_cliff {
-                { cliff_preview(&draft, &on_confirm_cliff, &on_cancel_cliff) }
+                <CliffDialog draft={(*draft).clone()} on_confirm={on_confirm_cliff}
+                             on_cancel={on_cancel_cliff} />
             }
 
             <div class="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
                 { save_bar_status(&status, dirty) }
-                <Button variant={BtnVariant::Primary} busy={matches!(&*status, SaveStatus::Saving)}
-                        busy_label="Saving…" disabled={!dirty || *pending_cliff}
+                <Button node_ref={save_trigger_ref} variant={BtnVariant::Primary}
+                        busy={matches!(&*status, SaveStatus::Saving)} busy_label="Saving…"
+                        disabled={!dirty || *pending_cliff || matches!(&*status, SaveStatus::Conflict(_))}
                         label="Save policy" onclick={on_save_click} />
             </div>
 
             <div class="border-t border-slate-100 pt-4">
-                <h4 class="mb-2 text-sm font-medium text-slate-600">
+                <h4 id="validate-draft-heading" class="mb-2 text-sm font-medium text-slate-600">
                     { "Validate / dry-run the draft" }
                 </h4>
                 <p class="mb-2 text-xs text-slate-500">
                     { "Shares one path with Save: the server compiles the draft the same way \
                        either button sends it, so a 400 here is the same error Save would hit." }
                 </p>
-                <DryRunPanel policy_override={Some((*draft).clone())} />
+                <section aria-labelledby="validate-draft-heading">
+                    <DryRunPanel policy_override={Some((*draft).clone())} />
+                </section>
             </div>
 
             <div class="border-t border-slate-100 pt-4">
-                <h4 class="mb-2 text-sm font-medium text-slate-600">
+                <h4 id="explain-stored-heading" class="mb-2 text-sm font-medium text-slate-600">
                     { "Explain — what the STORED (live) policy currently decides" }
                 </h4>
-                <DryRunPanel policy_override={Option::<String>::None} />
+                <section aria-labelledby="explain-stored-heading">
+                    <DryRunPanel policy_override={Option::<String>::None} />
+                </section>
             </div>
         </Section>
+        </div>
     }
 }
 
@@ -454,7 +639,7 @@ fn policy_editor(props: &PolicyEditorProps) -> Html {
 /// (deny-all) for every mint right now, independent of anything done in this editor.
 fn corrupt_banner() -> Html {
     html! {
-        <div role="alert" class="rounded-lg border-2 border-rose-400 bg-rose-50 px-4 py-3">
+        <div role="alert" class="mb-4 rounded-lg border-2 border-rose-400 bg-rose-50 px-4 py-3">
             <p class="text-sm font-bold text-rose-900">
                 { "LIVE OUTAGE — the stored overlay flow policy is CORRUPT. The live gate is \
                    failing closed: every dial/expose mint is being DENIED right now, not just \
@@ -464,54 +649,14 @@ fn corrupt_banner() -> Html {
     }
 }
 
-/// The server's one-time CLIFF warning (present only on the PUT that stored the first policy),
-/// kept visible for the rest of this mount rather than a transient toast.
-fn warning_banner(msg: &str) -> Html {
-    html! {
-        <div role="alert" class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
-            <p class="text-sm text-amber-800 whitespace-pre-wrap">{ msg }</p>
-        </div>
-    }
-}
-
 /// Nothing is stored — the mint gate is OFF, every dial/expose is allowed ungated.
 fn off_banner() -> Html {
     html! {
-        <div role="status" class="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+        <div role="status" class="mb-4 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
             <p class="text-sm font-medium text-slate-700">
                 { "No flow policy is stored — the mint gate is OFF: every dial/expose is \
                    currently allowed, ungated." }
             </p>
-        </div>
-    }
-}
-
-/// The blocking cliff-confirm preview (absent→present only; see `needs_cliff_confirm`). Embeds a
-/// live [`DryRunPanel`] against the draft so the operator sees their own access BEFORE
-/// committing, rather than a bare `confirm()` dialog.
-fn cliff_preview(
-    draft: &UseStateHandle<String>,
-    on_confirm: &Callback<MouseEvent>,
-    on_cancel: &Callback<MouseEvent>,
-) -> Html {
-    html! {
-        <div role="alertdialog" aria-label="Confirm storing the first overlay flow policy"
-             class="space-y-3 rounded-lg border-2 border-amber-300 bg-amber-50 p-4">
-            <p class="text-sm font-semibold text-amber-900">
-                { "Storing this policy flips the overlay mint gate from OFF (every dial/expose \
-                   currently allowed) to DEFAULT-DENY: from the moment it is stored, every \
-                   dial/expose NOT matched by a `permit` in this policy is denied." }
-            </p>
-            <p class="text-sm text-amber-800">
-                { "Preview your own access under the draft before committing — fill in a flow \
-                   you expect to still work (e.g. your own holder key) and run it below." }
-            </p>
-            <DryRunPanel policy_override={Some((**draft).clone())} />
-            <div class="flex items-center gap-2 border-t border-amber-200 pt-3">
-                <Button variant={BtnVariant::Danger} label="Store it — flip the gate on"
-                        onclick={on_confirm.clone()} />
-                <Button variant={BtnVariant::Secondary} label="Cancel" onclick={on_cancel.clone()} />
-            </div>
         </div>
     }
 }
@@ -521,8 +666,11 @@ fn cliff_preview(
 fn save_bar_status(status: &SaveStatus, dirty: bool) -> Html {
     match status {
         SaveStatus::Saving => html! { <span class="text-sm text-slate-500">{ "Saving…" }</span> },
-        SaveStatus::Error(msg) => html! {
-            <span class="text-sm text-rose-700" title={msg.clone()}>{ "Save failed" }</span>
+        SaveStatus::Error(_) => html! {
+            <span class="text-sm text-rose-700">{ "Save failed" }</span>
+        },
+        SaveStatus::Conflict(_) => html! {
+            <span class="text-sm text-amber-700">{ "Save conflict" }</span>
         },
         _ if dirty => html! { <Pill text="unsaved changes" tone={Tone::Warn} /> },
         SaveStatus::Saved => html! { <Pill text="saved" tone={Tone::Good} /> },
@@ -531,8 +679,154 @@ fn save_bar_status(status: &SaveStatus, dirty: bool) -> Html {
 }
 
 // ===========================================================================
+// The cliff dialog — a real (if hand-rolled) modal, not a bare `confirm()`.
+// ===========================================================================
+
+/// Elements considered "focusable" for the Tab-trap below: native interactive elements plus
+/// anything with an explicit, non-negative `tabindex`. Good enough for a dialog built entirely
+/// from this crate's own form widgets (no third-party custom elements to account for).
+const FOCUSABLE_SELECTOR: &str = "button:not([disabled]), input:not([disabled]), \
+     select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+#[derive(Properties, PartialEq)]
+struct CliffDialogProps {
+    draft: String,
+    on_confirm: Callback<()>,
+    on_cancel: Callback<()>,
+}
+
+/// The blocking cliff-confirm dialog (absent→present transition only; see [`needs_cliff_confirm`]).
+/// Focus moves into it the instant it mounts (this component only ever renders while the cliff is
+/// pending, so mounting IS opening — the fresh render that shows it and the render that disables
+/// Save are the same commit, so there is no earlier point to move focus from), Tab/Shift+Tab cycle
+/// within it ([`trap_tab_key`]), Escape cancels, and "Store it" stays disabled until the operator
+/// has both acknowledged the consequence (a checkbox) AND run the embedded dry-run at least once.
+#[function_component(CliffDialog)]
+fn cliff_dialog(props: &CliffDialogProps) -> Html {
+    let dialog_ref = use_node_ref();
+    let ack = use_state(|| false);
+    let dry_run_done = use_state(|| false);
+
+    {
+        let dialog_ref = dialog_ref.clone();
+        use_effect_with((), move |()| {
+            if let Some(el) = dialog_ref.cast::<HtmlElement>() {
+                let _ = el.focus();
+                el.scroll_into_view();
+            }
+            || ()
+        });
+    }
+
+    let on_keydown = {
+        let dialog_ref = dialog_ref.clone();
+        let on_cancel = props.on_cancel.clone();
+        Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
+            "Escape" => {
+                e.prevent_default();
+                on_cancel.emit(());
+            }
+            "Tab" => {
+                if let (Some(container), Some(focused)) = (
+                    dialog_ref.cast::<HtmlElement>(),
+                    e.target_dyn_into::<HtmlElement>(),
+                ) {
+                    trap_tab_key(&container, &focused, e.shift_key(), &e);
+                }
+            }
+            _ => {}
+        })
+    };
+
+    let on_ack = {
+        let ack = ack.clone();
+        Callback::from(move |v: bool| ack.set(v))
+    };
+    let on_dry_run_ran = {
+        let dry_run_done = dry_run_done.clone();
+        Callback::from(move |()| dry_run_done.set(true))
+    };
+    let on_confirm = {
+        let cb = props.on_confirm.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+    let on_cancel = {
+        let cb = props.on_cancel.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+
+    let armable = *ack && *dry_run_done;
+    const WARNING_ID: &str = "cliff-warning-text";
+
+    html! {
+        <div ref={dialog_ref} role="alertdialog" aria-modal="true"
+             aria-label="Confirm storing the first overlay flow policy"
+             aria-describedby={WARNING_ID}
+             tabindex="-1" onkeydown={on_keydown}
+             class="my-4 space-y-3 rounded-lg border-2 border-amber-300 bg-amber-50 p-4">
+            <p id={WARNING_ID} class="text-sm font-semibold text-amber-900">
+                { "Storing this policy flips the overlay mint gate from OFF (every dial/expose \
+                   currently allowed) to DEFAULT-DENY: from the moment it is stored, every \
+                   dial/expose NOT matched by a `permit` in this policy is denied." }
+            </p>
+            <p class="text-sm text-amber-800">
+                { "Run the dry-run below against a flow you expect to still work (e.g. your own \
+                   holder key) — it must run at least once before you can store." }
+            </p>
+            <DryRunPanel policy_override={Some(props.draft.clone())} on_ran={Some(on_dry_run_ran)} />
+            <CheckField
+                label="I understand every unmatched dial/expose will be denied once this is stored."
+                checked={*ack} on_change={on_ack} />
+            <div class="flex flex-wrap items-center gap-2 border-t border-amber-200 pt-3">
+                <Button variant={BtnVariant::Danger} disabled={!armable}
+                        label="Store it — flip the gate to default-deny" onclick={on_confirm} />
+                <Button variant={BtnVariant::Secondary} label="Cancel" onclick={on_cancel} />
+            </div>
+            if !armable {
+                <p class="text-xs text-amber-700">
+                    { "Run the dry-run and check the box above to enable storing." }
+                </p>
+            }
+        </div>
+    }
+}
+
+/// Tab-trap: keep focus cycling within `container` while a dialog is open — Tab past the last
+/// focusable element wraps to the first, Shift+Tab past the first wraps to the last. Identity
+/// compared via `is_same_node` (`web_sys` extern types don't derive `PartialEq`, so `==` is not
+/// available between two `HtmlElement`s).
+fn trap_tab_key(container: &HtmlElement, focused: &HtmlElement, shift: bool, e: &KeyboardEvent) {
+    let Ok(list) = container.query_selector_all(FOCUSABLE_SELECTOR) else {
+        return;
+    };
+    let len = list.length();
+    if len == 0 {
+        return;
+    }
+    let first = list.get(0).and_then(|n| n.dyn_into::<HtmlElement>().ok());
+    let last = list
+        .get(len - 1)
+        .and_then(|n| n.dyn_into::<HtmlElement>().ok());
+    let is_focused = |el: &Option<HtmlElement>| {
+        el.as_ref()
+            .is_some_and(|e| focused.is_same_node(e.dyn_ref::<web_sys::Node>()))
+    };
+    if shift && is_focused(&first) {
+        e.prevent_default();
+        if let Some(last) = &last {
+            let _ = last.focus();
+        }
+    } else if !shift && is_focused(&last) {
+        e.prevent_default();
+        if let Some(first) = &first {
+            let _ = first.focus();
+        }
+    }
+}
+
+// ===========================================================================
 // The explain/dry-run form (shared by: the editor's "Validate/dry-run the draft", the cliff
-// preview, and the standalone "Explain — stored policy" section).
+// dialog, and the standalone "Explain — stored policy" section).
 // ===========================================================================
 
 #[derive(Properties, PartialEq)]
@@ -540,6 +834,10 @@ struct DryRunPanelProps {
     /// `Some(text)` evaluates against this inline policy (a pre-store preview of a draft);
     /// `None` evaluates against whatever the server currently has stored (the live policy).
     policy_override: Option<String>,
+    /// Notified once a dry-run completes (success or error) — the cliff dialog uses this to
+    /// require at least one run before "Store it" can be armed.
+    #[prop_or_default]
+    on_ran: Option<Callback<()>>,
 }
 
 #[function_component(DryRunPanel)]
@@ -556,6 +854,19 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
     let now = use_state(String::new);
     let busy = use_state(|| false);
     let result = use_state(|| Option::<ApiResult<FlowPolicyTestResponse>>::None);
+
+    // A result evaluated against a DIFFERENT policy (draft vs. stored, or an edited draft) is
+    // misleading once shown — clear it whenever the caller switches which policy this panel
+    // evaluates (the editor's "Validate the draft" panel re-passes `policy_override` on every
+    // keystroke, so a stale ALLOW/DENY never lingers past the edit that invalidated it).
+    {
+        let result = result.clone();
+        let policy_override = props.policy_override.clone();
+        use_effect_with(policy_override, move |_| {
+            result.set(None);
+            || ()
+        });
+    }
 
     let on_action = {
         let action = action.clone();
@@ -612,6 +923,7 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
         let busy = busy.clone();
         let result = result.clone();
         let policy_override = props.policy_override.clone();
+        let on_ran = props.on_ran.clone();
         Callback::from(move |_: MouseEvent| {
             let client = session.client();
             let session = session.clone();
@@ -630,6 +942,7 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
             };
             let busy = busy.clone();
             let result = result.clone();
+            let on_ran = on_ran.clone();
             busy.set(true);
             spawn_local(async move {
                 let outcome = client
@@ -638,14 +951,26 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
                 busy.set(false);
                 match outcome {
                     Err(ApiError::Unauthorized) => session.sign_out(),
-                    other => result.set(Some(other)),
+                    other => {
+                        result.set(Some(other));
+                        if let Some(cb) = &on_ran {
+                            cb.emit(());
+                        }
+                    }
                 }
             });
         })
     };
 
+    let caption = if props.policy_override.is_some() {
+        "Evaluating: your unsaved draft"
+    } else {
+        "Evaluating: the live stored policy"
+    };
+
     html! {
         <div class="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+            <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{ caption }</p>
             <div class="grid gap-3 sm:grid-cols-2">
                 <label class="block">
                     <span class="block text-sm font-medium text-slate-700">{ "Action" }</span>
@@ -654,21 +979,27 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
                         <option value="expose">{ "expose" }</option>
                     </select>
                 </label>
-                <TextField label="Service" value={(*service).clone()} placeholder="svc/db"
+                <TextField label="Service" value={(*service).clone()} hint="e.g. svc/db"
                            mono=true on_change={on_service} />
-                <TextField label="Holder key" value={(*holder).clone()} placeholder="ed25519:…"
+                <TextField label="Holder key" value={(*holder).clone()} hint="e.g. ed25519:…"
                            mono=true on_change={on_holder} />
-                <TextField label="TTL requested (seconds)" value={(*ttl).clone()} on_change={on_ttl} />
+                <TextField label="TTL requested (seconds)" value={(*ttl).clone()}
+                           input_type={Some(AttrValue::from("number"))} on_change={on_ttl} />
                 <TextField label="Role (optional)" value={(*role).clone()} on_change={on_role} />
                 <TextField label="Scope (optional)" value={(*scope).clone()} on_change={on_scope} />
                 <TextField label="Node (optional)" value={(*node).clone()}
                            hint="The serving node's overlay identity (Stage A)." on_change={on_node} />
                 <TextField label="Now (optional, Unix seconds)" value={(*now).clone()}
+                           input_type={Some(AttrValue::from("number"))}
                            hint="Defaults to the server clock — set to preview a `not_after` cutoff."
                            on_change={on_now} />
                 <CheckField label="Enrolled (holder presented a verified overlay-member credential)"
                             checked={*enrolled} on_change={on_enrolled} />
             </div>
+            <p class="text-xs text-slate-500">
+                { "Tip: leaving Service/Holder empty evaluates an unmatched flow — expect DENY \
+                   until you fill in a real target." }
+            </p>
             <Button variant={BtnVariant::Secondary} busy={*busy} busy_label="Running…"
                     label="Run dry-run" onclick={on_run} />
             { dry_run_result(&result) }
@@ -676,8 +1007,11 @@ fn dry_run_panel(props: &DryRunPanelProps) -> Html {
     }
 }
 
-/// The dry-run result: a clear ALLOW/DENY pill (text-labeled, not color-only), the TTL ceiling,
-/// deciding policies, diagnostics (via [`explain_diagnostics`] — see its doc), and any `note`.
+/// The dry-run result: a headline decision (text-labeled, not color-only — a plain "Decision:
+/// ALLOW/DENY" line, colored but never relying on color alone), in an `aria-live` region so a
+/// screen reader hears it without needing to re-find the result after clicking Run; the TTL
+/// ceiling, deciding policies (or an explicit "no permit matched" note on an unmatched deny),
+/// diagnostics (via [`explain_diagnostics`] — see its doc), and any `note`.
 fn dry_run_result(result: &UseStateHandle<Option<ApiResult<FlowPolicyTestResponse>>>) -> Html {
     match &**result {
         None => html! {},
@@ -687,16 +1021,20 @@ fn dry_run_result(result: &UseStateHandle<Option<ApiResult<FlowPolicyTestRespons
             </div>
         },
         Some(Ok(resp)) => {
-            let (label, tone) = if resp.decision == "allow" {
-                ("ALLOW", Tone::Good)
+            let (headline_class, label) = if resp.decision == "allow" {
+                ("text-emerald-700", "ALLOW")
             } else {
-                ("DENY", Tone::Bad)
+                ("text-rose-700", "DENY")
             };
             let diagnostics = explain_diagnostics(resp);
+            let no_match = resp.decision != "allow" && resp.deciding_policies.is_empty();
             html! {
-                <div class="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <div role="status" aria-live="polite"
+                     class="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-3">
                     <div class="flex flex-wrap items-center gap-2">
-                        <Pill text={label} tone={tone} />
+                        <p class={classes!("text-base", "font-semibold", headline_class)}>
+                            { format!("Decision: {label}") }
+                        </p>
                         if let Some(ceiling) = resp.ttl_ceiling {
                             <span class="text-xs text-slate-600">
                                 { format!("TTL pulled down to {ceiling}s") }
@@ -706,7 +1044,11 @@ fn dry_run_result(result: &UseStateHandle<Option<ApiResult<FlowPolicyTestRespons
                     if let Some(note) = &resp.note {
                         <p class="text-xs font-medium text-amber-700">{ note }</p>
                     }
-                    if !resp.deciding_policies.is_empty() {
+                    if no_match {
+                        <p class="text-xs text-slate-500">
+                            { "No permit matched — denied by default." }
+                        </p>
+                    } else if !resp.deciding_policies.is_empty() {
                         <div>
                             <p class="text-xs font-medium text-slate-500">{ "Deciding policies" }</p>
                             <ul class="mt-1 space-y-0.5">

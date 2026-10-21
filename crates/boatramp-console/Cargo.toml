@@ -82,6 +82,14 @@ web-sys = { version = "0.3", features = [
   # Copy-to-clipboard for the "shown once" secrets (minted token / join token).
   "Navigator",
   "Clipboard",
+  # The overlay flow-policy cliff dialog's hand-rolled focus trap (`.focus()` +
+  # `scroll_into_view()` on open, Tab-cycling within it while open — `Node` is
+  # `is_same_node`, used to detect wrap-around; `web_sys` extern types don't
+  # derive `PartialEq`, so this is the correct identity comparison, not `==`).
+  "HtmlElement",
+  "KeyboardEvent",
+  "NodeList",
+  "Node",
 ] }
 gloo-dialogs = "0.2"
 

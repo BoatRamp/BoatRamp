@@ -425,6 +425,11 @@ enum OverlayTab {
 #[function_component(OverlayPage)]
 fn overlay_page() -> Html {
     let tab = use_state(|| OverlayTab::Directory);
+    // Whether the Policy tab's in-progress draft has unsaved edits — reported up by
+    // `OverlayPolicy` (which only ever mounts while that tab is active, so this reads as "as of
+    // the last time it was visible"); gates the tab switch below so a hand-authored draft can't be
+    // silently discarded by a stray click.
+    let policy_dirty = use_state(|| false);
 
     let tab_class = |active: bool| {
         if active {
@@ -434,19 +439,40 @@ fn overlay_page() -> Html {
              hover:text-slate-800"
         }
     };
-    let select = |target: OverlayTab, tab: UseStateHandle<OverlayTab>| {
-        Callback::from(move |_: MouseEvent| tab.set(target))
+    // Switching AWAY from the Policy tab while its draft is dirty confirms first (the full
+    // route-navigation case — e.g. the top-nav "Sites"/"Monitoring" links — is NOT guarded here;
+    // that would need a broader router-level hook this change doesn't take on).
+    let select =
+        |target: OverlayTab, tab: UseStateHandle<OverlayTab>, dirty: UseStateHandle<bool>| {
+            Callback::from(move |_: MouseEvent| {
+                if *tab == OverlayTab::Policy
+                    && target != OverlayTab::Policy
+                    && *dirty
+                    && !gloo_dialogs::confirm(
+                        "You have an unsaved flow-policy draft. Switch tabs and discard it?",
+                    )
+                {
+                    return;
+                }
+                tab.set(target);
+            })
+        };
+    let on_policy_dirty = {
+        let policy_dirty = policy_dirty.clone();
+        Callback::from(move |dirty: bool| policy_dirty.set(dirty))
     };
 
     html! {
         <div>
             <h2 class="mb-4 text-lg font-semibold text-slate-900">{ "Overlay" }</h2>
             <div class="mb-6 flex gap-6 border-b border-slate-200">
-                <button onclick={select(OverlayTab::Directory, tab.clone())}
+                <button onclick={select(OverlayTab::Directory, tab.clone(), policy_dirty.clone())}
+                        aria-current={if matches!(*tab, OverlayTab::Directory) { "true" } else { "false" }}
                         class={tab_class(matches!(*tab, OverlayTab::Directory))}>
                     { "Directory" }
                 </button>
-                <button onclick={select(OverlayTab::Policy, tab.clone())}
+                <button onclick={select(OverlayTab::Policy, tab.clone(), policy_dirty.clone())}
+                        aria-current={if matches!(*tab, OverlayTab::Policy) { "true" } else { "false" }}
                         class={tab_class(matches!(*tab, OverlayTab::Policy))}>
                     { "Flow policy" }
                 </button>
@@ -454,7 +480,7 @@ fn overlay_page() -> Html {
             {
                 match *tab {
                     OverlayTab::Directory => html! { <OverlayDirectory /> },
-                    OverlayTab::Policy => html! { <OverlayPolicy /> },
+                    OverlayTab::Policy => html! { <OverlayPolicy on_dirty={on_policy_dirty} /> },
                 }
             }
         </div>
