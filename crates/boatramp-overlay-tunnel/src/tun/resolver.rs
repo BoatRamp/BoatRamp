@@ -29,7 +29,7 @@ pub enum Method {
     /// `/etc/resolv.conf` has no per-domain scoping, so this fallback adds `127.0.0.1` as A
     /// nameserver for the WHOLE host, not just the zone — acceptable only because the embedded
     /// responder itself still REFUSES (never answers, never recurses) anything outside the zone
-    /// (plan §3.3/§5), so no query is ever mis-answered, but other resolvers on the same host do get
+    /// (plan §3.3/§5), so no query is ever wrongly answered, but other resolvers on the same host do get
     /// one extra (first-tried) nameserver in their list for the front-end's lifetime.
     ResolvConfStanza,
 }
