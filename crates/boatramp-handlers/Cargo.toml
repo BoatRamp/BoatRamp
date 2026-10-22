@@ -37,6 +37,12 @@ pass-gate-mutation = []
 # each of the three security checks in `tcp_connect_decision` — allowlist membership, connect-only, and
 # the posture gate — goes RED when neutered (`admit_unallowlisted`/`admit_bind_listen`/`drop_posture`).
 # Also armed under `cfg(test)`; NEVER enabled in a shipped build (it only reads a test env var).
+#
+# SAME lane, a SECOND seam (Build A, mailroom #15): also arms `BOATRAMP_TCPEGRESS_TLS_MUTATION`
+# (`bindings::tcp_egress::tcpegress_tls_mutation`), whose `skip_tls_wrap` value makes `connect-tls`
+# hand back the RAW (unterminated) TCP stream instead of the TLS-terminated one — orthogonal to the
+# three gate-decision checks above (it proves the TLS WRAP itself can't be silently dropped). Needs
+# `tcp-egress` for the seam to exist; harmless (just a dead `cfg`) when `tcp-egress` is off.
 tcpegress-gate-mutation = ["engine"]
 # Anti-hollow gate lane for the host-owned inbound-TCP listener dispatch gate (PLAN-handler-tcp-inbound):
 # arms the `BOATRAMP_TCPLISTENER_MUTATION` seam (`engine::tcplistener_mutation`) so the CI gate can prove
@@ -145,6 +151,18 @@ blob-upload = ["engine", "dep:async-trait"]
 # (boatramp-server/boatramp); this gates the WIT `tcp-connection-host` world + the engine's conn-lane
 # dispatch. Off by default (experimental); the shipped binary turns it on via batteries-included.
 tcp-listener = ["engine"]
+# The `tcp-egress` capability (host-terminated outbound-TLS egress, PLAN-handler-tcp-egress Build A,
+# mailroom cap-req #15): the OUTBOUND mirror of `tcp-listener` — the host DIALS the TCP connection AND
+# TERMINATES TLS, handing the guest only plaintext `wasi:io` streams (the guest does zero crypto, and
+# never receives `wasi:sockets`). Reuses the EXACT SAME grant as the gated `wasi:sockets` capability
+# (the deploy declares `wasi:sockets`, not a new token) and the SAME per-handler `egress_allowlist` +
+# node posture (`allow_guest_tcp_egress`) — gated through the identical `tcp_connect_decision`
+# predicate used for every resolved candidate address (the DNS-rebinding choke: resolve once, check
+# each candidate, connect only to a checked address, never re-resolve). Needs no new deps beyond
+# `engine` (rustls/tokio-rustls/webpki-roots are already pulled in for the guest-egress extra-CA TLS
+# client, which this reuses verbatim via `guest_egress_client_config`). Off by default (experimental);
+# the shipped binary turns it on via batteries-included.
+tcp-egress = ["engine"]
 
 [dependencies]
 boatramp-core.workspace = true

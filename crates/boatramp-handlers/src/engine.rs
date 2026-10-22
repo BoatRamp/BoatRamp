@@ -361,6 +361,18 @@ const EPOCH_TICK_MS: u64 = 10;
 /// while a silent (slowloris) one is. Overridable per node via `with_streaming_idle_ms`.
 const DEFAULT_STREAMING_IDLE_MS: u64 = 600_000;
 
+/// Default per-dial CONNECT timeout for the `tcp-egress` capability (`PLAN-handler-tcp-egress`
+/// Build A, mailroom #15): bounds the TCP connect AND the TLS handshake together. Overridable via
+/// [`HandlerEngine::with_tcp_egress_timeouts`].
+#[cfg(feature = "tcp-egress")]
+const DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-dial READ/IDLE timeout for `tcp-egress`: how long the peer may go silent after the
+/// handshake before the connection's streams surface a timeout. Overridable via
+/// [`HandlerEngine::with_tcp_egress_timeouts`].
+#[cfg(feature = "tcp-egress")]
+const DEFAULT_TCP_EGRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Upper bound (chars) on the guest-returned error text carried by
 /// [`HandlerError::ConsumerError`]. The guest controls this string, so it is bounded here before it
 /// is stored (and the DLQ layer sanitizes control chars before an operator sees it).
@@ -502,6 +514,18 @@ struct HostState {
     egress_depth: u32,
     /// The per-process nonce that authenticates a self-egress depth marker.
     egress_nonce: u64,
+    /// Whether this invocation's guest may dial out through the `tcp-egress` capability (copied
+    /// from the engine's `allow_tcp_egress` posture — the EXACT SAME flag that gates the raw
+    /// `wasi:sockets` outbound-TCP capability, `PLAN-handler-tcp-egress` Build A / mailroom #15). No
+    /// new posture knob; `false` is the deny-by-default.
+    #[cfg(feature = "tcp-egress")]
+    tcp_egress_enabled: bool,
+    /// Per-dial CONNECT timeout for `tcp-egress` (copied from the engine).
+    #[cfg(feature = "tcp-egress")]
+    tcp_egress_connect_timeout: Duration,
+    /// Per-dial READ/IDLE timeout for `tcp-egress` (copied from the engine).
+    #[cfg(feature = "tcp-egress")]
+    tcp_egress_idle_timeout: Duration,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -621,7 +645,11 @@ fn egress_dns_error(
 /// verification or accepts an unpinned cert. With `extra_roots` empty this is exactly the stock trust
 /// set (webpki only). An explicit aws-lc-rs provider is used so the config does not depend on a
 /// process-default `CryptoProvider` having been installed.
-fn guest_egress_client_config(
+///
+/// `pub(crate)` (mailroom #15 Build A): the `tcp-egress` host binding reuses this EXACT builder for
+/// its own TLS dial — "the verifying rustls `ClientConfig`" the task calls out — rather than forking
+/// a second copy. Same trust set, same explicit provider, same full verification.
+pub(crate) fn guest_egress_client_config(
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<rustls::ClientConfig, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
@@ -931,6 +959,73 @@ async fn tcp_connect_decision(
         return true;
     }
     tcp_egress_allowed(allowlist, addr).await
+}
+
+/// Why [`resolve_and_gate_tcp_egress`] refused a dial. Independent of any WIT/bindgen type — the
+/// `tcp-egress` host binding maps this to the guest-facing `egress-error` variant.
+#[cfg(feature = "tcp-egress")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TcpEgressResolveError {
+    /// `host` did not resolve to any address.
+    DnsFailure,
+    /// Every resolved candidate address was denied by the reused egress gate (posture off, the SSRF
+    /// floor, or not in the per-handler `egress_allowlist`).
+    RefusedByGate,
+}
+
+/// The DNS-rebinding choke point for the `tcp-egress` host-terminated outbound-TLS dial
+/// (`PLAN-handler-tcp-egress` Build A, mailroom cap-req #15) — the load-bearing security property
+/// that makes a host-side dial on a guest-supplied hostname safe: resolve `host` **ONCE**, then run
+/// [`tcp_connect_decision`] — the EXACT SAME predicate the gated `wasi:sockets` capability's
+/// `socket_addr_check` closure calls, so this is one source of truth, never a forked copy — against
+/// **EACH** resolved candidate address individually, returning only the addresses that pass. The
+/// caller (`bindings::tcp_egress::TcpEgressHost::connect_tls`) MUST connect to one of the addresses
+/// in the returned `Vec` and must **NEVER** resolve `host` again: a second lookup could return a
+/// DIFFERENT address than the one just checked (the attacker flips their DNS record between the
+/// check and the connect — classic DNS rebinding), which would let an SSRF-floored or
+/// non-allowlisted target slip through a gate that "checks the name" instead of "checks the peer it
+/// is about to dial". Checking (and later connecting to) the SAME resolved `SocketAddr` closes that
+/// window structurally.
+///
+/// A hostname that resolves to SEVERAL addresses (e.g. a dual-stack A/AAAA name) is filtered
+/// per-candidate, not per-name — some addresses may pass while others are denied; only a name whose
+/// EVERY candidate is denied returns [`TcpEgressResolveError::RefusedByGate`].
+#[cfg(feature = "tcp-egress")]
+pub(crate) async fn resolve_and_gate_tcp_egress(
+    host: &str,
+    port: u16,
+    allowlist: &[String],
+    allow_private: bool,
+    posture_tcp_egress: bool,
+) -> Result<Vec<SocketAddr>, TcpEgressResolveError> {
+    // ONE resolution. An IP-literal `host` "resolves" to itself synchronously (no network lookup);
+    // everything else does a real DNS query. Either way, `addrs` is the FINAL, fixed candidate set —
+    // nothing downstream of this function may call `lookup_host` again for this dial.
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| TcpEgressResolveError::DnsFailure)?
+        .collect();
+    if addrs.is_empty() {
+        return Err(TcpEgressResolveError::DnsFailure);
+    }
+    let mut checked = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        if tcp_connect_decision(
+            SocketAddrUse::TcpConnect,
+            addr,
+            allowlist,
+            allow_private,
+            posture_tcp_egress,
+        )
+        .await
+        {
+            checked.push(addr);
+        }
+    }
+    if checked.is_empty() {
+        return Err(TcpEgressResolveError::RefusedByGate);
+    }
+    Ok(checked)
 }
 
 /// The active async-lane mutation (anti-hollow gates), or `None`. Present ONLY under `cfg(test)`
@@ -1399,6 +1494,24 @@ pub struct HandlerEngine {
     /// `allow_tcp_egress` (inbound ≠ outbound authority). It NEVER grants the guest `wasi:sockets`.
     #[cfg_attr(not(feature = "tcp-listener"), allow(dead_code))]
     allow_tcp_listener: bool,
+    /// Per-dial CONNECT timeout for the `tcp-egress` capability (`PLAN-handler-tcp-egress` Build A,
+    /// mailroom #15): bounds the TCP connect AND the TLS handshake together (one "establish the
+    /// connection" budget) so a hung/slow peer can't pin the invocation. Configurable via
+    /// [`with_tcp_egress_timeouts`](Self::with_tcp_egress_timeouts); defaults to
+    /// [`DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT`]. Independent of `allow_tcp_egress` (which gates
+    /// WHETHER a dial is permitted at all; this bounds how long a PERMITTED dial may take).
+    #[cfg(feature = "tcp-egress")]
+    tcp_egress_connect_timeout: Duration,
+    /// Per-dial READ/IDLE timeout for `tcp-egress`: if the peer sends (or accepts) no bytes for this
+    /// long AFTER the handshake, the guest's next read/write on the connection's streams surfaces a
+    /// timeout error instead of hanging forever on a silent peer — there is no outer watchdog loop
+    /// for these streams (unlike the inbound conn lane's `select!`; the guest drives `wasi:io` reads
+    /// on its own schedule, possibly long after `connect-tls` returned), so the bound lives INSIDE
+    /// the stream adapter itself. Configurable via
+    /// [`with_tcp_egress_timeouts`](Self::with_tcp_egress_timeouts); defaults to
+    /// [`DEFAULT_TCP_EGRESS_IDLE_TIMEOUT`].
+    #[cfg(feature = "tcp-egress")]
+    tcp_egress_idle_timeout: Duration,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -1607,6 +1720,10 @@ impl HandlerEngine {
             // Deny-by-default: inbound listeners dispatch only once an operator opts the posture in via
             // `with_tcp_listener`. A node that never calls it can never dispatch a listener connection.
             allow_tcp_listener: false,
+            #[cfg(feature = "tcp-egress")]
+            tcp_egress_connect_timeout: DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT,
+            #[cfg(feature = "tcp-egress")]
+            tcp_egress_idle_timeout: DEFAULT_TCP_EGRESS_IDLE_TIMEOUT,
             limits,
             epoch_ticker,
         })
@@ -1874,6 +1991,20 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_tcp_listener(mut self, allow: bool) -> Self {
         self.allow_tcp_listener = allow;
+        self
+    }
+
+    /// Override the `tcp-egress` capability's per-dial timeouts (`PLAN-handler-tcp-egress` Build A,
+    /// mailroom #15): `connect` bounds the TCP connect + TLS handshake together; `idle` bounds how
+    /// long the peer may go silent after the handshake before the connection's streams surface a
+    /// timeout. Defaults are [`DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT`] / [`DEFAULT_TCP_EGRESS_IDLE_TIMEOUT`]
+    /// when never called. Independent of [`with_tcp_egress`](Self::with_tcp_egress) (which gates
+    /// WHETHER a dial is permitted; this bounds how long a permitted one may take).
+    #[cfg(feature = "tcp-egress")]
+    #[must_use]
+    pub fn with_tcp_egress_timeouts(mut self, connect: Duration, idle: Duration) -> Self {
+        self.tcp_egress_connect_timeout = connect;
+        self.tcp_egress_idle_timeout = idle;
         self
     }
 
@@ -2811,6 +2942,23 @@ impl HandlerEngine {
         bindings::session::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::session::SessionHost::new(state.bindings.session())
         })?;
+        // Host-terminated outbound-TLS egress (`PLAN-handler-tcp-egress` Build A, mailroom #15):
+        // reuses the SAME per-invocation `egress_allowlist` the gated `wasi:sockets` capability
+        // attaches (no new grant kind) + the engine's `allow_tcp_egress`/`allow_private_egress`
+        // posture + its guest-egress extra-CA roots, so the dial is gated identically to a guest's
+        // own `wasi:sockets` connect.
+        #[cfg(feature = "tcp-egress")]
+        bindings::tcp_egress::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::tcp_egress::TcpEgressHost::new(
+                &mut state.table,
+                state.tcp_egress_enabled,
+                state.allow_private_egress,
+                state.bindings.egress_allowlist(),
+                state.guest_egress_extra_roots.clone(),
+                state.tcp_egress_connect_timeout,
+                state.tcp_egress_idle_timeout,
+            )
+        })?;
         Ok(linker)
     }
 
@@ -2933,6 +3081,12 @@ impl HandlerEngine {
             guest_egress_extra_roots: self.guest_egress_extra_roots.clone(),
             egress_depth: 0,
             egress_nonce: self.egress_nonce,
+            #[cfg(feature = "tcp-egress")]
+            tcp_egress_enabled: self.allow_tcp_egress,
+            #[cfg(feature = "tcp-egress")]
+            tcp_egress_connect_timeout: self.tcp_egress_connect_timeout,
+            #[cfg(feature = "tcp-egress")]
+            tcp_egress_idle_timeout: self.tcp_egress_idle_timeout,
             #[cfg(feature = "sql")]
             sql,
         };

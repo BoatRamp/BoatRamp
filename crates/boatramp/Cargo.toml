@@ -66,6 +66,7 @@ default = [
   "blob-upload-cloud",
   "session",
   "tcp-listener",
+  "tcp-egress",
   "cluster",
   "operator",
   "mcp",
@@ -282,6 +283,13 @@ session = ["handlers", "boatramp-server/session"]
 # Experimental; batteries-included in the default build (runtime-opt-in via the posture + a declared
 # `[serve.listeners.<name>]`, so compiling it in binds nothing by itself).
 tcp-listener = ["handlers", "boatramp-server/tcp-listener"]
+# Host-terminated outbound-TLS egress (`boatramp:handlers/tcp-egress`, PLAN-handler-tcp-egress Build
+# A, mailroom cap-req #15): the OUTBOUND mirror of `tcp-listener` — the host DIALS the TCP connection
+# AND TERMINATES TLS, handing a granted guest only plaintext `wasi:io` streams. Reuses the SAME gated
+# `wasi:sockets` grant + per-handler `egress_allowlist` (no new grant kind). Implies `handlers`.
+# Experimental; batteries-included in the default build (runtime-opt-in via the posture +
+# a non-empty per-handler `egress_allowlist`, so compiling it in grants nothing by itself).
+tcp-egress = ["handlers", "boatramp-server/tcp-egress"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

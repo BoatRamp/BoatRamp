@@ -407,6 +407,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The host-terminated outbound-TLS egress capability (`PLAN-handler-tcp-egress` Build A, mailroom
+    // #15): the host dials + terminates TLS on a guest-named `host:port`/`sni` and hands back
+    // plaintext `wasi:io` streams (the guest does zero crypto, never receives `wasi:sockets` for this
+    // surface). Cargo-gated on `tcp-egress` (which pulls the WIT interface + the `TcpEgressHost`
+    // binding); REUSES the `wasi:sockets` grant + per-handler `egress_allowlist` (no new grant kind —
+    // see `capability_token`). A guest declares `requires = ["tcp-egress"]` so a deploy against a host
+    // predating it is refused cleanly (instead of failing to instantiate). Experimental until the shape
+    // (incl. the deferred Build B STARTTLS/`opportunistic` relay path) settles.
+    if cfg!(feature = "tcp-egress") {
+        f.push(CapabilityFeature {
+            name: "tcp-egress",
+            lifecycle: Experimental,
+        });
+    }
     f
 }
 

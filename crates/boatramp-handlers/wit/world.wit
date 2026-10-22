@@ -1390,3 +1390,104 @@ interface tcp-connection-handler {
 world tcp-connection-host {
   export tcp-connection-handler;
 }
+
+/// Value types for the host-terminated outbound-TLS **egress** capability (`PLAN-handler-tcp-egress`
+/// Build A, mailroom cap-req #15): the OUTBOUND mirror of [`tcp-connection-handler`] above. The
+/// literal "the host wraps a guest's `wasi:sockets` outbound connection with TLS" is infeasible
+/// (`wasi:sockets` is served by wasmtime; the guest owns the socket + streams, and the host's only
+/// hook is the pure yes/no `socket_addr_check`). Instead the HOST dials the TCP connection AND
+/// terminates TLS, handing the guest only plaintext `wasi:io` streams — the guest does ZERO crypto,
+/// exactly as a `tcp-connection-host` listener guest never sees `wasi:sockets`.
+interface tcp-egress-types {
+  /// How the host verifies the peer's certificate on `connect-tls`.
+  enum verify-mode {
+    /// Full verification: webpki roots **⊕** the operator's `extra_roots` (the SAME trust set
+    /// [`guest_egress_client_config`] builds for guest `wasi:http` egress), an explicit `aws-lc-rs`
+    /// crypto provider, and a full certificate-chain + hostname check against the dialed `sni`. The
+    /// ONLY mode this host build implements.
+    strict,
+    /// A relaxed/pinned verifier for a Build B STARTTLS relay path (e.g. a mail relay whose
+    /// certificate the host cannot chain to a public root). This host build REFUSES it with
+    /// `unsupported-verify-mode` rather than implementing a relaxed verifier.
+    opportunistic,
+  }
+
+  /// Why a dial failed.
+  variant egress-error {
+    /// Denied by the reused egress gate — the node posture (`allow_guest_tcp_egress`) is off, the
+    /// resolved peer is not in the per-handler `egress_allowlist`, or it fails the `is_global_ip`
+    /// SSRF floor (unless `allow_guest_private_egress` is also on). Deliberately UNDIFFERENTIATED
+    /// beyond this: a guest must not be able to use the error to probe WHICH check failed or learn
+    /// internal network topology.
+    refused-by-gate,
+    /// `host` did not resolve to any address.
+    dns-failure,
+    /// The TCP connect, or the TLS handshake, did not complete within the host's configured
+    /// per-dial connect timeout.
+    connect-timeout,
+    /// The TCP connect failed for a reason other than a timeout (e.g. connection refused). Carries
+    /// a client-safe reason.
+    connect-failed(string),
+    /// The TLS handshake failed (certificate verification, protocol mismatch, ALPN, ...). Carries a
+    /// client-safe reason — never raw peer bytes.
+    tls-failure(string),
+    /// `verify-mode.opportunistic` was requested; this host build implements `strict` only.
+    unsupported-verify-mode,
+    /// Any other host-side failure establishing the connection.
+    other(string),
+  }
+}
+
+/// The host-terminated outbound-TLS egress capability (Build A: implicit-TLS only — the PULL path).
+/// Reuses the EXACT SAME grant as the gated `wasi:sockets` outbound-TCP capability
+/// (`PLAN-handler-tcp-egress`): a deploy declares `wasi:sockets` (not a separate token), and the SAME
+/// per-handler `egress_allowlist` + node posture (`allow_guest_tcp_egress`) gate every dial through
+/// the identical enforced predicate. No new grant kind.
+interface tcp-egress {
+  // wasi:io version-pinned (0.2.3) so it matches the wasi:io the host serves — the SAME pin
+  // `tcp-connection-handler` uses, so a component holding streams from EITHER surface sees the same
+  // resource type.
+  use wasi:io/streams@0.2.3.{input-stream, output-stream};
+  use tcp-egress-types.{verify-mode, egress-error};
+
+  /// One host-dialed, host-terminated-TLS outbound connection. The guest never holds
+  /// `wasi:sockets` — this resource (and the `wasi:io` streams it hands out) is its entire network
+  /// surface for the dial. Dropping it without an explicit `shutdown-output` closes the socket
+  /// abruptly (no TLS `close_notify`).
+  ///
+  /// Forward-compatibility note (Build B, STARTTLS): a `start-tls(sni: string, verify: verify-mode)
+  /// -> result<_, egress-error>` method is designed to be ADDED here (append-only) alongside a new
+  /// plaintext `connect` function, so a guest can speak a protocol's plaintext greeting/negotiation
+  /// over `take-input`/`take-output` and then upgrade THIS SAME resource in place. Build A implements
+  /// implicit-TLS only — `connect-tls` already completes the handshake before returning, so
+  /// `take-input`/`take-output` are meant to be called exactly once, immediately.
+  resource connection {
+    /// Take ownership of the connection's readable half (the host-constructed `wasi:io`
+    /// `input-stream` — the SAME resource type a `tcp-connection-handler` listener guest receives).
+    /// Callable once; a second call (or a call after the connection closed) returns `none`.
+    take-input: func() -> option<input-stream>;
+    /// Take ownership of the connection's writable half (`wasi:io` `output-stream`). Callable once;
+    /// a second call returns `none`.
+    take-output: func() -> option<output-stream>;
+    /// Half-close the write side (TLS `close_notify`, then TCP shutdown-write) if `take-output` has
+    /// NOT already handed it off as a separate resource — a no-op once the write half has been
+    /// taken (the guest then closes it by dropping/closing that resource itself) or after a previous
+    /// `shutdown-output`. Idempotent.
+    shutdown-output: func();
+  }
+
+  /// Dial `host:port`, verify the peer's certificate against `sni` per `verify`, and terminate TLS
+  /// host-side. On success the guest gets a plaintext `connection`; the WHOLE dial — DNS resolve,
+  /// the reused per-handler `egress_allowlist` + SSRF-floor gate, TCP connect, and the TLS handshake
+  /// — runs host-side under the host's per-dial connect timeout. Only `verify-mode.strict` is
+  /// implemented in this build (`opportunistic` is refused with `unsupported-verify-mode`).
+  connect-tls: func(host: string, port: u16, sni: string, verify: verify-mode) -> result<connection, egress-error>;
+}
+
+/// Import-only world for the `tcp-egress` host binding (the `TcpEgressHost` Host impl), mirroring
+/// `blob-upload-host` / `session-import-host`. `@unstable`, off by default (cargo feature
+/// `tcp-egress`, Experimental lifecycle). A guest WIT addition ⇒ a shim rev + a
+/// `HOST_HANDLERS_VERSION` bump.
+world tcp-egress-host {
+  import tcp-egress;
+}

@@ -198,6 +198,15 @@ session = ["handlers", "boatramp-handlers/session"]
 # the `tcp_listener_serve` accept-loop module + the capability advert. Implies `handlers`. Experimental.
 tcp-listener = ["handlers", "boatramp-handlers/tcp-listener"]
 
+# Host-terminated outbound-TLS egress (`boatramp:handlers/tcp-egress`, PLAN-handler-tcp-egress
+# Build A, mailroom cap-req #15): the OUTBOUND mirror of `tcp-listener` — the host DIALS the TCP
+# connection AND TERMINATES TLS, handing a granted guest only plaintext `wasi:io` streams (the guest
+# does zero crypto and never receives `wasi:sockets` for this surface). Reuses the SAME gated
+# `wasi:sockets` grant + per-handler `egress_allowlist` + the node posture `allow_guest_tcp_egress`
+# (no new grant kind). Gates the `HandlerRuntime`'s `TcpEgressHost` wiring + the capability advert.
+# Implies `handlers`. Experimental.
+tcp-egress = ["handlers", "boatramp-handlers/tcp-egress"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

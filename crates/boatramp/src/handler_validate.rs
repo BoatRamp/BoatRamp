@@ -196,6 +196,16 @@ mod imp {
             // → "disallowed interface", so `capabilities --check`/`sync` refused any component using it —
             // the construens presigned-ingress gap.
             ("boatramp:handlers", "blob-upload" | "blob-upload-types") => Some("blob-upload"),
+            // The host-terminated outbound-TLS egress capability (`PLAN-handler-tcp-egress` Build A,
+            // mailroom cap-req #15): the host dials + terminates TLS on a guest-named `host:port`/`sni`
+            // and hands back plaintext `wasi:io` streams — the guest NEVER imports `wasi:sockets`
+            // itself for this surface. It REUSES the `wasi:sockets` token (not a new grant kind): a
+            // deploy that already declares `wasi:sockets` (for the raw gated outbound-TCP capability)
+            // ALSO authorizes a component using `tcp-egress`, and the runtime dial applies the IDENTICAL
+            // posture + SSRF + per-handler `egress_allowlist` gate (`tcp_connect_decision`, shared with
+            // the raw capability — one source of truth). A component `use`s `tcp-egress-types` and
+            // imports `tcp-egress`; both label as this token.
+            ("boatramp:handlers", "tcp-egress-types" | "tcp-egress") => Some("wasi:sockets"),
             _ => None,
         }
     }
@@ -207,7 +217,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 7, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 8, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]

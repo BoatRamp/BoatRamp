@@ -55,6 +55,13 @@ pub mod session;
 pub mod sql;
 #[cfg(feature = "sql")]
 pub mod target_context;
+/// The host-terminated outbound-TLS egress binding (`boatramp:handlers/tcp-egress`,
+/// `PLAN-handler-tcp-egress` Build A, mailroom cap-req #15): the host dials + terminates TLS on a
+/// guest-named `host:port`/`sni` and hands back plaintext `wasi:io` streams — the guest never holds
+/// `wasi:sockets`. Its own off-by-default `tcp-egress` feature; reuses the gated `wasi:sockets`
+/// grant + `egress_allowlist` (no new grant kind).
+#[cfg(feature = "tcp-egress")]
+pub mod tcp_egress;
 /// Gap 3: `present-token` host-seals an in-guest-verified tenant onto the producer-context cell the
 /// `messaging` binding stamps — a messaging-lane concern, so gated with `messaging`.
 #[cfg(feature = "messaging")]
