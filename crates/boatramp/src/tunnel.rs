@@ -449,8 +449,8 @@ mod tests {
     // relay + served egress + TCP echo backend) with a mock `ControlPlane` that mints a dial
     // capability the SAME way the real `POST /api/overlay/dial` handler does
     // (`cose::mint_overlay_dial`) — proving the FULL path: a hand-written SOCKS5 client (NOT built
-    // on the core's own codec, so this is real wire interop, not self-agreement) CONNECTs a bare
-    // service name, the core resolves+mints+dials, and the echo round-trips relay-blind E2EE →
+    // on the core's own codec, so this is real wire interop, not self-agreement) issues a CONNECT
+    // to a bare service name, the core resolves+mints+dials, and the echo round-trips relay-blind E2EE →
     // egress → backend. Also records exactly what the mock `ControlPlane` was asked to resolve,
     // proving the plan §5 IP-as-local-handle invariant end to end: only a service NAME ever reaches
     // the control plane, never an address.
