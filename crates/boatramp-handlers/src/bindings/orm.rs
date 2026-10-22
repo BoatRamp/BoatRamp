@@ -20,19 +20,9 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/orm-host",
-        async: {
-            only_imports: [
-                "[method]database.select",
-                "[method]database.insert",
-                "[method]database.update",
-                "[method]database.delete",
-                "[method]database.delete-returning",
-                "[method]database.promote",
-                "[method]database.attach-reference",
-            ],
-        },
+        imports: { default: async },
         with: {
-            "boatramp:handlers/orm/database": super::OrmDatabase,
+            "boatramp:handlers/orm.database": super::OrmDatabase,
         },
     });
 }
@@ -62,7 +52,7 @@ impl<'a> OrmHost<'a> {
 }
 
 impl wit::Host for OrmHost<'_> {
-    fn open(&mut self, name: String) -> Result<Resource<OrmDatabase>, wit::Error> {
+    async fn open(&mut self, name: String) -> Result<Resource<OrmDatabase>, wit::Error> {
         if !self.session.granted(&name) {
             return Err(not_granted(&name));
         }
@@ -327,7 +317,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
 
-    fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
         // Dropping a handle does not end the transaction — the engine finalizes the
         // invocation (commit/rollback). The transaction is shared with the `sql` binding.
         self.table.delete(db)?;
@@ -922,11 +912,16 @@ fn backend_err(err: boatramp_core::sql::SqlError) -> wit::Error {
 }
 
 /// Add the `orm` interface to `linker`, resolving the per-invocation [`OrmHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = OrmHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> OrmHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> OrmHost<'_>,
 ) -> wasmtime::Result<()> {
-    wit::add_to_linker_get_host(linker, host)
+    wit::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
@@ -1085,7 +1080,7 @@ mod tests {
         )));
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let err = host
             .select(db, empty_select("work_order"))
             .await
@@ -1103,7 +1098,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.select(db, empty_select("work_order")).await.unwrap();
         }
         let log = log.lock().unwrap();
@@ -1123,7 +1118,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             let rep = db.rep();
 
             // SELECT * FROM live UNION SELECT * FROM archived — BOTH sides must be scoped.
@@ -1179,7 +1174,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             let rep = db.rep();
 
             // SELECT id FROM work_order WHERE tenant_id=? AND project_id=? ORDER BY created_at DESC LIMIT 10
@@ -1266,7 +1261,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
 
         let sel = wit::SelectQuery {
             exprs: vec![
@@ -1332,7 +1327,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
 
             let sel = wit::SelectQuery {
                 exprs: vec![
@@ -1392,7 +1387,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let sel = wit::SelectQuery {
             preds: vec![wit::PredNode::Negate(0)], // 0 references 0 → cycle
             filter: Some(0),
@@ -1412,7 +1407,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let sel = wit::SelectQuery {
             exprs: vec![
                 col("id"),                                         // 0
@@ -1466,7 +1461,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         host.select(db, correlated_count_select()).await.unwrap();
         let log = log.lock().unwrap();
         assert!(
@@ -1484,7 +1479,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         // SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)
         let sel = wit::SelectQuery {
             exprs: vec![
@@ -1523,7 +1518,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let sel = wit::SelectQuery {
             preds: vec![cmp(0, wit::CmpOp::Eq, 2)], // element.order_id = <the roll-up expr 2>
             ..correlated_count_select()
@@ -1540,7 +1535,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let err = host
             .select(db, correlated_count_select())
             .await
@@ -1555,7 +1550,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let upd = wit::UpdateQuery {
             exprs: vec![lit(wit::Value::Integer(1))],
             preds: vec![wit::PredNode::Conj(vec![])], // empty AND, no scope
@@ -1581,7 +1576,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // DELETE FROM payment WHERE id = ?1
             let del = wit::DeleteQuery {
                 exprs: vec![col("id"), lit(text("pay_1"))],
@@ -1608,7 +1603,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug (consume-and-read)
             let del = wit::DeleteQuery {
                 exprs: vec![col("slug"), lit(text("acme"))],
@@ -1636,7 +1631,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t
             let sel = wit::SelectQuery {
                 exprs: vec![
@@ -1668,7 +1663,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // SELECT slug FROM pending_signup WHERE slug=?1 UNION SELECT slug FROM reserved WHERE slug=?2
             let branch = wit::SelectBody {
                 exprs: vec![col("slug"), lit(text("acme"))],
@@ -1713,7 +1708,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1
             let source = wit::SelectBody {
                 exprs: vec![col("x"), col("id"), lit(text("s1"))],
@@ -1758,7 +1753,7 @@ mod tests {
         let mut sess = session(&log);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let del = wit::DeleteQuery {
             exprs: vec![],
             preds: vec![wit::PredNode::Conj(vec![])], // empty AND, no scope
@@ -1778,7 +1773,7 @@ mod tests {
         let mut sess = session(&log); // only the default "" is granted
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        assert!(host.open("nope".into()).is_err());
+        assert!(host.open("nope".into()).await.is_err());
     }
 
     /// Append-only drift guard for the shared `sql-types.value` variant (PLAN v2).
@@ -1871,7 +1866,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             let ins = wit::InsertQuery {
                 exprs: vec![lit(text("Hello"))],
                 table: "products".into(),
@@ -1908,7 +1903,7 @@ mod tests {
         let mut sess = target_write_session(&log, &["title"]);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let ins = wit::InsertQuery {
             exprs: vec![lit(wit::Value::Integer(9))],
             table: "products".into(),
@@ -1943,7 +1938,7 @@ mod tests {
         let mut sess = target_write_session(&log, &[]);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let ins = wit::InsertQuery {
             exprs: vec![lit(text("x"))],
             table: "products".into(),
@@ -1973,7 +1968,7 @@ mod tests {
         let mut sess = target_write_session(&log, &[]); // read-only target
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let q = wit::AttachReferenceQuery {
             exprs: vec![lit(text("prod_1")), lit(text("nice"))],
             child: "favorites".into(),
@@ -2005,7 +2000,7 @@ mod tests {
         let mut sess = target_write_session(&log, &["title"]);
         let mut table = ResourceTable::new();
         let mut host = OrmHost::new(&mut table, &mut sess);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let del = wit::DeleteQuery {
             exprs: vec![col("id"), lit(text("p1"))],
             preds: vec![cmp(0, wit::CmpOp::Eq, 1)],

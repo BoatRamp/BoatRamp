@@ -47,11 +47,16 @@ impl target_context::Host for TargetContextHost {
 
 /// Add the `target-context` interface to `linker`, resolving the per-invocation [`TargetContextHost`]
 /// view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = TargetContextHost;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> TargetContextHost + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> TargetContextHost,
 ) -> wasmtime::Result<()> {
-    target_context::add_to_linker_get_host(linker, host)
+    target_context::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

@@ -381,7 +381,7 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     }
     // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress): connect-only,
     // per-handler-allowlisted, posture-gated (`allow_guest_tcp_egress`, off under multi-tenant). The
-    // socket host is ALWAYS linked when the engine is compiled (`wasmtime_wasi::add_to_linker_async`),
+    // socket host is ALWAYS linked when the engine is compiled (`wasmtime_wasi::p2::add_to_linker_async`),
     // so host SUPPORT is advertised whenever handlers are — the posture/allowlist are a separate
     // RUNTIME decision, exactly like `wasi:http` egress is advertised yet SSRF-gated at runtime. A
     // guest declares `requires = ["wasi:sockets"]` so a deploy against a host predating it is refused

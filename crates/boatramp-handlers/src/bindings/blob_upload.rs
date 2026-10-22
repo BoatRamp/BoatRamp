@@ -44,9 +44,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/blob-upload-host",
-        async: {
-            only_imports: ["mint"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -580,11 +578,16 @@ impl blob_upload::Host for BlobUploadHost<'_> {
 
 /// Add the `blob-upload` interface to `linker`, resolving the per-invocation [`BlobUploadHost`] via
 /// `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = BlobUploadHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> BlobUploadHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> BlobUploadHost<'_>,
 ) -> wasmtime::Result<()> {
-    blob_upload::add_to_linker_get_host(linker, host)
+    blob_upload::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

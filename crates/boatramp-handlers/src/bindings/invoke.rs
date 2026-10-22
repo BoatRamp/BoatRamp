@@ -17,11 +17,9 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/invoke-host",
-        async: {
-            only_imports: ["invoke", "invoke-streaming", "[method]incoming-response.read"],
-        },
+        imports: { default: async },
         with: {
-            "boatramp:handlers/invoke/incoming-response": super::IncomingResponse,
+            "boatramp:handlers/invoke.incoming-response": super::IncomingResponse,
         },
     });
 }
@@ -292,11 +290,11 @@ impl invoke_iface::Host for InvokeHost<'_> {
 }
 
 impl invoke_iface::HostIncomingResponse for InvokeHost<'_> {
-    fn status(&mut self, resp: Resource<IncomingResponse>) -> u16 {
+    async fn status(&mut self, resp: Resource<IncomingResponse>) -> u16 {
         self.table.get(&resp).map(|r| r.status).unwrap_or(0)
     }
 
-    fn headers(&mut self, resp: Resource<IncomingResponse>) -> Vec<invoke_types::Header> {
+    async fn headers(&mut self, resp: Resource<IncomingResponse>) -> Vec<invoke_types::Header> {
         self.table
             .get(&resp)
             .map(|r| {
@@ -326,7 +324,7 @@ impl invoke_iface::HostIncomingResponse for InvokeHost<'_> {
             .map_err(invoke_types::Error::Failed)
     }
 
-    fn drop(&mut self, resp: Resource<IncomingResponse>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resp: Resource<IncomingResponse>) -> wasmtime::Result<()> {
         self.table.delete(resp)?;
         Ok(())
     }
@@ -365,11 +363,16 @@ fn target_matches(pattern: &str, name: &str) -> bool {
 
 /// Add the `invoke` interface to `linker`, resolving the per-invocation
 /// [`InvokeHost`] view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = InvokeHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> InvokeHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> InvokeHost<'_>,
 ) -> wasmtime::Result<()> {
-    invoke_iface::add_to_linker_get_host(linker, host)
+    invoke_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
@@ -542,8 +545,8 @@ mod tests {
         let owned = host.invoke_streaming("x".into(), req()).await.unwrap();
         let rep = owned.rep();
         // Status + headers are available before the body is read.
-        assert_eq!(host.status(Resource::new_borrow(rep)), 206);
-        let headers = host.headers(Resource::new_borrow(rep));
+        assert_eq!(host.status(Resource::new_borrow(rep)).await, 206);
+        let headers = host.headers(Resource::new_borrow(rep)).await;
         assert!(headers.iter().any(|h| h.name == "content-type"));
 
         // Read in small 4-byte bites: the body reassembles across reads, and the empty
@@ -565,6 +568,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        host.drop(owned).unwrap();
+        host.drop(owned).await.unwrap();
     }
 }

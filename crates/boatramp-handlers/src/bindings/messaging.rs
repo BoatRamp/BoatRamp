@@ -16,15 +16,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/messaging-host",
-        async: {
-            only_imports: [
-                "publish",
-                "publish-batch",
-                "publish-delayed",
-                "publish-with-ttl",
-                "publish-with-priority",
-            ],
-        },
+        imports: { default: async },
     });
 }
 
@@ -239,11 +231,16 @@ impl messaging_producer::Host for MessagingHost<'_> {
 
 /// Add the `messaging-producer` interface to `linker`, resolving the
 /// per-invocation [`MessagingHost`] view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = MessagingHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> MessagingHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> MessagingHost<'_>,
 ) -> wasmtime::Result<()> {
-    messaging_producer::add_to_linker_get_host(linker, host)
+    messaging_producer::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

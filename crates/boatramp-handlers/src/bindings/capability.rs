@@ -23,9 +23,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/capability-host",
-        async: {
-            only_imports: ["mint"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -140,11 +138,16 @@ impl capability_minter::Host for CapabilityHost<'_> {
 
 /// Add the `capability-minter` interface to `linker`, resolving the per-invocation
 /// [`CapabilityHost`] view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = CapabilityHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> CapabilityHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> CapabilityHost<'_>,
 ) -> wasmtime::Result<()> {
-    capability_minter::add_to_linker_get_host(linker, host)
+    capability_minter::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

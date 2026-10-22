@@ -80,11 +80,16 @@ impl logging_iface::Host for WasiLoggingHost<'_> {
 }
 
 /// Add the `wasi:logging` interface to `linker`, resolving the per-invocation host via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = WasiLoggingHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> WasiLoggingHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> WasiLoggingHost<'_>,
 ) -> wasmtime::Result<()> {
-    logging_iface::add_to_linker_get_host(linker, host)
+    logging_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

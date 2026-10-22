@@ -319,10 +319,10 @@ wit-component = "0.252"
 wit-parser = "0.252"
 
 # WebAssembly handler engine (compiled only with the handler `engine` feature).
-wasmtime = { version = "30", features = ["component-model", "async"] }
-wasmtime-wasi = "30"
-wasmtime-wasi-http = "30"
-wasmtime-wasi-io = "30"
+wasmtime = { version = "50", features = ["component-model", "async"] }
+wasmtime-wasi = "50"
+wasmtime-wasi-http = "50"
+wasmtime-wasi-io = "50"
 http = "1"
 http-body-util = "0.1"
 hyper = "1"

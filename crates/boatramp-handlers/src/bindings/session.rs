@@ -14,9 +14,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/session-import-host",
-        async: {
-            only_imports: ["send", "checkpoint", "close"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -106,11 +104,16 @@ impl session_iface::Host for SessionHost<'_> {
 }
 
 /// Add the `session` interface to `linker`, resolving the per-invocation [`SessionHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = SessionHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> SessionHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> SessionHost<'_>,
 ) -> wasmtime::Result<()> {
-    session_iface::add_to_linker_get_host(linker, host)
+    session_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

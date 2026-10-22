@@ -1,6 +1,7 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -17,12 +18,12 @@ use lru::LruCache;
 use tokio::sync::Semaphore;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::{IoView, SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi_http::bindings::ProxyPre;
-use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
-use wasmtime_wasi_http::body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody};
-use wasmtime_wasi_http::types::HostIncomingRequest;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi::sockets::SocketAddrUse;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
+use wasmtime_wasi_http::p2::body::{HyperIncomingBody, HyperOutgoingBody};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use crate::bindings::{self, Bindings};
 use crate::concurrency::KeyedSemaphores;
@@ -35,7 +36,8 @@ mod consumer_world {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/consumer",
-        async: true,
+        imports: { default: async },
+        exports: { default: async },
     });
 }
 
@@ -48,13 +50,14 @@ mod session_world {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/session-host",
-        async: true,
+        imports: { default: async },
+        exports: { default: async },
     });
 }
 
 // The tcp-connection-host world: the export caller for `tcp-connection-handler.handle`, which the host
 // re-enters ONCE per already-accepted inbound connection (PLAN-handler-tcp-inbound). The world EXPORTS
-// the handler and imports only `wasi:io` — mapped here to the SAME `wasmtime_wasi::bindings::io` host
+// the handler and imports only `wasi:io` — mapped here to the SAME `wasmtime_wasi::p2::bindings::io` host
 // types the engine linker already serves (`add_to_linker_async`), so the `input-stream`/`output-stream`
 // the host pushes into the store table (`AsyncReadStream`/`AsyncWriteStream`) are the resource type the
 // generated `call_handle` expects. The guest receives NO `wasi:sockets` (the socket host's deny-all
@@ -64,9 +67,10 @@ mod tcp_connection_world {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/tcp-connection-host",
-        async: true,
+        imports: { default: async },
+        exports: { default: async },
         with: {
-            "wasi:io": wasmtime_wasi::bindings::io,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
         },
     });
 }
@@ -112,7 +116,6 @@ impl std::hash::Hasher for Sha256Hasher {
 fn base_config(cache_dir: Option<&Path>) -> Result<Config, HandlerError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.async_support(true);
     config.epoch_interruption(true);
     config.consume_fuel(true);
     configure_compile_cache(&mut config, cache_dir);
@@ -124,86 +127,62 @@ fn base_config(cache_dir: Option<&Path>) -> Result<Config, HandlerError> {
 /// cranelift compile. Best-effort throughout: any failure logs a warning and degrades to no caching
 /// rather than failing engine construction.
 ///
-/// When `cache_dir` is `Some`, the cache is pinned to `<cache_dir>/wasmtime-cache` on the operator's
-/// **persistent data volume**. This matters because wasmtime's default location
-/// (`cache_config_load_default`) resolves to `~/.cache/wasmtime` — the *ephemeral container rootfs* on
-/// a distroless node — so it is WIPED on every restart/roll, and the first visitor after each deploy
-/// then eats the full compile (and, on a small node, a concurrent burst stampedes behind it). `None`
-/// (tests, or a caller without a data dir) falls back to that ephemeral default, still best-effort.
+/// `cache_dir` is the operator's **persistent data volume**; the cache is pinned to
+/// `<cache_dir>/wasmtime-cache` via wasmtime's programmatic [`wasmtime::Cache`] API (wasmtime 49+ —
+/// no config file on disk). This matters because wasmtime's default location resolves to
+/// `~/.cache/wasmtime` — the *ephemeral container rootfs* on a distroless node — so it would be WIPED
+/// on every restart/roll, and the first visitor after each deploy would eat the full compile (and, on
+/// a small node, a concurrent burst stampedes behind it). `None` (tests, or a caller without a data
+/// dir) leaves caching disabled.
 fn configure_compile_cache(config: &mut Config, cache_dir: Option<&Path>) {
-    // `#[cfg(test)]` severance seam: when forced, ignore the data dir and take the `None` (default,
-    // ephemeral) branch even though a dir was threaded — so the durability gate can prove its
-    // "cache files land under the data volume" assertion actually depends on this pinning (the
-    // mutation makes it land at the default location instead → the gate's data-dir check goes empty).
+    // `#[cfg(test)]` severance seam: when forced, ignore the data dir and take the `None` (no-cache)
+    // branch even though a dir was threaded — so the durability gate can prove its "cache files land
+    // under the data volume" assertion actually depends on this pinning (the mutation makes nothing
+    // land there → the gate's data-dir check goes empty).
     #[cfg(test)]
     let cache_dir = if compile_cache_mutation_forces_default() {
         None
     } else {
         cache_dir
     };
-    match cache_dir {
-        Some(dir) => {
-            if let Err(e) = enable_persistent_compile_cache(config, dir) {
-                tracing::warn!(
-                    target: "boatramp::handler",
-                    data_dir = %dir.display(),
-                    error = %e,
-                    "wasm compile cache could not be pinned to the data volume; serving continues \
-                     WITHOUT a persisted cache (components recompile on the first request after each restart)"
-                );
-            }
+    let Some(dir) = cache_dir else {
+        // No data dir (tests, or a caller without one): leave caching disabled.
+        return;
+    };
+    match build_persistent_cache(dir) {
+        Ok(cache) => {
+            config.cache(Some(cache));
         }
-        None => {
-            // `cache_config_load_default()` itself returns an error when it cannot resolve a default
-            // directory (e.g. no `$HOME` on a container) — swallow that rather than failing engine
-            // construction, honoring the best-effort contract (the prior code's `?` could hard-fail boot).
-            if let Err(e) = config.cache_config_load_default() {
-                tracing::debug!(
-                    target: "boatramp::handler",
-                    error = %e,
-                    "wasm compile cache not enabled (no default cache dir resolvable); serving continues uncached"
-                );
-            }
-        }
+        Err(e) => tracing::warn!(
+            target: "boatramp::handler",
+            data_dir = %dir.display(),
+            error = %e,
+            "wasm compile cache could not be pinned to the data volume; serving continues WITHOUT a \
+             persisted cache (components recompile on the first request after each restart)"
+        ),
     }
 }
 
-/// Pin the compile cache to `<data_dir>/wasmtime-cache` by generating a wasmtime cache-config TOML at
-/// `<data_dir>/wasmtime-cache.toml` and loading it. wasmtime 30's only programmatic cache knob is
-/// `cache_config_load(path)` (a TOML file); there is no in-memory `Cache` type until a later release.
-/// Returns an error (for the caller to log + degrade) if the dir can't be created or the config can't
-/// be written/loaded.
-fn enable_persistent_compile_cache(
-    config: &mut Config,
-    data_dir: &Path,
-) -> Result<(), HandlerError> {
+/// Build a persistent [`wasmtime::Cache`] pinned to `<data_dir>/wasmtime-cache` on the operator's data
+/// volume. Returns an error (for the caller to log + degrade) if the dir can't be created or the cache
+/// can't be built. The directory is created `0700` (defense-in-depth: the cache holds EXECUTABLE
+/// native artifacts a cache hit loads as host code, so a group/other-writable `/data` must not let
+/// another local principal plant a forged one; it is not content-MAC'd).
+fn build_persistent_cache(data_dir: &Path) -> Result<wasmtime::Cache, HandlerError> {
     let cache_root = data_dir.join("wasmtime-cache");
     std::fs::create_dir_all(&cache_root)
         .map_err(|e| HandlerError::Internal(format!("create {}: {e}", cache_root.display())))?;
-    // Security (defense-in-depth): the cache holds EXECUTABLE native artifacts — a wasmtime cache hit
-    // loads compiled host code — so a group/other-writable `/data` must not let another local principal
-    // plant a forged artifact (it is not content-MAC'd). Restrict to owner-only, best-effort.
     restrict_perms(&cache_root, 0o700);
-    // TOML-basic-string escape the directory (backslash + quote) so a Windows-style or quote-bearing
-    // data dir can never produce invalid TOML.
-    let escaped = cache_root
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let toml = format!("[cache]\nenabled = true\ndirectory = \"{escaped}\"\n");
-    let toml_path = data_dir.join("wasmtime-cache.toml");
-    std::fs::write(&toml_path, toml)
-        .map_err(|e| HandlerError::Internal(format!("write {}: {e}", toml_path.display())))?;
-    restrict_perms(&toml_path, 0o600);
-    config
-        .cache_config_load(&toml_path)
-        .map_err(|e| HandlerError::Internal(format!("load {}: {e}", toml_path.display())))?;
+    let mut cache_config = wasmtime::CacheConfig::new();
+    cache_config.with_directory(&cache_root);
+    let cache = wasmtime::Cache::new(cache_config)
+        .map_err(|e| HandlerError::Internal(format!("build wasm compile cache: {e}")))?;
     tracing::info!(
         target: "boatramp::handler",
         cache_dir = %cache_root.display(),
         "wasm compile cache pinned to the persistent data volume (survives restarts)"
     );
-    Ok(())
+    Ok(cache)
 }
 
 /// Best-effort restrict a path to owner-only (`0o700` for the cache dir, `0o600` for its config) on
@@ -497,23 +476,11 @@ struct HostState {
     http: WasiHttpCtx,
     limits: MemLimiter,
     bindings: Bindings,
-    /// Ceiling on this invocation's outbound `wasi:http` connect + first-byte
-    /// wait (from the engine), independent of the invocation's own timeout.
-    outbound_timeout: Option<Duration>,
-    /// Whether this invocation's guest outbound `wasi:http` may reach a private/loopback
-    /// address (from the engine's `allow_private_egress`). `false` is the SSRF default.
-    allow_private_egress: bool,
-    /// The instance's own serve socket(s) a guest self-call may reach (empty ⇒ self-egress
-    /// off). Copied from the engine.
-    self_egress_addrs: Arc<[SocketAddr]>,
-    /// Operator-supplied EXTRA trust anchors for this invocation's guest egress TLS client (copied
-    /// from the engine's `guest_egress_extra_roots`). Empty ⇒ the stock webpki-only sender.
-    guest_egress_extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
-    /// This invocation's inbound self-egress recursion depth: 0 for an external request, or
-    /// the value a parent self-call stamped (validated against [`egress_nonce`](Self::egress_nonce)).
-    egress_depth: u32,
-    /// The per-process nonce that authenticates a self-egress depth marker.
-    egress_nonce: u64,
+    /// This invocation's guest-egress policy, carried as the `wasi:http` [`WasiHttpHooks`] so the
+    /// SSRF guard + self-egress-depth cap + dev-posture extra-CA send run on every guest outbound
+    /// request. (wasmtime 49 moved the outbound-send override off `WasiHttpView::send_request` onto
+    /// this hooks type; [`GuestEgressHooks`] carries the per-invocation config.)
+    http_hooks: GuestEgressHooks,
     /// Whether this invocation's guest may dial out through the `tcp-egress` capability (copied
     /// from the engine's `allow_tcp_egress` posture — the EXACT SAME flag that gates the raw
     /// `wasi:sockets` outbound-TCP capability, `PLAN-handler-tcp-egress` Build A / mailroom #15). No
@@ -545,96 +512,120 @@ impl HostState {
     }
 }
 
-impl IoView for HostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 impl WasiHttpView for HostState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.http
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            hooks: &mut self.http_hooks,
+            table: &mut self.table,
+            ctx: &mut self.http,
+        }
     }
+}
 
-    /// SSRF egress guard for **guest** outbound HTTP: before
-    /// sending, resolve the destination and refuse it if any resolved address is
-    /// not globally routable (loopback / private / link-local / CGNAT / the
-    /// cloud-metadata IP). An adversarial guest therefore cannot reach internal
-    /// infrastructure via `wasi:http`; public destinations pass through to the
-    /// default sender. (The operator-config `proxy` rewrite has its own,
-    /// IP-pinning guard in the server.)
+/// Per-invocation guest-egress policy, carried as the `wasi:http` [`WasiHttpHooks`] — wasmtime 49
+/// moved the outbound-send override here from `WasiHttpView::send_request`. The security logic is
+/// unchanged from the pre-49 override: resolve-and-refuse a non-globally-routable target (SSRF),
+/// depth-cap a self-call over loopback, and widen TLS trust ONLY when an operator supplied extra
+/// roots (the dev-posture option). `Default` ⇒ the closed posture (no private egress, no
+/// self-egress, stock webpki trust).
+#[derive(Default)]
+struct GuestEgressHooks {
+    /// Ceiling on this invocation's outbound connect + first-byte wait (from the engine).
+    outbound_timeout: Option<Duration>,
+    /// Whether this invocation may reach a private/loopback address. `false` is the SSRF default.
+    allow_private_egress: bool,
+    /// The instance's own serve socket(s) a guest self-call may reach (empty ⇒ self-egress off).
+    self_egress_addrs: Arc<[SocketAddr]>,
+    /// Operator-supplied EXTRA trust anchors for this invocation's egress TLS client. Empty ⇒ the
+    /// stock webpki-only sender.
+    guest_egress_extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+    /// This invocation's inbound self-egress recursion depth (validated against `egress_nonce`).
+    egress_depth: u32,
+    /// The per-process nonce that authenticates a self-egress depth marker.
+    egress_nonce: u64,
+}
+
+impl WasiHttpHooks for GuestEgressHooks {
+    /// SSRF egress guard for **guest** outbound HTTP: before sending, resolve the destination and
+    /// refuse it if any resolved address is not globally routable (loopback / private / link-local /
+    /// CGNAT / the cloud-metadata IP). An adversarial guest therefore cannot reach internal
+    /// infrastructure via `wasi:http`; public destinations pass through to the default sender. (The
+    /// operator-config `proxy` rewrite has its own IP-pinning guard in the server.)
     fn send_request(
         &mut self,
-        request: http::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        mut config: wasmtime_wasi_http::types::OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        // Bound a hung upstream on its own terms (connect + first byte), so it
-        // can't silently ride the whole invocation budget. `None` keeps the
-        // wasmtime default. The between-bytes timeout is left alone so a slow
-        // streaming body (e.g. an LLM token stream) is not cut mid-flight.
+        mut request: http::Request<wasmtime_wasi_http::WasiBody>,
+        options: Option<wasmtime_wasi_http::RequestOptions>,
+        _fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        http::Response<wasmtime_wasi_http::WasiBody>,
+                        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+                    ),
+                    wasmtime_wasi_http::Error,
+                >,
+            > + Send,
+    > {
+        // Bound a hung upstream on its own terms (connect + first byte), so it can't silently ride
+        // the whole invocation budget. The between-bytes timeout is left alone so a slow streaming
+        // body (e.g. an LLM token stream) is not cut mid-flight.
+        let mut options = options.unwrap_or_default();
         if let Some(timeout) = self.outbound_timeout {
-            config.connect_timeout = timeout;
-            config.first_byte_timeout = timeout;
+            options.connect_timeout = Some(timeout);
+            options.first_byte_timeout = Some(timeout);
         }
-        let use_tls = config.use_tls;
+        // TLS is derived from the request scheme (the pre-49 `config.use_tls` bool is gone).
+        let use_tls = request.uri().scheme() == Some(&http::uri::Scheme::HTTPS);
         let allow_private = self.allow_private_egress;
         let self_addrs = self.self_egress_addrs.clone();
         let egress_depth = self.egress_depth;
         let egress_nonce = self.egress_nonce;
         let extra_roots = self.guest_egress_extra_roots.clone();
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            let mut request = request;
-            let result = match egress_target_allowed(
+        Box::new(async move {
+            let plan = egress_target_allowed(
                 request.uri(),
                 use_tls,
                 allow_private,
                 &self_addrs,
                 egress_depth,
             )
-            .await
+            .await?;
+            // A self-call carries its (nonce-stamped) recursion depth so the re-entering invocation
+            // sees it and the gate can cap the chain.
+            if let Some(next) = plan.self_depth
+                && let Ok(v) = format!("{egress_nonce:x}:{next}").parse()
             {
-                Ok(plan) => {
-                    // A self-call carries its (nonce-stamped) recursion depth so the
-                    // re-entering invocation sees it and the gate can cap the chain.
-                    if let Some(next) = plan.self_depth
-                        && let Ok(v) = format!("{egress_nonce:x}:{next}").parse()
-                    {
-                        request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
-                    }
-                    // Dev-posture extra-CA: when an operator supplied extra roots AND this is a TLS
-                    // request, send through our own handler that trusts webpki ⊕ those roots.
-                    // Otherwise (the default, and every plaintext request) use the stock sender
-                    // verbatim — production trust is byte-identical.
-                    if use_tls && !extra_roots.is_empty() {
-                        send_with_extra_roots(request, config, &extra_roots).await
-                    } else {
-                        wasmtime_wasi_http::types::default_send_request_handler(request, config)
-                            .await
-                    }
-                }
-                Err(code) => Err(code),
-            };
-            Ok(result)
-        });
-        Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
+                request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
+            }
+            // Dev-posture extra-CA: when an operator supplied extra roots AND this is a TLS request,
+            // send through our own handler that trusts webpki ⊕ those roots. Otherwise (the default,
+            // and every plaintext request) use the stock sender verbatim — production trust is
+            // byte-identical.
+            if use_tls && !extra_roots.is_empty() {
+                send_with_extra_roots(request, options, &extra_roots).await
+            } else {
+                let (resp, io) =
+                    wasmtime_wasi_http::default_send_request(request, Some(options)).await?;
+                Ok((
+                    resp.map(|b| {
+                        use http_body_util::BodyExt;
+                        b.boxed_unsync()
+                    }),
+                    Box::new(io)
+                        as Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+                ))
+            }
+        })
     }
-}
-
-/// Replicates wasmtime-wasi-http's crate-private `dns_error` (a `DnsError` with the given rcode).
-fn egress_dns_error(
-    rcode: String,
-    info_code: u16,
-) -> wasmtime_wasi_http::bindings::http::types::ErrorCode {
-    wasmtime_wasi_http::bindings::http::types::ErrorCode::DnsError(
-        wasmtime_wasi_http::bindings::http::types::DnsErrorPayload {
-            rcode: Some(rcode),
-            info_code: Some(info_code),
-        },
-    )
 }
 
 /// Build the guest-egress TLS client config trusting the webpki roots **⊕** the operator's `extra_roots`.
@@ -651,8 +642,7 @@ fn egress_dns_error(
 /// a second copy. Same trust set, same explicit provider, same full verification.
 pub(crate) fn guest_egress_client_config(
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
-) -> Result<rustls::ClientConfig, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+) -> Result<rustls::ClientConfig, wasmtime_wasi_http::Error> {
     let mut root_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -665,52 +655,52 @@ pub(crate) fn guest_egress_client_config(
     .with_safe_default_protocol_versions()
     .map_err(|e| {
         tracing::warn!("guest egress TLS config error: {e:?}");
-        ErrorCode::InternalError(Some("guest egress TLS config".into()))
+        wasmtime_wasi_http::Error::InternalError(Some("guest egress TLS config".into()))
     })
     .map(|b| b.with_root_certificates(root_store).with_no_client_auth())
 }
 
 /// Send a guest outbound **TLS** request trusting webpki ⊕ the operator's `extra_roots`. A faithful
-/// copy of wasmtime-wasi-http 30.0.2's `default_send_request_handler` TLS branch, differing ONLY in
-/// the root store (via [`guest_egress_client_config`]) — reached only when an operator supplied
-/// extra roots (the dev-posture option), otherwise the stock sender runs. Version-coupled: on a
-/// wasmtime-wasi-http bump, re-diff this against `default_send_request_handler`.
+/// port of wasmtime-wasi-http 50.0.0's `default_send_request` TLS branch, differing ONLY in the root
+/// store (via [`guest_egress_client_config`]) — reached only when an operator supplied extra roots
+/// (the dev-posture option), otherwise the stock sender runs. Returns the response plus the
+/// connection-driver future, exactly as [`wasmtime_wasi_http::default_send_request`] does.
+/// Version-coupled: on a wasmtime-wasi-http bump, re-diff this against `default_send_request`.
+#[allow(clippy::type_complexity)]
 async fn send_with_extra_roots(
-    mut request: http::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-    config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    mut request: http::Request<wasmtime_wasi_http::WasiBody>,
+    options: wasmtime_wasi_http::RequestOptions,
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<
-    wasmtime_wasi_http::types::IncomingResponse,
-    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+    (
+        http::Response<wasmtime_wasi_http::WasiBody>,
+        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ),
+    wasmtime_wasi_http::Error,
 > {
     use http_body_util::BodyExt;
     use rustls::pki_types::ServerName;
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::Error;
+
+    let connect_timeout = options.connect_timeout.unwrap_or(Duration::from_secs(600));
+    let first_byte_timeout = options
+        .first_byte_timeout
+        .unwrap_or(Duration::from_secs(600));
+    let between_bytes_timeout = options
+        .between_bytes_timeout
+        .unwrap_or(Duration::from_secs(600));
 
     let authority = match request.uri().authority() {
         Some(a) if a.port().is_some() => a.to_string(),
         // This path is TLS-only (the caller gates on `use_tls`), so default to 443.
         Some(a) => format!("{a}:443"),
-        None => return Err(ErrorCode::HttpRequestUriInvalid),
+        None => return Err(Error::HttpRequestUriInvalid),
     };
-    let tcp_stream = tokio::time::timeout(
-        config.connect_timeout,
-        tokio::net::TcpStream::connect(&authority),
-    )
-    .await
-    .map_err(|_| ErrorCode::ConnectionTimeout)?
-    .map_err(|e| match e.kind() {
-        std::io::ErrorKind::AddrNotAvailable => {
-            egress_dns_error("address not available".to_string(), 0)
-        }
-        _ if e
-            .to_string()
-            .starts_with("failed to lookup address information") =>
-        {
-            egress_dns_error("address not available".to_string(), 0)
-        }
-        _ => ErrorCode::ConnectionRefused,
-    })?;
+    let tcp_stream =
+        tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(&authority))
+            .await
+            .map_err(|_| Error::ConnectionTimeout)?
+            .map_err(Error::Connect)?;
 
     let tls_config = guest_egress_client_config(extra_roots)?;
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
@@ -718,22 +708,27 @@ async fn send_with_extra_roots(
     let domain = ServerName::try_from(host)
         .map_err(|e| {
             tracing::warn!("guest egress dns name error: {e:?}");
-            egress_dns_error("invalid dns name".to_string(), 0)
+            Error::DnsError {
+                rcode: Some("invalid dns name".to_string()),
+                info_code: None,
+            }
         })?
         .to_owned();
     let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
         tracing::warn!("guest egress tls protocol error: {e:?}");
-        ErrorCode::TlsProtocolError
+        Error::Tls(e)
     })?;
-    let stream = hyper_util::rt::TokioIo::new(stream);
+    let stream = wasmtime_wasi_http::io::TokioIo::new(stream);
 
     let (mut sender, conn) = tokio::time::timeout(
-        config.connect_timeout,
-        hyper::client::conn::http1::handshake(stream),
+        connect_timeout,
+        hyper::client::conn::http1::Builder::new().handshake(stream),
     )
     .await
-    .map_err(|_| ErrorCode::ConnectionTimeout)?
-    .map_err(wasmtime_wasi_http::hyper_request_error)?;
+    .map_err(|_| Error::ConnectionTimeout)?
+    .map_err(Error::Hyper)?;
+    // Drive the connection concurrently; the returned io-future awaits its completion (the wasi-http
+    // layer drives it to flush the request body + trailing response), mirroring `default_send_request`.
     let worker = wasmtime_wasi::runtime::spawn(async move {
         if let Err(e) = conn.await {
             tracing::warn!("guest egress connection dropped: {e}");
@@ -752,20 +747,67 @@ async fn send_with_extra_roots(
         .build()
         .expect("comes from a valid request");
 
-    let resp = tokio::time::timeout(config.first_byte_timeout, sender.send_request(request))
+    let resp = tokio::time::timeout(first_byte_timeout, sender.send_request(request))
         .await
-        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
-        .map_err(wasmtime_wasi_http::hyper_request_error)?
-        .map(|body| {
-            body.map_err(wasmtime_wasi_http::hyper_request_error)
-                .boxed()
-        });
+        .map_err(|_| Error::ConnectionReadTimeout)?
+        .map_err(Error::Hyper)?;
+    // Enforce the between-bytes response timeout that the stock `default_send_request` applies, so a
+    // trickling upstream body is cut if a frame doesn't arrive within the cap — parity with the
+    // production (non-extra-CA) path. Tokio panics on a zero-duration interval, so clamp to ~0.
+    let between = if between_bytes_timeout == Duration::ZERO {
+        Duration::new(0, 1)
+    } else {
+        between_bytes_timeout
+    };
+    let mut interval = tokio::time::interval(between);
+    interval.reset();
+    let resp = resp.map(|incoming| BetweenBytesBody { incoming, interval }.boxed_unsync());
 
-    Ok(wasmtime_wasi_http::types::IncomingResponse {
-        resp,
-        worker: Some(worker),
-        between_bytes_timeout: config.between_bytes_timeout,
-    })
+    let io = async move {
+        worker.await;
+        Ok(())
+    };
+    Ok((resp, Box::new(io)))
+}
+
+/// Response-body wrapper that enforces a between-bytes timeout: if a frame does not arrive within the
+/// interval, the body errors with [`wasmtime_wasi_http::Error::ConnectionReadTimeout`]. A faithful
+/// mirror of the `IncomingResponseBody` wrapper inside wasmtime-wasi-http's `default_send_request`, so
+/// the dev-posture extra-CA path (see [`send_with_extra_roots`]) has the same trickle protection as
+/// the stock sender.
+struct BetweenBytesBody {
+    incoming: hyper::body::Incoming,
+    interval: tokio::time::Interval,
+}
+
+impl HttpBody for BetweenBytesBody {
+    type Data = Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match Pin::new(&mut self.as_mut().incoming).poll_frame(cx) {
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => {
+                let err = if err.is_timeout() {
+                    wasmtime_wasi_http::Error::HttpResponseTimeout
+                } else {
+                    wasmtime_wasi_http::Error::Hyper(err)
+                };
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                self.interval.reset();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => {
+                std::task::ready!(self.interval.poll_tick(cx));
+                Poll::Ready(Some(Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)))
+            }
+        }
+    }
 }
 
 /// The request header carrying a guest self-egress call's recursion depth, stamped with the
@@ -805,9 +847,9 @@ async fn egress_target_allowed(
     allow_private: bool,
     self_addrs: &[SocketAddr],
     egress_depth: u32,
-) -> Result<EgressPlan, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-    let authority = uri.authority().ok_or(ErrorCode::HttpRequestUriInvalid)?;
+) -> Result<EgressPlan, wasmtime_wasi_http::Error> {
+    use wasmtime_wasi_http::Error;
+    let authority = uri.authority().ok_or(Error::HttpRequestUriInvalid)?;
     let port = authority
         .port_u16()
         .unwrap_or(if use_tls { 443 } else { 80 });
@@ -819,7 +861,7 @@ async fn egress_target_allowed(
         .trim_end_matches(']');
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|_| ErrorCode::DestinationNotFound)?;
+        .map_err(|_| Error::DestinationNotFound)?;
     let mut saw_any = false;
     let mut hit_self = false;
     for addr in addrs.by_ref() {
@@ -829,17 +871,17 @@ async fn egress_target_allowed(
         if self_addrs.contains(&addr) {
             hit_self = true;
         } else if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
-            return Err(ErrorCode::DestinationIpProhibited);
+            return Err(Error::DestinationIpProhibited);
         }
     }
     if !saw_any {
-        return Err(ErrorCode::DestinationNotFound);
+        return Err(Error::DestinationNotFound);
     }
     if hit_self {
         let next = egress_depth.saturating_add(1);
         if next > MAX_SELF_EGRESS_DEPTH {
             // Too deep a self-recursion — refuse rather than nest further.
-            return Err(ErrorCode::DestinationIpProhibited);
+            return Err(Error::DestinationIpProhibited);
         }
         return Ok(EgressPlan {
             self_depth: Some(next),
@@ -2767,13 +2809,12 @@ impl HandlerEngine {
         // clock, then hand them to the guest as host-owned `wasi:io` stream resources. The guest imports
         // only `wasi:io/streams` (never `wasi:sockets`), so these are its sole network surface.
         let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
-        let in_stream: wasmtime_wasi::DynInputStream =
-            Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(IdleTracked::new(
-                read_half,
-                Arc::clone(&last_activity),
-            )));
-        let out_stream: wasmtime_wasi::DynOutputStream =
-            Box::new(wasmtime_wasi::pipe::AsyncWriteStream::new(
+        let in_stream: wasmtime_wasi::p2::DynInputStream =
+            Box::new(wasmtime_wasi::p2::pipe::AsyncReadStream::new(
+                IdleTracked::new(read_half, Arc::clone(&last_activity)),
+            ));
+        let out_stream: wasmtime_wasi::p2::DynOutputStream =
+            Box::new(wasmtime_wasi::p2::pipe::AsyncWriteStream::new(
                 TCP_CONN_WRITE_BUDGET,
                 IdleTracked::new(write_half, Arc::clone(&last_activity)),
             ));
@@ -2862,8 +2903,8 @@ impl HandlerEngine {
     /// Shared by the request (`wasi:http`) and consumer (`wasi:messaging`) paths.
     fn build_linker(&self) -> Result<Linker<HostState>, HandlerError> {
         let mut linker = Linker::<HostState>::new(&self.engine);
-        wasmtime_wasi::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         // `wasi:logging` is host-side observability (captured like stdout/stderr), always linked
         // — not a grantable capability. A guest that imports it emits into the same log sink.
         bindings::wasi_logging::add_to_linker(&mut linker, |state: &mut HostState| {
@@ -2952,9 +2993,9 @@ impl HandlerEngine {
             bindings::tcp_egress::TcpEgressHost::new(
                 &mut state.table,
                 state.tcp_egress_enabled,
-                state.allow_private_egress,
+                state.http_hooks.allow_private_egress,
                 state.bindings.egress_allowlist(),
-                state.guest_egress_extra_roots.clone(),
+                state.http_hooks.guest_egress_extra_roots.clone(),
                 state.tcp_egress_connect_timeout,
                 state.tcp_egress_idle_timeout,
             )
@@ -3075,12 +3116,14 @@ impl HandlerEngine {
             http: WasiHttpCtx::new(),
             limits: store_limits,
             bindings,
-            outbound_timeout: self.outbound_timeout,
-            allow_private_egress: self.allow_private_egress,
-            self_egress_addrs: self.self_egress_addrs.clone(),
-            guest_egress_extra_roots: self.guest_egress_extra_roots.clone(),
-            egress_depth: 0,
-            egress_nonce: self.egress_nonce,
+            http_hooks: GuestEgressHooks {
+                outbound_timeout: self.outbound_timeout,
+                allow_private_egress: self.allow_private_egress,
+                self_egress_addrs: self.self_egress_addrs.clone(),
+                guest_egress_extra_roots: self.guest_egress_extra_roots.clone(),
+                egress_depth: 0,
+                egress_nonce: self.egress_nonce,
+            },
             #[cfg(feature = "tcp-egress")]
             tcp_egress_enabled: self.allow_tcp_egress,
             #[cfg(feature = "tcp-egress")]
@@ -3239,33 +3282,26 @@ impl HandlerEngine {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let out = store
             .data_mut()
+            .http()
             .new_response_outparam(sender)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
-        // Build the incoming request with a **streamed** body:
-        // bypass `new_incoming_request`'s `Error = hyper::Error` bound by using the
-        // public lower-level pieces directly, feeding our own bridged body whose
-        // errors map to `ErrorCode` — so the live request body flows into the
-        // guest frame-by-frame instead of being buffered up front.
+        // Build the incoming request with a **streamed**, byte-capped body (no up-front buffering).
+        // `stream_incoming_body` bridges the live body frame-by-frame, enforcing `max_body_bytes` and
+        // mapping read errors to `wasmtime_wasi_http::Error`; v49's `WasiHttpCtxView::new_incoming_request`
+        // then wraps it as the guest's `wasi:http` incoming request and pushes it to the table.
         let (parts, body) = request.into_parts();
         // Inbound self-egress recursion depth (nonce-verified — an external client can't forge it;
         // a fresh external request is depth 0, a guest self-call continues the chain at depth+1). The
         // SAME verification the request dispatch uses to skip the serve-admission gate for a
         // re-entrant self-call, so the two can never drift.
         let egress_depth = self.verified_self_egress_depth(&parts.headers);
-        store.data_mut().egress_depth = egress_depth;
-        let incoming = HostIncomingBody::new(
-            stream_incoming_body(body, effective.max_body_bytes),
-            BODY_FRAME_TIMEOUT,
-        );
-        let req = {
-            let state = store.data_mut();
-            let request = HostIncomingRequest::new(state, parts, Scheme::Http, Some(incoming))
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            state
-                .table()
-                .push(request)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?
-        };
+        store.data_mut().http_hooks.egress_depth = egress_depth;
+        let bridged = stream_incoming_body(body, effective.max_body_bytes);
+        let req = store
+            .data_mut()
+            .http()
+            .new_incoming_request(Scheme::Http, http::Request::from_parts(parts, bridged))
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         let instantiated_at = std::time::Instant::now();
         let proxy = proxy_pre
             .instantiate_async(&mut store)
@@ -3412,12 +3448,12 @@ struct GuardedStreamBody {
 
 impl HttpBody for GuardedStreamBody {
     type Data = Bytes;
-    type Error = ErrorCode;
+    type Error = wasmtime_wasi_http::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, ErrorCode>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, wasmtime_wasi_http::Error>>> {
         let this = self.get_mut();
         let r = Pin::new(&mut this.inner).poll_frame(cx);
         // Stamp activity on a real frame to the client so the idle watchdog never kills an
@@ -3472,7 +3508,7 @@ fn guard_streaming_response(
         _permit: permit,
         _cguard: cguard,
     };
-    http::Response::from_parts(parts, body.boxed())
+    http::Response::from_parts(parts, body.boxed_unsync())
 }
 
 /// An empty request body (for synthetic requests / requests without a body).
@@ -3482,25 +3518,22 @@ pub fn empty_body() -> http_body_util::combinators::BoxBody<bytes::Bytes, hyper:
         .boxed()
 }
 
-/// Per-frame read timeout for an incoming body (wasi-http's own default).
-const BODY_FRAME_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// A `Send + Sync` [`HttpBody`] backed by an mpsc receiver — the bridge target
 /// for [`stream_incoming_body`]. Holding only the receiver keeps it `Sync` (an
 /// arbitrary streaming body, e.g. axum's, may not be), so it boxes into the
 /// `Send + Sync` [`HyperIncomingBody`] the wasi-http layer requires.
 struct ChannelBody {
-    rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ErrorCode>>,
+    rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, wasmtime_wasi_http::Error>>,
 }
 
 impl HttpBody for ChannelBody {
     type Data = Bytes;
-    type Error = ErrorCode;
+    type Error = wasmtime_wasi_http::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, ErrorCode>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, wasmtime_wasi_http::Error>>> {
         self.rx.poll_recv(cx)
     }
 }
@@ -3508,14 +3541,14 @@ impl HttpBody for ChannelBody {
 /// Bridge an arbitrary request body into a [`HyperIncomingBody`] for the guest,
 /// **streaming** frame-by-frame (no up-front buffering) while enforcing a running
 /// byte cap. A forwarder task reads `body` (it only needs `Send`, not `Sync`),
-/// enforces `max_bytes`, maps any read error or cap breach to an `ErrorCode`, and
+/// enforces `max_bytes`, maps any read error or cap breach to an `wasmtime_wasi_http::Error`, and
 /// pushes frames through a channel the `Send + Sync` [`ChannelBody`] drains.
 fn stream_incoming_body<B>(body: B, max_bytes: Option<u64>) -> HyperIncomingBody
 where
     B: HttpBody<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, ErrorCode>>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, wasmtime_wasi_http::Error>>(8);
     tokio::spawn(async move {
         let mut body = std::pin::pin!(body);
         let mut total: u64 = 0;
@@ -3526,7 +3559,7 @@ where
                         total = total.saturating_add(data.len() as u64);
                         if max_bytes.is_some_and(|cap| total > cap) {
                             let _ = tx
-                                .send(Err(ErrorCode::InternalError(Some(
+                                .send(Err(wasmtime_wasi_http::Error::InternalError(Some(
                                     "request body exceeds the handler limit".to_string(),
                                 ))))
                                 .await;
@@ -3539,16 +3572,16 @@ where
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(Err(ErrorCode::InternalError(Some(format!(
-                            "request body read error: {err}"
-                        )))))
+                        .send(Err(wasmtime_wasi_http::Error::InternalError(Some(
+                            format!("request body read error: {err}"),
+                        ))))
                         .await;
                     return;
                 }
             }
         }
     });
-    ChannelBody { rx }.boxed()
+    ChannelBody { rx }.boxed_unsync()
 }
 
 /// Classify a wasmtime execution error: an epoch interrupt is a wall-clock timeout, an out-of-fuel
@@ -3577,7 +3610,6 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
 
     #[test]
     fn engine_builds() {
@@ -3664,12 +3696,14 @@ mod tests {
         ];
         let global = sa("93.184.216.34:443");
 
-        // (a) Connect-only: bind/listen + every UDP use denied, even allowlisted + posture on.
+        // (a) Connect-only: bind/listen/accept + every UDP use denied, even allowlisted + posture on.
         for bad in [
             SocketAddrUse::TcpBind,
+            SocketAddrUse::TcpListen,
+            SocketAddrUse::TcpAccept,
             SocketAddrUse::UdpBind,
-            SocketAddrUse::UdpConnect,
-            SocketAddrUse::UdpOutgoingDatagram,
+            SocketAddrUse::UdpSend,
+            SocketAddrUse::UdpReceive,
         ] {
             assert!(
                 !tcp_connect_decision(bad, global, &allow, true, true).await,
@@ -3732,8 +3766,8 @@ mod tests {
             "connect-only: TcpBind must be denied"
         );
         assert!(
-            !tcp_connect_decision(SocketAddrUse::UdpConnect, global, &allow, true, true).await,
-            "connect-only: UdpConnect must be denied"
+            !tcp_connect_decision(SocketAddrUse::UdpSend, global, &allow, true, true).await,
+            "connect-only: UdpSend must be denied"
         );
 
         // Dimension 2 — allowlist: allowlisted global admitted, non-allowlisted denied (mutation
@@ -3932,8 +3966,10 @@ mod tests {
         let abort = task.abort_handle();
 
         let inner: HyperOutgoingBody = Empty::<Bytes>::new()
-            .map_err(|never: std::convert::Infallible| -> ErrorCode { match never {} })
-            .boxed();
+            .map_err(
+                |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
+            )
+            .boxed_unsync();
         // Long idle/max so the watchdog never fires during the test — we assert lifecycle, not teardown.
         let wrapped = guard_streaming_response(
             http::Response::new(inner),
@@ -4331,13 +4367,13 @@ mod tests {
         }
     }
 
-    async fn egress(uri: &str, tls: bool) -> Result<(), ErrorCode> {
+    async fn egress(uri: &str, tls: bool) -> Result<(), wasmtime_wasi_http::Error> {
         egress_target_allowed(&uri.parse().unwrap(), tls, false, &[], 0)
             .await
             .map(|_| ())
     }
 
-    async fn egress_priv(uri: &str, tls: bool) -> Result<(), ErrorCode> {
+    async fn egress_priv(uri: &str, tls: bool) -> Result<(), wasmtime_wasi_http::Error> {
         egress_target_allowed(&uri.parse().unwrap(), tls, true, &[], 0)
             .await
             .map(|_| ())
@@ -4359,7 +4395,7 @@ mod tests {
         // A *different* loopback port is not the self socket → still blocked.
         assert!(matches!(
             plan("http://127.0.0.1:9999/", 0).await,
-            Err(ErrorCode::DestinationIpProhibited)
+            Err(wasmtime_wasi_http::Error::DestinationIpProhibited)
         ));
         // The self chain is depth-capped: at the max, one more hop is refused.
         assert_eq!(
@@ -4371,7 +4407,7 @@ mod tests {
         );
         assert!(matches!(
             plan("http://127.0.0.1:8080/", MAX_SELF_EGRESS_DEPTH).await,
-            Err(ErrorCode::DestinationIpProhibited)
+            Err(wasmtime_wasi_http::Error::DestinationIpProhibited)
         ));
     }
 
@@ -4390,7 +4426,7 @@ mod tests {
             assert!(
                 matches!(
                     egress(blocked, blocked.starts_with("https")).await,
-                    Err(ErrorCode::DestinationIpProhibited)
+                    Err(wasmtime_wasi_http::Error::DestinationIpProhibited)
                 ),
                 "{blocked} should be prohibited"
             );
@@ -4400,7 +4436,7 @@ mod tests {
         // A request with no authority is rejected as an invalid URI.
         assert!(matches!(
             egress("/relative-only", false).await,
-            Err(ErrorCode::HttpRequestUriInvalid)
+            Err(wasmtime_wasi_http::Error::HttpRequestUriInvalid)
         ));
     }
 
@@ -4424,7 +4460,7 @@ mod tests {
         // Structural refusals still hold regardless of the knob.
         assert!(matches!(
             egress_priv("/relative-only", false).await,
-            Err(ErrorCode::HttpRequestUriInvalid)
+            Err(wasmtime_wasi_http::Error::HttpRequestUriInvalid)
         ));
     }
 }

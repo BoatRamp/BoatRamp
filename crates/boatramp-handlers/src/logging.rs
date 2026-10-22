@@ -8,10 +8,12 @@
 //! logging interface. The concrete sink (a per-site bounded ring with a rate
 //! cap) lives in the server.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use bytes::Bytes;
-use wasmtime_wasi::{OutputStream, Pollable, StdoutStream, StreamResult, async_trait};
+use tokio::io::AsyncWrite;
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 
 /// Which standard stream a captured line came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +85,16 @@ impl SinkStdout {
     }
 }
 
+impl IsTerminal for SinkStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
 impl StdoutStream for SinkStdout {
-    fn stream(&self) -> Box<dyn OutputStream> {
+    // wasmtime 49's `StdoutStream` is `AsyncWrite`-based (the WASIp2 `OutputStream` is derived from
+    // it by the trait's default `p2_stream` adapter). We only provide the async sink.
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
         Box::new(SinkWriter {
             sink: self.sink.clone(),
             scope: self.scope.clone(),
@@ -92,10 +102,6 @@ impl StdoutStream for SinkStdout {
             stream: self.stream,
             buf: Vec::new(),
         })
-    }
-
-    fn isatty(&self) -> bool {
-        false
     }
 }
 
@@ -131,27 +137,27 @@ impl SinkWriter {
     }
 }
 
-impl OutputStream for SinkWriter {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        self.buf.extend_from_slice(&bytes);
+impl AsyncWrite for SinkWriter {
+    // Capture is best-effort and synchronous: buffer, forward complete lines, and always report the
+    // whole write accepted (never backpressure — a slow/absent sink must not stall or deadlock the
+    // guest; the sink's own rate cap drops excess).
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.buf.extend_from_slice(bytes);
         self.drain_lines();
-        Ok(())
+        Poll::Ready(Ok(bytes.len()))
     }
 
-    fn flush(&mut self) -> StreamResult<()> {
-        Ok(())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn check_write(&mut self) -> StreamResult<usize> {
-        // Never apply backpressure — capture is best-effort and must not stall
-        // (or deadlock) the guest; the sink's rate cap drops excess instead.
-        Ok(usize::MAX)
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
-}
-
-#[async_trait]
-impl Pollable for SinkWriter {
-    async fn ready(&mut self) {}
 }
 
 impl Drop for SinkWriter {

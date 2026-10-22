@@ -32,9 +32,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/messaging-stats-host",
-        async: {
-            only_imports: ["get", "groups"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -267,11 +265,16 @@ impl messaging_stats::Host for StatsHost<'_> {
 }
 
 /// Add the `messaging-stats` interface to `linker`, resolving the per-invocation [`StatsHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = StatsHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> StatsHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> StatsHost<'_>,
 ) -> wasmtime::Result<()> {
-    messaging_stats::add_to_linker_get_host(linker, host)
+    messaging_stats::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
