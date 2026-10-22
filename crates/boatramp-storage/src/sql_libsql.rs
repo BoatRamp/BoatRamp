@@ -3102,6 +3102,66 @@ mod tests {
         // file exists → both assertions above go RED.
     }
 
+    /// inc2 Stage E — PERMANENT regression guard pinning the filesystem-escape invariant on a
+    /// shadow-restore connection: the `writefile(path, data)` and `load_extension(path)` SQL
+    /// functions must be UNAVAILABLE / REFUSED, so a crafted `.dump` cannot write an out-of-shadow
+    /// file or load arbitrary native code the shadow-drop could never undo. Today libsql's default
+    /// build leaves `writefile` absent (CLI-only `fileio` ext) and `load_extension()` disabled, and
+    /// the shadow conn never calls `enable_load_extension` — this test pins BOTH so a future
+    /// libsql feature-flip that re-opened either escape goes RED, forcing the authorizer to be
+    /// extended to DENY the function (the authorizer, which already denies ATTACH/DETACH/PRAGMA, is
+    /// the durable barrier; this guards it). Runs in the MERGE gate (no server/Docker).
+    #[tokio::test]
+    async fn shadow_apply_refuses_writefile_and_load_extension() {
+        let dir = factory_dir("shadow-fsescape");
+        std::fs::create_dir_all(&dir).unwrap();
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        // A victim OUTSIDE the shadow that a working `writefile` would create — "never created" is
+        // an unambiguous proof the escape wrote nothing.
+        let victim_dir = factory_dir("shadow-fsescape-victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("pwned.txt");
+        assert!(!victim.exists());
+
+        // `writefile` — a fresh shadow (so a prior errored statement can't mask this one).
+        {
+            let mut shadow = backends.begin_dump_shadow("blog", "", false).await.unwrap();
+            let evil = format!("SELECT writefile('{}', 'pwned');\n", victim.display());
+            let fed = shadow.feed(evil.as_bytes()).await;
+            assert!(
+                fed.is_err(),
+                "writefile(...) must be unavailable/refused on a shadow-restore connection"
+            );
+            drop(shadow); // abort
+        }
+        assert!(
+            !victim.exists(),
+            "a refused writefile must not have created the out-of-shadow victim file"
+        );
+
+        // `load_extension` — likewise unavailable/refused (loading native code is never permitted).
+        {
+            let mut shadow = backends.begin_dump_shadow("blog", "", false).await.unwrap();
+            let evil = format!(
+                "SELECT load_extension('{}');\n",
+                victim_dir.join("evil.so").display()
+            );
+            let fed = shadow.feed(evil.as_bytes()).await;
+            assert!(
+                fed.is_err(),
+                "load_extension(...) must be unavailable/refused on a shadow-restore connection"
+            );
+            drop(shadow);
+        }
+
+        assert_eq!(
+            shadow_files(&dir),
+            0,
+            "aborted apply left no shadow residue"
+        );
+    }
+
     /// Splitter robustness: a `.dump` whose statements contain `;` inside a `[bracket]`/backtick
     /// identifier, a `-- line` comment, and a `/* block ; */` comment must NOT split wrongly — every
     /// row round-trips. (Reinforces the authorizer: a wrong split can not smuggle a statement past it.)

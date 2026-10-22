@@ -24,8 +24,9 @@ use std::sync::Arc;
 use boatramp_core::compute::{ComputeBackend, pg_client_image_for_server_version};
 use boatramp_docker::DockerBackend;
 use boatramp_node::pg_client::{
-    MysqlConnection, PgConnection, mysql_restore_invocation, mysqldump_invocation,
-    pg_dump_invocation, pg_restore_invocation,
+    MysqlConnection, PgConnection, mysql_restore_invocation, mysql_shadow_invocation,
+    mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
+    pg_restore_invocation, pg_restore_shadow_invocation,
 };
 use boatramp_node::project_bundle::{self, MemberKind, PgMemberInfo, SourceInfo, StagedMember};
 
@@ -354,6 +355,500 @@ async fn project_export_roundtrip_live() {
     .await;
 
     println!("PROJECT EXPORT ROUNDTRIP OK");
+}
+
+/// Monotonic-ish per-test suffix (seconds since epoch) for unique test db/role names.
+fn now_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// **Live pg ATOMIC shadow-restore round-trip** (inc2 Stage C; Tier-2 / nightly — needs a Docker
+/// daemon AND a Postgres server whose DSN user can `CREATE ROLE`/`CREATE DATABASE`). Self-skips.
+///
+/// Proves the SECURITY-CRITICAL split + the swap end-to-end against REAL pg: seed a SOURCE db,
+/// `pg_dump -Fc` it (FULL), create a SHADOW db owned by a freshly-created NON-SUPERUSER role, apply
+/// the dump with `pg_restore_shadow_invocation` CONNECTING AS THAT NON-SUPERUSER ROLE (so a crafted
+/// dump's superuser-only escapes would fail — see the crafted-escape gate), then the TRUSTED
+/// superuser/maintenance connection terminates + `ALTER DATABASE … RENAME`-swaps the shadow in for
+/// an (empty) live db, and we assert ROW equality on the swapped-in live db. Emits
+/// `PROJECT EXPORT PG CHUNKED SHADOW OK`.
+#[tokio::test]
+async fn project_export_pg_chunked_shadow_live() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pg shadow round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pg shadow round-trip not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let su = conn(&user, &password, &host, port, &db); // the DSN superuser
+    let maint = conn(&user, &password, &host, port, "postgres"); // superuser @ maintenance db
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &su,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let s = now_suffix();
+    let table = format!("brexp_shadow_t_{s}");
+    let source_db = format!("brexp_shadow_src_{s}");
+    let live_db = format!("brexp_shadow_live_{s}");
+    let shadow_db = format!("{live_db}__shadow_{s}");
+    let role = format!("brexp_shadow_role_{s}");
+    let rolepw = format!("rpw_{s}");
+    let expect = "1:alpha\n2:beta\n3:gamma";
+
+    // --- TRUSTED DDL (superuser): a NON-SUPERUSER apply role + a source db owned by it ---
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "CREATE ROLE \"{role}\" LOGIN PASSWORD '{rolepw}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "create the non-superuser apply role");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("CREATE DATABASE {source_db} OWNER \"{role}\""),
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db} OWNER \"{role}\""),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup DDL `{sql}`: {o}");
+    }
+
+    // --- seed the SOURCE db as the role (so the dump's objects are role-ownable) ---
+    let src_conn = conn(&user, &password, &host, port, &source_db);
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &src_conn,
+        &format!(
+            "CREATE TABLE {table}(id int primary key, v text); \
+             INSERT INTO {table} VALUES (1,'alpha'),(2,'beta'),(3,'gamma');"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "seed source table");
+
+    // --- EXPORT: pg_dump -Fc FULL of the source db (the driver streams this O(chunk); here a temp
+    //     archive is sufficient to exercise the shadow apply + swap) ---
+    let td = tempfile::tempdir().unwrap();
+    let dump = td.path().join("dump.pgc");
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let inv = pg_dump_invocation(&src_conn, false);
+        let f = tokio::fs::File::create(&dump).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
+            .await
+            .expect("pg_dump run_ephemeral");
+        assert_eq!(code, 0, "pg_dump");
+    }
+
+    // --- TRUSTED DDL (superuser): create the shadow db owned by the non-superuser role ---
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE {shadow_db} OWNER \"{role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create shadow db: {o}");
+
+    // --- IMPORT: pg_restore into the SHADOW, CONNECTING AS THE NON-SUPERUSER ROLE ---
+    let role_conn = conn(&role, &rolepw, &host, port, &shadow_db);
+    {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let inv = pg_restore_shadow_invocation(&role_conn, &shadow_db);
+        let restore_argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("{} 2>&1", inv.argv.join(" ")),
+        ];
+        let infile = tokio::fs::File::open(&dump).await.unwrap();
+        let mut rdr = infile.compat();
+        let out_path = td.path().join("restore.out");
+        let out = tokio::fs::File::create(&out_path).await.unwrap();
+        let mut sink = out.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &restore_argv, &inv.env, Some(&mut rdr), &mut sink)
+            .await
+            .expect("pg_restore run_ephemeral");
+        let out = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "pg_restore into shadow (as non-superuser); output:\n{out}"
+        );
+    }
+
+    // --- TRUSTED DDL (superuser): atomic rename-swap shadow in for live ---
+    for sql in [
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{live_db}' AND pid <> pg_backend_pid()"
+        ),
+        format!("ALTER DATABASE {live_db} RENAME TO {live_db}__old_{s}"),
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{shadow_db}' AND pid <> pg_backend_pid()"
+        ),
+        format!("ALTER DATABASE {shadow_db} RENAME TO {live_db}"),
+        format!("DROP DATABASE IF EXISTS {live_db}__old_{s}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "swap DDL `{sql}`: {o}");
+    }
+
+    // --- row equality on the swapped-in live db ---
+    let live_conn = conn(&user, &password, &host, port, &live_db);
+    let (_, got) = psql(
+        backend.as_ref(),
+        &image,
+        &live_conn,
+        &format!("SELECT id || ':' || v FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(got, expect, "rows after shadow swap match the source");
+
+    // --- cleanup (best-effort) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("DROP DATABASE IF EXISTS {shadow_db}"),
+        format!("DROP ROLE IF EXISTS \"{role}\""),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT EXPORT PG CHUNKED SHADOW OK");
+}
+
+/// **Live pg corruption → all-or-nothing abort** (inc2 Stage C; Tier-2 / nightly). Self-skips.
+///
+/// A TRUNCATED dump fed to `pg_restore --single-transaction` into the shadow ABORTS (non-zero), the
+/// driver's drop-on-abort `DROP DATABASE <shadow>` is reproduced, and we assert NO leftover
+/// `*__shadow_*` database remains AND the live db is byte-for-byte unchanged (its sentinel row
+/// survives — nothing partial ever reached live). Emits `PROJECT EXPORT PG CORRUPTION ABORT OK`.
+#[tokio::test]
+async fn project_export_pg_corruption_aborts_live() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pg corruption-abort not run)");
+        return;
+    };
+    let Some((user, password, host, port, db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres:// URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pg corruption-abort not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let su = conn(&user, &password, &host, port, &db);
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &su,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let s = now_suffix();
+    let source_db = format!("brexp_abort_src_{s}");
+    let live_db = format!("brexp_abort_live_{s}");
+    let shadow_db = format!("{live_db}__shadow_{s}");
+    let role = format!("brexp_abort_role_{s}");
+    let rolepw = format!("rpw_{s}");
+
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE ROLE \"{role}\" LOGIN PASSWORD '{rolepw}' NOSUPERUSER NOCREATEDB"),
+    )
+    .await;
+    assert_eq!(c, 0, "create role");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("CREATE DATABASE {source_db} OWNER \"{role}\""),
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db} OWNER \"{role}\""),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+
+    // --- seed source + a SENTINEL row in the live db (must survive the aborted import) ---
+    let src_conn = conn(&user, &password, &host, port, &source_db);
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &src_conn,
+        "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (7,'source');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed source");
+    let live_conn = conn(&user, &password, &host, port, &live_db);
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &live_conn,
+        "CREATE TABLE sentinel(id int primary key, v text); INSERT INTO sentinel VALUES (1,'keep');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed live sentinel");
+
+    // --- dump the source, then TRUNCATE it to simulate a corrupt/short member ---
+    let td = tempfile::tempdir().unwrap();
+    let dump = td.path().join("dump.pgc");
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let inv = pg_dump_invocation(&src_conn, false);
+        let f = tokio::fs::File::create(&dump).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
+            .await
+            .expect("pg_dump");
+        assert_eq!(code, 0, "pg_dump");
+    }
+    let bytes = std::fs::read(&dump).unwrap();
+    let truncated = td.path().join("dump.trunc.pgc");
+    std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap(); // keep the header, drop the rest
+
+    // --- create the shadow, then feed the TRUNCATED archive as the non-superuser role ---
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE {shadow_db} OWNER \"{role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create shadow");
+    let role_conn = conn(&role, &rolepw, &host, port, &shadow_db);
+    let restore_code = {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let inv = pg_restore_shadow_invocation(&role_conn, &shadow_db);
+        let infile = tokio::fs::File::open(&truncated).await.unwrap();
+        let mut rdr = infile.compat();
+        let out = tokio::fs::File::create(td.path().join("r.out"))
+            .await
+            .unwrap();
+        let mut sink = out.compat_write();
+        backend
+            .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut rdr), &mut sink)
+            .await
+            .expect("pg_restore run_ephemeral")
+    };
+    assert_ne!(
+        restore_code, 0,
+        "a truncated --single-transaction restore MUST abort non-zero (nothing committed)"
+    );
+
+    // --- driver drop-on-abort: DROP the shadow ---
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{shadow_db}' AND pid <> pg_backend_pid()"
+        ),
+    )
+    .await;
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP DATABASE IF EXISTS {shadow_db}"),
+    )
+    .await;
+    assert_eq!(c, 0, "drop shadow on abort");
+
+    // --- assert NO leftover *__shadow_* db + the live sentinel is intact (live never touched) ---
+    let (_, shadows) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{live_db}__shadow_%'"),
+    )
+    .await;
+    assert!(
+        shadows.trim().is_empty(),
+        "no orphan shadow database must remain after abort; found: {shadows:?}"
+    );
+    let (_, got) = psql(
+        backend.as_ref(),
+        &image,
+        &live_conn,
+        "SELECT id || ':' || v FROM sentinel ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        got, "1:keep",
+        "the live db is UNCHANGED after the aborted import"
+    );
+
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("DROP DATABASE IF EXISTS {shadow_db}"),
+        format!("DROP ROLE IF EXISTS \"{role}\""),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT EXPORT PG CORRUPTION ABORT OK");
+}
+
+/// **Live pg crafted-superuser-escape REFUSED** (inc2 Stage C — the pg analogue of Build 1's libsql
+/// ATTACH-authorizer gate; Tier-2 / nightly). Self-skips.
+///
+/// A pg dump in a bundle is attacker-crafted, and a SUPERUSER restore of a crafted dump can `COPY …
+/// TO PROGRAM` (arbitrary command) / `CREATE FUNCTION … LANGUAGE c` (arbitrary native code) = box
+/// takeover. This gate proves that when those exact escape statements are applied AS THE TARGET'S
+/// NON-SUPERUSER ROLE (how the driver applies every bundle dump), Postgres REFUSES each one — so the
+/// out-of-target program never runs (Postgres checks the privilege BEFORE executing the program, so
+/// a refusal means nothing outside the target was touched). `pg_restore` runs an archive's COPY/
+/// CREATE statements as the connected role, so the identical confinement applies to a real crafted
+/// `-Fc` bundle. Emits `PROJECT EXPORT PG CRAFTED ESCAPE REFUSED OK`.
+#[tokio::test]
+async fn project_export_pg_crafted_superuser_escape_refused_live() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pg crafted-escape gate not run)");
+        return;
+    };
+    let Some((user, password, host, port, db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres:// URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pg crafted-escape gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let su = conn(&user, &password, &host, port, &db);
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &su,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let s = now_suffix();
+    let scratch = format!("brexp_escape_{s}");
+    let role = format!("brexp_escape_role_{s}");
+    let rolepw = format!("rpw_{s}");
+    // An out-of-target path a superuser COPY TO PROGRAM would create (on the server); the refusal
+    // means the program never runs.
+    let victim = format!("/tmp/brexp_pwned_{s}");
+
+    let (c, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "CREATE ROLE \"{role}\" LOGIN PASSWORD '{rolepw}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "create the non-superuser role");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {scratch}"),
+        format!("CREATE DATABASE {scratch} OWNER \"{role}\""),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+
+    // Each escape is run AS THE NON-SUPERUSER ROLE (the identity the driver's pg_restore uses).
+    let role_conn = conn(&role, &rolepw, &host, port, &scratch);
+
+    // (1) COPY … TO PROGRAM — needs superuser / pg_execute_server_program; MUST be refused.
+    let (copy_code, copy_out) = psql(
+        backend.as_ref(),
+        &image,
+        &role_conn,
+        &format!("COPY (SELECT 1) TO PROGRAM 'touch {victim}'"),
+    )
+    .await;
+    assert_ne!(
+        copy_code, 0,
+        "COPY ... TO PROGRAM must be REFUSED to a non-superuser role; output:\n{copy_out}"
+    );
+
+    // (2) CREATE FUNCTION … LANGUAGE c — only a superuser may create a C-language function.
+    let (fn_code, fn_out) = psql(
+        backend.as_ref(),
+        &image,
+        &role_conn,
+        "CREATE FUNCTION brexp_evil() RETURNS integer AS '/bin/false', 'x' LANGUAGE c",
+    )
+    .await;
+    assert_ne!(
+        fn_code, 0,
+        "CREATE FUNCTION ... LANGUAGE c must be REFUSED to a non-superuser role; output:\n{fn_out}"
+    );
+
+    // (3) CREATE EXTENSION of an untrusted extension — likewise superuser-only.
+    let (ext_code, _ext_out) = psql(
+        backend.as_ref(),
+        &image,
+        &role_conn,
+        "CREATE EXTENSION IF NOT EXISTS plpython3u",
+    )
+    .await;
+    assert_ne!(
+        ext_code, 0,
+        "CREATE EXTENSION of an untrusted language must be REFUSED to a non-superuser role"
+    );
+
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {scratch}"),
+        format!("DROP ROLE IF EXISTS \"{role}\""),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT EXPORT PG CRAFTED ESCAPE REFUSED OK");
 }
 
 /// **In-process libsql snapshot → bundle → restore round-trip** (no Docker, no external
@@ -979,6 +1474,176 @@ async fn project_export_roundtrip_mysql() {
     .await;
 
     println!("PROJECT EXPORT MYSQL ROUNDTRIP OK");
+}
+
+/// **Live MySQL ATOMIC shadow-restore round-trip** (inc2 Stage D; Tier-2 / nightly — needs a Docker
+/// daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE DATABASE`). Self-skips.
+///
+/// Proves the non-superuser-apply split + the `RENAME TABLE` swap: seed a SOURCE db, dump it
+/// TABLES-ONLY (`mysqldump_tables_only_invocation` — no `CREATE DATABASE`/`USE`), create a SHADOW db
+/// + a NON-SUPERUSER user granted only on the shadow, apply the dump with `mysql_shadow_invocation`
+/// AS THAT NON-SUPERUSER USER, then atomically `RENAME TABLE shadow.t → live.t` (after moving any
+/// live table aside) and assert ROW equality on the swapped-in live db. Emits
+/// `PROJECT EXPORT MYSQL SHADOW OK`.
+#[tokio::test]
+async fn project_export_mysql_chunked_shadow_live() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (live mysql shadow round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live mysql shadow round-trip not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    let s = now_suffix();
+    let source_db = format!("brexp_mysh_src_{s}");
+    let live_db = format!("brexp_mysh_live_{s}");
+    let shadow_db = format!("{live_db}__shadow_{s}");
+    let role = format!("brexp_mysh_role_{s}");
+    let rolepw = format!("rpw_{s}");
+    let expect = "1:alpha\n2:beta\n3:gamma";
+
+    let mkconn = |db: &str, u: &str, pw: &str| MysqlConnection {
+        host: host.clone(),
+        port,
+        user: u.to_string(),
+        password: pw.to_string(),
+        database: db.to_string(),
+        connect_timeout_secs: 10,
+    };
+    let admin = mkconn("", &user, &password); // superuser, no default db
+
+    // --- TRUSTED DDL (superuser): dbs + a NON-SUPERUSER user granted ONLY on the shadow + live ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "DROP DATABASE IF EXISTS {source_db}; CREATE DATABASE {source_db}; \
+             DROP DATABASE IF EXISTS {live_db}; CREATE DATABASE {live_db}; \
+             DROP DATABASE IF EXISTS {shadow_db}; CREATE DATABASE {shadow_db}; \
+             CREATE USER '{role}'@'%' IDENTIFIED BY '{rolepw}'; \
+             GRANT ALL PRIVILEGES ON `{shadow_db}`.* TO '{role}'@'%';"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "setup DDL; mysql output:\n{o}");
+
+    // --- seed the SOURCE db ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&source_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed source; mysql output:\n{o}");
+
+    // --- EXPORT: tables-only mysqldump of the source db (no CREATE DATABASE/USE) → temp ---
+    let td = tempfile::tempdir().unwrap();
+    let dump = td.path().join("dump.sql");
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let inv = mysqldump_tables_only_invocation(&mkconn(&source_db, &user, &password));
+        let f = tokio::fs::File::create(&dump).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(image, &inv.argv, &inv.env, None, &mut sink)
+            .await
+            .expect("mysqldump run_ephemeral");
+        assert_eq!(code, 0, "mysqldump tables-only");
+    }
+    assert!(
+        std::fs::metadata(&dump)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "tables-only dump is non-empty"
+    );
+
+    // --- IMPORT: apply into the SHADOW as the NON-SUPERUSER user (stdin = the dump) ---
+    {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let role_conn = mkconn(&shadow_db, &role, &rolepw);
+        let inv = mysql_shadow_invocation(&role_conn, &shadow_db);
+        // Fold stderr into the sink so a failed apply surfaces its reason.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("{} 2>&1", inv.argv.join(" ")),
+        ];
+        let infile = tokio::fs::File::open(&dump).await.unwrap();
+        let mut rdr = infile.compat();
+        let out_path = td.path().join("apply.out");
+        let out = tokio::fs::File::create(&out_path).await.unwrap();
+        let mut sink = out.compat_write();
+        let code = backend
+            .run_ephemeral(image, &argv, &inv.env, Some(&mut rdr), &mut sink)
+            .await
+            .expect("mysql apply run_ephemeral");
+        let out = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "mysql apply into shadow (as non-superuser); output:\n{out}"
+        );
+    }
+
+    // --- TRUSTED DDL (superuser): atomic RENAME TABLE swap (live has no tables yet) + drop shadow ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "RENAME TABLE `{shadow_db}`.`t` TO `{live_db}`.`t`; \
+             DROP DATABASE IF EXISTS {shadow_db};"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "RENAME TABLE swap; mysql output:\n{o}");
+
+    // --- row equality on the swapped-in live db ---
+    let (_c, got) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        got, expect,
+        "rows after the mysql shadow swap match the source"
+    );
+
+    // --- cleanup ---
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "DROP DATABASE IF EXISTS {live_db}; DROP DATABASE IF EXISTS {source_db}; \
+             DROP DATABASE IF EXISTS {shadow_db}; DROP USER IF EXISTS '{role}'@'%';"
+        ),
+    )
+    .await;
+
+    println!("PROJECT EXPORT MYSQL SHADOW OK");
 }
 
 /// **Live full-DRIVER round-trip** — drives the real `NodeProjectExport::export()` /

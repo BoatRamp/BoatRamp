@@ -125,6 +125,64 @@ pub fn pg_restore_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocat
     }
 }
 
+/// Build a `psql` invocation that runs one **trusted, we-generate-it** DDL/utility statement
+/// (inc2 Stage C). This is the SUPERUSER / maintenance side of the atomic-shadow split: it runs
+/// ONLY our own generated control SQL — `CREATE DATABASE <shadow>`, `pg_terminate_backend`, the
+/// `ALTER DATABASE … RENAME` swap, `DROP DATABASE` — never a byte of the attacker-crafted bundle
+/// dump (that is applied by [`pg_restore_shadow_invocation`] as the NON-superuser target role).
+///
+/// `sql` is placed in argv (via `-c`): it is a constant/identifier-composed statement WE build
+/// (never a credential, never bundle-derived data), so argv is correct here — the only secret, the
+/// password, still rides in `PGPASSWORD` (the env), never argv. `-v ON_ERROR_STOP=1` makes a failed
+/// statement a non-zero exit (so the driver never mistakes a failed `CREATE DATABASE` for success),
+/// and `-tAc` keeps any output terse. The caller runs **one statement per invocation** because
+/// `CREATE DATABASE` / `ALTER DATABASE … RENAME` cannot run inside a transaction block and psql
+/// wraps a multi-statement `-c` string as one implicit transaction. The connect target (incl. the
+/// maintenance `postgres` database for `CREATE/ALTER/DROP DATABASE`) rides in `conn.env`.
+pub fn psql_invocation(conn: &PgConnection, sql: &str) -> SqlInvocation {
+    let argv = vec![
+        "psql".to_string(),
+        "-v".to_string(),
+        "ON_ERROR_STOP=1".to_string(),
+        "-tAc".to_string(),
+        sql.to_string(),
+    ];
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build the `pg_restore` invocation that applies the **attacker-crafted bundle dump** into a
+/// pre-created SHADOW database (inc2 Stage C) — the UNTRUSTED side of the atomic-shadow split.
+///
+/// It targets the shadow database by NAME (`-d <shadow_db>`, NOT `conn.database`) and is meant to
+/// run as the TARGET PROJECT'S own NON-SUPERUSER role (the driver resolves that credential), so a
+/// crafted dump's superuser-only escapes (`COPY … TO/FROM PROGRAM/FILE`, `CREATE FUNCTION …
+/// LANGUAGE c`, `CREATE EXTENSION`) FAIL at apply — Postgres denies them to a non-superuser. A FULL
+/// restore (schema + data; never `--data-only`): `--single-transaction` makes the shadow restore
+/// itself all-or-nothing, `--exit-on-error` aborts loudly on the first failed object, and
+/// `--no-owner`/`--no-privileges` keep the restore from reassigning ownership/ACLs (so no `SET
+/// ROLE`/`ALTER … OWNER` to the superuser is attempted). The dump is fed on stdin. NEVER pass `-j`
+/// here: parallel restore needs a seekable archive, and the dump arrives as a non-seekable pipe.
+/// `shadow_db` is a driver-derived identifier (`<db>__shadow_<ts>`), not a credential, so argv is
+/// correct; the password stays in `PGPASSWORD`.
+pub fn pg_restore_shadow_invocation(conn: &PgConnection, shadow_db: &str) -> SqlInvocation {
+    let argv = vec![
+        "pg_restore".to_string(),
+        "--no-owner".to_string(),
+        "--no-privileges".to_string(),
+        "--exit-on-error".to_string(),
+        "--single-transaction".to_string(),
+        "-d".to_string(),
+        shadow_db.to_string(),
+    ];
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
 /// A resolved MySQL connection target for the client. The password goes in `MYSQL_PWD`
 /// (the env the mysql/mysqldump clients read), never argv.
 #[derive(Debug, Clone)]
@@ -222,6 +280,66 @@ pub fn mysql_restore_invocation(conn: &MysqlConnection, data_only: bool) -> SqlI
     }
 }
 
+/// Build the **tables-only FULL** `mysqldump` for the inc2 chunked/shadow path (Stage D). Unlike
+/// the inc1 FULL dump ([`mysqldump_invocation`] with `--databases <db>`, which emits `CREATE
+/// DATABASE`/`USE <original>` and so TARGETS THE ORIGINAL NAME), this dumps the db's TABLES ONLY —
+/// a positional `<db>` with NO `--databases` — so the stream carries `CREATE TABLE` + data and NO
+/// `CREATE DATABASE`/`USE`. That lets `mysql <shadow>` ([`mysql_shadow_invocation`]) apply it into a
+/// freshly-created shadow database whose name differs from the source. `--single-transaction` takes
+/// a consistent InnoDB snapshot without locking; `--no-tablespaces` avoids the `PROCESS` privilege.
+/// Host/port/user are explicit (`mysqldump` ignores `MYSQL_HOST`); the password stays in `MYSQL_PWD`.
+pub fn mysqldump_tables_only_invocation(conn: &MysqlConnection) -> SqlInvocation {
+    let mut argv = vec![
+        "mysqldump".to_string(),
+        "--single-transaction".to_string(),
+        "--no-tablespaces".to_string(),
+    ];
+    argv.extend(conn.conn_args());
+    // Positional db, NO `--databases` ⇒ tables only, no `CREATE DATABASE`/`USE <original>`.
+    argv.push(conn.database.clone());
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build the `mysql` invocation that applies the **attacker-crafted** tables-only dump into a
+/// pre-created SHADOW database by NAME (inc2 Stage D) — the UNTRUSTED side of the atomic-shadow
+/// split. Meant to run as the TARGET PROJECT'S own NON-SUPERUSER role (the driver resolves that
+/// credential) so a crafted statement needing elevated privileges (`LOAD DATA INFILE`, `INTO
+/// OUTFILE`, creating a `LANGUAGE`-escalating routine) fails at apply. The dump (which carries NO
+/// `USE`) is fed on stdin and lands in `shadow_db` because it is named as the default database
+/// positionally. Host/port/user explicit; password in `MYSQL_PWD`; `shadow_db` is a driver-derived
+/// identifier (not a credential), so argv is correct.
+pub fn mysql_shadow_invocation(conn: &MysqlConnection, shadow_db: &str) -> SqlInvocation {
+    let mut argv = vec!["mysql".to_string()];
+    argv.extend(conn.conn_args());
+    argv.push(conn.connect_timeout_arg());
+    argv.push(shadow_db.to_string());
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build a `mysql` invocation that runs **trusted, we-generate-it** SQL fed on stdin — the
+/// SUPERUSER / maintenance side of the inc2 mysql shadow split (Stage D): `CREATE DATABASE
+/// <shadow>`, the atomic `RENAME TABLE` swap, `DROP DATABASE`, and the `information_schema` table
+/// enumeration the swap is built from. No default database is named (so `CREATE DATABASE` works and
+/// every object is schema-qualified in the SQL we build), `-N --batch` give header-less,
+/// tab-separated output for the enumeration query. Host/port/user explicit; password in `MYSQL_PWD`.
+pub fn mysql_admin_invocation(conn: &MysqlConnection) -> SqlInvocation {
+    let mut argv = vec!["mysql".to_string()];
+    argv.extend(conn.conn_args());
+    argv.push(conn.connect_timeout_arg());
+    argv.push("-N".to_string());
+    argv.push("--batch".to_string());
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +396,113 @@ mod tests {
                 Some(conn().database.as_str()),
                 "the target database must follow -d"
             );
+        }
+    }
+
+    #[test]
+    fn shadow_builders_split_trusted_ddl_from_untrusted_apply() {
+        let c = conn();
+        // The TRUSTED maintenance side: psql runs ONE generated statement; ON_ERROR_STOP so a
+        // failed CREATE/ALTER/DROP DATABASE is a non-zero exit (never mistaken for success).
+        let ddl = psql_invocation(&c, "CREATE DATABASE \"app__shadow_1\" OWNER \"owner\"");
+        assert_eq!(ddl.argv[0], "psql");
+        assert!(ddl.argv.iter().any(|a| a == "ON_ERROR_STOP=1"));
+        assert!(
+            ddl.argv
+                .iter()
+                .any(|a| a == "CREATE DATABASE \"app__shadow_1\" OWNER \"owner\"")
+        );
+        // The UNTRUSTED apply side: FULL restore (NEVER --data-only), single-transaction,
+        // exit-on-error, no-owner/no-privileges, targeting the SHADOW by name — and NEVER `-j`
+        // (parallel restore needs a seekable archive; the dump is a pipe).
+        let apply = pg_restore_shadow_invocation(&c, "app__shadow_1");
+        assert_eq!(apply.argv[0], "pg_restore");
+        assert!(apply.argv.iter().any(|a| a == "--single-transaction"));
+        assert!(apply.argv.iter().any(|a| a == "--exit-on-error"));
+        assert!(apply.argv.iter().any(|a| a == "--no-owner"));
+        assert!(apply.argv.iter().any(|a| a == "--no-privileges"));
+        assert!(
+            !apply.argv.iter().any(|a| a == "--data-only"),
+            "the chunked pg shadow path is FULL-restore only (default #1)"
+        );
+        assert!(
+            !apply
+                .argv
+                .iter()
+                .any(|a| a == "-j" || a.starts_with("--jobs")),
+            "NEVER parallel-restore a piped archive"
+        );
+        let pos = apply.argv.iter().position(|a| a == "-d").expect("-d");
+        assert_eq!(
+            apply.argv.get(pos + 1).map(String::as_str),
+            Some("app__shadow_1"),
+            "the shadow db (NOT conn.database) follows -d"
+        );
+        // Both still carry the credential ONLY in the env, never argv.
+        for inv in [&ddl, &apply] {
+            assert!(
+                inv.env
+                    .iter()
+                    .any(|(k, v)| k == "PGPASSWORD" && v == &c.password)
+            );
+            for a in &inv.argv {
+                assert!(
+                    !a.contains(&c.password),
+                    "credential leaked into argv: {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_shadow_builders_are_tables_only_and_target_the_shadow() {
+        let c = myconn();
+        // Tables-only FULL dump: positional db, NO --databases (so no CREATE DATABASE/USE of the
+        // ORIGINAL name), NO --no-create-info (schema + data), NO --connect-timeout (mysqldump
+        // rejects it).
+        let dump = mysqldump_tables_only_invocation(&c);
+        assert_eq!(dump.argv[0], "mysqldump");
+        assert!(!dump.argv.iter().any(|a| a == "--databases"));
+        assert!(!dump.argv.iter().any(|a| a == "--no-create-info"));
+        assert!(!dump.argv.iter().any(|a| a.starts_with("--connect-timeout")));
+        assert!(
+            dump.argv.last().map(String::as_str) == Some("app"),
+            "the db is positional (tables only): {:?}",
+            dump.argv
+        );
+        // The untrusted apply targets the SHADOW by name (positional default db).
+        let apply = mysql_shadow_invocation(&c, "app__shadow_1");
+        assert_eq!(apply.argv[0], "mysql");
+        assert!(apply.argv.iter().any(|a| a == "app__shadow_1"));
+        assert!(!apply.argv.iter().any(|a| a == "app"));
+        // The trusted admin side names NO default db (so CREATE/DROP DATABASE + schema-qualified
+        // RENAME TABLE work) and asks for header-less tab output for the table enumeration.
+        let admin = mysql_admin_invocation(&c);
+        assert_eq!(admin.argv[0], "mysql");
+        assert!(admin.argv.iter().any(|a| a == "-N"));
+        assert!(admin.argv.iter().any(|a| a == "--batch"));
+        assert!(
+            !admin
+                .argv
+                .iter()
+                .any(|a| a == "app" || a == "app__shadow_1"),
+            "the admin connection names no default database: {:?}",
+            admin.argv
+        );
+        // Credential only in MYSQL_PWD, never argv; host explicit (mysqldump ignores MYSQL_HOST).
+        for inv in [&dump, &apply, &admin] {
+            assert!(
+                inv.env
+                    .iter()
+                    .any(|(k, v)| k == "MYSQL_PWD" && v == &c.password)
+            );
+            assert!(inv.argv.iter().any(|a| a == &format!("--host={}", c.host)));
+            for a in &inv.argv {
+                assert!(
+                    !a.contains(&c.password),
+                    "credential leaked into argv: {a:?}"
+                );
+            }
         }
     }
 

@@ -1103,8 +1103,12 @@ where
 /// from that temp BEFORE `restore(spec, &verified_temp)` is called (and the temp is freed
 /// after). This closes the apply-then-verify window — a corrupt/tampered member is rejected
 /// before it is applied — while keeping staging bounded to the largest single member. Reads v1
-/// and v2 bundles. NOTE: an import aborted mid-stream may still have applied EARLIER members;
-/// full atomicity awaits the inc2 shadow-restore.
+/// and v2 bundles. NOTE: this is the inc1 staged reader — it verifies-then-applies but does NOT
+/// own per-member rollback, so an import aborted mid-stream may have applied EARLIER members.
+/// inc2's [`read_bundle_streaming_atomic`] adds the atomic shadow-restore (a FULL managed-DB
+/// member is swapped in only after its trailing SHA verifies, so a bad DB member applies NOTHING
+/// to live — per-member all-or-nothing); even there, the bundle is not whole-bundle atomic (the
+/// cross-member window) and a `--data-only` DB member keeps this non-atomic sidecar path.
 pub fn read_bundle_streaming_staged<R, H, F>(
     src: R,
     stage_dir: &Path,

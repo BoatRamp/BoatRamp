@@ -2740,8 +2740,15 @@ fn default_identity() -> String {
 /// STREAMED straight into the driver (never staged whole to a node temp file; peak staging is
 /// bounded to the largest single member) and restored in a single forward pass; dry-run unless
 /// `?apply=true`. Returns the import report JSON. `501` when no driver is wired, `409` on a
-/// schema skew / KV commingle refusal. NOTE: an import aborted mid-stream may have partially
-/// applied earlier members — full atomicity awaits the inc2 shadow-restore.
+/// schema skew / KV commingle refusal.
+///
+/// Atomicity (inc2): each FULL managed-DB member (pg/mysql/libsql) is applied into a SHADOW and
+/// swapped in only after its trailing SHA verifies, so a corrupt/truncated/aborted DB member
+/// applies NOTHING to live (PER-MEMBER all-or-nothing, default #2). A `--data-only` DB member
+/// stays on the non-atomic sidecar path (default #1: FULL-restore atomicity only). The bundle is
+/// NOT whole-bundle atomic: a cross-member window remains — an earlier DB member swapped live
+/// while a LATER member fails is not rolled back (a known residual). Overwriting a populated DB
+/// peaks at ~2× its size during the shadow swap.
 pub(super) async fn project_import(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     Query(q): Query<ProjectImportQuery>,

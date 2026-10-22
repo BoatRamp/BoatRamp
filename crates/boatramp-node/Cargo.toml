@@ -77,7 +77,7 @@ hex.workspace = true
 # `compat` adapters (tokio <-> futures AsyncRead/Write) for the project-export driver:
 # it streams a bundle member file (tokio) through `ComputeBackend::run_ephemeral`'s
 # std-agnostic `futures` stdin/stdout. Optional — pulled only by `project-export`.
-tokio-util = { workspace = true, features = ["compat"], optional = true }
+tokio-util = { workspace = true, features = ["compat", "rt"], optional = true }
 
 [features]
 # Cfg markers matching the binary's feature set: `config` parses every section in

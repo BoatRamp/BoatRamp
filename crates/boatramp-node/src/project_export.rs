@@ -26,6 +26,22 @@
 //! Phase 1 first cut: **docker backend, pg + libsql + KV + blobs, `--data-only` + full**.
 //! mysql and external-URL (non-managed) pg bindings are skipped with a note; the native
 //! container backend's `run_ephemeral` is `Unsupported`.
+//!
+//! ## Atomicity (inc2 chunked + shadow-restore)
+//! A FULL **managed** pg/mysql/libsql member streams O(chunk) (no whole-member temp) and is
+//! applied into a SHADOW — a not-yet-live database/file — then swapped in atomically ONLY after
+//! its trailing SHA verifies; any abort (SHA mismatch, truncation, restore error, disconnect)
+//! tears the shadow down and leaves live untouched (PER-MEMBER all-or-nothing, default #2). The
+//! untrusted dump is applied by the TARGET project's NON-SUPERUSER role (`--no-owner
+//! --no-privileges`), so a crafted dump's superuser-only escapes FAIL; the superuser/maintenance
+//! connection runs ONLY our trusted `CREATE/ALTER/DROP DATABASE` DDL. Residuals: a `--data-only`
+//! DB member stays on the non-atomic inc1 sidecar path (default #1 = FULL-restore atomicity only);
+//! the bundle is NOT whole-bundle atomic (an earlier member swapped-live while a later one fails is
+//! not rolled back — the cross-member window); overwriting a populated DB peaks at ~2× its size.
+//! An EXTERNAL bring-your-own-URL pg/mysql binding stays on the sidecar path (we never
+//! CREATE/RENAME/DROP databases on an operator's own server). Shared-server pg/mysql uses a
+//! per-import physical shadow database (a known cross-tenant surface deferred to the temp-schema
+//! follow-up, default #3 = temp-DB for dedicated/Single).
 #![cfg(feature = "project-export")]
 
 use std::collections::{BTreeMap, HashMap};
@@ -53,14 +69,17 @@ use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
 
 use crate::config::ExternalDatabaseConfig;
-use crate::managed_sql::{ManagedSqlCredentials, operator_target};
+use crate::managed_sql::{ManagedSqlCredentials, operator_target, owner_target};
 use crate::pg_client::{
-    MysqlConnection, PgConnection, mysql_restore_invocation, mysqldump_invocation,
-    pg_dump_invocation, pg_restore_invocation,
+    MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
+    mysql_shadow_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
+    pg_dump_invocation, pg_restore_invocation, pg_restore_shadow_invocation, psql_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
 };
+use boatramp_storage::ExternalSqlKind;
+use boatramp_storage::tenant_provision::quote_ident;
 
 type Perr = ProjectExportError;
 
@@ -381,6 +400,17 @@ async fn write_kek_file(path: &std::path::Path, kek: &[u8]) -> Result<(), Perr> 
     .map_err(other)
 }
 
+/// Which SQL identity to resolve for a managed binding (inc2 Stage C/D atomic-shadow split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRole {
+    /// The configured/superuser role (`operator_target`) — runs OUR trusted maintenance DDL
+    /// (`CREATE/ALTER/DROP DATABASE`), never the attacker-crafted dump.
+    Operator,
+    /// The per-project NON-SUPERUSER owner role (`owner_target`) — applies the attacker-crafted
+    /// dump, so a crafted superuser-only escape FAILS. (Equals Operator on a Single/dedicated box.)
+    Owner,
+}
+
 /// Always constructible from the node's always-present deps (deploy + KV + blobs); the
 /// engine contexts attach optionally — [`with_managed_pg`](Self::with_managed_pg) for the
 /// pg/mysql ephemeral-dump path, [`with_libsql`](Self::with_libsql) for the embedded
@@ -635,12 +665,34 @@ impl NodeProjectExport {
     /// Resolve a managed compute-backed SQL database to its reachable endpoint parts —
     /// the same derivation the runtime uses (`operator_target` + the healthy replica
     /// endpoint + the unsealed credential), with a colocated `Published` DB reached at its
-    /// container bridge IP.
+    /// container bridge IP. Uses the OPERATOR identity (the configured/superuser role).
     async fn resolve_managed_endpoint(
         &self,
         project: &str,
         db: &str,
         cfg: &ExternalDatabaseConfig,
+    ) -> Result<SqlEndpoint, Perr> {
+        self.resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Operator)
+            .await
+    }
+
+    /// Like [`resolve_managed_endpoint`](Self::resolve_managed_endpoint) but selects the SQL
+    /// identity by `role` (inc2 Stage C/D atomic-shadow split):
+    /// - [`EndpointRole::Operator`] — `operator_target`: the configured/superuser role (so the
+    ///   maintenance DDL `CREATE/ALTER/DROP DATABASE` can run). This is the one that runs OUR OWN
+    ///   trusted DDL, never the attacker-crafted dump.
+    /// - [`EndpointRole::Owner`] — `owner_target`: the per-project NON-SUPERUSER owner role on a
+    ///   Shared server (so a crafted dump's superuser-only escapes FAIL at apply); identical to the
+    ///   operator identity on a Single/dedicated instance (the one configured per-project role,
+    ///   `<= project-owner`, not the cluster superuser).
+    ///
+    /// Everything but the identity/credential is role-independent (same replica endpoint + host).
+    async fn resolve_managed_endpoint_role(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        role: EndpointRole,
     ) -> Result<SqlEndpoint, Perr> {
         let backend = self.require_backend()?;
         let envelope = self.envelope.as_ref().ok_or_else(|| {
@@ -649,7 +701,11 @@ impl NodeProjectExport {
                  none on this node"
             ))
         })?;
-        let target = operator_target(cfg, project, db).map_err(other)?;
+        let target = match role {
+            EndpointRole::Operator => operator_target(cfg, project, db),
+            EndpointRole::Owner => owner_target(cfg, project, db),
+        }
+        .map_err(other)?;
         let states = self
             .deploy
             .list_replica_states(ProjectRef::new(&target.endpoint_project), &target.workload)
@@ -784,6 +840,44 @@ impl NodeProjectExport {
         };
         Ok(code)
     }
+
+    /// Run a SQL client capturing its stdout as a trimmed string (plus the exit code) — for the
+    /// trusted-DDL utility queries of the inc2 shadow swap (pg `SELECT 1 FROM pg_database …`, mysql
+    /// `information_schema` table enumeration). The stdout temp lives under `stage_dir` and is
+    /// removed after.
+    async fn run_sql_capture(
+        &self,
+        image: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        stdin_path: Option<&Path>,
+        stage_dir: &Path,
+    ) -> Result<(i32, String), Perr> {
+        let out = stage_dir.join(format!("cap-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(image, argv, env, stdin_path, &out)
+            .await?;
+        let s = tokio::fs::read_to_string(&out).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out).await;
+        Ok((code, s.trim().to_string()))
+    }
+}
+
+/// A process-unique shadow suffix (`<nanos>_<pid>`) — same shape libsql's `shadow_path_for` uses,
+/// so two imports in the same second never collide and the `*__shadow_*` / `*__old_*` sweep matches.
+fn shadow_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}_{}", std::process::id())
+}
+
+/// Quote a Postgres **string literal** (single-quoted, doubling any embedded `'`) — for the
+/// `datname = '<db>'` predicate of our own generated `pg_terminate_backend` / `pg_database`
+/// utility SQL (the db name is driver-derived, never a credential or bundle data).
+fn pg_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// The resolved reachable endpoint of a SQL database (managed or external) — the raw
@@ -883,6 +977,106 @@ impl Read for ChannelReader {
         out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
+    }
+}
+
+/// An async [`futures::io::AsyncWrite`] that forwards each write into a bounded tokio channel —
+/// the bridge from a `run_ephemeral` stdout sink (`pg_dump`/`mysqldump`) straight into a
+/// ChunkedTrailer body channel (inc2 Stage C/D), so the SQL dump streams O(chunk) with NO temp.
+/// A full channel backpressures the dump via `Poll::Pending`; a closed channel is a broken pipe.
+struct AsyncChannelWriter {
+    sender: tokio_util::sync::PollSender<Vec<u8>>,
+}
+
+impl AsyncChannelWriter {
+    fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            sender: tokio_util::sync::PollSender::new(tx),
+        }
+    }
+}
+
+impl futures::io::AsyncWrite for AsyncChannelWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        let me = self.get_mut();
+        match me.sender.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => match me.sender.send_item(buf.to_vec()) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(_) => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "export dump sink closed",
+                ))),
+            },
+            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "export dump sink closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().sender.close();
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// An async [`futures::io::AsyncRead`] fed by a bounded tokio channel — the bridge from a
+/// ChunkedTrailer member's body channel into a `run_ephemeral` stdin reader (`pg_restore`/`mysql`)
+/// on the IMPORT side (inc2 Stage C/D). Bounded memory; a closed channel is clean EOF so the
+/// restore client sees stdin half-close and exits.
+struct AsyncChannelReader {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl AsyncChannelReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl futures::io::AsyncRead for AsyncChannelReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        let me = self.get_mut();
+        while me.pos >= me.buf.len() {
+            match me.rx.poll_recv(cx) {
+                Poll::Ready(Some(chunk)) if !chunk.is_empty() => {
+                    me.buf = chunk;
+                    me.pos = 0;
+                }
+                Poll::Ready(Some(_)) => continue, // skip an empty chunk, not EOF
+                Poll::Ready(None) => return Poll::Ready(Ok(0)), // all senders dropped ⇒ EOF
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let n = std::cmp::min(out.len(), me.buf.len() - me.pos);
+        out[..n].copy_from_slice(&me.buf[me.pos..me.pos + n]);
+        me.pos += n;
+        Poll::Ready(Ok(n))
     }
 }
 
@@ -1138,6 +1332,57 @@ enum ChunkState {
         temp: PathBuf,
         write_err: Option<Perr>,
     },
+    /// A Postgres member streaming into a SHADOW database (inc2 Stage C). The restore subprocess
+    /// (`pg_restore` as the NON-SUPERUSER owner role) reads the body channel as stdin while it runs;
+    /// at finish the shadow is atomically swapped in (verified) or dropped (abort) via trusted DDL.
+    Pg {
+        plan: Box<PgShadowPlan>,
+        restore: tokio::task::JoinHandle<Result<i32, Perr>>,
+        out_path: PathBuf,
+    },
+    /// A MySQL member streaming into a SHADOW database (inc2 Stage D), mirror of [`Pg`](Self::Pg):
+    /// `mysql <shadow>` applies the tables-only dump as the non-superuser role; finish swaps via an
+    /// atomic `RENAME TABLE` (verified) or drops the shadow (abort).
+    Mysql {
+        plan: Box<MysqlShadowPlan>,
+        restore: tokio::task::JoinHandle<Result<i32, Perr>>,
+        out_path: PathBuf,
+    },
+}
+
+/// The resolved plan for a Postgres atomic shadow-restore (inc2 Stage C). The DDL/identity SPLIT is
+/// the security core: `maint` is the SUPERUSER / maintenance connection (to the `postgres` db) that
+/// runs ONLY our trusted `CREATE/ALTER/DROP DATABASE` + `pg_terminate_backend`; `owner` is the
+/// NON-SUPERUSER per-project role that `pg_restore` connects as to apply the attacker-crafted dump.
+#[derive(Clone)]
+struct PgShadowPlan {
+    /// The live (target) database name.
+    live_db: String,
+    /// The transient shadow database (`<live>__shadow_<suffix>`) the dump restores into.
+    shadow_db: String,
+    /// The per-process-unique suffix (also names the rename-aside `<live>__old_<suffix>`).
+    suffix: String,
+    /// The SUPERUSER / maintenance connection (database = `postgres`) for the trusted DDL.
+    maint: PgConnection,
+    /// The NON-SUPERUSER owner connection `pg_restore` uses to apply the untrusted dump.
+    owner: PgConnection,
+    /// The owner role name (for `CREATE DATABASE <shadow> OWNER <owner>`).
+    owner_role: String,
+    /// The client image (`pg_dump`/`pg_restore`/`psql`).
+    image: String,
+}
+
+/// The resolved plan for a MySQL atomic shadow-restore (inc2 Stage D), mirror of [`PgShadowPlan`].
+#[derive(Clone)]
+struct MysqlShadowPlan {
+    live_db: String,
+    shadow_db: String,
+    suffix: String,
+    /// The SUPERUSER / maintenance connection (no default db) for the trusted DDL + enumeration.
+    maint: MysqlConnection,
+    /// The NON-SUPERUSER owner connection `mysql <shadow>` uses to apply the untrusted dump.
+    owner: MysqlConnection,
+    image: String,
 }
 
 #[async_trait]
@@ -1579,13 +1824,146 @@ impl ProjectExport for NodeProjectExport {
                                     }
                                 }
                             }
+                            MemberKind::PgDump => {
+                                // The UNTRUSTED pg dump → an atomic SHADOW database (inc2 Stage C).
+                                // Tenancy: the member path `sql/<db>.pgc` names a BINDING, not a
+                                // project; `self.databases.get(db)` + `resolve_pg(project, …)`
+                                // resolve the TARGET project's OWN managed db — a pg member can only
+                                // ever land in the target's tenant-keyed db, so there is no
+                                // cross-tenant surface (no re-key needed; the sidecar PgDump arm
+                                // does exactly the same).
+                                let db = match db_from_pg_member(&spec.path) {
+                                    Some(d) => d.to_string(),
+                                    None => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "bad pg member path {:?}",
+                                            spec.path
+                                        )));
+                                    }
+                                };
+                                let cfg = match self.databases.get(&db) {
+                                    Some(c) => c.clone(),
+                                    None => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "import: no database named {db:?} on this node"
+                                        )));
+                                    }
+                                };
+                                if !opts.apply {
+                                    // Dry-run: don't touch the server — drain + count.
+                                    let _ = reply.send(Ok(()));
+                                    while body_rx.recv().await.is_some() {}
+                                    report.pg_databases += 1;
+                                    pending_chunk = None;
+                                } else {
+                                    let plan = match self.pg_shadow_plan(project, &db, &cfg).await {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let _ = reply.send(Err(()));
+                                            return Err(e);
+                                        }
+                                    };
+                                    // TRUSTED DDL (superuser/maint): create the shadow owned by the
+                                    // NON-SUPERUSER role (which then applies the untrusted dump).
+                                    if let Err(e) = self.pg_create_shadow(&plan, &stage_dir).await {
+                                        let _ = reply.send(Err(()));
+                                        return Err(e);
+                                    }
+                                    let out_path =
+                                        stage_dir.join(format!("pgrestore-{chunk_idx}.out"));
+                                    chunk_idx += 1;
+                                    let restore = match self.spawn_pg_restore(
+                                        &plan,
+                                        body_rx,
+                                        out_path.clone(),
+                                    ) {
+                                        Ok(h) => h,
+                                        Err(e) => {
+                                            // Shadow was created — tear it down before failing.
+                                            self.pg_drop_shadow(&plan, &stage_dir).await;
+                                            let _ = reply.send(Err(()));
+                                            return Err(e);
+                                        }
+                                    };
+                                    let _ = reply.send(Ok(()));
+                                    pending_chunk = Some(ChunkState::Pg {
+                                        plan: Box::new(plan),
+                                        restore,
+                                        out_path,
+                                    });
+                                }
+                            }
+                            MemberKind::MysqlDump => {
+                                let db = match db_from_mysql_member(&spec.path) {
+                                    Some(d) => d.to_string(),
+                                    None => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "bad mysql member path {:?}",
+                                            spec.path
+                                        )));
+                                    }
+                                };
+                                let cfg = match self.databases.get(&db) {
+                                    Some(c) => c.clone(),
+                                    None => {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "import: no database named {db:?} on this node"
+                                        )));
+                                    }
+                                };
+                                if !opts.apply {
+                                    let _ = reply.send(Ok(()));
+                                    while body_rx.recv().await.is_some() {}
+                                    report.pg_databases += 1;
+                                    pending_chunk = None;
+                                } else {
+                                    let plan =
+                                        match self.mysql_shadow_plan(project, &db, &cfg).await {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                let _ = reply.send(Err(()));
+                                                return Err(e);
+                                            }
+                                        };
+                                    if let Err(e) =
+                                        self.mysql_create_shadow(&plan, &stage_dir).await
+                                    {
+                                        let _ = reply.send(Err(()));
+                                        return Err(e);
+                                    }
+                                    let out_path =
+                                        stage_dir.join(format!("myrestore-{chunk_idx}.out"));
+                                    chunk_idx += 1;
+                                    let restore = match self.spawn_mysql_restore(
+                                        &plan,
+                                        body_rx,
+                                        out_path.clone(),
+                                    ) {
+                                        Ok(h) => h,
+                                        Err(e) => {
+                                            self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                            let _ = reply.send(Err(()));
+                                            return Err(e);
+                                        }
+                                    };
+                                    let _ = reply.send(Ok(()));
+                                    pending_chunk = Some(ChunkState::Mysql {
+                                        plan: Box::new(plan),
+                                        restore,
+                                        out_path,
+                                    });
+                                }
+                            }
                             _ => {
                                 let _ = reply.send(Err(()));
-                                return Err(Perr::Unavailable(
-                                    "chunked pg/mysql import is a later (live-gated) stage; this \
-                                     bundle's chunked member kind is not wired here"
-                                        .into(),
-                                ));
+                                return Err(Perr::Unavailable(format!(
+                                    "chunked framing is not wired for member kind {:?}",
+                                    spec.kind
+                                )));
                             }
                         }
                     }
@@ -1640,8 +2018,104 @@ impl ProjectExport for NodeProjectExport {
                                 let _ = tokio::fs::remove_file(&temp).await;
                                 r
                             }
+                            Some(ChunkState::Pg {
+                                plan,
+                                restore,
+                                out_path,
+                            }) => {
+                                // The reader dropped body_tx → stdin EOF; await the restore client.
+                                let code = restore.await;
+                                let out = tokio::fs::read_to_string(&out_path)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ = tokio::fs::remove_file(&out_path).await;
+                                match code {
+                                    Ok(Ok(0)) if verified => {
+                                        // Restore clean AND trailer matched → atomic swap.
+                                        match self.pg_swap_shadow(&plan, &stage_dir).await {
+                                            Ok(()) => {
+                                                report.pg_databases += 1;
+                                                Ok(())
+                                            }
+                                            Err(e) => {
+                                                self.pg_drop_shadow(&plan, &stage_dir).await;
+                                                Err(e)
+                                            }
+                                        }
+                                    }
+                                    Ok(Ok(0)) => {
+                                        // Restore clean but trailer MISMATCH/truncation → abort:
+                                        // drop the shadow (live untouched); the reader raises the
+                                        // loud SHA/size error.
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
+                                        Ok(())
+                                    }
+                                    Ok(Ok(c)) => {
+                                        // Non-zero pg_restore exit — a crafted superuser-only escape
+                                        // refused as the non-superuser role lands here (as do other
+                                        // restore failures). Drop the shadow; live untouched.
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
+                                        Err(Perr::Other(format!(
+                                            "pg_restore into shadow {:?} exited {c}; live untouched: {out}",
+                                            plan.shadow_db
+                                        )))
+                                    }
+                                    Ok(Err(e)) => {
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
+                                        Err(e)
+                                    }
+                                    Err(je) => {
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
+                                        Err(other(je))
+                                    }
+                                }
+                            }
+                            Some(ChunkState::Mysql {
+                                plan,
+                                restore,
+                                out_path,
+                            }) => {
+                                let code = restore.await;
+                                let out = tokio::fs::read_to_string(&out_path)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ = tokio::fs::remove_file(&out_path).await;
+                                match code {
+                                    Ok(Ok(0)) if verified => {
+                                        match self.mysql_swap_shadow(&plan, &stage_dir).await {
+                                            Ok(()) => {
+                                                report.pg_databases += 1;
+                                                Ok(())
+                                            }
+                                            Err(e) => {
+                                                self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                                Err(e)
+                                            }
+                                        }
+                                    }
+                                    Ok(Ok(0)) => {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                        Ok(())
+                                    }
+                                    Ok(Ok(c)) => {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                        Err(Perr::Other(format!(
+                                            "mysql restore into shadow {:?} exited {c}; live untouched: {out}",
+                                            plan.shadow_db
+                                        )))
+                                    }
+                                    Ok(Err(e)) => {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                        Err(e)
+                                    }
+                                    Err(je) => {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                        Err(other(je))
+                                    }
+                                }
+                            }
                             None => {
-                                // A dry-run libsql chunk (no sink opened) — nothing to commit.
+                                // A dry-run libsql/pg/mysql chunk (no sink opened) — nothing to commit.
                                 Ok(())
                             }
                         };
@@ -1656,6 +2130,20 @@ impl ProjectExport for NodeProjectExport {
                         }
                     }
                 }
+            }
+            // Safety net: if the reader died WITHOUT a ChunkFinish (e.g. a panic / broken req
+            // channel) while a pg/mysql shadow was in flight, tear it down so no orphan db remains
+            // (the libsql/staged shadows self-clean on Drop; the startup sweep covers a crash).
+            match pending_chunk.take() {
+                Some(ChunkState::Pg { plan, restore, .. }) => {
+                    restore.abort();
+                    self.pg_drop_shadow(&plan, &stage_dir).await;
+                }
+                Some(ChunkState::Mysql { plan, restore, .. }) => {
+                    restore.abort();
+                    self.mysql_drop_shadow(&plan, &stage_dir).await;
+                }
+                _ => {}
             }
             Ok((report, data_only, saw_identity))
         };
@@ -1845,23 +2333,29 @@ impl NodeProjectExport {
 
         // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
         for (db, cfg) in &self.databases {
-            let dumpable =
-                cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) || !cfg.url_env.is_empty();
+            let is_managed = cfg.compute.as_deref().is_some_and(|c| !c.is_empty());
+            let dumpable = is_managed || !cfg.url_env.is_empty();
+            // A MANAGED pg/mysql FULL dump is framed ChunkedTrailer → the inc2 streamed dump +
+            // atomic shadow-restore (Stage C/D). A `--data-only` import stays on the inc1 sidecar
+            // path (default #1: FULL-restore atomicity only), and an EXTERNAL bring-your-own-URL
+            // binding stays sidecar too (we never CREATE/RENAME/DROP databases on an operator's own
+            // server). So: chunked IFF managed AND full.
+            let chunked = is_managed && !data_only;
             if kind_is_postgres(&cfg.kind) && dumpable {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
+                let pg = Some(PgMemberInfo {
+                    server_version_num,
+                    client_image: image.clone(),
+                    schema_fingerprint,
+                });
+                let spec = if chunked {
+                    MemberSpec::chunked(pg_member_path(db), MemberKind::PgDump, pg)
+                } else {
+                    MemberSpec::sidecar(pg_member_path(db), MemberKind::PgDump, pg)
+                };
                 ordered.push((
-                    // Sidecar in this build (staged temp + `pg_restore`); the pg shadow+chunked
-                    // path is the separate live-gated Stage C, which flips this to `chunked`.
-                    MemberSpec::sidecar(
-                        pg_member_path(db),
-                        MemberKind::PgDump,
-                        Some(PgMemberInfo {
-                            server_version_num,
-                            client_image: image.clone(),
-                            schema_fingerprint,
-                        }),
-                    ),
+                    spec,
                     StageJob::Pg {
                         conn,
                         image,
@@ -1871,18 +2365,18 @@ impl NodeProjectExport {
             } else if kind_is_mysql(&cfg.kind) && dumpable {
                 let (conn, image, version) = self.resolve_mysql(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
+                let pg = Some(PgMemberInfo {
+                    server_version_num: version,
+                    client_image: image.clone(),
+                    schema_fingerprint,
+                });
+                let spec = if chunked {
+                    MemberSpec::chunked(mysql_member_path(db), MemberKind::MysqlDump, pg)
+                } else {
+                    MemberSpec::sidecar(mysql_member_path(db), MemberKind::MysqlDump, pg)
+                };
                 ordered.push((
-                    // Sidecar in this build (staged temp + `mysql` restore); the mysql
-                    // shadow+chunked path is the separate live-gated Stage D.
-                    MemberSpec::sidecar(
-                        mysql_member_path(db),
-                        MemberKind::MysqlDump,
-                        Some(PgMemberInfo {
-                            server_version_num: version,
-                            client_image: image.clone(),
-                            schema_fingerprint,
-                        }),
-                    ),
+                    spec,
                     StageJob::Mysql {
                         conn,
                         image,
@@ -1995,9 +2489,65 @@ impl NodeProjectExport {
                     r
                 })
             }
+            Some(StageJob::Pg { conn, image, .. }) => {
+                // FULL `pg_dump -Fc` stdout → body channel, NO temp (inc2 Stage C). The chunked pg
+                // path is FULL-only (default #1), so `data_only` is ignored here (plan_export only
+                // frames pg chunked when !data_only).
+                let backend = self.require_backend()?.clone();
+                let conn = conn.clone();
+                let image = image.clone();
+                tokio::spawn(async move {
+                    let mut sink = AsyncChannelWriter::new(body_tx);
+                    let r: Result<(), Perr> = async {
+                        let inv = pg_dump_invocation(&conn, false);
+                        let code = backend
+                            .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
+                            .await
+                            .map_err(other)?;
+                        if code != 0 {
+                            return Err(Perr::Other(format!("pg_dump exited {code}")));
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    // Set poison BEFORE closing the sink, so a short/failed dump becomes a loud IO
+                    // error at the reader (never a valid trailer over an incomplete member).
+                    if r.is_err() {
+                        poison2.store(true, SeqCst);
+                    }
+                    drop(sink); // closes the PollSender → body_rx EOF, after the poison store
+                    r
+                })
+            }
+            Some(StageJob::Mysql { conn, image, .. }) => {
+                // Tables-only FULL `mysqldump` stdout → body channel, NO temp (inc2 Stage D).
+                let backend = self.require_backend()?.clone();
+                let conn = conn.clone();
+                let image = image.clone();
+                tokio::spawn(async move {
+                    let mut sink = AsyncChannelWriter::new(body_tx);
+                    let r: Result<(), Perr> = async {
+                        let inv = mysqldump_tables_only_invocation(&conn);
+                        let code = backend
+                            .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
+                            .await
+                            .map_err(other)?;
+                        if code != 0 {
+                            return Err(Perr::Other(format!("mysqldump exited {code}")));
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if r.is_err() {
+                        poison2.store(true, SeqCst);
+                    }
+                    drop(sink);
+                    r
+                })
+            }
             _ => {
                 return Err(Perr::Other(
-                    "export: chunked framing is wired only for libsql + large blobs in this build"
+                    "export: chunked framing is wired only for pg/mysql, libsql + large blobs"
                         .into(),
                 ));
             }
@@ -2349,6 +2899,536 @@ impl NodeProjectExport {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // inc2 Stage C — Postgres atomic shadow-restore
+    //
+    // THE SECURITY-CRITICAL SPLIT (the pg analogue of Build 1's libsql ATTACH-authorizer fix):
+    // a pg dump in a bundle is ATTACKER-CRAFTED (the trailer SHA is integrity, not authenticity),
+    // and run as a SUPERUSER a crafted dump can `COPY … TO/FROM PROGRAM/FILE`, `CREATE FUNCTION …
+    // LANGUAGE c`, `CREATE EXTENSION`, … = arbitrary code/file execution on the box. THEREFORE the
+    // UNTRUSTED dump is applied by `pg_restore` connecting as the TARGET project's NON-SUPERUSER
+    // owner role (`plan.owner`) with `--no-owner --no-privileges` (so every superuser-only escape
+    // FAILS), and the SUPERUSER / maintenance connection (`plan.maint`, on the `postgres` db) runs
+    // ONLY our own trusted `CREATE/ALTER/DROP DATABASE` + `pg_terminate_backend` DDL — never a byte
+    // of the bundle's dump.
+    // -----------------------------------------------------------------------
+
+    /// Resolve the [`PgShadowPlan`] for a MANAGED pg binding: the superuser/maintenance connection
+    /// (on `postgres`), the non-superuser owner connection, the owner role name, the client image,
+    /// and a fresh shadow name. External (bring-your-own-URL) bindings are refused — we must not
+    /// `CREATE/RENAME/DROP` databases on an operator's own server, and a single URL credential can't
+    /// give the superuser/non-superuser split — so they stay on the inc1 sidecar path.
+    async fn pg_shadow_plan(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<PgShadowPlan, Perr> {
+        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            return Err(Perr::Unavailable(format!(
+                "database {db:?}: the atomic chunked pg shadow-restore is for MANAGED \
+                 (compute-backed) databases only; an external bring-your-own-URL binding uses the \
+                 sidecar path"
+            )));
+        }
+        // Operator identity (configured/superuser) + version-detect → client image. Its endpoint
+        // (host/port) + the live tenant db name seed the maintenance connection.
+        let (operator_conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
+        let live_db = operator_conn.database.clone();
+        let mut maint = operator_conn;
+        // CREATE/ALTER/DROP DATABASE cannot run connected to the tenant db — point at `postgres`.
+        maint.database = "postgres".to_string();
+        // The NON-SUPERUSER apply identity (the per-project owner role).
+        let owner_ep = self
+            .resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Owner)
+            .await?;
+        let owner_role = owner_ep.user.clone();
+        let owner = owner_ep.into_pg(self.connect_timeout_secs);
+        let suffix = shadow_suffix();
+        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        Ok(PgShadowPlan {
+            live_db,
+            shadow_db,
+            suffix,
+            maint,
+            owner,
+            owner_role,
+            image,
+        })
+    }
+
+    /// Run ONE trusted DDL/utility statement through the SUPERUSER / maintenance connection
+    /// (`psql -c`). The caller passes a single statement (psql wraps a multi-statement `-c` string
+    /// as one implicit transaction, which `CREATE DATABASE`/`ALTER DATABASE … RENAME` forbid).
+    async fn pg_run_ddl(
+        &self,
+        plan: &PgShadowPlan,
+        sql: &str,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = psql_invocation(&plan.maint, sql);
+        let (code, out) = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg shadow DDL exited {code} ({sql}): {out}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a database `name` exists (via the maintenance connection) — so the swap can skip the
+    /// rename-aside when cloning into a target that has no live db yet.
+    async fn pg_db_exists(
+        &self,
+        plan: &PgShadowPlan,
+        name: &str,
+        stage_dir: &Path,
+    ) -> Result<bool, Perr> {
+        let sql = format!("SELECT 1 FROM pg_database WHERE datname = {}", pg_lit(name));
+        let inv = psql_invocation(&plan.maint, &sql);
+        let (code, out) = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg shadow: could not probe database {name:?} (exit {code}): {out}"
+            )));
+        }
+        Ok(out.trim() == "1")
+    }
+
+    /// TRUSTED DDL: create the shadow database owned by the NON-SUPERUSER owner role (so the
+    /// `pg_restore` apply as that role can create objects in it). The shadow name is per-process
+    /// unique, so no pre-drop is needed.
+    async fn pg_create_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) -> Result<(), Perr> {
+        let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
+        let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_role);
+        self.pg_run_ddl(
+            plan,
+            &format!("CREATE DATABASE {shadow_q} OWNER {owner_q}"),
+            stage_dir,
+        )
+        .await
+    }
+
+    /// Best-effort TEARDOWN of the shadow (abort / RAII): terminate any lingering restore
+    /// connection, then `DROP DATABASE IF EXISTS`. Called on EVERY abort path (SHA mismatch,
+    /// truncation, restore error, swap error) so nothing partial is ever left; the startup sweep
+    /// covers the crash case. Errors are logged, not propagated (we are already aborting).
+    async fn pg_drop_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) {
+        let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
+        let _ = self
+            .pg_run_ddl(
+                plan,
+                &format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = {} AND pid <> pg_backend_pid()",
+                    pg_lit(&plan.shadow_db)
+                ),
+                stage_dir,
+            )
+            .await;
+        if let Err(e) = self
+            .pg_run_ddl(
+                plan,
+                &format!("DROP DATABASE IF EXISTS {shadow_q}"),
+                stage_dir,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, shadow = %plan.shadow_db, "pg shadow drop-on-abort failed; the startup sweep will reclaim it");
+        }
+    }
+
+    /// TRUSTED DDL: atomically swap the verified shadow in for live. Terminate live sessions,
+    /// `ALTER DATABASE <live> RENAME TO <live>__old_<suffix>` (skipped if there is no live db yet),
+    /// terminate shadow sessions, `ALTER DATABASE <shadow> RENAME TO <live>`, then drop the aside
+    /// copy. A sub-ms window exists between the two renames where no `<live>` db is present
+    /// (acceptable for an import/clone, not a live cutover). If the shadow→live rename fails after
+    /// the aside, the aside is renamed back so live is never lost.
+    async fn pg_swap_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) -> Result<(), Perr> {
+        let live_q = quote_ident(ExternalSqlKind::Postgres, &plan.live_db);
+        let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
+        let old_db = format!("{}__old_{}", plan.live_db, plan.suffix);
+        let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
+        let live_exists = self.pg_db_exists(plan, &plan.live_db, stage_dir).await?;
+        if live_exists {
+            self.pg_run_ddl(
+                plan,
+                &format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = {} AND pid <> pg_backend_pid()",
+                    pg_lit(&plan.live_db)
+                ),
+                stage_dir,
+            )
+            .await?;
+            self.pg_run_ddl(
+                plan,
+                &format!("ALTER DATABASE {live_q} RENAME TO {old_q}"),
+                stage_dir,
+            )
+            .await?;
+        }
+        // Terminate the restore connection to the shadow before renaming it.
+        self.pg_run_ddl(
+            plan,
+            &format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = {} AND pid <> pg_backend_pid()",
+                pg_lit(&plan.shadow_db)
+            ),
+            stage_dir,
+        )
+        .await?;
+        if let Err(e) = self
+            .pg_run_ddl(
+                plan,
+                &format!("ALTER DATABASE {shadow_q} RENAME TO {live_q}"),
+                stage_dir,
+            )
+            .await
+        {
+            // Roll the aside back to live so a failed swap never loses the original.
+            if live_exists {
+                let _ = self
+                    .pg_run_ddl(
+                        plan,
+                        &format!("ALTER DATABASE {old_q} RENAME TO {live_q}"),
+                        stage_dir,
+                    )
+                    .await;
+            }
+            return Err(e);
+        }
+        if live_exists {
+            // The swap succeeded; the aside copy is obsolete (best-effort drop).
+            let _ = self
+                .pg_run_ddl(
+                    plan,
+                    &format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                         WHERE datname = {} AND pid <> pg_backend_pid()",
+                        pg_lit(&old_db)
+                    ),
+                    stage_dir,
+                )
+                .await;
+            let _ = self
+                .pg_run_ddl(plan, &format!("DROP DATABASE IF EXISTS {old_q}"), stage_dir)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Spawn the `pg_restore` subprocess that applies the untrusted dump into the shadow, connecting
+    /// as the NON-SUPERUSER owner role, reading the chunked member's body channel as stdin (so the
+    /// dump streams in O(chunk)). Returns its `JoinHandle` (awaited at `ChunkFinish`).
+    fn spawn_pg_restore(
+        &self,
+        plan: &PgShadowPlan,
+        body_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        out_path: PathBuf,
+    ) -> Result<tokio::task::JoinHandle<Result<i32, Perr>>, Perr> {
+        let backend = self.require_backend()?.clone();
+        let image = plan.image.clone();
+        let inv = pg_restore_shadow_invocation(&plan.owner, &plan.shadow_db);
+        Ok(tokio::spawn(async move {
+            let mut reader = AsyncChannelReader::new(body_rx);
+            let out = tokio::fs::File::create(&out_path).await.map_err(other)?;
+            let mut sink = out.compat_write();
+            backend
+                .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut reader), &mut sink)
+                .await
+                .map_err(other)
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // inc2 Stage D — MySQL atomic shadow-restore (secondary; construens is pg). Same
+    // non-superuser-apply split: `mysql <shadow>` applies the attacker dump as the owner role;
+    // the maintenance connection runs the trusted `CREATE DATABASE` + atomic `RENAME TABLE` swap.
+    // -----------------------------------------------------------------------
+
+    /// Resolve the [`MysqlShadowPlan`] for a MANAGED mysql binding (external bindings stay sidecar).
+    async fn mysql_shadow_plan(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<MysqlShadowPlan, Perr> {
+        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            return Err(Perr::Unavailable(format!(
+                "database {db:?}: the atomic chunked mysql shadow-restore is for MANAGED \
+                 (compute-backed) databases only; an external binding uses the sidecar path"
+            )));
+        }
+        let (operator_conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
+        let live_db = operator_conn.database.clone();
+        let maint = operator_conn; // mysql names no default db for the admin SQL
+        let owner_ep = self
+            .resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Owner)
+            .await?;
+        let owner = owner_ep.into_mysql(self.connect_timeout_secs);
+        let suffix = shadow_suffix();
+        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        Ok(MysqlShadowPlan {
+            live_db,
+            shadow_db,
+            suffix,
+            maint,
+            owner,
+            image,
+        })
+    }
+
+    /// Run trusted mysql SQL (fed on stdin, no default db) through the maintenance connection,
+    /// capturing stdout (for the table enumeration) + the exit code.
+    async fn mysql_run_admin(
+        &self,
+        plan: &MysqlShadowPlan,
+        sql: &str,
+        stage_dir: &Path,
+    ) -> Result<(i32, String), Perr> {
+        let inv = mysql_admin_invocation(&plan.maint);
+        let in_path = stage_dir.join(format!("mysql-admin-{}.sql", shadow_suffix()));
+        tokio::fs::write(&in_path, sql).await.map_err(other)?;
+        let r = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, Some(&in_path), stage_dir)
+            .await;
+        let _ = tokio::fs::remove_file(&in_path).await;
+        r
+    }
+
+    /// List the base tables of a database via `information_schema` (maintenance connection).
+    async fn mysql_list_tables(
+        &self,
+        plan: &MysqlShadowPlan,
+        db: &str,
+        stage_dir: &Path,
+    ) -> Result<Vec<String>, Perr> {
+        let sql = format!(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = {} AND table_type = 'BASE TABLE';",
+            mysql_lit(db)
+        );
+        let (code, out) = self.mysql_run_admin(plan, &sql, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not list tables of {db:?} (exit {code}): {out}"
+            )));
+        }
+        Ok(out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+
+    /// TRUSTED DDL: create the shadow database (the apply runs as the non-superuser owner, which has
+    /// `db.*` grants covering a same-named db on a Single instance; on Shared the shadow is a known
+    /// cross-tenant surface deferred to the temp-schema follow-up, default #3).
+    async fn mysql_create_shadow(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let shadow_q = quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db);
+        let (code, out) = self
+            .mysql_run_admin(plan, &format!("CREATE DATABASE {shadow_q};"), stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow create exited {code}: {out}"
+            )));
+        }
+        // Grant the non-superuser owner role the privileges to load the dump into the shadow.
+        let owner_user = mysql_lit(&plan.owner.user);
+        let _ = self
+            .mysql_run_admin(
+                plan,
+                &format!("GRANT ALL PRIVILEGES ON {shadow_q}.* TO {owner_user}@'%';"),
+                stage_dir,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Best-effort shadow teardown (abort / RAII).
+    async fn mysql_drop_shadow(&self, plan: &MysqlShadowPlan, stage_dir: &Path) {
+        let shadow_q = quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db);
+        if let Err(e) = self
+            .mysql_run_admin(
+                plan,
+                &format!("DROP DATABASE IF EXISTS {shadow_q};"),
+                stage_dir,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, shadow = %plan.shadow_db, "mysql shadow drop-on-abort failed; the startup sweep will reclaim it");
+        }
+    }
+
+    /// TRUSTED DDL: atomically swap the verified shadow in for live via ONE `RENAME TABLE` that
+    /// moves every live table aside (`<live>.<t>` → `<live>.__old_<suffix>_<t>`) AND every shadow
+    /// table in (`<shadow>.<t>` → `<live>.<t>`) — MySQL applies a multi-table `RENAME TABLE`
+    /// atomically — then drops the aside tables + the shadow database.
+    async fn mysql_swap_shadow(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let live_tables = self
+            .mysql_list_tables(plan, &plan.live_db, stage_dir)
+            .await?;
+        let shadow_tables = self
+            .mysql_list_tables(plan, &plan.shadow_db, stage_dir)
+            .await?;
+        let liveq = |t: &str| {
+            format!(
+                "{}.{}",
+                quote_ident(ExternalSqlKind::Mysql, &plan.live_db),
+                quote_ident(ExternalSqlKind::Mysql, t)
+            )
+        };
+        let shadowq = |t: &str| {
+            format!(
+                "{}.{}",
+                quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db),
+                quote_ident(ExternalSqlKind::Mysql, t)
+            )
+        };
+        let aside_name = |t: &str| format!("__old_{}_{t}", plan.suffix);
+        let mut moves: Vec<String> = Vec::new();
+        for t in &live_tables {
+            moves.push(format!("{} TO {}", liveq(t), liveq(&aside_name(t))));
+        }
+        for t in &shadow_tables {
+            moves.push(format!("{} TO {}", shadowq(t), liveq(t)));
+        }
+        if !moves.is_empty() {
+            let (code, out) = self
+                .mysql_run_admin(
+                    plan,
+                    &format!("RENAME TABLE {};", moves.join(", ")),
+                    stage_dir,
+                )
+                .await?;
+            if code != 0 {
+                return Err(Perr::Other(format!(
+                    "mysql shadow swap (RENAME TABLE) exited {code}: {out}"
+                )));
+            }
+        }
+        // Drop the aside tables + the now-empty shadow db (best-effort — the swap already landed).
+        for t in &live_tables {
+            let _ = self
+                .mysql_run_admin(
+                    plan,
+                    &format!("DROP TABLE IF EXISTS {};", liveq(&aside_name(t))),
+                    stage_dir,
+                )
+                .await;
+        }
+        self.mysql_drop_shadow(plan, stage_dir).await;
+        Ok(())
+    }
+
+    /// Spawn the `mysql <shadow>` subprocess that applies the untrusted tables-only dump as the
+    /// non-superuser owner role, reading the body channel as stdin.
+    fn spawn_mysql_restore(
+        &self,
+        plan: &MysqlShadowPlan,
+        body_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        out_path: PathBuf,
+    ) -> Result<tokio::task::JoinHandle<Result<i32, Perr>>, Perr> {
+        let backend = self.require_backend()?.clone();
+        let image = plan.image.clone();
+        let inv = mysql_shadow_invocation(&plan.owner, &plan.shadow_db);
+        Ok(tokio::spawn(async move {
+            let mut reader = AsyncChannelReader::new(body_rx);
+            let out = tokio::fs::File::create(&out_path).await.map_err(other)?;
+            let mut sink = out.compat_write();
+            backend
+                .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut reader), &mut sink)
+                .await
+                .map_err(other)
+        }))
+    }
+
+    /// Startup sweep of stale `*__shadow_*` / `*__old_*` databases left by a crash mid-import (the
+    /// RAII drop-on-abort only fires in-process). Best-effort per MANAGED pg/mysql binding: a
+    /// not-yet-ready or unreachable managed server simply yields no sweep (logged), never a boot
+    /// failure. Runs at node startup (no import is in flight yet). Returns the count dropped.
+    pub async fn sweep_stale_sql_shadows(&self, project: &str) -> usize {
+        let mut dropped = 0usize;
+        let session = self.work_dir.join(format!("shadow-sweep-{}", now_secs()));
+        if tokio::fs::create_dir_all(&session).await.is_err() {
+            return 0;
+        }
+        for (db, cfg) in &self.databases {
+            if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+                continue; // external bindings have no shadow dbs of ours
+            }
+            if kind_is_postgres(&cfg.kind) {
+                if let Ok(plan) = self.pg_shadow_plan(project, db, cfg).await {
+                    let sql = "SELECT datname FROM pg_database \
+                               WHERE datname LIKE '%\\_\\_shadow\\_%' OR datname LIKE '%\\_\\_old\\_%'";
+                    let inv = psql_invocation(&plan.maint, sql);
+                    if let Ok((0, out)) = self
+                        .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, &session)
+                        .await
+                    {
+                        for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            let q = quote_ident(ExternalSqlKind::Postgres, name);
+                            if self
+                                .pg_run_ddl(
+                                    &plan,
+                                    &format!("DROP DATABASE IF EXISTS {q}"),
+                                    &session,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                dropped += 1;
+                            }
+                        }
+                    }
+                }
+            } else if kind_is_mysql(&cfg.kind)
+                && let Ok(plan) = self.mysql_shadow_plan(project, db, cfg).await
+            {
+                let sql = "SELECT schema_name FROM information_schema.schemata \
+                           WHERE schema_name LIKE '%\\_\\_shadow\\_%';";
+                if let Ok((0, out)) = self.mysql_run_admin(&plan, sql, &session).await {
+                    for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                        let q = quote_ident(ExternalSqlKind::Mysql, name);
+                        if let Ok((0, _)) = self
+                            .mysql_run_admin(
+                                &plan,
+                                &format!("DROP DATABASE IF EXISTS {q};"),
+                                &session,
+                            )
+                            .await
+                        {
+                            dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&session).await;
+        dropped
+    }
+}
+
+/// Quote a MySQL **string literal** (single-quoted, doubling embedded `'`) — for our own generated
+/// `information_schema` predicates + grant user literals (db/role names are driver-derived).
+fn mysql_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]

@@ -945,7 +945,27 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             }
             driver = driver.with_libsql(std::sync::Arc::new(libsql_backends));
         }
-        Some(Arc::new(driver) as Arc<dyn boatramp_core::project_export::ProjectExport>)
+        let driver = Arc::new(driver);
+        // inc2 Stage C/D: best-effort startup sweep of stale `*__shadow_*` / `*__old_*` managed
+        // pg/mysql databases left by a crash mid-import (the in-process RAII drop-on-abort only
+        // fires in-process). DETACHED so a not-yet-ready / unreachable managed server never blocks
+        // or fails node boot; it covers a Shared server's whole fleet via the default-project
+        // maintenance connection (a non-default Single instance relies on the in-process guard).
+        {
+            let sweeper = driver.clone();
+            tokio::spawn(async move {
+                let n = sweeper
+                    .sweep_stale_sql_shadows(boatramp_core::project::DEFAULT_PROJECT)
+                    .await;
+                if n > 0 {
+                    tracing::info!(
+                        swept = n,
+                        "project-export: removed stale managed-SQL import shadow databases"
+                    );
+                }
+            });
+        }
+        Some(driver as Arc<dyn boatramp_core::project_export::ProjectExport>)
     };
     #[cfg(not(feature = "project-export"))]
     let project_export_cap: Option<Arc<dyn boatramp_core::project_export::ProjectExport>> = None;
