@@ -151,17 +151,22 @@ blob-upload = ["engine", "dep:async-trait"]
 # (boatramp-server/boatramp); this gates the WIT `tcp-connection-host` world + the engine's conn-lane
 # dispatch. Off by default (experimental); the shipped binary turns it on via batteries-included.
 tcp-listener = ["engine"]
-# The `tcp-egress` capability (host-terminated outbound-TLS egress, PLAN-handler-tcp-egress Build A,
+# The `tcp-egress` capability (host-terminated outbound-TLS egress, PLAN-handler-tcp-egress,
 # mailroom cap-req #15): the OUTBOUND mirror of `tcp-listener` — the host DIALS the TCP connection AND
 # TERMINATES TLS, handing the guest only plaintext `wasi:io` streams (the guest does zero crypto, and
 # never receives `wasi:sockets`). Reuses the EXACT SAME grant as the gated `wasi:sockets` capability
 # (the deploy declares `wasi:sockets`, not a new token) and the SAME per-handler `egress_allowlist` +
 # node posture (`allow_guest_tcp_egress`) — gated through the identical `tcp_connect_decision`
 # predicate used for every resolved candidate address (the DNS-rebinding choke: resolve once, check
-# each candidate, connect only to a checked address, never re-resolve). Needs no new deps beyond
-# `engine` (rustls/tokio-rustls/webpki-roots are already pulled in for the guest-egress extra-CA TLS
-# client, which this reuses verbatim via `guest_egress_client_config`). Off by default (experimental);
-# the shipped binary turns it on via batteries-included.
+# each candidate, connect only to a checked address, never re-resolve). Build A: `connect-tls`
+# (implicit TLS, `strict` verification only). Build B: `connect-plaintext` + `connection.start-tls`
+# (the STARTTLS/relay path — the guest drives a protocol's plaintext negotiation itself, then
+# upgrades the SAME connection in place; `verify-mode.opportunistic`, RFC 7435, is honored ONLY on
+# that path — `connect-tls` never downgrades). Needs no new deps beyond `engine` (rustls/
+# tokio-rustls/webpki-roots are already pulled in for the guest-egress extra-CA TLS client, which
+# `connect-tls`/`start-tls`'s `strict` arm reuses verbatim via `guest_egress_client_config`; `start-tls`'s
+# `opportunistic` arm builds its own separate relaxed `rustls::ClientConfig`). Off by default
+# (experimental); the shipped binary turns it on via batteries-included.
 tcp-egress = ["engine"]
 
 [dependencies]

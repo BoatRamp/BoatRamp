@@ -548,32 +548,56 @@ jobs:
           done
 
       # PLAN-handler-tcp-egress TCP-EGRESS TLS-WRAP GATE (markers `TCP-EGRESS TLS WRAP OK` /
-      # `TCP-EGRESS GATE REUSE OK`, mailroom #15 Build A). The host-terminated outbound-TLS egress
-      # capability (`boatramp:handlers/tcp-egress`) dials a guest-named `host:port` and TERMINATES
-      # TLS itself, handing the guest only plaintext `wasi:io` streams; it reuses the SAME
-      # `wasi:sockets` grant/allowlist/posture gate + the SAME DNS-rebinding choke
-      # (`resolve_and_gate_tcp_egress`) as the gate above. This step drives the whole `tcp_egress::`
-      # module (gate reuse / SSRF-floor denial / opportunistic-refused / DNS-rebinding choke /
-      # connect-timeout / connect-failed / idle-timeout / the M1 candidate-cap + single-deadline
-      # proofs) and asserts the marker + pass count catch a silent skip/rename. MUTATION-VERIFIED
-      # (the #503 convention, UNLIKE the test itself — `tcpegress_tls_wrap_gate` does NOT toggle the
-      # mutation in-process; it just dials a real loopback TLS server and asserts the exact
-      # plaintext greeting came back): re-running that SAME test with
-      # `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap` set externally makes the client skip its own
-      # handshake, so the bytes it reads are the server's raw TLS record, never the greeting — MUST
-      # FAIL; a PASS-under-mutation (a hollow wrap) fails the merge.
-      - name: "tcp-egress TLS-wrap gate (host-terminated TLS, DNS-rebinding choke, M1 shared-deadline)"
+      # `TCP-EGRESS GATE REUSE OK` / `TCP-EGRESS GATE REUSE PLAINTEXT OK` / `TCP-EGRESS STARTTLS OK`
+      # / `TCP-EGRESS STARTTLS OPPORTUNISTIC OK` / `TCP-EGRESS STARTTLS INJECTION SAFE`, mailroom
+      # #15 Build A + Build B). The host-terminated outbound-TLS egress capability
+      # (`boatramp:handlers/tcp-egress`) dials a guest-named `host:port` and TERMINATES TLS itself,
+      # handing the guest only plaintext `wasi:io` streams; it reuses the SAME `wasi:sockets`
+      # grant/allowlist/posture gate + the SAME DNS-rebinding choke (`resolve_and_gate_tcp_egress`)
+      # as the gate above — Build B's `connect-plaintext` (STARTTLS/relay) dial reuses it
+      # IDENTICALLY. This step drives the whole `tcp_egress::` module (gate reuse / SSRF-floor
+      # denial / opportunistic-refused-on-pull / DNS-rebinding choke / connect-timeout /
+      # connect-failed / idle-timeout / the M1 candidate-cap + single-deadline proofs / the STARTTLS
+      # round-trip + injection-safety + opportunistic-relay proofs) and asserts the markers + pass
+      # count catch a silent skip/rename. MUTATION-VERIFIED (the #503 convention, UNLIKE the tests
+      # themselves — none of them toggle a mutation in-process):
+      #   - `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap`, re-running `tcpegress_tls_wrap_gate`,
+      #     MUST FAIL (the client skips its own handshake, so the bytes it reads are the server's
+      #     raw TLS record, never the greeting) — Build A's TLS wrap is load-bearing.
+      #   - `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_start_tls_wrap`, re-running
+      #     `starttls_round_trip_upgrades_to_real_tls`, MUST FAIL (the "upgraded" connection is still
+      #     raw TCP, so the post-upgrade read never sees the server's encrypted greeting) — Build
+      #     B's `start-tls` wrap is load-bearing, not cosmetic.
+      #   - `BOATRAMP_TCPEGRESS_TLS_MUTATION=admit_opportunistic_on_pull`, re-running
+      #     `connect_tls_opportunistic_mutation_seam`, MUST STILL PASS (the test asserts whichever
+      #     behavior is correct for the active mutation) but MUST switch from refusing
+      #     `verify-mode.opportunistic` on `connect-tls` to ADMITTING it (printing a DIFFERENT
+      #     marker) — proving the explicit refusal in `connect_tls`, not the relaxed verifier's mere
+      #     non-existence, is what structurally stops a guest from downgrading the strict PULL path.
+      - name: "tcp-egress TLS-wrap gate (host-terminated TLS, DNS-rebinding choke, M1 shared-deadline, Build B STARTTLS)"
         run: |
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
             --features tcp-egress tcp_egress:: -- --nocapture 2>&1 | tee tcp-egress-tls.log
-          grep -qE 'test result: ok\. 9 passed' tcp-egress-tls.log \
-            || { echo "::error::tcp-egress TLS-wrap gate did not run all 9 cases (silent skip/rename, or the count drifted)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 16 passed' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress TLS-wrap gate did not run all 16 cases (silent skip/rename, or the count drifted)" >&2; exit 1; }
           grep -q 'TCP-EGRESS TLS WRAP OK' tcp-egress-tls.log \
             || { echo "::error::tcp-egress TLS-wrap gate never reached its marker (a host-TLS-termination regression)" >&2; exit 1; }
           grep -q 'TCP-EGRESS GATE REUSE OK' tcp-egress-tls.log \
             || { echo "::error::tcp-egress gate-reuse marker missing (the wasi:sockets grant/allowlist/posture reuse is not actually enforced for this capability)" >&2; exit 1; }
-          # Mutation guard: the SAME test, re-run with the env var set, MUST now fail.
+          grep -q 'TCP-EGRESS GATE REUSE PLAINTEXT OK' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress connect-plaintext gate-reuse marker missing (Build B's relay dial is not actually reusing the same gate)" >&2; exit 1; }
+          grep -q 'TCP-EGRESS STARTTLS OK' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress STARTTLS round-trip marker missing (start-tls is not actually upgrading the connection)" >&2; exit 1; }
+          grep -q 'TCP-EGRESS STARTTLS OPPORTUNISTIC OK' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress opportunistic-relay marker missing" >&2; exit 1; }
+          grep -q 'TCP-EGRESS STARTTLS INJECTION SAFE' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress STARTTLS injection-safety marker missing (CVE-2011-0411-class regression)" >&2; exit 1; }
+          if grep -q 'MUTATION ADMITTED' tcp-egress-tls.log; then
+            echo "::error::tcp-egress opportunistic-on-pull mutation marker printed WITHOUT the mutation set — connect-tls is admitting opportunistic verification unconditionally" >&2
+            exit 1
+          fi
+          # Mutation guard 1 (Build A): the SAME test, re-run with the env var set, MUST now fail.
           if BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap cargo-zigbuild test --target x86_64-unknown-linux-musl \
             -p boatramp-handlers --features tcp-egress tcpegress_tls_wrap_gate \
             -- --nocapture > tcp-egress-tls-mutation-skip_tls_wrap.log 2>&1; then
@@ -582,6 +606,29 @@ jobs:
           else
             echo "tcp-egress TLS-wrap mutation verified: 'skip_tls_wrap' fails the gate as expected."
           fi
+          # Mutation guard 2 (Build B): the SAME test, re-run with the env var set, MUST now fail —
+          # `start-tls` "upgrading" without ever handshaking must NOT look like a real TLS round trip.
+          if BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_start_tls_wrap cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-handlers --features tcp-egress starttls_round_trip_upgrades_to_real_tls \
+            -- --nocapture > tcp-egress-tls-mutation-skip_start_tls_wrap.log 2>&1; then
+            echo "::error::tcp-egress start-tls gate is HOLLOW — it passed under skip_start_tls_wrap (the start-tls handshake is not actually load-bearing)" >&2
+            exit 1
+          else
+            echo "tcp-egress start-tls mutation verified: 'skip_start_tls_wrap' fails the gate as expected."
+          fi
+          # Mutation guard 3 (Build B, opportunistic gating): the SAME test, re-run with the env var
+          # set, MUST STILL PASS but must flip from refusing to ADMITTING opportunistic on the pull
+          # path — proving the explicit refusal (not the relaxed verifier's absence) is load-bearing.
+          if ! BOATRAMP_TCPEGRESS_TLS_MUTATION=admit_opportunistic_on_pull cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-handlers --features tcp-egress connect_tls_opportunistic_mutation_seam \
+            -- --nocapture > tcp-egress-tls-mutation-admit_opportunistic_on_pull.log 2>&1; then
+            echo "::error::tcp-egress opportunistic-gating mutation test itself failed to run under admit_opportunistic_on_pull (it should still PASS, just admit the dial)" >&2
+            cat tcp-egress-tls-mutation-admit_opportunistic_on_pull.log >&2
+            exit 1
+          fi
+          grep -q 'MUTATION ADMITTED' tcp-egress-tls-mutation-admit_opportunistic_on_pull.log \
+            || { echo "::error::tcp-egress opportunistic-gating gate is HOLLOW — under admit_opportunistic_on_pull it did not actually admit an opportunistic dial on connect-tls (the structural claim is unproven)" >&2; exit 1; }
+          echo "tcp-egress opportunistic-gating mutation verified: 'admit_opportunistic_on_pull' flips connect-tls to admit opportunistic verification, proving the normal refusal is load-bearing."
 
       # DNS RECORD-VERIFY MATCH GATE (marker `RECORD-VERIFY MATCH OK`, mailroom #2 Phase 1). The pure
       # `record_verify::evaluate` matcher is the whole security surface of the generic multi-record

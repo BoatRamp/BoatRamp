@@ -1399,20 +1399,25 @@ world tcp-connection-host {
 /// terminates TLS, handing the guest only plaintext `wasi:io` streams — the guest does ZERO crypto,
 /// exactly as a `tcp-connection-host` listener guest never sees `wasi:sockets`.
 interface tcp-egress-types {
-  /// How the host verifies the peer's certificate on `connect-tls`.
+  /// How the host verifies the peer's certificate on `connect-tls`/`start-tls`.
   enum verify-mode {
     /// Full verification: webpki roots **⊕** the operator's `extra_roots` (the SAME trust set
     /// [`guest_egress_client_config`] builds for guest `wasi:http` egress), an explicit `aws-lc-rs`
     /// crypto provider, and a full certificate-chain + hostname check against the dialed `sni`. The
-    /// ONLY mode this host build implements.
+    /// ONLY mode `connect-tls` ever honors.
     strict,
-    /// A relaxed/pinned verifier for a Build B STARTTLS relay path (e.g. a mail relay whose
-    /// certificate the host cannot chain to a public root). This host build REFUSES it with
-    /// `unsupported-verify-mode` rather than implementing a relaxed verifier.
+    /// A relaxed verifier for the `start-tls` STARTTLS/relay path (Build B, RFC 7435 opportunistic
+    /// encryption — e.g. an MX relay whose certificate the host cannot chain to a public root):
+    /// accepts ANY peer certificate (self-signed, expired, hostname-mismatched, unchained) without
+    /// hard-failing, while still cryptographically verifying the TLS handshake signature itself (so
+    /// a passive eavesdropper, or an active peer with no matching private key at all, still cannot
+    /// read or tamper with the session — only the PEER'S IDENTITY is left unauthenticated).
+    /// STRUCTURALLY refused on `connect-tls` — see that function's doc; `opportunistic` is honored
+    /// ONLY by `start-tls`.
     opportunistic,
   }
 
-  /// Why a dial failed.
+  /// Why a dial, or a `start-tls` upgrade, failed.
   variant egress-error {
     /// Denied by the reused egress gate — the node posture (`allow_guest_tcp_egress`) is off, the
     /// resolved peer is not in the per-handler `egress_allowlist`, or it fails the `is_global_ip`
@@ -1428,21 +1433,30 @@ interface tcp-egress-types {
     /// The TCP connect failed for a reason other than a timeout (e.g. connection refused). Carries
     /// a client-safe reason.
     connect-failed(string),
-    /// The TLS handshake failed (certificate verification, protocol mismatch, ALPN, ...). Carries a
-    /// client-safe reason — never raw peer bytes.
+    /// The TLS handshake failed (certificate verification — `strict` only, protocol mismatch, ALPN,
+    /// a non-TLS peer, ...) — also the outcome when a peer that pipelined bytes ahead of its
+    /// plaintext affirmative reply causes `start-tls`'s handshake read to choke on them (see
+    /// `start-tls`'s injection-safety doc). Carries a client-safe reason — never raw peer bytes.
     tls-failure(string),
-    /// `verify-mode.opportunistic` was requested; this host build implements `strict` only.
+    /// `verify-mode.opportunistic` was requested on `connect-tls`, which honors `strict` only.
     unsupported-verify-mode,
-    /// Any other host-side failure establishing the connection.
+    /// Any other host-side failure (including calling `start-tls` on a connection that doesn't
+    /// support it, or that has already been upgraded).
     other(string),
   }
 }
 
-/// The host-terminated outbound-TLS egress capability (Build A: implicit-TLS only — the PULL path).
-/// Reuses the EXACT SAME grant as the gated `wasi:sockets` outbound-TCP capability
-/// (`PLAN-handler-tcp-egress`): a deploy declares `wasi:sockets` (not a separate token), and the SAME
-/// per-handler `egress_allowlist` + node posture (`allow_guest_tcp_egress`) gate every dial through
-/// the identical enforced predicate. No new grant kind.
+/// The host-terminated outbound-TLS egress capability. Reuses the EXACT SAME grant as the gated
+/// `wasi:sockets` outbound-TCP capability (`PLAN-handler-tcp-egress`): a deploy declares
+/// `wasi:sockets` (not a separate token), and the SAME per-handler `egress_allowlist` + node posture
+/// (`allow_guest_tcp_egress`) gate every dial through the identical enforced predicate. No new grant
+/// kind. Two dial shapes:
+/// - `connect-tls` (Build A): **implicit TLS** — the host dials and hands the guest a `connection`
+///   that is ALREADY TLS-terminated (`strict` verification only — the PULL path never downgrades).
+/// - `connect-plaintext` (Build B): **no TLS yet** — the guest drives a protocol's plaintext
+///   negotiation itself (e.g. SMTP `EHLO`/`STARTTLS`), then calls `start-tls` to upgrade the SAME
+///   `connection` in place (the relay/STARTTLS path, where `opportunistic` verification becomes
+///   available).
 interface tcp-egress {
   // wasi:io version-pinned (0.2.3) so it matches the wasi:io the host serves — the SAME pin
   // `tcp-connection-handler` uses, so a component holding streams from EITHER surface sees the same
@@ -1450,44 +1464,87 @@ interface tcp-egress {
   use wasi:io/streams@0.2.3.{input-stream, output-stream};
   use tcp-egress-types.{verify-mode, egress-error};
 
-  /// One host-dialed, host-terminated-TLS outbound connection. The guest never holds
-  /// `wasi:sockets` — this resource (and the `wasi:io` streams it hands out) is its entire network
-  /// surface for the dial.
+  /// One host-dialed outbound connection — either already TLS-terminated (`connect-tls`) or, before
+  /// `start-tls` succeeds, a raw plaintext TCP connection (`connect-plaintext`). The guest never
+  /// holds `wasi:sockets` — this resource (and the `wasi:io` streams it hands out) is its entire
+  /// network surface for the dial.
   ///
-  /// Lifecycle: BEFORE `take-input`/`take-output` run, this resource owns the connection's split
-  /// halves, and dropping it closes the socket abruptly (no TLS `close_notify`). AFTER both takes,
-  /// this resource is INERT — the taken `input-stream`/`output-stream` resources now own the split
-  /// halves independently, so `connection` itself may be dropped first (immediately, harmlessly);
-  /// the TLS session only actually closes once BOTH taken streams have themselves been dropped.
-  /// `shutdown-output` is likewise only EFFECTIVE before `take-output` runs — see its own doc.
+  /// Lifecycle: BEFORE `take-input`/`take-output` run for the CURRENT phase, this resource owns the
+  /// connection's split halves, and dropping it closes the socket abruptly (no TLS `close_notify`
+  /// for an implicit-TLS connection; a plain TCP close for a not-yet-upgraded plaintext one). AFTER
+  /// both takes, this resource is INERT for that phase — the taken `input-stream`/`output-stream`
+  /// resources now own the split halves independently, so `connection` itself may be dropped first
+  /// (immediately, harmlessly). For a TLS connection (implicit, or upgraded by `start-tls`), the TLS
+  /// session only actually closes once BOTH taken streams have themselves been dropped, and
+  /// DROPPING the taken `output-stream` drives a best-effort TLS `close_notify` first (bounded by
+  /// the host's idle timeout) — unlike `shutdown-output` below, this works even AFTER `take-output`
+  /// has already handed the write half off as a separate resource. `shutdown-output` is likewise
+  /// only EFFECTIVE before `take-output` runs for the current phase — see its own doc.
   ///
-  /// Forward-compatibility note (Build B, STARTTLS): a `start-tls(sni: string, verify: verify-mode)
-  /// -> result<_, egress-error>` method is designed to be ADDED here (append-only) alongside a new
-  /// plaintext `connect` function, so a guest can speak a protocol's plaintext greeting/negotiation
-  /// over `take-input`/`take-output` and then upgrade THIS SAME resource in place. Build A implements
-  /// implicit-TLS only — `connect-tls` already completes the handshake before returning, so
-  /// `take-input`/`take-output` are meant to be called exactly once, immediately.
+  /// A `connect-plaintext` connection has TWO phases: PRE-upgrade (plaintext — `take-input`/
+  /// `take-output` hand out streams that read/write the raw TCP bytes the guest's own protocol
+  /// dialog drives) and, after a successful `start-tls`, POST-upgrade (TLS-terminated — exactly like
+  /// a `connect-tls` connection). `take-input`/`take-output` are callable ONCE PER PHASE: a second
+  /// call within the SAME phase returns `none`, but a successful `start-tls` begins a fresh phase,
+  /// after which each may be called once more to get the upgraded streams. A `connect-tls`
+  /// connection has only the one (already-TLS) phase.
   resource connection {
-    /// Take ownership of the connection's readable half (the host-constructed `wasi:io`
-    /// `input-stream` — the SAME resource type a `tcp-connection-handler` listener guest receives).
-    /// Callable once; a second call (or a call after the connection closed) returns `none`.
+    /// Take ownership of the connection's CURRENT-phase readable half (the host-constructed
+    /// `wasi:io` `input-stream` — the SAME resource type a `tcp-connection-handler` listener guest
+    /// receives). Callable once per phase (see the resource's own doc); a second call in the same
+    /// phase (or a call after the connection closed) returns `none`.
     take-input: func() -> option<input-stream>;
-    /// Take ownership of the connection's writable half (`wasi:io` `output-stream`). Callable once;
-    /// a second call returns `none`.
+    /// Take ownership of the connection's CURRENT-phase writable half (`wasi:io` `output-stream`).
+    /// Callable once per phase; a second call in the same phase returns `none`.
     take-output: func() -> option<output-stream>;
-    /// Half-close the write side (TLS `close_notify`, then TCP shutdown-write) if `take-output` has
-    /// NOT already handed it off as a separate resource — a no-op once the write half has been
-    /// taken (the guest then closes it by dropping/closing that resource itself) or after a previous
-    /// `shutdown-output`. Idempotent.
+    /// Half-close the write side (TLS `close_notify` for a TLS connection, then TCP shutdown-write)
+    /// if `take-output` has NOT already handed it off as a separate resource for the CURRENT phase —
+    /// a no-op once the write half has been taken (the guest then closes it by dropping/closing that
+    /// resource itself — which, for a TLS connection, ALSO drives `close_notify`, see the resource's
+    /// own doc) or after a previous `shutdown-output`. Idempotent.
     shutdown-output: func();
+    /// Upgrade a `connect-plaintext` connection to TLS **in place** (Build B): the guest has already
+    /// driven the plaintext protocol negotiation over `take-input`/`take-output` (e.g. sent
+    /// `STARTTLS` and read the peer's affirmative reply); this performs the TLS client handshake
+    /// over the SAME underlying TCP connection — reclaiming the raw halves even if `take-input`/
+    /// `take-output` already handed them out as separate resources — and, on success, starts a new
+    /// phase so `take-input`/`take-output` can be called once more for the TLS-terminated streams.
+    ///
+    /// Injection safety (the CVE-2011-0411 class, RFC 3207 §4): the host NEVER reads ahead of the
+    /// guest's own plaintext `read`/`ready` calls — there is no background buffering, so nothing a
+    /// peer sends is ever consumed host-side before the guest (or this handshake) actually asks for
+    /// it. Any bytes a peer pipelines immediately after its plaintext affirmative reply — before the
+    /// guest calls `start-tls` — are therefore STILL sitting unread on the wire when this handshake
+    /// begins reading, so they are fed to the TLS record-layer parser as its first input, never
+    /// delivered to the guest as plaintext: ordinary injected bytes do not parse as a valid TLS
+    /// record, so the handshake fails (`tls-failure`) rather than silently admitting them.
+    ///
+    /// Opportunistic gating (the load-bearing security decision): `verify-mode.opportunistic` is
+    /// honored ONLY here — `connect-tls`'s strict PULL path never downgrades, structurally (the
+    /// relaxed verifier this builds is reachable from no other call site).
+    ///
+    /// Refused with `other` on a `connect-tls`-originated (already-TLS) connection, or on a
+    /// `connect-plaintext` connection that has already been upgraded (or whose previous upgrade
+    /// attempt already failed — there is no plaintext fallback after a failed upgrade, which would
+    /// itself be a downgrade oracle). Runs under a fresh instance of the host's per-dial connect
+    /// timeout (resolution is not repeated — the connection is already established).
+    start-tls: func(sni: string, verify: verify-mode) -> result<_, egress-error>;
   }
 
   /// Dial `host:port`, verify the peer's certificate against `sni` per `verify`, and terminate TLS
   /// host-side. On success the guest gets a plaintext `connection`; the WHOLE dial — DNS resolve,
   /// the reused per-handler `egress_allowlist` + SSRF-floor gate, TCP connect, and the TLS handshake
-  /// — runs host-side under the host's per-dial connect timeout. Only `verify-mode.strict` is
-  /// implemented in this build (`opportunistic` is refused with `unsupported-verify-mode`).
+  /// — runs host-side under the host's per-dial connect timeout. `verify-mode.strict` ONLY —
+  /// `opportunistic` is ALWAYS refused with `unsupported-verify-mode` (the relay/STARTTLS path's
+  /// relaxed verification is reachable only via `start-tls`; see `connection`'s own doc).
   connect-tls: func(host: string, port: u16, sni: string, verify: verify-mode) -> result<connection, egress-error>;
+
+  /// Dial `host:port` with NO TLS (Build B, the relay/STARTTLS path): the whole dial — DNS resolve,
+  /// the SAME reused `egress_allowlist` + SSRF-floor gate + DNS-rebinding choke as `connect-tls` —
+  /// runs host-side under the host's per-dial connect timeout. On success the guest gets a plaintext
+  /// `connection` to speak its own protocol's negotiation over (via `take-input`/`take-output`)
+  /// before calling `start-tls` to upgrade it.
+  connect-plaintext: func(host: string, port: u16) -> result<connection, egress-error>;
 }
 
 /// Import-only world for the `tcp-egress` host binding (the `TcpEgressHost` Host impl), mirroring
