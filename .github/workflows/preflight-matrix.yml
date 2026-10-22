@@ -198,3 +198,105 @@ jobs:
           CLUSTER: boatramp-e2e
           KEEP: "1"
         run: scripts/e2e-k8s.sh
+
+  # LIVE project export/import round-trip (inc2: atomic shadow-restore, the ephemeral
+  # non-superuser apply that closes RCE-on-import, and a pgvector FULL round-trip) against
+  # REAL Postgres (pgvector) + MySQL — `crates/boatramp-node/tests/project_export_roundtrip.rs`.
+  # This file's `#![cfg(feature = "project-export")]` makes the `test (all features)` job above
+  # (`cargo test --workspace --all-features`) compile + run it too, but that job never sets
+  # BOATRAMP_TEST_PG_URL / BOATRAMP_TEST_MYSQL_URL, so every live test in the file hits its
+  # self-skip guard and the job still reports `test result: ok` — a silent skip, not a gate. This
+  # job stands up a pgvector Postgres + a MySQL on the docker default bridge (mirrors
+  # `capability.yml`'s `container_live` env-clone step): both this job's test process AND the
+  # test's own ephemeral pg_dump/pg_restore/mysqldump/mysql client containers — launched via the
+  # SAME host docker daemon as siblings on that bridge — reach the servers by container IP. It
+  # then runs the WHOLE test binary and greps for EVERY one of its success markers, so a silently
+  # skipped live test (unset env, unreachable docker) or a real regression fails the job instead
+  # of reporting a clean `ok`.
+  export-import-live:
+    name: test (project export/import live — Postgres pgvector + MySQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: export-import-live
+
+      - name: Project export/import round-trip holds live (hard gate — shadow-restore + pgvector)
+        run: |
+          set -o pipefail
+          # Start a stock pgvector Postgres on the docker default bridge so BOTH this job's test
+          # process AND the ephemeral pg_dump/pg_restore containers the test launches (siblings on
+          # the same bridge, via the host docker daemon) reach it by its container IP — the
+          # colocated-reachability shape the driver handles. No sudo: the test drives the docker
+          # API as the runner user (docker group), not the native container backend.
+          docker rm -f brexport-pg >/dev/null 2>&1 || true
+          docker run -d --name brexport-pg -e POSTGRES_PASSWORD=postgres \
+            pgvector/pgvector:pg16 >/dev/null
+          for _ in $(seq 1 60); do
+            docker exec brexport-pg pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+          PGIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-pg)"
+          echo "pgvector bridge IP: $PGIP"
+          # Same colocated-reachability shape for MySQL: native-password auth so the plaintext
+          # bridge connection works; 8.0 is pinned because `--default-authentication-plugin` is
+          # gone in 8.4. The ephemeral mysqldump/mysql client containers the test launches reach
+          # it by its bridge IP.
+          docker rm -f brexport-mysql >/dev/null 2>&1 || true
+          docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql \
+            mysql:8.0 --default-authentication-plugin=mysql_native_password >/dev/null
+          for _ in $(seq 1 90); do
+            docker exec brexport-mysql mysqladmin ping -h 127.0.0.1 -uroot -pmysql >/dev/null 2>&1 && break
+            sleep 2
+          done
+          MYIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-mysql)"
+          echo "mysql bridge IP: $MYIP"
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+          BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
+            cargo test -p boatramp-node --features project-export \
+            --test project_export_roundtrip \
+            -- --nocapture --test-threads=1 2>&1 | tee project-export-live.log
+          docker rm -f brexport-pg >/dev/null 2>&1 || true
+          docker rm -f brexport-mysql >/dev/null 2>&1 || true
+
+          # HARD gate: the file's 12 live/always-on tests + the 1 pure-unit URL-parser test must
+          # ALL actually run (both live DBs reachable, docker usable for the ephemeral client
+          # containers) — a self-skip (unset env / unreachable docker) still prints
+          # `test result: ok`, so require the exact passed-count AND every one of the file's
+          # success markers below.
+          grep -qE 'test result: ok\. 13 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 13 tests (silent skip or failure?)" >&2; exit 1; }
+
+          # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
+          grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
+            || { echo "::error::live pg export/import round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG CHUNKED SHADOW OK' project-export-live.log \
+            || { echo "::error::live pg ATOMIC shadow-restore round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG CORRUPTION ABORT OK' project-export-live.log \
+            || { echo "::error::live pg corruption all-or-nothing abort gate never reached its marker (silent skip, or a partial import landed)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG CRAFTED ESCAPE REFUSED OK' project-export-live.log \
+            || { echo "::error::live pg crafted-superuser-escape REFUSED gate never reached its marker (silent skip, or an escape was NOT refused — RCE-on-import)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK' project-export-live.log \
+            || { echo "::error::live pg crafted-escape-via-the-real-driver gate never reached its marker (silent skip, or the RCE-on-import escape was NOT refused through NodeProjectExport)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG PGVECTOR ROUNDTRIP OK' project-export-live.log \
+            || { echo "::error::live pgvector FULL round-trip through the real driver never reached its marker (silent skip or a regression — needs pgvector/pgvector:pg16)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT DRIVER ROUNDTRIP OK' project-export-live.log \
+            || { echo "::error::live full-driver pg round-trip (NodeProjectExport::export/import, not the reconstructed primitives) never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+
+          # --- live mysql (needs BOATRAMP_TEST_MYSQL_URL + docker) ---
+          grep -q 'PROJECT EXPORT MYSQL ROUNDTRIP OK' project-export-live.log \
+            || { echo "::error::live mysql export/import round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT MYSQL SHADOW OK' project-export-live.log \
+            || { echo "::error::live mysql ATOMIC shadow-restore round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+
+          # --- no-docker members of the SAME test binary (always run) — gating on their markers
+          #     too proves the whole file executed, not just the live-pg/mysql subset above (e.g.
+          #     a feature-flag change that silently dropped project-export's libsql coverage).
+          grep -q 'PROJECT EXPORT LIBSQL ROUNDTRIP OK' project-export-live.log \
+            || { echo "::error::libsql project export/import round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT LIBSQL CHUNKED ATOMIC OK' project-export-live.log \
+            || { echo "::error::libsql chunked ATOMIC shadow round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT CROSS-TENANT LEAK GATE OK' project-export-live.log \
+            || { echo "::error::cross-tenant leak gate never reached its marker (silent skip, or a cross-tenant byte leak)" >&2; exit 1; }
