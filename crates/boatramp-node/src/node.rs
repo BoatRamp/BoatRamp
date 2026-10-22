@@ -893,13 +893,21 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             .as_ref()
             .and_then(|h| h.bindings.sql.as_ref());
         let databases = sql_cfg.map(|s| s.databases.clone()).unwrap_or_default();
+        // The operator trusted-extension allowlist the superuser pre-creates in a pg shadow before
+        // the NON-superuser apply, so a legit `CREATE EXTENSION IF NOT EXISTS <ext>` (pgvector) in an
+        // untrusted dump no-ops instead of failing under the non-superuser apply (HIGH-1 pgvector
+        // wrinkle). Same operator-controlled allowlist the owner-gated migration surface uses.
+        let trusted_extensions = sql_cfg
+            .and_then(|s| s.migrate_trusted_extensions.clone())
+            .unwrap_or_default();
         let mut driver = crate::project_export::NodeProjectExport::new(
             databases,
             deploy.clone(),
             kv.clone(),
             export_blobs,
             data_dir.join("project-export"),
-        );
+        )
+        .with_trusted_extensions(trusted_extensions);
         // Operator digest-pin / override for the ephemeral SQL-client images (the `pg_dump`/
         // `mysqldump`/`psql` one-shots), so a `pgvector/pgvector:pg16@sha256:<hex>` ref can be
         // supplied by env and accepted under the multi-tenant posture without rootfs staging. `None`

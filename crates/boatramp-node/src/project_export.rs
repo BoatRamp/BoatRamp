@@ -28,20 +28,28 @@
 //! container backend's `run_ephemeral` is `Unsupported`.
 //!
 //! ## Atomicity (inc2 chunked + shadow-restore)
-//! A FULL **managed** pg/mysql/libsql member streams O(chunk) (no whole-member temp) and is
-//! applied into a SHADOW — a not-yet-live database/file — then swapped in atomically ONLY after
-//! its trailing SHA verifies; any abort (SHA mismatch, truncation, restore error, disconnect)
-//! tears the shadow down and leaves live untouched (PER-MEMBER all-or-nothing, default #2). The
-//! untrusted dump is applied by the TARGET project's NON-SUPERUSER role (`--no-owner
-//! --no-privileges`), so a crafted dump's superuser-only escapes FAIL; the superuser/maintenance
-//! connection runs ONLY our trusted `CREATE/ALTER/DROP DATABASE` DDL. Residuals: a `--data-only`
-//! DB member stays on the non-atomic inc1 sidecar path (default #1 = FULL-restore atomicity only);
-//! the bundle is NOT whole-bundle atomic (an earlier member swapped-live while a later one fails is
-//! not rolled back — the cross-member window); overwriting a populated DB peaks at ~2× its size.
-//! An EXTERNAL bring-your-own-URL pg/mysql binding stays on the sidecar path (we never
-//! CREATE/RENAME/DROP databases on an operator's own server). Shared-server pg/mysql uses a
-//! per-import physical shadow database (a known cross-tenant surface deferred to the temp-schema
-//! follow-up, default #3 = temp-DB for dedicated/Single).
+//! A FULL **managed, dedicated/Single** pg/mysql/libsql member streams O(chunk) (no whole-member
+//! temp) and is applied into a SHADOW — a not-yet-live database/file — then swapped in atomically
+//! ONLY after its trailing SHA verifies; any abort (SHA mismatch, truncation, restore error,
+//! disconnect) tears the shadow down and leaves live untouched (PER-MEMBER all-or-nothing,
+//! default #2).
+//!
+//! HIGH-1 (Build-2 Security re-review): the pg/mysql dump in a bundle is attacker-crafted, so it is
+//! applied by a freshly-minted, per-import EPHEMERAL non-superuser role (pg: `NOSUPERUSER
+//! NOCREATEDB NOCREATEROLE`, owns the shadow; mysql: a user granted ONLY on the shadow db, no
+//! `SUPER`/`FILE`/`*.*`) with `--no-owner --no-privileges` — NOT the binding's configured user,
+//! which on a managed co-located server is the BOOTSTRAP SUPERUSER. A fail-closed probe REFUSES the
+//! apply unless the role is provably non-superuser. The superuser/maintenance connection runs ONLY
+//! our own trusted DDL (`CREATE ROLE`/`CREATE/ALTER/DROP DATABASE`/`REASSIGN OWNED`), and pre-creates
+//! the operator trusted-extension allowlist in the shadow so a legit `CREATE EXTENSION IF NOT EXISTS
+//! <ext>` (pgvector) no-ops under the non-superuser apply. Residuals / boundaries: a `--data-only`
+//! member and a Shared/external member are NOT chunked, and a MANAGED sidecar apply is REFUSED
+//! fail-closed (it would apply as superuser — a least-privilege sidecar apply is the follow-up); an
+//! EXTERNAL bring-your-own-URL binding applies with the OPERATOR'S OWN credential against the
+//! operator's own database (their trust boundary); a Shared multi-tenant server is refused for
+//! chunked shadow-restore (the per-import physical shadow db is a cross-tenant surface deferred to
+//! the temp-schema follow-up, default #3 = temp-DB for dedicated/Single). The bundle is NOT
+//! whole-bundle atomic (cross-member window); overwriting a populated DB peaks at ~2× its size.
 #![cfg(feature = "project-export")]
 
 use std::collections::{BTreeMap, HashMap};
@@ -69,7 +77,7 @@ use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
 
 use crate::config::ExternalDatabaseConfig;
-use crate::managed_sql::{ManagedSqlCredentials, operator_target, owner_target};
+use crate::managed_sql::{ManagedSqlCredentials, operator_target};
 use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
     mysql_shadow_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
@@ -141,6 +149,14 @@ fn kind_is_libsql(kind: &str) -> bool {
 /// the version banner, not the kind string).
 fn kind_is_mysql(kind: &str) -> bool {
     matches!(kind.to_ascii_lowercase().as_str(), "mysql" | "mariadb")
+}
+
+/// Whether a binding is MANAGED (compute-backed) — i.e. one of OUR co-located managed DB servers
+/// whose configured user is a cluster superuser — vs. an EXTERNAL bring-your-own-URL binding (the
+/// operator's own database + credential). The untrusted-dump apply must never run as a superuser on
+/// a managed binding (HIGH-1).
+fn is_managed_binding(cfg: &ExternalDatabaseConfig) -> bool {
+    cfg.compute.as_deref().is_some_and(|c| !c.is_empty())
 }
 
 /// Parse a `postgres://` / `mysql://` DSN into `(user, password, host, port, database)`
@@ -400,17 +416,6 @@ async fn write_kek_file(path: &std::path::Path, kek: &[u8]) -> Result<(), Perr> 
     .map_err(other)
 }
 
-/// Which SQL identity to resolve for a managed binding (inc2 Stage C/D atomic-shadow split).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndpointRole {
-    /// The configured/superuser role (`operator_target`) — runs OUR trusted maintenance DDL
-    /// (`CREATE/ALTER/DROP DATABASE`), never the attacker-crafted dump.
-    Operator,
-    /// The per-project NON-SUPERUSER owner role (`owner_target`) — applies the attacker-crafted
-    /// dump, so a crafted superuser-only escape FAILS. (Equals Operator on a Single/dedicated box.)
-    Owner,
-}
-
 /// Always constructible from the node's always-present deps (deploy + KV + blobs); the
 /// engine contexts attach optionally — [`with_managed_pg`](Self::with_managed_pg) for the
 /// pg/mysql ephemeral-dump path, [`with_libsql`](Self::with_libsql) for the embedded
@@ -457,6 +462,11 @@ pub struct NodeProjectExport {
     import_member_cap: u64,
     /// Whole-bundle import byte ceiling (default [`DEFAULT_IMPORT_TOTAL_CAP`]).
     import_total_cap: u64,
+    /// The operator trusted-extension allowlist (`handlers.bindings.sql.migrate_trusted_extensions`)
+    /// the superuser pre-creates in a pg shadow before the NON-superuser apply, so a legit `CREATE
+    /// EXTENSION IF NOT EXISTS <ext>` (e.g. pgvector) in an untrusted dump no-ops. A dump naming an
+    /// extension NOT on this list fails fail-closed under the non-superuser apply.
+    trusted_extensions: Vec<String>,
 }
 
 impl NodeProjectExport {
@@ -489,7 +499,18 @@ impl NodeProjectExport {
             chunk_size: DEFAULT_CHUNK_SIZE,
             import_member_cap: DEFAULT_IMPORT_MEMBER_CAP,
             import_total_cap: DEFAULT_IMPORT_TOTAL_CAP,
+            trusted_extensions: Vec::new(),
         }
+    }
+
+    /// Set the operator trusted-extension allowlist (from
+    /// `handlers.bindings.sql.migrate_trusted_extensions`) the superuser pre-creates in a pg shadow
+    /// before the NON-superuser apply — so a legit `CREATE EXTENSION IF NOT EXISTS <ext>` (pgvector)
+    /// in an untrusted dump no-ops instead of failing under the non-superuser apply.
+    #[must_use]
+    pub fn with_trusted_extensions(mut self, extensions: Vec<String>) -> Self {
+        self.trusted_extensions = extensions;
+        self
     }
 
     /// Override the chunk size for `ChunkedTrailer` members (TEST ONLY — production uses the
@@ -665,34 +686,14 @@ impl NodeProjectExport {
     /// Resolve a managed compute-backed SQL database to its reachable endpoint parts —
     /// the same derivation the runtime uses (`operator_target` + the healthy replica
     /// endpoint + the unsealed credential), with a colocated `Published` DB reached at its
-    /// container bridge IP. Uses the OPERATOR identity (the configured/superuser role).
+    /// container bridge IP. Uses the OPERATOR identity (the configured/superuser role); the
+    /// untrusted-dump apply NEVER uses this identity — it uses a freshly-minted ephemeral
+    /// non-superuser role (see [`PgShadowPlan`]/[`MysqlShadowPlan`]).
     async fn resolve_managed_endpoint(
         &self,
         project: &str,
         db: &str,
         cfg: &ExternalDatabaseConfig,
-    ) -> Result<SqlEndpoint, Perr> {
-        self.resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Operator)
-            .await
-    }
-
-    /// Like [`resolve_managed_endpoint`](Self::resolve_managed_endpoint) but selects the SQL
-    /// identity by `role` (inc2 Stage C/D atomic-shadow split):
-    /// - [`EndpointRole::Operator`] — `operator_target`: the configured/superuser role (so the
-    ///   maintenance DDL `CREATE/ALTER/DROP DATABASE` can run). This is the one that runs OUR OWN
-    ///   trusted DDL, never the attacker-crafted dump.
-    /// - [`EndpointRole::Owner`] — `owner_target`: the per-project NON-SUPERUSER owner role on a
-    ///   Shared server (so a crafted dump's superuser-only escapes FAIL at apply); identical to the
-    ///   operator identity on a Single/dedicated instance (the one configured per-project role,
-    ///   `<= project-owner`, not the cluster superuser).
-    ///
-    /// Everything but the identity/credential is role-independent (same replica endpoint + host).
-    async fn resolve_managed_endpoint_role(
-        &self,
-        project: &str,
-        db: &str,
-        cfg: &ExternalDatabaseConfig,
-        role: EndpointRole,
     ) -> Result<SqlEndpoint, Perr> {
         let backend = self.require_backend()?;
         let envelope = self.envelope.as_ref().ok_or_else(|| {
@@ -701,11 +702,7 @@ impl NodeProjectExport {
                  none on this node"
             ))
         })?;
-        let target = match role {
-            EndpointRole::Operator => operator_target(cfg, project, db),
-            EndpointRole::Owner => owner_target(cfg, project, db),
-        }
-        .map_err(other)?;
+        let target = operator_target(cfg, project, db).map_err(other)?;
         let states = self
             .deploy
             .list_replica_states(ProjectRef::new(&target.endpoint_project), &target.workload)
@@ -1350,10 +1347,17 @@ enum ChunkState {
     },
 }
 
-/// The resolved plan for a Postgres atomic shadow-restore (inc2 Stage C). The DDL/identity SPLIT is
-/// the security core: `maint` is the SUPERUSER / maintenance connection (to the `postgres` db) that
-/// runs ONLY our trusted `CREATE/ALTER/DROP DATABASE` + `pg_terminate_backend`; `owner` is the
-/// NON-SUPERUSER per-project role that `pg_restore` connects as to apply the attacker-crafted dump.
+/// The resolved plan for a Postgres atomic shadow-restore (inc2 Stage C).
+///
+/// THE SECURITY CORE (HIGH-1 fix): the untrusted dump is applied by an EPHEMERAL, per-import
+/// `NOSUPERUSER NOCREATEDB NOCREATEROLE` role (`eph_role`), created by the superuser for exactly
+/// this import and dropped afterwards — so the confinement holds REGARDLESS of what the binding's
+/// configured user is (on a Single/dedicated managed pg that user is the bootstrap SUPERUSER, so
+/// relying on `owner_target` would NOT confine). The SUPERUSER / maintenance connection (`maint`,
+/// on the `postgres` db) runs ONLY our own trusted `CREATE ROLE`/`CREATE/ALTER/DROP DATABASE`/
+/// `REASSIGN OWNED`/`pg_terminate_backend` DDL — never a byte of the bundle's dump. On success the
+/// shadow's objects are `REASSIGN OWNED` from the ephemeral role to `owner_user` (the configured
+/// role that normally owns the tenant db) before the ephemeral role is dropped.
 #[derive(Clone)]
 struct PgShadowPlan {
     /// The live (target) database name.
@@ -1364,15 +1368,41 @@ struct PgShadowPlan {
     suffix: String,
     /// The SUPERUSER / maintenance connection (database = `postgres`) for the trusted DDL.
     maint: PgConnection,
-    /// The NON-SUPERUSER owner connection `pg_restore` uses to apply the untrusted dump.
-    owner: PgConnection,
-    /// The owner role name (for `CREATE DATABASE <shadow> OWNER <owner>`).
-    owner_role: String,
+    /// The EPHEMERAL non-superuser role name the untrusted dump is applied as.
+    eph_role: String,
+    /// The ephemeral role's randomly-generated login password.
+    eph_password: String,
+    /// The configured role that normally owns the tenant db — the shadow's objects are reassigned
+    /// to it on a successful swap (so the swapped-in live db has its usual ownership).
+    owner_user: String,
     /// The client image (`pg_dump`/`pg_restore`/`psql`).
     image: String,
+    /// The operator trusted-extension allowlist the superuser pre-creates in the shadow (so a legit
+    /// `CREATE EXTENSION IF NOT EXISTS <ext>` in the dump no-ops under the non-superuser apply).
+    trusted_extensions: Vec<String>,
 }
 
-/// The resolved plan for a MySQL atomic shadow-restore (inc2 Stage D), mirror of [`PgShadowPlan`].
+impl PgShadowPlan {
+    /// The SUPERUSER connection pointed at the SHADOW db (for extension pre-create + `REASSIGN
+    /// OWNED`, which must run connected to the db they target).
+    fn maint_on_shadow(&self) -> PgConnection {
+        let mut c = self.maint.clone();
+        c.database = self.shadow_db.clone();
+        c
+    }
+    /// The NON-SUPERUSER apply connection (the ephemeral role) pointed at the shadow db.
+    fn apply_conn(&self) -> PgConnection {
+        let mut c = self.maint.clone();
+        c.user = self.eph_role.clone();
+        c.password = self.eph_password.clone();
+        c.database = self.shadow_db.clone();
+        c
+    }
+}
+
+/// The resolved plan for a MySQL atomic shadow-restore (inc2 Stage D), mirror of [`PgShadowPlan`]:
+/// the untrusted dump is applied by an EPHEMERAL `mysql` user granted ONLY on the shadow db (never
+/// `*.*`, `SUPER`, or `FILE`), created + dropped by the superuser around the import.
 #[derive(Clone)]
 struct MysqlShadowPlan {
     live_db: String,
@@ -1380,9 +1410,31 @@ struct MysqlShadowPlan {
     suffix: String,
     /// The SUPERUSER / maintenance connection (no default db) for the trusted DDL + enumeration.
     maint: MysqlConnection,
-    /// The NON-SUPERUSER owner connection `mysql <shadow>` uses to apply the untrusted dump.
-    owner: MysqlConnection,
+    /// The EPHEMERAL non-superuser user the untrusted dump is applied as.
+    eph_user: String,
+    /// The ephemeral user's randomly-generated password.
+    eph_password: String,
     image: String,
+}
+
+impl MysqlShadowPlan {
+    /// The NON-SUPERUSER apply connection (the ephemeral user).
+    fn apply_conn(&self) -> MysqlConnection {
+        let mut c = self.maint.clone();
+        c.user = self.eph_user.clone();
+        c.password = self.eph_password.clone();
+        c.database = self.shadow_db.clone();
+        c
+    }
+}
+
+/// A random token (32 hex chars) for an ephemeral role's login password — never persisted, never
+/// handed to a handler; it exists only for the lifetime of one import's shadow apply.
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    // A failed RNG is fatal to the import, not silently weak.
+    getrandom::getrandom(&mut bytes).expect("os rng for ephemeral role password");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[async_trait]
@@ -1865,9 +1917,24 @@ impl ProjectExport for NodeProjectExport {
                                             return Err(e);
                                         }
                                     };
-                                    // TRUSTED DDL (superuser/maint): create the shadow owned by the
-                                    // NON-SUPERUSER role (which then applies the untrusted dump).
+                                    // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER
+                                    // role + the shadow it owns + pre-create the allowlisted exts.
                                     if let Err(e) = self.pg_create_shadow(&plan, &stage_dir).await {
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
+                                        let _ = reply.send(Err(()));
+                                        return Err(e);
+                                    }
+                                    // FAIL-CLOSED: refuse the untrusted apply unless the apply role is
+                                    // provably a non-superuser.
+                                    if let Err(e) = self
+                                        .pg_assert_not_superuser(
+                                            &plan.apply_conn(),
+                                            &plan.image,
+                                            &stage_dir,
+                                        )
+                                        .await
+                                    {
+                                        self.pg_drop_shadow(&plan, &stage_dir).await;
                                         let _ = reply.send(Err(()));
                                         return Err(e);
                                     }
@@ -1932,6 +1999,15 @@ impl ProjectExport for NodeProjectExport {
                                     if let Err(e) =
                                         self.mysql_create_shadow(&plan, &stage_dir).await
                                     {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
+                                        let _ = reply.send(Err(()));
+                                        return Err(e);
+                                    }
+                                    // FAIL-CLOSED: refuse unless the apply user is least-privilege.
+                                    if let Err(e) =
+                                        self.mysql_assert_not_superuser(&plan, &stage_dir).await
+                                    {
+                                        self.mysql_drop_shadow(&plan, &stage_dir).await;
                                         let _ = reply.send(Err(()));
                                         return Err(e);
                                     }
@@ -2335,12 +2411,15 @@ impl NodeProjectExport {
         for (db, cfg) in &self.databases {
             let is_managed = cfg.compute.as_deref().is_some_and(|c| !c.is_empty());
             let dumpable = is_managed || !cfg.url_env.is_empty();
-            // A MANAGED pg/mysql FULL dump is framed ChunkedTrailer → the inc2 streamed dump +
-            // atomic shadow-restore (Stage C/D). A `--data-only` import stays on the inc1 sidecar
-            // path (default #1: FULL-restore atomicity only), and an EXTERNAL bring-your-own-URL
-            // binding stays sidecar too (we never CREATE/RENAME/DROP databases on an operator's own
-            // server). So: chunked IFF managed AND full.
-            let chunked = is_managed && !data_only;
+            // A MANAGED, DEDICATED/Single pg/mysql FULL dump is framed ChunkedTrailer → the inc2
+            // streamed dump + atomic shadow-restore (Stage C/D). A `--data-only` import stays on the
+            // inc1 sidecar path (default #1: FULL-restore atomicity only); an EXTERNAL
+            // bring-your-own-URL binding stays sidecar (we never CREATE/RENAME/DROP databases on an
+            // operator's own server); and a SHARED multi-tenant server stays sidecar (HIGH-1 / #6:
+            // the per-import physical shadow db is a cross-tenant surface deferred to the temp-schema
+            // follow-up). So: chunked IFF managed AND full AND not-Shared.
+            let is_shared = matches!(cfg.tenant, crate::config::TenantIsolation::Shared);
+            let chunked = is_managed && !data_only && !is_shared;
             if kind_is_postgres(&cfg.kind) && dumpable {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
@@ -2756,6 +2835,27 @@ impl NodeProjectExport {
                     }
                 }
                 if opts.apply {
+                    // HIGH-1: a SIDECAR pg member (data-only, or a Shared/dedicated FULL that was not
+                    // chunked) is still ATTACKER-CRAFTED. Applying it via `resolve_pg` would connect
+                    // as the configured user, which on a MANAGED co-located server is the BOOTSTRAP
+                    // SUPERUSER — a crafted archive's `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE
+                    // c` / `CREATE EXTENSION` would then execute = RCE. The chunked FULL path confines
+                    // this with an ephemeral non-superuser role + shadow; a least-privilege sidecar
+                    // apply (data-only into a live schema) is the follow-up, so until it lands we
+                    // REFUSE a managed sidecar apply fail-closed rather than apply as superuser. An
+                    // EXTERNAL bring-your-own-URL binding applies with the OPERATOR'S OWN credential
+                    // against the OPERATOR'S OWN database (their trust boundary, not our managed
+                    // cluster), so it is still applied.
+                    if is_managed_binding(cfg) {
+                        return Err(Perr::Unavailable(format!(
+                            "import refused: a MANAGED pg database ({db:?}) can only be restored via \
+                             the atomic chunked shadow path (a FULL, dedicated/Single bundle). A \
+                             data-only or Shared sidecar restore would apply the untrusted dump as \
+                             the bootstrap superuser (RCE risk); a least-privilege sidecar apply is a \
+                             pending follow-up. Re-export as a FULL dedicated bundle, or import into \
+                             an external (bring-your-own-URL) binding."
+                        )));
+                    }
                     let inv = pg_restore_invocation(&conn, data_only);
                     let devnull = temp.with_extension("restore.out");
                     let code = self
@@ -2786,6 +2886,18 @@ impl NodeProjectExport {
                     }
                 }
                 if opts.apply {
+                    // HIGH-1 (mirror of the pg sidecar arm): refuse a MANAGED sidecar mysql apply —
+                    // it would connect as the bootstrap superuser against our co-located server. An
+                    // EXTERNAL binding applies with the operator's own credential (their trust).
+                    if is_managed_binding(cfg) {
+                        return Err(Perr::Unavailable(format!(
+                            "import refused: a MANAGED mysql database ({db:?}) can only be restored \
+                             via the atomic chunked shadow path (a FULL, dedicated/Single bundle); a \
+                             data-only/Shared sidecar restore would apply the untrusted dump as a \
+                             superuser (RCE risk). Re-export as a FULL dedicated bundle, or import \
+                             into an external binding."
+                        )));
+                    }
                     let inv = mysql_restore_invocation(&conn, data_only);
                     let devnull = temp.with_extension("myrestore.out");
                     let code = self
@@ -2906,19 +3018,29 @@ impl NodeProjectExport {
     // THE SECURITY-CRITICAL SPLIT (the pg analogue of Build 1's libsql ATTACH-authorizer fix):
     // a pg dump in a bundle is ATTACKER-CRAFTED (the trailer SHA is integrity, not authenticity),
     // and run as a SUPERUSER a crafted dump can `COPY … TO/FROM PROGRAM/FILE`, `CREATE FUNCTION …
-    // LANGUAGE c`, `CREATE EXTENSION`, … = arbitrary code/file execution on the box. THEREFORE the
-    // UNTRUSTED dump is applied by `pg_restore` connecting as the TARGET project's NON-SUPERUSER
-    // owner role (`plan.owner`) with `--no-owner --no-privileges` (so every superuser-only escape
-    // FAILS), and the SUPERUSER / maintenance connection (`plan.maint`, on the `postgres` db) runs
-    // ONLY our own trusted `CREATE/ALTER/DROP DATABASE` + `pg_terminate_backend` DDL — never a byte
-    // of the bundle's dump.
+    // LANGUAGE c`, `CREATE EXTENSION`, … = arbitrary code/file execution on the box.
+    //
+    // HIGH-1 (Build-2 Security re-review): the configured binding user is NOT reliably a
+    // non-superuser — on a Single/dedicated managed pg it is the bootstrap SUPERUSER (POSTGRES_USER),
+    // and `owner_target` only yields a genuine non-superuser role for `Shared && !default`. So the
+    // apply MUST NOT use the configured/owner identity. Instead the superuser creates an EPHEMERAL
+    // per-import `NOSUPERUSER NOCREATEDB NOCREATEROLE` role (random password), the shadow is OWNED by
+    // it, `pg_restore` applies the untrusted dump CONNECTING AS THAT ephemeral role (so every
+    // superuser-only escape FAILS regardless of `cfg.user`), and a fail-closed probe REFUSES the
+    // apply if the resolved role is somehow a superuser. The SUPERUSER / maintenance connection
+    // (`plan.maint`, on `postgres`) runs ONLY our own trusted DDL — never a byte of the dump — and,
+    // before the apply, pre-creates the operator trusted-extension allowlist in the shadow so a legit
+    // `CREATE EXTENSION IF NOT EXISTS <ext>` (e.g. pgvector) no-ops under the non-superuser apply.
+    // Chunked shadow-restore is for DEDICATED/Single managed servers only; a Shared multi-tenant
+    // server is refused here (the per-import physical shadow db is a cross-tenant surface deferred to
+    // the temp-schema follow-up).
     // -----------------------------------------------------------------------
 
-    /// Resolve the [`PgShadowPlan`] for a MANAGED pg binding: the superuser/maintenance connection
-    /// (on `postgres`), the non-superuser owner connection, the owner role name, the client image,
-    /// and a fresh shadow name. External (bring-your-own-URL) bindings are refused — we must not
-    /// `CREATE/RENAME/DROP` databases on an operator's own server, and a single URL credential can't
-    /// give the superuser/non-superuser split — so they stay on the inc1 sidecar path.
+    /// Resolve the [`PgShadowPlan`] for a MANAGED, non-Shared pg binding: the superuser/maintenance
+    /// connection (on `postgres`), a freshly-minted EPHEMERAL non-superuser apply role + password,
+    /// the client image, the shadow name, and the trusted-extension allowlist. External
+    /// (bring-your-own-URL) bindings are refused — we must not `CREATE/RENAME/DROP` databases on an
+    /// operator's own server — and a Shared multi-tenant server is refused (dedicated/Single only).
     async fn pg_shadow_plan(
         &self,
         project: &str,
@@ -2932,30 +3054,66 @@ impl NodeProjectExport {
                  sidecar path"
             )));
         }
+        if matches!(cfg.tenant, crate::config::TenantIsolation::Shared) {
+            return Err(Perr::Unavailable(format!(
+                "database {db:?}: the atomic chunked pg shadow-restore is for DEDICATED/Single \
+                 managed servers only; a Shared multi-tenant server's per-import physical shadow db \
+                 is a cross-tenant surface deferred to the temp-schema follow-up"
+            )));
+        }
         // Operator identity (configured/superuser) + version-detect → client image. Its endpoint
-        // (host/port) + the live tenant db name seed the maintenance connection.
+        // (host/port) + the live tenant db name + the configured owner seed the maintenance conn.
         let (operator_conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
+        let owner_user = operator_conn.user.clone();
         let mut maint = operator_conn;
         // CREATE/ALTER/DROP DATABASE cannot run connected to the tenant db — point at `postgres`.
         maint.database = "postgres".to_string();
-        // The NON-SUPERUSER apply identity (the per-project owner role).
-        let owner_ep = self
-            .resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Owner)
-            .await?;
-        let owner_role = owner_ep.user.clone();
-        let owner = owner_ep.into_pg(self.connect_timeout_secs);
         let suffix = shadow_suffix();
         let shadow_db = format!("{live_db}__shadow_{suffix}");
+        let eph_role = format!("brexp_apply_{suffix}");
         Ok(PgShadowPlan {
             live_db,
             shadow_db,
             suffix,
             maint,
-            owner,
-            owner_role,
+            eph_role,
+            eph_password: random_token(),
+            owner_user,
             image,
+            trusted_extensions: self.trusted_extensions.clone(),
         })
+    }
+
+    /// Fail-closed defense-in-depth probe: confirm the resolved apply identity (`conn`) is NOT a
+    /// superuser before any untrusted dump reaches it. Refuses the import loudly otherwise, so the
+    /// non-superuser confinement can never be silently absent.
+    async fn pg_assert_not_superuser(
+        &self,
+        conn: &PgConnection,
+        image: &str,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = psql_invocation(
+            conn,
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+        );
+        let (code, out) = self
+            .run_sql_capture(image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg shadow: could not probe the apply role's superuser attribute (exit {code}): {out}"
+            )));
+        }
+        if out.trim() != "f" {
+            return Err(Perr::Other(format!(
+                "pg shadow REFUSED: the resolved apply role is a SUPERUSER (rolsuper={:?}); an \
+                 untrusted bundle dump must only be applied by a non-superuser role",
+                out.trim()
+            )));
+        }
+        Ok(())
     }
 
     /// Run ONE trusted DDL/utility statement through the SUPERUSER / maintenance connection
@@ -3000,26 +3158,62 @@ impl NodeProjectExport {
         Ok(out.trim() == "1")
     }
 
-    /// TRUSTED DDL: create the shadow database owned by the NON-SUPERUSER owner role (so the
-    /// `pg_restore` apply as that role can create objects in it). The shadow name is per-process
-    /// unique, so no pre-drop is needed.
+    /// TRUSTED DDL (superuser): mint the EPHEMERAL non-superuser apply role, create the shadow
+    /// database OWNED by it (so the `pg_restore` apply as that role can create objects), and
+    /// pre-create the operator trusted-extension allowlist in the shadow (so a legit `CREATE
+    /// EXTENSION IF NOT EXISTS <ext>` in the untrusted dump no-ops under the non-superuser apply —
+    /// the pgvector wrinkle). The role name + shadow name are per-process unique, so no pre-drop is
+    /// needed. A dump that references an extension NOT on the allowlist fails fail-closed under the
+    /// non-superuser apply (correct: we never let an untrusted bundle install an arbitrary extension).
     async fn pg_create_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) -> Result<(), Perr> {
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
-        let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_role);
+        // The random password is a trusted, we-generate-it literal (not a credential that leaks via
+        // argv — psql's -c SQL is not a process listing concern on the DB host, and it never reaches
+        // a handler); still, quote it as a SQL literal defensively.
         self.pg_run_ddl(
             plan,
-            &format!("CREATE DATABASE {shadow_q} OWNER {owner_q}"),
+            &format!(
+                "CREATE ROLE {role_q} LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE \
+                 NOREPLICATION NOBYPASSRLS",
+                pg_lit(&plan.eph_password)
+            ),
             stage_dir,
         )
-        .await
+        .await?;
+        self.pg_run_ddl(
+            plan,
+            &format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
+            stage_dir,
+        )
+        .await?;
+        // Pre-create the allowlisted extensions in the shadow, as the SUPERUSER, connected to the
+        // shadow (extensions are database-local). `IF NOT EXISTS` so a re-run is a no-op.
+        if !plan.trusted_extensions.is_empty() {
+            let maint_shadow = PgShadowPlan {
+                maint: plan.maint_on_shadow(),
+                ..plan.clone()
+            };
+            for ext in &plan.trusted_extensions {
+                let ext_q = quote_ident(ExternalSqlKind::Postgres, ext);
+                self.pg_run_ddl(
+                    &maint_shadow,
+                    &format!("CREATE EXTENSION IF NOT EXISTS {ext_q}"),
+                    stage_dir,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
-    /// Best-effort TEARDOWN of the shadow (abort / RAII): terminate any lingering restore
-    /// connection, then `DROP DATABASE IF EXISTS`. Called on EVERY abort path (SHA mismatch,
-    /// truncation, restore error, swap error) so nothing partial is ever left; the startup sweep
-    /// covers the crash case. Errors are logged, not propagated (we are already aborting).
+    /// Best-effort TEARDOWN of the shadow + ephemeral role (abort / RAII): terminate any lingering
+    /// restore connection, `DROP DATABASE IF EXISTS` (which removes the ephemeral-owned objects),
+    /// then `DROP ROLE IF EXISTS` the ephemeral role (it owns nothing once the shadow is gone).
+    /// Called on EVERY abort path; the startup sweep covers the crash case.
     async fn pg_drop_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) {
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
         let _ = self
             .pg_run_ddl(
                 plan,
@@ -3041,6 +3235,12 @@ impl NodeProjectExport {
         {
             tracing::warn!(error = %e, shadow = %plan.shadow_db, "pg shadow drop-on-abort failed; the startup sweep will reclaim it");
         }
+        if let Err(e) = self
+            .pg_run_ddl(plan, &format!("DROP ROLE IF EXISTS {role_q}"), stage_dir)
+            .await
+        {
+            tracing::warn!(error = %e, role = %plan.eph_role, "pg ephemeral apply-role drop-on-abort failed; the startup sweep will reclaim it");
+        }
     }
 
     /// TRUSTED DDL: atomically swap the verified shadow in for live. Terminate live sessions,
@@ -3052,8 +3252,30 @@ impl NodeProjectExport {
     async fn pg_swap_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) -> Result<(), Perr> {
         let live_q = quote_ident(ExternalSqlKind::Postgres, &plan.live_db);
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
+        let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_user);
         let old_db = format!("{}__old_{}", plan.live_db, plan.suffix);
         let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
+        // Reassign the restored objects (owned by the ephemeral role after a `--no-owner` restore)
+        // to the configured owner, then re-own the database, so the swapped-in live db has its usual
+        // ownership and the ephemeral role can be dropped. REASSIGN OWNED must run connected to the
+        // db it targets (the shadow); ALTER DATABASE OWNER runs from the maintenance db.
+        let maint_shadow = PgShadowPlan {
+            maint: plan.maint_on_shadow(),
+            ..plan.clone()
+        };
+        self.pg_run_ddl(
+            &maint_shadow,
+            &format!("REASSIGN OWNED BY {role_q} TO {owner_q}"),
+            stage_dir,
+        )
+        .await?;
+        self.pg_run_ddl(
+            plan,
+            &format!("ALTER DATABASE {shadow_q} OWNER TO {owner_q}"),
+            stage_dir,
+        )
+        .await?;
         let live_exists = self.pg_db_exists(plan, &plan.live_db, stage_dir).await?;
         if live_exists {
             self.pg_run_ddl(
@@ -3121,12 +3343,16 @@ impl NodeProjectExport {
                 .pg_run_ddl(plan, &format!("DROP DATABASE IF EXISTS {old_q}"), stage_dir)
                 .await;
         }
+        // The ephemeral apply role has no objects left (reassigned) — drop it.
+        let _ = self
+            .pg_run_ddl(plan, &format!("DROP ROLE IF EXISTS {role_q}"), stage_dir)
+            .await;
         Ok(())
     }
 
     /// Spawn the `pg_restore` subprocess that applies the untrusted dump into the shadow, connecting
-    /// as the NON-SUPERUSER owner role, reading the chunked member's body channel as stdin (so the
-    /// dump streams in O(chunk)). Returns its `JoinHandle` (awaited at `ChunkFinish`).
+    /// as the EPHEMERAL NON-SUPERUSER role, reading the chunked member's body channel as stdin (so
+    /// the dump streams in O(chunk)). Returns its `JoinHandle` (awaited at `ChunkFinish`).
     fn spawn_pg_restore(
         &self,
         plan: &PgShadowPlan,
@@ -3135,7 +3361,7 @@ impl NodeProjectExport {
     ) -> Result<tokio::task::JoinHandle<Result<i32, Perr>>, Perr> {
         let backend = self.require_backend()?.clone();
         let image = plan.image.clone();
-        let inv = pg_restore_shadow_invocation(&plan.owner, &plan.shadow_db);
+        let inv = pg_restore_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
         Ok(tokio::spawn(async move {
             let mut reader = AsyncChannelReader::new(body_rx);
             let out = tokio::fs::File::create(&out_path).await.map_err(other)?;
@@ -3153,7 +3379,10 @@ impl NodeProjectExport {
     // the maintenance connection runs the trusted `CREATE DATABASE` + atomic `RENAME TABLE` swap.
     // -----------------------------------------------------------------------
 
-    /// Resolve the [`MysqlShadowPlan`] for a MANAGED mysql binding (external bindings stay sidecar).
+    /// Resolve the [`MysqlShadowPlan`] for a MANAGED, non-Shared mysql binding (external bindings
+    /// stay sidecar; Shared multi-tenant is refused — dedicated/Single only). Mints an EPHEMERAL
+    /// apply user + password (HIGH-1: the configured user is the bootstrap superuser on a dedicated
+    /// instance, so the apply must NOT use it).
     async fn mysql_shadow_plan(
         &self,
         project: &str,
@@ -3166,23 +3395,68 @@ impl NodeProjectExport {
                  (compute-backed) databases only; an external binding uses the sidecar path"
             )));
         }
+        if matches!(cfg.tenant, crate::config::TenantIsolation::Shared) {
+            return Err(Perr::Unavailable(format!(
+                "database {db:?}: the atomic chunked mysql shadow-restore is for DEDICATED/Single \
+                 managed servers only; a Shared multi-tenant server is deferred"
+            )));
+        }
         let (operator_conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
         let maint = operator_conn; // mysql names no default db for the admin SQL
-        let owner_ep = self
-            .resolve_managed_endpoint_role(project, db, cfg, EndpointRole::Owner)
-            .await?;
-        let owner = owner_ep.into_mysql(self.connect_timeout_secs);
         let suffix = shadow_suffix();
         let shadow_db = format!("{live_db}__shadow_{suffix}");
+        let eph_user = format!("brexp_apply_{suffix}");
         Ok(MysqlShadowPlan {
             live_db,
             shadow_db,
             suffix,
             maint,
-            owner,
+            eph_user,
+            eph_password: random_token(),
             image,
         })
+    }
+
+    /// Fail-closed probe: refuse the untrusted mysql apply unless the ephemeral user's grants carry
+    /// NO `SUPER`, `FILE`, or `ALL PRIVILEGES ON *.*` — so a crafted dump cannot `INTO OUTFILE` /
+    /// `LOAD DATA INFILE` / otherwise escape. Runs as the apply user (`SHOW GRANTS FOR CURRENT_USER`).
+    async fn mysql_assert_not_superuser(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let apply = plan.apply_conn();
+        let inv = mysql_admin_invocation(&apply);
+        let in_path = stage_dir.join(format!("mysql-probe-{}.sql", shadow_suffix()));
+        tokio::fs::write(&in_path, "SHOW GRANTS FOR CURRENT_USER();")
+            .await
+            .map_err(other)?;
+        let r = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, Some(&in_path), stage_dir)
+            .await;
+        let _ = tokio::fs::remove_file(&in_path).await;
+        let (code, out) = r?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not probe the apply user's grants (exit {code}): {out}"
+            )));
+        }
+        // Refuse SUPER/FILE (global-only escape privileges) or any NON-trivial `*.*` grant. The
+        // baseline `GRANT USAGE ON *.* TO …` that every user carries is harmless (USAGE = "no
+        // privileges") and must NOT trip the probe.
+        for line in out.lines() {
+            let up = line.to_ascii_uppercase();
+            let dangerous_global = up.contains("ON *.*") && !up.contains("USAGE ON *.*");
+            if up.contains("SUPER") || up.contains("FILE") || dangerous_global {
+                return Err(Perr::Other(format!(
+                    "mysql shadow REFUSED: the resolved apply user holds SUPER/FILE/*.* privileges; \
+                     an untrusted bundle dump must only be applied by a least-privilege user. \
+                     grants: {out}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Run trusted mysql SQL (fed on stdin, no default db) through the maintenance connection,
@@ -3228,42 +3502,44 @@ impl NodeProjectExport {
             .collect())
     }
 
-    /// TRUSTED DDL: create the shadow database (the apply runs as the non-superuser owner, which has
-    /// `db.*` grants covering a same-named db on a Single instance; on Shared the shadow is a known
-    /// cross-tenant surface deferred to the temp-schema follow-up, default #3).
+    /// TRUSTED DDL: create the shadow database + mint the EPHEMERAL apply user granted ONLY on the
+    /// shadow db (never `*.*`, `SUPER`, or `FILE`), so a crafted dump applied as that user cannot
+    /// escape. The ephemeral user is dropped on swap/abort.
     async fn mysql_create_shadow(
         &self,
         plan: &MysqlShadowPlan,
         stage_dir: &Path,
     ) -> Result<(), Perr> {
         let shadow_q = quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db);
+        let user_lit = mysql_lit(&plan.eph_user);
+        let pw_lit = mysql_lit(&plan.eph_password);
         let (code, out) = self
-            .mysql_run_admin(plan, &format!("CREATE DATABASE {shadow_q};"), stage_dir)
+            .mysql_run_admin(
+                plan,
+                &format!(
+                    "CREATE DATABASE {shadow_q}; \
+                     CREATE USER {user_lit}@'%' IDENTIFIED BY {pw_lit}; \
+                     GRANT ALL PRIVILEGES ON {shadow_q}.* TO {user_lit}@'%';"
+                ),
+                stage_dir,
+            )
             .await?;
         if code != 0 {
             return Err(Perr::Other(format!(
-                "mysql shadow create exited {code}: {out}"
+                "mysql shadow create (db + ephemeral user) exited {code}: {out}"
             )));
         }
-        // Grant the non-superuser owner role the privileges to load the dump into the shadow.
-        let owner_user = mysql_lit(&plan.owner.user);
-        let _ = self
-            .mysql_run_admin(
-                plan,
-                &format!("GRANT ALL PRIVILEGES ON {shadow_q}.* TO {owner_user}@'%';"),
-                stage_dir,
-            )
-            .await;
         Ok(())
     }
 
-    /// Best-effort shadow teardown (abort / RAII).
+    /// Best-effort shadow + ephemeral-user teardown (abort / RAII).
     async fn mysql_drop_shadow(&self, plan: &MysqlShadowPlan, stage_dir: &Path) {
         let shadow_q = quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db);
+        let user_lit = mysql_lit(&plan.eph_user);
         if let Err(e) = self
             .mysql_run_admin(
                 plan,
-                &format!("DROP DATABASE IF EXISTS {shadow_q};"),
+                &format!("DROP DATABASE IF EXISTS {shadow_q}; DROP USER IF EXISTS {user_lit}@'%';"),
                 stage_dir,
             )
             .await
@@ -3338,7 +3614,7 @@ impl NodeProjectExport {
     }
 
     /// Spawn the `mysql <shadow>` subprocess that applies the untrusted tables-only dump as the
-    /// non-superuser owner role, reading the body channel as stdin.
+    /// EPHEMERAL least-privilege user, reading the body channel as stdin.
     fn spawn_mysql_restore(
         &self,
         plan: &MysqlShadowPlan,
@@ -3347,7 +3623,7 @@ impl NodeProjectExport {
     ) -> Result<tokio::task::JoinHandle<Result<i32, Perr>>, Perr> {
         let backend = self.require_backend()?.clone();
         let image = plan.image.clone();
-        let inv = mysql_shadow_invocation(&plan.owner, &plan.shadow_db);
+        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
         Ok(tokio::spawn(async move {
             let mut reader = AsyncChannelReader::new(body_rx);
             let out = tokio::fs::File::create(&out_path).await.map_err(other)?;

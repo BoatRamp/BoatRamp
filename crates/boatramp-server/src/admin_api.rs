@@ -2742,13 +2742,19 @@ fn default_identity() -> String {
 /// `?apply=true`. Returns the import report JSON. `501` when no driver is wired, `409` on a
 /// schema skew / KV commingle refusal.
 ///
-/// Atomicity (inc2): each FULL managed-DB member (pg/mysql/libsql) is applied into a SHADOW and
-/// swapped in only after its trailing SHA verifies, so a corrupt/truncated/aborted DB member
-/// applies NOTHING to live (PER-MEMBER all-or-nothing, default #2). A `--data-only` DB member
-/// stays on the non-atomic sidecar path (default #1: FULL-restore atomicity only). The bundle is
-/// NOT whole-bundle atomic: a cross-member window remains — an earlier DB member swapped live
-/// while a LATER member fails is not rolled back (a known residual). Overwriting a populated DB
-/// peaks at ~2× its size during the shadow swap.
+/// Atomicity (inc2): each FULL managed, dedicated/Single DB member (pg/mysql/libsql) is applied
+/// into a SHADOW and swapped in only after its trailing SHA verifies, so a corrupt/truncated/
+/// aborted DB member applies NOTHING to live (PER-MEMBER all-or-nothing, default #2). The bundle is
+/// NOT whole-bundle atomic: a cross-member window remains (a known residual). Overwriting a
+/// populated DB peaks at ~2× its size during the shadow swap.
+///
+/// Privilege confinement (HIGH-1): a bundle's pg/mysql dump is attacker-crafted, so the chunked
+/// shadow apply runs it as a freshly-minted EPHEMERAL non-superuser role (a fail-closed probe
+/// refuses a superuser), never the binding's configured user (the bootstrap superuser on a managed
+/// co-located server). Consequently a MANAGED `--data-only` or Shared sidecar restore — which would
+/// apply as that superuser — is REFUSED fail-closed (a least-privilege sidecar apply is a
+/// follow-up); an EXTERNAL bring-your-own-URL binding applies with the operator's own credential
+/// against their own database; and chunked shadow-restore is dedicated/Single only (Shared deferred).
 pub(super) async fn project_import(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     Query(q): Query<ProjectImportQuery>,
