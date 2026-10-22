@@ -1,0 +1,37 @@
+# Coverage-guided fuzz target for the overlay service tunneler's TUN front-end (plan §3.5/§5/§6):
+# the `smoltcp`-based userspace netstack is "the main new security-sensitive surface" this release
+# adds — the only place arbitrary, attacker-controlled bytes from an untrusted network reach a full
+# IP/TCP parser. Run with a nightly toolchain:  cargo +nightly fuzz run fuzz_netstack_ingress
+# The stable regression net lives in ../src/tun/netstack.rs's own
+# `fuzz_one_frame_never_panics_on_a_handful_of_edge_cases` test (same split boatramp-http/fuzz
+# takes between its nightly fuzz targets and ../tests/fuzz_smoke.rs).
+[package]
+name = "boatramp-overlay-tunnel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+boatramp-overlay-tunnel = { path = "..", features = ["tun"] }
+# This crate's own `[workspace]` (below) resolves independently of the root workspace's pinned
+# `Cargo.lock` — by itself, that pulls tokio-util 0.7.20, which added a second
+# `Encoder<bytes::Bytes>` impl for `LengthDelimitedCodec` alongside the existing
+# `Encoder<&[u8]>`, making an un-annotated `.flush()` call in `boatramp-overlay::circuit`
+# (a transitive dependency via `boatramp-overlay-tunnel` → `boatramp-overlay-client`) ambiguous —
+# a latent upstream issue unrelated to this fuzz target, only surfaced by the independent
+# resolution. Pinned to the exact version the root workspace's `Cargo.lock` already uses (where it
+# resolves cleanly) rather than patching the unrelated crate.
+tokio-util = "=0.7.18"
+
+[[bin]]
+name = "fuzz_netstack_ingress"
+path = "fuzz_targets/fuzz_netstack_ingress.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

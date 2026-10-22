@@ -201,14 +201,16 @@ jobs:
             build -p boatramp-overlay-client \
             --no-default-features --features client --locked
 
-  # overlay service tunneler (R1) — the lean (no-`tun`) SOCKS build's ring-free proof. The SOCKS
-  # front-end adds NO new dependency on top of the SDK (hand-rolled codec, no crypto crate of its
-  # own), so it MUST stay exactly as ring-free / rustls-platform-verifier-free as
-  # `boatramp-overlay-client` itself (same aws-lc-rs-only posture). Cheap (`cargo tree` resolves, it
-  # does not compile) so it runs on every push/PR that touches the crate, unlike the mobile legs
-  # above. The `tun` feature (default OFF) is checked too, proving it currently adds ZERO deps in
-  # this release (a pure cargo-feature scaffold — R2 is where real TUN deps land behind it, and this
-  # same job would then need updating to assert THEIR isolation instead of their absence).
+  # overlay service tunneler (R1 SOCKS + R2 TUN) — the lean (no-`tun`) SOCKS build's ring-free
+  # proof. The SOCKS front-end adds NO new dependency on top of the SDK (hand-rolled codec, no
+  # crypto crate of its own), so it MUST stay exactly as ring-free / rustls-platform-verifier-free
+  # as `boatramp-overlay-client` itself (same aws-lc-rs-only posture). Cheap (`cargo tree` resolves,
+  # it does not compile) so it runs on every push/PR that touches the crate, unlike the mobile legs
+  # above. The `--features tun` graph is checked too — R2 landed its REAL dependency set (`tun-rs`,
+  # `smoltcp`, `hickory-proto`, `net-route`, `nix`) behind the feature isolation R1 only reserved;
+  # this job is the proof that set is STILL ring-free / rustls-platform-verifier-free (every one of
+  # those crates' own transitive graphs is aws-lc-rs/no-TLS-stack-at-all), not just the lean SOCKS
+  # graph.
   tunnel-ring-free:
     name: overlay-tunnel ring-free dependency proof
     runs-on: ubuntu-latest
@@ -236,4 +238,4 @@ jobs:
             echo "::error::ring or rustls-platform-verifier found in the --features tun graph"
             exit 1
           fi
-          echo "tun-feature graph is ring-free / rustls-platform-verifier-free (R1: identical to lean — tun adds no deps yet)"
+          echo "tun-feature graph is ring-free / rustls-platform-verifier-free (R2's real TUN deps included)"

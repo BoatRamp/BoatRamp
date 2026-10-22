@@ -17,11 +17,22 @@ description = "Service-by-name consumption layer over the boatramp overlay fabri
 default = []
 # The full TUN virtual-interface front-end (device + embedded DNS + synthetic-IP allocator +
 # userspace TCP/IP stack + per-OS route/resolver integration) — overlay-service-tunneler plan §3,
-# release R2+. Default OFF so the lean SOCKS build never links its (much heavier) dependency set;
-# this release only RESERVES the gate — `tun` module below is a stub that always errors, so R2 can
-# land the real `tun`/`smoltcp`/`hickory-*`/`net-route` deps behind this SAME feature without ever
-# touching the ring-free SOCKS graph.
-tun = []
+# release R2 (Linux). Default OFF so the lean SOCKS build never links this heavier dependency set —
+# every dep below is `optional = true` and enabled ONLY by this feature, so the lean (no-`tun`)
+# graph is byte-for-byte what it was in R1.
+tun = [
+  "dep:tun-rs",
+  "dep:smoltcp",
+  "dep:hickory-proto",
+  "dep:net-route",
+  "dep:nix",
+  "dep:serde",
+  "dep:serde_json",
+  # Signal handling for the clean-teardown path (plan §3.9: SIGINT/SIGTERM/SIGHUP). `tokio` itself
+  # is a non-optional dependency of the lean build too, so this is a feature-on-a-feature
+  # reference (not `dep:tokio`) — the lean (no-`tun`) build's tokio feature set is untouched.
+  "tokio/signal",
+]
 
 [dependencies]
 # The ONLY boatramp dependency (plan §4): the embeddable overlay client SDK — `OverlayClient::dial`,
@@ -60,6 +71,57 @@ base64 = "0.22"
 # (via boatramp-overlay-proto, which names it directly too); zero deps of its own, so this adds
 # nothing to the dependency graph and cannot affect the ring-free posture.
 zeroize = "1"
+
+# ---- `tun` feature only (plan §3/§7) — every dep below is `optional = true`, enabled solely by
+# the `tun` feature table above, so the lean (SOCKS-only) build graph is untouched by any of this.
+#
+# TUN device (plan §3.1). The plan names the `tun` crate (rust-tun), but its Cargo.toml declares
+# `license = "WTFPL"` (confirmed by reading its published manifest) — not MIT as the plan assumed,
+# and not in this workspace's `deny.toml` license allow-list. `tun-rs` is a drop-in equivalent
+# (async/tokio Linux `/dev/net/tun` support via the same `nix`-based posix layer, same
+# builder-pattern API) under Apache-2.0, already allow-listed — a license-driven substitution, not
+# a functional one; see the crate-level `tun` module doc for the full rationale.
+tun-rs = { version = "2", optional = true, default-features = false, features = [
+  "async_tokio",
+] }
+# Userspace TCP/IP stack (plan §3.5): pure-Rust, no_std+alloc, upstream-fuzzed, no C FFI, no `ring` —
+# the explicit alternative to C lwIP/`netstack-lwip` the plan rejects. Default features only (no
+# `log`/`alloc`/`std`-gated extras we don't need beyond what `std` already pulls in for `Vec`).
+smoltcp = { version = "0.12", optional = true, default-features = false, features = [
+  "std",
+  "medium-ip",
+  "socket-tcp",
+  "proto-ipv4",
+] }
+# Embedded DNS zone handler (plan §3.3): `op::Message`/`rr::*` encode+decode only — explicitly
+# `default-features = false` with just `std` (NOT the crate's own `default = ["std", "tokio"]`,
+# and nowhere near `__tls`/`__https`/`__quic`/`dnssec-*`) so this can never pull `ring` or
+# `rustls*` even if a future hickory-proto release changes its own defaults; this crate hand-rolls
+# the UDP/TCP listen loop (same hand-rolled-protocol posture as the SOCKS codec) rather than using
+# hickory-proto's own tokio transport, so the `tokio` feature is not needed either.
+hickory-proto = { version = "0.25", optional = true, default-features = false, features = [
+  "std",
+] }
+# Route install (plan §3.2): one cross-platform crate for the CIDR→TUN route instead of shelling a
+# native tool. Non-decision per plan §9.
+net-route = { version = "0.4", optional = true }
+# Linux privilege drop (plan §3.7 — `geteuid`/`setgid`/`setuid` after TUN+route setup, when this
+# process is root via `sudo`): `nix`'s `user` feature is a SAFE wrapper over those syscalls, which
+# this crate needs because `#![forbid(unsafe_code)]` (lib.rs) rules out calling raw `libc` directly.
+# Already transitively in the tree (via `tun-rs`); named directly only because this crate's own
+# `privilege` module calls it.
+nix = { version = "0.31", optional = true, default-features = false, features = [
+  "user",
+  # `kill(pid, None)` — the portable (Linux + macOS, unlike parsing Linux-only `/proc`) existence
+  # check `teardown::process_alive` uses to decide whether a marker's recorded PID is still alive.
+  "signal",
+] }
+# The plan §3.9 dirty-state marker: a small JSON file listing every host mutation this run made, so
+# a NEXT launch (or `boatramp tunnel --cleanup`) can detect and revert a crashed run's leftovers.
+# Already a workspace dependency (used throughout `boatramp` itself); `optional = true` here purely
+# to keep it out of the lean (no-`tun`) graph.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [lints]
 workspace = true

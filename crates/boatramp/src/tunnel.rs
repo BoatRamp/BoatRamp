@@ -1,13 +1,14 @@
-//! `boatramp tunnel` (overlay-service-tunneler plan, R1): the SOCKS5 (+ optional HTTP `CONNECT`)
-//! front-end over the shared [`boatramp_overlay_tunnel`] core.
+//! `boatramp tunnel` (overlay-service-tunneler plan, R1 SOCKS + R2 Linux TUN): the SOCKS5 (+
+//! optional HTTP `CONNECT`) front-end, and (behind the crate's `tun` cargo feature) the full TUN
+//! virtual-interface front-end, both over the shared [`boatramp_overlay_tunnel`] core.
 //!
 //! This module is CLI glue only — plan §1.1's key layout consequence ("the SDK does no HTTP") holds
 //! all the way up here too: [`HttpControlPlane`] is the ONE place in this binary that turns an
 //! overlay service name into an HTTP round trip against the control plane, implementing
 //! [`boatramp_overlay_tunnel::ControlPlane`] over [`crate::client::connect`] exactly the way
 //! `forward.rs`'s `resolve_via_control_plane` does for a single dial. Everything past that boundary
-//! — catalog, cap lifecycle, the `OverlayClient` pool, the SOCKS wire protocol — lives in the core
-//! crate and is reused unchanged.
+//! — catalog, cap lifecycle, the `OverlayClient` pool, the SOCKS wire protocol, the TUN device/DNS/
+//! netstack/teardown — lives in the core crate and is reused unchanged.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,10 +37,26 @@ pub struct TunnelArgs {
     /// only on a single-user host where that is an acceptable tradeoff.
     #[arg(long)]
     pub no_local_auth: bool,
-    /// Start the TUN virtual-interface front-end instead of/alongside SOCKS (plan §3). NOT
-    /// implemented in this release — see the error this prints for why and what ships instead.
+    /// Start the TUN virtual-interface front-end instead of SOCKS (plan §3; Linux only — needs
+    /// the crate's `tun` cargo feature, and `CAP_NET_ADMIN`/root to open the device).
     #[arg(long)]
     pub tun: bool,
+    /// The synthetic CIDR routed into the TUN device (plan §3.2). Only meaningful with `--tun`.
+    #[arg(long, default_value = "100.64.0.0/10")]
+    pub cidr: String,
+    /// The embedded DNS zone's TLD (plan §3.3/§9 open decision 1 — operator-configurable,
+    /// default `internal`, RFC 8375). Only meaningful with `--tun`.
+    #[arg(long, default_value = "internal")]
+    pub dns_zone: String,
+    /// The embedded DNS zone's `<cluster>` label (plan §3.3). Defaults to `[publish].project`
+    /// from the project config, falling back to `default` if that is unset too. Only meaningful
+    /// with `--tun`.
+    #[arg(long)]
+    pub cluster: Option<String>,
+    /// Detect and revert a dirty-state marker left by a crashed previous `--tun` run (plan §3.9),
+    /// then exit — does not start any front-end. Safe to run even with no marker present.
+    #[arg(long)]
+    pub cleanup: bool,
     /// Cap on concurrent accepted connections, SOCKS + HTTP CONNECT combined (Security MEDIUM-3 —
     /// bounds a local attacker opening connections faster than they're served).
     #[arg(long, default_value_t = boatramp_overlay_tunnel::DEFAULT_MAX_CONNECTIONS)]
@@ -100,17 +117,24 @@ pub enum TunnelCmdError {
     /// Any other control-plane failure surfaced through the core's `ControlPlaneError::Other`.
     #[error("overlay control plane: {0}")]
     ControlPlane(String),
-    /// The requested TUN front-end is not implemented in this release.
+    /// `--tun` was requested but this binary wasn't built with the crate's `tun` cargo feature.
     #[error(
-        "--tun is not implemented in this release (R1 ships the shared core + SOCKS5 front-end \
-         only; TUN is plan §3/§8's R2). Use `boatramp tunnel --socks` instead."
+        "--tun needs this binary built with the `tun` cargo feature (plan §3/§8's R2, Linux \
+         only) — rebuild with `--features tun` (on top of `overlay`), or use `boatramp tunnel \
+         --socks` instead."
     )]
     #[cfg(not(feature = "tun"))]
     TunNotBuilt,
-    /// The `tun` cargo feature IS compiled in, but its implementation is still the R1 stub.
     #[error(transparent)]
     #[cfg(feature = "tun")]
-    Tun(#[from] boatramp_overlay_tunnel::tun::TunError),
+    Tun(#[from] boatramp_overlay_tunnel::TunError),
+    /// `--cidr` is only meaningful (and only parsed) with `--tun`.
+    #[cfg(feature = "tun")]
+    #[error("bad --cidr `{0}`: {1}")]
+    Cidr(
+        String,
+        #[source] boatramp_overlay_tunnel::tun::cidr::CidrError,
+    ),
 }
 
 /// Translate a [`ControlPlaneError`] into the CLI's own actionable variant — the HTTP-agnostic core
@@ -266,6 +290,77 @@ fn local_auth_path() -> Result<PathBuf, TunnelCmdError> {
     Ok(crate::overlay::config_dir()?.join("tunnel-socks.auth"))
 }
 
+/// The TUN front-end's plan §3.9 dirty-state marker path:
+/// `$XDG_CONFIG_HOME/boatramp/tunnel-tun.marker`, else `~/.config/boatramp/tunnel-tun.marker` —
+/// same established CLI config dir as the SOCKS local-auth file and the operator identity key.
+#[cfg(feature = "tun")]
+fn tun_marker_path() -> Result<PathBuf, TunnelCmdError> {
+    Ok(crate::overlay::config_dir()?.join("tunnel-tun.marker"))
+}
+
+/// `[publish].project` from the project config, falling back to `default` — the plan §3.3
+/// `<cluster>` DNS-zone label's default source, absent an explicit `--cluster`.
+#[cfg(feature = "tun")]
+fn resolve_cluster(explicit: Option<String>, config: &crate::config::ProjectConfig) -> String {
+    explicit
+        .or_else(|| config.publish.project.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// `boatramp tunnel --tun`'s own run loop (plan §3/§8 R2, Linux only): build the `ControlPlane` +
+/// `Tunnel` core exactly like the SOCKS path below, then hand it to
+/// [`boatramp_overlay_tunnel::TunFrontend::bind`]/`serve`.
+#[cfg(feature = "tun")]
+async fn run_tun(
+    args: TunnelArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<(), TunnelCmdError> {
+    use boatramp_overlay_tunnel::tun::cidr::Ipv4Cidr;
+    use boatramp_overlay_tunnel::{TunFrontend, TunOptions};
+
+    let cidr: Ipv4Cidr = args
+        .cidr
+        .parse()
+        .map_err(|e| TunnelCmdError::Cidr(args.cidr.clone(), e))?;
+    let cluster = resolve_cluster(args.cluster.clone(), config);
+    let marker_path = tun_marker_path()?;
+
+    if args.cleanup {
+        let report = boatramp_overlay_tunnel::tun::teardown::cleanup_stale(&marker_path)?;
+        if report.found_marker {
+            eprintln!(
+                "boatramp tunnel --cleanup: found a dirty-state marker — reverted_resolver={} \
+                 owner_still_running={}",
+                report.reverted_resolver, report.owner_still_running
+            );
+        } else {
+            eprintln!("boatramp tunnel --cleanup: no dirty-state marker found — nothing to do");
+        }
+        return Ok(());
+    }
+
+    let (server, http) = crate::client::connect(args.server.clone(), config)?;
+    let holder = crate::overlay::operator_identity()?;
+    let control_plane = std::sync::Arc::new(HttpControlPlane::new(server, http));
+    let tunnel = Tunnel::new(control_plane, holder).await?;
+
+    let options = TunOptions::new(cidr, args.dns_zone.clone(), cluster, marker_path);
+    eprintln!(
+        "boatramp tunnel: starting the TUN front-end over {} (zone `*.{}`) — CAP_NET_ADMIN/root \
+         required; Ctrl-C to stop",
+        options.cidr,
+        options.zone_suffix()
+    );
+    let front_end = TunFrontend::bind(tunnel, options).await?;
+    eprintln!(
+        "boatramp tunnel: TUN ready on {} ({})",
+        front_end.interface_addr(),
+        front_end.tun_name()
+    );
+    front_end.serve().await?;
+    Ok(())
+}
+
 /// Run `boatramp tunnel` until interrupted: build the `ControlPlane` from `client::connect`, load
 /// the operator's persistent overlay identity, construct the core, and start the requested
 /// front-end(s).
@@ -273,12 +368,9 @@ pub async fn run(
     args: TunnelArgs,
     config: &crate::config::ProjectConfig,
 ) -> Result<(), TunnelCmdError> {
-    if args.tun {
+    if args.tun || args.cleanup {
         #[cfg(feature = "tun")]
-        {
-            boatramp_overlay_tunnel::tun::start()?;
-            return Ok(());
-        }
+        return run_tun(args, config).await;
         #[cfg(not(feature = "tun"))]
         return Err(TunnelCmdError::TunNotBuilt);
     }

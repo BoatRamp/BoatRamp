@@ -17,11 +17,14 @@
 //! - [`socks`] — the SOCKS5 front-end (plan §2): a hand-rolled, loopback-bound SOCKS5 (+ optional
 //!   HTTP `CONNECT`) server that maps an in-band hostname to a service name and calls `open`.
 //!
-//! ## Shape (later releases)
+//! ## Shape (R2 — this release, Linux only; behind the `tun` cargo feature, default OFF)
 //!
-//! - `tun` (behind the `tun` cargo feature, default OFF) — the full TUN virtual-interface front-end
-//!   (plan §3): synthetic IPs, an embedded DNS zone, a userspace TCP/IP stack. Not implemented in
-//!   this release; see [`tun`] for the scaffold and why it is feature-isolated from day one.
+//! - [`tun`] — the full TUN virtual-interface front-end (plan §3): a synthetic-IP allocator, an
+//!   embedded non-recursive DNS zone, a `smoltcp`-based userspace TCP/IP stack bridging accepted
+//!   connections to [`core::Tunnel::open`], Linux route + split-DNS host integration, and
+//!   RAII+marker-file teardown (plan §3.9). Feature-isolated from day one (R1) so the lean SOCKS
+//!   build never links any of this crate's (much heavier) `tun`-only dependency set. macOS (R3) and
+//!   Windows (R4) are later increments — see [`tun`]'s module doc for the per-OS seam.
 //!
 //! ## Dependency posture
 //!
@@ -33,51 +36,13 @@
 
 pub mod core;
 pub mod socks;
+#[cfg(feature = "tun")]
+pub mod tun;
 
 // Ergonomic re-exports of each module's main types, so a consumer (the `boatramp` CLI) can write
 // `boatramp_overlay_tunnel::Tunnel` instead of `boatramp_overlay_tunnel::core::Tunnel`. The
 // `core`/`socks`/`tun` module names themselves still match the plan's module layout (§4).
 pub use core::{ControlPlane, ControlPlaneError, DialGrant, ServiceInfo, Tunnel, TunnelError};
 pub use socks::{DEFAULT_MAX_CONNECTIONS, LocalAuth, LocalAuthError, SocksError, SocksServer};
-
-/// The TUN virtual-interface front-end (plan §3) — a **feature-gated scaffold only** in this
-/// release.
-///
-/// R1 ships the shared core + SOCKS5 front-end only (plan §8). This module exists so release R2 can
-/// land the TUN device/embedded-DNS/synthetic-IP-allocator/userspace-TCP-IP-stack implementation
-/// (and its much heavier dependency set — `tun`, `smoltcp`, `hickory-*`, `net-route`) behind the
-/// SAME `tun` cargo feature from day one, without ever having touched the lean, ring-free SOCKS
-/// build: the feature is `default = []` (off) on this crate, so the dependency isolation this module
-/// reserves is real today, not aspirational.
 #[cfg(feature = "tun")]
-pub mod tun {
-    /// Always returned in this release — see the module doc. R2 replaces this with the real
-    /// device/DNS/synthetic-IP/netstack wiring (plan §3).
-    #[derive(Debug, thiserror::Error)]
-    pub enum TunError {
-        #[error(
-            "the TUN front-end is not implemented in this release (R1 ships the shared core + \
-             SOCKS5 front-end only); it is a later increment — see \
-             plans/overlay-service-tunneler.md §3/§8 (R2)"
-        )]
-        NotImplemented,
-    }
-
-    /// Always fails in this release. Present (rather than omitted) so `--features tun` already
-    /// exercises the real call path a later release fills in, instead of a dangling cargo feature
-    /// with nothing behind it.
-    pub fn start() -> Result<(), TunError> {
-        Err(TunError::NotImplemented)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn the_tun_stub_always_reports_not_implemented() {
-            assert!(matches!(
-                super::start(),
-                Err(super::TunError::NotImplemented)
-            ));
-        }
-    }
-}
+pub use tun::{TunError, TunFrontend, TunOptions};
