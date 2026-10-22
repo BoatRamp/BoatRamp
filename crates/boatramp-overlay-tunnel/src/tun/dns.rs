@@ -26,6 +26,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::Semaphore;
 
 use super::alloc::{PoolExhausted, SyntheticIpAllocator};
 
@@ -221,6 +222,14 @@ pub enum DnsServerError {
 /// (`socks::server::HANDSHAKE_TIMEOUT`). DNS-over-TCP is a short, bounded exchange by nature.
 const TCP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Cap on concurrent in-flight DNS-over-TCP connections (Security review LOW — mirrors the SOCKS
+/// front-end's own connection cap, `socks::DEFAULT_MAX_CONNECTIONS`/Security MEDIUM-3 there):
+/// bounds a peer opening TCP DNS connections faster than they're served from spawning an unbounded
+/// number of tasks / exhausting file descriptors. DNS-over-TCP is a rare, short-lived path in
+/// practice (most queries are UDP, which never spawns a per-datagram task to begin with); this is
+/// deliberately generous rather than tightly tuned.
+const MAX_TCP_CONNECTIONS: usize = 256;
+
 impl DnsServer {
     /// Bind UDP + TCP on `addr` (plan default `127.0.0.1:5353`).
     pub async fn bind(
@@ -317,12 +326,21 @@ async fn serve_tcp(
     allocator: Arc<SyntheticIpAllocator>,
     tunnel: Arc<crate::core::Tunnel>,
 ) -> Result<(), DnsServerError> {
+    // Acquired BEFORE spawning (same reasoning as `socks::server::accept_loop`): a saturated cap
+    // backpressures the accept loop itself, rather than piling up unbounded spawned tasks each
+    // waiting on a permit.
+    let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
         let (stream, peer) = listener.accept().await.map_err(DnsServerError::Accept)?;
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("the DNS TCP connection semaphore is never closed");
         let zone = zone.clone();
         let allocator = Arc::clone(&allocator);
         let tunnel = Arc::clone(&tunnel);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = tokio::time::timeout(
                 TCP_EXCHANGE_TIMEOUT,
                 handle_tcp(stream, &zone, &allocator, &tunnel),

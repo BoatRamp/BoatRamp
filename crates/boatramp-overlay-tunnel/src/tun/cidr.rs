@@ -17,7 +17,7 @@ pub struct Ipv4Cidr {
     prefix_len: u8,
 }
 
-/// A malformed `--cidr`/`--dns-zone`-adjacent CIDR string.
+/// A malformed, or structurally unusable, `--cidr` string.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CidrError {
     #[error("`{0}` is not of the form `a.b.c.d/prefix`")]
@@ -26,6 +26,26 @@ pub enum CidrError {
     Addr(String),
     #[error("prefix length `{0}` is not in 0..=32")]
     Prefix(String),
+    /// Security review INFO: `/0` isn't just impractical, it's unrepresentable by this type's
+    /// `u32`-based [`Ipv4Cidr::size`]/[`Ipv4Cidr::hosts`] arithmetic (`2^32` overflows `u32`,
+    /// underflow-panicking `hosts()`'s `size() as u32 - 1` in a debug build) — rejected outright
+    /// rather than ever reaching that arithmetic.
+    #[error(
+        "/0 has no usable host range this allocator can represent — pick a narrower prefix (the \
+         default is /10)"
+    )]
+    ZeroPrefixUnsupported,
+    /// Security review INFO: fewer than 2 usable host addresses means the TUN interface's own
+    /// reserved address ([`super::alloc::SyntheticIpAllocator::reserve_interface_address`]) and the
+    /// allocator's first allocation ([`super::alloc::SyntheticIpAllocator::allocate`]) COLLIDE on
+    /// the same address (both fall back to [`Ipv4Cidr::network`] when [`Ipv4Cidr::hosts`] is
+    /// empty) — rejected outright at parse time rather than silently colliding at runtime.
+    #[error(
+        "/{0} leaves fewer than 2 usable host addresses (one is needed for the TUN interface \
+         itself, at least one more to allocate to a service) — use /30 or wider, e.g. the default \
+         /10"
+    )]
+    TooNarrow(u8),
 }
 
 impl Ipv4Cidr {
@@ -76,7 +96,12 @@ impl Ipv4Cidr {
         (u32::from(addr) & mask) == u32::from(self.network)
     }
 
-    /// Total address count in the network (`2^(32-prefix)`), capped at `u32::MAX` for `/0`.
+    /// Total address count in the network (`2^(32-prefix)`). **Only valid for `prefix_len >= 1`**
+    /// — at `/0` this is `2^32`, which does not fit in the `u64` → `u32` narrowing [`Ipv4Cidr::hosts`]
+    /// does with it (`FromStr` rejects `/0` outright — [`CidrError::ZeroPrefixUnsupported`] — for
+    /// exactly this reason; [`Ipv4Cidr::new`] itself is NOT validated, so a direct, unvalidated
+    /// `/0` construction followed by a `hosts()` call would still hit the stale arithmetic this
+    /// comment used to (wrongly) call "capped").
     #[must_use]
     pub fn size(&self) -> u64 {
         1u64 << (32 - u32::from(self.prefix_len))
@@ -84,7 +109,8 @@ impl Ipv4Cidr {
 
     /// The usable host range, excluding the network address itself and (for anything narrower than
     /// `/31`) the broadcast address — the range the synthetic-IP allocator draws from. A `/31` or
-    /// `/32` (degenerate, never a real `--cidr` value) yields an empty range rather than panicking.
+    /// `/32` (rejected by `FromStr` — [`CidrError::TooNarrow`] — but still reachable via the
+    /// unvalidated [`Ipv4Cidr::new`]) yields an empty range rather than panicking.
     pub fn hosts(&self) -> impl Iterator<Item = Ipv4Addr> + use<> {
         let start = u32::from(self.network).saturating_add(1);
         let end = if self.prefix_len >= 31 {
@@ -99,6 +125,9 @@ impl Ipv4Cidr {
 impl FromStr for Ipv4Cidr {
     type Err = CidrError;
 
+    /// The validated entry point for untrusted input (`--cidr`, plan §3.2) — [`Ipv4Cidr::new`]
+    /// itself stays a plain, unvalidated constructor for internal callers that already know their
+    /// prefix is sane (this crate's own `default_cidr`/tests, both fixed literals).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (addr_part, prefix_part) = s
             .split_once('/')
@@ -111,6 +140,12 @@ impl FromStr for Ipv4Cidr {
             .map_err(|_| CidrError::Prefix(prefix_part.to_string()))?;
         if prefix_len > 32 {
             return Err(CidrError::Prefix(prefix_part.to_string()));
+        }
+        if prefix_len == 0 {
+            return Err(CidrError::ZeroPrefixUnsupported);
+        }
+        if prefix_len > 30 {
+            return Err(CidrError::TooNarrow(prefix_len));
         }
         Ok(Self::new(address, prefix_len))
     }
@@ -171,5 +206,31 @@ mod tests {
         assert!("100.64.0.0/99".parse::<Ipv4Cidr>().is_err());
         assert!("100.64.0.0".parse::<Ipv4Cidr>().is_err());
         assert!("256.0.0.0/8".parse::<Ipv4Cidr>().is_err());
+    }
+
+    /// Security review INFO: `/0` is rejected outright (it would otherwise panic — or, in release,
+    /// silently wrap — inside `hosts()`'s `size() as u32 - 1`), never reaching that arithmetic.
+    #[test]
+    fn rejects_slash_0() {
+        let err = "100.64.0.0/0".parse::<Ipv4Cidr>().unwrap_err();
+        assert!(matches!(err, CidrError::ZeroPrefixUnsupported));
+    }
+
+    /// Security review INFO: `/31` and `/32` leave fewer than 2 usable hosts — the TUN interface's
+    /// own reserved address and the allocator's first allocation would otherwise collide (both fall
+    /// back to the network address when `hosts()` is empty). `/30` (exactly 2 usable hosts) is the
+    /// narrowest value that must still be ACCEPTED.
+    #[test]
+    fn rejects_slash_31_and_slash_32_but_accepts_the_slash_30_boundary() {
+        assert!(matches!(
+            "100.64.0.0/31".parse::<Ipv4Cidr>().unwrap_err(),
+            CidrError::TooNarrow(31)
+        ));
+        assert!(matches!(
+            "100.64.0.0/32".parse::<Ipv4Cidr>().unwrap_err(),
+            CidrError::TooNarrow(32)
+        ));
+        let c: Ipv4Cidr = "100.64.0.0/30".parse().unwrap();
+        assert_eq!(c.hosts().count(), 2, "/30 must still be accepted");
     }
 }

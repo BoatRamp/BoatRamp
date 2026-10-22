@@ -122,9 +122,11 @@ impl TunFrontend {
     /// (plan §3.9), then opens the TUN device + installs its route (plan §3.1/§3.2), applies the
     /// host resolver override (plan §3.6), starts the embedded DNS (plan §3.3) and the netstack
     /// (plan §3.5) bridged to the real device, and finally drops privileges where feasible (plan
-    /// §3.7). Every step that can fail leaves nothing dangling: an error partway through this
-    /// function drops whatever WAS already constructed (its `Drop` impls revert it) before
-    /// returning.
+    /// §3.7). Every step that can fail leaves nothing dangling: an error early on just drops
+    /// whatever WAS already constructed (its `Drop` impls revert it) before returning; a privilege-
+    /// drop FAILURE specifically (Security review MEDIUM-3) is fatal AFTER the rest is already
+    /// running, so that path explicitly calls [`TunFrontend::shutdown`] on the fully-built front-end
+    /// before returning the error, rather than relying on `Drop` alone.
     pub async fn bind(tunnel: Arc<Tunnel>, options: TunOptions) -> Result<Self, TunError> {
         match teardown::cleanup_stale(&options.marker_path) {
             Ok(report) if report.found_marker => {
@@ -206,13 +208,7 @@ impl TunFrontend {
         ));
         pump_handles.shrink_to_fit();
 
-        // 5. Privilege drop where feasible (plan §3.7) — last, now that every privileged
-        // operation (opening the TUN device, installing the route) is already done.
-        if let Err(err) = super::privilege::drop_to_unprivileged() {
-            tracing::warn!(error = %err, "boatramp tunnel: privilege drop failed — continuing as-is");
-        }
-
-        Ok(Self {
+        let front_end = Self {
             device,
             interface_addr,
             dns_handle,
@@ -221,7 +217,33 @@ impl TunFrontend {
             pump_handles,
             resolver_guard,
             marker_path: options.marker_path,
-        })
+        };
+
+        // 5. Privilege drop where feasible (plan §3.7) — last, now that every privileged
+        // operation (opening the TUN device, installing the route) is already done.
+        //
+        // Security review MEDIUM-3: a drop FAILURE is FATAL, not a warn-and-continue — this
+        // process must never end up serving the untrusted packet-parsing netstack and the
+        // untrusted-query DNS responder (both already running, above) as root because a
+        // privilege drop silently didn't happen. Fail CLOSED: revert everything `bind()` already
+        // built (the exact same sequence `shutdown()` takes) and return the error.
+        if let Err(err) = super::privilege::drop_to_unprivileged() {
+            tracing::error!(
+                error = %err,
+                "boatramp tunnel: privilege drop FAILED — refusing to start (this would otherwise \
+                 serve the untrusted packet/DNS parsing surface as root); reverting everything \
+                 set up so far"
+            );
+            if let Err(shutdown_err) = front_end.shutdown().await {
+                tracing::warn!(
+                    error = %shutdown_err,
+                    "boatramp tunnel: cleanup after a failed privilege drop hit its own error"
+                );
+            }
+            return Err(TunError::Privilege(err));
+        }
+
+        Ok(front_end)
     }
 
     /// The TUN device's interface name (e.g. `tun0`).

@@ -338,7 +338,16 @@ fn service_connections(
     for (&handle, conn) in conns.iter_mut() {
         let socket = sockets.get_mut::<tcp::Socket>(handle);
 
-        if !conn.bridge_started && socket.is_active() {
+        // Security review MEDIUM-4 (the cheap half): gate on `State::Established` — the handshake
+        // FULLY complete — not `is_active()`, which is already true in `SynReceived` (right after
+        // this process's own SYN-ACK, before the peer's final ACK ever arrives). A bare SYN with
+        // no completing ACK must drive NO dial: `is_active()` would have started the bridge (and
+        // so the overlay dial) on the SYN alone, letting a peer that never finishes a single
+        // handshake still trigger a mint per spoofed/incomplete attempt. The full idle/half-open
+        // socket reaper (a `SynReceived` connection that never completes at all, tying up a slot
+        // until `smoltcp`'s own retransmit timeout gives up) is deferred to R5 — this gate alone
+        // only narrows WHEN the dial fires, not how long an incomplete attempt occupies a slot.
+        if !conn.bridge_started && socket.state() == tcp::State::Established {
             conn.bridge_started = true;
             listening.remove(&conn.dst);
             let to_app_rx = conn
@@ -705,6 +714,92 @@ mod tests {
             frame[ihl + 6],
             frame[ihl + 7],
         ])
+    }
+
+    /// Security review MEDIUM-4 (the cheap half), directly: a bare `SYN` with no completing `ACK`
+    /// must drive NO dial at all — only once the handshake actually reaches `Established` does
+    /// the bridge (and so the overlay dial) start. Before this fix, `is_active()` already covered
+    /// `SynReceived` (right after this process's own `SYN-ACK`, before the peer's final `ACK` ever
+    /// arrives), so a `SYN` alone would have triggered a mint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bare_syn_drives_no_dial_but_a_completed_handshake_does() {
+        let backend: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cp = Arc::new(MockControlPlane::new(vec![entry_at(
+            "svc/db", backend, true,
+        )]));
+        let holder = OverlaySecret::generate().unwrap();
+        let tunnel = Tunnel::new(
+            Arc::clone(&cp) as Arc<dyn crate::core::ControlPlane>,
+            holder,
+        )
+        .await
+        .unwrap();
+
+        let config = test_config();
+        let allocator = Arc::new(SyntheticIpAllocator::new(config.cidr));
+        let dst_addr = allocator.allocate("svc/db").unwrap();
+
+        let (raw_in_tx, raw_in_rx) = mpsc::channel(16);
+        let (raw_out_tx, mut raw_out_rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run(
+            config,
+            raw_in_rx,
+            raw_out_tx,
+            Arc::clone(&tunnel),
+            Arc::clone(&allocator),
+            shutdown_rx,
+        ));
+
+        let client = (Ipv4Addr::new(10, 1, 1, 1), 51000);
+        let dst = (dst_addr, 5432);
+
+        // The bare SYN — no completing ACK follows yet.
+        raw_in_tx
+            .send(build_frame(client, dst, 0x02, 2000, 0, &[]))
+            .await
+            .unwrap();
+        let syn_ack = tokio::time::timeout(Duration::from_secs(5), raw_out_rx.recv())
+            .await
+            .expect("a SYN-ACK must be produced")
+            .expect("raw_out must not have closed");
+        assert!(peek_tcp(&syn_ack).unwrap().ack);
+
+        // Give the (would-be) bridge task every chance to have started and dialed — then assert
+        // it did NOT. A short, bounded wait rather than a fixed sleep: there is nothing to poll
+        // FOR here (the assertion is an absence), so this is deliberately generous (500ms).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            cp.mint_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a bare SYN (SynReceived, not yet Established) must never drive an overlay dial"
+        );
+
+        // NOW complete the handshake — this is the one thing that must flip the gate.
+        raw_in_tx
+            .send(build_frame(
+                client,
+                dst,
+                0x10,
+                2001,
+                info_seq(&syn_ack) + 1,
+                &[],
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if cp.mint_calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a COMPLETED handshake must drive the overlay dial");
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Plan §5: a SYN to an address this process never allocated must drive NO dial at all — the

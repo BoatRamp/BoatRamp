@@ -14,7 +14,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Which mechanism [`ResolverGuard::apply`] used — persisted in the plan §3.9 marker so a FRESH
@@ -25,12 +25,20 @@ pub enum Method {
     /// genuinely scoped to the zone suffix, nothing else on the host is touched.
     Resolvectl,
     /// A managed, marker-delimited stanza appended to `/etc/resolv.conf` — the fallback when
-    /// systemd-resolved is unavailable. **Caveat, documented rather than hidden:** classic
-    /// `/etc/resolv.conf` has no per-domain scoping, so this fallback adds `127.0.0.1` as A
-    /// nameserver for the WHOLE host, not just the zone — acceptable only because the embedded
-    /// responder itself still REFUSES (never answers, never recurses) anything outside the zone
-    /// (plan §3.3/§5), so no query is ever wrongly answered, but other resolvers on the same host do get
-    /// one extra (first-tried) nameserver in their list for the front-end's lifetime.
+    /// systemd-resolved is unavailable. **Caveats, documented rather than hidden:**
+    /// - Classic `/etc/resolv.conf` has no per-domain scoping, so this fallback adds `127.0.0.1` as
+    ///   a nameserver for the WHOLE host, not just the zone — acceptable only because the embedded
+    ///   responder itself still REFUSES (never answers, never recurses) anything outside the zone
+    ///   (plan §3.3/§5), so no query is ever wrongly answered.
+    /// - This stanza is APPENDED — i.e. added LAST, not first-tried: glibc's resolver tries
+    ///   `nameserver` lines in the ORDER they appear, so an existing nameserver is still consulted
+    ///   first for every query (this zone's own names included, until that first nameserver times
+    ///   out or refuses — which it will, since it has never heard of them).
+    /// - glibc additionally caps resolv.conf at `MAXNS = 3` nameserver lines — if the file already
+    ///   has 3 (or more), this appended line is SILENTLY IGNORED by glibc's resolver (though a
+    ///   `getaddrinfo` caller linked against a different resolver, e.g. systemd's own, may behave
+    ///   differently). Not solvable by this fallback itself (no per-domain scoping to fall back to
+    ///   further); `resolvectl` (this enum's other variant) doesn't share either caveat.
     ResolvConfStanza,
 }
 
@@ -83,15 +91,45 @@ fn revert_resolvectl(tun_name: &str) {
     }
 }
 
-/// Fallback (plan §3.6): append a marker-delimited stanza pointing the WHOLE host at the embedded
-/// responder (see [`Method::ResolvConfStanza`]'s doc for the caveat). Idempotent: if a stanza from
-/// an earlier, uncleanly-terminated run is already present, it is removed first so this never
-/// nests/duplicates.
-fn append_resolv_conf_stanza(dns_addr: SocketAddr) -> io::Result<()> {
-    remove_resolv_conf_stanza()?; // idempotent — see above
-    let path = resolv_conf_path();
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut new_contents = existing;
+/// Resolve `/etc/resolv.conf` (or whatever `path` is) to the REAL file a write should land on —
+/// following any symlink. This matters because `/etc/resolv.conf` is ubiquitously a symlink in
+/// practice (systemd-resolved → `/run/systemd/resolve/stub-resolv.conf`, NetworkManager →
+/// `/run/NetworkManager/resolv.conf`, `resolvconf` → `/run/resolvconf/resolv.conf`, …): Security
+/// review LOW — writing straight through `path` with a non-atomic `std::fs::write` would (a) risk
+/// a reader observing a partially-written file (no atomicity), and worse, (b) if ever done via a
+/// rename-based replace WITHOUT resolving first, would replace the SYMLINK ITSELF with a plain
+/// file, breaking whatever system owns it. Falls back to `path` unchanged if it doesn't exist (or
+/// is a broken symlink) — the same permissive "no resolv.conf yet" posture this module has always
+/// taken for a first-ever write.
+fn resolve_target(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Replace `target`'s contents atomically: write a sibling temp file in the SAME directory (so the
+/// rename below is a same-filesystem, atomic rename — no partial-write window, and no TOCTOU
+/// between resolving a symlink via [`resolve_target`] and writing through it), then rename it over
+/// `target`. `target` should already be the RESOLVED path (the symlink's target, not the symlink
+/// itself) — renaming onto the symlink path directly would replace the symlink with a plain file.
+fn write_atomically(target: &Path, contents: &str) -> io::Result<()> {
+    let dir = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", target.display()),
+        )
+    })?;
+    let tmp_path = dir.join(format!(
+        ".resolv.conf.boatramp-tunnel.{}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, contents)?;
+    std::fs::rename(&tmp_path, target)
+}
+
+/// Pure: the new file content with the stanza present, pointing at `dns_addr` — idempotent by
+/// construction (always rebuilt from [`strip_stanza_from`]'s output, so appending onto an already-
+/// stanza'd file never nests/duplicates). No I/O — directly unit-tested below.
+fn add_stanza_to(contents: &str, dns_addr: SocketAddr) -> String {
+    let mut new_contents = strip_stanza_from(contents);
     if !new_contents.is_empty() && !new_contents.ends_with('\n') {
         new_contents.push('\n');
     }
@@ -100,20 +138,15 @@ fn append_resolv_conf_stanza(dns_addr: SocketAddr) -> io::Result<()> {
     new_contents.push_str(&format!("nameserver {}\n", dns_addr.ip()));
     new_contents.push_str(STANZA_END);
     new_contents.push('\n');
-    std::fs::write(&path, new_contents)
+    new_contents
 }
 
-/// Strip a previously-appended stanza (identified by its begin/end markers) back out of
-/// `/etc/resolv.conf`. A no-op (not an error) if no stanza is present — this is called
-/// unconditionally on EVERY revert path, including a fresh-process [`cleanup_stale`] where the
-/// stanza may or may not actually be there.
-fn remove_resolv_conf_stanza() -> io::Result<()> {
-    let path = resolv_conf_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Ok(()); // no resolv.conf at all — nothing to strip
-    };
+/// Pure: `contents` with any previously-appended stanza (identified by its begin/end markers)
+/// stripped back out — a no-op (returns `contents` unchanged) if no stanza is present. No I/O —
+/// directly unit-tested below.
+fn strip_stanza_from(contents: &str) -> String {
     if !contents.contains(STANZA_BEGIN) {
-        return Ok(());
+        return contents.to_string();
     }
     let mut out = String::with_capacity(contents.len());
     let mut inside = false;
@@ -132,7 +165,34 @@ fn remove_resolv_conf_stanza() -> io::Result<()> {
         out.push_str(line);
         out.push('\n');
     }
-    std::fs::write(&path, out)
+    out
+}
+
+/// Fallback (plan §3.6): append a marker-delimited stanza pointing the WHOLE host at the embedded
+/// responder (see [`Method::ResolvConfStanza`]'s doc for the caveats). Idempotent via
+/// [`add_stanza_to`]. Writes through [`resolve_target`]/[`write_atomically`] so a symlinked
+/// `/etc/resolv.conf` (the common case) is followed, not replaced.
+fn append_resolv_conf_stanza(dns_addr: SocketAddr) -> io::Result<()> {
+    let path = resolv_conf_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let new_contents = add_stanza_to(&existing, dns_addr);
+    write_atomically(&resolve_target(&path), &new_contents)
+}
+
+/// Strip a previously-appended stanza back out of `/etc/resolv.conf` (via [`strip_stanza_from`]).
+/// A no-op (not an error) if no stanza is present — this is called unconditionally on EVERY revert
+/// path, including a fresh-process [`cleanup_stale`] where the stanza may or may not actually be
+/// there. Writes through [`resolve_target`]/[`write_atomically`], same as the append path.
+fn remove_resolv_conf_stanza() -> io::Result<()> {
+    let path = resolv_conf_path();
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Ok(()); // no resolv.conf at all — nothing to strip
+    };
+    if !contents.contains(STANZA_BEGIN) {
+        return Ok(());
+    }
+    let stripped = strip_stanza_from(&contents);
+    write_atomically(&resolve_target(&path), &stripped)
 }
 
 /// A failure applying the host resolver override.
@@ -212,65 +272,22 @@ pub fn revert_by_method(method: Method, tun_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    /// Exercises the stanza add/remove pair directly against a throwaway file (NOT the real
-    /// `/etc/resolv.conf` — `resolv_conf_path` is not parameterized for production code's sake, so
-    /// this test duplicates the exact append/strip logic against a temp path instead of calling the
-    /// real functions, which would require root and would mutate this host's actual DNS config).
-    fn append_stanza_at(path: &Path, dns_addr: SocketAddr) -> io::Result<()> {
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let mut new_contents = existing;
-        if !new_contents.is_empty() && !new_contents.ends_with('\n') {
-            new_contents.push('\n');
-        }
-        new_contents.push_str(STANZA_BEGIN);
-        new_contents.push('\n');
-        new_contents.push_str(&format!("nameserver {}\n", dns_addr.ip()));
-        new_contents.push_str(STANZA_END);
-        new_contents.push('\n');
-        std::fs::write(path, new_contents)
-    }
-
-    fn remove_stanza_at(path: &Path) -> io::Result<()> {
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            return Ok(());
-        };
-        if !contents.contains(STANZA_BEGIN) {
-            return Ok(());
-        }
-        let mut out = String::new();
-        let mut inside = false;
-        for line in contents.lines() {
-            if line == STANZA_BEGIN {
-                inside = true;
-                continue;
-            }
-            if line == STANZA_END {
-                inside = false;
-                continue;
-            }
-            if inside {
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        std::fs::write(path, out)
-    }
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("br-tunnel-resolv-{tag}-{}", std::process::id()))
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("br-tunnel-resolv-dir-{tag}-{}", std::process::id()))
+    }
+
+    // --- `add_stanza_to`/`strip_stanza_from`: pure, no I/O (Security review LOW fix — these now
+    // ARE the real production functions, not a duplicated stand-in; see their own doc comments). ---
+
     #[test]
     fn appending_then_removing_the_stanza_restores_the_original_content() {
-        let path = temp_path("roundtrip");
         let original = "nameserver 8.8.8.8\nsearch example.com\n";
-        std::fs::write(&path, original).unwrap();
-
-        append_stanza_at(&path, "127.0.0.1:5353".parse().unwrap()).unwrap();
-        let with_stanza = std::fs::read_to_string(&path).unwrap();
+        let with_stanza = add_stanza_to(original, "127.0.0.1:5353".parse().unwrap());
         assert!(with_stanza.contains(STANZA_BEGIN));
         assert!(with_stanza.contains("nameserver 127.0.0.1"));
         assert!(
@@ -278,39 +295,91 @@ mod tests {
             "original content must be kept"
         );
 
-        remove_stanza_at(&path).unwrap();
-        let restored = std::fs::read_to_string(&path).unwrap();
+        let restored = strip_stanza_from(&with_stanza);
         assert_eq!(restored, original);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn appending_twice_does_not_nest_or_duplicate() {
-        let path = temp_path("idempotent");
-        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
-
-        append_stanza_at(&path, "127.0.0.1:5353".parse().unwrap()).unwrap();
-        remove_stanza_at(&path).unwrap(); // mirrors `append_resolv_conf_stanza`'s own idempotency
-        append_stanza_at(&path, "127.0.0.1:5353".parse().unwrap()).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.matches(STANZA_BEGIN).count(), 1);
-        assert_eq!(contents.matches(STANZA_END).count(), 1);
-
-        let _ = std::fs::remove_file(&path);
+        let dns_addr: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+        let once = add_stanza_to("nameserver 8.8.8.8\n", dns_addr);
+        let twice = add_stanza_to(&once, dns_addr);
+        assert_eq!(twice.matches(STANZA_BEGIN).count(), 1);
+        assert_eq!(twice.matches(STANZA_END).count(), 1);
+        // Idempotent in the stronger sense too: appending twice produces the SAME content as
+        // appending once (not just "no duplicate marker").
+        assert_eq!(once, twice);
     }
 
     #[test]
     fn removing_when_no_stanza_is_present_is_a_harmless_no_op() {
-        let path = temp_path("absent");
-        std::fs::write(&path, "nameserver 8.8.8.8\n").unwrap();
-        remove_stanza_at(&path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "nameserver 8.8.8.8\n"
-        );
+        let input = "nameserver 8.8.8.8\n";
+        assert_eq!(strip_stanza_from(input), input);
+    }
+
+    // --- `resolve_target`/`write_atomically`: real filesystem I/O against temp paths (never the
+    // real `/etc/resolv.conf`), proving the Security review LOW fix (symlink-followed, atomic). ---
+
+    #[test]
+    fn resolve_target_falls_back_to_the_plain_path_when_nothing_exists_yet() {
+        let path = temp_path("resolve-missing");
         let _ = std::fs::remove_file(&path);
+        assert_eq!(resolve_target(&path), path);
+    }
+
+    #[test]
+    fn write_atomically_writes_a_plain_non_symlink_path_in_place() {
+        let path = temp_path("write-plain");
+        let _ = std::fs::remove_file(&path);
+        write_atomically(&path, "hello\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        // No leftover temp file next to it.
+        let dir = path.parent().unwrap();
+        let stray = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name().to_string_lossy().contains("boatramp-tunnel") && e.path() != path
+            });
+        assert!(!stray, "no stray temp file should be left behind");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Security review LOW, directly: a symlinked `/etc/resolv.conf` (the common case — systemd-
+    /// resolved/NetworkManager/resolvconf all manage it that way) must have the REAL target file
+    /// updated, with the symlink itself left completely alone (never replaced by a plain file).
+    #[test]
+    fn write_through_a_symlink_updates_the_target_and_preserves_the_symlink() {
+        let dir = temp_dir("symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let real_file = dir.join("real-resolv.conf");
+        std::fs::write(&real_file, "placeholder\n").unwrap();
+        let link_path = dir.join("resolv.conf"); // stands in for `/etc/resolv.conf`
+        std::os::unix::fs::symlink(&real_file, &link_path).unwrap();
+
+        let target = resolve_target(&link_path);
+        assert_eq!(target, real_file.canonicalize().unwrap());
+
+        let new_contents = add_stanza_to(
+            &std::fs::read_to_string(&link_path).unwrap(),
+            "127.0.0.1:5353".parse().unwrap(),
+        );
+        write_atomically(&target, &new_contents).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must survive — never replaced by a plain file"
+        );
+        let real_contents = std::fs::read_to_string(&real_file).unwrap();
+        assert!(real_contents.contains(STANZA_BEGIN));
+        assert!(real_contents.contains("placeholder"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `resolvectl`/`resolv.conf` interaction needs root + a real link, so this only proves the
