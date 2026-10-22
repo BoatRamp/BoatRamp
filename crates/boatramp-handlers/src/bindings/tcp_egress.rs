@@ -236,25 +236,28 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for IdleTimeout<T> 
     }
 }
 
+/// Security review LOW-1: `Drop::drop`'s best-effort `close_notify` is bounded by a SHORT, DEDICATED
+/// timeout rather than the connection's (possibly much longer) idle timeout — a `Drop` has no
+/// guest-visible error channel either way, so there is no benefit to holding the write half + fd
+/// open for a full idle window per abandoned connection; a few seconds is plenty for a cooperative
+/// peer to ack the close, and bounds the worst case for an uncooperative one.
+const CLOSE_NOTIFY_DROP_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Wraps a TLS-terminated write half so DROPPING the `output-stream` resource built from it (once
 /// `take-output` has handed it off as a separate resource) still attempts a graceful TLS
 /// `close_notify` — Build A had no path for this at all (the WIT `shutdown-output` method is only
-/// effective BEFORE `take-output` runs; see `connection`'s doc). Best-effort, bounded by the
-/// connection's idle timeout, and never surfaced as a guest-visible error (there is no error channel
-/// for a `Drop`). If the guest itself drives a `poll_shutdown` to completion (e.g. a protocol that
-/// explicitly half-closes before dropping), `inner` is already `None` by the time `Drop` runs, so
-/// this never double-sends `close_notify`.
+/// effective BEFORE `take-output` runs; see `connection`'s doc). Best-effort (bounded by
+/// [`CLOSE_NOTIFY_DROP_TIMEOUT`]) and never surfaced as a guest-visible error (there is no error
+/// channel for a `Drop`). If the guest itself drives a `poll_shutdown` to completion (e.g. a
+/// protocol that explicitly half-closes before dropping), `inner` is already `None` by the time
+/// `Drop` runs, so this never double-sends `close_notify`.
 struct CloseNotifyOnDrop {
     inner: Option<BoxedWrite>,
-    idle: Duration,
 }
 
 impl CloseNotifyOnDrop {
-    fn new(inner: BoxedWrite, idle: Duration) -> Self {
-        Self {
-            inner: Some(inner),
-            idle,
-        }
+    fn new(inner: BoxedWrite) -> Self {
+        Self { inner: Some(inner) }
     }
 }
 
@@ -307,11 +310,22 @@ impl tokio::io::AsyncWrite for CloseNotifyOnDrop {
 
 impl Drop for CloseNotifyOnDrop {
     fn drop(&mut self) {
-        if let Some(mut w) = self.inner.take() {
-            let idle = self.idle;
-            tokio::spawn(async move {
-                let _ =
-                    tokio::time::timeout(idle, tokio::io::AsyncWriteExt::shutdown(&mut w)).await;
+        let Some(w) = self.inner.take() else {
+            return;
+        };
+        // Security review LOW-1: a `Drop` can run with NO tokio runtime current (e.g. during
+        // runtime/store teardown) — `tokio::spawn` would PANIC in that case, and a panicking `Drop`
+        // can escalate to a process abort. Spawn the best-effort close only when a runtime is
+        // actually there to run it; otherwise just let `w` drop here, which closes the socket
+        // abruptly (no `close_notify`) — no worse than Build A's original behavior.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut w = w;
+            handle.spawn(async move {
+                let _ = tokio::time::timeout(
+                    CLOSE_NOTIFY_DROP_TIMEOUT,
+                    tokio::io::AsyncWriteExt::shutdown(&mut w),
+                )
+                .await;
             });
         }
     }
@@ -454,7 +468,7 @@ impl TcpEgressConnection {
         self.output.take().map(|w| {
             Box::new(wasmtime_wasi::pipe::AsyncWriteStream::new(
                 TCP_EGRESS_WRITE_BUDGET,
-                IdleTimeout::new(CloseNotifyOnDrop::new(w, idle), idle),
+                IdleTimeout::new(CloseNotifyOnDrop::new(w), idle),
             )) as DynOutputStream
         })
     }
@@ -2119,5 +2133,141 @@ mod tests {
             "expected the handshake itself to fail on the injected bytes; got {err:?}"
         );
         println!("TCP-EGRESS STARTTLS INJECTION SAFE");
+    }
+
+    /// Injection safety, STRONGER half (security review LOW-2): the test above proves the handshake
+    /// FAILS on unread injected bytes, but that alone doesn't discriminate "the host fed them to the
+    /// TLS parser" from any other reason a hollow implementation might fail for. This test proves
+    /// the actually-discriminating property: when the guest drains the injected tail itself as
+    /// ordinary PRE-upgrade plaintext (exactly the WIT doc's guidance for a careful shim — consume
+    /// through the affirmative reply before calling `start-tls`), nothing is left unread on the
+    /// wire, so a REAL handshake against a REAL rustls server completes cleanly — and the
+    /// post-upgrade read yields ONLY the genuine encrypted application data, NEVER a replay of the
+    /// already-consumed injected tail. Together with the test above (unread bytes choke the
+    /// handshake rather than being smuggled through) and this one (already-read bytes are never
+    /// replayed into the post-upgrade stream), no byte ever crosses the phase boundary in either
+    /// direction.
+    #[tokio::test]
+    async fn starttls_injected_tail_never_replayed_after_a_real_upgrade() {
+        let (ca, chain, key) = ca_and_leaf();
+        const PLAIN_PLUS_INJECTED: &[u8] = b"220 ready for tls\r\nINJECTED-COMMAND please-run\r\n";
+        const AFTER: &[u8] = b"TCP-EGRESS STARTTLS REAL APP DATA";
+        let port = spawn_plaintext_then_tls_server(chain, key, PLAIN_PLUS_INJECTED, AFTER).await;
+        let mut table = ResourceTable::new();
+        let mut host = TcpEgressHost::new(
+            &mut table,
+            true,
+            true,
+            Arc::from(vec![format!("127.0.0.1:{port}")]),
+            Arc::from(vec![ca]),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        );
+
+        let conn_res =
+            tcp_egress::Host::connect_plaintext(&mut host, "127.0.0.1".to_string(), port)
+                .await
+                .expect("plaintext dial must succeed");
+        let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .expect("plaintext input not yet taken");
+        // Drain EVERYTHING the peer sent pre-upgrade (greeting AND the "injected" tail) as ordinary
+        // plaintext — nothing is left unread on the wire.
+        let drained = read_exact_n(&mut host, &plain_in, PLAIN_PLUS_INJECTED.len()).await;
+        assert_eq!(
+            drained, PLAIN_PLUS_INJECTED,
+            "the pre-upgrade phase must deliver the full plaintext stream, injected tail included"
+        );
+
+        tcp_egress::HostConnection::start_tls(
+            &mut host,
+            reborrow(&conn_res),
+            "localhost".to_string(),
+            VerifyMode::Strict,
+        )
+        .await
+        .expect("with nothing left unread on the wire, a real handshake must succeed cleanly");
+
+        let bytes = read_stream_to_eof(&mut host, conn_res)
+            .await
+            .expect("post-upgrade read must succeed");
+        assert_eq!(
+            bytes, AFTER,
+            "the post-upgrade stream must contain ONLY the genuine encrypted app data — never a \
+             replay of the already-consumed pre-upgrade injected tail"
+        );
+    }
+
+    /// Pins that `start-tls` actually HONORS `verify-mode.strict` (promised to mailroom): a
+    /// trusted-chain cert upgrades cleanly, while a self-signed/unchained cert (the SAME shape
+    /// `start_tls_opportunistic_accepts_self_signed_cert` uses, but WITHOUT `opportunistic`) is
+    /// refused — `strict` is not silently relaxed. `connect-tls` unconditionally refusing
+    /// `opportunistic` is already covered elsewhere (`opportunistic_verify_mode_is_refused` /
+    /// `connect_tls_opportunistic_mutation_seam`); this is the `start-tls`-side complement, pinning
+    /// `strict`'s own verification behavior there.
+    #[tokio::test]
+    async fn start_tls_strict_verifies_trusted_and_refuses_untrusted() {
+        // Trusted case: the leaf chains to the CA supplied as `extra_roots`.
+        {
+            let (ca, chain, key) = ca_and_leaf();
+            const PLAIN: &[u8] = b"220 ready for tls\r\n";
+            const AFTER: &[u8] = b"TRUSTED STRICT OK";
+            let port = spawn_plaintext_then_tls_server(chain, key, PLAIN, AFTER).await;
+            let mut table = ResourceTable::new();
+            let mut host = TcpEgressHost::new(
+                &mut table,
+                true,
+                true,
+                Arc::from(vec![format!("127.0.0.1:{port}")]),
+                Arc::from(vec![ca]),
+                Duration::from_secs(5),
+                Duration::from_millis(500),
+            );
+            let conn_res =
+                tcp_egress::Host::connect_plaintext(&mut host, "127.0.0.1".to_string(), port)
+                    .await
+                    .expect("plaintext dial must succeed");
+            let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+                .expect("plaintext input not yet taken");
+            let _ = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
+            tcp_egress::HostConnection::start_tls(
+                &mut host,
+                reborrow(&conn_res),
+                "localhost".to_string(),
+                VerifyMode::Strict,
+            )
+            .await
+            .expect("strict start-tls must succeed against a trusted-chain certificate");
+            let bytes = read_stream_to_eof(&mut host, conn_res)
+                .await
+                .expect("post-upgrade read must succeed");
+            assert_eq!(bytes, AFTER);
+        }
+
+        // Untrusted case: a self-signed, unchained leaf (no extra_roots) with `verify-mode.strict`
+        // must be REFUSED, not silently admitted.
+        {
+            let (chain, key) = self_signed_leaf();
+            const PLAIN: &[u8] = b"220 ready for tls\r\n";
+            const AFTER: &[u8] = b"UNUSED";
+            let port = spawn_plaintext_then_tls_server(chain, key, PLAIN, AFTER).await;
+            let mut table = ResourceTable::new();
+            let mut host = host_fixture(&mut table, port); // no extra_roots
+            let conn_res =
+                tcp_egress::Host::connect_plaintext(&mut host, "127.0.0.1".to_string(), port)
+                    .await
+                    .expect("plaintext dial must succeed");
+            let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+                .expect("plaintext input not yet taken");
+            let _ = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
+            let err = tcp_egress::HostConnection::start_tls(
+                &mut host,
+                conn_res,
+                "localhost".to_string(),
+                VerifyMode::Strict,
+            )
+            .await
+            .expect_err("strict start-tls must refuse a self-signed, unchained certificate");
+            assert!(matches!(err, EgressError::TlsFailure(_)), "{err:?}");
+        }
     }
 }

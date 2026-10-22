@@ -1523,6 +1523,15 @@ interface tcp-egress {
     /// honored ONLY here — `connect-tls`'s strict PULL path never downgrades, structurally (the
     /// relaxed verifier this builds is reachable from no other call site).
     ///
+    /// Note for guest/shim authors (the host's guarantee stops at the host/guest boundary): the
+    /// host itself never reads ahead of the guest's own plaintext `read`/`ready` calls, but a GUEST
+    /// that reads PAST the protocol's affirmative reply during the plaintext phase (e.g. because it
+    /// used a read size larger than one line and the peer happened to pipeline more bytes in the
+    /// same segment) receives those extra bytes too — as ordinary, UNAUTHENTICATED plaintext. A
+    /// correct guest/shim consumes EXACTLY through the affirmative reply before calling `start-tls`
+    /// and must never treat anything it already read during the plaintext phase as if it arrived
+    /// over the upgraded, authenticated channel.
+    ///
     /// Refused with `other` on a `connect-tls`-originated (already-TLS) connection, or on a
     /// `connect-plaintext` connection that has already been upgraded (or whose previous upgrade
     /// attempt already failed — there is no plaintext fallback after a failed upgrade, which would
