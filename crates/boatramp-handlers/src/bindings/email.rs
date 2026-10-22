@@ -28,9 +28,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/email-host",
-        async: {
-            only_imports: ["send"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -201,11 +199,16 @@ impl email_sender::Host for EmailHost<'_> {
 
 /// Add the `email-sender` interface to `linker`, resolving the per-invocation
 /// [`EmailHost`] view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = EmailHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> EmailHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> EmailHost<'_>,
 ) -> wasmtime::Result<()> {
-    email_sender::add_to_linker_get_host(linker, host)
+    email_sender::add_to_linker::<T, LinkData>(linker, host)
 }
 
 // ---------------------------------------------------------------------------

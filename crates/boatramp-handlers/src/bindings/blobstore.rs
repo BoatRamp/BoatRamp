@@ -20,42 +20,22 @@ use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
 use bytes::Bytes;
 use futures::StreamExt;
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-use wasmtime_wasi::{DynInputStream, DynOutputStream};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 
 mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "wasi:blobstore/imports",
-        // Methods that touch the (async) Storage backend block; the in-memory
-        // value/stream resources do not.
-        async: {
-            only_imports: [
-                "[method]container.info",
-                "[method]container.get-data",
-                "[method]container.write-data",
-                "[method]container.list-objects",
-                "[method]container.delete-object",
-                "[method]container.delete-objects",
-                "[method]container.has-object",
-                "[method]container.object-info",
-                "[method]container.clear",
-                "create-container",
-                "get-container",
-                "delete-container",
-                "container-exists",
-                "copy-object",
-                "move-object",
-            ],
-        },
+        imports: { default: async },
         with: {
             "wasi:io/streams": wasmtime_wasi_io::bindings::wasi::io::streams,
             "wasi:io/poll": wasmtime_wasi_io::bindings::wasi::io::poll,
             "wasi:io/error": wasmtime_wasi_io::bindings::wasi::io::error,
-            "wasi:blobstore/types/incoming-value": super::IncomingValue,
-            "wasi:blobstore/types/outgoing-value": super::OutgoingValue,
-            "wasi:blobstore/container/container": super::Container,
-            "wasi:blobstore/container/stream-object-names": super::StreamObjectNames,
+            "wasi:blobstore/types.incoming-value": super::IncomingValue,
+            "wasi:blobstore/types.outgoing-value": super::OutgoingValue,
+            "wasi:blobstore/container.container": super::Container,
+            "wasi:blobstore/container.stream-object-names": super::StreamObjectNames,
         },
     });
 }
@@ -71,7 +51,7 @@ mod generated_list {
         path: "wit",
         world: "boatramp:handlers/blob-list-host",
         // `list-page` touches the (async) Storage backend.
-        async: true,
+        imports: { default: async },
     });
 }
 
@@ -556,7 +536,7 @@ async fn marker_exists(storage: &dyn Storage, prefix: &str) -> Result<bool, Stri
 impl blobstore::types::Host for BlobHost<'_> {}
 
 impl blobstore::types::HostOutgoingValue for BlobHost<'_> {
-    fn new_outgoing_value(&mut self) -> Resource<OutgoingValue> {
+    async fn new_outgoing_value(&mut self) -> Resource<OutgoingValue> {
         self.table
             .push(OutgoingValue {
                 pipe: MemoryOutputPipe::new(OUTGOING_CAP),
@@ -565,7 +545,7 @@ impl blobstore::types::HostOutgoingValue for BlobHost<'_> {
             .expect("resource table push")
     }
 
-    fn outgoing_value_write_body(
+    async fn outgoing_value_write_body(
         &mut self,
         this: Resource<OutgoingValue>,
     ) -> Result<Resource<DynOutputStream>, ()> {
@@ -580,28 +560,28 @@ impl blobstore::types::HostOutgoingValue for BlobHost<'_> {
         self.table.push_child(stream, &this).map_err(|_| ())
     }
 
-    fn finish(&mut self, this: Resource<OutgoingValue>) -> Result<(), String> {
+    async fn finish(&mut self, this: Resource<OutgoingValue>) -> Result<(), String> {
         // The bytes are persisted by `container.write-data`; finishing just
         // retires the resource.
         self.table.delete(this).map_err(estr)?;
         Ok(())
     }
 
-    fn drop(&mut self, rep: Resource<OutgoingValue>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<OutgoingValue>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
 }
 
 impl blobstore::types::HostIncomingValue for BlobHost<'_> {
-    fn incoming_value_consume_sync(
+    async fn incoming_value_consume_sync(
         &mut self,
         this: Resource<IncomingValue>,
     ) -> Result<Vec<u8>, String> {
         Ok(self.table.delete(this).map_err(estr)?.bytes)
     }
 
-    fn incoming_value_consume_async(
+    async fn incoming_value_consume_async(
         &mut self,
         this: Resource<IncomingValue>,
     ) -> Result<Resource<DynInputStream>, String> {
@@ -610,14 +590,14 @@ impl blobstore::types::HostIncomingValue for BlobHost<'_> {
         self.table.push(stream).map_err(estr)
     }
 
-    fn size(&mut self, this: Resource<IncomingValue>) -> u64 {
+    async fn size(&mut self, this: Resource<IncomingValue>) -> u64 {
         self.table
             .get(&this)
             .map(|v| v.bytes.len() as u64)
             .unwrap_or(0)
     }
 
-    fn drop(&mut self, rep: Resource<IncomingValue>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<IncomingValue>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
@@ -626,7 +606,7 @@ impl blobstore::types::HostIncomingValue for BlobHost<'_> {
 impl blobstore::container::Host for BlobHost<'_> {}
 
 impl blobstore::container::HostContainer for BlobHost<'_> {
-    fn name(&mut self, this: Resource<Container>) -> Result<String, String> {
+    async fn name(&mut self, this: Resource<Container>) -> Result<String, String> {
         Ok(self.table.get(&this).map_err(estr)?.name.clone())
     }
 
@@ -837,14 +817,14 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         Ok(())
     }
 
-    fn drop(&mut self, rep: Resource<Container>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<Container>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
 }
 
 impl blobstore::container::HostStreamObjectNames for BlobHost<'_> {
-    fn read_stream_object_names(
+    async fn read_stream_object_names(
         &mut self,
         this: Resource<StreamObjectNames>,
         len: u64,
@@ -857,7 +837,7 @@ impl blobstore::container::HostStreamObjectNames for BlobHost<'_> {
         Ok((batch, at_end))
     }
 
-    fn skip_stream_object_names(
+    async fn skip_stream_object_names(
         &mut self,
         this: Resource<StreamObjectNames>,
         num: u64,
@@ -869,7 +849,7 @@ impl blobstore::container::HostStreamObjectNames for BlobHost<'_> {
         Ok((skip as u64, at_end))
     }
 
-    fn drop(&mut self, rep: Resource<StreamObjectNames>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<StreamObjectNames>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
@@ -1076,13 +1056,13 @@ pub async fn read_object_through_guest_binding(
         let iv = host
             .get_data(Resource::new_own(rep), object.to_string(), 0, 0)
             .await?;
-        let bytes = host.incoming_value_consume_sync(iv)?;
+        let bytes = host.incoming_value_consume_sync(iv).await?;
         return Ok(if bytes.len() == 1 { Vec::new() } else { bytes });
     }
     let iv = host
         .get_data(Resource::new_own(rep), object.to_string(), 0, size - 1)
         .await?;
-    host.incoming_value_consume_sync(iv)
+    host.incoming_value_consume_sync(iv).await
 }
 
 impl blob_list::Host for BlobHost<'_> {
@@ -1130,14 +1110,19 @@ impl blob_list::Host for BlobHost<'_> {
 /// resolving the per-invocation [`BlobHost`] view via `host`. `blob-list` rides the SAME `host`
 /// closure and the SAME grant/confinement as the standard blobstore surface, so it is uniform across
 /// the request and consumer lanes by construction.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = BlobHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> BlobHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> BlobHost<'_>,
 ) -> wasmtime::Result<()> {
-    blobstore::types::add_to_linker_get_host(linker, host)?;
-    blobstore::container::add_to_linker_get_host(linker, host)?;
-    blobstore::blobstore::add_to_linker_get_host(linker, host)?;
-    blob_list::add_to_linker_get_host(linker, host)?;
+    blobstore::types::add_to_linker::<T, LinkData>(linker, host)?;
+    blobstore::container::add_to_linker::<T, LinkData>(linker, host)?;
+    blobstore::blobstore::add_to_linker::<T, LinkData>(linker, host)?;
+    blob_list::add_to_linker::<T, LinkData>(linker, host)?;
     Ok(())
 }
 
@@ -1150,7 +1135,6 @@ mod tests {
     use boatramp_core::{GetObject, ObjectMeta};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use wasmtime_wasi::OutputStream;
 
     /// A minimal in-memory [`Storage`] for exercising the binding.
     #[derive(Default, Clone)]
@@ -1280,9 +1264,12 @@ mod tests {
 
     /// Push a ready-to-write outgoing value (bytes already buffered), as if the
     /// guest had written them through the output-stream.
-    fn outgoing(table: &mut ResourceTable, bytes: &[u8]) -> Resource<OutgoingValue> {
+    async fn outgoing(table: &mut ResourceTable, bytes: &[u8]) -> Resource<OutgoingValue> {
+        use tokio::io::AsyncWriteExt;
         let mut pipe = MemoryOutputPipe::new(OUTGOING_CAP);
-        pipe.write(Bytes::copy_from_slice(bytes)).unwrap();
+        // wasmtime 50's `MemoryOutputPipe` is `AsyncWrite` (no sync `OutputStream::write`); feed the
+        // bytes through it so `pipe.contents()` yields them, as if the guest had written them.
+        pipe.write_all(bytes).await.unwrap();
         table
             .push(OutgoingValue {
                 pipe,
@@ -1300,7 +1287,7 @@ mod tests {
 
         let container = host.create_container("photos".into()).await.unwrap();
         let crep = container.rep();
-        let ov = outgoing(host.table, b"jpeg-bytes");
+        let ov = outgoing(host.table, b"jpeg-bytes").await;
         host.write_data(Resource::new_own(crep), "cat.jpg".into(), ov)
             .await
             .unwrap();
@@ -1332,7 +1319,7 @@ mod tests {
             .get_data(Resource::new_own(crep), "cat.jpg".into(), 0, 9)
             .await
             .unwrap();
-        let bytes = host.incoming_value_consume_sync(iv).unwrap();
+        let bytes = host.incoming_value_consume_sync(iv).await.unwrap();
         assert_eq!(bytes, b"jpeg-bytes");
     }
 
@@ -1346,14 +1333,14 @@ mod tests {
         let c = host.create_container("c".into()).await.unwrap();
         let crep = c.rep();
         for name in ["a.txt", "b.txt"] {
-            let ov = outgoing(host.table, b"x");
+            let ov = outgoing(host.table, b"x").await;
             host.write_data(Resource::new_own(crep), name.into(), ov)
                 .await
                 .unwrap();
         }
 
         let stream = host.list_objects(Resource::new_own(crep)).await.unwrap();
-        let (mut names, end) = host.read_stream_object_names(stream, 100).unwrap();
+        let (mut names, end) = host.read_stream_object_names(stream, 100).await.unwrap();
         names.sort();
         assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
         assert!(end);
@@ -1381,7 +1368,7 @@ mod tests {
             "der/shaB/0.jpg",
             "top.txt",
         ] {
-            let ov = outgoing(host.table, b"x");
+            let ov = outgoing(host.table, b"x").await;
             host.write_data(Resource::new_own(crep), name.into(), ov)
                 .await
                 .unwrap();
@@ -1389,7 +1376,7 @@ mod tests {
         // A SECOND container whose keys must NEVER surface via the first's list.
         let o = host.create_container("other".into()).await.unwrap();
         let orep = o.rep();
-        let ov = outgoing(host.table, b"x");
+        let ov = outgoing(host.table, b"x").await;
         host.write_data(Resource::new_own(orep), "der/shaA/0.jpg".into(), ov)
             .await
             .unwrap();
@@ -1506,7 +1493,7 @@ mod tests {
         let c = host.get_container("c".into()).await.unwrap();
         let crep = c.rep();
 
-        let ov = outgoing(host.table, b"data");
+        let ov = outgoing(host.table, b"data").await;
         host.write_data(Resource::new_own(crep), "o".into(), ov)
             .await
             .unwrap();
@@ -1536,7 +1523,7 @@ mod tests {
         host.create_container("dst".into()).await.unwrap();
         let src = host.get_container("src".into()).await.unwrap();
         let srep = src.rep();
-        let ov = outgoing(host.table, b"payload");
+        let ov = outgoing(host.table, b"payload").await;
         host.write_data(Resource::new_own(srep), "f".into(), ov)
             .await
             .unwrap();
@@ -1578,7 +1565,7 @@ mod tests {
         let mut host = BlobHost::new(&mut table, Some(&bind));
 
         host.create_container("src".into()).await.unwrap();
-        let ov = outgoing(host.table, b"x");
+        let ov = outgoing(host.table, b"x").await;
         let src = host.create_container("src".into()).await.unwrap();
         host.write_data(src, "f".into(), ov).await.unwrap();
 
@@ -1609,7 +1596,7 @@ mod tests {
             let mut a = BlobHost::new(&mut table, Some(&bind_a));
             let c = a.create_container("shared".into()).await.unwrap();
             let crep = c.rep();
-            let ov = outgoing(a.table, b"a-only");
+            let ov = outgoing(a.table, b"a-only").await;
             a.write_data(Resource::new_own(crep), "k".into(), ov)
                 .await
                 .unwrap();
@@ -1820,6 +1807,7 @@ mod tests {
         let stream = host.list_objects(c).await.expect("pass: list ok");
         let (names, _at_end) = host
             .read_stream_object_names(stream, 100)
+            .await
             .expect("pass: read names");
         assert!(
             names.is_empty(),
@@ -1973,7 +1961,7 @@ mod tests {
 
         let c = host.create_container("c".into()).await.unwrap();
         let crep = c.rep();
-        let ov = outgoing(host.table, b"x");
+        let ov = outgoing(host.table, b"x").await;
         let err = host
             .write_data(Resource::new_own(crep), "../escape".into(), ov)
             .await
@@ -2192,7 +2180,7 @@ mod tests {
             let mut host = BlobHost::new(&mut table, Some(&bind));
             let c = host.create_container("c".into()).await.unwrap();
             let crep = c.rep();
-            let ov = outgoing(host.table, b"x");
+            let ov = outgoing(host.table, b"x").await;
             let res = host
                 .write_data(Resource::new_own(crep), "../escape".into(), ov)
                 .await;

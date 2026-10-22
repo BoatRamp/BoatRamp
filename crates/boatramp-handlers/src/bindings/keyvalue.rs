@@ -15,26 +15,12 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "wasi:keyvalue/imports",
-        // Only the methods that actually touch the (async) KvStore block.
-        async: {
-            only_imports: [
-                "[method]bucket.get",
-                "[method]bucket.set",
-                "[method]bucket.delete",
-                "[method]bucket.exists",
-                "[method]bucket.list-keys",
-                "increment",
-                "get-many",
-                "set-many",
-                "delete-many",
-            ],
-        },
-        trappable_imports: true,
+        imports: { default: async | trappable },
         with: {
-            "wasi:keyvalue/store/bucket": super::Bucket,
+            "wasi:keyvalue/store.bucket": super::Bucket,
         },
         trappable_error_type: {
-            "wasi:keyvalue/store/error" => super::KvHostError,
+            "wasi:keyvalue/store.error" => super::KvHostError,
         },
     });
 }
@@ -103,7 +89,7 @@ impl<'a> KvHost<'a> {
 }
 
 impl keyvalue::store::Host for KvHost<'_> {
-    fn open(&mut self, identifier: String) -> Result<Resource<Bucket>, KvHostError> {
+    async fn open(&mut self, identifier: String) -> Result<Resource<Bucket>, KvHostError> {
         let binding = self.binding.ok_or(KvHostError::AccessDenied)?;
         // The guest names a logical bucket within its own namespace; an empty
         // name is the default bucket. It can never escape `hkv/{site}/`.
@@ -180,7 +166,7 @@ impl keyvalue::store::HostBucket for KvHost<'_> {
         Ok(keyvalue::store::KeyResponse { keys, cursor: None })
     }
 
-    fn drop(&mut self, bucket: Resource<Bucket>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, bucket: Resource<Bucket>) -> wasmtime::Result<()> {
         self.table.delete(bucket)?;
         Ok(())
     }
@@ -261,13 +247,18 @@ impl keyvalue::batch::Host for KvHost<'_> {
 
 /// Add the `wasi:keyvalue` store/atomics/batch interfaces to `linker`, resolving
 /// the per-invocation [`KvHost`] view from the store's host state via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = KvHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> KvHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> KvHost<'_>,
 ) -> wasmtime::Result<()> {
-    keyvalue::store::add_to_linker_get_host(linker, host)?;
-    keyvalue::atomics::add_to_linker_get_host(linker, host)?;
-    keyvalue::batch::add_to_linker_get_host(linker, host)?;
+    keyvalue::store::add_to_linker::<T, LinkData>(linker, host)?;
+    keyvalue::atomics::add_to_linker::<T, LinkData>(linker, host)?;
+    keyvalue::batch::add_to_linker::<T, LinkData>(linker, host)?;
     Ok(())
 }
 
@@ -294,7 +285,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = KvHost::new(&mut table, Some(&bind));
 
-        let bucket = host.open(String::new()).unwrap();
+        let bucket = host.open(String::new()).await.unwrap();
         let rep = bucket.rep();
         host.set(bucket, "greeting".into(), b"hi".to_vec())
             .await
@@ -330,7 +321,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = KvHost::new(&mut table, Some(&bind));
 
-        let cache = host.open("cache".into()).unwrap();
+        let cache = host.open("cache".into()).await.unwrap();
         host.set(cache, "k".into(), b"v".to_vec()).await.unwrap();
         assert_eq!(
             store.get("hkv/site-a/cache/k").await.unwrap(),
@@ -344,7 +335,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = KvHost::new(&mut table, Some(&bind));
 
-        let bucket = host.open(String::new()).unwrap();
+        let bucket = host.open(String::new()).await.unwrap();
         let rep = bucket.rep();
         host.set(bucket, "a".into(), b"1".to_vec()).await.unwrap();
         host.set(Resource::new_own(rep), "b".into(), b"2".to_vec())
@@ -365,7 +356,7 @@ mod tests {
         let (_store, bind) = binding("hkv/site-a/");
         let mut table = ResourceTable::new();
         let mut host = KvHost::new(&mut table, Some(&bind));
-        let bucket = host.open(String::new()).unwrap();
+        let bucket = host.open(String::new()).await.unwrap();
         let rep = bucket.rep();
 
         host.set_many(
@@ -429,12 +420,12 @@ mod tests {
 
         {
             let mut host_a = KvHost::new(&mut table, Some(&bind_a));
-            let b = host_a.open(String::new()).unwrap();
+            let b = host_a.open(String::new()).await.unwrap();
             host_a.set(b, "secret".into(), b"a".to_vec()).await.unwrap();
         }
         {
             let mut host_b = KvHost::new(&mut table, Some(&bind_b));
-            let b = host_b.open(String::new()).unwrap();
+            let b = host_b.open(String::new()).await.unwrap();
             // site-b sees nothing under its own namespace.
             assert_eq!(host_b.get(b, "secret".into()).await.unwrap(), None);
         }
@@ -445,7 +436,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = KvHost::new(&mut table, None);
         assert!(matches!(
-            host.open(String::new()),
+            host.open(String::new()).await,
             Err(KvHostError::AccessDenied)
         ));
     }

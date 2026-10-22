@@ -32,11 +32,9 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/sql-host",
-        async: {
-            only_imports: ["[method]database.query", "[method]database.execute"],
-        },
+        imports: { default: async },
         with: {
-            "boatramp:handlers/sql-query/database": super::SqlDatabase,
+            "boatramp:handlers/sql-query.database": super::SqlDatabase,
         },
     });
 }
@@ -369,11 +367,14 @@ impl<'a> SqlHost<'a> {
 }
 
 impl sql_query::Host for SqlHost<'_> {
-    fn open(&mut self, name: String) -> Result<Resource<SqlDatabase>, sql_types::Error> {
+    async fn open(&mut self, name: String) -> Result<Resource<SqlDatabase>, sql_types::Error> {
         self.open_handle(name, false)
     }
 
-    fn open_read_only(&mut self, name: String) -> Result<Resource<SqlDatabase>, sql_types::Error> {
+    async fn open_read_only(
+        &mut self,
+        name: String,
+    ) -> Result<Resource<SqlDatabase>, sql_types::Error> {
         self.open_handle(name, true)
     }
 }
@@ -518,7 +519,7 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         txn.execute(&statement, &params).await.map_err(to_wit_error)
     }
 
-    fn drop(&mut self, db: Resource<SqlDatabase>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, db: Resource<SqlDatabase>) -> wasmtime::Result<()> {
         // Dropping a handle does not end the transaction — it stays open until
         // the engine finalizes the invocation (commit/rollback).
         self.table.delete(db)?;
@@ -665,11 +666,16 @@ fn to_wit_error(err: SqlError) -> sql_types::Error {
 
 /// Add the `sql` interface to `linker`, resolving the per-invocation [`SqlHost`]
 /// view via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = SqlHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> SqlHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> SqlHost<'_>,
 ) -> wasmtime::Result<()> {
-    sql_query::add_to_linker_get_host(linker, host)
+    sql_query::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
@@ -777,7 +783,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             let rep = db.rep();
             let n = host
                 .execute(
@@ -818,8 +824,8 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let main = host.open("main".into()).unwrap();
-            let cache = host.open("cache".into()).unwrap();
+            let main = host.open("main".into()).await.unwrap();
+            let cache = host.open("cache".into()).await.unwrap();
             host.execute(main, "INSERT INTO m VALUES (1)".into(), vec![])
                 .await
                 .unwrap();
@@ -852,7 +858,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.execute(db, "INSERT INTO t VALUES (1)".into(), vec![])
                 .await
                 .unwrap();
@@ -875,8 +881,8 @@ mod tests {
         let mut session = SqlSession::for_backends(HashMap::new());
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
-        assert!(host.open(String::new()).is_err());
-        assert!(host.open("main".into()).is_err());
+        assert!(host.open(String::new()).await.is_err());
+        assert!(host.open("main".into()).await.is_err());
     }
 
     /// `open-read-only` begins via `begin_read_only` (which a replica-configured
@@ -890,12 +896,12 @@ mod tests {
         {
             let mut host = SqlHost::new(&mut table, &mut session);
             // A read-only handle: its query begins a read-only transaction.
-            let ro = host.open_read_only(String::new()).unwrap();
+            let ro = host.open_read_only(String::new()).await.unwrap();
             host.query(ro, "SELECT n FROM t".into(), vec![])
                 .await
                 .unwrap();
             // A read-write handle to the same name gets its own transaction.
-            let rw = host.open(String::new()).unwrap();
+            let rw = host.open(String::new()).await.unwrap();
             host.execute(rw, "INSERT INTO t VALUES (1)".into(), vec![])
                 .await
                 .unwrap();
@@ -1091,7 +1097,7 @@ mod tests {
             let mut table = ResourceTable::new();
             let mut host = SqlHost::new(&mut table, &mut session);
 
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             let rep = db.rep();
             // Via `query`.
             assert!(
@@ -1121,7 +1127,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
 
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let rep = db.rep();
         // A normal SELECT.
         host.query(db, "SELECT n FROM t WHERE k = ?1".into(), vec![])
@@ -1150,7 +1156,7 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
 
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         host.execute(db, "SET boatramp.project = 'x'".into(), vec![])
             .await
             .unwrap();
@@ -1183,7 +1189,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // The P0 fix: a scoped read no longer NEEDS the `{scope}` marker — the whole statement is
             // AST-confined to the caller's own tenant. It runs (no refusal) with the confinement
             // host-injected onto the table reference (`Uniform` keys → the `tenant_id` column).
@@ -1207,7 +1213,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             // A stray `{scope}` marker is now OPTIONAL and inert (neutralised to `1 = 1`); the real
             // confinement is host-injected structurally as an escaped literal, so the guest's own
             // `?1` param keeps its numbering (undisturbed) and the tenant is NOT a bound param.
@@ -1237,7 +1243,7 @@ mod tests {
         let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::None);
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         // A DELETE routed through query() must be judged a WRITE (write: none) and refused —
         // it must NOT run under the read grant.
         let err = host
@@ -1260,7 +1266,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.execute(db, "SELECT 1 FROM t WHERE id = 1".into(), vec![])
                 .await
                 .unwrap();
@@ -1282,7 +1288,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.query(db, "SELECT 1 WHERE {scope}".into(), vec![])
                 .await
                 .unwrap();
@@ -1364,7 +1370,7 @@ mod tests {
             let mut table = ResourceTable::new();
             {
                 let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
+                let db = host.open(String::new()).await.unwrap();
                 let err = host
                     .execute(
                         db,
@@ -1396,7 +1402,7 @@ mod tests {
             let mut table = ResourceTable::new();
             {
                 let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
+                let db = host.open(String::new()).await.unwrap();
                 let err = host
                     .execute(
                         db,
@@ -1423,7 +1429,7 @@ mod tests {
             let mut table = ResourceTable::new();
             {
                 let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
+                let db = host.open(String::new()).await.unwrap();
                 let err = host
                     .execute(
                         db,
@@ -1478,7 +1484,7 @@ mod tests {
                 let mut table = ResourceTable::new();
                 let res = {
                     let mut host = SqlHost::new(&mut table, &mut session);
-                    let db = host.open(String::new()).unwrap();
+                    let db = host.open(String::new()).await.unwrap();
                     host.execute(db, stmt.to_string(), vec![]).await
                 };
                 match res {
@@ -1528,7 +1534,7 @@ mod tests {
             let mut table = ResourceTable::new();
             {
                 let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
+                let db = host.open(String::new()).await.unwrap();
                 // Literals (not `?N`) so the statement parses under every dialect the P0 AST rewrite
                 // runs (Postgres rejects `?` placeholders).
                 host.execute(
@@ -1750,7 +1756,7 @@ mod tests {
             // which the fixed code does not do, so the gate fails under that mutation.
             let res = {
                 let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
+                let db = host.open(String::new()).await.unwrap();
                 // Literals (not `?N`) so the statement parses under every dialect the P0 AST rewrite
                 // runs (Postgres rejects `?` placeholders).
                 host.execute(
@@ -1799,7 +1805,7 @@ mod tests {
                 let mut table2 = ResourceTable::new();
                 let res2 = {
                     let mut host = SqlHost::new(&mut table2, &mut session2);
-                    let db = host.open(String::new()).unwrap();
+                    let db = host.open(String::new()).await.unwrap();
                     host.execute(
                         db,
                         "UPDATE oauth_state SET x = 1 WHERE {scope}".to_string(),
@@ -1889,7 +1895,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.query(
                 db,
                 "SELECT p.id FROM products p JOIN reviews r ON r.product_id = p.id".into(),
@@ -1923,7 +1929,7 @@ mod tests {
         let mut table = ResourceTable::new();
         {
             let mut host = SqlHost::new(&mut table, &mut session);
-            let db = host.open(String::new()).unwrap();
+            let db = host.open(String::new()).await.unwrap();
             host.query(
                 db,
                 "SELECT id FROM products WHERE published = false OR 1 = 1".into(),
@@ -1951,7 +1957,7 @@ mod tests {
         let mut session = target_session(log.clone(), "tenant_B");
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let err = host
             .query(db, "SELECT * FROM secrets".into(), vec![])
             .await
@@ -1971,7 +1977,7 @@ mod tests {
         let mut session = target_session(log.clone(), "tenant_B");
         let mut table = ResourceTable::new();
         let mut host = SqlHost::new(&mut table, &mut session);
-        let db = host.open(String::new()).unwrap();
+        let db = host.open(String::new()).await.unwrap();
         let err = host
             .execute(db, "DELETE FROM products WHERE id = 1".into(), vec![])
             .await

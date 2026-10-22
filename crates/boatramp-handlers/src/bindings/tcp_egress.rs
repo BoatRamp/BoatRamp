@@ -47,7 +47,7 @@
 //!
 //! 1. **Injection safety (the CVE-2011-0411 class, RFC 3207 §4).** [`PlaintextEgressInput`] reads
 //!    directly off the raw socket with `try_read`/`readable()` and NO background task — unlike
-//!    [`wasmtime_wasi::pipe::AsyncReadStream`] (used for the already-TLS phase, where read-ahead is
+//!    [`wasmtime_wasi::p2::pipe::AsyncReadStream`] (used for the already-TLS phase, where read-ahead is
 //!    harmless), nothing is ever consumed from the peer ahead of the guest's own `read`/`ready`
 //!    cadence. So any bytes a peer pipelines immediately after its plaintext affirmative reply are
 //!    STILL sitting unread on the wire when `start_tls` reclaims the raw halves — the TLS handshake
@@ -70,7 +70,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{DynInputStream, DynOutputStream};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 
 use crate::engine::{
     TcpEgressResolveError, guest_egress_client_config, resolve_and_gate_tcp_egress,
@@ -80,21 +80,14 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/tcp-egress-host",
-        async: {
-            only_imports: [
-                "connect-tls",
-                "connect-plaintext",
-                "[method]connection.shutdown-output",
-                "[method]connection.start-tls",
-            ],
-        },
+        imports: { default: async },
         with: {
             // Reuse wasmtime-wasi's OWN already-generated `wasi:io` bindings (the same mapping
             // `tcp_connection_world` uses for the inbound listener), so the `input-stream`/
             // `output-stream` resources this interface `use`s are the SAME `DynInputStream`/
             // `DynOutputStream` Rust type the engine already pushes into the store table.
-            "wasi:io": wasmtime_wasi::bindings::io,
-            "boatramp:handlers/tcp-egress/connection": super::TcpEgressConnection,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
+            "boatramp:handlers/tcp-egress.connection": super::TcpEgressConnection,
         },
     });
 }
@@ -447,9 +440,9 @@ impl TcpEgressConnection {
         }
         let idle = self.idle_timeout;
         self.input.take().map(|r| {
-            Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(IdleTimeout::new(
-                r, idle,
-            ))) as DynInputStream
+            Box::new(wasmtime_wasi::p2::pipe::AsyncReadStream::new(
+                IdleTimeout::new(r, idle),
+            )) as DynInputStream
         })
     }
 
@@ -466,7 +459,7 @@ impl TcpEgressConnection {
         }
         let idle = self.idle_timeout;
         self.output.take().map(|w| {
-            Box::new(wasmtime_wasi::pipe::AsyncWriteStream::new(
+            Box::new(wasmtime_wasi::p2::pipe::AsyncWriteStream::new(
                 TCP_EGRESS_WRITE_BUDGET,
                 IdleTimeout::new(CloseNotifyOnDrop::new(w), idle),
             )) as DynOutputStream
@@ -593,7 +586,7 @@ impl TcpEgressConnection {
 ///
 /// This is the structural property Build B's injection safety relies on: the host NEVER consumes a
 /// byte from the peer ahead of what THIS call (driven by the guest's own `read`/`ready` cadence)
-/// asks for — there is no background buffering, unlike [`wasmtime_wasi::pipe::AsyncReadStream`]
+/// asks for — there is no background buffering, unlike [`wasmtime_wasi::p2::pipe::AsyncReadStream`]
 /// (used for the already-TLS phase, where read-ahead is harmless). So whatever the peer sent that
 /// neither the guest nor the host has read yet simply stays in the kernel socket buffer until
 /// `start_tls` reclaims the raw halves and hands them to the TLS handshake — which treats any such
@@ -604,15 +597,15 @@ struct PlaintextEgressInput {
 }
 
 #[wasmtime_wasi::async_trait]
-impl wasmtime_wasi::InputStream for PlaintextEgressInput {
-    fn read(&mut self, size: usize) -> wasmtime_wasi::StreamResult<Bytes> {
+impl wasmtime_wasi::p2::InputStream for PlaintextEgressInput {
+    fn read(&mut self, size: usize) -> wasmtime_wasi::p2::StreamResult<Bytes> {
         let Ok(mut guard) = self.half.try_lock() else {
             // Serialized per-invocation guest calls make concurrent access unreachable in
             // practice; treat it as "nothing ready yet" rather than trap.
             return Ok(Bytes::new());
         };
         let Some(half) = guard.as_ref() else {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(wasmtime_wasi::p2::StreamError::Closed);
         };
         if size == 0 {
             return Ok(Bytes::new());
@@ -622,7 +615,7 @@ impl wasmtime_wasi::InputStream for PlaintextEgressInput {
             // A 0-byte read indicates the peer closed its write side.
             Ok(0) => {
                 *guard = None;
-                Err(wasmtime_wasi::StreamError::Closed)
+                Err(wasmtime_wasi::p2::StreamError::Closed)
             }
             Ok(n) => {
                 buf.truncate(n);
@@ -633,14 +626,16 @@ impl wasmtime_wasi::InputStream for PlaintextEgressInput {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Bytes::new()),
             Err(e) => {
                 *guard = None;
-                Err(wasmtime_wasi::StreamError::LastOperationFailed(e.into()))
+                Err(wasmtime_wasi::p2::StreamError::LastOperationFailed(
+                    e.into(),
+                ))
             }
         }
     }
 }
 
 #[wasmtime_wasi::async_trait]
-impl wasmtime_wasi::Pollable for PlaintextEgressInput {
+impl wasmtime_wasi::p2::Pollable for PlaintextEgressInput {
     async fn ready(&mut self) {
         let guard = self.half.lock().await;
         if let Some(half) = guard.as_ref() {
@@ -687,21 +682,21 @@ impl PlaintextEgressOutput {
 }
 
 #[wasmtime_wasi::async_trait]
-impl wasmtime_wasi::OutputStream for PlaintextEgressOutput {
-    fn write(&mut self, bytes: Bytes) -> wasmtime_wasi::StreamResult<()> {
+impl wasmtime_wasi::p2::OutputStream for PlaintextEgressOutput {
+    fn write(&mut self, bytes: Bytes) -> wasmtime_wasi::p2::StreamResult<()> {
         let Ok(mut st) = self.state.try_lock() else {
-            return Err(wasmtime_wasi::StreamError::trap(
+            return Err(wasmtime_wasi::p2::StreamError::trap(
                 "concurrent access to resource not supported",
             ));
         };
         let Some(half) = st.half.as_ref() else {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(wasmtime_wasi::p2::StreamError::Closed);
         };
         if !st.pending.is_empty() {
             // The WASI contract requires calling `check-write` (which would have reported 0) before
             // writing again while bytes are still queued — mirrors wasmtime-wasi's own
             // `TcpWriter::write`.
-            return Err(wasmtime_wasi::StreamError::trap(
+            return Err(wasmtime_wasi::p2::StreamError::trap(
                 "unpermitted: must call check_write first",
             ));
         }
@@ -713,33 +708,35 @@ impl wasmtime_wasi::OutputStream for PlaintextEgressOutput {
             }
             Err(e) => {
                 st.half = None;
-                Err(wasmtime_wasi::StreamError::LastOperationFailed(e.into()))
+                Err(wasmtime_wasi::p2::StreamError::LastOperationFailed(
+                    e.into(),
+                ))
             }
         }
     }
 
-    fn flush(&mut self) -> wasmtime_wasi::StreamResult<()> {
+    fn flush(&mut self) -> wasmtime_wasi::p2::StreamResult<()> {
         let Ok(st) = self.state.try_lock() else {
-            return Err(wasmtime_wasi::StreamError::trap(
+            return Err(wasmtime_wasi::p2::StreamError::trap(
                 "concurrent access to resource not supported",
             ));
         };
         // No host-side buffering beyond `pending` (already opportunistically drained by
         // `check_write`/`ready`) — a no-op unless the stream is already closed.
         if st.half.is_none() {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(wasmtime_wasi::p2::StreamError::Closed);
         }
         Ok(())
     }
 
-    fn check_write(&mut self) -> wasmtime_wasi::StreamResult<usize> {
+    fn check_write(&mut self) -> wasmtime_wasi::p2::StreamResult<usize> {
         let Ok(mut st) = self.state.try_lock() else {
-            return Err(wasmtime_wasi::StreamError::trap(
+            return Err(wasmtime_wasi::p2::StreamError::trap(
                 "concurrent access to resource not supported",
             ));
         };
         if st.half.is_none() {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(wasmtime_wasi::p2::StreamError::Closed);
         }
         if !st.pending.is_empty() {
             // `half` is TAKEN (not just borrowed) for the duration of the drain attempt — a fresh
@@ -751,7 +748,11 @@ impl wasmtime_wasi::OutputStream for PlaintextEgressOutput {
             st.pending = pending;
             match result {
                 Ok(()) => st.half = Some(half),
-                Err(e) => return Err(wasmtime_wasi::StreamError::LastOperationFailed(e.into())),
+                Err(e) => {
+                    return Err(wasmtime_wasi::p2::StreamError::LastOperationFailed(
+                        e.into(),
+                    ));
+                }
             }
             if !st.pending.is_empty() {
                 return Ok(0);
@@ -762,7 +763,7 @@ impl wasmtime_wasi::OutputStream for PlaintextEgressOutput {
 }
 
 #[wasmtime_wasi::async_trait]
-impl wasmtime_wasi::Pollable for PlaintextEgressOutput {
+impl wasmtime_wasi::p2::Pollable for PlaintextEgressOutput {
     async fn ready(&mut self) {
         let mut st = self.state.lock().await;
         if st.pending.is_empty() || st.half.is_none() {
@@ -913,7 +914,7 @@ impl tcp_egress::HostConnection for TcpEgressHost<'_> {
     // SAME host issued (and that outlives it only within one invocation) would be an internal
     // engine bug, not a guest-triggerable condition, so it is `expect`ed rather than threaded
     // through a WIT-level error (there is none to thread it through).
-    fn take_input(
+    async fn take_input(
         &mut self,
         self_: Resource<TcpEgressConnection>,
     ) -> Option<Resource<DynInputStream>> {
@@ -925,7 +926,7 @@ impl tcp_egress::HostConnection for TcpEgressHost<'_> {
             .map(|s| self.table.push(s).expect("push input-stream into table"))
     }
 
-    fn take_output(
+    async fn take_output(
         &mut self,
         self_: Resource<TcpEgressConnection>,
     ) -> Option<Resource<DynOutputStream>> {
@@ -958,7 +959,7 @@ impl tcp_egress::HostConnection for TcpEgressHost<'_> {
         conn.start_tls(&sni, verify).await
     }
 
-    fn drop(&mut self, rep: Resource<TcpEgressConnection>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<TcpEgressConnection>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
@@ -1214,18 +1215,23 @@ fn tcpegress_tls_mutation() -> Option<String> {
 
 /// Add the `tcp-egress` interface to `linker`, resolving the per-invocation [`TcpEgressHost`] view
 /// via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = TcpEgressHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> TcpEgressHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> TcpEgressHost<'_>,
 ) -> wasmtime::Result<()> {
-    tcp_egress::add_to_linker_get_host(linker, host)
+    tcp_egress::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use wasmtime_wasi::Pollable as _;
+    use wasmtime_wasi::p2::Pollable as _;
 
     /// Mint a throwaway CA + a `localhost` leaf signed by it (mirrors
     /// `engine::egress_tls_tests::ca_and_leaf`, duplicated here so this module's tests are
@@ -1413,6 +1419,7 @@ mod tests {
         conn_res: Resource<TcpEgressConnection>,
     ) -> Result<Vec<u8>, String> {
         let in_res = tcp_egress::HostConnection::take_input(host, conn_res)
+            .await
             .expect("input not yet taken for this phase");
         let stream: &mut DynInputStream = host.table.get_mut(&in_res).unwrap();
         let mut buf = Vec::new();
@@ -1420,7 +1427,7 @@ mod tests {
             match stream.read(4096) {
                 Ok(bytes) if bytes.is_empty() => stream.ready().await,
                 Ok(bytes) => buf.extend_from_slice(&bytes),
-                Err(wasmtime_wasi::StreamError::Closed) => break,
+                Err(wasmtime_wasi::p2::StreamError::Closed) => break,
                 Err(e) => return Err(format!("read failed after {} bytes: {e:?}", buf.len())),
             }
         }
@@ -1966,6 +1973,7 @@ mod tests {
                 .await
                 .expect("plaintext dial must succeed");
         let in_res = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .await
             .expect("plaintext input not yet taken");
         let _ = read_exact_n(&mut host, &in_res, PLAIN.len()).await;
         tcp_egress::HostConnection::start_tls(
@@ -2021,6 +2029,7 @@ mod tests {
                 .await
                 .expect("plaintext dial must succeed");
         let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .await
             .expect("plaintext input not yet taken");
         let greeting = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
         assert_eq!(
@@ -2067,6 +2076,7 @@ mod tests {
                 .await
                 .expect("plaintext dial must succeed");
         let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .await
             .expect("plaintext input not yet taken");
         let greeting = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
         assert_eq!(greeting, PLAIN);
@@ -2111,6 +2121,7 @@ mod tests {
                 .await
                 .expect("plaintext dial must succeed");
         let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .await
             .expect("plaintext input not yet taken");
         // Read EXACTLY the expected reply — the injected tail is deliberately left unread on the
         // wire, still sitting in the kernel socket buffer.
@@ -2169,6 +2180,7 @@ mod tests {
                 .await
                 .expect("plaintext dial must succeed");
         let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+            .await
             .expect("plaintext input not yet taken");
         // Drain EVERYTHING the peer sent pre-upgrade (greeting AND the "injected" tail) as ordinary
         // plaintext — nothing is left unread on the wire.
@@ -2227,6 +2239,7 @@ mod tests {
                     .await
                     .expect("plaintext dial must succeed");
             let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+                .await
                 .expect("plaintext input not yet taken");
             let _ = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
             tcp_egress::HostConnection::start_tls(
@@ -2257,6 +2270,7 @@ mod tests {
                     .await
                     .expect("plaintext dial must succeed");
             let plain_in = tcp_egress::HostConnection::take_input(&mut host, reborrow(&conn_res))
+                .await
                 .expect("plaintext input not yet taken");
             let _ = read_exact_n(&mut host, &plain_in, PLAIN.len()).await;
             let err = tcp_egress::HostConnection::start_tls(

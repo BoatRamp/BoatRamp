@@ -15,9 +15,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/graphql-host",
-        async: {
-            only_imports: ["run", "run-persisted"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -140,11 +138,16 @@ impl graphql_iface::Host for GraphqlHost<'_> {
 }
 
 /// Add the `graphql` interface to `linker`, resolving the per-invocation [`GraphqlHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = GraphqlHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> GraphqlHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> GraphqlHost<'_>,
 ) -> wasmtime::Result<()> {
-    graphql_iface::add_to_linker_get_host(linker, host)
+    graphql_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

@@ -24,9 +24,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/migrate-ddl-host",
-        async: {
-            only_imports: ["exec", "exec-batch", "query"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -92,11 +90,16 @@ impl migrate_iface::Host for MigrateHost<'_> {
 }
 
 /// Wire the `migrate-ddl` host into `linker`, drawing the per-invocation grant from `get`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = MigrateHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    get: impl Fn(&mut T) -> MigrateHost<'_> + Send + Sync + Copy + 'static,
+    get: fn(&mut T) -> MigrateHost<'_>,
 ) -> wasmtime::Result<()> {
-    migrate_iface::add_to_linker_get_host(linker, get)
+    migrate_iface::add_to_linker::<T, LinkData>(linker, get)
 }
 
 #[cfg(test)]

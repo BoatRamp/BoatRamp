@@ -22,22 +22,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/admin-host",
-        async: {
-            only_imports: [
-                "domain-add",
-                "domain-verify",
-                "domain-remove",
-                "domain-list",
-                "email-set",
-                "email-delete",
-                "email-list",
-                "site-config-get",
-                "site-config-put",
-                "secret-set",
-                "secret-delete",
-                "secret-list",
-            ],
-        },
+        imports: { default: async },
     });
 }
 
@@ -256,11 +241,16 @@ impl admin_iface::Host for AdminHost<'_> {
 }
 
 /// Add the `admin` interface to `linker`, resolving the per-invocation [`AdminHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = AdminHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> AdminHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> AdminHost<'_>,
 ) -> wasmtime::Result<()> {
-    admin_iface::add_to_linker_get_host(linker, host)
+    admin_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]

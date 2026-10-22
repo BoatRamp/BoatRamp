@@ -25,9 +25,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/tenancy-host",
-        async: {
-            only_imports: ["present-token"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -157,7 +155,7 @@ impl tenancy_iface::Host for TenancyHost<'_> {
     /// the seal is absent/expired/invalid, the host set no sealed principal and this returns `none`.
     /// The value is exactly what the host verified (guest-blind); the guest can neither name nor
     /// supply it. Synchronous — a pure read of the per-invocation binding.
-    fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
+    async fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
         match self.sealed_principal? {
             SealedPrincipal::Tenant { tenant, persona } => Some(tenancy_iface::SealedPrincipal {
                 tenant: tenant.clone(),
@@ -173,11 +171,16 @@ impl tenancy_iface::Host for TenancyHost<'_> {
 }
 
 /// Add the `tenancy` interface to `linker`, resolving the per-invocation [`TenancyHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = TenancyHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> TenancyHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> TenancyHost<'_>,
 ) -> wasmtime::Result<()> {
-    tenancy_iface::add_to_linker_get_host(linker, host)
+    tenancy_iface::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
@@ -228,11 +231,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn sealed_principal_is_none_without_a_verified_seal_and_verbatim_with_one() {
+    #[tokio::test]
+    async fn sealed_principal_is_none_without_a_verified_seal_and_verbatim_with_one() {
         // No seal (the sync/HTTP lane, or a seal-less/invalid consumer message) ⇒ `none`.
         let mut host = TenancyHost::new(None, None);
-        assert!(host.current_principal().is_none());
+        assert!(host.current_principal().await.is_none());
 
         // A host-verified TENANT seal ⇒ the exact `{tenant, persona}` the host verified, verbatim. It
         // needs NO `present-token` grant (the binding is `None` here) — a pure read of the seal.
@@ -243,6 +246,7 @@ mod tests {
         let mut host = TenancyHost::new(None, Some(&sealed));
         let p = host
             .current_principal()
+            .await
             .expect("a verified tenant seal is present");
         assert_eq!(p.tenant, "acme");
         assert_eq!(p.persona.as_deref(), Some("Integration"));
@@ -256,6 +260,7 @@ mod tests {
         let mut host = TenancyHost::new(None, Some(&tenant_only));
         let p = host
             .current_principal()
+            .await
             .expect("a verified tenant seal is present");
         assert_eq!(p.tenant, "acme");
         assert_eq!(p.persona, None);
@@ -268,7 +273,7 @@ mod tests {
         };
         let mut host = TenancyHost::new(None, Some(&system));
         assert!(
-            host.current_principal().is_none(),
+            host.current_principal().await.is_none(),
             "a system seal is not guest-observable via the tenant record — returns none (fail closed)"
         );
     }

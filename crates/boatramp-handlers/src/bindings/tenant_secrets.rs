@@ -34,9 +34,7 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "boatramp:handlers/tenant-secrets-host",
-        async: {
-            only_imports: ["get", "set", "delete", "list"],
-        },
+        imports: { default: async },
     });
 }
 
@@ -284,11 +282,16 @@ impl tenant_secrets::Host for TenantSecretsHost<'_> {
 
 /// Add the `tenant-secrets` interface to `linker`, resolving the per-invocation
 /// [`TenantSecretsHost`] via `host`.
+struct LinkData;
+impl wasmtime::component::HasData for LinkData {
+    type Data<'a> = TenantSecretsHost<'a>;
+}
+
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
-    host: impl Fn(&mut T) -> TenantSecretsHost<'_> + Send + Sync + Copy + 'static,
+    host: fn(&mut T) -> TenantSecretsHost<'_>,
 ) -> wasmtime::Result<()> {
-    tenant_secrets::add_to_linker_get_host(linker, host)
+    tenant_secrets::add_to_linker::<T, LinkData>(linker, host)
 }
 
 #[cfg(test)]
