@@ -27,9 +27,9 @@ does not satisfy any right on `site`.
 
 ## Resources
 
-Three resources are target-scoped: `site` (target `<project>/<site>`), `project`
-(target `<project>`, since 0.2.0), and `secrets` (target `<project>`, since 0.3.10).
-The rest are global.
+Four resources are target-scoped: `site` (target `<project>/<site>`), `project`
+(target `<project>`, since 0.2.0), `secrets` (target `<project>`, since 0.3.10), and
+`blob_upload` (target `<project>`, at the mint route). The rest are global.
 
 | Resource | Scoped | Governs |
 | --- | --- | --- |
@@ -37,6 +37,7 @@ The rest are global.
 | `project` | `<project>` | The project entity plus the resources it owns — its functions, compute workloads, workflows, and GraphQL admin surface (subgraph registry + safelist). A `project` grant is the tenant boundary: a token scoped to one project cannot touch a sibling. |
 | `secrets` | `<project>` | The project's sealed secret store — its `boatramp:<name>` values and SMTP email profiles. Separate from `project` so managing credentials is a distinct, admin-gated right, auditable on its own (since 0.3.10). |
 | `blobs` | global | Content-addressed blob uploads. |
+| `blob_upload` | `<project>` at the mint route | Minting a scoped, short-lived S3-ingress upload credential for a project's blob container (`POST /api/blob-mint-upload`, `boatramp blob mint-upload`). Deliberately separate from `blobs` (a `deploy`-grade action every publisher holds): minting an external-ingress credential is admin-gated, granted only via `admin` — never a default tenant role. |
 | `tokens` | global | API token management. |
 | `certs` | global | TLS certificate status. |
 | `cache` | global | Cache invalidation. |
@@ -109,6 +110,7 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `POST` | `/api/tokens/bootstrap` | none (bootstrap secret) |
 | `POST` | `/api/cluster/join` | none (single-use join token) |
 | `PUT` | `/api/blobs/<hash>` | `blobs` · `deploy` |
+| `POST` | `/api/blob-mint-upload` | `blob_upload` · `write` *(proj, from the request path)* — `blob-upload` feature |
 | `GET` | `/api/sites` | `system` · `read` |
 | `GET` | `/api/projects` | `system` · `read` |
 | `POST` | `/api/projects` | `system` · `admin` |
@@ -139,12 +141,18 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET` | `/api/overlay/services` | `overlay` · `read` |
 | `POST` | `/api/overlay/dial` | `overlay` · `write` (mint a holder-bound dial capability) |
 | `POST` | `/api/overlay/expose` | `overlay` · `admin` — minting a **publish** capability claims a service name forward clients pin, strictly above dial's `overlay` · `write` |
+| `POST` | `/api/overlay/invite` | `overlay` · `admin` — minting a single-use `overlay-enroll` invitation admits a NEW identity into the overlay trust set once redeemed |
+| `POST` | `/api/overlay/enroll` | none — the enrollee presents a single-use overlay-enroll invitation (verified by the handler), not an admin bearer |
+| `POST` | `/api/overlay/pair-code` | `overlay` · `admin` — minting a pairing rendezvous code stands up a relay slot; redemption itself is unauthenticated (the SAS backstops it) |
+| `GET` | `/api/overlay/pair-relay` | none — an unauthenticated relay-topology lookup for the human-typeable short-code path (discloses only the relay socket + identity, never a capability) |
 | `GET`/`PUT`/`POST` | `/api/overlay/policy[/test]` | `system` · `admin` — editing the overlay **flow policy** is a node-admin act, and `GET`/`test` are a policy-enumeration oracle, so all three sit at the top tier (**not** an `overlay·*` right). The flow policy is a *separate* gate that can only deny-or-shrink a mint `overlay·write`/`admin` already permits — a first step toward the per-name publish scoping the `overlay·admin` note above calls for. |
 | `POST`/`DELETE` | `/api/tokens[/<id>]` | `tokens` · `admin` |
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |
 | `GET` | `/api/metrics` | `system` · `read` |
 | `GET`/`POST` | `/api/prune`, `/api/scrub` | `system` · `admin` |
+| `POST` | `/api/project-export` | `system` · `admin` — stream a project to a `BRPROJ` bundle from a running node (`project-export` feature) |
+| `POST` | `/api/project-import` | `system` · `admin` — import a `BRPROJ` bundle into a project on a running node (`project-export` feature) |
 | any | `/api/authz/*` | `system` · `admin` |
 | any | other `/api/*` | `system` · `admin` (deny-safe) |
 

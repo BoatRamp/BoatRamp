@@ -115,3 +115,49 @@ reads and forwards writes without voting (learner).
 
 **Mesh** — the raw-public-key mutual-TLS network between cluster nodes. See
 [cluster mesh certificates](../how-to/cluster-certs.md).
+
+## Overlay fabric
+
+**Overlay** — boatramp's relay-blind, capability-gated, end-to-end-encrypted network
+for reaching in-cluster services from the outside (or publishing a local service
+into the cluster), with no VPN and no exposed ports. See
+[`boatramp forward`](./cli.md#boatramp-forward) /
+[`boatramp expose`](./cli.md#boatramp-expose).
+
+**Relay / ingress** — a node accepting external client dials and forwarding them,
+ciphertext-blind, into the cluster. Configured under
+[`[overlay]`](./boatramp-cfg.md#overlay).
+
+**Egress / terminator** — a node fronting a local backend service; it independently
+re-verifies every dial's capability against the proven client identity
+(zero-trust), so a compromised relay can't reach the backend on its own.
+
+**Dial capability** — a holder-bound, time-bounded credential minted to reach a
+specific overlay service (`boatramp forward`, `Overlay·Write`).
+
+**Publish capability** — a holder-bound, time-bounded credential minted to publish
+a service name into the cluster (`boatramp expose`, `Overlay·Admin`) — a
+stronger grant than a dial capability, because it claims a name other clients
+trust and pin.
+
+**Exposer** — a client registered with a relay under `boatramp expose`, publishing
+a local service into the cluster's self-serve directory.
+
+**Pairing** — the operator-to-operator flow (`boatramp overlay pair` /
+`pair-code`) that mutually verifies two overlay identities via a
+relay-blind handshake and a human-compared **SAS**, admitting a MITM-free peer
+into local trust with no shared control plane required for the handshake.
+
+**SAS (short authentication string)** — a few words or digits, derived
+deterministically from a pairing handshake's transcript, that two operators
+compare out of band; a match rules out an active man-in-the-middle.
+
+**Pairing PARK** — the relay-hosted rendezvous an `overlay pair-code` recipient
+parks at (`overlay pair --accept`) so a NAT'd peer can redeem the code and meet
+through the relay. Per relay, `open` (unauthenticated — the SAS is the trust
+anchor) or `authenticated` (requires an `overlay-pairing-park` capability).
+
+**Flow policy** — an optional, operator-authored Cedar policy that can deny or
+shrink the TTL of a dial/publish mint the RBAC layer already permits — a
+narrower, separate gate from RBAC itself. See
+[Overlay flow policy](./api.md#overlay-flow-policy).

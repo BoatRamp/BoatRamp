@@ -46,6 +46,7 @@ re-keying (a migration — see [Upgrade a store to project scoping](../how-to/mi
 | `projectmeta/<proj>` | **mutable pointer** → the hash of the project's current spec |
 | `owner/<kind>/<name>` | reverse index: a resource `(kind, name)` → its owning project (single-membership guard) |
 | `authz/policy` | the RBAC policy (roles → rights); absent ⇒ the built-in default |
+| `overlay/flow-policy` | the operator-authored overlay **flow policy** (Cedar text, the `Overlay` namespace) gating the dial/publish-cap mint; absent *or empty* ⇒ the gate is off (allow); corrupt or unreadable ⇒ fail-closed deny. Separate from `authz/policy` |
 | `authz/tokens/<id>` | issued-token metadata (label, roles); the token is never stored |
 | `authz/revoked/<id>` | a revocation marker (presence ⇒ revoked) |
 | `auth/root/<alg:hex>` | an extra trusted **root anchor** (`auth rotate-root`, make-before-break) |

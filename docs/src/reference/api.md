@@ -37,6 +37,55 @@ target the reserved `default` project and stay byte-identical to pre-0.2.0.
 | any | `/api/projects/:project/sites/…` | Per-project site endpoints — the same shapes as [Sites & deployments](#sites--deployments), scoped to the project. |
 | any | `/api/projects/:project/{functions,compute,workflows,graphql}/…` | Per-project function / compute / workflow / GraphQL-admin endpoints, scoped to the project. |
 
+## Project export & import
+
+Stream a whole project — its managed-database contents, control-plane KV slice, and blobs — off a
+**running node** as a single portable `BRPROJ` bundle, and back in. This is how you **clone** a
+project into another environment (staging → prod, a per-customer copy) or recover one. Both verbs
+run against a running node and are gated `System·Admin` (the `project-export` feature; on by
+default). See [Export, import & clone a project](../how-to/clone-project.md) for the CLI and the
+full operational picture (format, atomicity, the managed-DB restore constraints).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. `System·Admin`. |
+| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt]` | Import a `BRPROJ` bundle (the request body) into `project`. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `System·Admin`. |
+
+The bundle is **streamed** on both ends — the node never stages the whole bundle to a temp file.
+A small/sidecar-framed member (the control-plane KV slice, small blobs, the identity container)
+stages to one bounded temp at a time (peak ≈ the largest such member); a large streamed member (a
+managed SQL dump, a libsql snapshot, a large blob) is **chunked** (64 MiB parts, each hashed and
+counted as it streams, with a trailing checksum+size record verified once the whole member has
+passed through) — peak for those members is one chunk, not the whole member. A truncated or
+corrupted stream fails loud at import (the per-member checksum catches it), never silently.
+
+A **full** import of a **managed, dedicated/single-tenant** Postgres/MySQL/libsql database is
+**atomic**: it restores into a not-yet-live shadow database, verifies it, then swaps it in only
+after verification succeeds (a Postgres/MySQL database rename, or a libsql file rename) — any
+failure tears the shadow down and leaves the live database untouched. The untrusted dump is applied
+by a freshly-minted, import-scoped **non-superuser** role (Postgres/MySQL) or a confined SQLite
+authorizer (libsql) — never the binding's own (superuser-grade, on a managed co-located server)
+credential — closing an RCE-on-import hazard a crafted dump could otherwise exploit. This
+atomic path does **not** cover: a **data-only** import, a **shared**-tenant managed database (even
+on a full bundle), or an older pre-chunking bundle's managed dump — those are refused for a managed
+target with a `501` explaining that a full, dedicated-bundle re-export (or an external,
+bring-your-own-URL binding) is the way forward; a least-privilege data-only apply is a pending
+follow-up. An **external** (bring-your-own-URL) database binding is unaffected by any of this — it
+restores with the operator's own configured credential against the operator's own database (their
+trust boundary, not boatramp's managed cluster).
+
+A Postgres extension in the dump (e.g. `vector`/pgvector) is only created if it is on the operator's
+[trusted-extension allowlist](./boatramp-cfg.md#handlers)
+(`handlers.bindings.sql.migrate_trusted_extensions` — the same allowlist the
+[in-app migration `extension` step](../how-to/in-app-migrations.md#enable-an-extension) uses); the
+superuser maintenance connection pre-creates each allowlisted extension in the shadow before the
+non-superuser apply runs, so the dump's own `CREATE EXTENSION IF NOT EXISTS` no-ops instead of
+failing. An extension not on the allowlist fails the restore.
+
+A bundle member is capped at **256 GiB**, and a whole bundle at **1 TiB** — fixed node limits, not
+currently exposed as a config key or CLI flag. Exceeding either refuses the import with a `501`
+naming the cap.
+
 ## Sites & deployments
 
 The paths below target the `default` project; the `/api/projects/:project/sites/…`
@@ -59,6 +108,7 @@ counterparts are identical but scoped to `:project`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `PUT` | `/api/blobs/:hash` | Upload a content-addressed blob (raw body; the server verifies the hash). |
+| `POST` | `/api/blob-mint-upload` | Mint a scoped, short-lived S3 upload credential for a project+site's blob container (`blob_upload` · `write`, `blob-upload` feature). See [Direct-to-storage blob ingress](../how-to/blob-ingress.md). |
 
 ### Blob-backend migration (node-level)
 
@@ -184,6 +234,10 @@ node-admin. Present with the `overlay` feature.
 | `POST` | `/api/overlay/dial` | Resolve a service to its relay/egress topology and mint a holder-bound dial capability for it (signed by the node's root issuer, still scope-verified at the egress). `Overlay·Write`. |
 | `POST` | `/api/overlay/expose` | Resolve this node's ingress-relay topology and mint a holder-bound **publish** capability for a service (self-serve `boatramp expose`). `Overlay·Admin` — strictly above dial's `Overlay·Write`, because publishing CLAIMS a name that forward clients trust and pin. |
 | `GET` | `/api/overlay/services` | List the overlay service directory — the services you can `forward` to. `Overlay·Read`. |
+| `POST` | `/api/overlay/invite` | Mint a single-use `overlay-enroll` invitation (role + service scope) + a `brojoin1.…` ticket for `boatramp overlay join`. `Overlay·Admin` — admitting a new identity into the overlay trust set is owner-grade, like publishing a name. |
+| `POST` | `/api/overlay/enroll` | Redeem a `brojoin1.…` invitation: the enrollee proves possession of its overlay identity and is admitted into the relay's live trust set. **No right** — gated by the single-use invitation itself (like `/api/cluster/join`), not an admin bearer. |
+| `POST` | `/api/overlay/pair-code` | Mint a single-use, short-TTL pairing **rendezvous** code (`bropair1…`, optionally also a human-typeable short code) so two peers that cannot direct-dial can meet through this node's ingress relay. `Overlay·Admin` — minting one stands up a relay rendezvous slot; `404` when this node runs no ingress relay (`[overlay] accept_exposed`). |
+| `GET` | `/api/overlay/pair-relay` | Look up this cluster's pairing ingress-relay topology (relay address + identity) for the human-typeable **short-code** path, which carries no topology of its own. **No right** — the short-code dialer has no credential yet; this discloses only non-secret topology, never a capability. `404` with no ingress relay. |
 
 The directory is a **merged view**: the static `[overlay]` routes ∪ the services
 currently published by live `boatramp expose` exposers (when this node runs an
@@ -242,6 +296,56 @@ non-`ed25519` `holder_pubkey` is `400`. The relay still holder-binds and
 scope-verifies the publish capability at registration — this route only gates WHO
 may obtain one. See the [`[overlay]`](./boatramp-cfg.md#overlay) serve roles.
 
+### Overlay pairing
+
+Relay-blind rendezvous + a **commit-then-reveal** short authentication string (SAS), so two
+operators' devices can mutually verify identities and detect an active man-in-the-middle, with no
+reachable control plane needed for the handshake itself. `POST /api/overlay/pair-code` only stands
+up the meeting point; the pairing handshake + SAS derivation happen directly between the two peers
+(direct dial or through the relay, which bridges only ciphertext).
+
+`POST /api/overlay/pair-code` request (all optional):
+
+```json
+{ "ttl_secs": 300, "short": false, "accepter_pubkey": "ed25519:<hex>" }
+```
+
+`ttl_secs` defaults to 300s, clamped to a 600s ceiling (a pairing code is a short-lived meeting
+credential, never a long-lived one — redemption is unauthenticated by design, so a code must not
+stand open for long). `short` also mints a human-typeable short code (digit count set by
+[`[overlay] pair_short_code_digits`](./boatramp-cfg.md#overlay)) aliasing the same rendezvous.
+`accepter_pubkey` (the accepter's `ed25519:<hex>` overlay identity) is **required** only when this
+relay runs `[overlay] pairing_park = "authenticated"`, in which case the response also mints a
+holder-bound `overlay-pairing-park` capability for that key — ignored (and optional) against the
+default OPEN-mode relay. The response:
+
+```json
+{
+  "relay": "10.0.0.1:9100",
+  "relay_id": "ed25519:<relay-key>",
+  "rendezvous": "<hex rendezvous id>",
+  "expires_at": 1760000300,
+  "short_code": "1234-5678",
+  "park_cap": "<COSE overlay-pairing-park capability>"
+}
+```
+
+`short_code`/`park_cap` are present only when requested/applicable. A node with no root private key
+returns `501` (only when `accepter_pubkey` is given, i.e. authenticated-park mode); a node that
+accepts no ingress-relay rendezvous (`[overlay] accept_exposed`) returns `404`.
+
+`GET /api/overlay/pair-relay` is the companion lookup for the short-code path (a short code, unlike
+`bropair1…`, carries no topology of its own): it returns `{ "relay": "...", "relay_id": "..." }`
+with no authentication required — the short-code dialer has no credential yet, and this discloses
+only non-secret topology (the same values every authenticated pair-code/expose mint already
+returns), never a capability. `404` with no ingress relay.
+
+A **leaked pairing code only lets someone race to redeem it** ahead of the legitimate peer — not
+forge a matching SAS: whoever ends up on the other end of the handshake still has to produce a SAS
+that matches what the legitimate peer expects, and a relay-in-the-middle's two independent
+handshake legs necessarily diverge. See [`boatramp overlay pair` / `pair-code`](./cli.md#boatramp-overlay)
+for the full pairing walkthrough.
+
 ### Overlay flow policy
 
 An optional, operator-authored **per-flow access policy** (a Cedar policy in its own
@@ -271,6 +375,15 @@ minted capability is offline-verified, the gate has no real-time revocation, rat
 concurrent-session limit — a tightening is bounded by the capability TTL (set
 `[overlay].max_dial_ttl_secs` to your acceptable revocation latency), and only a single `not_after`
 (`context.now <= N`) temporal bound is allowed.
+
+A policy rule can also scope to the **node** actually serving the flow: the `Overlay::Service`
+resource is a member of `Overlay::Node`, populated from the mint's resolved target — the dial's
+`egress_id`, or the expose relay's `relay_id` — so `resource in Overlay::Node::"<id>"` restricts a
+rule to one serving node regardless of which service name reaches it (an absent/unresolved node
+simply never matches a node-scoped rule — default-deny-safe). Combine it with a
+`resource == Overlay::Service::"<name>"` check, or use it alone to gate every service a given node
+fronts. Preview a node-scoped rule with the console's policy "Node (optional)" test field (the CLI's
+`overlay policy test` has no `--node` flag yet).
 
 ## Root anchors
 

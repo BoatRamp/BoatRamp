@@ -88,7 +88,7 @@ flags unique to each command:
 | [`cloudflare`](#boatramp-cloudflare) | Deploy to Cloudflare Containers natively over the REST API (`cluster` feature). |
 | [`forward`](#boatramp-forward) | Forward a local port to an in-cluster service over the overlay fabric (`overlay` feature). |
 | [`expose`](#boatramp-expose) | Publish a local service INTO the cluster over the overlay fabric — the reverse of `forward` (`overlay` feature). |
-| [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial/publish capability + ticket (`overlay` feature). |
+| [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial/publish capability + ticket, pair devices, administer the flow policy (`overlay` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
 [Errors & exit codes](./errors.md).
@@ -191,7 +191,13 @@ resolves to. Takes the common `--server` flag.
 | `create <name>` | Create a project. `<name>` is a slug (no `/`). Flags: `--display <name>`, `--description <text>`, `--region <name>` (default region for the project's compute/replicas). |
 | `ls` | List all projects. |
 | `show <name>` | Print one project's full record. |
+| `doctor` | Scan for resource identifiers the v0.7.0 strict slug allowlist no longer accepts (`Project·Read`, read-only) — a CI preflight for that breaking cutover. Lists each non-conforming name, why it fails, what it affects, and a suggested fix; exits non-zero if any are found. |
 | `rm <name>` | Delete a project. Refused (with an enumeration of what remains) while it still owns resources, and always for the reserved `default`. `--force` cascades the teardown (deprovision managed DBs, remove compute workloads + volumes, delete functions + sites, clear secrets + GraphQL safelist, then remove the project); `--dry-run` prints what would be destroyed and changes nothing; `--force` prompts for a typed-name confirmation unless `--yes`/`-y` (required when stdin isn't a terminal). |
+| `migrate {apply,dry-run,baseline,status}` | Drive the project's owner-gated schema migrations for a managed database. The mutating verbs run as the project's non-superuser owner role and need `Project·Admin`; `status` needs `Project·Read`. See [In-app schema migrations](../how-to/in-app-migrations.md). |
+| `repair [--apply]` | Repair a managed tenant's provisioning drift (the owner-model retrofit that unblocks `migrate`). Defaults to a dry-run; `--apply` converges. Fixes provisioning only — never touches schema or data. `Project·Admin`. |
+| `tenant-secrets {set,rotate,ls,rm}` | Manage the project's **per-tenant** sealed secrets — each tenant's own third-party credential, sealed server-side under `(tenant, name)`, each verb taking `--tenant <t>`. Distinct from the per-project `boatramp secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`. |
+| `export <name> --out <file>` | Stream the project (managed-DB dumps + control-plane KV slice + blobs) to a portable `BRPROJ` bundle, from a **running node** (`System·Admin`). See [Export, import & clone a project](../how-to/clone-project.md). |
+| `import <name> --in <file>` | Import a `BRPROJ` bundle into a project on a **running node** (`System·Admin`); a dry-run plan by default, `--apply` executes. See [Export, import & clone a project](../how-to/clone-project.md). |
 
 ## `boatramp apply`
 
@@ -578,6 +584,11 @@ Overlay forward-flow tooling (the server side is configured under
 | `ls` | List the cluster's overlay service directory (`GET /api/overlay/services`) — the services you can `forward` to. |
 | `resolve <name>` | Resolve one service name to its topology (relay + egress identities + relay posture). |
 | `grant <service>` | **Control-plane-less** path: mint a dial capability + a one-flag forward ticket (below). |
+| `grant-expose <service>` | **Control-plane-less** path: mint a publish capability + a one-flag expose ticket (the reverse-ingress analog of `grant`, for [`boatramp expose --ticket`](#boatramp-expose)). |
+| `invite` | Mint a single-use `overlay-enroll` invitation (`--role node\|device\|workload --scope <svc>`) + a `brojoin1.…` ticket for `overlay join`. A confidential bearer secret — deliver it over a private channel. |
+| `join <ticket>` | Redeem a `brojoin1.…` invitation: prove possession of this operator's overlay identity and be admitted into the relay's live trust set, adopting the returned membership credential. |
+| `pair` | Pair with another operator's device and mutually verify identities with a short authentication string (SAS), detecting an active man-in-the-middle. |
+| `pair-code` | Mint a single-use, short-TTL pairing rendezvous code (`bropair1…`) so two NAT'd peers can meet through the cluster relay (`POST /api/overlay/pair-code`, `Overlay·Admin`). |
 | `policy ls` | Show the active overlay **flow policy** (Cedar text) + its version (`GET /api/overlay/policy`, `System·Admin`). |
 | `policy set <file>` | Replace the flow policy from a `.cedar` file (or `-` for stdin) (`PUT`, `System·Admin`); `--if-match <version>` for a conditional write, a validation failure prints the server's `400` verbatim, an empty file turns the gate off. |
 | `policy test` | Dry-run a dial/expose mint against the policy (`POST …/test`, `System·Admin`) — prints ALLOW/DENY + TTL ceiling + deciding policies; mints nothing. |
@@ -600,6 +611,62 @@ enrollment, the ticket works as-is. Flags: `--relay <host:port>`, `--relay-id`/`
 `--holder-pub <id>` (bind a client-generated identity; the ticket then carries no secret),
 `--ttl-secs <n>` (default 3600), `--config <path>`.
 
+**`overlay grant-expose <service>`** mirrors `grant` for the reverse-ingress (publish) direction: it
+mints a holder-bound overlay-**publish** capability + a one-flag **expose ticket** (`brexp1.…`)
+redeemed with `boatramp expose <local> svc/<name> --ticket <blob>`. The ticket additionally carries
+the cluster trust root's public key, because the exposer (the terminator) independently verifies
+each incoming forward client's dial capability against it (zero-trust). Flags mirror `grant`:
+`--relay <host:port>`, `--relay-id`, `--holder-pub <id>`, `--ttl-secs <n>` (default 3600),
+`--config <path>`.
+
+**`overlay invite` / `overlay join`** are the offline enrollment pair: `invite --role
+node|device|workload --scope <svc>` mints a single-use `overlay-enroll` invitation + a `brojoin1.…`
+ticket (signed with the cluster root key, like `grant`); the new peer redeems it with `overlay join
+<ticket>`, proving possession of their own overlay identity to be admitted into the relay's live
+trust set. The invitation is a confidential bearer secret (anyone holding it, plus their own
+overlay key, can enroll until it is spent) — deliver it over a private channel; its blast radius is
+bounded by its TTL and single-use redemption.
+
+**`overlay pair` / `overlay pair-code`** mutually verify two operators' overlay identities with a
+short authentication string (SAS) — detecting an active man-in-the-middle — and pin the peer's
+proven identity (locally, in-memory). Two transports:
+
+- **Direct dial**: one side `overlay pair --listen <host:port>` (the responder), the other
+  `overlay pair <host:port>` (the initiator) — for peers that can reach each other directly.
+- **Relay rendezvous**: for NAT'd peers that cannot direct-dial, they meet through the cluster's
+  ingress relay (relay-blind — it bridges only ciphertext). One side mints a single-use,
+  short-TTL code with `overlay pair-code` (`bropair1…`, gated `Overlay·Admin` — `POST
+  /api/overlay/pair-code` — minting one stands up a relay rendezvous slot), shares it with the new
+  peer, then parks it with `overlay pair --accept <code>`; the peer redeems it with `overlay pair
+  <code>`. `pair-code --short` also mints a human-typeable **short code** (e.g. `1234-5678`,
+  digit count set by [`[overlay] pair_short_code_digits`](boatramp-cfg.md#overlay), default 8),
+  redeemed with `overlay pair --short <code>` — the initiator looks up the relay's topology via the
+  **unauthenticated** `GET /api/overlay/pair-relay` (a short code carries no topology of its own;
+  this route discloses only the relay's public socket + identity, not a capability).
+
+Both transports run the same relay-blind E2EE handshake plus a **commit-then-reveal** nonce
+exchange (à la ZRTP / Bluetooth numeric comparison: each side commits to its contribution before
+either reveals), then derive a SAS the two operators **compare out of band** — 3 words (e.g.
+`cargo-delta-hotel`) or 8 keypad digits. `--expect <SAS_WORDS>` is the non-interactive confirm
+(required when stdin is not a TTY); the pairing aborts on any mismatch, with no way to skip the
+check. Commit-then-reveal matters: without it, a relay-in-the-middle could learn one leg's SAS
+target and grind its own KEM contribution offline until the two human-compared codes collide; the
+commitment forces both sides to fix their contribution before either learns the other's, which is
+what keeps the SAS's ~1-in-16.7-million collision odds real on a per-*online*-attempt basis. A
+**leaked pairing code only lets someone race to redeem it first** — not forge a matching SAS: the
+rendezvous is first-redeem-wins, but whoever ends up on the other end of the handshake still has to
+produce a SAS that matches what the legitimate peer expects, and a MITM's two independent legs
+diverge.
+
+By default a relay's pairing PARK is **open** (unauthenticated — the SAS is the trust anchor). An
+operator can tighten it per relay with [`[overlay] pairing_park =
+"authenticated"`](boatramp-cfg.md#overlay): the accepter must then present a holder-bound
+`overlay-pairing-park` capability and prove possession of it. Mint that capability by passing the
+accepter's own overlay public key (from their `overlay id`) to `overlay pair-code
+--accepter-pubkey <pubkey>`; hand them the capability (the `park_cap` it prints) alongside the
+code, and they present it with `overlay pair --accept <code> --park-cap <cap>`. Redemption itself
+stays unauthenticated in both PARK modes — only the accepter side gets the extra check.
+
 **`overlay policy {ls,set,test}`** administers the cluster's overlay **flow policy** — the per-flow
 access gate that decides which dial/publish-cap mints the control plane will issue (**deny-or-shrink-TTL
 only**), separate from the RBAC that grants `Overlay·Write`/`Admin`. All three verbs need `System·Admin`
@@ -608,6 +675,11 @@ and take `--server` (else `[publish].server`). `set` validates server-side (pars
 verbatim, and the FIRST stored policy warns because the gate becomes default-deny. `test` takes
 `--action dial|expose --service <name>` (optionally `--holder`, `--role`, `--scope`, `--enrolled`,
 `--ttl-secs`) and previews the decision without minting — use it before relying on a new policy.
+A policy rule may also scope to the resolved **node** serving the request (`resource in
+Overlay::Node::"<id>"` — the dial target's `egress_id`, or the expose relay's `relay_id`); the CLI's
+`policy test` has no `--node` flag to preview a node-scoped rule (the console's test form does) —
+use `boatramp overlay resolve <service>` to find the node id, then check the policy's effect via the
+console, or temporarily store a service-scoped test policy instead.
 
 ## `boatramp forward`
 
@@ -625,10 +697,12 @@ identity (`~/.config/boatramp/overlay.key`). Zero hand-typed topology, and **no 
 your token carries the `Overlay·Write` right — the mint happens for you on every `forward`.
 
 **First-run setup (one-time, by an admin).** Self-serve needs your boatramp token to hold the
-`Overlay·Write` right (admins have it already via the `admin` role). For a non-admin operator, an
-admin grants an overlay role — e.g. mint a token with `boatramp token mint --role overlay` (a role
-whose policy includes `Overlay·Write`, and `Overlay·Read` to browse the directory). With that, you
-never touch a per-service grant again.
+`Overlay·Write` right (admins have it already via the `admin` role). None of the eight
+[built-in roles](./rbac.md#default-roles) besides `admin` grant it, so for a non-admin operator an
+admin first defines a custom role with `boatramp auth policy set` — e.g. an `overlay` role whose
+rights include `overlay`·`write` (dial) and `overlay`·`read` (browse the directory) — then mints a
+token against it: `boatramp token mint --role overlay`. With that, you never touch a per-service
+grant again.
 
 **Walkthrough.**
 
@@ -848,10 +922,13 @@ without a re-apply, then reclaim the old store.
 | Sub-action | Description |
 | --- | --- |
 | `put <file>` | Upload a file as a content-addressed blob; prints its hash (the key to pass to `compute set --kernel/--rootfs`). |
+| `mint-upload` | Mint a scoped, short-lived S3 upload credential for a project+site's blob container, so an external client (browser, bulk agent) can upload directly over the S3 protocol; TTL + max-bytes clamp to operator ceilings. `blob-upload` feature, gated `BlobUpload·Write`. See [Direct-to-storage blob ingress](../how-to/blob-ingress.md). |
 | [`migrate`](#blob-migrate) | **Offline, node-local** copy of every object from one blob backend to another. |
 | [`drain`](#blob-drain) | **Daemon-mediated** drain of a managed node's configured read-fallback secondary → primary. |
 | [`purge`](#blob-purge) | Reclaim unreferenced blobs, or a drained secondary's objects (dry-run by default). |
 | [`status`](#blob-status) | Print the node's blob migration posture (`{ blob_fallback_active }`). |
+| `verify` | List every blob a live site deployment or function references that is MISSING from the backend — a dead reference that would 404 on invoke/serve. Read-only (`System·Read`). |
+| `rehome` | Default-scope blob re-home (v0.31.0): re-homes the node's own bare default-scoped blob objects to their two-segment `…/default/…` spelling, in place. Offline + node-local, mirrors `boatramp migrate --stage`/`--finalize`. Run with the node stopped. |
 
 > **The three blob-storage `migrate`/`drain` verbs.** `blob migrate` is **offline** — it
 > builds *both* backends in the CLI process from two node config files and never contacts a

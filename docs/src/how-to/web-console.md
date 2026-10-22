@@ -2,7 +2,7 @@
 
 boatramp ships a small web **management console** — a WebAssembly single-page app
 that drives the control-plane `/api` (sites, deployments, tokens, config,
-observability, the overlay directory). It is **baked into the binary** and served,
+observability, the overlay directory + flow policy). It is **baked into the binary** and served,
 when you turn it on, from the same origin as the API. Nothing to deploy
 separately, no CORS to configure.
 
@@ -77,20 +77,42 @@ The console has a real client-side router, so pages are deep-linkable URLs under
 the mount path (e.g. `/_console/sites/blog`) — a refresh or a shared link lands
 on the right page.
 
-## Overlay directory
+## Overlay
 
-The **Overlay** page (node-global, under the `node` nav group) lists the overlay
-forward-flow service directory — the console view of
-[`boatramp overlay ls`](../reference/cli.md#boatramp-overlay). It shows what is
-joinable: each service name, the relay to dial, the relay and egress overlay
-**identities** a client pins, and the relay's client-auth posture
-(`capability-only` or `mutual-pin`). It is read-only; minting a dial capability
-stays a CLI action (`boatramp forward` / `overlay grant`).
+The **Overlay** page (node-global, under the `node` nav group) has two tabs:
+**Directory** (read-only service discovery) and **Flow policy** (the
+`System·Admin`-gated Cedar policy editor).
+
+### Directory
+
+The Directory tab lists the overlay forward-flow service directory — the
+console view of [`boatramp overlay ls`](../reference/cli.md#boatramp-overlay).
+It shows what is joinable: each service name, the relay to dial, the relay and
+egress overlay **identities** a client pins, and the relay's client-auth
+posture (`capability-only` or `mutual-pin`). It is read-only; minting a dial
+capability stays a CLI action (`boatramp forward` / `overlay grant`).
 
 Viewing it needs the `Overlay·Read` right (the `overlay` role, or `admin`); a
 token without it sees a note explaining which role to ask an admin for rather
 than a bare error. When no services are published (`[overlay] routes` unset), the
 page says so. Backed by [`GET /api/overlay/services`](../reference/api.md#overlay).
+
+### Flow policy
+
+The Flow policy tab edits the cluster's overlay **flow policy** — the per-flow
+Cedar access gate described in
+[API reference: Overlay flow policy](../reference/api.md#overlay-flow-policy)
+and [`overlay policy {ls,set,test}`](../reference/cli.md#boatramp-overlay). It
+is a meaningfully higher-privilege surface than the read-only Directory tab:
+viewing, editing, and dry-run testing the policy all need `System·Admin`, not
+`Overlay·Read`. The editor shows the active Cedar text + its version, lets an
+admin replace it (a validation failure surfaces the server's error inline,
+never silently clears the policy), and includes a test/explain form (action,
+service, holder, role, scope, enrolled, TTL, and an optional **node** field)
+that previews a dial/expose decision — ALLOW/DENY + TTL ceiling + the deciding
+policies — without minting anything. Storing the **first** policy a cluster has
+ever had surfaces an explicit cliff warning, because the gate flips from
+off (allow) to default-deny the moment any policy is stored.
 
 ## Sign in
 

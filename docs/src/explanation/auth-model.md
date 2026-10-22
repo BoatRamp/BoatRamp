@@ -26,8 +26,9 @@ a signature-scale cost.
 Once a token verifies, the request is authorized with
 [Cedar](https://www.cedarpolicy.com/). Cedar decides whether the token's granted
 roles carry a **right** — an action (`read`, `write`, `deploy`, `admin`) on a
-**resource** (`site`, `project`, `blobs`, `tokens`, `certs`, `cache`, `system`),
-optionally scoped to a target — that satisfies what the endpoint requires. The
+**resource** (`site`, `project`, `secrets`, `blobs`, `blob_upload`, `tokens`,
+`certs`, `cache`, `system`, `overlay`), optionally scoped to a target — that
+satisfies what the endpoint requires. The
 policy is data: a default role-to-rights mapping ships built in, and an operator
 can replace it (validated server-side, so a bad policy cannot brick the control
 plane). Unmapped paths fall through to `system` · `admin`, so a narrow token
@@ -36,10 +37,11 @@ never reaches an ungated action by accident. The full vocabulary is in the
 
 ## The project is the tenant boundary
 
-Two resources are target-scoped. A `site` right binds to a `<project>/<site>`
-target; a `project` right binds to a `<project>` and governs everything that
-project owns — its functions, compute, and workflows, and the project entity
-itself. This is what makes a project a hard tenant boundary: a token granted
+Several resources are target-scoped (the full, current list is in the
+[RBAC reference](../reference/rbac.md#resources)). A `site` right binds to a
+`<project>/<site>` target; a `project` right binds to a `<project>` and governs
+everything that project owns — its functions, compute, and workflows, and the
+project entity itself. This is what makes a project a hard tenant boundary: a token granted
 `project_admin:acme` has full control of `acme` and every site under it, but Cedar
 denies it any access to a sibling project `shop`. The built-in
 `project_admin` / `project_publisher` / `project_viewer` roles express the common

@@ -482,7 +482,19 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 `bindings.sql` fields: `dir`, `url`, `admin_url`, `replica_url`, `token_env`,
 `admin_token_env`, `preview_mode` (`empty` \| `branch` \| `shared`),
 `preview_init`, `databases`. See
-[Use handler bindings](../how-to/handler-bindings.md).
+[Use handler bindings](../how-to/handler-bindings.md). Four more top-level
+`bindings.sql` fields govern the **declarative managed-database** stack rather
+than the bring-your-own `databases:` map:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `migrate_trusted_extensions` | list of strings | `[]` (none) | The **trusted-extension allowlist** — the only Postgres extensions the owner-gated schema-migration `Extension` step (and a managed-DB [project import](../how-to/clone-project.md)'s shadow-restore) may enable; a name not on it is refused fail-closed. A raw `sql` migration step may never `CREATE EXTENSION` at all. Env: `BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS` (comma-separated). See [Enable an extension](../how-to/in-app-migrations.md#enable-an-extension). |
+| `deprovision_grace_secs` | integer | `604800` (7 days) | Soft-delete grace window for a per-tenant managed database: when a project/site is deleted, a **Shared + Postgres** tenant is soft-deleted (renamed aside, role disabled) and stays recoverable for this long before a reaper hard-drops it. `0` disables the soft path (immediate hard drop). MySQL and all `Single` tenants always hard-drop immediately. Env: `BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS`. |
+| `max_declared_databases` | integer | `16` | Per-project ceiling on the number of `databases:` entries a project may declare (a disk-exhaustion guard — each declared DB eagerly provisions a 10–200 GiB volume); a declare past it is refused (422-class). `0` disables declaring any managed database on this node. Env: `BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES`. |
+| `max_declared_volume_mib` | integer | `524288` (512 GiB) | Per-project ceiling on the aggregate declared-volume size (MiB) across all a project's declared databases; a declare that would exceed it is refused. `0` disables managed declarations on this node. Env: `BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB`. |
+
+See [Declare a managed database](../how-to/managed-databases.md#limits) for the
+`max_declared_*` pair in context.
 
 ### Memory ceilings per lane
 
@@ -605,6 +617,9 @@ re-authorizes the sealed capability end-to-end against the cryptographically-pro
 | `client_auth` | string | — (required for a relay unless `allowed_clients` is non-empty) | Relay transport-auth posture: `"capability-only"` (accept any client key at TLS; rest authorization on the capability gate + the egress's E2EE re-authz — this is what lets an operator self-serve without pre-enrollment) or `"mutual-pin"` (keep the `allowed_clients` RPK pin as a strictly-more-restrictive pre-filter). A relay with a non-empty `allowed_clients` and no `client_auth` defaults to `"mutual-pin"`; a relay with **neither** is a hard error — an empty allowlist is never silently treated as accept-any. |
 | `allowed_clients` | list of strings | `[]` | Client overlay identities (`ed25519:` tagged hex) the relay mutual-authenticates under `client_auth = "mutual-pin"`. (A capability is still required and is the authority; this is only the transport-layer pre-filter. Ignored under `"capability-only"`.) |
 | `routes` | list of `{ service, egress, egress_id }` | `[]` | Relay routing: a requested service → the egress overlay address + identity to forward it to. These also form the **self-serve discovery directory** the control plane resolves `boatramp forward svc/<name>` against. |
+| `accept_exposed` | bool | `false` | Reverse ingress (`boatramp expose`): accept exposer **registrations** on this relay, so a local service published into the cluster is reachable by a cluster-side `boatramp forward svc/<name>`. Opt-in — `false`/unset keeps the relay forward-only. Requires `relay_listen`. A registration is holder-bound to an `overlay-publish` capability verified against `trust_root`; first-live-claim-wins on the name. This is also the flag that lets the relay host the **pairing rendezvous** (`overlay pair-code` / `overlay pair --accept`) — without it, both `POST /api/overlay/pair-code` and `GET /api/overlay/pair-relay` return `404`. |
+| `pairing_park` | string | `"open"` | Per-relay operator choice for the pairing **PARK** service (overlay pairing, see [`boatramp overlay`](cli.md#boatramp-overlay)): `"open"` (the default) keeps an unauthenticated park, bounded only by the park budget + a per-IP cap, with the human-compared SAS as the trust anchor; `"authenticated"` additionally requires the parking accepter to present a holder-bound `overlay-pairing-park` capability (minted via `overlay pair-code --accepter-pubkey`) and prove possession of it. **Redeem stays unauthenticated in both modes** — the unpaired dialer is, by design, not membership-gated; the SAS backstops it. Any other value is a hard startup error (never silently falls back to open). Read only when this relay also runs the pairing rendezvous (i.e. `accept_exposed` is set). |
+| `pair_short_code_digits` | integer | `8` | Digit count for the human-typeable pairing **short code** a relay can mint alongside a `bropair1…` code (`overlay pair-code --short`): `K = 10^<n>` possible codes (default `10^8 ≈ 2^26.6`). Clamped to `7..=10`. Independent of `accept_exposed` — read only when a relay actually mints/redeems a short code. |
 | `egress_listen` | socket address | — | Bind an egress/terminator here (UDP/QUIC). Unset ⇒ no egress. |
 | `services` | list of `{ name, backend }` | `[]` | Egress service map: a service name → the local backend it fronts. A service not listed is refused — the egress authorizes only what it fronts. |
 
