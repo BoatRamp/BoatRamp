@@ -8,7 +8,7 @@ mod http_connect;
 mod server;
 
 pub use auth::{LocalAuth, LocalAuthError};
-pub use server::{SocksError, SocksServer};
+pub use server::{DEFAULT_MAX_CONNECTIONS, SocksError, SocksServer};
 
 #[cfg(test)]
 mod tests {
@@ -31,9 +31,15 @@ mod tests {
         let tunnel = Tunnel::new(Arc::clone(&cp) as Arc<dyn ControlPlane>, holder)
             .await
             .unwrap();
-        let server = SocksServer::bind(tunnel, auth, "127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
+        let server = SocksServer::bind(
+            tunnel,
+            auth,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         let addr = server.socks_addr().unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;

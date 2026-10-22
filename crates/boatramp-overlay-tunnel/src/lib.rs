@@ -38,7 +38,7 @@ pub mod socks;
 // `boatramp_overlay_tunnel::Tunnel` instead of `boatramp_overlay_tunnel::core::Tunnel`. The
 // `core`/`socks`/`tun` module names themselves still match the plan's module layout (§4).
 pub use core::{ControlPlane, ControlPlaneError, DialGrant, ServiceInfo, Tunnel, TunnelError};
-pub use socks::{LocalAuth, LocalAuthError, SocksError, SocksServer};
+pub use socks::{DEFAULT_MAX_CONNECTIONS, LocalAuth, LocalAuthError, SocksError, SocksServer};
 
 /// The TUN virtual-interface front-end (plan §3) — a **feature-gated scaffold only** in this
 /// release.

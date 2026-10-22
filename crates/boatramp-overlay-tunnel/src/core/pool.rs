@@ -11,6 +11,7 @@ use boatramp_overlay_client::{
     OverlayClient, OverlayClientError, OverlayId, OverlaySecret, PathMode,
 };
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 /// `(relay, relay_id, egress_id, capability_only)` — everything that determines the shape of the
 /// `OverlayClient` built to dial it. All four fields are `Copy`/cheap so the key itself is cheap.
@@ -21,20 +22,28 @@ type PoolKey = (SocketAddr, OverlayId, OverlayId, bool);
 /// — `OverlaySecret` deliberately does not implement `Clone` (its seed is zeroized), so every pooled
 /// client needs its own reconstructed copy, exactly as `OverlayClient::dial`'s internal
 /// `clone_secret` does for the SDK's own per-flow endpoint.
+///
+/// Security MEDIUM-1: `holder_seed_hex` keeps `seed_hex()`'s own `Zeroizing<String>` wrapper rather
+/// than unwrapping it into a plain `String` — a plain `String` would leave the operator's long-term
+/// ed25519 seed sitting in cleartext heap for the whole life of the daemon (recoverable from a core
+/// dump or swapped-out memory); `Zeroizing` overwrites it on drop instead.
 pub(crate) struct ClientPool {
-    holder_seed_hex: String,
+    holder_seed_hex: Zeroizing<String>,
     clients: RwLock<HashMap<PoolKey, Arc<OverlayClient>>>,
 }
 
 impl ClientPool {
     pub(super) fn new(holder: &OverlaySecret) -> Self {
         Self {
-            holder_seed_hex: holder.seed_hex().to_string(),
+            holder_seed_hex: holder.seed_hex(),
             clients: RwLock::new(HashMap::new()),
         }
     }
 
     fn clone_holder(&self) -> Result<OverlaySecret, OverlayClientError> {
+        // `&self.holder_seed_hex` auto-derefs `Zeroizing<String>` -> `&str` (clippy flags an
+        // explicit `&*` here as redundant); the point of keeping `Zeroizing` is the TYPE held in
+        // the struct field, not how it's borrowed at this one call site.
         Ok(OverlaySecret::from_seed_hex(&self.holder_seed_hex)?)
     }
 

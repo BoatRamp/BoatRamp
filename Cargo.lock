@@ -1928,10 +1928,12 @@ name = "boatramp-overlay-tunnel"
 version = "0.43.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "boatramp-overlay-client",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

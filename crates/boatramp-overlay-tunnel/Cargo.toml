@@ -47,6 +47,19 @@ async-trait = { workspace = true }
 # Typed error enums ONLY — the untyped-error convenience crate is CI-banned.
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Decodes the `Proxy-Authorization: Basic` header the HTTP CONNECT front-end checks (Security
+# MEDIUM-2 — the same local-auth credential SOCKS enforces, carried as HTTP's own idiom). Already
+# in the tree (root workspace dep, used by `boatramp` itself); pinned to the same "0.22" spec here
+# rather than `workspace = true` so this crate's own Cargo.toml stays self-contained per its
+# existing style (every other dep here is a plain version string too).
+base64 = "0.22"
+# Keeps the pool's reconstructable copy of the operator's long-term ed25519 seed
+# (`ClientPool::holder_seed_hex`) zeroized on drop, matching `OverlaySecret::seed_hex()`'s own
+# `Zeroizing<String>` (Security MEDIUM-1: a plain `String` here would leave the seed recoverable
+# from a core dump / swapped memory for the daemon's whole life). Already in the tree transitively
+# (via boatramp-overlay-proto, which names it directly too); zero deps of its own, so this adds
+# nothing to the dependency graph and cannot affect the ring-free posture.
+zeroize = "1"
 
 [lints]
 workspace = true

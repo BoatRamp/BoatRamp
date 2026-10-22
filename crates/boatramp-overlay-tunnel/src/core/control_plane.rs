@@ -33,7 +33,11 @@ pub struct ServiceInfo {
 /// A resolved + minted dial grant: the topology [`ServiceInfo`] carries, plus a holder-bound
 /// capability token and its absolute expiry (Unix seconds). Never cached or reused past
 /// `expires_at` (plan §5 — an overlay-dial capability is offline-verified with no revocation).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Security INFO: `Debug` is hand-written (not derived) so `token` — a live, holder-bound
+/// capability — never appears in a log line, a panic message, or a test assertion's failure
+/// output; use [`DialGrant::token`] directly when the actual value is needed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DialGrant {
     pub relay: SocketAddr,
     pub relay_id: OverlayId,
@@ -44,6 +48,19 @@ pub struct DialGrant {
     pub token: String,
     /// Absolute Unix-seconds expiry of `token`.
     pub expires_at: u64,
+}
+
+impl std::fmt::Debug for DialGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialGrant")
+            .field("relay", &self.relay)
+            .field("relay_id", &self.relay_id)
+            .field("egress_id", &self.egress_id)
+            .field("capability_only", &self.capability_only)
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// A failure resolving the catalog or minting a dial capability through the control plane.

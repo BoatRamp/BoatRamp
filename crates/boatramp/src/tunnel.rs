@@ -40,6 +40,17 @@ pub struct TunnelArgs {
     /// implemented in this release — see the error this prints for why and what ships instead.
     #[arg(long)]
     pub tun: bool,
+    /// Cap on concurrent accepted connections, SOCKS + HTTP CONNECT combined (Security MEDIUM-3 —
+    /// bounds a local attacker opening connections faster than they're served).
+    #[arg(long, default_value_t = boatramp_overlay_tunnel::DEFAULT_MAX_CONNECTIONS)]
+    pub max_connections: usize,
+    /// Acknowledge binding `--socks`/`--http-connect` to a NON-loopback address (Security LOW-2).
+    /// Absent this flag, a non-loopback bind is refused outright: this proxy resolves overlay
+    /// services by name and dials under YOUR operator identity, so a LAN/0.0.0.0-exposed bind
+    /// (especially combined with `--no-local-auth`) would hand anyone who can reach it an
+    /// unauthenticated by-name proxy into your overlay.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
 }
 
 /// A `tunnel` failure.
@@ -49,6 +60,13 @@ pub enum TunnelCmdError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Addr(String),
+    /// Security LOW-2: a non-loopback bind was requested without `--allow-non-loopback`.
+    #[error(
+        "refusing to bind {0} — it is not a loopback address, so this would expose a by-name \
+         overlay proxy (dialing under YOUR operator identity) to the whole network/host. Pass \
+         --allow-non-loopback to acknowledge this and continue anyway."
+    )]
+    NonLoopbackBind(SocketAddr),
     #[error("control plane: {0}")]
     Client(#[from] crate::client::ClientError),
     #[error("overlay identity: {0}")]
@@ -265,6 +283,25 @@ pub async fn run(
         return Err(TunnelCmdError::TunNotBuilt);
     }
 
+    // Parse + validate the bind addresses BEFORE touching the network at all (Security LOW-2):
+    // fail fast and loud on a non-loopback bind rather than first standing up a control-plane
+    // connection for nothing.
+    let socks_addr: SocketAddr = args
+        .socks
+        .parse()
+        .map_err(|_| TunnelCmdError::Addr(format!("bad --socks address `{}`", args.socks)))?;
+    let http_connect_addr = match &args.http_connect {
+        Some(a) => Some(
+            a.parse::<SocketAddr>()
+                .map_err(|_| TunnelCmdError::Addr(format!("bad --http-connect address `{a}`")))?,
+        ),
+        None => None,
+    };
+    check_loopback_bind(socks_addr, args.allow_non_loopback)?;
+    if let Some(addr) = http_connect_addr {
+        check_loopback_bind(addr, args.allow_non_loopback)?;
+    }
+
     let (server, http) = crate::client::connect(args.server.clone(), config)?;
     let holder = crate::overlay::operator_identity()?;
 
@@ -278,7 +315,8 @@ pub async fn run(
     };
     if let Some(a) = &auth {
         eprintln!(
-            "boatramp tunnel: local SOCKS auth required — username `{}` (see {})",
+            "boatramp tunnel: local SOCKS auth required — username `{}` (see {}); the SAME \
+             credential gates --http-connect too",
             a.username,
             local_auth_path()?.display()
         );
@@ -288,19 +326,14 @@ pub async fn run(
         );
     }
 
-    let socks_addr: SocketAddr = args
-        .socks
-        .parse()
-        .map_err(|_| TunnelCmdError::Addr(format!("bad --socks address `{}`", args.socks)))?;
-    let http_connect_addr = match &args.http_connect {
-        Some(a) => Some(
-            a.parse::<SocketAddr>()
-                .map_err(|_| TunnelCmdError::Addr(format!("bad --http-connect address `{a}`")))?,
-        ),
-        None => None,
-    };
-
-    let server = SocksServer::bind(tunnel, auth, socks_addr, http_connect_addr).await?;
+    let server = SocksServer::bind(
+        tunnel,
+        auth,
+        socks_addr,
+        http_connect_addr,
+        args.max_connections,
+    )
+    .await?;
     eprintln!(
         "boatramp tunnel: SOCKS5 ready on {} — Ctrl-C to stop",
         server.socks_addr()?
@@ -309,6 +342,23 @@ pub async fn run(
         eprintln!("boatramp tunnel: HTTP CONNECT ready on {addr}");
     }
     server.serve().await?;
+    Ok(())
+}
+
+/// Security LOW-2: refuse a non-loopback bind outright unless `--allow-non-loopback` was passed;
+/// when it was, still warn loudly on every startup rather than silently accepting the exposure.
+fn check_loopback_bind(addr: SocketAddr, allow_non_loopback: bool) -> Result<(), TunnelCmdError> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    if !allow_non_loopback {
+        return Err(TunnelCmdError::NonLoopbackBind(addr));
+    }
+    eprintln!(
+        "boatramp tunnel: WARNING — binding {addr}, which is NOT a loopback address. This exposes \
+         a by-name overlay proxy, dialing under YOUR operator identity, to anyone who can reach \
+         this address (acknowledged via --allow-non-loopback)."
+    );
     Ok(())
 }
 
@@ -349,6 +399,48 @@ mod tests {
         let w = Wrap::try_parse_from(["tunnel", "--no-local-auth", "--tun"]).unwrap();
         assert!(w.args.no_local_auth);
         assert!(w.args.tun);
+    }
+
+    #[test]
+    fn max_connections_defaults_to_the_core_crates_constant() {
+        let w = Wrap::try_parse_from(["tunnel"]).unwrap();
+        assert_eq!(
+            w.args.max_connections,
+            boatramp_overlay_tunnel::DEFAULT_MAX_CONNECTIONS
+        );
+        assert!(!w.args.allow_non_loopback);
+    }
+
+    #[test]
+    fn max_connections_and_allow_non_loopback_are_settable() {
+        let w = Wrap::try_parse_from(["tunnel", "--max-connections", "4", "--allow-non-loopback"])
+            .unwrap();
+        assert_eq!(w.args.max_connections, 4);
+        assert!(w.args.allow_non_loopback);
+    }
+
+    // ---- Security LOW-2: non-loopback bind refusal/warning ----
+
+    #[test]
+    fn a_loopback_bind_is_always_fine() {
+        check_loopback_bind("127.0.0.1:1080".parse().unwrap(), false).unwrap();
+        check_loopback_bind("[::1]:1080".parse().unwrap(), false).unwrap();
+    }
+
+    #[test]
+    fn a_non_loopback_bind_is_refused_without_the_ack_flag() {
+        let addr: SocketAddr = "0.0.0.0:1080".parse().unwrap();
+        let err = check_loopback_bind(addr, false).unwrap_err();
+        assert!(
+            matches!(err, TunnelCmdError::NonLoopbackBind(a) if a == addr),
+            "expected NonLoopbackBind({addr}), got {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_bind_is_accepted_with_the_ack_flag() {
+        let addr: SocketAddr = "0.0.0.0:1080".parse().unwrap();
+        check_loopback_bind(addr, true).unwrap();
     }
 
     // ---- E2E: a real SOCKS5 client, through the core, to a LIVE relay+egress+backend ----
@@ -502,9 +594,15 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SocksServer::bind(tunnel, None, "127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
+        let server = SocksServer::bind(
+            tunnel,
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            boatramp_overlay_tunnel::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         let socks_addr = server.socks_addr().unwrap();
         tokio::spawn(async move {
             let _ = server.serve().await;

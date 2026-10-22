@@ -106,6 +106,10 @@ pub(crate) enum CodecError {
     UnsupportedAddrType(u8),
     #[error("a domain name must be valid UTF-8")]
     InvalidDomainName,
+    /// Security MEDIUM-3: the greeting/auth/request handshake did not complete within the bound —
+    /// a slow-loris peer must not be able to pin a connection task indefinitely.
+    #[error("socks handshake timed out")]
+    HandshakeTimeout,
 }
 
 /// Read the client greeting (`VER NMETHODS METHODS[NMETHODS]`) and pick an auth method:
@@ -136,15 +140,14 @@ where
     let chosen = match require {
         Some(required) if offered.contains(&required) => Some(required),
         Some(_) => None,
-        None => {
-            // No local auth configured — prefer no-auth, fall back to user/pass if that's all that
-            // was offered (still safe: the SOCKS layer just won't challenge for credentials).
-            if offered.contains(&AuthMethod::NoAuth) {
-                Some(AuthMethod::NoAuth)
-            } else {
-                offered.first().copied()
-            }
-        }
+        // No local auth configured (no credential store to check anything against): select
+        // `NoAuth` ONLY. Security LOW-1: the previous `offered.first()` fallback would select
+        // `UserPass` for a client offering only that method, with nothing behind it to verify
+        // against — the caller then has no credential to check, which is either a reachable panic
+        // or (worse) a silent bypass, never "still safe" as the old comment claimed.
+        None => offered
+            .contains(&AuthMethod::NoAuth)
+            .then_some(AuthMethod::NoAuth),
     };
 
     match chosen {
@@ -185,10 +188,10 @@ where
     let mut pass = vec![0u8; plen[0] as usize];
     stream.read_exact(&mut pass).await?;
 
-    // Constant-time-ish by comparing both independently rather than short-circuiting on the first
-    // mismatch — a purely local, loopback-only credential, so a timing side-channel is not the
-    // threat model here; this is a straightforward equality check for correctness, not a hardened
-    // crypto comparison.
+    // A plain (short-circuiting, non-constant-time) equality check — not hardened against a timing
+    // side-channel. That is an accepted tradeoff, not an oversight: this credential only ever
+    // guards a loopback SOCKS port against another local user, a threat model a sub-millisecond
+    // timing difference over a local socket does not meaningfully weaken.
     let ok = user == expected_user.as_bytes() && pass == expected_pass.as_bytes();
     stream
         .write_all(&[VER_USERPASS, if ok { 0x00 } else { 0x01 }])
