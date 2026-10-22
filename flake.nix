@@ -211,6 +211,43 @@
             fi
           '';
 
+          # Standing rule: no AI-authorship/attribution trailers in git history.
+          # `forbidAiTrailersMsg` runs at `commit-msg` and rejects a message carrying
+          # `Co-Authored-By: Claude`, `Claude-Session:`, "Generated with [Claude Code]",
+          # or a claude.ai/code session URL. `forbidAiTrailersPush` is the pre-push
+          # belt-and-suspenders: it scans the messages of the commits actually being
+          # pushed (catching anything introduced via amend/rebase/cherry-pick/import).
+          aiTrailerPattern = "co-authored-by:.*(claude|anthropic\\.com)|claude-session:|generated with \\[claude code\\]|claude\\.ai/code/";
+          forbidAiTrailersMsg = pkgs.writeShellScript "forbid-ai-trailers-msg" ''
+            msg="$1"
+            pat='${aiTrailerPattern}'
+            if hits="$(grep -iEn "$pat" "$msg")"; then
+              echo "error: AI-attribution trailer in commit message (banned in this repo):" >&2
+              printf '%s\n' "$hits" >&2
+              echo "remove the trailer line(s) and re-commit." >&2
+              exit 1
+            fi
+          '';
+          forbidAiTrailersPush = pkgs.writeShellScript "forbid-ai-trailers-push" ''
+            pat='${aiTrailerPattern}'
+            to="''${PRE_COMMIT_TO_REF:-}"
+            from="''${PRE_COMMIT_FROM_REF:-}"
+            [ -n "$to" ] || exit 0
+            if [ -z "$from" ] || [ "$from" = "0000000000000000000000000000000000000000" ]; then
+              commits="$(git rev-list "$to" --not --remotes 2>/dev/null)"
+            else
+              commits="$(git rev-list "$from..$to" 2>/dev/null)"
+            fi
+            rc=0
+            for c in $commits; do
+              if git log -1 --format='%B' "$c" | grep -iEq "$pat"; then
+                echo "error: commit $c carries an AI-attribution trailer — push blocked." >&2
+                rc=1
+              fi
+            done
+            exit $rc
+          '';
+
           # Build the single, batteries-included `boatramp` binary. The workspace
           # default is "all non-conflicting features" (see crates/boatramp/Cargo.toml),
           # so a plain `-p boatramp` build already compiles every backend — fs/S3/GCS/
@@ -687,6 +724,28 @@
               language = "system";
               files = "\\.(rs|toml)$";
               pass_filenames = false;
+            };
+            # Standing rule: block AI-authorship/attribution trailers (see the
+            # `forbidAiTrailers*` scripts above). commit-msg is the primary gate;
+            # pre-push catches anything that bypassed it.
+            forbid-ai-trailers-msg = {
+              enable = true;
+              name = "block AI-attribution trailers (commit message)";
+              entry = "${forbidAiTrailersMsg}";
+              language = "system";
+              stages = [ "commit-msg" ];
+              # commit-msg passes the message file as the arg ONLY when pass_filenames
+              # is true; with false the script sees no file and checks nothing.
+              pass_filenames = true;
+            };
+            forbid-ai-trailers-push = {
+              enable = true;
+              name = "block AI-attribution trailers (pre-push)";
+              entry = "${forbidAiTrailersPush}";
+              language = "system";
+              stages = [ "pre-push" ];
+              pass_filenames = false;
+              always_run = true;
             };
           };
         };
