@@ -3673,6 +3673,28 @@ impl NodeProjectExport {
                             }
                         }
                     }
+                    // Orphan ephemeral apply ROLES (`brexp_apply_%`) left by a crash — drop them
+                    // AFTER their shadow dbs are gone (they then own nothing). Each has a random,
+                    // never-persisted password and owns nothing, so this is tidiness, not security.
+                    let role_sql =
+                        "SELECT rolname FROM pg_roles WHERE rolname LIKE 'brexp\\_apply\\_%'";
+                    let role_inv = psql_invocation(&plan.maint, role_sql);
+                    if let Ok((0, out)) = self
+                        .run_sql_capture(&plan.image, &role_inv.argv, &role_inv.env, None, &session)
+                        .await
+                    {
+                        for role in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            let q = quote_ident(ExternalSqlKind::Postgres, role);
+                            // Best-effort: skips a role that still owns objects (its shadow lingered).
+                            if self
+                                .pg_run_ddl(&plan, &format!("DROP ROLE IF EXISTS {q}"), &session)
+                                .await
+                                .is_ok()
+                            {
+                                dropped += 1;
+                            }
+                        }
+                    }
                 }
             } else if kind_is_mysql(&cfg.kind)
                 && let Ok(plan) = self.mysql_shadow_plan(project, db, cfg).await
@@ -3686,6 +3708,25 @@ impl NodeProjectExport {
                             .mysql_run_admin(
                                 &plan,
                                 &format!("DROP DATABASE IF EXISTS {q};"),
+                                &session,
+                            )
+                            .await
+                        {
+                            dropped += 1;
+                        }
+                    }
+                }
+                // Orphan ephemeral apply USERS (`brexp_apply_%`) left by a crash — drop them after
+                // their shadow dbs are gone (tidiness: each has a random, never-persisted password
+                // and only ever held a grant on the now-dropped shadow db).
+                let user_sql = "SELECT user FROM mysql.user WHERE user LIKE 'brexp\\_apply\\_%';";
+                if let Ok((0, out)) = self.mysql_run_admin(&plan, user_sql, &session).await {
+                    for u in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                        let user_lit = mysql_lit(u);
+                        if let Ok((0, _)) = self
+                            .mysql_run_admin(
+                                &plan,
+                                &format!("DROP USER IF EXISTS {user_lit}@'%';"),
                                 &session,
                             )
                             .await

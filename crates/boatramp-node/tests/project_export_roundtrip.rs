@@ -881,16 +881,17 @@ fn craft_chunked_pg_bundle(source: &str, db: &str, dump: &[u8]) -> Vec<u8> {
 /// the libsql `shadow_apply_refuses_writefile_and_load_extension` gate, driven end-to-end through
 /// `NodeProjectExport::import`, NOT a hand-provisioned role; Tier-2 / nightly). Self-skips.
 ///
-/// This proves the SURFACE: a crafted bundle whose chunked pg member installs an extension (an
-/// RCE-class superuser-only op — extensions ship C code / escalating SQL) is REFUSED when imported
-/// through the real driver on a MANAGED, Single/dedicated config, because the driver applies the
-/// untrusted dump as a freshly-minted EPHEMERAL NON-SUPERUSER role (which the HIGH-1 fix created) —
-/// NOT the bootstrap superuser. With `vector` NOT on the trusted-extension allowlist, the shadow has
-/// no pre-created `vector`, so the non-superuser apply's `CREATE EXTENSION vector` is refused and the
-/// import FAILS; the side-effect never lands (the live target never gets `vector`, no `*__shadow_*`
-/// db + no `brexp_apply_*` role leak). The companion `..._crafted_superuser_escape_refused_live`
-/// mechanism test covers the `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE c` escape classes
-/// against the same kind of non-superuser role. Emits `PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK`.
+/// This proves the SURFACE: a crafted bundle whose chunked pg member defines a `LANGUAGE c`
+/// function — a DEFINITIVELY superuser-only op (unlike `CREATE EXTENSION`, which a trusted-marked
+/// extension like recent pgvector would let a db-owner install, false-REDing the gate; and unlike
+/// `COPY … TO PROGRAM`, which `pg_dump` never emits into a `-Fc` archive, so it can't ride a crafted
+/// bundle member) — is REFUSED when imported through the real driver on a MANAGED, Single/dedicated
+/// config, because the driver applies the untrusted dump as a freshly-minted EPHEMERAL NON-SUPERUSER
+/// role (the HIGH-1 fix) — NOT the bootstrap superuser. The import FAILS and the superuser-only
+/// side-effect never lands (the C function is absent from the live target, no `*__shadow_*` db
+/// remains, no `brexp_apply_*` role leaks). The companion `..._crafted_superuser_escape_refused_live`
+/// mechanism test covers the `COPY … TO PROGRAM` filesystem-marker escape against the same kind of
+/// non-superuser role. Emits `PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK`.
 #[tokio::test]
 async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     use boatramp_core::compute::{
@@ -937,7 +938,9 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     assert_eq!(code, 0, "version detect");
     let image = pg_client_image_for_server_version(&ver).expect("client image");
 
-    // --- build a crafted SOURCE db that installs pgvector (an RCE-class extension) + dump it ---
+    // --- build a crafted SOURCE db that defines a `LANGUAGE c` function (superuser-only) + dump
+    //     it. `check_function_bodies=off` lets the CREATE succeed in the source without loading the
+    //     (nonexistent) library; a restore still hits the superuser-only privilege check. ---
     for sql in [
         format!("DROP DATABASE IF EXISTS {source_db}"),
         format!("CREATE DATABASE {source_db}"),
@@ -952,13 +955,13 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
         backend.as_ref(),
         &image,
         &src,
-        "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE t(id int primary key);",
+        "SET check_function_bodies = off; \
+         CREATE FUNCTION brexp_evil_c() RETURNS integer \
+           AS 'nonexistent_lib', 'nonexistent_sym' LANGUAGE c; \
+         CREATE TABLE t(id int primary key);",
     )
     .await;
-    assert_eq!(
-        c, 0,
-        "install vector in source (needs the pgvector image): {o}"
-    );
+    assert_eq!(c, 0, "define the LANGUAGE c function in the source: {o}");
     let td = tempfile::tempdir().unwrap();
     let dumpf = td.path().join("src.pgc");
     {
@@ -970,7 +973,7 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
             .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
             .await
             .expect("pg_dump");
-        assert_eq!(code, 0, "pg_dump source (with vector)");
+        assert_eq!(code, 0, "pg_dump source (with the LANGUAGE c function)");
     }
     let dump_bytes = std::fs::read(&dumpf).unwrap();
     let bundle = craft_chunked_pg_bundle("default", "app", &dump_bytes);
@@ -1036,8 +1039,8 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
         // published_endpoint=false ⇒ the seeded replica endpoint host is used verbatim.
         .with_managed_pg(backend.clone(), envelope, op, false)
-        // vector is NOT on the allowlist ⇒ the shadow has no pre-created vector ⇒ the
-        // non-superuser apply's `CREATE EXTENSION vector` is refused.
+        // The refused op is a `LANGUAGE c` function (superuser-only regardless of any extension
+        // allowlist), so the allowlist is irrelevant here — empty.
         .with_trusted_extensions(vec![]);
 
     // --- import the crafted bundle THROUGH THE REAL DRIVER: must FAIL (escape refused) ---
@@ -1055,22 +1058,22 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
         .await;
     assert!(
         res.is_err(),
-        "import of a crafted bundle installing an un-allowlisted extension MUST fail (the \
-         non-superuser apply cannot CREATE EXTENSION); got: {res:?}"
+        "import of a crafted bundle defining a LANGUAGE c function MUST fail (the non-superuser \
+         apply cannot CREATE a C-language function); got: {res:?}"
     );
 
-    // --- side-effect never landed: live target never got vector, no shadow/role leaked ---
+    // --- side-effect never landed: the C function is absent from live, no shadow/role leaked ---
     let live = conn(&user, &password, &host, port, &live_db);
     let (_c, got) = psql(
         backend.as_ref(),
         &image,
         &live,
-        "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
+        "SELECT 1 FROM pg_proc WHERE proname = 'brexp_evil_c'",
     )
     .await;
     assert!(
         got.trim().is_empty(),
-        "the crafted extension must NOT exist in the live target after a refused import"
+        "the crafted superuser-only function must NOT exist in the live target after a refused import"
     );
     let (_c, shadows) = psql(
         backend.as_ref(),
@@ -1104,6 +1107,259 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     }
 
     println!("PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK");
+}
+
+/// **Live POSITIVE pgvector round-trip THROUGH THE REAL DRIVER** (inc2 HIGH-1 L3 — the load-bearing
+/// correctness proof for the construens clone; Tier-2 / nightly, needs a live pgvector pg +
+/// `BOATRAMP_TEST_PG_URL`). Self-skips.
+///
+/// Proves that a legit FULL dedicated bundle of a source DB that USES pgvector (a `vector(3)` column
+/// with rows) round-trips SUCCESSFULLY under the ephemeral NON-SUPERUSER apply when `vector` is on
+/// the trusted-extension allowlist: the superuser pre-creates `vector` in the shadow, so the dump's
+/// `CREATE EXTENSION IF NOT EXISTS vector` NO-OPS (no superuser needed) and the `vector(3)` table +
+/// rows restore as the ephemeral role. Drives the REAL `pg_dump` (the driver's export primitive) →
+/// the REAL `NodeProjectExport::import`, then asserts: the import SUCCEEDS, the swapped-in live DB
+/// has the `vector` extension + the table rows intact, the ephemeral `brexp_apply_%` role is DROPPED,
+/// the `*__shadow_*` db is GONE, and the live DB is owned by the configured owner. This is the
+/// end-to-end proof that the non-superuser confinement does NOT break a pgvector restore. Emits
+/// `PROJECT EXPORT PG PGVECTOR ROUNDTRIP OK`.
+#[tokio::test]
+async fn project_export_pg_pgvector_roundtrip_via_driver_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_export::{ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pgvector round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pgvector round-trip not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let s = now_suffix();
+    let source_db = format!("brexp_pv_src_{s}");
+    let live_db = format!("brexp_pv_live_{s}");
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // --- a source DB that USES pgvector (vector(3) column + rows) + dump it ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("CREATE DATABASE {source_db}"),
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+    let src = conn(&user, &password, &host, port, &source_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &src,
+        "CREATE EXTENSION IF NOT EXISTS vector; \
+         CREATE TABLE items(id int primary key, embedding vector(3)); \
+         INSERT INTO items VALUES (1, '[1,2,3]'), (2, '[4,5,6]');",
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "seed pgvector source (needs the pgvector image, e.g. pgvector/pgvector:pg16): {o}"
+    );
+    let td = tempfile::tempdir().unwrap();
+    let dumpf = td.path().join("src.pgc");
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let inv = pg_dump_invocation(&src, false);
+        let f = tokio::fs::File::create(&dumpf).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
+            .await
+            .expect("pg_dump");
+        assert_eq!(code, 0, "pg_dump pgvector source");
+    }
+    let bundle = craft_chunked_pg_bundle("default", "app", &std::fs::read(&dumpf).unwrap());
+
+    // --- MANAGED Single/default driver pointing at the test DSN (seeded replica), vector ALLOWLISTED ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            compute: Some("pg".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/pg", sealed).await.unwrap();
+    }
+    let td2 = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td2.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "pg".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td2.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        // vector ON the allowlist ⇒ the superuser pre-creates it in the shadow ⇒ the dump's
+        // `CREATE EXTENSION IF NOT EXISTS vector` no-ops under the ephemeral non-superuser apply.
+        .with_trusted_extensions(vec!["vector".to_string()]);
+
+    // --- import THROUGH THE REAL DRIVER: must SUCCEED under the non-superuser apply ---
+    let mut src_body = futures::io::Cursor::new(bundle);
+    let res = drv
+        .import(
+            "default",
+            &mut src_body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        res.is_ok(),
+        "a legit pgvector bundle MUST round-trip under the ephemeral non-superuser apply when \
+         `vector` is allowlisted; got: {res:?}"
+    );
+
+    // --- the swapped-in live DB has vector + the rows intact ---
+    let live = conn(&user, &password, &host, port, &live_db);
+    let (_c, has_vec) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
+    )
+    .await;
+    assert_eq!(
+        has_vec.trim(),
+        "1",
+        "the live DB must have the vector extension after restore"
+    );
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT id || ':' || embedding FROM items ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:[1,2,3]\n2:[4,5,6]",
+        "the vector(3) table's rows must round-trip intact"
+    );
+    // --- the ephemeral role is dropped, the shadow is gone, live is owned by the configured owner ---
+    let (_c, roles) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        "SELECT rolname FROM pg_roles WHERE rolname LIKE 'brexp_apply_%'",
+    )
+    .await;
+    assert!(
+        roles.trim().is_empty(),
+        "no ephemeral apply role must remain: {roles:?}"
+    );
+    let (_c, shadows) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{live_db}__shadow_%'"),
+    )
+    .await;
+    assert!(
+        shadows.trim().is_empty(),
+        "no shadow db must remain: {shadows:?}"
+    );
+    let (_c, owner) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{live_db}'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner.trim(),
+        user,
+        "the swapped-in live DB must be owned by the configured owner, not the ephemeral role"
+    );
+
+    // --- cleanup (best-effort) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT EXPORT PG PGVECTOR ROUNDTRIP OK");
 }
 
 /// **In-process libsql snapshot → bundle → restore round-trip** (no Docker, no external
