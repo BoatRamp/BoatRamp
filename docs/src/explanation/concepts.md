@@ -53,7 +53,7 @@ rolled back on its own. See [Functions: the compute primitive](./functions.md).
 ## A project owns sites, functions, and compute
 
 Sites, functions, and compute workloads do not float free — each belongs to
-exactly one **project** (a *Workspace*, in Uchron terms). A project is the owning
+exactly one **project** (a *Workspace*). A project is the owning
 group above the site and the **tenant boundary**: the resources it holds are keyed
 under its own namespace, scheduled independently, and a managed handler's
 row-level scope resolves to the owning project. Two projects can each own a `blog`

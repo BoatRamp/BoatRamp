@@ -55,10 +55,10 @@ one before returning. You get three host calls: `send` (enqueue an outbound fram
 ordered, host-buffered for at-least-once resume), `checkpoint` (persist opaque resume
 state), and `close` (end the session).
 
-With the [shim](./deploy-handler.md) the boilerplate is a macro:
+With the [shim](./deploy-handler.md) the boilerplate is a macro (shown here imported
+as `compat`):
 
 ```rust
-use boatramp_uchron_compat as compat;
 use compat::session::Session;
 use compat::CompatError;
 

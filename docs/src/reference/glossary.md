@@ -8,7 +8,7 @@ concept has a fuller treatment, the definition links to it.
 **Site** — a named project boatramp serves. The unit that owns domains, config,
 and deployments.
 
-**Project** — the Workspace (Uchron term) that owns many sites, functions, and
+**Project** — the Workspace that owns many sites, functions, and
 compute, and is the tenant boundary for a managed handler's row-level scope. Every
 resource belongs to exactly one project; a site name is unique only within its
 project. See [Organize sites into a project](../how-to/projects.md).

@@ -666,7 +666,7 @@ footprint — its capability ceiling permits neither `wasi:keyvalue` nor `wasi:m
 `mqgp/` finds no object — there is nothing to strand, so the online re-home (the `serve` boot stage, the
 console **Store migration** wizard, and the `/api/store-migrate` API) proceeds automatically. This is
 the common case, e.g. a marketing `site` that only serves `wasi:http` (the incident's own
-`site/construens`).
+affected site).
 
 A **data-bearing** commingle, a resource named literally `default`, a reserved-scope-prefix name, any
 store/scan error, and *every* collision seen by the offline `boatramp migrate` CLI (which has no
@@ -852,7 +852,7 @@ non-HTTP protocol (POP3/IMAP/SMTP/LMTP, a custom-protocol broker). Experimental,
   security review that specifically drove this path.
 - **Admission.** `tcp-listener` is advertised as an Experimental capability feature and requires
   `requires = ["tcp-listener"]`, so a deploy against a pre-feature host is refused cleanly (host
-  handler-contract version 0.6 → 0.7). The guest-side `boatramp-uchron-shim` ships a matching
+  handler-contract version 0.6 → 0.7). The guest-side shim ships a matching
   `tcp-listener` capability the same cycle. Inbound UDP and guest-driven `bind`/`listen` remain
   future work.
 
@@ -1143,7 +1143,7 @@ moved the dominant cost off the blob path entirely. Two fixes: a durable wasm co
 
 ## [0.25.0] - 2026-10-09
 
-Blob marker-`HEAD` dedup — part of the construens image-serve-latency work (Ask 3a). Eliminates the
+Blob marker-`HEAD` dedup — part of the image-serve-latency work (Ask 3a). Eliminates the
 per-serve `.boatramp-container` marker `HEAD` round-trip (one of two serial object-store round-trips per
 blob serve) without weakening Dim-0 blob tenant confinement. Host/daemon-side only; no WIT/shim change.
 
@@ -1169,7 +1169,7 @@ cold/uncached path.
 
 ## [0.24.0] - 2026-10-09
 
-Node-health observability — Stage 1 of the construens node-health-alerting request (incident: a node's
+Node-health observability — Stage 1 of the node-health-alerting request (incident: a node's
 `/data` silently filled to 100%, managed Postgres couldn't create its sandbox, and every DB-backed
 request failed with no alert). Host/daemon-side only; no WIT/shim change. (Stage 2 — the alerting loop,
 sealed-secret webhook/email channels, and the orphaned-replica reaper — follows as a separate, security-
@@ -1191,7 +1191,7 @@ Stage 2 threads `data_dir` via `ServerOptions` so the disk signal is available r
 
 ## [0.23.0] - 2026-10-09
 
-Per-phase latency observability for plain handlers (construens `boatramp-image-serve-latency`, Ask 1 —
+Per-phase latency observability for plain handlers (`boatramp-image-serve-latency`, Ask 1 —
 the primary ask). Extends the v0.21.0 federated-gateway instrumentation to EVERY handler dispatch, so a
 plain `#[handler]` route's host-side cost is attributable instead of a single opaque `duration_ms`.
 Host/daemon-side only; no WIT/shim change.
@@ -1217,7 +1217,7 @@ release, driven by what this instrumentation measures on the cold/uncached path.
 ## [0.22.0] - 2026-10-09
 
 Adds a `TableScope::Owned { column }` tenancy variant for scoping MANY-rows-per-owner collections by a
-non-unique ownership column on the own axis (construens `boatramp-owned-column-scope`). Host/daemon-side
+non-unique ownership column on the own axis (`boatramp-owned-column-scope`). Host/daemon-side
 only; no WIT/shim change.
 
 - **`Owned { column }`** scopes a table by `column = <resolved own value>` — the per-row analog of
@@ -1243,8 +1243,8 @@ only; no WIT/shim change.
 
 ## [0.21.0] - 2026-10-08
 
-Removes the ~1 s of per-request overhead inside the **federated GraphQL gateway** (construens
-`boatramp-federated-gateway-overhead`) and makes a `/graphql` request's time attributable. The JWKS
+Removes the ~1 s of per-request overhead inside the **federated GraphQL gateway**
+(`boatramp-federated-gateway-overhead`) and makes a `/graphql` request's time attributable. The JWKS
 fetch on the token-claims auth path — the one uncached phase (compose + plan were already memoized per
 composition version) — was paid on every request. It is now served from a cache and refreshed in the
 **background**, so no request blocks on it.
@@ -1290,7 +1290,7 @@ the existing issuer-trust gate.
 
 Completes the `on_unresolved:"pass"` + observability/perf follow-ups surfaced by v0.19.0 — honoring
 `pass` on the last surface, closing the per-request component re-read on every lane, and delivering
-the rest of the construens memory-observability asks.
+the rest of the memory-observability asks.
 
 - **`on_unresolved:"pass"` on the `/graphql` gateway:** a gateway-level `pass` now propagates into
   subgraph fetches (and the in-process `graphql::run` fan-out), so an unresolved caller confines to
@@ -1508,10 +1508,10 @@ a cross-tenant escalation in the initial content-keyed capture.
 Scaling (prefix-scoped, paginated guest blob list): the guest `wasi:blobstore`
 `container.list-objects()` can only list the WHOLE container, eagerly, to completion — no prefix
 filter, no resumable cursor. Past ~tens of thousands of objects a single `list()` 504s a sync-lane
-handler, so first-class blob GC and prefix-scoped maintenance cannot run at scale (construens: a blob
+handler, so first-class blob GC and prefix-scoped maintenance cannot run at scale (a blob
 GC that snapshots a 21k+ object container times out before any delete). This adds a server-side prefix
-filter and a bounded, resumable page. Guest-facing WIT addition ⇒ the `boatramp-uchron-shim` revs in
-lockstep (0.0.4 → 0.0.5). construens `boatramp-blob-list-prefix`.
+filter and a bounded, resumable page. Guest-facing WIT addition ⇒ the shim revs in
+lockstep (0.0.4 → 0.0.5). Addresses `boatramp-blob-list-prefix`.
 
 ### Added
 
@@ -1553,9 +1553,9 @@ lockstep (0.0.4 → 0.0.5). construens `boatramp-blob-list-prefix`.
 Observability (blob-read error granularity): a failed blob READ (`get`/`get_range`/`head`) used to
 collapse into one opaque `StorageError::Backend` string with NO HTTP status / error code / request-id
 in the logs — so a 403 (an under-scoped credential), a 416, a throttle/5xx, or a transport fault were
-indistinguishable from a genuine 404. That ambiguity cost construens a multi-hour misdiagnosis of a
+indistinguishable from a genuine 404. That ambiguity caused a multi-hour misdiagnosis of a
 real blob-read incident. Each S3/Tigris/R2 read fault is now classified and logged with its concrete
-outcome. Host-only; no WIT/shim change. (This is Ask 1 of the construens request; Ask 2 — an
+outcome. Host-only; no WIT/shim change. (This is Ask 1 of the originating request; Ask 2 — an
 async-vs-sync read discrepancy — was the v0.12.7 consumer-scope bug and is already fixed: both lanes
 share one backend/credential/bucket, and the only divergence, the scope, is now project-qualified.)
 
@@ -1573,7 +1573,7 @@ share one backend/credential/bucket, and the only divergence, the scope, is now 
   5xx/transport) logs at **WARN** and returns the new structured
   `StorageError::BackendRead { reason, status, code, request_id }`, so an operator can tell a real miss
   from a credential/throttle/server/transport fault at a glance. Wired on
-  the S3 backend (the construens/Tigris path and the incident); GCS/Azure reuse the same classifier as
+  the S3 backend (the Tigris path and the incident); GCS/Azure reuse the same classifier as
   a ready follow-up.
 
 ### Security / custody
@@ -1692,7 +1692,7 @@ no shim rev.
 
 ## [0.12.4] - 2026-10-03
 
-Async-lane hardening (two construens requests) plus a workspace-wide Rust-idiomaticity/perf review.
+Async-lane hardening (two internal requests) plus a workspace-wide Rust-idiomaticity/perf review.
 The async lane — where durable, retryable, no-client-connected work runs — gains a raisable per-lane
 memory ceiling and a per-consumer concurrency budget, so a memory-heavy worker (image decode/resize)
 and a bursty one (thumbnail backfill) can each be sized without starving the others. A follow-up
@@ -1701,8 +1701,8 @@ found. Host/node only; no guest-facing (WIT) change, so no shim rev.
 
 ### Added
 
-- **Raisable per-lane WASM linear-memory ceiling** (construens
-  `boatramp-async-lane-memory-budget-request`). New `[handlers]` `async_max_memory_mb` /
+- **Raisable per-lane WASM linear-memory ceiling**
+  (`boatramp-async-lane-memory-budget-request`). New `[handlers]` `async_max_memory_mb` /
   `sync_max_memory_mb` / `streaming_max_memory_mb` raise a lane's per-component memory ceiling above
   the 64 MiB default. A component right-sizes itself *down* with its own `limits.memory_mb` / site
   `max_memory_mb`; a component with neither inherits the (raised) lane ceiling. A per-component value
@@ -1710,8 +1710,8 @@ found. Host/node only; no guest-facing (WIT) change, so no shim rev.
   Default host unchanged (64 MiB everywhere). With `pooling`, the allocator sizes its virtual
   reservation off the max-of-lanes ceiling × summed lane concurrency and fails loudly if it can't be
   reserved (never a silent first-invocation OOM); without pooling there is no up-front reservation.
-- **Per-consumer async concurrency override** (construens
-  `boatramp-per-consumer-concurrency-request`). A `wasi:messaging` consumer may declare
+- **Per-consumer async concurrency override**
+  (`boatramp-per-consumer-concurrency-request`). A `wasi:messaging` consumer may declare
   `max_concurrency` to cap its own in-flight messages at `min(cap, async_max_concurrency)`, so one
   consumer's burst can't occupy the whole async lane and starve the others. Unset ⇒ shares the lane
   as before. Pure admission control — ordering, at-least-once, and retry/DLQ semantics unchanged.
@@ -1748,7 +1748,7 @@ found. Host/node only; no guest-facing (WIT) change, so no shim rev.
 
 Additive — close the `handlers.bindings.sql` env-mapping gap so a file-less (fly `[env]`-only) fleet can
 set the migration trusted-extension allowlist (and the declared-DB ceilings) without a `boatramp.cfg` edit
-and a server roll (construens `boatramp-migrate-trusted-extensions-env-request`). Host/node only; no
+and a server roll (`boatramp-migrate-trusted-extensions-env-request`). Host/node only; no
 guest-facing (WIT) change; no change to any allowlist or migration semantics.
 
 ### Added
@@ -1773,8 +1773,8 @@ guest-facing (WIT) change; no change to any allowlist or migration semantics.
 ## [0.12.2] - 2026-10-02
 
 Additive — a bounded, declarative **claim transform** on the `token` tenant source, so a multi-IdP app
-can *derive* its tenant key from a verified JWT claim instead of injecting the claim verbatim (construens
-`boatramp-feature-token-claim-transform`). Host/daemon only; no guest-facing (WIT) change; the default
+can *derive* its tenant key from a verified JWT claim instead of injecting the claim verbatim
+(`boatramp-feature-token-claim-transform`). Host/daemon only; no guest-facing (WIT) change; the default
 preserves today's behavior exactly (no `extract`/`namespace` ⇒ verbatim, byte-identical).
 
 ### Added
@@ -1818,8 +1818,8 @@ preserves today's behavior exactly (no `extract`/`namespace` ⇒ verbatim, byte-
 
 ## [0.12.1] - 2026-10-02
 
-Additive — an opt-in soft domain-tenancy source for public wildcard hosts (construens
-`boatramp-optional-domain-source`). Host/daemon only; no guest-facing (WIT) change; the default preserves
+Additive — an opt-in soft domain-tenancy source for public wildcard hosts
+(`boatramp-optional-domain-source`). Host/daemon only; no guest-facing (WIT) change; the default preserves
 today's behavior exactly.
 
 ### Added
@@ -1983,8 +1983,8 @@ that is already stuck. Host/daemon only; no guest-facing (WIT) change.
 
 ## [0.10.0] - 2026-09-30
 
-Additive — a grouped-aggregate completion for the typed `orm` builder (construens
-`boatramp-orm-groupby-request`). `GROUP BY` / `HAVING` and the `count`/`sum`/`avg`/`min`/`max`
+Additive — a grouped-aggregate completion for the typed `orm` builder
+(`boatramp-orm-groupby-request`). `GROUP BY` / `HAVING` and the `count`/`sum`/`avg`/`min`/`max`
 aggregates were already supported end-to-end (typed builder → WIT → host, tenant-confined); this fills
 the last gap and proves the confinement.
 
@@ -2154,7 +2154,7 @@ Additive, non-breaking. Host-only blob-read fix.
 
 ## [0.7.4] - 2026-09-29
 
-Additive, non-breaking. Three fixes in the S3-blob / operator-surface area (two from construens bug
+Additive, non-breaking. Three fixes in the S3-blob / operator-surface area (two from internal bug
 reports). The presigned blob-upload path pulls the cloud minters into the default build (new SDK
 dependencies), but nothing is enabled without operator config + a guest grant.
 
@@ -2704,7 +2704,7 @@ refusal, which rejects attaching a not-yet-verified hostname. That refusal is a 
 ## [0.5.9] - 2026-09-27
 
 S3-compatible external blob ingress (#497) — a large, additive, non-breaking feature. No public
-HTTP/CLI/config break; existing guests and sites need no change. Companion `boatramp-uchron-shim` rev
+HTTP/CLI/config break; existing guests and sites need no change. Companion shim rev
 `716c640` (byte-faithful guest `blob-upload` WIT, off-by-default feature, pinned by rev).
 
 A general platform primitive: let a client **outside** the wasm sandbox upload large binary objects
@@ -3383,7 +3383,7 @@ exactly as a publish. Deny-by-default: an ungranted component has no binding.
   `dead_letter_count`/`backlog`/`in_flight_count`/`list_groups` substrate gauges (no new bookkeeping).
   Granted per component via a `messaging-stats` import + declared `stats_topics` templates; attached
   to functions, request handlers, and consumers with the invocation's host-resolved tenant.
-- **Shim:** a `compat::messaging_stats` guest module (`boatramp-uchron-shim`, off-by-default
+- **Shim:** a `compat::messaging_stats` guest module (the authoring kit's off-by-default
   `messaging-stats` feature) — `messaging_stats::get` / `groups` — imported in the function + consumer
   worlds.
 
@@ -3455,7 +3455,7 @@ RLS and then read cross-tenant. The runtime app role stays a non-owner, RLS-subj
   the only extensions a migration may enable. Neither a raw `sql` step nor a function's
   `migrate::exec` may `CREATE EXTENSION`; the sole path is an allowlist-gated,
   host-templated `extension` step.
-- **Shim:** a `compat::migrate` guest module (`boatramp-uchron-shim`, off-by-default
+- **Shim:** a `compat::migrate` guest module (the authoring kit's off-by-default
   `migrate` feature) so a migration function calls `migrate::exec(ddl)` / `migrate::query`
   ergonomically.
 - How-to: `docs/src/how-to/in-app-migrations.md` (leads with function steps + the bundle
@@ -3597,7 +3597,7 @@ first pass) and CI-run reconciliation tests.
   host; never removes); reads merge them back (round-trip unchanged); the domain-routing index is
   projected from the store. Removal is explicit via `domain rm` (which now also unbinds the host's
   context). Migrates a pre-0.4.23 site's embedded contexts to the store on its next write. Resolves the
-  construens `apply`-clobbers-contexts follow-up architecturally (a general "don't embed imperative
+  `apply`-clobbers-contexts follow-up architecturally (a general "don't embed imperative
   runtime state in a declarative object" separation), not just for this one field.
 - **Domain aliases reconcile against the verification store.** On a cooperative `apply`, an alias that is
   a **verified** (attached) domain survives even when the manifest omits it, while a merely-declared alias
@@ -3612,7 +3612,7 @@ Two changes. **Deploy resilience:** a many-function `apply` (e.g. one triggered 
 changes every component hash) no longer times out at the edge — the compile storm, the redundant
 re-introspect/recompose, and the O(N²) supergraph composition are all removed from the deploy hot
 path, and an optional accept-then-validate mode lets a slow-but-valid deploy return immediately —
-**without ever letting an unvalidated component serve**. **Cooperative apply (construens):** a
+**without ever letting an unvalidated component serve**. **Cooperative apply:** a
 declarative `apply` no longer wipes imperatively-written per-host `domains.contexts` / `domains.aliases`.
 Behind a security-review loop (converged to ship after two Medium fixes — an atomic batch promote and a
 stale-hash-skip clear — plus a Cloudflare-KV atomicity follow-up) and a new CI-hard live gate proving,
@@ -3643,7 +3643,7 @@ over a real engine, that a failed/non-composing deploy never activates nor serve
   while `domains.primary`/`wildcards`/`canonical_redirect` and all non-domain config stay
   manifest-authoritative (replace). So a declarative `apply` that doesn't mention a host's context/alias
   leaves it intact; removal stays explicit (`domain rm`). `domain add`/`rm`/attach remain authoritative
-  writers. Resolves the construens `apply`-clobbers-contexts gap (the `domain-source` funnel rollout
+  writers. Resolves the `apply`-clobbers-contexts gap (the `domain-source` funnel rollout
   blocker). No config-format change.
 
 ### Fixed
@@ -4432,8 +4432,8 @@ and CI-hard live gates.
   (byte-identical to every working deployment), and a longer one keeps a readable head
   plus a stable base-36 digest of the whole id (the same collision-resistant scheme the
   veth names use), so hostname, cgroup, veth, and log stem stay consistent and distinct
-  long ids never collide. (Regression surfaced on construens-preview, a 68-byte
-  hostname; construens, at 52 bytes, was unaffected.)
+  long ids never collide. (Regression surfaced on a preview deployment with a 68-byte
+  hostname; production, at 52 bytes, was unaffected.)
 
 ## [0.3.14] - 2026-09-03
 
@@ -4602,7 +4602,7 @@ IP-collision class the CI (which only ever launched one container) never hit.
 - **Default single-tenant install:** no action. The default project's compute
   identity (bare `<workload>-<replica>`), its `"data"` volume, and its bridge IPs
   are unchanged, so nothing re-provisions and no data moves.
-- **Per-tenant `Single` managed DB (the construens class):** on upgrade the boot
+- **Per-tenant `Single` managed DB:** on upgrade the boot
   reconcile now brings up exactly one container per tenant at a distinct, stable IP
   with a matching credential — the `password authentication failed` / *"no healthy
   replica"* failure clears with no manual step. If a prior broken run left a
@@ -5861,7 +5861,7 @@ IP-collision class the CI (which only ever launched one container) never hit.
 
 ### Added
 - **First-class Projects — the multi-site owning + tenant boundary.** A **project**
-  (Uchron's *Workspace*) owns many sites plus their functions and compute, and is the
+  (a *Workspace*) owns many sites plus their functions and compute, and is the
   tenant boundary a managed handler's row-level scope resolves to. New `boatramp
   project {create,ls,show,rm}` and a `/api/projects` + `/api/projects/<proj>/…` control
   surface; a global `--project` flag (falling back to `[publish].project` →

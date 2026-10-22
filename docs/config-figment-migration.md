@@ -32,8 +32,8 @@ different (overlapping, inconsistent) slice:
 **The core bug:** A and C are serve-only; B is everywhere. So `BOATRAMP_S3_BUCKET`
 (Loader A) is honored by `serve` but **not** by `boatramp migrate` / `blob migrate` — the
 offline ops that most need to resolve the real blob backend (this is exactly what the
-construens v0.34.0 offline finalize tripped over, and what the v0.34.0 targeted stopgap
-patched by hand in Loader B).
+v0.34.0 offline finalize tripped over, and what the v0.34.0 targeted stopgap patched
+by hand in Loader B).
 
 The fix: **one** resolution pipeline — `defaults → file → env → explicit flags` — built
 once and consumed by **every** subcommand.
@@ -45,7 +45,7 @@ Every input we honor today keeps working. In particular:
 - **Current env var names stay verbatim.** figment's generic `Env` provider derives names
   from struct paths, which would *rename* our many irregular ones. We do **not** use
   figment's `Env` provider; we supply a custom overlay (below) that reproduces the exact
-  names. A live deployment (construens) depends on these names.
+  names. A live deployment depends on these names.
 - **Dynamic-keyed maps + lists** keep populating from env.
 - **Secret-sourced inputs** stay exactly as they are (never routed through the config
   struct / figment).

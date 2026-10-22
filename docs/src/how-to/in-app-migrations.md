@@ -83,9 +83,9 @@ fn reason(e: &MigrateError) -> String {
 }
 ```
 
-> The [`compat::migrate`](https://docs.rs/) module in the `boatramp-uchron-shim` (its
-> off-by-default `migrate` feature) wraps this so a migration function calls
-> `migrate::exec(ddl)` / `migrate::query(sql)` ergonomically.
+> The `compat::migrate` module in the authoring kit (its off-by-default `migrate`
+> feature) wraps this so a migration function calls `migrate::exec(ddl)` /
+> `migrate::query(sql)` ergonomically.
 
 Four properties of a function step are load-bearing — know them before you write one:
 

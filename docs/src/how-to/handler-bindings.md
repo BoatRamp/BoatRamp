@@ -414,11 +414,10 @@ DESC`. `is_own()` is the underlying `0`/`1` expression (usable in `select`, or `
 keep only overrides). It **fails closed** without an own-tenant (`own`/`own+null`) read, and needs
 the experimental **`orm-own-pref`** capability — declare `requires = ["orm-own-pref"]`.
 
-The builder is provided by the authoring kit (the
-[boatramp-uchron-shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim) `compat::orm`
-module) behind its off-by-default `orm` cargo feature — turn it on only against a boatramp
-that ships the `orm` interface. See that kit's authoring guide for the full surface
-(inserts, upserts, `RETURNING`, JSON, subqueries, `UNION`, `CASE`, expressions, `own_first`).
+The builder is provided by the authoring kit's `compat::orm` module behind its
+off-by-default `orm` cargo feature — turn it on only against a boatramp that ships
+the `orm` interface. See that kit's authoring guide for the full surface (inserts,
+upserts, `RETURNING`, JSON, subqueries, `UNION`, `CASE`, expressions, `own_first`).
 
 See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
 for the full field list and [Cargo features](../reference/features.md) for the
