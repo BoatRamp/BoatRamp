@@ -79,30 +79,42 @@ fn conn(user: &str, password: &str, host: &str, port: u16, db: &str) -> PgConnec
     }
 }
 
-/// Run `psql -v ON_ERROR_STOP=1 -tAc <sql>` in an ephemeral container, returning
-/// `(exit_code, stdout_trimmed)`.
+/// Run `psql -v ON_ERROR_STOP=1 -tA -f -` (SQL fed on stdin) in an ephemeral container,
+/// returning `(exit_code, output_trimmed)`. Wrapped in `sh -c '… 2>&1'` so a failed
+/// statement's stderr merges into the sink — like `mysql_run`, because `run_ephemeral`
+/// keeps only the container's stdout and DROPS its stderr on a non-zero exit, which would
+/// otherwise hide WHY a setup/probe failed (e.g. a refused DDL). SQL on stdin (not a `-c`
+/// argv string) avoids shell-quoting crafted SQL. `PGOPTIONS` raises `client_min_messages`
+/// to `warning` so routine NOTICEs never pollute the captured output of an output-parsed
+/// probe (`SELECT …`); real errors still surface.
 async fn psql(
     backend: &dyn ComputeBackend,
     image: &str,
     c: &PgConnection,
     sql: &str,
 ) -> (i32, String) {
-    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
     let td = tempfile::tempdir().unwrap();
+    let sql_path = td.path().join("in.sql");
+    tokio::fs::write(&sql_path, sql).await.unwrap();
     let out_path = td.path().join("out");
     let argv = vec![
-        "psql".to_string(),
-        "-v".to_string(),
-        "ON_ERROR_STOP=1".to_string(),
-        "-tAc".to_string(),
-        sql.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "exec psql -v ON_ERROR_STOP=1 -tA -f - 2>&1".to_string(),
     ];
-    let env = c.env();
+    let mut env = c.env();
+    env.push((
+        "PGOPTIONS".to_string(),
+        "-c client_min_messages=warning".to_string(),
+    ));
+    let infile = tokio::fs::File::open(&sql_path).await.unwrap();
+    let mut rdr = infile.compat();
     let code = {
         let f = tokio::fs::File::create(&out_path).await.unwrap();
         let mut sink = f.compat_write();
         backend
-            .run_ephemeral(image, &argv, &env, None, &mut sink)
+            .run_ephemeral(image, &argv, &env, Some(&mut rdr), &mut sink)
             .await
             .expect("psql run_ephemeral")
     };
@@ -881,17 +893,21 @@ fn craft_chunked_pg_bundle(source: &str, db: &str, dump: &[u8]) -> Vec<u8> {
 /// the libsql `shadow_apply_refuses_writefile_and_load_extension` gate, driven end-to-end through
 /// `NodeProjectExport::import`, NOT a hand-provisioned role; Tier-2 / nightly). Self-skips.
 ///
-/// This proves the SURFACE: a crafted bundle whose chunked pg member defines a `LANGUAGE c`
-/// function — a DEFINITIVELY superuser-only op (unlike `CREATE EXTENSION`, which a trusted-marked
-/// extension like recent pgvector would let a db-owner install, false-REDing the gate; and unlike
-/// `COPY … TO PROGRAM`, which `pg_dump` never emits into a `-Fc` archive, so it can't ride a crafted
-/// bundle member) — is REFUSED when imported through the real driver on a MANAGED, Single/dedicated
-/// config, because the driver applies the untrusted dump as a freshly-minted EPHEMERAL NON-SUPERUSER
-/// role (the HIGH-1 fix) — NOT the bootstrap superuser. The import FAILS and the superuser-only
-/// side-effect never lands (the C function is absent from the live target, no `*__shadow_*` db
-/// remains, no `brexp_apply_*` role leaks). The companion `..._crafted_superuser_escape_refused_live`
-/// mechanism test covers the `COPY … TO PROGRAM` filesystem-marker escape against the same kind of
-/// non-superuser role. Emits `PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK`.
+/// This proves the SURFACE: a crafted bundle whose chunked pg member defines a `CREATE EVENT
+/// TRIGGER` — a DEFINITIVELY superuser-only op, and itself an import-time code-execution vector (an
+/// event trigger runs its function on DDL) — is REFUSED when imported through the real driver on a
+/// MANAGED, Single/dedicated config, because the driver applies the untrusted dump as a
+/// freshly-minted EPHEMERAL NON-SUPERUSER role (the HIGH-1 fix) — NOT the bootstrap superuser. An
+/// event trigger is chosen over the alternatives because it needs no external file (unlike a
+/// `LANGUAGE c` function, whose library Postgres accesses at CREATE even with
+/// `check_function_bodies=off`, so a nonexistent-lib payload cannot be created in the SOURCE),
+/// `pg_dump` emits it into a `-Fc` archive (unlike `COPY … TO PROGRAM`), and a db-owner cannot
+/// install it (unlike `CREATE EXTENSION` of a trusted-marked extension like recent pgvector, which
+/// would false-RED the gate). The import FAILS and the superuser-only side-effect never lands (the
+/// event trigger is absent from the live target, no `*__shadow_*` db remains, no `brexp_apply_*`
+/// role leaks). The companion `..._crafted_superuser_escape_refused_live` mechanism test covers the
+/// `COPY … TO PROGRAM` filesystem-marker escape against the same kind of non-superuser role. Emits
+/// `PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK`.
 #[tokio::test]
 async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     use boatramp_core::compute::{
@@ -938,9 +954,11 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     assert_eq!(code, 0, "version detect");
     let image = pg_client_image_for_server_version(&ver).expect("client image");
 
-    // --- build a crafted SOURCE db that defines a `LANGUAGE c` function (superuser-only) + dump
-    //     it. `check_function_bodies=off` lets the CREATE succeed in the source without loading the
-    //     (nonexistent) library; a restore still hits the superuser-only privilege check. ---
+    // --- build a crafted SOURCE db that defines a superuser-only `CREATE EVENT TRIGGER` + dump it.
+    //     The event trigger (its no-op plpgsql function is creatable by anyone) needs no external
+    //     file, is emitted by `pg_dump -Fc`, and a restore hits the superuser-only privilege check
+    //     ("permission denied to create event trigger"). The trigger is created LAST so its (empty)
+    //     body never fires on the source's own DDL. ---
     for sql in [
         format!("DROP DATABASE IF EXISTS {source_db}"),
         format!("CREATE DATABASE {source_db}"),
@@ -955,13 +973,17 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
         backend.as_ref(),
         &image,
         &src,
-        "SET check_function_bodies = off; \
-         CREATE FUNCTION brexp_evil_c() RETURNS integer \
-           AS 'nonexistent_lib', 'nonexistent_sym' LANGUAGE c; \
-         CREATE TABLE t(id int primary key);",
+        "CREATE TABLE t(id int primary key); \
+         CREATE FUNCTION brexp_evil_et_fn() RETURNS event_trigger \
+           LANGUAGE plpgsql AS $$ BEGIN END $$; \
+         CREATE EVENT TRIGGER brexp_evil_et ON ddl_command_start \
+           EXECUTE FUNCTION brexp_evil_et_fn();",
     )
     .await;
-    assert_eq!(c, 0, "define the LANGUAGE c function in the source: {o}");
+    assert_eq!(
+        c, 0,
+        "define the superuser-only event trigger in the source: {o}"
+    );
     let td = tempfile::tempdir().unwrap();
     let dumpf = td.path().join("src.pgc");
     {
@@ -973,7 +995,7 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
             .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
             .await
             .expect("pg_dump");
-        assert_eq!(code, 0, "pg_dump source (with the LANGUAGE c function)");
+        assert_eq!(code, 0, "pg_dump source (with the event trigger)");
     }
     let dump_bytes = std::fs::read(&dumpf).unwrap();
     let bundle = craft_chunked_pg_bundle("default", "app", &dump_bytes);
@@ -1039,8 +1061,8 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
         // published_endpoint=false ⇒ the seeded replica endpoint host is used verbatim.
         .with_managed_pg(backend.clone(), envelope, op, false)
-        // The refused op is a `LANGUAGE c` function (superuser-only regardless of any extension
-        // allowlist), so the allowlist is irrelevant here — empty.
+        // The refused op is a superuser-only event trigger (superuser-only regardless of any
+        // extension allowlist), so the allowlist is irrelevant here — empty.
         .with_trusted_extensions(vec![]);
 
     // --- import the crafted bundle THROUGH THE REAL DRIVER: must FAIL (escape refused) ---
@@ -1058,22 +1080,22 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
         .await;
     assert!(
         res.is_err(),
-        "import of a crafted bundle defining a LANGUAGE c function MUST fail (the non-superuser \
-         apply cannot CREATE a C-language function); got: {res:?}"
+        "import of a crafted bundle defining an event trigger MUST fail (the non-superuser \
+         apply cannot CREATE an event trigger); got: {res:?}"
     );
 
-    // --- side-effect never landed: the C function is absent from live, no shadow/role leaked ---
+    // --- side-effect never landed: the event trigger is absent from live, no shadow/role leaked ---
     let live = conn(&user, &password, &host, port, &live_db);
     let (_c, got) = psql(
         backend.as_ref(),
         &image,
         &live,
-        "SELECT 1 FROM pg_proc WHERE proname = 'brexp_evil_c'",
+        "SELECT 1 FROM pg_event_trigger WHERE evtname = 'brexp_evil_et'",
     )
     .await;
     assert!(
         got.trim().is_empty(),
-        "the crafted superuser-only function must NOT exist in the live target after a refused import"
+        "the crafted superuser-only event trigger must NOT exist in the live target after a refused import"
     );
     let (_c, shadows) = psql(
         backend.as_ref(),
@@ -1115,9 +1137,13 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
 ///
 /// Proves that a legit FULL dedicated bundle of a source DB that USES pgvector (a `vector(3)` column
 /// with rows) round-trips SUCCESSFULLY under the ephemeral NON-SUPERUSER apply when `vector` is on
-/// the trusted-extension allowlist: the superuser pre-creates `vector` in the shadow, so the dump's
-/// `CREATE EXTENSION IF NOT EXISTS vector` NO-OPS (no superuser needed) and the `vector(3)` table +
-/// rows restore as the ephemeral role. Drives the REAL `pg_dump` (the driver's export primitive) →
+/// the extension allowlist: the superuser pre-creates `vector` in the shadow, so the dump's
+/// `CREATE EXTENSION IF NOT EXISTS vector` NO-OPS (the existence check precedes the superuser
+/// privilege check, so no superuser is needed to re-run it) and the `vector(3)` table + rows restore
+/// as the ephemeral role. The dump is taken `--no-comments`, so the OWNER-only `COMMENT ON EXTENSION
+/// vector` that pg_dump would otherwise emit — which the non-superuser apply could not run on the
+/// superuser-owned extension — is absent (the extension's comment is re-set by CREATE EXTENSION
+/// regardless). Drives the REAL `pg_dump` (the driver's export primitive) →
 /// the REAL `NodeProjectExport::import`, then asserts: the import SUCCEEDS, the swapped-in live DB
 /// has the `vector` extension + the table rows intact, the ephemeral `brexp_apply_%` role is DROPPED,
 /// the `*__shadow_*` db is GONE, and the live DB is owned by the configured owner. This is the

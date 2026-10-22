@@ -877,6 +877,18 @@ fn pg_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// POSIX-single-quote each token of a driver-composed argv and join with spaces, so the
+/// command can run under `sh -c '… 2>&1'` (merging stderr into the captured sink). Only
+/// ever applied to driver-derived flags + identifiers — never a credential (the password
+/// rides in the env, e.g. PGPASSWORD), so the single-quoting is defense-in-depth, not a
+/// trust boundary. Each embedded `'` is closed, escaped as `'\''`, and reopened.
+fn sh_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The resolved reachable endpoint of a SQL database (managed or external) — the raw
 /// parts the ephemeral client connects with.
 struct SqlEndpoint {
@@ -3187,8 +3199,18 @@ impl NodeProjectExport {
             stage_dir,
         )
         .await?;
-        // Pre-create the allowlisted extensions in the shadow, as the SUPERUSER, connected to the
-        // shadow (extensions are database-local). `IF NOT EXISTS` so a re-run is a no-op.
+        // Pre-create the allowlisted extensions in the shadow AS THE SUPERUSER, connected to the
+        // shadow (extensions are database-local). `IF NOT EXISTS` so a re-run is a no-op. A
+        // non-trusted extension (e.g. pgvector — its control file sets no `trusted = true`) can
+        // only be installed by a superuser, so the pre-create MUST be the superuser; the untrusted
+        // dump's `CREATE EXTENSION IF NOT EXISTS <ext>` then no-ops under the non-superuser apply
+        // (the existence check precedes the privilege check, so an already-present extension needs
+        // no privilege). The dump's OWNER-only `COMMENT ON EXTENSION <ext>` — which the
+        // non-superuser apply could NOT run on this superuser-owned extension — is kept out of the
+        // bundle by dumping with `--no-comments` (see `pg_dump_invocation`); the extension's
+        // comment is re-set by CREATE EXTENSION regardless, so nothing is lost for the extension.
+        // A dump that references an extension NOT on the allowlist fails fail-closed under the
+        // non-superuser apply (correct: an untrusted bundle must not install an arbitrary extension).
         if !plan.trusted_extensions.is_empty() {
             let maint_shadow = PgShadowPlan {
                 maint: plan.maint_on_shadow(),
@@ -3362,12 +3384,24 @@ impl NodeProjectExport {
         let backend = self.require_backend()?.clone();
         let image = plan.image.clone();
         let inv = pg_restore_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        // Run the restore under `sh -c '… 2>&1'` so pg_restore's STDERR — where Postgres
+        // reports a refused/failed object — merges into the captured sink that the caller
+        // reads for the error message. `run_ephemeral` keeps only the container's stdout
+        // and DROPS stderr on a non-zero exit, so without this a failed import (a refused
+        // superuser-only escape, or any restore error) surfaces as an empty, causeless
+        // "exited N; live untouched: ". Only driver-derived flags + the shadow-db
+        // identifier (`[A-Za-z0-9_]`) are composed into the command — never the password,
+        // which rides in `inv.env` (PGPASSWORD); each token is POSIX single-quoted, and
+        // `exec` keeps the reported exit status pg_restore's own.
+        let cmd = format!("exec {} 2>&1", sh_join(&inv.argv));
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        let env = inv.env;
         Ok(tokio::spawn(async move {
             let mut reader = AsyncChannelReader::new(body_rx);
             let out = tokio::fs::File::create(&out_path).await.map_err(other)?;
             let mut sink = out.compat_write();
             backend
-                .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut reader), &mut sink)
+                .run_ephemeral(&image, &argv, &env, Some(&mut reader), &mut sink)
                 .await
                 .map_err(other)
         }))

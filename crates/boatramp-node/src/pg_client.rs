@@ -86,6 +86,16 @@ pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation
         "pg_dump".to_string(),
         "--no-owner".to_string(),
         "--no-privileges".to_string(),
+        // `--no-comments`: the atomic shadow-restore applies the dump as a NON-SUPERUSER
+        // ephemeral role (the inc2 RCE-on-import guard), which cannot run a `COMMENT ON
+        // EXTENSION <ext>` — that is OWNER-only, and a NON-trusted extension (e.g. pgvector,
+        // whose control file sets no `trusted = true`) can only be installed, hence owned, by
+        // the superuser that pre-creates it in the shadow. The extension's own comment is
+        // redundant anyway (CREATE EXTENSION re-sets it from the control file), so stripping
+        // comments loses nothing for the extension. PG16's pg_dump has no `--exclude-extension`
+        // (PG17+) to scope this to extensions only, so object comments are not carried through a
+        // project export; that is an accepted fidelity limitation, not a correctness one.
+        "--no-comments".to_string(),
         "-Fc".to_string(),
     ];
     if data_only {
