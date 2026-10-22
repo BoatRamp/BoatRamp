@@ -547,6 +547,42 @@ jobs:
             fi
           done
 
+      # PLAN-handler-tcp-egress TCP-EGRESS TLS-WRAP GATE (markers `TCP-EGRESS TLS WRAP OK` /
+      # `TCP-EGRESS GATE REUSE OK`, mailroom #15 Build A). The host-terminated outbound-TLS egress
+      # capability (`boatramp:handlers/tcp-egress`) dials a guest-named `host:port` and TERMINATES
+      # TLS itself, handing the guest only plaintext `wasi:io` streams; it reuses the SAME
+      # `wasi:sockets` grant/allowlist/posture gate + the SAME DNS-rebinding choke
+      # (`resolve_and_gate_tcp_egress`) as the gate above. This step drives the whole `tcp_egress::`
+      # module (gate reuse / SSRF-floor denial / opportunistic-refused / DNS-rebinding choke /
+      # connect-timeout / connect-failed / idle-timeout / the M1 candidate-cap + single-deadline
+      # proofs) and asserts the marker + pass count catch a silent skip/rename. MUTATION-VERIFIED
+      # (the #503 convention, UNLIKE the test itself — `tcpegress_tls_wrap_gate` does NOT toggle the
+      # mutation in-process; it just dials a real loopback TLS server and asserts the exact
+      # plaintext greeting came back): re-running that SAME test with
+      # `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap` set externally makes the client skip its own
+      # handshake, so the bytes it reads are the server's raw TLS record, never the greeting — MUST
+      # FAIL; a PASS-under-mutation (a hollow wrap) fails the merge.
+      - name: "tcp-egress TLS-wrap gate (host-terminated TLS, DNS-rebinding choke, M1 shared-deadline)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features tcp-egress tcp_egress:: -- --nocapture 2>&1 | tee tcp-egress-tls.log
+          grep -qE 'test result: ok\. 9 passed' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress TLS-wrap gate did not run all 9 cases (silent skip/rename, or the count drifted)" >&2; exit 1; }
+          grep -q 'TCP-EGRESS TLS WRAP OK' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress TLS-wrap gate never reached its marker (a host-TLS-termination regression)" >&2; exit 1; }
+          grep -q 'TCP-EGRESS GATE REUSE OK' tcp-egress-tls.log \
+            || { echo "::error::tcp-egress gate-reuse marker missing (the wasi:sockets grant/allowlist/posture reuse is not actually enforced for this capability)" >&2; exit 1; }
+          # Mutation guard: the SAME test, re-run with the env var set, MUST now fail.
+          if BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-handlers --features tcp-egress tcpegress_tls_wrap_gate \
+            -- --nocapture > tcp-egress-tls-mutation-skip_tls_wrap.log 2>&1; then
+            echo "::error::tcp-egress TLS-wrap gate is HOLLOW — it passed under skip_tls_wrap (the TLS handshake is not actually load-bearing)" >&2
+            exit 1
+          else
+            echo "tcp-egress TLS-wrap mutation verified: 'skip_tls_wrap' fails the gate as expected."
+          fi
+
       # DNS RECORD-VERIFY MATCH GATE (marker `RECORD-VERIFY MATCH OK`, mailroom #2 Phase 1). The pure
       # `record_verify::evaluate` matcher is the whole security surface of the generic multi-record
       # verifier: it decides Ok/Mismatch/Missing per record. This gate drives it (deterministic, no live

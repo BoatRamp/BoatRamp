@@ -1452,8 +1452,14 @@ interface tcp-egress {
 
   /// One host-dialed, host-terminated-TLS outbound connection. The guest never holds
   /// `wasi:sockets` — this resource (and the `wasi:io` streams it hands out) is its entire network
-  /// surface for the dial. Dropping it without an explicit `shutdown-output` closes the socket
-  /// abruptly (no TLS `close_notify`).
+  /// surface for the dial.
+  ///
+  /// Lifecycle: BEFORE `take-input`/`take-output` run, this resource owns the connection's split
+  /// halves, and dropping it closes the socket abruptly (no TLS `close_notify`). AFTER both takes,
+  /// this resource is INERT — the taken `input-stream`/`output-stream` resources now own the split
+  /// halves independently, so `connection` itself may be dropped first (immediately, harmlessly);
+  /// the TLS session only actually closes once BOTH taken streams have themselves been dropped.
+  /// `shutdown-output` is likewise only EFFECTIVE before `take-output` runs — see its own doc.
   ///
   /// Forward-compatibility note (Build B, STARTTLS): a `start-tls(sni: string, verify: verify-mode)
   /// -> result<_, egress-error>` method is designed to be ADDED here (append-only) alongside a new

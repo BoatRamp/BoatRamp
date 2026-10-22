@@ -21,9 +21,19 @@
 //!
 //! # DNS-rebinding choke point (load-bearing)
 //! `host` is resolved EXACTLY ONCE, inside [`crate::engine::resolve_and_gate_tcp_egress`]; each
-//! resolved candidate address is checked individually through the gate, and [`connect_dial`] below
-//! connects ONLY to an address already in that checked set — it never calls `lookup_host` again.
-//! See that function's doc comment for the attack this closes.
+//! resolved candidate address is checked individually through the gate, and [`connect_and_handshake`]
+//! below connects ONLY to an address already in that checked set — it never calls `lookup_host`
+//! again. See that function's doc comment for the attack this closes.
+//!
+//! # One shared deadline, capped fan-out (Security review M1)
+//! The WHOLE pipeline — resolve, gate-check every candidate, connect, and the TLS handshake — runs
+//! under exactly ONE `connect_timeout` ([`tcp_egress::Host::connect_tls`] is the only
+//! `tokio::time::timeout` call site in the dial path), mirroring the `wasi:http` egress path's
+//! single-budget semantics: never a separate timeout per gated candidate plus another for the
+//! handshake. An async host import can't be epoch-trapped, so an unbounded pipeline would let a
+//! guest naming a many-homed (or broad-CIDR-allowlisted) blackholed host pin a sync-lane slot for
+//! `(N+1)*connect_timeout` and fan out N TCP SYNs. [`MAX_DIAL_CANDIDATES`] additionally caps how
+//! many gate-checked candidates one dial ever attempts, independent of the time budget.
 //!
 //! Build A implements implicit TLS only (`verify-mode.strict`); `opportunistic` (Build B's relay
 //! path) is refused with `unsupported-verify-mode` rather than a relaxed verifier.
@@ -65,6 +75,23 @@ pub use tcp_egress_types::{EgressError, VerifyMode};
 /// stalling on per-chunk backpressure without buffering unboundedly.
 const TCP_EGRESS_WRITE_BUDGET: usize = 64 * 1024;
 
+/// Cap on how many gate-CHECKED candidate addresses one `connect-tls` dial ATTEMPTS (Security
+/// review M1) — independent of the shared `connect_timeout` budget (see the module docs), this
+/// bounds the TCP-SYN fan-out a guest-named many-homed (or broad-CIDR-allowlisted) target can
+/// cause for one call. A dual-stack-ish handful (4–8) covers normal multi-homing without letting a
+/// pathological allowlist multiply the attempt count unboundedly.
+const MAX_DIAL_CANDIDATES: usize = 8;
+
+/// Fixed, non-verbose reason strings for `connect-failed`/`tls-failure` (Security review L1) —
+/// parity with the `wasi:http` egress path's generic `ConnectionRefused`/`TlsProtocolError`: raw
+/// `io::Error`/rustls `Display` text (which can echo OS-specific detail, or an internal
+/// address/port resolved from a domain allowlist entry) never reaches the guest.
+const REASON_CONNECT_FAILED: &str = "connect failed";
+const REASON_TLS_CONFIG: &str = "tls configuration error";
+const REASON_INVALID_SNI: &str = "invalid sni";
+const REASON_TLS_HANDSHAKE: &str = "tls handshake failed";
+const REASON_INTERNAL: &str = "internal error";
+
 /// A boxed, type-erased `AsyncRead`/`AsyncWrite` half. `Box<dyn Trait>` is `Unpin` regardless of the
 /// pointee, so [`TcpEgressConnection`] needs no `Pin` ceremony. Boxing (rather than a concrete
 /// `tokio_rustls::client::TlsStream<TcpStream>` split half) is what lets the anti-hollow
@@ -76,6 +103,11 @@ type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin + 'static>;
 /// The host-dialed, (normally) host-terminated-TLS outbound connection a granted guest holds. Not
 /// constructible by the guest — returned by `connect-tls`. See the module docs for the
 /// forward-compatibility note re: Build B's `start-tls`.
+///
+/// Lifecycle: while `input`/`output` are still `Some` (before the guest's `take-input`/
+/// `take-output`), dropping this value closes the socket abruptly. Once BOTH are taken, this
+/// struct holds nothing live — it is inert, droppable in any order, and the connection only
+/// actually closes once BOTH taken `wasi:io` streams have themselves been dropped.
 pub struct TcpEgressConnection {
     /// `None` once handed off by `take-input`.
     input: Option<BoxedRead>,
@@ -198,9 +230,19 @@ impl TcpEgressConnection {
     }
 
     /// Half-close the write side if it hasn't been taken yet; a no-op otherwise (see the WIT doc).
+    /// Security review L2: the flush/shutdown itself is bounded by `idle_timeout` — a peer that
+    /// fills its receive window and stops reading would otherwise pend this await for as long as
+    /// TCP's own (far longer) retransmission timers, and an async host import can't be
+    /// epoch-trapped out of it. A timeout here is a best-effort abandon (same as any other failure
+    /// path — `shutdown-output` never reports an error), not a graceful close; the socket is still
+    /// dropped once the resource itself is dropped.
     async fn shutdown_output(&mut self) {
         if let Some(mut w) = self.output.take() {
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+            let _ = tokio::time::timeout(
+                self.idle_timeout,
+                tokio::io::AsyncWriteExt::shutdown(&mut w),
+            )
+            .await;
         }
     }
 }
@@ -256,23 +298,28 @@ impl tcp_egress::Host for TcpEgressHost<'_> {
             return Err(EgressError::UnsupportedVerifyMode);
         }
 
-        // The DNS-rebinding choke: resolve ONCE, check EACH candidate through the reused gate.
-        let checked = resolve_and_gate_tcp_egress(
-            &host,
-            port,
-            &self.allowlist,
-            self.allow_private,
-            self.enabled,
+        // Security review M1: the WHOLE resolve + gate-check + connect + handshake pipeline runs
+        // under exactly ONE `connect_timeout` — this is the ONLY `tokio::time::timeout` call site
+        // in the dial path (see the module docs). `dial_pipeline` itself carries no timeout of its
+        // own, so a slow DNS resolve simply leaves correspondingly less budget for the
+        // connect/handshake rather than adding a fresh window on top.
+        let dialed = tokio::time::timeout(
+            self.connect_timeout,
+            dial_pipeline(
+                &host,
+                port,
+                &sni,
+                &self.allowlist,
+                self.allow_private,
+                self.enabled,
+                &self.extra_roots,
+            ),
         )
         .await
-        .map_err(|e| match e {
-            TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
-            TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
-        })?;
+        .map_err(|_| EgressError::ConnectTimeout)
+        .and_then(|r| r)?;
 
-        let (input, output) = connect_dial(&checked, &sni, self.connect_timeout, &self.extra_roots)
-            .await
-            .map(split_boxed)?;
+        let (input, output) = split_boxed(dialed);
 
         let conn = TcpEgressConnection {
             input: Some(input),
@@ -281,7 +328,7 @@ impl tcp_egress::Host for TcpEgressHost<'_> {
         };
         self.table
             .push(conn)
-            .map_err(|e| EgressError::Other(e.to_string()))
+            .map_err(|_| EgressError::Other(REASON_INTERNAL.to_string()))
     }
 }
 
@@ -346,9 +393,10 @@ fn split_boxed(stream: DialedStream) -> (BoxedRead, BoxedWrite) {
     }
 }
 
-/// What [`connect_dial`] hands back: normally the TLS-terminated stream. The `RawMutation` arm
-/// exists ONLY to let the anti-hollow `skip_tls_wrap` mutation (test / `tcpegress-gate-mutation`
-/// feature) hand back the pre-handshake TCP stream instead — never constructed in a shipped build.
+/// What [`connect_and_handshake`] hands back: normally the TLS-terminated stream. The
+/// `RawMutation` arm exists ONLY to let the anti-hollow `skip_tls_wrap` mutation (test /
+/// `tcpegress-gate-mutation` feature) hand back the pre-handshake TCP stream instead — never
+/// constructed in a shipped build.
 enum DialedStream {
     // Boxed: a `TlsStream` is large relative to a bare `TcpStream`, and this enum is otherwise
     // short-lived (immediately split into the two boxed halves `TcpEgressConnection` stores).
@@ -357,40 +405,66 @@ enum DialedStream {
     RawMutation(tokio::net::TcpStream),
 }
 
-/// Connect to one of the already-gate-CHECKED `addrs` (the DNS-rebinding choke's output — see the
-/// module docs) and terminate TLS. NEVER resolves `sni`/any hostname again; every candidate in
-/// `addrs` is dialed in order, the first successful TCP connect wins, and the TLS handshake (or, ONLY
-/// under the `skip_tls_wrap` mutation, nothing) runs against that same connected socket. Both the
-/// connect and the handshake share ONE `connect_timeout` budget per candidate (establishing the
-/// connection is one conceptual step).
-async fn connect_dial(
-    addrs: &[std::net::SocketAddr],
-    sni: &str,
-    connect_timeout: Duration,
-    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
-) -> Result<DialedStream, EgressError> {
-    let mut last_err: Option<String> = None;
-    let mut saw_timeout = false;
-    let mut tcp_stream = None;
-    for addr in addrs {
-        match tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
-                tcp_stream = Some(s);
-                break;
-            }
-            Ok(Err(e)) => last_err = Some(e.to_string()),
-            Err(_) => saw_timeout = true,
+// Manual (not derived) `Debug`: `tokio_rustls::client::TlsStream`/`TcpStream` don't implement it,
+// and this is only ever needed for a test's `expect_err` message.
+impl std::fmt::Debug for DialedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tls(_) => f.write_str("DialedStream::Tls(..)"),
+            #[cfg(any(test, feature = "tcpegress-gate-mutation"))]
+            Self::RawMutation(_) => f.write_str("DialedStream::RawMutation(..)"),
         }
     }
-    let tcp_stream = match tcp_stream {
-        Some(s) => s,
-        None if last_err.is_none() && saw_timeout => return Err(EgressError::ConnectTimeout),
-        None => {
-            return Err(EgressError::ConnectFailed(last_err.unwrap_or_else(|| {
-                "every candidate address refused the connection".into()
-            })));
+}
+
+/// Resolve `host`, gate-check every candidate (the DNS-rebinding choke — see the module docs), and
+/// connect + terminate TLS over the first of at most [`MAX_DIAL_CANDIDATES`] checked addresses to
+/// succeed. Carries NO timeout of its own (Security review M1): [`tcp_egress::Host::connect_tls`]
+/// wraps this ENTIRE call in one `connect_timeout`, so a slow resolve leaves correspondingly less
+/// budget for the connect/handshake rather than adding a fresh window on top of it.
+async fn dial_pipeline(
+    host: &str,
+    port: u16,
+    sni: &str,
+    allowlist: &[String],
+    allow_private: bool,
+    posture: bool,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<DialedStream, EgressError> {
+    let checked = resolve_and_gate_tcp_egress(host, port, allowlist, allow_private, posture)
+        .await
+        .map_err(|e| match e {
+            TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
+            TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
+        })?;
+    // Security review M1: cap how many gate-checked candidates this dial ATTEMPTS — independent of
+    // the shared time budget above, so a many-homed (or broad-CIDR-allowlisted) target can't fan
+    // out an unbounded number of TCP SYNs for one guest call.
+    let candidates = &checked[..checked.len().min(MAX_DIAL_CANDIDATES)];
+    connect_and_handshake(candidates, sni, extra_roots).await
+}
+
+/// Connect to the first of the already-gate-CHECKED `addrs` to succeed, and terminate TLS (or, ONLY
+/// under the `skip_tls_wrap` mutation, nothing) over that same connected socket. NEVER resolves
+/// `sni`/any hostname again. Carries no timeout of its own — see [`dial_pipeline`]'s doc; it is
+/// cancelled cleanly (a plain future drop) if the caller's single outer timeout fires at any point,
+/// mid-loop or mid-handshake.
+async fn connect_and_handshake(
+    addrs: &[std::net::SocketAddr],
+    sni: &str,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<DialedStream, EgressError> {
+    let mut tcp_stream = None;
+    for addr in addrs {
+        if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+            tcp_stream = Some(s);
+            break;
         }
-    };
+    }
+    // Security review L1: a coarse, fixed reason — never the raw `io::Error` text (which can echo
+    // OS-specific detail or an internal address resolved from a domain allowlist entry).
+    let tcp_stream =
+        tcp_stream.ok_or_else(|| EgressError::ConnectFailed(REASON_CONNECT_FAILED.to_string()))?;
 
     // ANTI-HOLLOW MUTATION SEAM (`tcpegress-gate-mutation` / cfg(test) only — NEVER in a shipped
     // build, since the feature is never enabled there): `skip_tls_wrap` hands back the RAW TCP
@@ -403,15 +477,14 @@ async fn connect_dial(
     }
 
     let tls_config = guest_egress_client_config(extra_roots)
-        .map_err(|_| EgressError::TlsFailure("TLS client config error".into()))?;
+        .map_err(|_| EgressError::TlsFailure(REASON_TLS_CONFIG.to_string()))?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-        .map_err(|e| EgressError::TlsFailure(format!("invalid SNI {sni:?}: {e}")))?;
-    let tls_stream =
-        tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp_stream))
-            .await
-            .map_err(|_| EgressError::ConnectTimeout)?
-            .map_err(|e| EgressError::TlsFailure(e.to_string()))?;
+        .map_err(|_| EgressError::TlsFailure(REASON_INVALID_SNI.to_string()))?;
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|_| EgressError::TlsFailure(REASON_TLS_HANDSHAKE.to_string()))?;
     Ok(DialedStream::Tls(Box::new(tls_stream)))
 }
 
@@ -445,15 +518,6 @@ mod tests {
     use super::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use wasmtime_wasi::Pollable as _;
-
-    /// Serializes every test in this module that touches `BOATRAMP_TCPEGRESS_TLS_MUTATION`
-    /// (setting it OR relying on it being unset) — mirrors `engine.rs`'s own `ENV_LOCK` discipline
-    /// for `BOATRAMP_ASYNCLANE_MUTATION`/`BOATRAMP_TCPEGRESS_MUTATION`, since Rust's test harness
-    /// runs tests in parallel threads within one process and the env var is process-global. An
-    /// async-aware `tokio::sync::Mutex` (not `std::sync::Mutex`, which `engine.rs`'s tests use) —
-    /// this module's critical sections span real `.await`s (the network dial itself), which a
-    /// `std::sync::Mutex` guard must never be held across.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Mint a throwaway CA + a `localhost` leaf signed by it (mirrors
     /// `engine::egress_tls_tests::ca_and_leaf`, duplicated here so this module's tests are
@@ -558,50 +622,36 @@ mod tests {
         Ok(buf)
     }
 
-    /// `PLAN-handler-tcp-egress` Build A anti-hollow gate (mirrors the inbound TE-3 harness style):
-    /// a REAL loopback TLS server hands a plaintext greeting through `connect-tls` + `take-input` —
-    /// proving the host actually dials, terminates TLS, and exposes decrypted bytes to the guest as
-    /// `wasi:io`. MUTATION-VERIFIED: re-run with `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap` the
-    /// SAME kind of assertion MUST fail (the client skips its own handshake, so what arrives on the
-    /// wire is the server's raw TLS handshake record, never the plaintext greeting) — proving the
-    /// TLS wrap is load-bearing, not cosmetic. Prints the grep-able marker `TCP-EGRESS TLS WRAP OK`.
+    /// `PLAN-handler-tcp-egress` Build A anti-hollow gate (mirrors the `tcp_egress_allowlist_gate` /
+    /// `tcp_listener_dispatch_gate` #503 mutation-loop convention — this test does NOT toggle the
+    /// mutation itself): a REAL loopback TLS server hands a plaintext greeting through
+    /// `connect-tls` + `take-input` — proving the host actually dials, terminates TLS, and exposes
+    /// decrypted bytes to the guest as `wasi:io`. Prints the grep-able marker `TCP-EGRESS TLS WRAP
+    /// OK`. MUTATION-VERIFIED externally: the CI gate re-runs this EXACT test with
+    /// `BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap` set in the environment, which must make it
+    /// FAIL (the client then skips its own handshake, so what arrives on the wire is the server's
+    /// raw TLS handshake record, never the plaintext greeting) — proving the TLS wrap is
+    /// load-bearing, not cosmetic. A plain `cargo test` run (the var unset) always takes the clean
+    /// path.
     #[tokio::test]
-    async fn tcpegress_mutation() {
-        let _g = ENV_LOCK.lock().await;
-        unsafe { std::env::remove_var("BOATRAMP_TCPEGRESS_TLS_MUTATION") };
-
+    async fn tcpegress_tls_wrap_gate() {
         let (ca, chain, key) = ca_and_leaf();
         const GREETING: &[u8] = b"TCP-EGRESS TLS OK";
         let port = spawn_tls_server(chain, key, GREETING).await;
         let allow = [format!("127.0.0.1:{port}")];
         let allow_refs: Vec<&str> = allow.iter().map(String::as_str).collect();
 
-        let clean = dial_and_read(port, true, &allow_refs, std::slice::from_ref(&ca)).await;
-        match clean {
+        let dialed = dial_and_read(port, true, &allow_refs, std::slice::from_ref(&ca)).await;
+        match dialed {
             Ok(bytes) => assert_eq!(
                 bytes, GREETING,
-                "a clean dial must terminate TLS and hand back the server's plaintext greeting"
+                "a clean dial must terminate TLS and hand back the server's plaintext greeting \
+                 (a failure here under BOATRAMP_TCPEGRESS_TLS_MUTATION=skip_tls_wrap is the \
+                 EXPECTED mutation-verification outcome, not a real regression)"
             ),
-            Err(e) => panic!("clean dial failed: {e:?}"),
+            Err(e) => panic!("dial failed: {e}"),
         }
         println!("TCP-EGRESS TLS WRAP OK");
-
-        // Mutation guard: skip the TLS wrap and prove the SAME assertion now fails. A fresh server
-        // instance (the first was consumed by the clean dial above).
-        unsafe { std::env::set_var("BOATRAMP_TCPEGRESS_TLS_MUTATION", "skip_tls_wrap") };
-        let (ca2, chain2, key2) = ca_and_leaf();
-        let port2 = spawn_tls_server(chain2, key2, GREETING).await;
-        let allow2 = [format!("127.0.0.1:{port2}")];
-        let allow2_refs: Vec<&str> = allow2.iter().map(String::as_str).collect();
-        let mutated = dial_and_read(port2, true, &allow2_refs, std::slice::from_ref(&ca2)).await;
-        unsafe { std::env::remove_var("BOATRAMP_TCPEGRESS_TLS_MUTATION") };
-
-        let hollow = matches!(mutated.as_deref(), Ok(bytes) if bytes == GREETING);
-        assert!(
-            !hollow,
-            "HOLLOW GATE: skipping the TLS wrap must NOT still produce the server's plaintext \
-             greeting (got {mutated:?}) — the wrap is supposed to be load-bearing"
-        );
     }
 
     /// Gate reuse (the capability-specific checks, PLAN-handler-tcp-egress Build A): a target
@@ -730,8 +780,6 @@ mod tests {
     /// hanging the invocation.
     #[tokio::test]
     async fn tls_handshake_hang_times_out() {
-        let _g = ENV_LOCK.lock().await;
-        unsafe { std::env::remove_var("BOATRAMP_TCPEGRESS_TLS_MUTATION") };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         // Keep the listener alive (bound + listening) but never accept — the connect itself
@@ -771,8 +819,6 @@ mod tests {
     /// drop the listener) — loopback refuses instantly.
     #[tokio::test]
     async fn connect_refused_is_connect_failed_not_timeout() {
-        let _g = ENV_LOCK.lock().await;
-        unsafe { std::env::remove_var("BOATRAMP_TCPEGRESS_TLS_MUTATION") };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -797,7 +843,12 @@ mod tests {
         )
         .await
         .expect_err("a refused connect must not look like success");
-        assert!(matches!(err, EgressError::ConnectFailed(_)), "{err:?}");
+        // Security review L1: the payload is the fixed, coarse reason — never a raw `io::Error`
+        // (which on most platforms would read something like "Connection refused (os error 61)").
+        match err {
+            EgressError::ConnectFailed(reason) => assert_eq!(reason, REASON_CONNECT_FAILED),
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
     }
 
     /// The `IdleTimeout` adapter: a reader that never produces data must surface a `TimedOut` io
@@ -814,5 +865,120 @@ mod tests {
             .await
             .expect_err("a silent peer must time out, not hang forever");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Security review M1 (the cap half): `dial_pipeline` only ever ATTEMPTS the first
+    /// [`MAX_DIAL_CANDIDATES`] gate-checked addresses. Construct `MAX_DIAL_CANDIDATES` refused
+    /// candidates (distinct LOW ports on loopback — ports 1.. are essentially never listened on in
+    /// a test sandbox, so these refuse immediately, never hang) followed by ONE real listener as
+    /// the `(MAX_DIAL_CANDIDATES + 1)`-th candidate: if the cap is respected, that listener is
+    /// NEVER reached, so the whole dial still fails. A control run puts the SAME listener WITHIN
+    /// the cap and confirms it IS reached (the dial then fails only at the TLS handshake, because
+    /// the listener speaks no TLS — proving the TCP connect itself succeeded).
+    ///
+    /// Deliberately all on `127.0.0.1` (never a second loopback alias like `127.0.0.2`): macOS
+    /// only auto-configures `127.0.0.1` on `lo0` — the rest of `127.0.0.0/8` needs an explicit
+    /// `ifconfig … alias`, which a test must not depend on.
+    #[tokio::test]
+    async fn max_dial_candidates_caps_the_attempted_set() {
+        // A real listener standing in for "a candidate that WOULD succeed if tried". Accepts and
+        // immediately drops every connection — this test is about candidate-count capping, not
+        // the handshake (covered by `tcpegress_tls_wrap_gate`/`tls_handshake_hang_times_out`).
+        let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = good.accept().await {
+                drop(socket);
+            }
+        });
+
+        // `MAX_DIAL_CANDIDATES` low, almost-certainly-unused ports on loopback, then the good one
+        // (its OS-assigned ephemeral port, necessarily distinct) as the candidate immediately
+        // BEYOND the cap.
+        let mut candidates: Vec<std::net::SocketAddr> = (1..=MAX_DIAL_CANDIDATES as u16)
+            .map(|p| std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+            .collect();
+        assert_eq!(candidates.len(), MAX_DIAL_CANDIDATES);
+        candidates.push(good_addr);
+
+        let beyond_cap = &candidates[..candidates.len().min(MAX_DIAL_CANDIDATES)];
+        let err = connect_and_handshake(beyond_cap, "localhost", &[])
+            .await
+            .expect_err(
+                "every candidate WITHIN the cap is refused; the good one beyond it must never \
+                 be attempted",
+            );
+        assert!(
+            matches!(err, EgressError::ConnectFailed(_)),
+            "beyond the cap, the dial must fail the same way as if the good candidate didn't \
+             exist at all; got {err:?}"
+        );
+
+        // Control: move the good address to WITHIN the cap (replace the last refused entry) and
+        // confirm it IS reached — the TCP connect succeeds, so the failure moves to the handshake.
+        let mut within_cap = candidates[..MAX_DIAL_CANDIDATES - 1].to_vec();
+        within_cap.push(good_addr);
+        assert_eq!(within_cap.len(), MAX_DIAL_CANDIDATES);
+        let err2 = connect_and_handshake(&within_cap, "localhost", &[])
+            .await
+            .expect_err("the good address speaks no TLS, so the handshake must fail");
+        assert!(
+            matches!(err2, EgressError::TlsFailure(_)),
+            "a reachable-but-non-TLS peer within the cap must fail at the HANDSHAKE stage (proving \
+             the connect itself succeeded), not ConnectFailed; got {err2:?}"
+        );
+    }
+
+    /// Security review M1 (the shared-deadline half): the WHOLE `connect_tls` pipeline (resolve +
+    /// gate-check + connect + handshake) is bounded by roughly ONE `connect_timeout`, not a sum of
+    /// separate per-phase budgets — reusing the handshake-hang technique
+    /// (`tls_handshake_hang_times_out`) as the one kind of "slow step" this test suite can simulate
+    /// hermetically (a genuinely unresponsive TCP peer only fails on the OS's own SYN-retry timers,
+    /// tens of seconds, so a true many-SLOW-candidate network blackhole can't be reproduced in a
+    /// fast unit test — see [`max_dial_candidates_caps_the_attempted_set`] for the complementary
+    /// fan-out-cap proof, and the module docs for why ONE `tokio::time::timeout` call site is now
+    /// the whole story). Before the fix, the (here, trivially-fast) TCP connect and the handshake
+    /// hang each had their OWN separate `connect_timeout` window, stacking to roughly 2x; now there
+    /// is exactly one.
+    #[tokio::test]
+    async fn single_deadline_bounds_the_whole_pipeline_not_per_phase() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _keep_alive = listener;
+
+        let allow = vec![format!("127.0.0.1:{port}")];
+        let connect_timeout = Duration::from_millis(150);
+        let mut table = ResourceTable::new();
+        let mut host = TcpEgressHost::new(
+            &mut table,
+            true,
+            true,
+            Arc::from(allow),
+            Arc::from(Vec::new()),
+            connect_timeout,
+            Duration::from_secs(5),
+        );
+        let started = std::time::Instant::now();
+        let err = tcp_egress::Host::connect_tls(
+            &mut host,
+            "127.0.0.1".to_string(),
+            port,
+            "localhost".to_string(),
+            VerifyMode::Strict,
+        )
+        .await
+        .expect_err("a hung handshake must still time out");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, EgressError::ConnectTimeout), "{err:?}");
+        // A generous ceiling (2x the budget), comfortably below what stacking a separate
+        // connect-phase timeout and a separate handshake-phase timeout would have allowed under
+        // the pre-fix code (which could reach ~2x `connect_timeout` even for this single-candidate
+        // case, since the TCP connect itself has its own full timeout window before the
+        // handshake's), while tolerant of ordinary scheduler jitter in CI.
+        assert!(
+            elapsed < connect_timeout * 2,
+            "the whole pipeline must be bounded by roughly ONE connect_timeout \
+             ({connect_timeout:?}), not stacked per-phase budgets — took {elapsed:?}"
+        );
     }
 }
