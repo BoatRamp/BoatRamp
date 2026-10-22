@@ -1,0 +1,14 @@
+// Example WebAssembly *session* guest world (mailroom cap-req 17): imports the boatramp `session`
+// host half and exports the `session-handler` the engine re-enters once per inbound batch (mechanism
+// B), identically to `session-echo`. Unlike `session-echo`, this guest is SERVER-SPEAKS-FIRST: it
+// greets on the first re-entry that has NOT yet checkpointed `greeted`, regardless of whether that
+// re-entry carries any frames — which is exactly what makes it greet on the host's connect-time
+// dispatch (an empty `frames: []` batch, no guest/WIT change needed). Built to a component with
+// `cargo build --release --target wasm32-wasip2`; consumed as a fixture by the session-listener
+// live-capability gate proving the connect-greeting mechanism end to end.
+package boatramp:caps-example;
+
+world session-greet {
+  import boatramp:handlers/session;
+  export boatramp:handlers/session-handler;
+}

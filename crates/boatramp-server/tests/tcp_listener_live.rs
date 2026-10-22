@@ -52,6 +52,13 @@ const TCP_SPIN: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/t
 #[cfg(feature = "session")]
 const SESSION_ECHO: &[u8] =
     include_bytes!("../../boatramp-handlers/tests/fixtures/session-echo.wasm");
+/// A SERVER-SPEAKS-FIRST `session-handler` guest (mailroom cap-req 17): greets ("* OK session-greet
+/// ready\r\n") on the first re-entry that has not yet checkpointed a `greeted` flag — including a
+/// re-entry carrying NO frames, i.e. the host's connect-time dispatch. Echoes any later frame back
+/// prefixed `GOT:`, and closes on a `cancel` frame. See `examples/handlers/session-greet`.
+#[cfg(feature = "session")]
+const SESSION_GREET: &[u8] =
+    include_bytes!("../../boatramp-handlers/tests/fixtures/session-greet.wasm");
 
 const SITE: &str = "edgesite";
 const COMPONENT: &str = "tcp/handler.wasm";
@@ -881,5 +888,91 @@ async fn session_listener_live_reentry_checkpoint_and_instance_release() {
         "SESSION-LISTENER LIVE OK: re-entry + checkpoint-resume across the instance drop, two frames \
          drove two instantiations (no pinned instance), survived an idle gap, clean EOF teardown, \
          and posture-OFF refuses the re-entry (guest never instantiated)."
+    );
+}
+
+/// cap-req 17 LIVE gate: the host's CONNECT-TIME dispatch (an empty `frames: []` batch invoked once,
+/// BEFORE the first inbound read) lets a server-speaks-first guest `send` its greeting without
+/// waiting for the client to write anything first — the INVERSE of
+/// [`session_listener_live_reentry_checkpoint_and_instance_release`] (which writes `"hello"` before
+/// its first read). Drives a REAL `session-greet` guest over a REAL loopback socket: the client
+/// reads the greeting FIRST (no prior write — this is the whole point: a greeting-first client like
+/// Thunderbird/Apple Mail/Python `imaplib` would otherwise deadlock), then writes one frame and reads
+/// the ordinary echoed reply — proving the connection falls straight through to the normal read loop
+/// afterwards (no hang, no added latency beyond the one connect-time guest invocation).
+#[cfg(feature = "session")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_listener_live_connect_greeting_before_client_speaks() {
+    const GREETING: &[u8] = b"* OK session-greet ready\r\n";
+
+    let (runtime, deploy) = live_runtime(SESSION_GREET, 42).await;
+    let base_insts = runtime
+        .instance_stats()
+        .expect("engine present")
+        .session
+        .instantiations;
+    let (handle, addr) = bind_and_serve_session(
+        runtime.clone(),
+        deploy,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let _ = client.set_nodelay(true);
+
+    // THE proof: read the greeting WITHOUT writing anything first. Pre-cap-req-17, the guest's
+    // first re-entry happens only after the client writes ≥1 byte, so this read would hang forever
+    // against the old shape — bounded here so a regression turns the test RED, not a CI hang.
+    let mut got = vec![0u8; GREETING.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut got))
+        .await
+        .expect(
+            "connect-time greeting read timed out — the guest never greeted before the client wrote",
+        )
+        .expect("connect-time greeting read failed");
+    assert_eq!(
+        &got, GREETING,
+        "the guest must greet on the EMPTY connect-time batch, before any client byte"
+    );
+
+    // The connect dispatch alone must have instantiated the guest (the hibernation property holds
+    // for it too: no instance is held between the connect dispatch and the next re-entry).
+    let after_connect = runtime
+        .instance_stats()
+        .expect("engine present")
+        .session
+        .instantiations;
+    assert!(
+        after_connect - base_insts >= 1,
+        "the connect-time dispatch must instantiate the guest: {base_insts} → {after_connect}"
+    );
+
+    // Normal operation continues straight afterwards: one real frame gets the ordinary echoed
+    // reply — no hang, no extra latency; the driver fell through to the read loop as required.
+    client.write_all(b"hi").await.unwrap();
+    let mut got2 = vec![0u8; b"GOT:hi".len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut got2))
+        .await
+        .expect("post-greeting echo read timed out")
+        .expect("post-greeting echo read failed");
+    assert_eq!(
+        &got2, b"GOT:hi",
+        "the connection must fall through to the ordinary read loop after the connect dispatch"
+    );
+
+    // Clean close: drop the client → the driver reads EOF → the connection ends cleanly (bounded).
+    drop(client);
+    let (res, _) = await_dispatch(handle, Duration::from_secs(5), "session-connect-greeting").await;
+    assert!(
+        res.is_ok(),
+        "session connection ends cleanly on peer EOF: {res:?}"
+    );
+
+    println!(
+        "SESSION CONNECT GREETING OK: a server-speaks-first guest greeted at connect — BEFORE the \
+         client wrote anything — then normal re-entry continued unaffected (one frame echoed), and \
+         the connection tore down cleanly on EOF."
     );
 }

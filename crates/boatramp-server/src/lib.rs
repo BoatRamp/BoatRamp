@@ -1166,6 +1166,12 @@ impl HandlerRuntime {
     /// protocol-agnostic: each read chunk is delivered as one opaque frame and the guest reassembles
     /// partial protocol units across re-entries via its checkpoint.
     ///
+    /// **Connect-time dispatch (cap-req 17):** BEFORE the first inbound read, the guest is re-entered
+    /// once with an empty `frames: []` batch, so a server-speaks-first protocol (IMAP `* OK` / SMTP
+    /// `220` / POP3 `+OK`) can `send` its greeting + `checkpoint` at accept, without waiting for the
+    /// client to speak first. A guest that doesn't greet on an empty batch is a no-op here and the
+    /// connection proceeds straight to the read loop.
+    ///
     /// Delivery is **at-least-once** w.r.t. guest effects (Security review INFO): a `send` reaches the
     /// wire and a `checkpoint` updates the in-memory cell DURING a re-entry, but a per-invocation SQL
     /// txn commits only on a clean re-entry — so a trap AFTER a `send` leaves bytes already on the wire
@@ -1257,6 +1263,95 @@ impl HandlerRuntime {
         );
 
         let deadline = tokio::time::Instant::now() + max_conn_duration;
+
+        // Connect-time dispatch (mailroom cap-req 17): invoke the guest ONCE, BEFORE the first
+        // inbound read, with an EMPTY `frames: []` batch — the host's "connect" re-entry for a
+        // server-speaks-first protocol (IMAP `* OK` / SMTP `220` / POP3 `+OK`). `resumed` is
+        // `state.checkpoint_snapshot()`, which is `None` here (the state was just created above) —
+        // exactly the shape the FIRST inbound re-entry would otherwise carry, so this is simply "the
+        // guest's first re-entry happens at connect instead of waiting on the first client byte".
+        // Zero WIT/guest change: `session-input { id, resumed, frames }` already allows an empty
+        // `frames` list. A guest that doesn't greet (a client-speaks-first guest) returns having sent
+        // nothing, and the driver falls straight through to the read loop below — one extra guest
+        // invocation, no added latency, no hang.
+        //
+        // Idempotency / at-least-once (mirrors the loop's own contract documented on this fn): this
+        // dispatch runs EXACTLY ONCE per accepted connection — the host never retries it (a trap here
+        // ends the connection outright, exactly like a trapped inbound re-entry; there is no "connect
+        // dispatch redelivery" path on this socket transport, unlike the HTTP/SSE session transport's
+        // `Idempotency-Key` dedup window). A reconnect gets a brand-new `id` (`CONN_SEQ`) and a fresh,
+        // unresumed `state`, so it is indistinguishable from any other first-ever re-entry. Safety
+        // against double-greeting a SINGLE connection's own redelivery therefore rests, as documented
+        // above, on the guest's own idempotency guard — a checkpointed `greeted` flag — the same
+        // guard any session-handler must already have to tolerate at-least-once effects.
+        let bindings = match crate::function_runtime::build_function_bindings(
+            inner,
+            project_ref,
+            &scope,
+            site,
+            fn_config,
+            0,
+            &crate::function_runtime::FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(b) => b.with_session(std::sync::Arc::new(
+                crate::session_driver::SocketSessionController::new(
+                    state.clone(),
+                    session_limits.max_frame_bytes,
+                    session_limits.max_checkpoint_bytes,
+                ),
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    %peer,
+                    "session listener bindings unavailable at connect; closing: {e:?}"
+                );
+                state.shutdown().await;
+                return Ok(());
+            }
+        };
+        let connect_batch = boatramp_handlers::SessionBatch {
+            id: id.clone(),
+            resumed: state.checkpoint_snapshot(),
+            frames: vec![],
+        };
+        let connect_reentry = inner.engine.dispatch_session_socket(
+            &hash,
+            &wasm,
+            connect_batch,
+            bindings,
+            limits,
+            true,
+        );
+        let mut connect_failed = false;
+        tokio::select! {
+            res = connect_reentry => {
+                if let Err(e) = res {
+                    tracing::warn!(%peer, error = %e, "session listener connect dispatch failed; closing");
+                    connect_failed = true;
+                }
+            }
+            _ = tokio::time::sleep(reentry_timeout) => {
+                tracing::warn!(
+                    %peer, ?reentry_timeout,
+                    "session listener connect dispatch exceeded its processing deadline; closing \
+                     (slow peer / stuck guest)"
+                );
+                connect_failed = true;
+            }
+        }
+        // A trap/timeout ends the connection outright (no resume), same as the loop below; a clean
+        // connect dispatch that itself closed the session (e.g. a guest that refuses at connect) also
+        // ends here rather than entering the read loop.
+        if connect_failed || state.is_closed() {
+            state.shutdown().await;
+            return Ok(());
+        }
+
         let mut buf = vec![0u8; SESSION_CONN_READ_BUF];
         loop {
             let n = tokio::select! {

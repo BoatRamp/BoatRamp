@@ -303,4 +303,35 @@ mod tests {
             Err(boatramp_handlers::SessionError::Closed)
         ));
     }
+
+    // cap-req 17: the host-side half of the connect-time dispatch's idempotency contract. The
+    // connect dispatch's `SessionBatch.resumed` is built from `state.checkpoint_snapshot()`
+    // (`crates/boatramp-server/src/lib.rs`, `dispatch_session_connection`) — a FRESH connection's
+    // state must therefore read back `None` (the "not yet greeted" marker a server-speaks-first
+    // guest checks), and once the guest checkpoints its `greeted` flag, that SAME cell is what any
+    // LATER re-entry on this connection — a normal inbound frame, or a would-be redelivered connect
+    // dispatch — would see. Since the host never swaps `state` mid-connection (it is cloned, not
+    // replaced, into each re-entry's controller), a second "not yet greeted" `resumed: None` batch on
+    // one connection is structurally unreachable: double-greet would require a brand-new
+    // `SocketSessionState`, i.e. a genuinely new connection. No wasm needed to prove this half.
+    #[tokio::test]
+    async fn fresh_socket_state_is_unresumed_and_a_checkpointed_greeted_flag_persists() {
+        let (_client, server) = tokio::io::duplex(64);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let state =
+            SocketSessionState::new(Arc::new(tokio::sync::Mutex::new(Box::new(server_write))));
+
+        // A fresh connection's checkpoint is `None` — exactly the `resumed` the connect-time batch
+        // carries, i.e. "not yet greeted" from the guest's point of view.
+        assert_eq!(state.checkpoint_snapshot(), None);
+
+        // The guest greets on this (connect-time) re-entry and checkpoints `greeted = true` (one
+        // byte, mirroring `examples/handlers/session-greet`).
+        let ctl = SocketSessionController::new(state.clone(), 64, 8);
+        ctl.checkpoint(vec![1]).await.unwrap();
+
+        // A would-be REDELIVERED connect dispatch builds its batch from this SAME state, so its
+        // `resumed` is now `Some([1])` — already greeted, never `None` again on this connection.
+        assert_eq!(state.checkpoint_snapshot(), Some(vec![1]));
+    }
 }
