@@ -5,6 +5,76 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.43.0] - 2026-10-22
+
+This release completes the overlay fabric's **enrollment & pairing** program and the **project
+export/import streaming** program. On the overlay, two parties with no prior trust can now pair over
+the relay-blind rendezvous with a commit-then-reveal SAS (`boatramp overlay pair`, or a human-typeable
+short code), each flow is gated by a per-flow access policy that addresses **services, not IPs** (the
+OpenZiti-style model — internal numbering is irrelevant), a cluster can **expose** a local service
+into the mesh (reverse ingress), and external programs can link the overlay directly through a new
+embeddable client SDK. On export/import, a project's databases now stream through a verifiable,
+chunked **format-v2 bundle** restored into a throwaway shadow and swapped in atomically, applied by an
+ephemeral **non-superuser** role so a crafted bundle cannot escalate on import — the fix for the
+env-clone disk-fill, now safe for big databases.
+
+### Added
+
+- **Overlay enrollment & pairing.** A relay-blind `bropair1` rendezvous; a commit-then-reveal **SAS
+  pairing** handshake (`boatramp overlay pair`, direct-dial) with human-typeable **short codes**; and
+  mint/redeem **join tokens** with a live `TrustSet` admit, so two parties with no prior trust
+  establish a holder-bound channel without a control-plane round-trip.
+- **Per-flow overlay access policy.** A per-flow ACL gates the dial/publish-capability mint, expressed
+  as a `node/<id>` flow-policy resource in a dedicated Cedar `Overlay` namespace, with a console
+  **flow-policy editor + explain view**.
+- **Per-relay pairing PARK.** Each relay operator chooses whether pairing is offered as an open or an
+  authenticated service — a per-relay operator config, not a global switch.
+- **Embeddable overlay client SDK** (`boatramp-overlay-client`, a new crate). A lean, linkable
+  client-edge crate external programs use to dial, forward, expose, and pair over the relay-blind
+  overlay (no relay/egress/control-plane roles), with an **iOS + Android** cross-compile lane for the
+  mobile SDK.
+- **`boatramp expose` — reverse ingress.** Publish a local service into the cluster over the overlay
+  (the inverse of `forward`): self-serve, with a dynamic service directory, gated by `Overlay·Admin`.
+- **Console overlay directory view.** Browse and inspect the cluster's overlay services (discovery).
+- **Project export/import streaming.** A streamable **format-v2 bundle** (an ordered member list with
+  a per-member sidecar) streamed through live export/import at **O(largest member)**, plus inc2's
+  **atomic shadow-restore** across libsql / Postgres / MySQL — chunked trailing-SHA members verified
+  before an atomic swap, with a corruption-abort gate that leaves the live database untouched.
+
+### Changed
+
+- **Overlay flow policy addresses services, not IPs.** The dead source-IP condition slot is dropped;
+  a flow policy targets service identities, matching the fabric's service/identity addressing
+  (internal IP numbering is dynamic and irrelevant, the OpenZiti model).
+- **Project exports are taken `--no-comments`.** The inc2 non-superuser shadow-restore apply cannot
+  replay an owner-only `COMMENT ON EXTENSION` for a NON-trusted extension the operator pre-provisions
+  (e.g. pgvector, whose control file sets no `trusted = true`, so only a superuser can install and
+  thus own it). The extension's own comment is re-set by `CREATE EXTENSION` from its control file, so
+  nothing is lost for the extension; object comments are not carried through a project export (a
+  fidelity limitation, not a correctness one).
+
+### Fixed
+
+- **inc2 live Postgres/MySQL export-import gate green against real servers.** `run_ephemeral` kept
+  only a client container's stdout and dropped its stderr on a non-zero exit, so a failed managed
+  import surfaced a causeless error; the shadow `pg_restore` now runs under `sh -c '… 2>&1'` so
+  Postgres's real error reaches the captured sink (also a production diagnostics fix). On the back of
+  that, the pgvector round-trip now restores under the non-superuser apply (superuser pre-create +
+  `--no-comments`), and the crafted superuser-only escape test uses a `CREATE EVENT TRIGGER` payload
+  (a `LANGUAGE c` function cannot be created in the source on PG16 even with
+  `check_function_bodies=off`). All 13 live round-trip tests are a hard preflight gate.
+
+### Security
+
+- **Overlay pairing/exposer rate-limits bounded + fail-closed** (HIGH-1): the short-code guess
+  limiter is bounded and the capability mint fails closed; the pairing PARK budget and the
+  exposer-registration budget are each bounded separately from live flows.
+- **Export/import RCE-on-import confinement** (inc2 HIGH-1): the untrusted bundle dump is applied by a
+  freshly-minted ephemeral **non-superuser** role, never the binding's configured (often superuser)
+  user — a SQLite authorizer confines the libsql apply (no `ATTACH`/`load_extension` escape), and an
+  ephemeral `NOSUPERUSER` role confines the Postgres/MySQL apply; import carries a symmetric
+  scope-filter + an import-over guard.
+
 ## [0.42.0] - 2026-10-20
 
 boatramp gains its own **overlay network fabric** — the `bro` fabric — a from-scratch boatramp-idiom
