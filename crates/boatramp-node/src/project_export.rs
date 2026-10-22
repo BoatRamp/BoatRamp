@@ -3047,7 +3047,7 @@ impl NodeProjectExport {
         db: &str,
         cfg: &ExternalDatabaseConfig,
     ) -> Result<PgShadowPlan, Perr> {
-        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+        if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
             return Err(Perr::Unavailable(format!(
                 "database {db:?}: the atomic chunked pg shadow-restore is for MANAGED \
                  (compute-backed) databases only; an external bring-your-own-URL binding uses the \
@@ -3389,7 +3389,7 @@ impl NodeProjectExport {
         db: &str,
         cfg: &ExternalDatabaseConfig,
     ) -> Result<MysqlShadowPlan, Perr> {
-        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+        if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
             return Err(Perr::Unavailable(format!(
                 "database {db:?}: the atomic chunked mysql shadow-restore is for MANAGED \
                  (compute-backed) databases only; an external binding uses the sidecar path"
@@ -3646,7 +3646,7 @@ impl NodeProjectExport {
             return 0;
         }
         for (db, cfg) in &self.databases {
-            if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
                 continue; // external bindings have no shadow dbs of ours
             }
             if kind_is_postgres(&cfg.kind) {
