@@ -1715,16 +1715,23 @@ async fn redeem_enroll(
     resp.json().await.map_err(|e| Error::Overlay(e.to_string()))
 }
 
-/// The operator's overlay identity key path: `$XDG_CONFIG_HOME/boatramp/overlay.key`, else
-/// `~/.config/boatramp/overlay.key` (the established CLI config dir).
-fn operator_key_path() -> Result<std::path::PathBuf> {
+/// The established CLI config dir: `$XDG_CONFIG_HOME/boatramp`, else `~/.config/boatramp`. Shared
+/// by every per-operator file that lives alongside the overlay identity key (that key itself, and —
+/// for `boatramp tunnel`'s SOCKS local auth, plan §9.2 — `tunnel-socks.auth`).
+pub(crate) fn config_dir() -> Result<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .ok_or_else(|| {
             Error::Overlay("cannot locate the config dir (set HOME or XDG_CONFIG_HOME)".into())
         })?;
-    Ok(base.join("boatramp").join("overlay.key"))
+    Ok(base.join("boatramp"))
+}
+
+/// The operator's overlay identity key path: `$XDG_CONFIG_HOME/boatramp/overlay.key`, else
+/// `~/.config/boatramp/overlay.key` (the established CLI config dir).
+fn operator_key_path() -> Result<std::path::PathBuf> {
+    Ok(config_dir()?.join("overlay.key"))
 }
 
 /// Load the operator's persistent overlay identity, generating + persisting one (`0600`, atomic) on
@@ -1793,6 +1800,11 @@ pub(crate) struct DialResponseBody {
     #[serde(default)]
     pub relay_client_auth: String,
     pub token: String,
+    /// Absolute Unix-seconds expiry of `token` (server-clamped TTL applied). `forward`/`expose`
+    /// dial once per accepted connection and never needed this; the tunnel's cap-cache (plan §1.4)
+    /// does, to know when a cached grant must be re-minted rather than reused.
+    #[serde(default)]
+    pub expires_at: u64,
 }
 
 /// `POST /api/overlay/expose` request/response (CLI mirror of the server types) — the self-serve

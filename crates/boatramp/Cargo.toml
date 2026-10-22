@@ -94,9 +94,17 @@ overlay = [
   "dep:boatramp-overlay",
   "boatramp-overlay/server",
   "dep:boatramp-overlay-client",
+  "dep:boatramp-overlay-tunnel",
   "boatramp-node/overlay",
   "dep:async-trait",
 ]
+# The TUN virtual-interface front-end for `boatramp tunnel --tun` (overlay-service-tunneler plan
+# §3) — default OFF, mirroring `boatramp-overlay-tunnel`'s own `tun` feature (default OFF there
+# too). R1 ships NO implementation behind this gate (the crate's `tun` module is a stub that always
+# errors) — this feature exists only so the dependency-isolation boundary is real and testable
+# before R2 lands real (much heavier) TUN deps behind it. `dep:` is listed explicitly (not just via
+# `overlay`) so enabling `tun` alone still resolves, even without `overlay` also enabled.
+tun = ["dep:boatramp-overlay-tunnel", "boatramp-overlay-tunnel/tun"]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]
@@ -349,6 +357,10 @@ boatramp-overlay = { workspace = true, optional = true }
 # The embeddable overlay client SDK: the single-source client-edge the `forward`/`expose`/`pair`
 # subcommands consume (dogfood). Behind the `overlay` feature.
 boatramp-overlay-client = { workspace = true, optional = true }
+# The overlay service tunneler (shared core + SOCKS5 front-end, R1): backs `boatramp tunnel` /
+# `boatramp connect`. Behind the `overlay` feature; its own `tun` feature is passed through by this
+# crate's `tun` feature (default OFF — see that feature's comment).
+boatramp-overlay-tunnel = { workspace = true, optional = true }
 # The node config model (moved out of the binary so it is a library value the
 # serve path and embedders share). Feature flags below forward to its matching
 # cfg markers so config parsing stays consistent per feature.

@@ -52,6 +52,10 @@ mod completions;
 mod compose;
 mod compression;
 mod compute;
+// `boatramp connect <svc>` — the overlay service tunneler's one-shot dial + stdio splice
+// (overlay-service-tunneler plan R1), for `ssh ProxyCommand`/scripting.
+#[cfg(feature = "overlay")]
+mod connect;
 mod db;
 /// On-demand per-SNI TLS issuance at scale (cap-req 03): the allowlist-gated, single-flight,
 /// cluster-aware issuer + the resolve-None-retry SNI resolver. Gated on `cluster` too: issuance uses
@@ -112,6 +116,10 @@ mod serve;
 mod sync;
 mod tenancy;
 mod token;
+// `boatramp tunnel` — the overlay service tunneler's SOCKS5 (+ optional HTTP CONNECT) daemon
+// (overlay-service-tunneler plan R1): reach overlay services by name, unprivileged.
+#[cfg(feature = "overlay")]
+mod tunnel;
 mod version;
 
 use error::CliError;
@@ -163,6 +171,14 @@ enum Command {
     /// forward ticket (`overlay grant`) for `boatramp forward --ticket` (requires `--features overlay`).
     #[cfg(feature = "overlay")]
     Overlay(overlay::OverlayArgs),
+    /// Reach overlay services BY NAME: a SOCKS5 (+ optional HTTP CONNECT) proxy daemon over the
+    /// shared tunnel core (overlay-service-tunneler plan R1; requires `--features overlay`).
+    #[cfg(feature = "overlay")]
+    Tunnel(tunnel::TunnelArgs),
+    /// One-shot dial + stdio splice to a single overlay service — for `ssh ProxyCommand`/scripting
+    /// (requires `--features overlay`).
+    #[cfg(feature = "overlay")]
+    Connect(connect::ConnectArgs),
     /// Build (optional) and publish a folder as a new atomic deployment.
     Sync(sync::SyncArgs),
     /// Reconcile a whole project (sites + functions + compute) to a declarative
@@ -541,6 +557,39 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `tunnel` is a long-running SOCKS5 (+ optional HTTP CONNECT) daemon over the overlay service
+    // tunneler's shared core (like `forward`/`expose`) — self-serve only, so it always reads the
+    // project config (server URL + token) to resolve + mint over the control plane.
+    #[cfg(feature = "overlay")]
+    if matches!(cli.command, Command::Tunnel(_)) {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.cfg"));
+        let Command::Tunnel(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        let config = config::ProjectConfig::load(&path, None).unwrap_or_default();
+        tunnel::run(args, &config).await?;
+        return Ok(());
+    }
+
+    // `connect` is the one-shot stdio-splice analog of `tunnel` — same self-serve control-plane
+    // wiring, a single dial instead of a daemon.
+    #[cfg(feature = "overlay")]
+    if matches!(cli.command, Command::Connect(_)) {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.cfg"));
+        let Command::Connect(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        let config = config::ProjectConfig::load(&path, None).unwrap_or_default();
+        connect::run(args, &config).await?;
+        return Ok(());
+    }
+
     // `security` also reads the server daemon config (`boatramp.cfg`), like
     // `serve`, since the posture lives there — not in the project config.
     if matches!(cli.command, Command::Security(_)) {
@@ -623,6 +672,10 @@ async fn async_main() -> Result<(), CliError> {
         Command::Forward(_) => unreachable!("handled above"),
         #[cfg(feature = "overlay")]
         Command::Expose(_) => unreachable!("handled above"),
+        #[cfg(feature = "overlay")]
+        Command::Tunnel(_) => unreachable!("handled above"),
+        #[cfg(feature = "overlay")]
+        Command::Connect(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
         Command::Migrate(_) => unreachable!("handled above"),
         #[cfg(feature = "operator")]

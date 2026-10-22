@@ -35,6 +35,12 @@ pub enum CliError {
     #[cfg(feature = "overlay")]
     #[error(transparent)]
     Overlay(#[from] crate::overlay::Error),
+    /// The `tunnel` AND `connect` commands (overlay service tunneler) — both share the one
+    /// `TunnelCmdError` vocabulary (same control-plane wiring, a different front-end), so `?` from
+    /// either command dispatch converts through this single variant.
+    #[cfg(feature = "overlay")]
+    #[error(transparent)]
+    Tunnel(#[from] crate::tunnel::TunnelCmdError),
     /// The `sync` command.
     #[error(transparent)]
     Sync(#[from] crate::sync::Error),

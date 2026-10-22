@@ -1555,6 +1555,7 @@ dependencies = [
  "boatramp-node",
  "boatramp-overlay",
  "boatramp-overlay-client",
+ "boatramp-overlay-tunnel",
  "boatramp-rpktls",
  "boatramp-server",
  "boatramp-storage",
@@ -1920,6 +1921,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "boatramp-overlay-tunnel"
+version = "0.43.0"
+dependencies = [
+ "async-trait",
+ "boatramp-overlay-client",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

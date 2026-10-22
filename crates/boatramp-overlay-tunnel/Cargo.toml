@@ -1,0 +1,52 @@
+[package]
+name = "boatramp-overlay-tunnel"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Service-by-name consumption layer over the boatramp overlay fabric (OpenZiti-style): a front-end-agnostic core (catalog, cap-cache, OverlayClient pool) plus a hand-rolled SOCKS5 front-end. The TUN virtual-interface front-end is a later, feature-gated increment."
+
+[features]
+default = []
+# The full TUN virtual-interface front-end (device + embedded DNS + synthetic-IP allocator +
+# userspace TCP/IP stack + per-OS route/resolver integration) — overlay-service-tunneler plan §3,
+# release R2+. Default OFF so the lean SOCKS build never links its (much heavier) dependency set;
+# this release only RESERVES the gate — `tun` module below is a stub that always errors, so R2 can
+# land the real `tun`/`smoltcp`/`hickory-*`/`net-route` deps behind this SAME feature without ever
+# touching the ring-free SOCKS graph.
+tun = []
+
+[dependencies]
+# The ONLY boatramp dependency (plan §4): the embeddable overlay client SDK — `OverlayClient::dial`,
+# `Flow`, the identity/dial-request types. This crate never links `boatramp-overlay`'s server roles,
+# `boatramp-server`, or `boatramp-core`; the lean (no-`tun`) graph stays ring-free /
+# rustls-platform-verifier-free, matching the SDK's own posture (mobile.yml).
+boatramp-overlay-client = { workspace = true }
+# A minimal tokio — mirrors `boatramp-overlay-client`'s own cut: just the runtime + the primitives
+# the catalog/cap-cache/SOCKS accept-loop/splice path needs. NOT `fs`/`process`/`signal`/`io-std`
+# (CLI concerns) — an embedder brings its own runtime shape.
+tokio = { version = "1", default-features = false, features = [
+  "rt",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "sync",
+  "time",
+  "macros",
+] }
+# The injected `ControlPlane` boundary (the SDK does no HTTP — the CLI implements this trait over
+# `client::connect`): an `#[async_trait]` trait, same pattern as the CLI's own `LiveExposers`.
+async-trait = { workspace = true }
+# Typed error enums ONLY — the untyped-error convenience crate is CI-banned.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

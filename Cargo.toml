@@ -12,6 +12,9 @@ members = [
   "crates/boatramp-overlay-proto",
   "crates/boatramp-overlay",
   "crates/boatramp-overlay-client",
+  # The service-by-name tunneler (overlay service tunneler plan, R1): shared core + SOCKS5
+  # front-end over `boatramp-overlay-client`. See crates/boatramp-overlay-tunnel for detail.
+  "crates/boatramp-overlay-tunnel",
   # A HOST bin example embedding the overlay client SDK (overlay follow-up #4). A member (not
   # excluded like the wasm guests): it targets the host, so the normal `--workspace` build/clippy gate
   # compiles it. Its dep set is only `boatramp-overlay-client` + a minimal tokio.
@@ -97,6 +100,7 @@ boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.43.0" }
 boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.43.0" }
 boatramp-overlay = { path = "crates/boatramp-overlay", version = "0.43.0" }
 boatramp-overlay-client = { path = "crates/boatramp-overlay-client", version = "0.43.0" }
+boatramp-overlay-tunnel = { path = "crates/boatramp-overlay-tunnel", version = "0.43.0" }
 boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.43.0" }
 boatramp-storage = { path = "crates/boatramp-storage", version = "0.43.0" }
 boatramp-server = { path = "crates/boatramp-server", version = "0.43.0" }

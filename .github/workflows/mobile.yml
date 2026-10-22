@@ -50,6 +50,10 @@ on:
       - 'crates/boatramp-overlay-proto/**'
       - 'crates/boatramp-rpktls/**'
       - 'crates/boatramp-core/**'
+      # The overlay service tunneler's lean (no-`tun`) SOCKS build — same ring-free posture,
+      # proven by the `tunnel-ring-free` job below rather than a mobile cross-compile (this
+      # crate has no mobile-specific build of its own yet).
+      - 'crates/boatramp-overlay-tunnel/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -61,6 +65,7 @@ on:
       - 'crates/boatramp-overlay-proto/**'
       - 'crates/boatramp-rpktls/**'
       - 'crates/boatramp-core/**'
+      - 'crates/boatramp-overlay-tunnel/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -195,3 +200,40 @@ jobs:
           cargo ndk -t ${{ matrix.abi }} --platform 21 \
             build -p boatramp-overlay-client \
             --no-default-features --features client --locked
+
+  # overlay service tunneler (R1) — the lean (no-`tun`) SOCKS build's ring-free proof. The SOCKS
+  # front-end adds NO new dependency on top of the SDK (hand-rolled codec, no crypto crate of its
+  # own), so it MUST stay exactly as ring-free / rustls-platform-verifier-free as
+  # `boatramp-overlay-client` itself (same aws-lc-rs-only posture). Cheap (`cargo tree` resolves, it
+  # does not compile) so it runs on every push/PR that touches the crate, unlike the mobile legs
+  # above. The `tun` feature (default OFF) is checked too, proving it currently adds ZERO deps in
+  # this release (a pure cargo-feature scaffold — R2 is where real TUN deps land behind it, and this
+  # same job would then need updating to assert THEIR isolation instead of their absence).
+  tunnel-ring-free:
+    name: overlay-tunnel ring-free dependency proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tunnel-ring-free
+
+      - name: cargo tree must show no ring / rustls-platform-verifier (lean, default features)
+        run: |
+          cargo tree -p boatramp-overlay-tunnel -e normal --locked > /tmp/tree-lean.txt
+          cat /tmp/tree-lean.txt
+          if grep -iE '(^| )ring v|rustls-platform-verifier' /tmp/tree-lean.txt; then
+            echo "::error::ring or rustls-platform-verifier found in the lean boatramp-overlay-tunnel graph"
+            exit 1
+          fi
+          echo "lean graph is ring-free / rustls-platform-verifier-free"
+
+      - name: cargo tree must show no ring / rustls-platform-verifier (--features tun)
+        run: |
+          cargo tree -p boatramp-overlay-tunnel -e normal --features tun --locked > /tmp/tree-tun.txt
+          if grep -iE '(^| )ring v|rustls-platform-verifier' /tmp/tree-tun.txt; then
+            echo "::error::ring or rustls-platform-verifier found in the --features tun graph"
+            exit 1
+          fi
+          echo "tun-feature graph is ring-free / rustls-platform-verifier-free (R1: identical to lean — tun adds no deps yet)"
