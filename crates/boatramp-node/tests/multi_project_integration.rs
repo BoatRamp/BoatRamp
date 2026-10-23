@@ -811,6 +811,7 @@ fn plain_web_spec() -> ComputeSpec {
         isolation: boatramp_core::compute::IsolationRequirement::Trusted,
         prefer_backend: None,
         bindings: vec![],
+        post_launch: vec![],
     }
 }
 

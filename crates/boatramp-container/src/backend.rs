@@ -1587,6 +1587,7 @@ impl ContainerBackend {
             isolation: boatramp_core::compute::IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: Vec::new(),
+            post_launch: Vec::new(),
         };
         let mut plan = SandboxPlan::for_spec(&spec, rootfs, id, GUEST_UID, GUEST_GID);
         // Read-only rootfs: a one-shot client never writes its rootfs (dumps stream to
@@ -2778,6 +2779,7 @@ mod tests {
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
     }
 

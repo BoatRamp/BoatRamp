@@ -211,6 +211,7 @@ mod tests {
             isolation: boatramp_types::compute::IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
     }
 

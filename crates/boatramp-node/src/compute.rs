@@ -1004,6 +1004,7 @@ mod tests {
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
     }
 

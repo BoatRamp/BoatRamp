@@ -222,6 +222,32 @@ pub struct ComputeSpec {
     /// URL. Empty ⇒ omitted from the wire + the content hash (back-compat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<ComputeBinding>,
+    /// Idempotent setup actions boatramp runs against this workload AFTER its runner
+    /// reports up and it passes its service-readiness probe, and before the replica is
+    /// marked ready (`Provisioned`) and routed to. The general, user-declared half of the
+    /// post-launch primitive (a stock image's one-off init / migrate / warmup step); the
+    /// managed-database `CREATE DATABASE` / role setup is a separate *derived* source that
+    /// is not part of the content hash. Actions MUST be idempotent — a relaunch (crash,
+    /// node move, reboot) re-enters the launch path and re-runs them (there is no
+    /// first-launch marker). Empty ⇒ omitted from the wire + the content hash (back-compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_launch: Vec<PostLaunchAction>,
+}
+
+/// A single [`ComputeSpec::post_launch`] action. Extensible: `Exec` is the canonical
+/// general kind (run a command in the launched container via the backend's `exec`);
+/// future kinds (an HTTP warmup, a SQL script) are additive variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostLaunchAction {
+    /// Run a command inside the launched container via the backend's `exec` (needs a
+    /// backend that supports exec — docker / native container; a backend without exec
+    /// support fails the action, surfaced as the replica's provisioning failure). The
+    /// command inherits the container's environment; a non-zero exit fails the action.
+    Exec {
+        /// The command + arguments to exec in the container.
+        argv: Vec<String>,
+    },
 }
 
 /// A managed-resource dependency a compute workload declares. It names a *resource*,
@@ -634,7 +660,32 @@ mod tests {
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
+    }
+
+    #[test]
+    fn empty_post_launch_does_not_change_the_spec_hash() {
+        // A spec that declares no post-launch actions serializes without the field, so it
+        // hashes identically to a pre-post_launch spec (back-compat / schema stays v1).
+        let a = spec();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("post_launch"),
+            "empty post_launch is omitted"
+        );
+
+        // Declaring an action is recorded and changes the content hash (it is part of the
+        // workload's identity — changing it remints the spec and rolls the container).
+        let mut b = spec();
+        b.post_launch = vec![PostLaunchAction::Exec {
+            argv: vec!["/bin/true".into()],
+        }];
+        assert_ne!(
+            a.id(),
+            b.id(),
+            "a declared post-launch action changes the id"
+        );
     }
 
     #[test]

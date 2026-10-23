@@ -1704,6 +1704,7 @@ mod tests {
             isolation: Default::default(),
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
     }
 

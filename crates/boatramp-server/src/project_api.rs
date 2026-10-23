@@ -475,6 +475,7 @@ mod tests {
             isolation: Default::default(),
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         };
         let hash = deploy.put_compute_spec(&spec).await.unwrap();
         deploy

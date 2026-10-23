@@ -1327,6 +1327,7 @@ fn build_spec(
         isolation: isolation.into(),
         prefer_backend: None,
         bindings,
+        post_launch: Vec::new(),
     })
 }
 

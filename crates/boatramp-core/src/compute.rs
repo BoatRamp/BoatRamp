@@ -1503,6 +1503,7 @@ pub fn managed_db_spec(
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
         bindings: vec![],
+        post_launch: vec![],
     }
 }
 
@@ -1583,7 +1584,8 @@ pub async fn reconcile_once(
                 // replaced container re-provisions. This is where "runner up" becomes
                 // "ready": the gated surfaces route only once a replica is `Provisioned`.
                 let new_readiness =
-                    advance_readiness(backend.as_ref(), managed_db, &project_name, state).await;
+                    advance_readiness(backend.as_ref(), managed_db, &project_name, &spec, state)
+                        .await;
                 if new_readiness != state.readiness {
                     state.readiness = new_readiness;
                     changed = true;
@@ -1839,9 +1841,10 @@ fn region_of_node(nodes: &[Node], id: u64) -> Option<String> {
 /// on a change. Idempotent and safe to call every tick (it skips the DDL once a replica
 /// is already [`Provisioned`](Readiness::Provisioned)).
 async fn advance_readiness(
-    _backend: &dyn ComputeBackend,
+    backend: &dyn ComputeBackend,
     managed_db: Option<&dyn ManagedDbEnvResolver>,
     project: &str,
+    spec: &ComputeSpec,
     state: &ObservedInstance,
 ) -> Readiness {
     if !state.healthy {
@@ -1849,37 +1852,75 @@ async fn advance_readiness(
         // stopped answering). Fall back to Starting so the gated surfaces stop routing.
         return Readiness::Starting;
     }
-    // Already provisioned: done — don't re-run idempotent DDL every tick. A relaunch
+    // Already provisioned: done — don't re-run idempotent actions every tick. A relaunch
     // resets this to `Starting` (see `launch_one`), so a replaced replica re-provisions.
     if state.readiness.is_provisioned() {
         return Readiness::Provisioned;
     }
-    let Some(m) = managed_db else {
-        // No managed-DB resolver wired: a healthy generic workload is usable.
-        return Readiness::Provisioned;
-    };
     let workload = &state.handle.workload;
-    match m
-        .probe_managed_ready(project, workload, &state.endpoint)
-        .await
-    {
-        // Not a managed database: a healthy generic workload is usable. (The general
-        // user-declared post-launch action-runner advances this through `ServiceReady`
-        // before `Provisioned`; added with the `post_launch` field.)
-        None => Readiness::Provisioned,
-        // Listens but does not answer yet — still initializing, OR cannot read its data
-        // directory (the data-dir-ownership failure surfaces here as a stuck `Starting`
-        // instead of a silent healthy-but-broken container).
-        Some(false) => Readiness::Starting,
-        // The service answers: run the derived provisioning DDL (idempotent).
-        Some(true) => match m
-            .provision_managed(project, workload, &state.endpoint)
+    // 1) Service-readiness probe + the DERIVED managed-DB provisioning (CREATE DATABASE /
+    //    roles). A generic workload (or no resolver) has no managed step here.
+    if let Some(m) = managed_db {
+        match m
+            .probe_managed_ready(project, workload, &state.endpoint)
             .await
         {
-            Ok(()) => Readiness::Provisioned,
-            Err(reason) => Readiness::ProvisionFailed { reason },
-        },
+            // Not a managed database → generic path (fall through to post-launch actions).
+            None => {}
+            // Listens but does not answer yet — still initializing, OR cannot read its data
+            // directory (the data-dir-ownership failure surfaces here as a stuck `Starting`
+            // instead of a silent healthy-but-broken container).
+            Some(false) => return Readiness::Starting,
+            // The service answers → run the derived provisioning DDL (idempotent).
+            Some(true) => {
+                if let Err(reason) = m
+                    .provision_managed(project, workload, &state.endpoint)
+                    .await
+                {
+                    return Readiness::ProvisionFailed { reason };
+                }
+            }
+        }
     }
+    // 2) The GENERAL user-declared post-launch actions (ComputeSpec::post_launch), run for
+    //    both managed and generic workloads once service-ready, before `Provisioned`.
+    //    Idempotent (re-run on every relaunch) — see `PostLaunchAction`.
+    if let Err(reason) = run_post_launch(backend, spec, state).await {
+        return Readiness::ProvisionFailed { reason };
+    }
+    Readiness::Provisioned
+}
+
+/// Run a workload's user-declared [`post_launch`](ComputeSpec::post_launch) actions
+/// against its launched instance, in order, stopping at the first failure. Idempotent by
+/// contract (the caller re-runs it on every relaunch). An empty list is a no-op.
+async fn run_post_launch(
+    backend: &dyn ComputeBackend,
+    spec: &ComputeSpec,
+    state: &ObservedInstance,
+) -> Result<(), String> {
+    for action in &spec.post_launch {
+        match action {
+            PostLaunchAction::Exec { argv } => {
+                match backend.exec(&state.handle, argv, None).await {
+                    Ok(out) if out.exit_code == 0 => {}
+                    Ok(out) => {
+                        // A trimmed stderr tail for diagnosis (the operator's own command's
+                        // output — no boatramp secret material).
+                        let tail = String::from_utf8_lossy(&out.stderr);
+                        let tail = tail.trim();
+                        let tail = &tail[tail.len().saturating_sub(200)..];
+                        return Err(format!(
+                            "post-launch exec {argv:?} exited {}: {tail}",
+                            out.exit_code
+                        ));
+                    }
+                    Err(e) => return Err(format!("post-launch exec {argv:?}: {e}")),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Materialize + launch one replica, returning its observed state.
@@ -2164,6 +2205,7 @@ mod tests {
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
+            post_launch: vec![],
         }
     }
 
@@ -3016,6 +3058,21 @@ mod tests {
         async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
             Ok(Health::Healthy)
         }
+        // Controllable exec for the post-launch-action tests: argv `["fail", …]` exits
+        // non-zero (with a stderr tail), anything else exits 0.
+        async fn exec(
+            &self,
+            _handle: &InstanceHandle,
+            argv: &[String],
+            _stdin: Option<&[u8]>,
+        ) -> Result<ExecOutput, BackendError> {
+            let fail = argv.first().map(String::as_str) == Some("fail");
+            Ok(ExecOutput {
+                exit_code: if fail { 1 } else { 0 },
+                stdout: Vec::new(),
+                stderr: if fail { b"boom".to_vec() } else { Vec::new() },
+            })
+        }
     }
 
     #[tokio::test]
@@ -3661,7 +3718,7 @@ mod tests {
         let m = FakeManagedDb::new(Some(true), true);
         let mut s = observed("w", 0, 1, true);
         s.readiness = Readiness::Starting;
-        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
         assert_eq!(r, Readiness::Provisioned);
         assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -3672,7 +3729,7 @@ mod tests {
         let m = FakeManagedDb::new(Some(true), false);
         let mut s = observed("w", 0, 1, true);
         s.readiness = Readiness::Starting;
-        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
         assert_eq!(
             r,
             Readiness::ProvisionFailed {
@@ -3689,7 +3746,7 @@ mod tests {
         let m = FakeManagedDb::new(Some(false), true);
         let mut s = observed("w", 0, 1, true);
         s.readiness = Readiness::Starting;
-        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
         assert_eq!(r, Readiness::Starting);
         assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -3704,11 +3761,11 @@ mod tests {
         let mut s = observed("w", 0, 1, true);
         s.readiness = Readiness::Starting;
         assert_eq!(
-            advance_readiness(&backend, Some(&m), "default", &s).await,
+            advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await,
             Readiness::Provisioned
         );
         assert_eq!(
-            advance_readiness(&backend, None, "default", &s).await,
+            advance_readiness(&backend, None, "default", &spec(1, 128), &s).await,
             Readiness::Provisioned
         );
     }
@@ -3719,7 +3776,7 @@ mod tests {
         let m = FakeManagedDb::new(Some(true), true);
         let s = observed("w", 0, 1, false); // not healthy
         assert_eq!(
-            advance_readiness(&backend, Some(&m), "default", &s).await,
+            advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await,
             Readiness::Starting
         );
     }
@@ -3732,12 +3789,65 @@ mod tests {
         let m = FakeManagedDb::new(Some(true), false);
         let s = observed("w", 0, 1, true); // `observed` sets healthy ⇒ Provisioned
         assert_eq!(s.readiness, Readiness::Provisioned);
-        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
         assert_eq!(r, Readiness::Provisioned);
         assert_eq!(
             m.provisions.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "provisioning DDL must not re-run once the replica is already Provisioned"
         );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_runs_post_launch_exec_then_provisioned() {
+        // A generic healthy workload with a user-declared post-launch Exec that succeeds
+        // reaches Provisioned (the general primitive, no managed DB involved).
+        let backend = FakeBackend;
+        let mut sp = spec(1, 128);
+        sp.post_launch = vec![PostLaunchAction::Exec {
+            argv: vec!["ok".into()],
+        }];
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        assert_eq!(
+            advance_readiness(&backend, None, "default", &sp, &s).await,
+            Readiness::Provisioned
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_post_launch_exec_failure_is_provision_failed() {
+        let backend = FakeBackend;
+        let mut sp = spec(1, 128);
+        sp.post_launch = vec![PostLaunchAction::Exec {
+            argv: vec!["fail".into()],
+        }];
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        match advance_readiness(&backend, None, "default", &sp, &s).await {
+            Readiness::ProvisionFailed { reason } => {
+                assert!(reason.contains("exited 1"), "{reason}");
+            }
+            other => panic!("expected ProvisionFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_managed_then_post_launch_both_run() {
+        // A managed DB with a post-launch Exec: the derived DDL runs AND the user action
+        // runs, in that order, before Provisioned.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), true);
+        let mut sp = spec(1, 128);
+        sp.post_launch = vec![PostLaunchAction::Exec {
+            argv: vec!["ok".into()],
+        }];
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        assert_eq!(
+            advance_readiness(&backend, Some(&m), "default", &sp, &s).await,
+            Readiness::Provisioned
+        );
+        assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
