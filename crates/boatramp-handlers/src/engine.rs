@@ -1554,17 +1554,12 @@ pub struct HandlerEngine {
     /// [`DEFAULT_TCP_EGRESS_IDLE_TIMEOUT`].
     #[cfg(feature = "tcp-egress")]
     tcp_egress_idle_timeout: Duration,
-    epoch_ticker: Option<std::thread::JoinHandle<()>>,
-    epoch_ticker_stop: Arc<std::sync::atomic::AtomicBool>,
+    epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for HandlerEngine {
     fn drop(&mut self) {
-        self.epoch_ticker_stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(handle) = self.epoch_ticker.take() {
-            let _ = handle.join();
-        }
+        self.epoch_ticker.abort();
     }
 }
 
@@ -1694,24 +1689,15 @@ impl HandlerEngine {
     ) -> Result<Self, HandlerError> {
         let capacity = NonZeroUsize::new(cache_size.max(1)).expect("cache size >= 1");
         let cache = Mutex::new(LruCache::new(capacity));
-        // Tick the epoch so store deadlines fire (timeouts). A DEDICATED OS THREAD, not
-        // a tokio task: the kernel schedules it preemptively and independently of the
-        // async worker pool, so a CPU-bound guest fiber monopolizing the tokio workers
-        // cannot starve it and delay a guest's wall-clock timeout trap (a tokio-task
-        // ticker did exactly that under CPU-constrained CI). `increment_epoch` is a
-        // cheap lock-free bump; the timeout mechanism is otherwise unchanged.
+        // Tick the epoch so store deadlines fire (timeouts).
         let ticker_engine = engine.clone();
-        let epoch_ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ticker_stop = Arc::clone(&epoch_ticker_stop);
-        let epoch_ticker = std::thread::Builder::new()
-            .name("boatramp-epoch-ticker".into())
-            .spawn(move || {
-                while !ticker_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
-                    ticker_engine.increment_epoch();
-                }
-            })
-            .expect("spawn boatramp-epoch-ticker thread");
+        let epoch_ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(EPOCH_TICK_MS));
+            loop {
+                interval.tick().await;
+                ticker_engine.increment_epoch();
+            }
+        });
         Ok(Self {
             engine,
             stats: Arc::new(crate::instance_stats::InstanceStats::default()),
@@ -1781,8 +1767,7 @@ impl HandlerEngine {
             #[cfg(feature = "tcp-egress")]
             tcp_egress_idle_timeout: DEFAULT_TCP_EGRESS_IDLE_TIMEOUT,
             limits,
-            epoch_ticker: Some(epoch_ticker),
-            epoch_ticker_stop,
+            epoch_ticker,
         })
     }
 

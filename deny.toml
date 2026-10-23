@@ -52,11 +52,6 @@ ignore = [
   # direct dep. Revisit if a replacement YAML backend appears upstream.
   "RUSTSEC-2024-0449",
 
-  # fxhash (0.2.1): unmaintained (repo stale, owner inactive) — not a vulnerability.
-  # Transitive via wasmtime -> fxprof-processed-profile (its profiler); no direct
-  # dep and no safe upgrade (wasmtime pins it). Revisit when wasmtime drops it.
-  "RUSTSEC-2025-0057", # fxhash: no longer maintained
-
   # crossbeam-epoch (0.9.18): invalid pointer deref in the `fmt::Pointer`/`Debug`
   # impls for `Atomic`/`Shared` — only triggered by *formatting* a null-created
   # epoch pointer. Transitive via slatedb -> crossbeam-skiplist (its memtable),

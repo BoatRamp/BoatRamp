@@ -5250,6 +5250,26 @@ async fn per_site_timeout_cap_applies() {
     let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
     let app = router(deploy, Auth::disabled(), runtime);
 
+    // Warm the one-time component compile first. The first request to reach a
+    // guest pays the cold cranelift compile cost, which — under wasmtime 50 on a
+    // CPU-constrained CI runner — can itself take several seconds, independent of
+    // the timeout cap. The cap still fires on this warm-up (the guest busy-loops),
+    // but we discard its timing and measure a SECOND, warm request so `elapsed`
+    // reflects only the capped EXECUTION, which is the signal this test is about:
+    // that the 50ms site cap, not the 10s engine default, bounds the run.
+    let warmup = {
+        let mut r = Request::builder()
+            .method("GET")
+            .uri("/_sites/blog/loop")
+            .body(Body::empty())
+            .unwrap();
+        r.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        r
+    };
+    let warm_status = app.clone().oneshot(warmup).await.unwrap().status();
+    assert_eq!(warm_status, StatusCode::GATEWAY_TIMEOUT);
+
     let mut req = Request::builder()
         .method("GET")
         .uri("/_sites/blog/loop")
@@ -5262,7 +5282,9 @@ async fn per_site_timeout_cap_applies() {
     let elapsed = start.elapsed();
 
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-    // The cap (50ms), not the 10s default, fired.
+    // The cap (50ms), not the 10s default, fired. The compile is now warm, so this
+    // window is just the capped execution plus scheduling jitter; 5s stays far
+    // below the 10s default while tolerating a loaded runner.
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "timed out after {elapsed:?}; the per-site cap did not apply"
