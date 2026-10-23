@@ -92,6 +92,11 @@ semicolon_if_nothing_returned = "warn"
 # A specific allow overrides CI's `-D warnings`. (Newer clippy flags this
 # `result_large_err` where 1.96/1.97 did not.)
 result_large_err = "allow"
+# `#[async_trait]` expands `async fn -> Result<..>` into a method returning a boxed
+# future that is itself `#[must_use]`; clippy (1.99+) then flags `double_must_use`
+# against the already-`#[must_use]` `Result`. The redundant attribute lives in
+# async_trait's generated code, not ours, so there is nothing to fix at the source.
+double_must_use = "allow"
 
 [workspace.dependencies]
 boatramp-types = { path = "crates/boatramp-types", version = "0.43.0" }
