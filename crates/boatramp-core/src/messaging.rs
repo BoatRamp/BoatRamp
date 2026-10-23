@@ -2816,7 +2816,7 @@ impl Messaging for LogMessaging {
         if msg.inline {
             // Saturating (never wrap on underflow — a post-restart ack of a pre-restart inline
             // message would otherwise underflow the counter and wedge the budget at "full").
-            let _ = self.inline_inflight_bytes.fetch_update(
+            let _ = self.inline_inflight_bytes.try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |v| Some(v.saturating_sub(msg.payload.len())),
@@ -3094,7 +3094,7 @@ impl Messaging for LogMessaging {
                 // where they finally leave the node — release them, saturating so a post-restart purge
                 // of a pre-restart record can't underflow and wedge the budget at "full".
                 Some(len) => {
-                    let _ = self.inline_inflight_bytes.fetch_update(
+                    let _ = self.inline_inflight_bytes.try_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
                         |v| Some(v.saturating_sub(len)),
@@ -3421,7 +3421,7 @@ impl Messaging for LogMessaging {
                     // C2: release an inline dead-letter's bytes from the SA1 budget on discard
                     // (saturating — see purge_dead_letters).
                     Some(len) => {
-                        let _ = self.inline_inflight_bytes.fetch_update(
+                        let _ = self.inline_inflight_bytes.try_update(
                             std::sync::atomic::Ordering::Relaxed,
                             std::sync::atomic::Ordering::Relaxed,
                             |v| Some(v.saturating_sub(len)),
