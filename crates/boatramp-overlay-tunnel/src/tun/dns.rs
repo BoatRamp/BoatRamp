@@ -121,17 +121,18 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let query = Message::from_vec(query_bytes).map_err(DnsError::Parse)?;
-    let mut response = Message::new();
-    response.set_id(query.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(OpCode::Query);
+    let query = Message::from_vec(query_bytes).map_err(|e| DnsError::Parse(e.into()))?;
+    // hickory-proto 0.26 folded id/message_type/op_code/response_code/recursion_available into
+    // `Message::metadata` (a plain `Metadata` struct); `Message::new` now takes the first three
+    // directly instead of the removed `set_id`/`set_message_type`/`set_op_code` setters.
+    let mut response = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
     // RD (recursion desired) is whatever the client asked; RA (recursion AVAILABLE) is always
     // false — this resolver never recurses, by construction (plan §3.3/§5 split-horizon).
-    response.set_recursion_available(false);
+    // (`Metadata::new` already defaults this to false; set explicitly for clarity.)
+    response.metadata.recursion_available = false;
 
-    let Some(question) = query.queries().first().cloned() else {
-        response.set_response_code(ResponseCode::FormErr);
+    let Some(question) = query.queries.first().cloned() else {
+        response.metadata.response_code = ResponseCode::FormErr;
         return response.to_vec().map_err(DnsError::Encode);
     };
     response.add_query(question.clone());
@@ -140,14 +141,14 @@ where
     match classify(zone, &qname) {
         Classification::OutOfZone => {
             // Plan §3.3/§5: out-of-zone is REFUSED, never recursed — the split-horizon invariant.
-            response.set_response_code(ResponseCode::Refused);
+            response.metadata.response_code = ResponseCode::Refused;
         }
         Classification::InZone(candidate) => match is_known_service(candidate).await {
             None => {
-                response.set_response_code(ResponseCode::NXDomain);
+                response.metadata.response_code = ResponseCode::NXDomain;
             }
             Some(canonical_service) => {
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
                 if question.query_type() == RecordType::A {
                     let addr = allocator
                         .allocate(&canonical_service)
@@ -157,7 +158,7 @@ where
                         ANSWER_TTL_SECS,
                         RData::A(A(addr)),
                     );
-                    record.set_dns_class(DNSClass::IN);
+                    record.dns_class = DNSClass::IN;
                     response.add_answer(record);
                 }
                 // A known service queried as a non-A type (e.g. AAAA — this zone is IPv4-only)
@@ -435,11 +436,8 @@ mod tests {
     fn build_query(qname: &str, qtype: RecordType) -> Vec<u8> {
         use hickory_proto::op::Query;
         use hickory_proto::rr::Name;
-        let mut msg = Message::new();
-        msg.set_id(0x1234);
-        msg.set_message_type(MessageType::Query);
-        msg.set_op_code(OpCode::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         let name = Name::from_ascii(qname).unwrap();
         let mut query = Query::new();
         query.set_name(name);
@@ -466,13 +464,13 @@ mod tests {
             .await
             .unwrap();
         let reply = Message::from_vec(&reply_bytes).unwrap();
-        assert_eq!(reply.response_code(), ResponseCode::NoError);
-        assert_eq!(reply.answers().len(), 1);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
         assert!(
-            !reply.recursion_available(),
+            !reply.metadata.recursion_available,
             "must never advertise recursion"
         );
-        let RData::A(A(addr)) = reply.answers()[0].data() else {
+        let RData::A(A(addr)) = &reply.answers[0].data else {
             panic!("expected an A record");
         };
         assert!(allocator.cidr().contains(*addr));
@@ -488,8 +486,8 @@ mod tests {
             .await
             .unwrap();
         let reply = Message::from_vec(&reply_bytes).unwrap();
-        assert_eq!(reply.response_code(), ResponseCode::NXDomain);
-        assert!(reply.answers().is_empty());
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+        assert!(reply.answers.is_empty());
         // An unknown name must never consume a synthetic address.
         assert_eq!(allocator.len(), 0);
     }
@@ -503,8 +501,8 @@ mod tests {
             .await
             .unwrap();
         let reply = Message::from_vec(&reply_bytes).unwrap();
-        assert_eq!(reply.response_code(), ResponseCode::Refused);
-        assert!(reply.answers().is_empty());
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert!(reply.answers.is_empty());
     }
 
     #[tokio::test]
@@ -516,8 +514,8 @@ mod tests {
             .await
             .unwrap();
         let reply = Message::from_vec(&reply_bytes).unwrap();
-        assert_eq!(reply.response_code(), ResponseCode::NoError);
-        assert!(reply.answers().is_empty(), "IPv4-only zone: AAAA is NODATA");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.answers.is_empty(), "IPv4-only zone: AAAA is NODATA");
     }
 
     #[tokio::test]
@@ -537,10 +535,10 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let RData::A(A(a1)) = first.answers()[0].data() else {
+        let RData::A(A(a1)) = &first.answers[0].data else {
             panic!()
         };
-        let RData::A(A(a2)) = second.answers()[0].data() else {
+        let RData::A(A(a2)) = &second.answers[0].data else {
             panic!()
         };
         assert_eq!(a1, a2);

@@ -16,16 +16,41 @@ ignore = [
   # the TLS stacks below; no direct dep. Drops out when they bump.
   "RUSTSEC-2025-0134",
 
-  # rustls-webpki cert/CRL edge cases, fixed in >=0.103.10 — which reqwest
-  # already uses (0.103.16). The flagged older lines are pinned transitively and
-  # can't be bumped here: 0.102.8 via libsql -> hyper-rustls 0.25/rustls 0.22,
-  # 0.101.7 via the aws-sdk (s3 feature) -> rustls 0.21. Limited impact (the
-  # advisories note an attacker must compromise a trusted issuing authority).
-  # Revisit when libsql / aws-sdk move to rustls 0.23.
-  "RUSTSEC-2026-0049", # CRL distribution-point matching
-  "RUSTSEC-2026-0098", # name constraints for URI names
-  "RUSTSEC-2026-0099", # name constraints with wildcard names
-  "RUSTSEC-2026-0104", # panic in CRL parsing
+  # Old-rustls-line advisories (rustls itself + rustls-webpki), all fixed on the
+  # primary 0.23 line (0.23.46, which reqwest/the workspace already use) but
+  # unbumpable on the two pinned-transitive old lines: rustls 0.21.12 +
+  # rustls-webpki 0.101.7 via the aws-sdk (s3 feature) -> rustls 0.21; rustls
+  # 0.22.4 + rustls-webpki 0.102.8 via libsql -> hyper-rustls 0.25 -> rustls
+  # 0.22. Limited impact (the cert/CRL advisories need a compromised trusted
+  # issuing authority; the Debug/downgrade advisories need a custom
+  # ClientSessionStore that Debug-logs session values, which boatramp doesn't
+  # have). Revisit when libsql / aws-sdk move to rustls 0.23.
+  "RUSTSEC-2026-0049", # rustls-webpki: CRL distribution-point matching
+  "RUSTSEC-2026-0098", # rustls-webpki: name constraints for URI names
+  "RUSTSEC-2026-0099", # rustls-webpki: name constraints with wildcard names
+  "RUSTSEC-2026-0104", # rustls-webpki: panic in CRL parsing
+  "RUSTSEC-2026-0382", # rustls-webpki: distrusted emSign intermediates
+  "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
+  "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade to classical key exchange
+
+  # h2 0.3.27 unbounded empty DATA frames (low severity; patched in 0.4.16, and
+  # the workspace's primary h2 line is already >=0.4.20). Pinned transitively by
+  # the AWS SDK (aws-smithy-http-client -> aws-smithy-runtime -> aws-config),
+  # reachable only through the opt-in S3 blob backend, not the default build.
+  # Revisit when aws-smithy-http-client moves off h2 0.3.
+  "RUSTSEC-2026-0258",
+
+  # rkyv 0.7.46 shared-pointer validation bypass (fixed in 0.8.17; the 0.7 series
+  # is no longer supported upstream). Transitive via lightningcss (alpha, pins
+  # rkyv 0.7) -> parcel_sourcemap, lightningcss's own build/bundle-time sourcemap
+  # cache — a build-time CSS path over boatramp's own authored input, not
+  # attacker-controlled and not guest-reachable at runtime. Revisit when
+  # lightningcss leaves alpha and bumps rkyv.
+  "RUSTSEC-2026-0235",
+
+  # unsafe-libyaml 0.2.11: unmaintained, no fixed release exists. Transitive, no
+  # direct dep. Revisit if a replacement YAML backend appears upstream.
+  "RUSTSEC-2024-0449",
 
   # fxhash (0.2.1): unmaintained (repo stale, owner inactive) — not a vulnerability.
   # Transitive via wasmtime -> fxprof-processed-profile (its profiler); no direct

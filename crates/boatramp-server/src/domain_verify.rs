@@ -187,31 +187,48 @@ impl DomainProbe for ServerDomainProbe {
 /// cleanly fails), not an error.
 #[cfg(feature = "domain-verify-dns")]
 async fn resolve_txt(name: &str) -> Result<Vec<String>, VerifyError> {
-    use hickory_resolver::TokioAsyncResolver;
-    use hickory_resolver::error::ResolveErrorKind;
+    // hickory-resolver 0.26 replaced the old infallible `TokioAsyncResolver::tokio_from_system_conf`
+    // / `TokioAsyncResolver::tokio` constructors with a fallible builder (`TokioResolver::
+    // builder_tokio()` reads the system config; `Resolver::builder_with_config` + `.build()` is the
+    // explicit fallback) — both legs of the former `match` now return a `Result`, so this chains
+    // the same system-conf-or-default fallback through `.and_then`/`.or_else`.
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::ResolverConfig;
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    use hickory_resolver::proto::rr::RData;
 
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-        Ok(resolver) => resolver,
-        Err(_) => TokioAsyncResolver::tokio(
-            hickory_resolver::config::ResolverConfig::default(),
-            hickory_resolver::config::ResolverOpts::default(),
-        ),
-    };
+    let resolver = hickory_resolver::TokioResolver::builder_tokio()
+        .and_then(hickory_resolver::ResolverBuilder::build)
+        .or_else(|_| {
+            Resolver::builder_with_config(
+                ResolverConfig::default(),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+        })
+        .map_err(|e| VerifyError::Probe(format!("building the DNS resolver: {e}")))?;
     let lookup = match resolver.txt_lookup(name).await {
         Ok(lookup) => lookup,
-        Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
+        Err(err) if err.is_no_records_found() => {
             return Ok(Vec::new());
         }
         Err(err) => return Err(VerifyError::Probe(err.to_string())),
     };
-    // A single TXT record may arrive as several ≤255-byte chunks; join them.
+    // A single TXT record may arrive as several ≤255-byte chunks; join them. 0.26 dropped the
+    // specialized `TxtLookup::iter()` (yielding `&TXT` directly) in favor of the generic
+    // `Lookup::answers()` (`&[Record]`), so each record's `RData` is matched explicitly; `txt_data`
+    // is now a plain public field (was a `txt_data()` method).
     let values = lookup
+        .answers()
         .iter()
-        .map(|txt| {
-            txt.txt_data()
-                .iter()
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect::<String>()
+        .filter_map(|record| match &record.data {
+            RData::TXT(txt) => Some(
+                txt.txt_data
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect::<String>(),
+            ),
+            _ => None,
         })
         .collect();
     Ok(values)
@@ -228,7 +245,7 @@ async fn resolve_txt(name: &str) -> Result<Vec<String>, VerifyError> {
 /// [`VerifyError::Unsupported`] rather than silently failing.
 pub struct ServerRecordProbe {
     #[cfg(feature = "domain-verify-dns")]
-    resolver: hickory_resolver::TokioAsyncResolver,
+    resolver: hickory_resolver::TokioResolver,
 }
 
 impl ServerRecordProbe {
@@ -352,20 +369,29 @@ impl DohEndpoint {
 /// short 5-15s floor (so a freshly-published name that was NXDOMAIN moments ago is
 /// re-queried quickly — the "publish then verify" loop).
 #[cfg(feature = "domain-verify-dns")]
-fn build_doh_resolver() -> hickory_resolver::TokioAsyncResolver {
-    use hickory_resolver::TokioAsyncResolver;
-    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+fn build_doh_resolver() -> hickory_resolver::TokioResolver {
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
     let endpoint = DohEndpoint::configured();
-    // `from_ips_https` builds DoH name servers with TLS verification against
-    // `tls_name` (SNI + cert name), so the pinned endpoint is authenticated.
-    let group = NameServerConfigGroup::from_ips_https(
-        &endpoint.ips,
-        endpoint.port,
-        endpoint.tls_name,
-        true,
-    );
-    let config = ResolverConfig::from_parts(None, Vec::new(), group);
+    // 0.26 dropped `NameServerConfigGroup::from_ips_https` (which built every IP's DoH config at
+    // once); `NameServerConfig::https` now builds one IP's config, TLS-verified against
+    // `tls_name` (SNI + cert name) so the pinned endpoint is authenticated — the port defaults to
+    // 443 but is overridden on each connection below to honor a custom endpoint port.
+    let tls_name: Arc<str> = Arc::from(endpoint.tls_name.as_str());
+    let name_servers: Vec<NameServerConfig> = endpoint
+        .ips
+        .iter()
+        .map(|ip| {
+            let mut ns = NameServerConfig::https(*ip, tls_name.clone(), None);
+            for conn in &mut ns.connections {
+                conn.port = endpoint.port;
+            }
+            ns
+        })
+        .collect();
+    let config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
 
     let mut opts = ResolverOpts::default();
     opts.positive_max_ttl = Some(Duration::from_secs(300));
@@ -375,18 +401,21 @@ fn build_doh_resolver() -> hickory_resolver::TokioAsyncResolver {
     // resolver (that would defeat the pinned, verified endpoint).
     opts.try_tcp_on_error = false;
 
-    TokioAsyncResolver::tokio(config, opts)
+    // This is our own fixed, deterministic config (no system conf involved), so a build failure
+    // means a genuine environment/TLS-backend problem — fail fast at startup rather than silently
+    // serve a broken DNS-record verifier.
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .unwrap_or_else(|err| panic!("building the pinned DoH resolver: {err}"))
 }
 
 /// Map a hickory lookup error to an empty result when the name simply has no
 /// records of the queried kind (verification then reports `Missing`, not an
 /// error), else a [`VerifyError::Probe`].
 #[cfg(feature = "domain-verify-dns")]
-fn empty_or_probe_err<T>(
-    err: hickory_resolver::error::ResolveError,
-) -> Result<Vec<T>, VerifyError> {
-    use hickory_resolver::error::ResolveErrorKind;
-    if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) {
+fn empty_or_probe_err<T>(err: hickory_resolver::net::NetError) -> Result<Vec<T>, VerifyError> {
+    if err.is_no_records_found() {
         Ok(Vec::new())
     } else {
         Err(VerifyError::Probe(err.to_string()))
@@ -396,30 +425,46 @@ fn empty_or_probe_err<T>(
 #[cfg(feature = "domain-verify-dns")]
 impl ServerRecordProbe {
     async fn resolve_txt_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        use hickory_resolver::proto::rr::RData;
         let lookup = match self.resolver.txt_lookup(name).await {
             Ok(lookup) => lookup,
             Err(err) => return empty_or_probe_err(err),
         };
         // A single TXT record may arrive as several ≤255-byte chunks; join them
-        // (same reconstruction the ownership TXT path uses).
+        // (same reconstruction the ownership TXT path uses). 0.26 dropped the
+        // specialized `TxtLookup::iter()` for the generic `Lookup::answers()`
+        // (`&[Record]`), so each record's `RData` is matched explicitly.
         Ok(lookup
+            .answers()
             .iter()
-            .map(|txt| {
-                txt.txt_data()
-                    .iter()
-                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                    .collect::<String>()
+            .filter_map(|record| match &record.data {
+                RData::TXT(txt) => Some(
+                    txt.txt_data
+                        .iter()
+                        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
             })
             .collect())
     }
 
     async fn resolve_mx_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        use hickory_resolver::proto::rr::RData;
         let lookup = match self.resolver.mx_lookup(name).await {
             Ok(lookup) => lookup,
             Err(err) => return empty_or_probe_err(err),
         };
         // The exchange host (preference is not part of the match; see the matcher).
-        Ok(lookup.iter().map(|mx| mx.exchange().to_utf8()).collect())
+        // `MX::exchange` is now a plain public field (was an `exchange()` method).
+        Ok(lookup
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::MX(mx) => Some(mx.exchange.to_utf8()),
+                _ => None,
+            })
+            .collect())
     }
 
     async fn resolve_cname_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
@@ -431,8 +476,9 @@ impl ServerRecordProbe {
             Err(err) => return empty_or_probe_err(err),
         };
         Ok(lookup
+            .answers()
             .iter()
-            .filter_map(|rdata| match rdata {
+            .filter_map(|record| match &record.data {
                 RData::CNAME(cname) => Some(cname.0.to_utf8()),
                 _ => None,
             })
@@ -440,11 +486,19 @@ impl ServerRecordProbe {
     }
 
     async fn resolve_a_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        use hickory_resolver::proto::rr::RData;
         let lookup = match self.resolver.ipv4_lookup(name).await {
             Ok(lookup) => lookup,
             Err(err) => return empty_or_probe_err(err),
         };
-        Ok(lookup.iter().map(|a| a.0.to_string()).collect())
+        Ok(lookup
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(a.0.to_string()),
+                _ => None,
+            })
+            .collect())
     }
 }
 

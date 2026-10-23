@@ -314,13 +314,17 @@ boatramp-storage = { workspace = true }
 
 # Public-DNS resolver for the `domain-verify-dns` feature: the TXT ownership
 # method AND the generic multi-record verifier (`verify-records`). The
-# `dns-over-https-rustls` feature adds DoH so the record verifier resolves over a
-# pinned, TLS-verified, operator-allowlisted endpoint. Optional; the HTTP-token
-# ownership method needs no resolver.
-hickory-resolver = { version = "0.24", default-features = false, features = [
-  "dns-over-https-rustls",
+# `https-ring` feature adds DoH (ring crypto provider, matching this crate's
+# other rustls use — see the `rustls`/`tokio-rustls` deps below) so the record
+# verifier resolves over a pinned, TLS-verified, operator-allowlisted endpoint;
+# `webpki-roots` supplies the trust roots for that TLS connection (0.26 split
+# the old "dns-over-https-rustls" meta-feature into these). Optional; the
+# HTTP-token ownership method needs no resolver.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+  "https-ring",
   "system-config",
-  "tokio-runtime",
+  "tokio",
+  "webpki-roots",
 ], optional = true }
 
 # JWT verification for the `oidc` control-plane auth feature. Optional.

@@ -99,7 +99,7 @@ smoltcp = { version = "0.12", optional = true, default-features = false, feature
 # `rustls*` even if a future hickory-proto release changes its own defaults; this crate hand-rolls
 # the UDP/TCP listen loop (same hand-rolled-protocol posture as the SOCKS codec) rather than using
 # hickory-proto's own tokio transport, so the `tokio` feature is not needed either.
-hickory-proto = { version = "0.25", optional = true, default-features = false, features = [
+hickory-proto = { version = "0.26", optional = true, default-features = false, features = [
   "std",
 ] }
 # Route install (plan §3.2): one cross-platform crate for the CIDR→TUN route instead of shelling a
