@@ -4640,6 +4640,13 @@ mod egress_tls_tests {
              still apply and full certificate verification is always performed."
         );
     }
+}
+
+/// The DNS-rebinding TOCTOU pinning regression lives in its own module so the extra-CA gate above
+/// (`egress_tls_tests::`, which CI pins to exactly one test by count) keeps its count unchanged.
+#[cfg(test)]
+mod egress_pin_tests {
+    use super::*;
 
     /// INFO-A regression (DNS-rebinding TOCTOU): [`send_guest_request`] connects to the PINNED,
     /// pre-validated address and never re-resolves the request's host. The URI names

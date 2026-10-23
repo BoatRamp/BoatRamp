@@ -593,6 +593,10 @@ const DYNAMIC_KEYS: &[(&str, &str)] = &[
         "console URL path prefix (default /_console)",
     ),
     (
+        "mcp.enabled",
+        "serve the MCP (Model Context Protocol) endpoint",
+    ),
+    (
         "posture.oidc_require_audience",
         "tighten-only: require an OIDC audience",
     ),
