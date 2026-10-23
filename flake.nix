@@ -14,6 +14,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+    # MinIO (a dev-only, local S3 test double — see `just minio`) was dropped from
+    # nixos-unstable when it was abandoned upstream, so it is pinned here to the last
+    # nixpkgs rev that still packaged it. It is NOT in the build/release path — only
+    # the devShell + the `just minio` recipe use it — so this pin never touches a
+    # shipped artifact.
+    nixpkgs-minio.url = "github:NixOS/nixpkgs/a799d3e3886da994fa307f817a6bc705ae538eeb";
+
     flake-parts.url = "github:hercules-ci/flake-parts";
 
     rust-overlay = {
@@ -370,17 +377,29 @@
             inherit system;
             overlays = [
               (import inputs.rust-overlay)
-              # MinIO is flagged insecure upstream; it is only a dev-only, local
-              # testing tool here, so we clear the marker. Doing it in an overlay
-              # (rather than config.permittedInsecurePackages) is version-
-              # independent and survives nixpkgs bumps.
-              (_final: prev: {
-                minio = prev.minio.overrideAttrs (old: {
-                  meta = (old.meta or { }) // {
-                    knownVulnerabilities = [ ];
-                  };
-                });
-              })
+              # MinIO is a dev-only, local S3 test double (`just minio`); it was
+              # removed from nixos-unstable (abandoned upstream), so we source it from
+              # the pinned `nixpkgs-minio` rev that still has it and clear its insecure
+              # marker. Overlaying (not config.permittedInsecurePackages) keeps it
+              # version-independent across main-nixpkgs bumps. Not in the build/release
+              # path — only the devShell + the `just minio` recipe consume it.
+              (
+                _final: _prev:
+                let
+                  minioPkgs = import inputs.nixpkgs-minio { inherit system; };
+                  clearInsecure =
+                    p:
+                    p.overrideAttrs (old: {
+                      meta = (old.meta or { }) // {
+                        knownVulnerabilities = [ ];
+                      };
+                    });
+                in
+                {
+                  minio = clearInsecure minioPkgs.minio;
+                  minio-client = minioPkgs.minio-client;
+                }
+              )
             ];
           };
 
