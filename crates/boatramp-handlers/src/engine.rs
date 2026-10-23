@@ -606,24 +606,13 @@ impl WasiHttpHooks for GuestEgressHooks {
             {
                 request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
             }
-            // Dev-posture extra-CA: when an operator supplied extra roots AND this is a TLS request,
-            // send through our own handler that trusts webpki ⊕ those roots. Otherwise (the default,
-            // and every plaintext request) use the stock sender verbatim — production trust is
-            // byte-identical.
-            if use_tls && !extra_roots.is_empty() {
-                send_with_extra_roots(request, options, &extra_roots).await
-            } else {
-                let (resp, io) =
-                    wasmtime_wasi_http::default_send_request(request, Some(options)).await?;
-                Ok((
-                    resp.map(|b| {
-                        use http_body_util::BodyExt;
-                        b.boxed_unsync()
-                    }),
-                    Box::new(io)
-                        as Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
-                ))
-            }
+            // Connect to the IP(s) the gate just resolved AND validated — never re-resolve the
+            // hostname (that second `lookup_host` is the DNS-rebinding TOCTOU: an adversarial
+            // resolver could return an internal IP between the SSRF check and the connect). SNI +
+            // Host stay the original hostname. `extra_roots` empty ⇒ stock webpki-only trust; the
+            // dev-posture extra-CA set widens it. This one sender replaces both the stock
+            // `default_send_request` and the former extra-roots-only path.
+            send_guest_request(request, options, use_tls, &extra_roots, &plan.addrs).await
         })
     }
 }
@@ -660,17 +649,28 @@ pub(crate) fn guest_egress_client_config(
     .map(|b| b.with_root_certificates(root_store).with_no_client_auth())
 }
 
-/// Send a guest outbound **TLS** request trusting webpki ⊕ the operator's `extra_roots`. A faithful
-/// port of wasmtime-wasi-http 50.0.0's `default_send_request` TLS branch, differing ONLY in the root
-/// store (via [`guest_egress_client_config`]) — reached only when an operator supplied extra roots
-/// (the dev-posture option), otherwise the stock sender runs. Returns the response plus the
-/// connection-driver future, exactly as [`wasmtime_wasi_http::default_send_request`] does.
-/// Version-coupled: on a wasmtime-wasi-http bump, re-diff this against `default_send_request`.
+/// The single guest-outbound HTTP sender, for BOTH plaintext and TLS. It connects to `addrs` — the
+/// IP(s) [`egress_target_allowed`] already resolved AND cleared through the SSRF floor — and NEVER
+/// re-resolves the hostname. That pinning is the fix for the DNS-rebinding TOCTOU: the stock
+/// `wasmtime_wasi_http::default_send_request` (and the former extra-roots-only path) resolved the host
+/// a SECOND time at connect, so an adversarial resolver could return a validated public IP to the gate
+/// and then an internal IP (loopback / metadata / RFC1918) to the connect. Here the check and the use
+/// are the same bytes.
+///
+/// The Host header and TLS SNI remain the original hostname (from the request URI), so virtual hosting
+/// and certificate verification are unchanged — only the L3 peer is pinned. TLS trust is webpki ⊕
+/// `extra_roots` via [`guest_egress_client_config`]; with `extra_roots` empty that is exactly the stock
+/// webpki-only set (the production default). A faithful port of wasmtime-wasi-http 50.0.0's
+/// `default_send_request` otherwise (origin-form rewrite, connect/first-byte/between-bytes timeouts,
+/// concurrent connection driver). Version-coupled: on a wasmtime-wasi-http bump, re-diff against
+/// `default_send_request`.
 #[allow(clippy::type_complexity)]
-async fn send_with_extra_roots(
-    mut request: http::Request<wasmtime_wasi_http::WasiBody>,
+async fn send_guest_request(
+    request: http::Request<wasmtime_wasi_http::WasiBody>,
     options: wasmtime_wasi_http::RequestOptions,
+    use_tls: bool,
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+    addrs: &[SocketAddr],
 ) -> Result<
     (
         http::Response<wasmtime_wasi_http::WasiBody>,
@@ -678,9 +678,9 @@ async fn send_with_extra_roots(
     ),
     wasmtime_wasi_http::Error,
 > {
-    use http_body_util::BodyExt;
     use rustls::pki_types::ServerName;
     use wasmtime_wasi_http::Error;
+    use wasmtime_wasi_http::io::TokioIo;
 
     let connect_timeout = options.connect_timeout.unwrap_or(Duration::from_secs(600));
     let first_byte_timeout = options
@@ -690,35 +690,97 @@ async fn send_with_extra_roots(
         .between_bytes_timeout
         .unwrap_or(Duration::from_secs(600));
 
-    let authority = match request.uri().authority() {
-        Some(a) if a.port().is_some() => a.to_string(),
-        // This path is TLS-only (the caller gates on `use_tls`), so default to 443.
-        Some(a) => format!("{a}:443"),
-        None => return Err(Error::HttpRequestUriInvalid),
-    };
-    let tcp_stream =
-        tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(&authority))
-            .await
-            .map_err(|_| Error::ConnectionTimeout)?
-            .map_err(Error::Connect)?;
+    // The ORIGINAL hostname — used for SNI + cert verification, NEVER as the connect target. An IPv6
+    // literal keeps its brackets in the authority; strip them for `ServerName`.
+    let host = request
+        .uri()
+        .authority()
+        .ok_or(Error::HttpRequestUriInvalid)?
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
 
-    let tls_config = guest_egress_client_config(extra_roots)?;
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
-    let host = authority.split(':').next().unwrap_or(&authority);
-    let domain = ServerName::try_from(host)
-        .map_err(|e| {
-            tracing::warn!("guest egress dns name error: {e:?}");
-            Error::DnsError {
-                rcode: Some("invalid dns name".to_string()),
-                info_code: None,
-            }
-        })?
-        .to_owned();
-    let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
-        tracing::warn!("guest egress tls protocol error: {e:?}");
-        Error::Tls(e)
-    })?;
-    let stream = wasmtime_wasi_http::io::TokioIo::new(stream);
+    // Connect to a PINNED, pre-validated peer — no second DNS resolution.
+    let tcp_stream = connect_pinned(addrs, connect_timeout).await?;
+
+    if use_tls {
+        let tls_config = guest_egress_client_config(extra_roots)?;
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let domain = ServerName::try_from(host.as_str())
+            .map_err(|e| {
+                tracing::warn!("guest egress dns name error: {e:?}");
+                Error::DnsError {
+                    rcode: Some("invalid dns name".to_string()),
+                    info_code: None,
+                }
+            })?
+            .to_owned();
+        let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+            tracing::warn!("guest egress tls protocol error: {e:?}");
+            Error::Tls(e)
+        })?;
+        finish_guest_http1(
+            TokioIo::new(stream),
+            request,
+            connect_timeout,
+            first_byte_timeout,
+            between_bytes_timeout,
+        )
+        .await
+    } else {
+        finish_guest_http1(
+            TokioIo::new(tcp_stream),
+            request,
+            connect_timeout,
+            first_byte_timeout,
+            between_bytes_timeout,
+        )
+        .await
+    }
+}
+
+/// Connect to the FIRST reachable pre-validated peer, trying each in turn (A/AAAA order). Every
+/// address was already cleared by [`egress_target_allowed`], so trying the next on failure cannot
+/// widen reach. `addrs` is non-empty whenever the gate returned `Ok`.
+async fn connect_pinned(
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+) -> Result<tokio::net::TcpStream, wasmtime_wasi_http::Error> {
+    use wasmtime_wasi_http::Error;
+    let mut last: Option<Error> = None;
+    for &addr in addrs {
+        match tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = Some(Error::Connect(e)),
+            Err(_) => last = Some(Error::ConnectionTimeout),
+        }
+    }
+    Err(last.unwrap_or(Error::DestinationNotFound))
+}
+
+/// Shared HTTP/1 tail over an already-connected stream (plaintext or TLS): handshake, origin-form
+/// rewrite, send, and the between-bytes response-body timeout — mirroring `default_send_request`. The
+/// connection is driven concurrently; the returned io-future awaits it.
+#[allow(clippy::type_complexity)]
+async fn finish_guest_http1<S>(
+    stream: S,
+    mut request: http::Request<wasmtime_wasi_http::WasiBody>,
+    connect_timeout: Duration,
+    first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
+) -> Result<
+    (
+        http::Response<wasmtime_wasi_http::WasiBody>,
+        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ),
+    wasmtime_wasi_http::Error,
+>
+where
+    S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    use http_body_util::BodyExt;
+    use wasmtime_wasi_http::Error;
 
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
@@ -729,11 +791,7 @@ async fn send_with_extra_roots(
     .map_err(Error::Hyper)?;
     // Drive the connection concurrently; the returned io-future awaits its completion (the wasi-http
     // layer drives it to flush the request body + trailing response), mirroring `default_send_request`.
-    let worker = wasmtime_wasi::runtime::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::warn!("guest egress connection dropped: {e}");
-        }
-    });
+    let worker = wasmtime_wasi::runtime::spawn(conn);
 
     // Origin-form: strip scheme+authority (SendRequest::send_request does not).
     *request.uri_mut() = http::Uri::builder()
@@ -752,8 +810,8 @@ async fn send_with_extra_roots(
         .map_err(|_| Error::ConnectionReadTimeout)?
         .map_err(Error::Hyper)?;
     // Enforce the between-bytes response timeout that the stock `default_send_request` applies, so a
-    // trickling upstream body is cut if a frame doesn't arrive within the cap — parity with the
-    // production (non-extra-CA) path. Tokio panics on a zero-duration interval, so clamp to ~0.
+    // trickling upstream body is cut if a frame doesn't arrive within the cap. Tokio panics on a
+    // zero-duration interval, so clamp to ~0.
     let between = if between_bytes_timeout == Duration::ZERO {
         Duration::new(0, 1)
     } else {
@@ -764,8 +822,12 @@ async fn send_with_extra_roots(
     let resp = resp.map(|incoming| BetweenBytesBody { incoming, interval }.boxed_unsync());
 
     let io = async move {
-        worker.await;
-        Ok(())
+        // Surface a connection-level failure during the trailing body/flush to the wasi-http layer
+        // instead of reporting a dropped connection as success (parity with `default_send_request`).
+        worker.await.map_err(|e| {
+            tracing::warn!("guest egress connection dropped: {e}");
+            Error::Hyper(e)
+        })
     };
     Ok((resp, Box::new(io)))
 }
@@ -773,8 +835,8 @@ async fn send_with_extra_roots(
 /// Response-body wrapper that enforces a between-bytes timeout: if a frame does not arrive within the
 /// interval, the body errors with [`wasmtime_wasi_http::Error::ConnectionReadTimeout`]. A faithful
 /// mirror of the `IncomingResponseBody` wrapper inside wasmtime-wasi-http's `default_send_request`, so
-/// the dev-posture extra-CA path (see [`send_with_extra_roots`]) has the same trickle protection as
-/// the stock sender.
+/// the guest-egress sender (see [`send_guest_request`]) has the same trickle protection as the stock
+/// sender.
 struct BetweenBytesBody {
     incoming: hyper::body::Incoming,
     interval: tokio::time::Interval,
@@ -808,6 +870,16 @@ impl HttpBody for BetweenBytesBody {
             }
         }
     }
+
+    // Delegate the body metadata to the wrapped stream, mirroring the stock `IncomingResponseBody`
+    // (an empty/`content-length: 0` upstream still ends promptly and advertises its size).
+    fn is_end_stream(&self) -> bool {
+        self.incoming.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.incoming.size_hint()
+    }
 }
 
 /// The request header carrying a guest self-egress call's recursion depth, stamped with the
@@ -825,6 +897,12 @@ struct EgressPlan {
     /// `Some(next_depth)` when the target is this instance's own serve socket: the caller
     /// stamps [`SELF_EGRESS_DEPTH_HEADER`] with `next_depth` on the outgoing request.
     self_depth: Option<u32>,
+    /// The resolved-and-validated peer address(es) for the target host. The sender connects
+    /// to THESE pinned IPs rather than re-resolving the hostname — closing the DNS-rebinding
+    /// TOCTOU between the SSRF check here and the actual connect (a second `lookup_host` could
+    /// otherwise return an internal IP this gate never saw). Non-empty whenever the gate
+    /// returns `Ok` (an unresolvable host is already refused as `DestinationNotFound`).
+    addrs: Vec<SocketAddr>,
 }
 
 /// Resolve `uri`'s host and (unless `allow_private`) require every address be globally
@@ -859,13 +937,15 @@ async fn egress_target_allowed(
         .host()
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let mut addrs = tokio::net::lookup_host((host, port))
+    let resolved = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_| Error::DestinationNotFound)?;
-    let mut saw_any = false;
+    // Retain every resolved+validated address so the sender can connect to a PINNED IP rather
+    // than re-resolving the hostname (DNS-rebinding TOCTOU). Each entry here has already cleared
+    // the SSRF floor (or is the instance's own socket) below.
+    let mut addrs: Vec<SocketAddr> = Vec::new();
     let mut hit_self = false;
-    for addr in addrs.by_ref() {
-        saw_any = true;
+    for addr in resolved {
         // The instance's own serve socket is always permitted (it re-enters the pipeline);
         // depth-capped below. Otherwise apply the SSRF gate unless the posture trusts egress.
         if self_addrs.contains(&addr) {
@@ -873,8 +953,9 @@ async fn egress_target_allowed(
         } else if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
             return Err(Error::DestinationIpProhibited);
         }
+        addrs.push(addr);
     }
-    if !saw_any {
+    if addrs.is_empty() {
         return Err(Error::DestinationNotFound);
     }
     if hit_self {
@@ -885,9 +966,13 @@ async fn egress_target_allowed(
         }
         return Ok(EgressPlan {
             self_depth: Some(next),
+            addrs,
         });
     }
-    Ok(EgressPlan { self_depth: None })
+    Ok(EgressPlan {
+        self_depth: None,
+        addrs,
+    })
 }
 
 // KNOWN / ACCEPTED LIMITATIONS (PLAN-handler-tcp-egress TE-3, security-review accepted — not fixed in
@@ -4553,6 +4638,64 @@ mod egress_tls_tests {
              extra CA ONLY when supplied (a real loopback handshake to a test-CA server succeeds \
              with it, is rejected without it); trust is WIDENED, never bypassed — the webpki roots \
              still apply and full certificate verification is always performed."
+        );
+    }
+
+    /// INFO-A regression (DNS-rebinding TOCTOU): [`send_guest_request`] connects to the PINNED,
+    /// pre-validated address and never re-resolves the request's host. The URI names
+    /// `pinned-elsewhere.invalid` — a name RFC 6761 guarantees never resolves — yet the call reaches
+    /// a loopback origin supplied only via `addrs`. The pre-fix sender (which did a SECOND
+    /// `lookup_host` of the URI host at connect) would fail NXDOMAIN here; pinning makes it succeed,
+    /// proving the resolve-then-reresolve window is closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_egress_pins_validated_ip_and_never_reresolves_host() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Empty};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Minimal one-shot loopback HTTP/1 origin: consume the request head, reply 204.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            if let Ok((mut tcp, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = tcp.read(&mut buf).await;
+                let _ = tcp
+                    .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = tcp.flush().await;
+            }
+        });
+
+        let body: wasmtime_wasi_http::WasiBody = Empty::<Bytes>::new()
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed_unsync();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://pinned-elsewhere.invalid/health")
+            .body(body)
+            .unwrap();
+
+        let (resp, io) = send_guest_request(
+            request,
+            wasmtime_wasi_http::RequestOptions::default(),
+            false,          // plaintext
+            &[],            // no extra CA
+            &[server_addr], // the validated, PINNED peer
+        )
+        .await
+        .expect("pinned connect reaches the loopback origin despite a non-resolvable URI host");
+        assert_eq!(
+            resp.status(),
+            http::StatusCode::NO_CONTENT,
+            "the pinned loopback origin answered — the sender used `addrs`, not a DNS re-resolution"
+        );
+        let _ = std::pin::Pin::from(io).await;
+        let _ = srv.await;
+        println!(
+            "GUEST-EGRESS PIN OK: send_guest_request connected to the validated pinned IP and never \
+             re-resolved the request host — the DNS-rebinding window between the SSRF check and the \
+             connect is closed (a non-resolvable `.invalid` URI host still reached the pinned origin)."
         );
     }
 }
