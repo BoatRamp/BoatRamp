@@ -153,8 +153,14 @@ pub fn parse_settings(payload: &[u8]) -> Result<Vec<(u16, u32)>, H2Error> {
     if !payload.len().is_multiple_of(6) {
         return Err(conn(ErrorCode::FrameSizeError));
     }
+    // `as_chunks::<6>` over `chunks_exact(6)`: the length is already a multiple of
+    // 6 (checked above), so the remainder `.1` is empty and each chunk is a fixed
+    // `&[u8; 6]`, which elides the per-index bounds checks. (clippy 1.99
+    // `chunks_exact_to_as_chunks`.)
     Ok(payload
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             (
                 u16::from_be_bytes([c[0], c[1]]),
