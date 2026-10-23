@@ -24,6 +24,8 @@ use boatramp_core::kv::KvStore;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_core::project::ProjectRef;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::sql::SqlBackend;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_core::sql::SqlError;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 use boatramp_core::sql::{
@@ -213,6 +215,10 @@ pub struct ManagedDbEnv {
     /// How a managed DB's stock image runs on a shared-kernel backend so it can init
     /// (`[compute].managed_db_privilege`).
     privilege: ManagedDbPrivilege,
+    /// The deploy store, so the readiness pass can resolve a managed workload's live
+    /// endpoint and connect directly to it to probe + provision (the `Provisioned`-gate
+    /// carve-out: this connection must reach a not-yet-`Provisioned` replica).
+    deploy: DeployStore,
 }
 
 /// The uid:gid a stock DB image runs its server process as — both the official
@@ -246,6 +252,7 @@ impl ManagedDbEnv {
         databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
         creds: ManagedSqlCredentials,
         privilege: ManagedDbPrivilege,
+        deploy: DeployStore,
     ) -> Self {
         let mut dbs = HashMap::new();
         for db in databases.values() {
@@ -274,6 +281,7 @@ impl ManagedDbEnv {
             dbs,
             creds,
             privilege,
+            deploy,
         }
     }
 
@@ -281,6 +289,35 @@ impl ManagedDbEnv {
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.dbs.is_empty()
+    }
+
+    /// Build an admin connection to a managed workload's live endpoint, used by the
+    /// reconcile's readiness pass to probe + provision. It resolves through the
+    /// per-project [`DeployEndpointResolver`], which selects a Running + healthy replica
+    /// — deliberately NOT a `Provisioned`-gated one: this connection is what *produces*
+    /// `Provisioned`, so it must be able to reach a not-yet-provisioned replica.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    fn admin_backend(
+        &self,
+        project: &str,
+        workload: &str,
+        kind: ExternalSqlKind,
+        database: &str,
+        user: &str,
+        password: String,
+    ) -> boatramp_storage::sql_compute::ComputeResolvedSqlBackend {
+        let resolver = Arc::new(DeployEndpointResolver::new(self.deploy.clone(), project));
+        boatramp_storage::sql_compute::ComputeResolvedSqlBackend::new(
+            resolver,
+            workload,
+            kind,
+            database,
+            user,
+            password,
+            Some(1),
+            false,
+            Some(std::time::Duration::from_secs(10)),
+        )
     }
 
     /// Resolve the launched `workload` to the [`ManagedDbSpec`] whose server-init env
@@ -355,6 +392,85 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
             }
             ManagedDbPrivilege::Caps => PrivilegeDirective::Caps(managed_db_caps()),
         })
+    }
+
+    async fn probe_managed_ready(
+        &self,
+        project: &str,
+        workload: &str,
+        _endpoint: &boatramp_core::compute::Endpoint,
+    ) -> Option<bool> {
+        // Not a managed database → let the reconcile use the generic `healthy` signal.
+        let db = self.resolve_spec(workload)?;
+        // Resolve the init superuser's sealed password (same key the server-init env used,
+        // so this connects as exactly the user the image initialized). A credential we
+        // can't yet resolve means "not ready" (don't claim service-ready blindly).
+        let Ok(password) = self.creds.password(project, workload).await else {
+            return Some(false);
+        };
+        // Connect to the DB's OWN database as the superuser and run a real `SELECT 1`:
+        // this confirms both that the server answers AND that its database exists — a
+        // TCP-open `healthy` alone does not (a DB that can't read its data directory
+        // still listens but errors every query, the data-dir-ownership failure mode).
+        let admin =
+            self.admin_backend(project, workload, db.kind, &db.database, &db.user, password);
+        Some(admin.run_script("SELECT 1").await.is_ok())
+    }
+
+    async fn provision_managed(
+        &self,
+        project: &str,
+        workload: &str,
+        _endpoint: &boatramp_core::compute::Endpoint,
+    ) -> Result<(), String> {
+        // Not a managed database → nothing to provision.
+        let Some(db) = self.resolve_spec(workload) else {
+            return Ok(());
+        };
+        match db.tenant {
+            // The shared server hosts every tenant's per-tenant database inside itself;
+            // those provision lazily on first connect (`provision_shared`) / via `ensure`,
+            // NOT from the server workload's reconcile pass. The server's own default
+            // database comes from its image init. So there is nothing to create here.
+            crate::config::TenantIsolation::Shared => Ok(()),
+            // A dedicated per-tenant (or single-install) container: ensure its declared
+            // database exists on it, authoritatively, every launch. The stock image's
+            // `initdb` (POSTGRES_DB) usually already created it, so this is a confirming,
+            // idempotent `CREATE DATABASE` — "already exists" is success. Making it a
+            // post-launch action (not relying solely on the image init) is what lets an
+            // operator migrate before any component runs, and makes existence observable.
+            crate::config::TenantIsolation::Single => {
+                let password = self
+                    .creds
+                    .password(project, workload)
+                    .await
+                    .map_err(|e| format!("credential ({workload}): {e}"))?;
+                // `CREATE DATABASE` cannot run inside the database being created → connect
+                // to the always-present maintenance database as the init superuser.
+                let admin = self.admin_backend(
+                    project,
+                    workload,
+                    db.kind,
+                    crate::tenant_sql::maintenance_database(db.kind),
+                    &db.user,
+                    password,
+                );
+                let db_id = boatramp_storage::tenant_provision::quote_ident(db.kind, &db.database);
+                let stmt = match db.kind {
+                    // Postgres has no `IF NOT EXISTS` for `CREATE DATABASE`; tolerate the
+                    // already-exists error (the documented idempotency contract).
+                    ExternalSqlKind::Postgres => format!("CREATE DATABASE {db_id};"),
+                    ExternalSqlKind::Mysql => format!("CREATE DATABASE IF NOT EXISTS {db_id};"),
+                };
+                if let Err(e) = admin.run_script(&stmt).await {
+                    if crate::tenant_sql::is_database_exists_error(&e) {
+                        return Ok(());
+                    }
+                    return Err(format!("provision {}: {e}", db.database));
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2382,7 +2498,12 @@ mod tests {
 
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
-        let env = ManagedDbEnv::from_config(&dbs, creds, ManagedDbPrivilege::default());
+        let env = ManagedDbEnv::from_config(
+            &dbs,
+            creds,
+            ManagedDbPrivilege::default(),
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        );
         assert!(!env.is_empty());
 
         // The managed workload gets a rootless privilege directive by default; the
@@ -2439,7 +2560,12 @@ mod tests {
 
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
-        let env = ManagedDbEnv::from_config(&dbs, creds, ManagedDbPrivilege::default());
+        let env = ManagedDbEnv::from_config(
+            &dbs,
+            creds,
+            ManagedDbPrivilege::default(),
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        );
 
         // A per-tenant workload of `pg-metrics` matches both `pg` and `pg-metrics`;
         // the longest base (`pg-metrics`) must win → the metrics database/user.
@@ -2525,6 +2651,11 @@ mod tests {
             healthy,
             started_at: None,
             phase,
+            readiness: if healthy {
+                boatramp_core::compute::Readiness::Provisioned
+            } else {
+                boatramp_core::compute::Readiness::Starting
+            },
             snapshot: None,
         }
     }

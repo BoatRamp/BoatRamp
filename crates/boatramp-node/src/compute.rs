@@ -1156,6 +1156,7 @@ mod tests {
                     healthy: true,
                     started_at: None,
                     phase,
+                    readiness: boatramp_core::compute::Readiness::Provisioned,
                     snapshot: None,
                 },
             )

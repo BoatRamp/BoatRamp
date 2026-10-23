@@ -5295,6 +5295,11 @@ mod tests {
             healthy,
             started_at: None,
             phase,
+            readiness: if healthy && matches!(phase, ReplicaPhase::Running) {
+                boatramp_core::compute::Readiness::Provisioned
+            } else {
+                boatramp_core::compute::Readiness::Starting
+            },
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
                 project: project.into(),
                 workload: workload.into(),

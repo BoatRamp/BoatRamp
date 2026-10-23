@@ -302,6 +302,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
         healthy: true,
         started_at: None,
         phase: ReplicaPhase::Running,
+        readiness: boatramp_core::compute::Readiness::Provisioned,
         snapshot: None,
     };
     deploy

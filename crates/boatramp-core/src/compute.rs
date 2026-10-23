@@ -747,6 +747,62 @@ pub enum ReplicaPhase {
     Zero,
 }
 
+/// Service-level readiness of a replica — **distinct from
+/// [`ObservedInstance::healthy`]**, which is the backend's runner/TCP-level "the
+/// process is up" (a bare `TcpStream::connect` for the native container backend; the
+/// container being `running` for docker). The reconcile advances a replica through
+/// these states after launch:
+///
+/// - [`Starting`](Readiness::Starting) → launched, service not yet readiness-probed.
+/// - [`ServiceReady`](Readiness::ServiceReady) → the service answers its readiness
+///   probe (a managed DB: a real `SELECT 1`; a generic workload: the backend health
+///   check), but its post-launch actions have not completed.
+/// - [`Provisioned`](Readiness::Provisioned) → service-ready AND every post-launch
+///   action has completed. This is what the gated surfaces treat as *usable*.
+/// - [`ProvisionFailed`](Readiness::ProvisionFailed) → a post-launch action failed;
+///   surfaced (e.g. `db status`), retried on the next reconcile tick, and blocks the
+///   gated surfaces.
+///
+/// *Which* surfaces require which level is configurable (the readiness-gate policy),
+/// defaulting to [`Provisioned`](Readiness::Provisioned) for all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Readiness {
+    /// Launched; the service has not yet passed its service-level readiness probe.
+    Starting,
+    /// The service answers its readiness probe, but post-launch actions are not done.
+    ServiceReady,
+    /// Service-ready AND every post-launch action has completed — *usable*.
+    Provisioned,
+    /// A post-launch action failed; carries the reason. Retried next tick; gated.
+    ProvisionFailed {
+        /// Human-readable failure reason (no credential material).
+        reason: String,
+    },
+}
+
+impl Readiness {
+    /// Whether this replica has completed its post-launch actions and is usable by a
+    /// surface that requires full provisioning (the strict default gate).
+    pub fn is_provisioned(&self) -> bool {
+        matches!(self, Self::Provisioned)
+    }
+
+    /// Whether the service has passed its readiness probe (≥ `ServiceReady`), i.e. it
+    /// is reachable even if its post-launch actions have not all completed. Used by a
+    /// surface whose readiness-gate has been relaxed to `service_ready`.
+    pub fn is_service_ready(&self) -> bool {
+        matches!(self, Self::ServiceReady | Self::Provisioned)
+    }
+}
+
+/// Back-compat default for [`ObservedInstance::readiness`]: a record written before the
+/// field existed was an already-running replica, so it deserializes as
+/// [`Provisioned`](Readiness::Provisioned) — it keeps routing across the upgrade, and
+/// the next reconcile tick recomputes its real readiness. Keeps the stored schema v1.
+fn readiness_provisioned_backcompat() -> Readiness {
+    Readiness::Provisioned
+}
+
 /// An observed replica (the persisted control-plane state at
 /// `compute_state/<workload>/<replica>`; also the gateway's upstream source).
 /// Usually [`Running`](ReplicaPhase::Running); a scale-to-zero replica persists
@@ -783,6 +839,13 @@ pub struct ObservedInstance {
     /// deserializing as [`Running`](ReplicaPhase::Running) — schema stays v1.
     #[serde(default)]
     pub phase: ReplicaPhase,
+    /// Service-level readiness, **distinct from `healthy`** (which is runner/TCP-level).
+    /// Advanced by the reconcile's readiness pass (service-readiness probe + post-launch
+    /// actions). `#[serde(default = …)]` deserializes older records (no field) as
+    /// [`Provisioned`](Readiness::Provisioned) so an already-running replica keeps
+    /// routing across the upgrade; the next tick recomputes it. Schema stays v1.
+    #[serde(default = "readiness_provisioned_backcompat")]
+    pub readiness: Readiness,
     /// The snapshot to restore from — `Some` iff `phase == Zero`.
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
@@ -1129,6 +1192,42 @@ pub trait ManagedDbEnvResolver: Send + Sync {
     fn managed_db_privilege(&self, _project: &str, _workload: &str) -> Option<PrivilegeDirective> {
         None
     }
+
+    /// Probe a **managed-DB** workload's *service-level* readiness by connecting to
+    /// `endpoint` and running a real `SELECT 1` — a TCP-open `healthy` is not enough (a
+    /// DB that can't read its data directory still listens but errors every query, the
+    /// data-dir-ownership failure mode). `None` when `workload` is not a managed database
+    /// (the reconcile then uses the generic `healthy` signal); `Some(true)` when the
+    /// server answers, `Some(false)` when it does not yet. **Connects directly to the
+    /// launching instance** — the readiness pass runs before the replica is
+    /// [`Provisioned`](Readiness::Provisioned), so it must NOT go through the
+    /// `Provisioned`-gated routing resolver (it is what *produces* `Provisioned`).
+    async fn probe_managed_ready(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _endpoint: &Endpoint,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Run a **managed-DB** workload's derived post-launch DDL — the `CREATE DATABASE`
+    /// (and, where applicable, role setup) for the database this `(project, workload)`
+    /// hosts — against `endpoint`, **idempotently** (relaunch re-enters this every time;
+    /// "already exists" is tolerated). Called once [`probe_managed_ready`] reports the
+    /// service answers. `Ok(())` ⇒ provisioned; `Err(reason)` ⇒ surfaced as
+    /// [`ProvisionFailed`](Readiness::ProvisionFailed) and retried next tick. A no-op
+    /// `Ok(())` when `workload` is not a managed database, or when there is nothing to
+    /// create here (e.g. the shared server, whose per-tenant databases provision lazily
+    /// on first connect). Connects directly to the instance (carve-out, as above).
+    async fn provision_managed(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _endpoint: &Endpoint,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// How a managed database is made able to initialize its stock image on a shared-kernel
@@ -1460,27 +1559,40 @@ pub async fn reconcile_once(
                 ));
                 continue;
             }
-            if let Some(backend) = backends.get(&state.backend)
-                && let Ok(health) = backend.health(&state.handle).await
-            {
-                let now_healthy = matches!(health, Health::Healthy);
-                // PERSIST a health transition. The endpoint resolver reads `healthy`
-                // from the STORE, not from this in-memory refresh — so a replica that
-                // becomes reachable *after* launch must have that recovery written
-                // back. `launch_one` probes readiness *before* the guest binds its
-                // port and persists `healthy: false`; without persisting the refresh,
-                // that pre-bind `false` sticks forever and the resolver reports "no
-                // healthy replica" for a perfectly reachable workload (a running
-                // healthy replica needs no Launch/Stop action, so nothing else writes
-                // it back). Only write on a change to keep the reconcile cheap.
-                if now_healthy != state.healthy {
-                    state.healthy = now_healthy;
-                    if let Err(e) = deploy.set_replica_state(project, state).await {
-                        report.errors.push(format!(
-                            "{}/{}: persist health: {e}",
-                            state.handle.workload, state.handle.replica
-                        ));
+            if let Some(backend) = backends.get(&state.backend) {
+                let mut changed = false;
+                // 1) Refresh the runner/TCP-level health. The endpoint/DNS resolvers read
+                // `healthy` from the STORE, not from this in-memory refresh, so a replica
+                // that becomes reachable *after* launch must have that recovery written
+                // back. `launch_one` probes *before* the guest binds its port and persists
+                // `healthy: false`; without persisting the refresh that pre-bind `false`
+                // sticks forever (a running healthy replica needs no Launch/Stop, so
+                // nothing else writes it). Persist only on a change to stay cheap.
+                if let Ok(health) = backend.health(&state.handle).await {
+                    let now_healthy = matches!(health, Health::Healthy);
+                    if now_healthy != state.healthy {
+                        state.healthy = now_healthy;
+                        changed = true;
                     }
+                }
+                // 2) Advance SERVICE-level readiness (distinct from `healthy`). A managed
+                // DB gets a real `SELECT 1` probe + its derived post-launch provisioning
+                // DDL; a generic workload is usable as soon as it is `healthy`. Only
+                // advances while not yet `Provisioned` — idempotent DDL is not re-run every
+                // tick once done — and a relaunch resets a replica to `Starting`, so a
+                // replaced container re-provisions. This is where "runner up" becomes
+                // "ready": the gated surfaces route only once a replica is `Provisioned`.
+                let new_readiness =
+                    advance_readiness(backend.as_ref(), managed_db, &project_name, state).await;
+                if new_readiness != state.readiness {
+                    state.readiness = new_readiness;
+                    changed = true;
+                }
+                if changed && let Err(e) = deploy.set_replica_state(project, state).await {
+                    report.errors.push(format!(
+                        "{}/{}: persist state: {e}",
+                        state.handle.workload, state.handle.replica
+                    ));
                 }
             }
         }
@@ -1675,6 +1787,9 @@ pub async fn reconcile_once(
                                 healthy: true,
                                 started_at: Some(crate::time::now_unix()),
                                 phase: ReplicaPhase::Running,
+                                // A woken replica re-advances through the readiness pass
+                                // so its (idempotent) post-launch actions re-run.
+                                readiness: Readiness::Starting,
                                 snapshot: None,
                             };
                             match deploy.set_replica_state(project, &state).await {
@@ -1716,6 +1831,55 @@ fn region_of_node(nodes: &[Node], id: u64) -> Option<String> {
         .iter()
         .find(|n| n.id == id)
         .and_then(|n| n.region.clone())
+}
+
+/// Compute a Running replica's new [`Readiness`] from its current `healthy` and — for a
+/// managed database — a real service probe (`SELECT 1`) followed by its derived
+/// post-launch provisioning. Pure of persistence: the caller writes the result back only
+/// on a change. Idempotent and safe to call every tick (it skips the DDL once a replica
+/// is already [`Provisioned`](Readiness::Provisioned)).
+async fn advance_readiness(
+    _backend: &dyn ComputeBackend,
+    managed_db: Option<&dyn ManagedDbEnvResolver>,
+    project: &str,
+    state: &ObservedInstance,
+) -> Readiness {
+    if !state.healthy {
+        // Runner up but the service is not confirmed (a never-ready launch, or a DB that
+        // stopped answering). Fall back to Starting so the gated surfaces stop routing.
+        return Readiness::Starting;
+    }
+    // Already provisioned: done — don't re-run idempotent DDL every tick. A relaunch
+    // resets this to `Starting` (see `launch_one`), so a replaced replica re-provisions.
+    if state.readiness.is_provisioned() {
+        return Readiness::Provisioned;
+    }
+    let Some(m) = managed_db else {
+        // No managed-DB resolver wired: a healthy generic workload is usable.
+        return Readiness::Provisioned;
+    };
+    let workload = &state.handle.workload;
+    match m
+        .probe_managed_ready(project, workload, &state.endpoint)
+        .await
+    {
+        // Not a managed database: a healthy generic workload is usable. (The general
+        // user-declared post-launch action-runner advances this through `ServiceReady`
+        // before `Provisioned`; added with the `post_launch` field.)
+        None => Readiness::Provisioned,
+        // Listens but does not answer yet — still initializing, OR cannot read its data
+        // directory (the data-dir-ownership failure surfaces here as a stuck `Starting`
+        // instead of a silent healthy-but-broken container).
+        Some(false) => Readiness::Starting,
+        // The service answers: run the derived provisioning DDL (idempotent).
+        Some(true) => match m
+            .provision_managed(project, workload, &state.endpoint)
+            .await
+        {
+            Ok(()) => Readiness::Provisioned,
+            Err(reason) => Readiness::ProvisionFailed { reason },
+        },
+    }
 }
 
 /// Materialize + launch one replica, returning its observed state.
@@ -1785,6 +1949,9 @@ async fn launch_one(
         healthy,
         started_at: Some(started_at),
         phase: ReplicaPhase::Running,
+        // Freshly launched: the reconcile's readiness pass probes service-readiness +
+        // runs post-launch actions to advance this to Provisioned (or ProvisionFailed).
+        readiness: Readiness::Starting,
         snapshot: None,
     })
 }
@@ -2377,6 +2544,13 @@ mod tests {
             // helpers exercise); the startup-grace tests set `started_at` explicitly.
             started_at: None,
             phase: ReplicaPhase::Running,
+            // A healthy baseline replica is fully provisioned (what the reconcile tests
+            // expect); the readiness-specific tests set this explicitly.
+            readiness: if healthy {
+                Readiness::Provisioned
+            } else {
+                Readiness::Starting
+            },
             snapshot: None,
         }
     }
@@ -3401,6 +3575,7 @@ mod tests {
             healthy: false,
             started_at: None,
             phase: ReplicaPhase::Zero,
+            readiness: Readiness::Starting,
             snapshot: Some(Snapshot {
                 project: "default".into(),
                 workload: "w".into(),
@@ -3438,6 +3613,131 @@ mod tests {
         assert!(
             got.contains(&("default".to_string(), "w".to_string(), 0)),
             "the parked (Zero) replica must be handed to gc_ip_pool so its IP is kept, got {got:?}"
+        );
+    }
+
+    // --- Readiness lifecycle: `advance_readiness` (runner-up vs ready) ---------------
+
+    /// A controllable [`ManagedDbEnvResolver`] for the readiness-pass tests. `probe` is
+    /// the `probe_managed_ready` result (`None` ⇒ not a managed DB); `provision_ok`
+    /// decides whether `provision_managed` succeeds. `provisions` counts provision calls
+    /// so a test can assert the idempotent DDL is NOT re-run once already provisioned.
+    struct FakeManagedDb {
+        probe: Option<bool>,
+        provision_ok: bool,
+        provisions: std::sync::atomic::AtomicUsize,
+    }
+    impl FakeManagedDb {
+        fn new(probe: Option<bool>, provision_ok: bool) -> Self {
+            Self {
+                probe,
+                provision_ok,
+                provisions: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl ManagedDbEnvResolver for FakeManagedDb {
+        async fn managed_db_env(&self, _p: &str, _w: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        async fn probe_managed_ready(&self, _p: &str, _w: &str, _e: &Endpoint) -> Option<bool> {
+            self.probe
+        }
+        async fn provision_managed(&self, _p: &str, _w: &str, _e: &Endpoint) -> Result<(), String> {
+            self.provisions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.provision_ok {
+                Ok(())
+            } else {
+                Err("boom".into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_managed_probe_then_provision_reaches_provisioned() {
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), true);
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        assert_eq!(r, Readiness::Provisioned);
+        assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_managed_provision_failure_surfaces_reason() {
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), false);
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        assert_eq!(
+            r,
+            Readiness::ProvisionFailed {
+                reason: "boom".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_probe_false_stays_starting() {
+        // Listens (healthy TCP) but does not answer `SELECT 1` — the data-dir-ownership
+        // failure mode. Must NOT advance to provisioned, and must not run the DDL.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(false), true);
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        assert_eq!(r, Readiness::Starting);
+        assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_generic_healthy_is_provisioned() {
+        // A non-managed workload (probe None) and a reconcile with no managed resolver
+        // both reach Provisioned as soon as the runner is healthy — no routing regression
+        // for generic workloads once gating is applied.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(None, true);
+        let mut s = observed("w", 0, 1, true);
+        s.readiness = Readiness::Starting;
+        assert_eq!(
+            advance_readiness(&backend, Some(&m), "default", &s).await,
+            Readiness::Provisioned
+        );
+        assert_eq!(
+            advance_readiness(&backend, None, "default", &s).await,
+            Readiness::Provisioned
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_unhealthy_falls_back_to_starting() {
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), true);
+        let s = observed("w", 0, 1, false); // not healthy
+        assert_eq!(
+            advance_readiness(&backend, Some(&m), "default", &s).await,
+            Readiness::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_already_provisioned_does_not_rerun_ddl() {
+        // Once Provisioned, the idempotent DDL must NOT be re-run every tick: a resolver
+        // whose provision would FAIL must never be called, and the state stays Provisioned.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), false);
+        let s = observed("w", 0, 1, true); // `observed` sets healthy ⇒ Provisioned
+        assert_eq!(s.readiness, Readiness::Provisioned);
+        let r = advance_readiness(&backend, Some(&m), "default", &s).await;
+        assert_eq!(r, Readiness::Provisioned);
+        assert_eq!(
+            m.provisions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provisioning DDL must not re-run once the replica is already Provisioned"
         );
     }
 }

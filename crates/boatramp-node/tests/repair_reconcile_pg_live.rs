@@ -344,6 +344,7 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
                 healthy: true,
                 started_at: None,
                 phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
                 snapshot: None,
             },
         )

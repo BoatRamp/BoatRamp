@@ -608,8 +608,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 .as_ref()
                 .map(|c| c.managed_db_privilege)
                 .unwrap_or_default();
-            let env =
-                crate::managed_sql::ManagedDbEnv::from_config(&sql.databases, creds, privilege);
+            let env = crate::managed_sql::ManagedDbEnv::from_config(
+                &sql.databases,
+                creds,
+                privilege,
+                deploy.clone(),
+            );
             (!env.is_empty()).then(|| Arc::new(env) as Arc<_>)
         }
         _ => None,

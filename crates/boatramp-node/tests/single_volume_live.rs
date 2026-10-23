@@ -443,6 +443,7 @@ async fn provision_and_launch_tenant(
         healthy: true,
         started_at: None,
         phase: ReplicaPhase::Running,
+        readiness: boatramp_core::compute::Readiness::Provisioned,
         snapshot: None,
     };
     deploy

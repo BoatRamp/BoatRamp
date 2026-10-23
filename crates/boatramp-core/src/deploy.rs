@@ -8080,6 +8080,7 @@ mod tests {
                     healthy: true,
                     started_at: None,
                     phase: ReplicaPhase::Running,
+                    readiness: crate::compute::Readiness::Provisioned,
                     snapshot: None::<Snapshot>,
                 },
             )

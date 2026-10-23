@@ -2013,12 +2013,55 @@ pub(super) async fn database_status(
     // `Single` tenant) varies by isolation, so the coarse "declared" fact is what a status
     // view honestly asserts.
     let workload = format!("bramp-db-{}-{}", project.as_ref().as_str(), name);
+    // Surface the workload's live readiness (distinct from the bare declaration): read its
+    // replica states and reduce them to a single honest signal. This is what lets an
+    // operator see "declared but not yet ready to migrate" vs "ready", and turns a
+    // can't-serve-but-looks-running container (e.g. a data-dir-ownership failure) into a
+    // visible `provision_failed` instead of a silent healthy. A workload registered under
+    // a different scope (a `Shared` server lives in the default project) or not yet
+    // launched has no replicas here → `pending` (honest: this view doesn't track it).
+    let states = deploy
+        .list_replica_states(project.as_ref(), &workload)
+        .await
+        .unwrap_or_default();
+    let readiness = summarize_readiness(&states);
     Json(serde_json::json!({
         "database": db,
         "workload": workload,
         "declared": true,
+        "readiness": readiness,
     }))
     .into_response()
+}
+
+/// Reduce a managed workload's replica states to one readiness signal for `db status`.
+/// Most-informative-wins so an operator sees the actionable state: a `provision_failed`
+/// (with its reason) is surfaced over a sibling that is merely `starting`; `provisioned`
+/// means at least one replica is usable. No replicas ⇒ `pending` (not launched, or
+/// registered under another scope this view does not track).
+fn summarize_readiness(states: &[boatramp_core::compute::ObservedInstance]) -> serde_json::Value {
+    use boatramp_core::compute::{Readiness, ReplicaPhase};
+    let running: Vec<&Readiness> = states
+        .iter()
+        .filter(|s| s.phase == ReplicaPhase::Running)
+        .map(|s| &s.readiness)
+        .collect();
+    if running.is_empty() {
+        return serde_json::json!({ "state": "pending" });
+    }
+    if let Some(reason) = running.iter().find_map(|r| match r {
+        Readiness::ProvisionFailed { reason } => Some(reason.clone()),
+        _ => None,
+    }) {
+        return serde_json::json!({ "state": "provision_failed", "reason": reason });
+    }
+    if running.iter().any(|r| r.is_provisioned()) {
+        return serde_json::json!({ "state": "provisioned" });
+    }
+    if running.iter().any(|r| r.is_service_ready()) {
+        return serde_json::json!({ "state": "service_ready" });
+    }
+    serde_json::json!({ "state": "starting" })
 }
 
 // ---------------------------------------------------------------------------
@@ -3902,6 +3945,11 @@ mod tests {
             healthy,
             started_at,
             phase: ReplicaPhase::Running,
+            readiness: if healthy {
+                boatramp_core::compute::Readiness::Provisioned
+            } else {
+                boatramp_core::compute::Readiness::Starting
+            },
             snapshot: None,
         }
     }

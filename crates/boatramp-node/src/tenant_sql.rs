@@ -135,7 +135,7 @@ fn engine_of(kind: ExternalSqlKind) -> ManagedDbEngine {
 /// provisioning DDL on a `Shared` server (a `CREATE DATABASE` cannot run *inside*
 /// the database being created). Postgres has the always-present `postgres`
 /// database; MySQL uses its always-present `mysql` catalog database.
-fn maintenance_database(kind: ExternalSqlKind) -> &'static str {
+pub(crate) fn maintenance_database(kind: ExternalSqlKind) -> &'static str {
     match kind {
         ExternalSqlKind::Postgres => "postgres",
         ExternalSqlKind::Mysql => "mysql",
@@ -562,7 +562,7 @@ async fn provision_shared(
 /// Whether a SQL error is a benign "database already exists" (Postgres SQLSTATE
 /// 42P04, surfaced in the message by sqlx). Treated as success on the idempotent
 /// `CREATE DATABASE` per the [`provision_ddl`] contract.
-fn is_database_exists_error(err: &SqlError) -> bool {
+pub(crate) fn is_database_exists_error(err: &SqlError) -> bool {
     let msg = err.to_string().to_ascii_lowercase();
     msg.contains("already exists") && msg.contains("database")
 }

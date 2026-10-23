@@ -288,6 +288,7 @@ async fn rls_session_guard_holds_live_mysql() {
         healthy: true,
         started_at: None,
         phase: ReplicaPhase::Running,
+        readiness: boatramp_core::compute::Readiness::Provisioned,
         snapshot: None,
     };
     deploy
