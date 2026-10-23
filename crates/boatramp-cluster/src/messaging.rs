@@ -878,11 +878,11 @@ impl Messaging for RaftMessaging {
         if msg.inline {
             // Release the inline bytes from the SA1 budget (saturating — never wrap on a post-restart
             // ack of a pre-restart inline message).
-            let _ = self.inline_inflight_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(msg.payload.len())),
-            );
+            let _ =
+                self.inline_inflight_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(msg.payload.len()))
+                    });
         } else {
             self.storage
                 .delete(&messaging::payload_key(&msg.topic, &msg.id))
@@ -1054,11 +1054,11 @@ impl Messaging for RaftMessaging {
         }
         // C2: release the purged inline dead-letters' bytes from the SA1 budget (saturating).
         if inline_release > 0 {
-            let _ = self.inline_inflight_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(inline_release)),
-            );
+            let _ =
+                self.inline_inflight_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(inline_release))
+                    });
         }
         Ok(ids.len() + grouped.len())
     }
@@ -1301,11 +1301,11 @@ impl Messaging for RaftMessaging {
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
         }
         if inline_release > 0 {
-            let _ = self.inline_inflight_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(inline_release)),
-            );
+            let _ =
+                self.inline_inflight_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(inline_release))
+                    });
         }
         Ok(matched.len())
     }

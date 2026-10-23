@@ -600,11 +600,11 @@ mod tests {
 
     fn internet_checksum(data: &[u8]) -> u16 {
         let mut sum: u32 = 0;
-        let mut iter = data.chunks_exact(2);
-        for chunk in &mut iter {
+        let (pairs, rest) = data.as_chunks::<2>();
+        for chunk in pairs {
             sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
         }
-        if let [last] = iter.remainder() {
+        if let [last] = rest {
             sum += u32::from(*last) << 8;
         }
         while sum >> 16 != 0 {

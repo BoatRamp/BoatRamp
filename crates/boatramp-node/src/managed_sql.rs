@@ -1377,11 +1377,11 @@ impl NodeMigrationRunner {
                     _ => LedgerOrigin::Apply.as_str().to_string(),
                 };
                 AppliedMigration {
-                    id: r.first().map(&text).unwrap_or_default(),
-                    ordinal: r.get(1).map(&int).unwrap_or_default(),
-                    content_hash: r.get(2).map(&text).unwrap_or_default(),
-                    kind: r.get(3).map(&text).unwrap_or_default(),
-                    applied_at: r.get(4).map(&text).unwrap_or_default(),
+                    id: r.first().map(text).unwrap_or_default(),
+                    ordinal: r.get(1).map(int).unwrap_or_default(),
+                    content_hash: r.get(2).map(text).unwrap_or_default(),
+                    kind: r.get(3).map(text).unwrap_or_default(),
+                    applied_at: r.get(4).map(text).unwrap_or_default(),
                     origin,
                 }
             })
@@ -1871,11 +1871,11 @@ impl LibsqlMigrationRunner {
                     _ => LedgerOrigin::Apply.as_str().to_string(),
                 };
                 AppliedMigration {
-                    id: r.first().map(&text).unwrap_or_default(),
-                    ordinal: r.get(1).map(&int).unwrap_or_default(),
-                    content_hash: r.get(2).map(&text).unwrap_or_default(),
-                    kind: r.get(3).map(&text).unwrap_or_default(),
-                    applied_at: r.get(4).map(&text).unwrap_or_default(),
+                    id: r.first().map(text).unwrap_or_default(),
+                    ordinal: r.get(1).map(int).unwrap_or_default(),
+                    content_hash: r.get(2).map(text).unwrap_or_default(),
+                    kind: r.get(3).map(text).unwrap_or_default(),
+                    applied_at: r.get(4).map(text).unwrap_or_default(),
                     origin,
                 }
             })
