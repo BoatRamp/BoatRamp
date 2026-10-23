@@ -28,7 +28,15 @@ from these — a CI check guards against drift); `boatramp operator run` is the
 controller entrypoint (what the Deployment runs). The operator watches
 `BoatRampCluster` and the tenant `Site` CRD (and `Function`, once the FaaS backend
 lands) and reconciles them via server-side apply, so it owns exactly the fields it
-sets. Release images are cosign-signed with an attached CycloneDX SBOM.
+sets. Release images are cosign-signed (with the project's release key) and carry an attached
+CycloneDX SBOM. Verify a pulled image against the repo's published key
+([`cosign.pub`](https://github.com/BoatRamp/BoatRamp/blob/main/cosign.pub) at the repo root):
+
+```sh
+# One key verifies every tag, including the images migrated from the prior history.
+cosign verify --key cosign.pub ghcr.io/boatramp/boatramp:<tag>
+cosign verify-attestation --key cosign.pub --type cyclonedx ghcr.io/boatramp/boatramp:<tag>
+```
 
 ## Create a cluster
 

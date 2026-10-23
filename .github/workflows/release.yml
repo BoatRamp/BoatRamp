@@ -286,6 +286,9 @@ jobs:
     needs: [build, preflight]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # Scopes the release signing key (COSIGN_PRIVATE_KEY) to this job via a protected environment,
+    # so the private half is never exposed to the build/test jobs that run untrusted-ish code.
+    environment: release-signing
     steps:
       - uses: actions/checkout@v5
       # Building the boatramp binaries through Nix is disk- and memory-heavy on a
@@ -379,12 +382,17 @@ jobs:
           push container-cloudflare-debug "${base}-cloudflare" "${tag}-debug" debug
           cat image-refs.txt
 
-      # Supply chain: keyless-sign each image + attach a CycloneDX SBOM (both via
-      # the OIDC token — no long-lived keys). Verifiable with `cosign verify` /
-      # `cosign verify-attestation` against this repo's OIDC issuer.
-      - name: Sign images + attach SBOM (cosign keyless + syft)
+      # Supply chain: KEY-sign each image + attach a CycloneDX SBOM. Signed with the project's
+      # release signing key — the SAME key the migrated historical images were re-signed under, so a
+      # verifier uses ONE command for every tag, old and new:
+      #   cosign verify --key cosign.pub <ref>
+      #   cosign verify-attestation --key cosign.pub --type cyclonedx <ref>
+      # (cosign.pub is committed at the repo root; the private half is the COSIGN_PRIVATE_KEY secret,
+      # scoped to the protected `release-signing` environment below.)
+      - name: Sign images + attach SBOM (cosign key + syft)
         env:
-          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: "" # the release key is passwordless; it lives only as the CI secret
         run: |
           set -euo pipefail
           # syft's `docker-archive:` reader needs an UNCOMPRESSED tar. The nix image output is a
@@ -408,9 +416,9 @@ jobs:
             while read -r ref tar; do
               [ -n "$ref" ] || continue
               n=$((n + 1))
-              cosign sign --yes "$ref"
+              cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$ref"
               syft "docker-archive:sbom-src-${n}.tar" -o cyclonedx-json > sbom.json
-              cosign attest --yes --predicate sbom.json --type cyclonedx "$ref"
+              cosign attest --yes --key env://COSIGN_PRIVATE_KEY --predicate sbom.json --type cyclonedx "$ref"
             done < image-refs.txt
           '
 
