@@ -12,8 +12,9 @@
 
 use async_trait::async_trait;
 
-use cryptoki::context::{CInitializeArgs, Pkcs11};
+use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
+use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
 use cryptoki::object::{Attribute, AttributeType, ObjectClass};
 use cryptoki::session::UserType;
 use cryptoki::slot::Slot;
@@ -45,9 +46,11 @@ impl Pkcs11Signer {
         pin_env: &str,
         alg: TokenAlg,
     ) -> Result<Self, SignerError> {
-        let pin = AuthPin::new(SignerError::env(pin_env)?);
+        let pin = AuthPin::from(SignerError::env(pin_env)?);
         let ctx = Pkcs11::new(module).map_err(|e| SignerError::backend(BACKEND, e))?;
-        ctx.initialize(CInitializeArgs::OsThreads)
+        // Equivalent to the old `CInitializeArgs::OsThreads`: let the library use
+        // the OS's native locking (we don't supply custom mutex callbacks).
+        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
             .map_err(|e| SignerError::backend(BACKEND, e))?;
 
         let slot = ctx
@@ -105,7 +108,7 @@ impl Pkcs11Signer {
 
     /// Open a fresh logged-in session and sign `data` (a digest for ECDSA, the
     /// message for EdDSA) with the private key. Blocking.
-    fn sign_blocking(&self, mechanism: &Mechanism, data: &[u8]) -> Result<Vec<u8>, TokenError> {
+    fn sign_blocking(&self, mechanism: &Mechanism<'_>, data: &[u8]) -> Result<Vec<u8>, TokenError> {
         let session = self
             .ctx
             .open_ro_session(self.slot)
@@ -166,8 +169,12 @@ impl Signer for Pkcs11Signer {
         match self.alg {
             // CKM_ECDSA signs the digest and returns the raw r‖s form directly.
             TokenAlg::Es256 => self.sign_blocking(&Mechanism::Ecdsa, &sha256(tbs)),
-            // CKM_EDDSA signs the message and returns the raw 64-byte signature.
-            TokenAlg::Ed25519 => self.sign_blocking(&Mechanism::Eddsa, tbs),
+            // CKM_EDDSA (pure, no prehash/context) signs the message and returns
+            // the raw 64-byte signature.
+            TokenAlg::Ed25519 => self.sign_blocking(
+                &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Ed25519)),
+                tbs,
+            ),
         }
     }
 }

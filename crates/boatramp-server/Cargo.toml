@@ -382,7 +382,7 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-kms = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
-cryptoki = { version = "0.7", optional = true }
+cryptoki = { version = "0.12", optional = true }
 
 # The M4 cloud blob-upload minters (feature-gated). AWS reuses the workspace aws-config +
 # the STS SDK for session-policy brokering + aws-sdk-s3 for the presigned-PUT shape. GCS uses
