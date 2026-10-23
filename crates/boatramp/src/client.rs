@@ -1223,6 +1223,26 @@ impl ControlPlane {
             .await?)
     }
 
+    /// Eager-provision an already-declared managed database, idempotently
+    /// (`POST /api/{seg}/databases/{name}/ensure`). `Project·Admin`. This provisions the
+    /// database so an operator can migrate it before any component runs — the declaration
+    /// still lives in the `databases:` manifest (ensure never *declares*). Returns on the
+    /// server's acknowledgement (`204`); readiness is then observable via `db status`.
+    pub async fn ensure_database(&self, name: &str) -> Result<()> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .post(format!("{server}/api/{seg}/{name}/ensure"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");
