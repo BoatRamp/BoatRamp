@@ -51,7 +51,19 @@ occur.
 | `mcp.enabled` | bool | Serve the HTTP [`/mcp` endpoint](../how-to/mcp.md#over-http) (default on; a live kill-switch — `false` makes it `404`). |
 | `posture.oidc_require_audience` | bool | **Tighten-only**: require an OIDC audience. |
 | `posture.ratelimit_fail_open` | bool | **Tighten-only**: set `false` to fail closed. |
+| `posture.allow_unauthenticated_public_bind` | bool | **Tighten-only**: set `false` to forbid a non-loopback bind with control-plane auth disabled. |
+| `posture.allow_site_private_upstreams` | bool | **Tighten-only**: set `false` to forbid site-declared gateway upstreams to private/loopback IPs. |
+| `posture.allow_site_unix_upstreams` | bool | **Tighten-only**: set `false` to forbid site-declared `unix:` gateway upstreams. |
 | `posture.allow_shared_kernel_compute` | bool | **Tighten-only**: set `false` to forbid shared-kernel compute. |
+| `posture.domain_verify_allow_private` | bool | **Tighten-only**: set `false` to forbid HTTP domain-verification probes to private hosts. |
+| `posture.allow_implicit_routing` | bool | **Tighten-only**: set `false` to forbid resolving an unmatched `Host` to a site without an explicit domain registration. |
+
+As of this release, `boatramp config set <key> <value>` and `config list` only name
+`posture.oidc_require_audience`, `posture.ratelimit_fail_open`, and
+`posture.allow_shared_kernel_compute` individually; the other five posture keys above
+are validated and applied identically (same tighten-only ratchet) but are set via
+`boatramp config apply -f daemon.json` (the whole-config JSON write) until the
+single-key setter names them too.
 
 ### Ceilings and the tighten-only ratchet
 

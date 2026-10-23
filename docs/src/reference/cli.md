@@ -89,6 +89,8 @@ flags unique to each command:
 | [`forward`](#boatramp-forward) | Forward a local port to an in-cluster service over the overlay fabric (`overlay` feature). |
 | [`expose`](#boatramp-expose) | Publish a local service INTO the cluster over the overlay fabric — the reverse of `forward` (`overlay` feature). |
 | [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial/publish capability + ticket, pair devices, administer the flow policy (`overlay` feature). |
+| [`tunnel`](#boatramp-tunnel) | Run a local SOCKS5 (+ optional HTTP CONNECT) proxy daemon that reaches overlay services by name (`overlay` feature). |
+| [`connect`](#boatramp-connect) | One-shot dial of a single overlay service, splicing stdin/stdout (`overlay` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
 [Errors & exit codes](./errors.md).
@@ -523,6 +525,7 @@ Operator SQL to a managed database. See [Handler bindings](../how-to/handler-bin
 | `exec [--db <name>] [--file <path>]` | Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) to a managed database, from `--file` or stdin. `--db` is the binding name (empty = the site's default database). |
 | `query <sql> [--db <name>]` | Run one row-returning query and print the result (add the global `--output-format json` for structured rows). |
 | `ping [--db <name>]` | Actively TCP-probe each replica of a managed database — a reachability check that bypasses the stored-health gate `query` trips on (distinguishes "the DB is down" from "up but the resolver won't serve it"). Admin-scoped. |
+| `move --db <name> --to <name> [--site <site>]` | **Relocate** a managed libsql database to a new binding name, data intact — vacuum-copies to the destination, verifies it, then removes the source. `--db` is the **source** binding (default = the site's default database); `--to` is the **destination** binding and must not already exist; `--site` falls back to `[publish].site`. Local single-node only — a remote/sqld backend is refused. Destructive; node-level `System·Admin` (not the project-scoped right `exec`/`query`/`ping` use). |
 
 ## `boatramp token`
 
@@ -782,6 +785,60 @@ The `ready` banner prints only after a confirmed registration (a name already cl
 exposer fails first — names are first-live-claim-wins). The exposer is the terminator, so it
 independently authorizes each incoming forward client's dial capability against the cluster trust root
 (zero-trust, exactly like an in-cluster egress). Runs until interrupted (Ctrl-C).
+
+## `boatramp tunnel`
+
+Run a local SOCKS5 (+ optional HTTP `CONNECT`) proxy daemon that reaches overlay services **by
+name** — ordinary tools (`psql`, `curl`, a browser via its SOCKS proxy setting) dial any cataloged
+service without a dedicated `forward` per port. Requires the `overlay` feature.
+
+```
+boatramp tunnel
+```
+
+Self-serve, the same way as `forward`: the CLI uses your boatramp token to mint dial capabilities
+via the control plane, binding to your persistent overlay identity
+(`~/.config/boatramp/overlay.key`). SOCKS is the only consumption front-end this release ships, so
+it is on by default; `--tun` replaces it with the TUN virtual-interface front-end instead.
+
+| Flag | Meaning |
+| --- | --- |
+| `--server <url>` | boatramp server for self-serve resolution (else `[publish].server`). |
+| `--socks [<addr>]` | Bind the SOCKS5 front-end to `<addr>` — default, and the value when passed bare, `127.0.0.1:1080`. Always on unless `--tun` is passed. |
+| `--http-connect [<addr>]` | Also bind a small HTTP `CONNECT` front-end to `<addr>` (for `HTTPS_PROXY`/`http.proxy`-style clients) — default when passed bare `127.0.0.1:1081`. Off unless passed. |
+| `--no-local-auth` | Disable the auto-generated local SOCKS/CONNECT credential (required by default) — a loopback port with no local auth lets ANY local user proxy under your overlay identity. Pass this only on a single-user host where that is an acceptable tradeoff. |
+| `--tun` | Start the TUN virtual-interface front-end instead of SOCKS. Linux only — needs this binary's `tun` cargo feature and `CAP_NET_ADMIN`/root to open the device. |
+| `--cidr <cidr>` | The synthetic CIDR routed into the TUN device (default `100.64.0.0/10`). Only meaningful with `--tun`. |
+| `--dns-zone <tld>` | The embedded DNS zone's TLD (default `internal`). Only meaningful with `--tun`. |
+| `--cluster <name>` | The embedded DNS zone's `<cluster>` label (defaults to `[publish].project`, else `default`). Only meaningful with `--tun`. |
+| `--cleanup` | Detect and revert a dirty-state marker left by a crashed previous `--tun` run, then exit — starts no front-end. Safe to run with no marker present. |
+| `--max-connections <n>` | Cap on concurrent accepted connections, SOCKS + HTTP CONNECT combined. |
+| `--allow-non-loopback` | Acknowledge binding `--socks`/`--http-connect` to a non-loopback address. Absent this flag, a non-loopback bind is refused outright: this proxy dials under YOUR operator identity, so exposing it to the LAN (especially with `--no-local-auth`) would hand anyone who can reach it an unauthenticated by-name proxy into your overlay. |
+
+With no `--tun`/`--cleanup`, `tunnel` loads (or generates) the local SOCKS/CONNECT credential,
+binds the requested front-end(s), and runs until interrupted (Ctrl-C); each accepted connection
+resolves a bare service name (e.g. `db`) through the same self-serve control-plane path `forward`
+uses, dials it, and splices the two streams, relay-blind and capability-gated.
+
+## `boatramp connect`
+
+One-shot dial of a single overlay service, splicing stdin/stdout until either side closes — the
+shape an `ssh ProxyCommand` or a script pipes through, for a caller that already has one specific
+destination in mind and does not want to stand up a `tunnel` daemon for it. Requires the `overlay`
+feature.
+
+```
+boatramp connect svc/db
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `<service>` | The overlay service to reach (e.g. `db`, `svc-db`, or `svc/db`). |
+| `--server <url>` | boatramp server for self-serve resolution (else `[publish].server`). |
+
+Reuses the exact same control-plane wiring and persistent overlay identity as `tunnel`/`forward`
+(`~/.config/boatramp/overlay.key`) — only the front-end differs (one spliced stdio pair instead of
+a SOCKS daemon). Runs until either `service` or the local process closes its side.
 
 ## `boatramp operator`
 

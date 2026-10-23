@@ -301,7 +301,7 @@ unconditional and independent of these — they are backstops/tuning):
 | --- | --- | --- | --- |
 | `checkpoint_interval` | int (secs) | `10` | Periodic checkpoint cadence. `0` disables the cadence (the per-write frontier-sync still runs). |
 | `close_deadline` | int (secs) | `20` | Graceful drain+close budget on shutdown. `0` is rejected (a zero budget would abandon every close and guarantee a torn tail). |
-| `gc_interval` | int (secs) | `3600` | Online maintenance-GC cadence. `0` disables the supervised GC task (leaving only SlateDB's embedded GC). |
+| `gc_interval` | int (secs) | `900` | Online maintenance-GC cadence. `0` disables the supervised GC task (leaving only SlateDB's embedded GC). |
 | `gc_min_age` | int (secs) | `3600` | Minimum object age before maintenance-GC may reclaim it (never zero, so a reader mid-scan can't have a needed object reclaimed). |
 
 ### `serve.listeners`

@@ -10,7 +10,7 @@ a laptop to the edge.
 [![crates.io](https://img.shields.io/crates/v/boatramp.svg?logo=rust&label=crates.io)](https://crates.io/crates/boatramp)
 [![Docs](https://img.shields.io/badge/docs-boatramp.dev-2088c1.svg)](https://docs.boatramp.dev/)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust 1.82+](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.97+](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org)
 [![Single binary](https://img.shields.io/badge/deploy-single%20binary-success.svg)](#install)
 [![Discord](https://img.shields.io/discord/1531712304104607914?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/A78gHFF3F3)
 
@@ -171,7 +171,7 @@ nix run github:BoatRamp/BoatRamp/v0.43.0 -- serve  # pin a release
 nix profile install github:BoatRamp/BoatRamp      # install the binary
 ```
 
-**From source** (Rust 1.82+):
+**From source** (Rust 1.97+):
 
 ```sh
 git checkout v0.43.0                                                 # the release (omit for the development tip)

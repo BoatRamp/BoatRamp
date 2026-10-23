@@ -477,13 +477,15 @@ See [Diagnose compute](../how-to/diagnose-compute.md).
 Run a migration script or a single query against a managed co-located database via
 its sealed credential (resolved server-side). Project-owned (`project` · `deploy`);
 writes are additionally posture-gated. Top-level paths target the `default` project;
-`/api/projects/:project/sql/…` scopes to another project. Since 0.3.9 (`ping`: 0.3.14).
+`/api/projects/:project/sql/…` scopes to another project. Since 0.3.9 (`ping`: 0.3.14;
+`sql-move`: 0.5.0).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/sql/:db/exec` | Run a migration / statement script against the managed database `:db`. |
 | `POST` | `/api/sql/:db/query` | Run a single query and return its rows. |
 | `POST` | `/api/sql/:db/ping` | Active per-replica reachability probe (bypasses the stored-health gate). |
+| `POST` | `/api/sql-move` | Relocate a libsql database to a new binding name, data intact — body `{project, site, from, to}`. Node-level `system` · `admin` (not this table's `project` · `deploy`); local single-node only, a remote/sqld backend is refused `422`. Backs `boatramp sql move`. |
 
 ## Schema migrations (owner-gated)
 
