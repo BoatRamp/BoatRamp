@@ -86,6 +86,16 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // original project-qualified path and gates it with the dedicated `Resource::BlobUpload` (Write —
     // NOT the deploy-grade publisher/Blobs·Deploy right). Without this entry the route would 404.
     "blob-mint-upload",
+    // The DECLARATIVE managed-database front door
+    // (`/api/projects/<proj>/databases{,/<name>{,/ensure,/status}}`, #501 Stage B): `boatramp apply` of a
+    // `databases:` block declares + eagerly provisions a project's managed DB (CREATE DATABASE + owner role
+    // + RLS GUC + extensions) WITHOUT needing a handler to open it first — the operator "migrate before any
+    // component" path. Rewrites onto the global `/api/databases/…` handler, tagged with the tenant, so a
+    // non-default (Shared multi-tenant) project can declare its OWN managed database. The imperative
+    // top-level `/api/databases/…` form already worked and `Right::required` already gates BOTH forms at
+    // `Project·Admin` (#501 Stage B authz, which anticipated this project-qualified path) — this entry was
+    // the only missing piece; without it the project-scoped apply 404s (imperative/declarative parity).
+    "databases",
 ];
 
 /// The tenant project a request targets, injected as a request extension by
@@ -344,6 +354,19 @@ mod tests {
         let s = scope_of("/api/projects/acme/repair/appdb/dry-run");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/repair/appdb/dry-run"));
+
+        // The DECLARATIVE managed-database front door rewrites onto the global `/api/databases/…`
+        // handler, tagged with the tenant — so `boatramp apply` of a `databases:` block eagerly
+        // provisions a NON-default project's managed DB (imperative/declarative parity with the
+        // top-level `/api/databases/…` form). `Right::required` already gates this project-qualified
+        // path at Project·Admin (#501 Stage B). Mutation witness: drop `"databases"` from
+        // PROJECT_SCOPED_FAMILIES and this rewrite is `None` → the apply 404s.
+        let s = scope_of("/api/projects/acme/databases/appdb");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/databases/appdb"));
+        let s = scope_of("/api/projects/acme/databases/appdb/ensure");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/databases/appdb/ensure"));
     }
 
     /// A6 (v0.7.0): a present-but-non-conforming `<proj>` segment marks the scope
