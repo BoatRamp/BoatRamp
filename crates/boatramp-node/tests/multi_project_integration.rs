@@ -1098,7 +1098,7 @@ async fn internal_dns_refuses_cross_project() {
 /// flips it true once the guest is reachable — but a *running* replica needs no
 /// Launch/Stop action, so before the fix that recovery was never written back. The store
 /// kept `healthy:false` forever and `DeployEndpointResolver` (which reads the store)
-/// reported "no healthy replica" for a perfectly reachable DB — exactly construens'
+/// reported "no healthy replica" for a perfectly reachable DB — exactly a production
 /// v0.3.12 symptom. DRIVES two real `reconcile_once` passes over a fake that is Unhealthy
 /// on its first probe (pre-bind) then Healthy. ASSERTS: after launch the resolver sees no
 /// healthy endpoint; after the next reconcile the recovered health is PERSISTED and the

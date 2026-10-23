@@ -1025,7 +1025,7 @@ pub fn materialize(
 
 /// A read-only summary of a route/function's declared in-site tenancy, surfaced on
 /// [`FunctionSummary`] so an operator can confirm the scope + the `on_unresolved` pass-vs-deny
-/// decision WITHOUT black-box probing (the gap construens hit diagnosing an applied-but-seemingly-
+/// decision WITHOUT black-box probing (the gap an operator hit diagnosing an applied-but-seemingly-
 /// ignored `on_unresolved: "pass"`). `None` on [`FunctionSummary::tenancy`] ⇒ the function declares
 /// no tenancy of its own and inherits the site decision (read the site config to see that one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

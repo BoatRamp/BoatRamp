@@ -46,8 +46,8 @@ const CLAIM_CTX: &str = "br_ctx";
 /// `None`), never a panic. Absent when no persona was configured (unchanged for every existing
 /// producer).
 const CLAIM_PERSONA: &str = "br_persona";
-/// Text claim key for a signed-context envelope's **principal class** (construens
-/// `cron-system-principal`). Present (value [`SCOPE_KIND_SYSTEM`]) ONLY on a SYSTEM seal — a
+/// Text claim key for a signed-context envelope's **principal class** (a
+/// `cron-system-principal` request). Present (value [`SCOPE_KIND_SYSTEM`]) ONLY on a SYSTEM seal — a
 /// no-tenant platform/super-admin principal. A tenant seal omits it entirely (so existing seals are
 /// byte-unchanged). It is a POSITIVE, signed marker: a system principal is recognised ONLY by this
 /// claim's presence, NEVER by the mere absence of `br_ctx` (that still rejects, preserving the
@@ -1505,7 +1505,7 @@ pub fn verify_overlay_member(
 /// tenant-only [`verify_context`] projects out just [`VerifiedContext::tenant`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedContext {
-    /// The principal CLASS this seal carries (construens `cron-system-principal`): `Tenant` for an
+    /// The principal CLASS this seal carries (a `cron-system-principal` request): `Tenant` for an
     /// ordinary own-tenant seal (`br_ctx` present, no scope-kind claim), `System` for a no-tenant
     /// platform/super-admin seal (a positive `br_scope_kind=system` claim, no `br_ctx`). The class is
     /// signature-bound and recognised ONLY by the positive marker — never by a missing tenant.
@@ -1568,7 +1568,7 @@ pub async fn mint_context(
     sign_claims(builder.build(), signer).await
 }
 
-/// Mint a **SYSTEM** signed-context envelope (construens `cron-system-principal`): a `COSE_Sign1` CWT
+/// Mint a **SYSTEM** signed-context envelope (a `cron-system-principal` request): a `COSE_Sign1` CWT
 /// with `br_kind = "context"` and a positive `br_scope_kind = "system"` claim, and — deliberately —
 /// **no `br_ctx`** (a system principal has no tenant). Signed by the fleet `Signer`. The async lane
 /// resolves this to a [`PrincipalKind::System`](crate::tenancy::PrincipalKind) principal (base/`IS
@@ -2780,7 +2780,7 @@ mod tests {
         );
     }
 
-    /// construens `cron-system-principal` — a SYSTEM signed-context is classed `System`, carries NO
+    /// A `cron-system-principal` request — a SYSTEM signed-context is classed `System`, carries NO
     /// tenant, and is recognised ONLY by a POSITIVE signed `br_scope_kind=system` marker (never by a
     /// missing tenant). The reject forks are the load-bearing security property.
     #[tokio::test]

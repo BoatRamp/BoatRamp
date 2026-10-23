@@ -541,13 +541,13 @@ impl Right {
         let default_project = crate::project::DEFAULT_PROJECT.to_string();
         let right = match path {
             "/api/sites" => Self::new(Resource::System, None, Action::Read),
-            // Node-level instance-lifecycle + memory observability (construens
-            // memory-instance-observability): read-only telemetry over the node's shared wasm engine
+            // Node-level instance-lifecycle + memory observability (an
+            // instance-observability request): read-only telemetry over the node's shared wasm engine
             // (warm/cold/evict + RSS). A NODE-global read, gated `System·Read` EXPLICITLY (never a
             // per-project mapping) — it reveals resident component hashes + memory across every project
             // on the node, so a project-scoped role must not reach it.
             "/api/instance-stats" => Self::new(Resource::System, None, Action::Read),
-            // Node-global health snapshot (construens node-health-alerting): `/data` filesystem
+            // Node-global health snapshot (a node-health-alerting request): `/data` filesystem
             // headroom + (later) managed-SQL health. A NODE-global read gated `System·Read`
             // EXPLICITLY — never a per-project mapping (it reveals node-wide disk/health, and the
             // disk-full incident it guards is a node fault, not a project one).
@@ -2246,7 +2246,7 @@ mod tests {
 
     #[test]
     fn instance_stats_endpoint_is_node_global_system_read() {
-        // construens memory-instance-observability: `/api/instance-stats` is a NODE-global read (the
+        // An instance-observability request: `/api/instance-stats` is a NODE-global read (the
         // engine is shared across every project), gated `System·Read` — NOT a per-project right, so a
         // project-scoped role (even that project's admin) must NOT reach it. The `operator`/node-read
         // role does. Guards the node-global-authz discipline (a per-project mapping would leak every
@@ -2272,7 +2272,7 @@ mod tests {
 
     #[test]
     fn node_health_endpoint_is_node_global_system_read() {
-        // construens node-health-alerting: `/api/node-health` is a NODE-global read (disk headroom /
+        // A node-health-alerting request: `/api/node-health` is a NODE-global read (disk headroom /
         // health are node faults, not project ones), gated `System·Read` EXPLICITLY — a project-scoped
         // role (even that project's admin) must NOT reach it (a per-project mapping would leak node-wide
         // state + invert the node-global-authz discipline [[node-global-endpoint-authz]]).

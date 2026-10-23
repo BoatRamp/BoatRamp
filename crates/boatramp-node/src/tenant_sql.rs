@@ -1311,7 +1311,7 @@ impl NodeTenantSqlResolver {
             // The NAMES are per-binding config; the handler binding sets the per-request/per-write
             // VALUE. Only when a tenant GUC name is configured (else today's project/site-only).
             if let Some(tenant) = self.binding.tenant_guc.clone().filter(|s| !s.is_empty()) {
-                // The principal-class GUC (construens `cron-system-principal`) is DERIVED from the
+                // The principal-class GUC (a `cron-system-principal` request) is DERIVED from the
                 // tenant GUC's own namespace (`app.tenant_id` ⇒ `app.principal_kind`) — no extra
                 // operator config, and it is inherently in the tenant GUC's reserved leading segment
                 // (plus `reserved_names` lists it), so a guest can never forge it. A Postgres custom

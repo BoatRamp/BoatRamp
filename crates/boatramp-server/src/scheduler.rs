@@ -1759,7 +1759,7 @@ mod consumer_scope_gate {
     /// `CONSUMER BLOB SCOPE OK`.
     #[test]
     fn consumer_scope_is_project_qualified_and_isolated() {
-        let p = ProjectRef::new("construens-preview");
+        let p = ProjectRef::new("exampleorg-preview");
         // The invariant: a consumer's scope EQUALS what the handler path computes for the same
         // (project, site) — `project_ref.qualified(site)`. This is the exact bug: they must match.
         assert_eq!(
@@ -1769,12 +1769,12 @@ mod consumer_scope_gate {
         );
         assert_eq!(
             consumer_dispatch_scope(p, "console"),
-            "construens-preview/console"
+            "exampleorg-preview/console"
         );
         // Background alias is qualified too.
         assert_eq!(
             consumer_dispatch_scope(p, "console/thumbs"),
-            "construens-preview/console/thumbs"
+            "exampleorg-preview/console/thumbs"
         );
         // Default project: now the two-segment `default/{site}` (v0.31.0 Finding 8), DISJOINT from
         // every named project's scope.

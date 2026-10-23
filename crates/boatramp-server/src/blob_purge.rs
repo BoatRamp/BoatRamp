@@ -213,7 +213,7 @@ pub(super) async fn blob_status(State(deploy): State<DeployStore>) -> Response {
 
 /// Dead content-addressed references (`GET /api/blob-verify`, `System·Read`): every blob a LIVE site
 /// deployment or function references but that is MISSING from the backend — an invoke/serve of it
-/// would 404 (the construens `identity` incident shape). Read-only. To repair a dead reference,
+/// would 404 (a production `identity` incident shape). Read-only. To repair a dead reference,
 /// re-upload the bytes (`boatramp blob put <file>`) or re-deploy the resource; the fix that STOPS the
 /// GC from creating them (referencing live function components) shipped alongside this.
 pub(super) async fn blob_verify(State(deploy): State<DeployStore>) -> Response {

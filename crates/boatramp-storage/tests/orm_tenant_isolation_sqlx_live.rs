@@ -878,7 +878,7 @@ async fn run_session_disjunct_battery(
 }
 
 /// A tenant-scoped **upsert** (`INSERT … ON CONFLICT … DO UPDATE`) on real Postgres — the gate for
-/// construens' P48 cutover bug. The host injects an own-partition guard into the `DO UPDATE`
+/// a production P48 cutover bug. The host injects an own-partition guard into the `DO UPDATE`
 /// (`WHERE <table>.<tenant_col> = $own`) so a guest upsert can't overwrite ANOTHER tenant's row via
 /// a conflict on a NON-tenant unique key. That guard column must be **target-table-qualified**:
 /// bare, it is ambiguous inside `DO UPDATE` on Postgres (the target table and the `excluded`
@@ -972,7 +972,7 @@ async fn run_upsert_guard_battery(backend: Arc<dyn SqlBackend>, engine: &str) {
     }
 
     // 2) Own flip works: acme upserts its OWN key → the guard matches, the DO UPDATE flips `enabled`
-    //    (construens' enableModule/disableModule on-conflict flip, confined to the caller's tenant).
+    //    (an enableModule/disableModule on-conflict flip, confined to the caller's tenant).
     {
         let (sql, params) = acme_upsert("mod_acme", "off");
         let mut tx = backend.begin().await.unwrap();

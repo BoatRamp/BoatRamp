@@ -194,7 +194,7 @@ mod imp {
             // the `token:`-prefix match above (`"blob-upload:write".strip_prefix("blob-upload")` ⇒
             // `Some(":write")`, which `starts_with(':')`). Without this arm the interface mapped to `None`
             // → "disallowed interface", so `capabilities --check`/`sync` refused any component using it —
-            // the construens presigned-ingress gap.
+            // a presigned-ingress gap.
             ("boatramp:handlers", "blob-upload" | "blob-upload-types") => Some("blob-upload"),
             // The host-terminated outbound-TLS egress capability (`PLAN-handler-tcp-egress`,
             // mailroom cap-req #15): the host dials + terminates TLS on a guest-named `host:port`/`sni`
@@ -636,7 +636,7 @@ mod imp {
 
         #[test]
         fn policy_gates_blob_upload_by_either_declared_right() {
-            // PLAN-blob-s3-ingress + the construens presigned-ingress gap: a component importing the
+            // PLAN-blob-s3-ingress + a presigned-ingress gap: a component importing the
             // single `blob-upload` interface (and `use`ing `blob-upload-types`) must deploy via `sync`
             // when it declares EITHER independent right (`blob-upload:write` or `blob-upload:multipart`)
             // — both satisfy the `blob-upload` token via the `token:`-prefix match. Before the

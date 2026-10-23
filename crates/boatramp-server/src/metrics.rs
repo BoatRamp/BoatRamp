@@ -45,7 +45,7 @@ pub enum Outcome {
     OutOfFuel,
     /// The guest exhausted its linear-memory budget (a denied `memory.grow` then a trap). Distinct
     /// from [`Trap`](Self::Trap) so the DLQ / stats read `out-of-memory` — an operator can tell memory
-    /// exhaustion from a generic crash (construens async-lane-memory-budget request #4).
+    /// exhaustion from a generic crash (an async-lane-memory-budget request #4).
     OutOfMemory,
     Overloaded,
     Trap,
@@ -97,7 +97,7 @@ pub struct Counters {
     pub ok: u64,
     pub timeout: u64,
     pub out_of_fuel: u64,
-    /// Guest linear-memory-budget exhaustion (distinct from `trap`) — construens async-lane #4.
+    /// Guest linear-memory-budget exhaustion (distinct from `trap`) — async-lane budget request #4.
     pub out_of_memory: u64,
     pub overloaded: u64,
     pub trap: u64,
@@ -199,7 +199,7 @@ impl Metrics {
         component_hash: &str,
         outcome: Outcome,
         duration: Duration,
-        // Per-invocation instance timing (construens ask #3), when this invocation drove a serve:
+        // Per-invocation instance timing (an observability request, ask #3), when this invocation drove a serve:
         // `cold` = it paid a (re)compile; `instantiate_ms` = the per-invocation instantiate cost.
         // `None` on a path with no serve (e.g. a pre-serve refusal / the consumer lane) → logged as
         // `cold=false, instantiate_ms=0` so the line's schema is stable; the `outcome` disambiguates.

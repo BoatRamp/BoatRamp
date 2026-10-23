@@ -5,7 +5,7 @@
 //! ambient env chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). This module lets an operator source
 //! that base credential from boatramp's `[secrets]` sealed store instead — ONE shared node-level source
 //! ([`crate::config::S3CredentialConfig`]) consumed by BOTH, since it is the same bucket key
-//! (construens' Tigris move wants exactly this).
+//! (a production Tigris move wants exactly this).
 //!
 //! The `access_key_id` is a public identifier (plain config). The `secret_access_key` is a **secret
 //! reference** in the same scheme the guest `secrets` map uses (`parse_secret_ref` in

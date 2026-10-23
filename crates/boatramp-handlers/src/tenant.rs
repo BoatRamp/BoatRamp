@@ -130,7 +130,7 @@ pub struct HostTenancy {
     /// Threaded from the route's [`Tenancy::Scoped::on_unresolved`](boatramp_core::tenancy::Tenancy)
     /// via [`with_unresolved_pass`](Self::with_unresolved_pass). Inert when a principal IS resolved.
     pass_unresolved: bool,
-    /// The resolved principal's CLASS (construens `cron-system-principal`). `Tenant` for every ordinary
+    /// The resolved principal's CLASS (a `cron-system-principal` request). `Tenant` for every ordinary
     /// principal (the default — byte-identical to pre-feature behavior). `System` ONLY when a *verified*
     /// system source produced it (a positive `br_scope_kind=system` seal, a node-config cron, an exact
     /// `System·Admin` deploy capture, or a `system_when` token match on an exactly-named issuer) — set

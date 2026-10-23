@@ -4414,7 +4414,7 @@ mod tests {
                 tcp_reachable: true,
             }]));
         let resp = sql_ping(
-            Extension(ProjectContext("construens".into())),
+            Extension(ProjectContext("exampleorg".into())),
             Extension(Some(op)),
             Path("default".into()),
         )
@@ -4432,7 +4432,7 @@ mod tests {
 
         // No managed SQL wired → 501.
         let resp = sql_ping(
-            Extension(ProjectContext("construens".into())),
+            Extension(ProjectContext("exampleorg".into())),
             Extension(None),
             Path("default".into()),
         )
@@ -4452,7 +4452,7 @@ mod tests {
         let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakePingSql(vec![]));
         for bad in ["", "a/b", "..", "proj*"] {
             let resp = sql_ping(
-                Extension(ProjectContext("construens".into())),
+                Extension(ProjectContext("exampleorg".into())),
                 Extension(Some(op.clone())),
                 Path(bad.into()),
             )
@@ -4466,7 +4466,7 @@ mod tests {
         // A valid `{db}` passes the screen (reaches the handler; here `default` pings
         // the fake op and returns 200 with no replicas).
         let resp = sql_ping(
-            Extension(ProjectContext("construens".into())),
+            Extension(ProjectContext("exampleorg".into())),
             Extension(Some(op)),
             Path(boatramp_core::project::DEFAULT_DB_NAME.into()),
         )

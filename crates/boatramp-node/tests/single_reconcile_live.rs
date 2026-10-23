@@ -1,6 +1,6 @@
 //! **The load-bearing reconcile-stability gate** for the v0.3.12 per-tenant managed
 //! Postgres fixes — Linux + root + a bridge, **ignored by default**. It is the live
-//! proof, on a REAL co-located Postgres, that construens' `Single` per-tenant managed
+//! proof, on a REAL co-located Postgres, that a non-default project's `Single` per-tenant managed
 //! database is (a) reachable on lazy provision WITHOUT a restart and (b) authenticates
 //! with a credential that is STABLE across a boot-style reconcile — the exact two bugs
 //! v0.3.12 fixes.
@@ -29,10 +29,10 @@
 //!
 //! ## What this gate asserts (live, on a real Postgres)
 //!
-//! For a **non-default** `construens` project, `Single`/`Project`-scope binding:
+//! For a **non-default** `exampleorg` project, `Single`/`Project`-scope binding:
 //!
 //! 1. **No two-workload split (live):** exactly ONE managed workload exists for the tenant
-//!    — `pg-<ident>` under `construens` — and NONE under the reserved `default`
+//!    — `pg-<ident>` under `exampleorg` — and NONE under the reserved `default`
 //!    (`list_compute_workloads(ProjectRef::DEFAULT)` has no `pg`). This is the live proof
 //!    that the tenant-aware `auto_register` no longer registers the Bug-2 duplicate.
 //! 2. **Reachable + authenticates WITHOUT a restart:** through the SHIPPED
@@ -45,7 +45,7 @@
 //!    (initdb skipped — a boot reconcile), then re-run `SELECT current_user`. It must STILL
 //!    authenticate. This is the core P1 == P2 proof.
 //! 4. **Operator path reaches the tenant DB:** through [`NodeOperatorSql`] (project
-//!    `construens`) `SELECT current_database(), current_user` reaches the tenant's
+//!    `exampleorg`) `SELECT current_database(), current_user` reaches the tenant's
 //!    `pg-<ident>` database + user — NOT a bare `pg`/`default`.
 //! 5. Print a single success marker only after every assertion held.
 //!
@@ -113,7 +113,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 /// The binding's configured compute-workload base. A `Single` tenant's dedicated
-/// workload is `<COMPUTE>-<ident>` (e.g. `pg-construens`) — the tenant-aware name that
+/// workload is `<COMPUTE>-<ident>` (e.g. `pg-exampleorg`) — the tenant-aware name that
 /// must be the ONLY managed workload for the tenant (no bare `pg`/`default` duplicate).
 const COMPUTE: &str = "pg";
 /// The binding's configured database name — the plain DB inside the per-tenant Single
@@ -122,9 +122,9 @@ const DATABASE: &str = "appdb";
 /// The binding's configured app user. For `Single` this is the account the container is
 /// initialized with AND the account the resolver + operator connect as.
 const APP_USER: &str = "app";
-/// The non-default project tenant under test (construens' scenario). Distinct from the
+/// The non-default project tenant under test (a production scenario). Distinct from the
 /// reserved `default`, so it gets the derived `pg-<ident>` workload the fix keys.
-const TENANT: &str = "construens";
+const TENANT: &str = "exampleorg";
 /// One deployed site, so `auto_register`'s Single boot-warm enumerates this tenant as
 /// "has resources" (its whole reachability path exercised) and does NOT resurrect an
 /// empty default.
@@ -239,7 +239,7 @@ async fn seed_project_with_site(deploy: &DeployStore, kv: &Arc<dyn KvStore>) {
         .expect("seed a current site deployment pointer");
 }
 
-/// LIVE reconcile-stability proof for construens' Single per-tenant managed Postgres.
+/// LIVE reconcile-stability proof for a non-default project's Single per-tenant managed Postgres.
 /// See the module header. Boots ONE dedicated container, then simulates a boot reconcile
 /// (stop + relaunch on the same volume) and re-checks the credential.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -350,7 +350,7 @@ async fn drive(
         .map_err(|e| format!("provision_tenant: {e}"))?;
 
     // === Assertion 1 (NO TWO-WORKLOAD SPLIT): exactly ONE managed workload for the tenant
-    // — `pg-<ident>` under `construens` — and NONE under the reserved `default`. This is the
+    // — `pg-<ident>` under `exampleorg` — and NONE under the reserved `default`. This is the
     // live proof the tenant-aware auto_register dropped Bug 2's bare `pg`/`default`
     // duplicate. ===
     let workload_name = tenant_workload_name();
@@ -454,7 +454,7 @@ async fn drive(
     );
 
     // === Assertion 4 (OPERATOR PATH REACHES THE TENANT DB): through `NodeOperatorSql`
-    // (project `construens`) run `SELECT current_database(), current_user`. It must reach
+    // (project `exampleorg`) run `SELECT current_database(), current_user`. It must reach
     // the tenant's own database + user (the `pg-<ident>` server), NOT a bare `pg`/`default`
     // (the Bug-2 operator arm). ===
     let operator = NodeOperatorSql::new(

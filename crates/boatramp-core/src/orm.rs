@@ -3965,7 +3965,7 @@ mod tests {
         // The host-injected DO UPDATE partition guard names `<table>.<col>`, never a bare column:
         // inside `DO UPDATE` the target table AND the `excluded` pseudo-relation both expose the
         // tenant column, so a bare guard is ambiguous on Postgres and the whole upsert fails at
-        // execution (construens' P48 cutover bug — reproduced on real PG 16). SQLite tolerates the
+        // execution (a production P48 cutover bug — reproduced on real PG 16). SQLite tolerates the
         // bare form, which is why this only surfaced on a Postgres backend.
         let build = |mode, value: Option<SqlValue>| {
             let mut ins = Insert {
@@ -5000,7 +5000,7 @@ mod tests {
 
     #[test]
     fn related_aggregate_single_correlated_count() {
-        // construens subgraph-chain:701 — count of child rows per parent, no fan-out.
+        // subgraph-chain:701 — count of child rows per parent, no fan-out.
         let q = Select {
             columns: vec![
                 item(Expr::col("id")),
@@ -5067,7 +5067,7 @@ mod tests {
 
     #[test]
     fn related_aggregate_with_temporal_or_filter() {
-        // construens subgraph-chain:731 — correlated count with a temporal `valid_to` filter.
+        // subgraph-chain:731 — correlated count with a temporal `valid_to` filter.
         let q = Select {
             columns: vec![SelectItem {
                 expr: related(
@@ -5103,7 +5103,7 @@ mod tests {
 
     #[test]
     fn related_aggregate_max_over_a_column_is_portable() {
-        // A correlated MAX over a column (construens subgraph-chain:1932 shape) — an ordinary
+        // A correlated MAX over a column (subgraph-chain:1932 shape) — an ordinary
         // subquery, portable across engines (not Postgres-specific like vector distance).
         let q = Select {
             columns: vec![SelectItem {
@@ -5379,7 +5379,7 @@ mod tests {
 
     #[test]
     fn target_read_capability_drops_a_declared_subset_confining_tenant_only() {
-        // construens embed bug (ruling A made COMPLETE): under a capability-only target read
+        // A production embed bug (ruling A made COMPLETE): under a capability-only target read
         // (require_public=false), a table that DECLARES a public subset (authored for the anonymous
         // funnel) must confine to `tenant = B` ALONE — the subset is NOT AND-ed on, so a resolver's
         // own within-tenant filter on that column isn't collided into the empty set. `tenant = B`

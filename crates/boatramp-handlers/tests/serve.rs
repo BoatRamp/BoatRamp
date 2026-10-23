@@ -101,14 +101,14 @@ async fn cached_compile_serves_twice() {
     }
 }
 
-/// MEASUREMENT (construens memory-instance-observability): drive REAL components through the engine
+/// MEASUREMENT (an instance-observability request): drive REAL components through the engine
 /// and read the LIVE instance stats, so the warm-hit / cold-compile / eviction / instantiate numbers
 /// are MEASURED on a real wasi:http component, not inferred. Run with `--nocapture` to see the data;
 /// the assertions pin the lifecycle contract (so it is also a CI-exercised correctness test).
 #[tokio::test(flavor = "multi_thread")]
 async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     // (A) STEADY STATE: a comfortably-sized cache (16), one component served 50×. Exactly ONE cold
-    // compile; the other 49 are warm hits; NO eviction — the shape construens should see if the box is
+    // compile; the other 49 are warm hits; NO eviction — the shape an operator should see if the box is
     // big enough. The per-request instantiate cost is the term distinct from a cold compile.
     let engine = HandlerEngine::new(Limits::default(), 16).expect("engine");
     for _ in 0..50 {
@@ -148,7 +148,7 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     );
 
     // (B) EVICTION under a TIGHT cache (1 slot), two distinct components alternated → churn: every
-    // serve is a cold miss, each new insert evicts the prior — the pathology construens HYPOTHESIZED
+    // serve is a cold miss, each new insert evicts the prior — the pathology HYPOTHESIZED
     // (but which, at its ~15 components vs the default 64-slot cache, should NOT be occurring; this
     // proves the signal fires when it IS). The 2nd/3rd serves may error at the kv grant check, but the
     // compile + instantiate are recorded first, so the lifecycle counts are exact.
@@ -176,7 +176,7 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     assert_eq!(t.warm_now, 1, "one component resident after the churn");
 }
 
-/// PERF (construens memory-instance): a WARM component serves WITHOUT its bytes — so the request path
+/// PERF (memory-instance observability): a WARM component serves WITHOUT its bytes — so the request path
 /// can skip re-reading (and, on a remote blob backend, re-fetching over the network) a component it
 /// would only discard on a warm hit. Proves `request_component_warm` + that `serve` ignores the
 /// `wasm` argument on a cache hit; and that a cold miss with empty bytes fails CLEARLY (the
@@ -418,7 +418,7 @@ async fn handler_over_its_memory_ceiling_is_out_of_memory() {
     // A memory ceiling of one page (64 KiB), below the guest's 17-page (~1 MiB) initial linear
     // memory: the instance's memory allocation is denied by the limiter, so the guest cannot start
     // and the host classifies the failure as `OutOfMemory` — a distinct terminal outcome (DLQ /
-    // stats `out-of-memory`) rather than an opaque `Trap` (construens async-lane-memory-budget #4).
+    // stats `out-of-memory`) rather than an opaque `Trap` (an async-lane-memory-budget request #4).
     // This exercises the real path end-to-end: `MemLimiter::memory_growing` observes the `Ok(false)`
     // deny, sets the flag, and `classify` maps the resulting error to `OutOfMemory`.
     let limits = Limits {
@@ -744,7 +744,7 @@ async fn consumer_without_keyvalue_grant_errors() {
 /// DIAGNOSTIC (`--ignored`): N concurrent FIRST (cold) serves of the SAME uncached component. If the
 /// serve-path compile is single-flighted, exactly ONE cranelift compile runs (`cold_misses == 1`) and
 /// the other N-1 share it; if not, all N compile (`cold_misses == N`) — the cold-gallery herd that,
-/// with a ~1 MB component on 2 vCPU, stacks into construens' ~112 s first reload.
+/// with a ~1 MB component on 2 vCPU, stacks into a production ~112 s first reload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "diagnostic: prints the cold-compile herd count"]
 async fn cold_compile_herd_repro() {
@@ -778,13 +778,13 @@ async fn cold_compile_herd_repro() {
 /// — point it at a scratchpad copy), warms it (compile+cache the `ProxyPre`), then fires N concurrent
 /// WARM serves for N in {1,4,8,16,32,48}, printing per-serve wall-clock p50/p99/max + total.
 ///
-/// This reproduces construens' warm `/img` symptom with ZERO blob/sql/network: every serve is a pure
+/// This reproduces a production warm `/img` symptom with ZERO blob/sql/network: every serve is a pure
 /// instantiate+run of the cached component. If per-serve balloons SUPER-linearly with N, the bottleneck
 /// is instantiation CPU/memory of the large (~10 MB compiled) component under core starvation — and the
 /// "7 s `binding_build_us`" is that dispatch-task PARK, misattributed by the `bindings_us - resolve_us`
 /// wall-clock remainder (there is no I/O or lock in the blobstore binding build). A flat/linear curve
 /// refutes the instantiation hypothesis. `$BOATRAMP_REPRO_CAP` overrides the engine concurrency cap
-/// (default 64, construens' `warm_capacity`); set it to ~cores to test the admission-gate fix.
+/// (default 64, the production `warm_capacity`); set it to ~cores to test the admission-gate fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "diagnostic: warm large-component concurrency scaling (needs $BOATRAMP_REPRO_COMPONENT)"]
 async fn warm_component_concurrency_repro() {

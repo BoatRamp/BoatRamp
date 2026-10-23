@@ -2016,7 +2016,7 @@ mod tests {
 
     #[test]
     fn capability_drops_declared_subset_so_a_resolver_filter_on_that_column_survives() {
-        // The construens embed bug: `products` declares `published = true` for the anonymous funnel,
+        // A production embed bug: `products` declares `published = true` for the anonymous funnel,
         // but a capability read filters on that same column for its own within-tenant purpose. The
         // declared subset must NOT be AND-ed on (it would collide), and the guest's own predicate is
         // preserved verbatim inside its parenthesised group — confined only by `tenant = B`.

@@ -170,7 +170,7 @@ pub struct RlsGuc {
     /// fail-closed). The guest can never set it — the whole [`Self::tenant`] namespace is reserved.
     pub all_marker: Option<String>,
     /// The GUC carrying the resolved principal **class** (e.g. `app.principal_kind`), if the operator
-    /// configured one (construens `cron-system-principal`). Set to `"system"` for a
+    /// configured one (a `cron-system-principal` request). Set to `"system"` for a
     /// [`PrincipalKind::System`](crate::tenancy::PrincipalKind) principal and `"tenant"` otherwise, so
     /// an app's RLS can grant the shared/base write to the system principal (`current_setting(name,
     /// true) = 'system'`) — the PRIMARY authorization signal for the no-tenant base-write, NOT mere
@@ -2452,7 +2452,7 @@ mod reserved_session_writes_tests {
         assert!(rejected_with_app("SET boatramp.project = 'x'"));
     }
 
-    /// construens `cron-system-principal` (panel Security S5): the derived class GUC
+    /// A `cron-system-principal` request (panel Security S5): the derived class GUC
     /// (`app.principal_kind`) MUST be in `RlsGuc::reserved_names`, so a guest can never `set_config` it
     /// and self-promote to the system principal for its own base-write.
     #[test]

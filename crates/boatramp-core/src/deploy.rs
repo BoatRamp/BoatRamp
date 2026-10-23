@@ -4177,7 +4177,7 @@ impl DeployStore {
         // CRITICAL (data-loss fix): a live FUNCTION's component blobs live in the SAME content-addressed
         // CAS as site files but are NOT named by any site manifest — and `delete_function` defers their
         // cleanup to this prune. Without adding them to `referenced`, the blob sweep below would delete
-        // the component of a LIVE function (every function invoke then 404s — the construens `identity`
+        // the component of a LIVE function (every function invoke then 404s — a production `identity`
         // incident shape). So reference every stored function's active + retained version components.
         self.extend_live_function_components(&mut referenced)
             .await?;
@@ -5988,9 +5988,9 @@ mod tests {
     }
 
     /// Multi-tenant wildcard-vhost precedence (regression pin). In ONE project, a **wildcard**
-    /// site (`*.construens.com` → `portal`) coexists in the same suffix with an **exact** site
-    /// (`console.construens.com` → `console`) and a per-tenant **exact** custom host on a third
-    /// site (`vip.construens.com` → `vip`). The pins: exact always beats the wildcard, and the
+    /// site (`*.exampleorg.com` → `portal`) coexists in the same suffix with an **exact** site
+    /// (`console.exampleorg.com` → `console`) and a per-tenant **exact** custom host on a third
+    /// site (`vip.exampleorg.com` → `vip`). The pins: exact always beats the wildcard, and the
     /// wildcard catches every un-attached tenant label at any depth.
     #[tokio::test]
     async fn wildcard_vhost_precedence_exact_beats_wildcard() {
@@ -6018,7 +6018,7 @@ mod tests {
         attach(
             "portal",
             DomainConfig {
-                wildcards: vec!["*.construens.com".into()],
+                wildcards: vec!["*.exampleorg.com".into()],
                 ..Default::default()
             },
         )
@@ -6027,7 +6027,7 @@ mod tests {
         attach(
             "console",
             DomainConfig {
-                primary: Some("console.construens.com".into()),
+                primary: Some("console.exampleorg.com".into()),
                 ..Default::default()
             },
         )
@@ -6036,7 +6036,7 @@ mod tests {
         attach(
             "vip",
             DomainConfig {
-                primary: Some("vip.construens.com".into()),
+                primary: Some("vip.exampleorg.com".into()),
                 ..Default::default()
             },
         )
@@ -6052,33 +6052,33 @@ mod tests {
                     .map(|o| o.site)
             }
         };
-        // Exact beats wildcard: an exactly-attached host wins over `*.construens.com`.
+        // Exact beats wildcard: an exactly-attached host wins over `*.exampleorg.com`.
         assert_eq!(
-            resolved("console.construens.com").await.as_deref(),
+            resolved("console.exampleorg.com").await.as_deref(),
             Some("console")
         );
-        assert_eq!(resolved("vip.construens.com").await.as_deref(), Some("vip"));
+        assert_eq!(resolved("vip.exampleorg.com").await.as_deref(), Some("vip"));
         // The wildcard catches every un-attached tenant label — at any depth.
         assert_eq!(
-            resolved("tenant7.construens.com").await.as_deref(),
+            resolved("tenant7.exampleorg.com").await.as_deref(),
             Some("portal")
         );
         assert_eq!(
-            resolved("anything-else.construens.com").await.as_deref(),
+            resolved("anything-else.exampleorg.com").await.as_deref(),
             Some("portal")
         );
         assert_eq!(
-            resolved("deep.team.construens.com").await.as_deref(),
+            resolved("deep.team.exampleorg.com").await.as_deref(),
             Some("portal")
         );
         // A host outside the suffix has no claim (the bare suffix is not a sub-label match either).
-        assert_eq!(resolved("construens.com").await, None);
+        assert_eq!(resolved("exampleorg.com").await, None);
         assert_eq!(resolved("console.example.com").await, None);
     }
 
     /// A `*.`-host attaches and routes with **no real DNS** via the admin override (what
     /// `attach_domain_unverified` does: start a DNS challenge, mark it verified without a proof,
-    /// attach) — so an operator can wire `*.construens.com` in a dev run and have every tenant
+    /// attach) — so an operator can wire `*.exampleorg.com` in a dev run and have every tenant
     /// label route immediately.
     #[tokio::test]
     async fn wildcard_attaches_and_routes_without_real_dns_admin_override() {
@@ -6093,25 +6093,25 @@ mod tests {
             .start_domain_verification(
                 ProjectRef::DEFAULT,
                 &site,
-                "*.construens.com",
+                "*.exampleorg.com",
                 VerificationMethod::Dns,
                 0,
             )
             .await
             .unwrap();
         store
-            .mark_domain_verified(ProjectRef::DEFAULT, &site, "*.construens.com")
+            .mark_domain_verified(ProjectRef::DEFAULT, &site, "*.exampleorg.com")
             .await
             .unwrap();
         store
-            .attach_verified_domain(ProjectRef::DEFAULT, &site, "*.construens.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &site, "*.exampleorg.com")
             .await
             .unwrap();
 
         // It routes immediately: any tenant label under the suffix resolves to the portal site.
         assert_eq!(
             store
-                .resolve_site_by_host("tenant7.construens.com")
+                .resolve_site_by_host("tenant7.exampleorg.com")
                 .await
                 .unwrap()
                 .map(|o| o.site)
@@ -6121,7 +6121,7 @@ mod tests {
         // The wildcard matches sub-labels only — the bare suffix is not claimed.
         assert_eq!(
             store
-                .resolve_site_by_host("construens.com")
+                .resolve_site_by_host("exampleorg.com")
                 .await
                 .unwrap()
                 .map(|o| o.site),
@@ -7452,7 +7452,7 @@ mod tests {
         // REGRESSION (data-loss bug): a live FUNCTION's component blobs live in the same CAS as site
         // files but are named by no site manifest, and `delete_function` defers their cleanup to
         // prune. Before the fix, `collect_garbage`'s referenced set omitted them, so a prune deleted a
-        // LIVE function's component (every invoke then 404s — the construens `identity` incident). With
+        // LIVE function's component (every invoke then 404s — a production `identity` incident). With
         // the fix they are referenced and survive; an unreferenced orphan is still reclaimed.
         use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
         use crate::kv::MemoryKv;

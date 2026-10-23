@@ -309,7 +309,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         handlers.set_tenant_secret_store(store);
     }
     // Record the node data directory so the node-health endpoint can report `/data` filesystem
-    // headroom (construens node-health-alerting — the disk-full incident signal).
+    // headroom (a node-health-alerting request — the disk-full incident signal).
     #[cfg(feature = "handlers")]
     handlers.set_data_dir(data_dir.to_path_buf());
     // Wire the fleet session-cookie signer (R3, PLAN-tenancy-principal): the same issuer that mints

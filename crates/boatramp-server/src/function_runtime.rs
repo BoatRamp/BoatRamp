@@ -131,7 +131,7 @@ pub(super) async fn mint_producer_context(
     // System·Admin, or an already-system invocation chain) seals a SYSTEM context: a positive signed
     // `br_scope_kind=system` marker, NO tenant. A consumer declaring `sources: [signed_context]` then
     // resolves the system class (base/`IS NULL`) instead of dead-lettering on a missing tenant —
-    // exactly construens' broken worker. The class rides the SIGNED marker, never a missing tenant.
+    // exactly a production broken worker. The class rides the SIGNED marker, never a missing tenant.
     if kind.is_system() {
         return boatramp_core::cose::mint_system_context(
             None,
@@ -319,7 +319,7 @@ pub(crate) struct ServerProducerContextSource {
 /// Extract a caller **persona/role** from an already-verified JWT claim set (PLAN-async-persona). The
 /// value must be a SINGLE scalar: a JSON string, OR a one-element array whose sole element is a string
 /// (some IdPs emit single-valued `roles` as a one-element array). A zero- or multi-element array is
-/// treated as ABSENT (a persona is one role, matched exactly — construens' `role` is one enum; a set
+/// treated as ABSENT (a persona is one role, matched exactly — `role` is one enum; a set
 /// would be ambiguous and could widen). NOT `scalar_to_sql` (that returns `None` on an array, and we
 /// must unwrap a one-element array; it also accepts non-strings we do not want for a role). `None` ⇒
 /// no usable persona ⇒ the caller seals no persona (fail-closed).
@@ -791,7 +791,7 @@ pub(super) async fn execute_function(
             );
         }
     };
-    // PERF (construens memory-instance, v0.14.0 warm-skip extended to the invoke/durable/cron/webhook
+    // PERF (memory-instance observability, v0.14.0 warm-skip extended to the invoke/durable/cron/webhook
     // lanes): `serve_with_limits*` serve a WARM component from the engine's compiled `ProxyPre` cache
     // and never look at the bytes, so re-reading the component blob here — a full remote GET on an
     // S3/Tigris backend just to discard it — is pure per-invocation latency. Read it ONLY on a cold

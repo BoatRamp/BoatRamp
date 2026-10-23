@@ -499,7 +499,7 @@ async fn resolve_value(
                 // P1 — system-principal mapping (PLAN-system-principal), operator opt-in,
                 // deny-by-default. A verified token whose `iss` is EXACTLY the operator-named system
                 // issuer AND whose gating claim equals the configured value resolves the typed
-                // `System` class (no tenant) — retiring construens' `tid="platform"` sentinel.
+                // `System` class (no tenant) — retiring the old `tid="platform"` sentinel.
                 if let Some(sw) = &cfg.system_when {
                     // Runtime S0 backstop: the system issuer must be EXACT-trusted (single `issuer`
                     // or an `issuer_trust.allow` member), never `suffix`-matched/discovered. A tainted

@@ -8,7 +8,7 @@
 # Safe to commit publicly: this is configuration, not secrets. The one secret —
 # the control-plane root key — is set out-of-band and injected at runtime:
 #   fly secrets set BOATRAMP_AUTH_ROOT_PRIVATE_KEY=<hex>
-# (done by `just fly-provision` in the uchron-devops repo); it never appears here.
+# (done by `just fly-provision` in the deploy-ops repo); it never appears here.
 #
 # No Dockerfile: the image is the flake's `.#container` (base: fs + SlateDB), built
 # + pushed to fly's registry by `just fly-image` and selected with

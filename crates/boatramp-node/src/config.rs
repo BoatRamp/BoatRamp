@@ -3123,7 +3123,7 @@ mod tests {
 
     #[test]
     fn env_configures_managed_postgres_secrets_and_privilege_with_no_file() {
-        // The construens acceptance case: with NO `boatramp.cfg` at all, the
+        // The acceptance case: with NO `boatramp.cfg` at all, the
         // environment alone stands up a managed co-located Postgres. It configures
         // the default (`"default"`-named, v0.5.0) database in
         // `handlers.bindings.sql.databases` (kind=postgres, compute=pg, database+user
@@ -5905,20 +5905,20 @@ pub(crate) mod figment_resolve {
             assert!(c.internal_dns, "bool coerced from \"on\"");
         }
 
-        /// The serve S3 scalars (the construens finalize concern) resolve from env —
+        /// The serve S3 scalars (a finalize concern) resolve from env —
         /// `ServeConfig` is `#[serde(default)]`. Asserts ALL FIVE top-level `[serve]` S3-backend
         /// levers (`blobs`/`s3_bucket`/`s3_endpoint`/`s3_region`/`s3_path_style`) resolve — the
         /// enum, three strings, and the bool. This resolves through the pipeline with NO flag layer
         /// (`resolve_from_env`), i.e. exactly the way the OFFLINE ops (`migrate`/`blob rehome`) see
         /// the object store from the environment — the parity that v0.34.0's hand-added Loader-B
         /// `SERVE_S3_BACKEND_ENV_VARS` arm provided and the figment overlay (`SERVE_SCALARS`) now
-        /// subsumes. So a file-less fleet (the Tigris-only construens deployment) needs no
+        /// subsumes. So a file-less fleet (a Tigris-only production deployment) needs no
         /// `boatramp.cfg` for its object store.
         #[test]
         fn serve_s3_scalars_extract() {
             let cfg = resolve_from_env(&map(&[
                 ("BOATRAMP_BLOBS", "s3"),
-                ("BOATRAMP_S3_BUCKET", "construens-blobs"),
+                ("BOATRAMP_S3_BUCKET", "exampleorg-blobs"),
                 ("BOATRAMP_S3_ENDPOINT", "https://fly.storage.tigris.dev"),
                 ("BOATRAMP_S3_REGION", "auto"),
                 ("BOATRAMP_S3_PATH_STYLE", "true"),
@@ -5926,7 +5926,7 @@ pub(crate) mod figment_resolve {
             .expect("extract");
             let serve = cfg.serve.expect("serve materialised from env");
             assert_eq!(serve.blobs, Some(crate::backends::BlobBackend::S3));
-            assert_eq!(serve.s3_bucket.as_deref(), Some("construens-blobs"));
+            assert_eq!(serve.s3_bucket.as_deref(), Some("exampleorg-blobs"));
             assert_eq!(
                 serve.s3_endpoint.as_deref(),
                 Some("https://fly.storage.tigris.dev")
@@ -6041,7 +6041,7 @@ pub(crate) mod figment_resolve {
                 ("BOATRAMP_UPLOAD_IDLE_TIMEOUT", "30"),
                 ("BOATRAMP_MAX_CONCURRENT_UPLOADS", "16"),
                 ("BOATRAMP_HTTP_REDIRECT_ADDR", "0.0.0.0:80"),
-                ("BOATRAMP_DEFAULT_SITE", "construens"),
+                ("BOATRAMP_DEFAULT_SITE", "exampleorg"),
                 ("BOATRAMP_POP_ORIGIN", "https://cp.example.com"),
                 ("BOATRAMP_PROTECT_PREVIEWS", "true"),
                 ("BOATRAMP_CLUSTER_RATE_LIMIT", "true"),
@@ -6065,7 +6065,7 @@ pub(crate) mod figment_resolve {
             assert_eq!(s.upload_idle_timeout_secs, Some(30));
             assert_eq!(s.max_concurrent_uploads, Some(16));
             assert_eq!(s.http_redirect_addr, Some("0.0.0.0:80".parse().unwrap()));
-            assert_eq!(s.default_site.as_deref(), Some("construens"));
+            assert_eq!(s.default_site.as_deref(), Some("exampleorg"));
             assert_eq!(s.pop_origin.as_deref(), Some("https://cp.example.com"));
             assert!(s.protect_previews);
             assert!(s.cluster_rate_limit);
@@ -6175,7 +6175,7 @@ pub(crate) mod figment_resolve {
                 ("BOATRAMP_AUTH_ROOT_PRIVATE_KEY", "deadbeefsecret"),
                 ("BOATRAMP_BOOTSTRAP_SECRET", "topsecretboot"),
                 ("BOATRAMP_AZURE_ACCESS_KEY", "azuresecretkey"),
-                ("BOATRAMP_DEFAULT_SITE", "construens"),
+                ("BOATRAMP_DEFAULT_SITE", "exampleorg"),
             ]);
             let dump = dump_redacted(&cfg).expect("dump");
             for leaked in ["deadbeefsecret", "topsecretboot", "azuresecretkey"] {
@@ -6186,7 +6186,7 @@ pub(crate) mod figment_resolve {
             }
             assert!(dump.contains("<redacted>"), "secrets shown as <redacted>");
             // A non-secret field is still shown in full.
-            assert!(dump.contains("construens"), "non-secret values are shown");
+            assert!(dump.contains("exampleorg"), "non-secret values are shown");
         }
 
         /// Security MEDIUM: the external signer's in-process `private_key` and a raw-inlined

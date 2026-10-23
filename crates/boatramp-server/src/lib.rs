@@ -1961,8 +1961,8 @@ impl HandlerRuntime {
     /// `owning_node` plus the safety-net-only counter. `None` on a no-runtime build. A single-node /
     /// non-CAS backend reports every function (it owns all) with an empty node label (degenerate there).
     #[cfg(feature = "handlers")]
-    /// A read-only snapshot of the node's wasm instance-lifecycle + memory stats (construens
-    /// memory-instance-observability): per-lane warm/cold/evict counters + durations, the live warm
+    /// A read-only snapshot of the node's wasm instance-lifecycle + memory stats (an
+    /// instance-observability request): per-lane warm/cold/evict counters + durations, the live warm
     /// set, in-flight vs ceiling, and process RSS vs the per-instance limit. `None` when no handler
     /// runtime is configured (the static server). Node-global — the engine is shared across sites.
     pub fn instance_stats(&self) -> Option<boatramp_handlers::InstanceStatsSnapshot> {

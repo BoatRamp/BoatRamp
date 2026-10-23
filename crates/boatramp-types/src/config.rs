@@ -782,7 +782,7 @@ pub struct HandlerConfig {
     /// Resolve **NO** site secrets for this handler (least-privilege opt-out). The `secrets`
     /// allowlist above can scope DOWN to a subset, but an *empty* allowlist means "the whole site
     /// pool" (the non-breaking #492 default), so there was no way to say "none". A blob/image serve
-    /// route on a secret-heavy site (e.g. construens `/img` on a site that declares ~18 IDP/OAuth
+    /// route on a secret-heavy site (e.g. a production `/img` on a site that declares ~18 IDP/OAuth
     /// secrets site-wide) reads none of them, yet paid to resolve + unseal all of them on every serve
     /// (image-serve-latency Ask B-3). Set `no_secrets: true` so `resolve_env` skips the site pool
     /// entirely for this handler — it then touches the secret store zero times per serve. The
@@ -2590,7 +2590,7 @@ mod tests {
     #[test]
     fn handler_config_with_a_blob_upload_import_passes_check_import() {
         // Part 5b: the offline validator must accept a manifest declaring the blob-upload grant — the
-        // gap that blocked construens' manifest before the runtime (which honors the grant) is even
+        // gap that blocked a guest's manifest before the runtime (which honors the grant) is even
         // reached. `DeployConfig::from_ron` runs `check_import` for every handler import, so a config
         // carrying `imports: ["blob-upload:write"]` now parses.
         let text = r#"(

@@ -3193,17 +3193,17 @@ mod tests {
 
     #[test]
     fn container_id_is_clamped_to_the_uts_hostname_limit() {
-        // A short id (every currently-working deployment, incl. the 52-byte construens
+        // A short id (every currently-working deployment, incl. the 52-byte production
         // case) is byte-identical — no digest, fully readable.
         assert_eq!(container_id("default", "web", 0), "web-0");
         assert_eq!(container_id("acme", "pg", 0), "acme-pg-0");
 
-        // The construens-preview case: a long project makes the per-tenant Single id
+        // The exampleorg-preview case: a long project makes the per-tenant Single id
         // embed the project twice and overrun 64 bytes → it must be clamped, not passed
         // to `sethostname` verbatim (which EINVALs and crash-loops the container). The
         // tenant ident tail is padded here so the raw id comfortably exceeds the limit.
-        let project = "construens-preview";
-        let workload = "pg-construens_preview_enzr6qk3m2p8x7v9w1y3z5"; // 44-char tenant ident
+        let project = "exampleorg-preview";
+        let workload = "pg-exampleorg_preview_enzr6qk3m2p8x7v9w1y3z5"; // 44-char tenant ident
         let raw = compute_instance_id(project, workload, 0);
         assert!(
             raw.len() > HOSTNAME_MAX,
@@ -3223,7 +3223,7 @@ mod tests {
 
         // Collision-resistant: two long ids sharing a >52-char prefix but diverging only
         // in the tail must NOT collapse to the same hostname (a plain truncate would).
-        let pad = "pg-construens_preview_commonprefixpaddddddddd_"; // 46 chars, shared
+        let pad = "pg-exampleorg_preview_commonprefixpaddddddddd_"; // 46 chars, shared
         let a = container_id(project, &format!("{pad}aaaa"), 0);
         let b = container_id(project, &format!("{pad}bbbb"), 0);
         assert!(a.len() <= HOSTNAME_MAX && b.len() <= HOSTNAME_MAX);

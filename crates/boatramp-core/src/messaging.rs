@@ -2742,7 +2742,7 @@ impl Messaging for LogMessaging {
                 // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
                 inline: None,
                 // Grouped last_error capture needs a per-in-flight reason (GroupState::InFlight) — a
-                // follow-up; work-queue dead-letters carry it today (that's construens' poison path).
+                // follow-up; work-queue dead-letters carry it today (that's the poison path).
                 last_error: None,
                 // A dead-letter is terminal — no further expiry.
                 expires_at_ms: 0,
@@ -3229,7 +3229,7 @@ impl Messaging for LogMessaging {
         reason: &str,
     ) -> Result<(), MessagingError> {
         // Grouped last_error capture (GroupState::InFlight) is a follow-up; today the work-queue lane
-        // records it (construens' poison path). A grouped call is a safe no-op, never an error.
+        // records it (the poison path). A grouped call is a safe no-op, never an error.
         if !msg.group.is_empty() {
             return Ok(());
         }
@@ -4763,7 +4763,7 @@ mod tests {
     // A **grouped** (fan-out) consumer's poison message must land in an INSPECTABLE dead-letter
     // store — counted, redrivable (with its payload), purgeable — not silently invisible. Before
     // the fix, grouped dead-letters went to `mqgd/…` while the operator ops scanned only `mqdead/…`,
-    // so `dead_letters` reported 0 for exactly the construens fan-out case. Mirrors the work-queue
+    // so `dead_letters` reported 0 for exactly this fan-out case. Mirrors the work-queue
     // DLQ tests, for a group.
     #[tokio::test]
     async fn grouped_dead_letters_are_visible_redrivable_and_purgeable() {

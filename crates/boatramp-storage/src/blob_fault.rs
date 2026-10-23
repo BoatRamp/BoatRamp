@@ -4,7 +4,7 @@
 //! Before this, a `get`/`get_range`/`head` fault collapsed into one opaque `StorageError::Backend`
 //! string with NO HTTP status / error code / request-id in the logs — so a 403 (under-scoped
 //! credential), a 416, a throttle/5xx, or a transport fault were indistinguishable from a genuine
-//! 404, which cost a multi-hour misdiagnosis (construens `boatramp-blob-read-error-granularity`). Now
+//! 404, which cost a multi-hour misdiagnosis (a production `boatramp-blob-read-error-granularity` request). Now
 //! each backend extracts `(status, code, request_id)` from its SDK error and routes through
 //! [`read_fault`], which classifies the outcome, emits ONE structured log line per failed read (key +
 //! op + status + code + request-id + latency), and returns a `StorageError` carrying the detail.
@@ -200,7 +200,7 @@ mod tests {
     /// OBSERVABILITY — the read fault's operator log level is chosen so the incident shape (a
     /// `get`/`get_range` content miss) is visible at the `boatramp=info` default, while routine HEAD
     /// existence-probe misses stay quiet and every abnormal fault is actionable. Locks the contract
-    /// construens' Ask 1 verification turns on (a failed consumer `get` 404 must reach the operator).
+    /// Ask 1 verification turns on (a failed consumer `get` 404 must reach the operator).
     #[test]
     fn read_fault_level_surfaces_the_content_miss_but_not_head_probes() {
         use tracing::Level;

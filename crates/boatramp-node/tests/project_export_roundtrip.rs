@@ -1132,7 +1132,7 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
 }
 
 /// **Live POSITIVE pgvector round-trip THROUGH THE REAL DRIVER** (inc2 HIGH-1 L3 — the load-bearing
-/// correctness proof for the construens clone; Tier-2 / nightly, needs a live pgvector pg +
+/// correctness proof for the env-clone pipeline; Tier-2 / nightly, needs a live pgvector pg +
 /// `BOATRAMP_TEST_PG_URL`). Self-skips.
 ///
 /// Proves that a legit FULL dedicated bundle of a source DB that USES pgvector (a `vector(3)` column

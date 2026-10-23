@@ -1,5 +1,5 @@
 //! The operator-facing **project export/import** capability — the native env-clone
-//! surface (construens). A node that runs a project's managed databases + blobs
+//! surface. A node that runs a project's managed databases + blobs
 //! implements it; the admin API (`POST /api/project-export` / `/api/project-import`,
 //! `System·Admin`) and the `boatramp project export|import` CLI client consume it,
 //! mirroring the [`OperatorSql`](crate::sql::OperatorSql) /
@@ -254,7 +254,7 @@ impl std::fmt::Debug for ExportOptions {
     }
 }
 
-/// The identity decision for an import (construens Ask-2 / Ask-4 c/d). The CLI/API surface
+/// The identity decision for an import (Ask-2 / Ask-4 c/d). The CLI/API surface
 /// requires the operator to choose explicitly; the in-core default is the SAFE `Fresh`.
 #[derive(Clone, Default)]
 pub enum IdentityChoice {

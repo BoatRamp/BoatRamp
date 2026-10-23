@@ -2035,14 +2035,14 @@ async fn serve_admission_gate_bounds_concurrency() {
 }
 
 /// LOCAL serve-latency-floor diagnostic (image-serve-latency Ask B-3) — reproduce the `/img`
-/// `bindgap` floor on THIS machine, no construens, no network. Drives the REAL serve path
+/// `bindgap` floor on THIS machine, no external dependency, no network. Drives the REAL serve path
 /// (`router` → `build_bindings`) and reads the `Server-Timing` phase breakdown off the response,
 /// while varying the two independent variables:
 ///
 ///   1. the project **tenancy-schema size** (`load_project_tenancy` deserializes + builds this per
 ///      serve) over an INSTANT in-memory KV — so if `bindgap` grows with the table count the floor is
 ///      the schema DECODE (CPU, re-done every serve); if it stays flat the floor is the KV GET I/O
-///      (and the construens 43 ms is a slow backend, not the decode);
+///      (and the production 43 ms is a slow backend, not the decode);
 ///   2. a per-`config/tenancy`-get DELAY + concurrency on a 2-worker runtime — to reproduce the
 ///      ~15× burst amplification (scheduling park on that one `await`).
 ///
@@ -8853,7 +8853,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
 /// explorer) is a property of the graphql ENDPOINT ROUTE, never a site-wide browser fallback. On a
 /// graphql-enabled site (`graphiql: true`) a browser GET (`Accept: text/html`) to a DIFFERENT declared
 /// route (an OIDC-style `/authorize`) must reach that route's own guest handler — NOT be shadowed by the
-/// GraphiQL IDE, which is the exact construens browser-login blocker. The `/graphql` endpoint itself still
+/// GraphiQL IDE, which is the exact production browser-login blocker. The `/graphql` endpoint itself still
 /// serves GraphiQL. **Mutation-verified:** reverting the `handler.route == <graphql route>` gate in
 /// `dispatch_handler` makes GET `/authorize` return the GraphiQL IDE → this gate FAILS (proven locally by
 /// reverting that filter).
@@ -10808,7 +10808,7 @@ async fn writing_to_a_nonexistent_project_is_rejected_not_ghosted() {
 ///   * an ungranted component (no binding) is `access-denied`.
 ///
 /// NOTE (shim): a fully-compiled guest live-gate additionally needs the `messaging-stats` guest
-/// interface wrapped in `boatramp-uchron-shim` (a `compat` fn), tracked separately. This host-level
+/// interface wrapped in the guest-compat shim (a `compat` fn), tracked separately. This host-level
 /// gate exercises the real substrate + the real tenant-substitution security property end to end.
 #[cfg(feature = "handlers")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -518,7 +518,7 @@ mod tests {
         let live = [
             (
                 "default",
-                "pg-construens_a1b2",
+                "pg-exampleorg_a1b2",
                 0u32,
                 Ipv4Addr::new(10, 0, 0, 2),
             ),
@@ -528,7 +528,7 @@ mod tests {
 
         // The boot reconcile relaunches each still-desired ordinal; adoption lets
         // each reclaim its own recorded endpoint.
-        let a = be.launch("default", "pg-construens_a1b2", 0);
+        let a = be.launch("default", "pg-exampleorg_a1b2", 0);
         let b = be.launch("default", "pg", 0);
 
         // The core invariant: two live containers NEVER share an IP.

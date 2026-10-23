@@ -1116,7 +1116,7 @@ jobs:
           grep -q 'COMPILE-CACHE DURABLE OK' compile-cache.log \
             || { echo "::error::compile-cache durability gate never reached its marker (the compile cache is no longer pinned to the data volume → components recompile after each restart)" >&2; exit 1; }
 
-      # BLOB-LIST PREFIX-CONFINEMENT gate (construens blob-list-prefix): the new guest `blob-list`
+      # BLOB-LIST PREFIX-CONFINEMENT gate (a prefix-confinement request): the new guest `blob-list`
       # (server-side prefix filter + bounded/resumable page) must stay inside the guest's container.
       # The guest `prefix` is JOINED under the host container prefix (`hblob/{site}/{container}/`) and
       # the returned keys are STRIPPED back to it — so a crafted/escaping prefix (or a forged cursor)
@@ -1144,7 +1144,7 @@ jobs:
             fi
           done
 
-      # ON-UNRESOLVED PASS gate (construens on_unresolved-pass-not-honored): an applied
+      # ON-UNRESOLVED PASS gate (an on_unresolved-pass-not-honored request): an applied
       # `on_unresolved: "pass"` must be honored on EVERY surface a storefront hits, not only the AST
       # SQL/ORM read path — a null-principal pass bind CONFINES (empty / zero rows) instead of hard
       # -refusing, while writes stay denied. The gate drives the two surfaces that previously dropped
@@ -1274,7 +1274,7 @@ jobs:
             echo "issuer-trust LIVE mutation verified: follow_redirects turns the gate RED → the redirect refusal is load-bearing."
           fi
 
-      # FEDERATED-GATEWAY JWKS PERF gate (boatramp-federated-gateway-overhead): the construens repro —
+      # FEDERATED-GATEWAY JWKS PERF gate (boatramp-federated-gateway-overhead): a production repro —
       # a 20-subgraph federation + single-issuer JWKS (`token_claims:(issuer, jwks_url)`), firing an
       # empty-returning query under a 50-way concurrent mass-call, must stay in the MS range with NO
       # per-request JWKS fetch and NO spike. A delayed localhost JWKS mock stands in for the ~1 s IdP
@@ -1464,7 +1464,7 @@ jobs:
   # secret) intact. The test is `#[ignore]`d (an on-disk close→reopen SIGSEGVs on process exit under the
   # static-musl workspace lane — the known SlateDB-on-musl teardown flake, like the ORM battery below)
   # and runs here UNIGNORED on the host toolchain; a silent skip or a regression fails the merge.
-  # (0.16↔0.13.1 on-disk read compatibility — needed to recover construens's 0.13.1-written volume — was
+  # (0.16↔0.13.1 on-disk read compatibility — needed to recover a 0.13.1-written production volume — was
   # verified with a cross-version open test during the upgrade; not a standing gate, since it would pull
   # a second `slatedb` into the storage test binary and aggravate that musl exit-SIGSEGV.)
   test-slatedb-wal-recovery:
@@ -1685,7 +1685,7 @@ jobs:
           cargo test -p boatramp --bin boatramp cli_tree_is_valid 2>&1 | tee v-cli.log
           grep -qE 'test result: ok\. 1 passed' v-cli.log \
             || { echo "::error::CLI tree / version-subcommand gate did not pass" >&2; exit 1; }
-          # blob-upload capability advertised iff compiled (the construens capabilities-omission gap).
+          # blob-upload capability advertised iff compiled (a capabilities-omission gap).
           cargo test -p boatramp-server --features handlers,blob-upload --lib \
             host_capability_features_registry_and_requires_filter 2>&1 | tee bu-reg.log
           grep -qE 'test result: ok\. 1 passed' bu-reg.log \
@@ -1701,7 +1701,7 @@ jobs:
           grep -qE 'test result: ok\. 5 passed' bu-nosts.log \
             || { echo "::error::blob-upload presigned no-STS mode gates did not pass" >&2; exit 1; }
           # blob-read: a backend/permission fault is logged + coarse-categorized, NOT a silent 404, and
-          # the raw SDK error never reaches the guest (the construens blob-read-404 masking trap).
+          # the raw SDK error never reaches the guest (a blob-read-404 masking trap).
           cargo test -p boatramp-handlers --features engine --lib \
             blob_err_masks_a_backend_fault_but_preserves_notfound 2>&1 | tee blobread.log
           grep -qE 'test result: ok\. 1 passed' blobread.log \
@@ -2982,7 +2982,7 @@ jobs:
       # #500: the GraphQL edge (query guard, federation/data planner, and the GraphiQL explorer) is a
       # property of the graphql ENDPOINT ROUTE, not a site-wide browser fallback. A browser GET
       # (Accept: text/html) to a sibling declared guest route (an OIDC-style /authorize) must reach that
-      # route's own handler — NOT be shadowed by the GraphiQL IDE (the construens browser-login blocker) —
+      # route's own handler — NOT be shadowed by the GraphiQL IDE (a browser-login blocker) —
       # while the /graphql endpoint still serves GraphiQL. A scoping regression (the site-wide edge shadows
       # guest GET routes again) fails the merge.
       - name: graphql edge route-scoped gate marker (#500)

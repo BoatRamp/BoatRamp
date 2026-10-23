@@ -1566,7 +1566,7 @@ pub async fn default_scope_collisions(
 /// console admin API can render + park it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationDecision {
-    /// Stable id an answer references (e.g. `collision:site/construens`).
+    /// Stable id an answer references (e.g. `collision:site/exampleorg`).
     pub id: String,
     /// The question to put to the operator.
     pub question: String,
@@ -2928,7 +2928,7 @@ mod tests {
 
     #[tokio::test]
     async fn commingle_with_no_data_plane_footprint_is_non_blocking_and_proceeds() {
-        // Feature A (the construens shape): a DEFAULT-project site named like tenant project `acme`,
+        // Feature A (a production shape): a DEFAULT-project site named like tenant project `acme`,
         // whose handler ceiling grants no KV/mq capability, whose scope holds no unattributable KV/mq
         // key, AND whose blobs (per the injected scanner) are all the tenant's, is NON-blocking — the
         // re-home proceeds, leaving the tenant's keyspace untouched.

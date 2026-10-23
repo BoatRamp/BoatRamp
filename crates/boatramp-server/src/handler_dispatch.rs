@@ -436,7 +436,7 @@ pub(super) async fn dispatch_handler(
         tracing::warn!(site, component = %handler.component, "handler component missing from deployment");
         return handler_unavailable();
     };
-    // PERF (construens memory-instance): on a WARM hit the engine serves from its compiled
+    // PERF (memory-instance observability): on a WARM hit the engine serves from its compiled
     // `ProxyPre` cache and never looks at the component bytes — so re-reading them here, which on a
     // remote blob backend (S3/Tigris) is a full network GET of a multi-hundred-KB component just to
     // discard it, is pure per-request latency (the ~0.5 s "not compute" steady cost). Read the blob
@@ -2148,7 +2148,7 @@ pub(super) async fn open_bindings_sql(
 /// Ask B-1 observability (image-serve-latency): per-sub-phase µs inside [`build_bindings`], so the
 /// otherwise-opaque `bindings_us` phase can be localized. `resolve_us` is auth (token verify) +
 /// in-site tenancy-resolve + the per-table tenancy-schema KV load (the big suspect — it makes the
-/// managed-DB / KV round-trips construens flagged); `messaging_build_us` is the `wasi:messaging`
+/// managed-DB / KV round-trips a production report flagged); `messaging_build_us` is the `wasi:messaging`
 /// producer-binding construction, which mints a per-publish signed-context (`mint_producer_context`),
 /// the one post-resolution binding that does real per-request async work. The dispatch path derives
 /// `binding_build_us = bindings_us − resolve_us` (every non-resolve binding build, messaging
@@ -2562,7 +2562,7 @@ pub(super) async fn build_bindings(
         // handler's own SQL base-writes; a handler that declared NO tenancy keeps `None` (plain SQL).
         // A target route is left untouched (its confinement is its own safe behavior). The emit CLASS
         // below is forced to System regardless, so the handler's `emit` seals a system `signed_context`
-        // for a downstream `signed_context` consumer (construens' worker). `run_as_system` is only ever
+        // for a downstream `signed_context` consumer (a production worker). `run_as_system` is only ever
         // `true` on a cron fire whose deployer capture was System (set in `fire_cron`).
         let tenancy = if run_as_system {
             tenancy.map(|h| if h.is_target() { h } else { h.coerce_system() })
@@ -2597,7 +2597,7 @@ pub(super) async fn build_bindings(
     if let Some(t) = &bindings_timing {
         t.set_resolve(t_resolve.elapsed().as_micros() as u64);
     }
-    // Ask B-2: time the `wasi:blobstore` binding construction on its own (the construens `/img` suspect).
+    // Ask B-2: time the `wasi:blobstore` binding construction on its own (the `/img` suspect).
     let t_blobstore_build = std::time::Instant::now();
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
     // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
@@ -2681,7 +2681,7 @@ pub(super) async fn build_bindings(
     }
     // Ask B-1: time the `wasi:messaging` producer-binding build specifically — it is the one
     // post-resolution binding that does real per-request async work (`mint_producer_context` below),
-    // so construens can see whether it contributes to the opaque `bindings_us` on a messaging route.
+    // so an operator can see whether it contributes to the opaque `bindings_us` on a messaging route.
     let t_messaging_build = std::time::Instant::now();
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
@@ -4129,7 +4129,7 @@ mod vhost_tests {
         let mut req = Request::builder()
             .method("GET")
             .uri("/_sites/portal/dashboard?tenant=7")
-            .header("host", "tenant7.construens.com")
+            .header("host", "tenant7.exampleorg.com")
             .body(Body::empty())
             .unwrap();
         set_forwarded_headers(&mut req, std::net::IpAddr::from([203, 0, 113, 9]));
@@ -4137,18 +4137,18 @@ mod vhost_tests {
         // The guest's `wasi:http` request authority is the real public host — not `localhost`, and
         // not the internal `/_sites/<site>/…` form. This is what a handler resolving its tenant
         // reads off the incoming request.
-        assert_eq!(req.uri().host(), Some("tenant7.construens.com"));
+        assert_eq!(req.uri().host(), Some("tenant7.exampleorg.com"));
         assert_eq!(req.uri().path(), "/dashboard");
         assert_eq!(req.uri().query(), Some("tenant=7"));
         // The `Host` header is preserved verbatim (the other channel a guest may read).
         assert_eq!(
             req.headers().get(header::HOST).unwrap(),
-            "tenant7.construens.com"
+            "tenant7.exampleorg.com"
         );
         // ...and mirrored to `X-Forwarded-Host`.
         assert_eq!(
             req.headers().get("x-forwarded-host").unwrap(),
-            "tenant7.construens.com"
+            "tenant7.exampleorg.com"
         );
     }
 }

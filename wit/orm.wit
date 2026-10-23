@@ -14,11 +14,11 @@
 //      a single-tenant Workspace needs nothing more, and callers pass NO project predicate.
 //   b) in-site multi-tenancy → ROW-LEVEL, OPTIONAL: when a table DECLARES a row policy
 //      (GDC `policy.rs`), the host conjoins it onto every access, bound from the request's
-//      verified claims, fail-closed (authoring-guide M4; → Uchron RLS). Applied host-side;
+//      verified claims, fail-closed (authoring-guide M4). Applied host-side;
 //      callers pass NO tenant predicate. NOT forced — tables without a declared policy get
 //      no row filter. This discriminates an app's own sub-tenants WITHIN one project's DB,
 //      never Workspaces/projects themselves.
-//   - Covers the ~13 must-have features from the construens-app scan; the rare 5%
+//   - Covers the ~13 must-have features from a production-app scan; the rare 5%
 //     (correlated subqueries, DISTINCT ON, CTEs, window fns, JSONB nesting, pgvector)
 //     stay on the raw `sql-query` escape hatch.
 

@@ -360,15 +360,15 @@ jobs:
         run: |
           set -o pipefail
           BIN="$(realpath target/debug/boatramp)"
-          # The load-bearing proof of the v0.3.12 fixes for construens' Single per-tenant
-          # managed Postgres. Before v0.3.12 the tenant DB was (Bug 1) unreachable on lazy
-          # provision until a process restart, and (Bug 2) after a boot reconcile the
+          # The load-bearing proof of the v0.3.12 fixes for a non-default project's Single
+          # per-tenant managed Postgres. Before v0.3.12 the tenant DB was (Bug 1) unreachable
+          # on lazy provision until a process restart, and (Bug 2) after a boot reconcile the
           # credential the CONTAINER was initdb'd with drifted from the one the PROCESS
           # connected with — a tenant-blind bare `pg`/`default` duplicate workload + a
-          # tenant-blind operator path. For a non-default `construens` Single/project binding
+          # tenant-blind operator path. For a non-default `exampleorg` Single/project binding
           # this boot-warms the tenant through the shipped `auto_register` path, launches its
           # dedicated container, and asserts (1) exactly ONE managed workload `pg-<ident>`
-          # under `construens` and NONE (`pg`) under `default` (no two-workload split), (2)
+          # under `exampleorg` and NONE (`pg`) under `default` (no two-workload split), (2)
           # the SHIPPED resolver's `SELECT current_user` authenticates WITHOUT a restart
           # (reachable), (3) after a boot-style reconcile (stop + relaunch on the same volume,
           # initdb skipped) the credential is STILL valid (the P1 == P2 core), and (4) the

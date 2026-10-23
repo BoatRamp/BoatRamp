@@ -2690,9 +2690,9 @@ mod tests {
         let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
 
-        // A `construens` project that HAS a site — under the old boot-warm this would have
+        // A `exampleorg` project that HAS a site — under the old boot-warm this would have
         // been enumerated + provisioned into a `pg-<ident>`. It must NOT be now.
-        seed_project_with_site(&deploy, &store_kv, "construens", "app").await;
+        seed_project_with_site(&deploy, &store_kv, "exampleorg", "app").await;
 
         let mut single = db("postgres", Some("pg"), "", None);
         single.tenant = TenantIsolation::Single; // (the default, made explicit)
@@ -2704,11 +2704,11 @@ mod tests {
         auto_register_managed_db_workloads(&deploy, &dbs).await;
 
         // No per-tenant `pg-<ident>` under the resourced project.
-        let (raw, _is_default) = tenant_key(TenantScope::Project, "construens", "");
+        let (raw, _is_default) = tenant_key(TenantScope::Project, "exampleorg", "");
         let derived = format!("pg-{}", sanitize_ident(&raw));
         assert!(
             deploy
-                .get_compute_workload(ProjectRef::new("construens"), &derived)
+                .get_compute_workload(ProjectRef::new("exampleorg"), &derived)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2737,7 +2737,7 @@ mod tests {
 
     /// Fix 1 (the over-warming bug proper): a `Single` binding + a project that owns ONLY
     /// a static site (never used `sql`) must register **no** managed workload at boot —
-    /// no spurious `pg`/`pg-<ident>`. This is the exact construens repro (a static-only
+    /// no spurious `pg`/`pg-<ident>`. This is the exact repro (a static-only
     /// `default` was getting a bogus `pg`).
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     #[tokio::test]
@@ -2788,12 +2788,12 @@ mod tests {
         single.user = Some("app".into());
 
         // Non-default project tenant → derived per-tenant workload under its project.
-        let (raw, is_default) = tenant_key(TenantScope::Project, "construens", "");
+        let (raw, is_default) = tenant_key(TenantScope::Project, "exampleorg", "");
         assert!(!is_default);
         let ident = sanitize_ident(&raw);
         let derived = format!("pg-{ident}");
 
-        let t = operator_target(&single, "construens", "main").unwrap();
+        let t = operator_target(&single, "exampleorg", "main").unwrap();
         assert_eq!(
             t.workload, derived,
             "targets the per-tenant workload, not bare `pg`"
@@ -2801,13 +2801,13 @@ mod tests {
         assert_eq!(t.database, "appdb");
         assert_eq!(t.user, "app");
         assert_eq!(
-            t.endpoint_project, "construens",
+            t.endpoint_project, "exampleorg",
             "a Single per-tenant workload's replicas live under its project"
         );
         // The credential key is the workload's OWN `(project, workload)` — matching
         // provision_single + the server-init env injector, so operator SQL unseals the
         // SAME password the container was initialized with.
-        assert_eq!(t.cred_project, "construens");
+        assert_eq!(t.cred_project, "exampleorg");
         assert_eq!(t.cred_workload, derived);
         assert_ne!(
             t.cred_workload, "pg",
@@ -2839,10 +2839,10 @@ mod tests {
         shared.database = Some("appdb".into());
         shared.user = Some("postgres".into());
 
-        let (raw, _) = tenant_key(TenantScope::Project, "construens", "");
+        let (raw, _) = tenant_key(TenantScope::Project, "exampleorg", "");
         let ident = sanitize_ident(&raw);
 
-        let t = operator_target(&shared, "construens", "main").unwrap();
+        let t = operator_target(&shared, "exampleorg", "main").unwrap();
         // The shared server workload, the tenant's per-tenant database, superuser user.
         assert_eq!(t.workload, "pg");
         assert_eq!(t.database, tenant_db_name("appdb", &ident));
@@ -2864,7 +2864,7 @@ mod tests {
         site.tenant = TenantIsolation::Single;
         site.tenant_scope = TenantScope::Site;
 
-        let err = operator_target(&site, "construens", "main").unwrap_err();
+        let err = operator_target(&site, "exampleorg", "main").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("site-scoped"),

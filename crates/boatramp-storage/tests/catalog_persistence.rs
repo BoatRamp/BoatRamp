@@ -4,7 +4,7 @@
 //! TARGET route is refused the base write. Built exactly as the host binding builds a write
 //! (`force_scope` + `compile`), run against a real embedded libsql file. The capability itself ships
 //! since v0.4.16 (`AccessMode::Null` → `ScopeMode::NullOnly`); this gate regression-locks it for the
-//! construens global event-catalog (`reference_entity`) use case and proves the v0.12.5 target-route
+//! production global event-catalog (`reference_entity`) use case and proves the v0.12.5 target-route
 //! refusal live. Prints `CATALOG BASE-WRITE OK` so a silent skip can't masquerade as a pass.
 //!
 //! The mutation-verified anti-hollow proof for `write_target`'s NULL stamp + the target refusal lives

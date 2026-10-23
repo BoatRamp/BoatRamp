@@ -1768,7 +1768,7 @@ mod tests {
         );
     }
 
-    /// ANTI-HOLLOW GATE — BLOB half (construens `on_unresolved: "pass"`): a null-principal `pass` bind
+    /// ANTI-HOLLOW GATE — BLOB half (the null-principal `pass` request): a null-principal `pass` bind
     /// CONFINES instead of refusing on the always-compiled `wasi:blobstore` `{tenant}` surface (the
     /// guest's own container opens EMPTY; another tenant's objects stay unreachable; writes refuse) —
     /// the blob analog of the SQL/ORM null-principal `1 = 0`. MUTATION-VERIFIED:

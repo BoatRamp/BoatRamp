@@ -468,12 +468,12 @@ mod tests {
         assert_eq!(e.unwrap(&wrapped).await.unwrap(), secret);
     }
 
-    /// LOCAL diagnostic for image-serve-latency Ask B-3 follow-up Ask (A): construens measured
+    /// LOCAL diagnostic for image-serve-latency Ask B-3 follow-up Ask (A): production measured
     /// `secret_env_us` ≈ 313 ms resolving ~18 `boatramp:` secrets per serve, yet a block-cached
     /// control-plane get is ~8µs. This times the FULL real per-secret path — `SecretStore::get`
     /// (KV point-get + JSON decode) + the REAL `LocalKek` AES-256-GCM unseal — for 18 secrets fetched
     /// CONCURRENTLY, over an INSTANT in-memory KV. If this is sub-millisecond (it is), the 313 ms is NOT
-    /// the envelope or the get-path code — it's environmental: 18 COLD secret-block reads on construens'
+    /// the envelope or the get-path code — it's environmental: 18 COLD secret-block reads on the production
     /// network `/data` volume (blocks not retained in the block cache under the node's memory pressure).
     /// The fix is therefore to stop reading unused/cold secrets per serve (scope to the component /
     /// resolved-env cache), not to speed a get that is already µs.
@@ -488,7 +488,7 @@ mod tests {
         use std::sync::Arc;
 
         let store = SecretStore::new(Arc::new(MemoryKv::new()), Arc::new(kek()));
-        // 18 secrets, like construens' console site (IDP + social refs).
+        // 18 secrets, like a production console site (IDP + social refs).
         let names: Vec<String> = (0..18).map(|i| format!("sec{i:02}")).collect();
         for n in &names {
             store

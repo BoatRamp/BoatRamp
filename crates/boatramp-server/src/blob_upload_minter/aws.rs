@@ -380,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn presigned_only_mints_a_single_object_presigned_put() {
-        // The construens Tigris case: a single-key, PUT-only scope on an STS-less backend mints a
+        // A Tigris case: a single-key, PUT-only scope on an STS-less backend mints a
         // per-object presigned PUT — signed from the base credential, no STS. The constrained
         // content-type is signed in (returned as a required header the client must send).
         let minter = presigned_only_minter();

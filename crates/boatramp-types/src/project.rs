@@ -1,4 +1,4 @@
-//! Projects (= Uchron **Workspaces**): the owning boundary for a set of sites,
+//! Projects (= **Workspaces**): the owning boundary for a set of sites,
 //! functions, and compute workloads, plus shared config/secrets. A Project is
 //! content-addressed and atomically activated exactly like a site deployment — an
 //! immutable `projectver/<hash>` spec body, a mutable `projectmeta/<name>` pointer, and

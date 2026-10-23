@@ -660,7 +660,7 @@ mod tests {
         }]));
         let be = ComputeResolvedSqlBackend::new(
             diag,
-            "pg-construens",
+            "pg-exampleorg",
             ExternalSqlKind::Postgres,
             "db",
             "u",
@@ -678,7 +678,7 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("managed sql `pg-construens`"),
+            msg.contains("managed sql `pg-exampleorg`"),
             "names the workload: {msg}"
         );
         assert!(

@@ -328,7 +328,7 @@ pub enum WalRepairError {
     /// generation that merely *decoded*, which then failed `Db::open` with `invalid compaction`, and
     /// `kv recover` reported "should open normally" because it decoded). The heavier fallback —
     /// rebuilding the LSM from the WAL + surviving SSTs while discarding the bad compaction record
-    /// (construens ask #2) — is DEFERRED and NOT performed here; recover from a clean volume snapshot
+    /// (ask #2) — is DEFERRED and NOT performed here; recover from a clean volume snapshot
     /// or the object-store backup instead.
     #[error(
         "control-plane manifest recovery refused: {examined} manifest generation(s) at `{root}` \

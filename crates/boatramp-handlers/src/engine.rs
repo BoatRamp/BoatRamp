@@ -318,7 +318,7 @@ pub enum Lane {
 }
 
 /// Per-serve cost returned by [`Engine::serve_lane`], so the server can attribute per-invocation
-/// latency (construens ask #3): `cold` is whether this serve paid a cranelift (re)compile vs reused a
+/// latency (a latency-observability ask): `cold` is whether this serve paid a cranelift (re)compile vs reused a
 /// warm component; `instantiate_us` is the per-invocation `instantiate_async` cost (distinct from the
 /// cold compile and from the handler body). The `serve_with_limits*` wrappers discard it; the metered
 /// HTTP + function-invoke paths read it onto the `handler invocation` signal.
@@ -384,7 +384,7 @@ pub enum HandlerError {
     /// (lane ∧ component) ceiling and the guest then trapped. Distinguished from the opaque
     /// [`Trap`](Self::Trap) so the async-lane DLQ reads `out-of-memory` — an operator who raised (or
     /// could raise) a lane's `*_max_memory_mb` sees memory exhaustion as a distinct terminal outcome
-    /// rather than a generic crash (construens async-lane-memory-budget request #4).
+    /// rather than a generic crash (an async-lane-memory-budget request).
     #[error("handler exhausted its linear-memory budget")]
     OutOfMemory,
     /// The engine is at its concurrency limit.
@@ -1373,7 +1373,7 @@ impl ConsumerGates {
 
 /// Insert a freshly-compiled component into a lane's LRU cache, returning `1` if the insert EVICTED
 /// a resident component (the cache was at capacity and the key was new), else `0` — the per-lane
-/// eviction signal for the instance-lifecycle stats (construens memory-instance-observability). A
+/// eviction signal for the instance-lifecycle stats (an instance-observability request). A
 /// warm component dropped here pays a cold recompile on its next request; the REASON is the LRU
 /// capacity cap (reported as `warm_capacity`). Version-agnostic over the `lru` API (len-vs-cap, not
 /// a return-value contract).
@@ -1391,7 +1391,7 @@ pub struct HandlerEngine {
     engine: Engine,
     /// Host-side instance-lifecycle counters (warm-hit / cold-miss / eviction / instantiation +
     /// durations), incremented on the serve path and snapshotted read-only for the admin stats
-    /// surface (construens memory-instance-observability). `Arc` so the server can hold a handle.
+    /// surface (an instance-observability request). `Arc` so the server can hold a handle.
     stats: Arc<crate::instance_stats::InstanceStats>,
     cache: Mutex<LruCache<String, ProxyPre<HostState>>>,
     /// Request-lane **warm floor** (cold-start cap-req 09): a SEPARATE pinned set, checked
@@ -2229,8 +2229,8 @@ impl HandlerEngine {
         self.consumer_pre(hash, wasm).map(|_| ())
     }
 
-    /// Read-only snapshot of the instance-lifecycle + memory stats (construens
-    /// memory-instance-observability): each lane's live warm set / capacity / in-flight, the lifetime
+    /// Read-only snapshot of the instance-lifecycle + memory stats (an
+    /// instance-observability request): each lane's live warm set / capacity / in-flight, the lifetime
     /// warm-hit / cold-miss / eviction / instantiation counters + durations, and process RSS vs the
     /// configured per-instance ceiling. A pure read (the serving surface admin-gates it); the warm set
     /// + in-flight are read live under the lane locks, the counters are lock-free atomics.
@@ -2357,7 +2357,7 @@ impl HandlerEngine {
             .request
             .record_cold_miss(compile.as_nanos() as u64);
         // Operator-visible at the default `boatramp=info`: a warm-cache MISS paid a cranelift compile,
-        // the term a warm hit avoids — the signal construens needs to tell a cold start from execution.
+        // the term a warm hit avoids — the signal needed to tell a cold start from execution.
         // Rare when healthy (once per deploy); frequent only when eviction is churning the cache (the
         // very problem to surface). Level-by-op, mirroring the blob-read-404 lesson.
         tracing::info!(
@@ -3312,7 +3312,7 @@ impl HandlerEngine {
             .request
             .record_instantiation(instantiate_elapsed.as_nanos() as u64);
         // Per-serve timing surfaced to the server for the per-invocation `cold`/`instantiate_ms`
-        // signal (construens ask #3): distinguishes a cold (re)compile + the instantiate cost from
+        // signal (a latency-observability ask): distinguishes a cold (re)compile + the instantiate cost from
         // the handler body and from queueing.
         let timing = ServeTiming {
             cold,
@@ -4467,7 +4467,7 @@ mod tests {
 
 /// The dev-posture guest-egress extra-CA gate: a REAL loopback TLS handshake proving
 /// [`guest_egress_client_config`] trusts an operator-supplied CA **only when supplied**, and never
-/// bypasses verification. This is the boatramp-side hard gate for the extra-CA feature (construens'
+/// bypasses verification. This is the boatramp-side hard gate for the extra-CA feature (the
 /// compiled-guest OIDC back-channel test is the end-to-end companion).
 #[cfg(test)]
 mod egress_tls_tests {

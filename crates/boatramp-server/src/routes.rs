@@ -540,11 +540,11 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/handlers",
             get(operator_handler_stats),
         )
-        // Node-global wasm instance-lifecycle + memory observability (construens
-        // memory-instance-observability). NOT per-site — the engine is shared node-wide; authz gates
+        // Node-global wasm instance-lifecycle + memory observability (an
+        // instance-observability request). NOT per-site — the engine is shared node-wide; authz gates
         // it `System·Read`.
         .route("/api/instance-stats", get(node_instance_stats))
-        // Node-global health snapshot (construens node-health-alerting): `/data` filesystem headroom
+        // Node-global health snapshot (a node-health-alerting request): `/data` filesystem headroom
         // (the disk-full incident signal) + later managed-SQL health. NOT per-site; authz gates it
         // `System·Read` in `authz::Right::required`.
         .route("/api/node-health", get(node_health))

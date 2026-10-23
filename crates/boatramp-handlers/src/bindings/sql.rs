@@ -162,7 +162,7 @@ impl SqlSession {
         if let (Some(sname), Some(sv)) = (&guc.session, tenancy.rls_session_value()) {
             gucs.push((sname.clone(), sv.clone()));
         }
-        // The principal-CLASS GUC (construens `cron-system-principal`): `"system"` for a system
+        // The principal-CLASS GUC (a `cron-system-principal` request): `"system"` for a system
         // principal (no tenant — the tenant GUC above is left unset, so reads fall to `IS NULL` only),
         // `"tenant"` otherwise. Always set when configured, so an app RLS grants the shared/base write
         // ONLY when `current_setting(app.principal_kind, true) = 'system'`. The name is reserved

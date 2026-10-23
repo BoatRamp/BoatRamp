@@ -350,14 +350,14 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     // rides); experimental until the shape settles. A guest declares `requires = ["blob-upload"]` (and the
     // write/multipart right in `imports`); a deploy against a host without it is refused cleanly.
     // Registering it here is what makes it appear in `boatramp capabilities` and pass `capabilities
-    // --check` — its ABSENCE was the construens presigned-ingress gap.
+    // --check` — its ABSENCE was a presigned-ingress gap.
     if cfg!(feature = "blob-upload") {
         f.push(CapabilityFeature {
             name: "blob-upload",
             lifecycle: Experimental,
         });
     }
-    // The `blob-list` capability (construens blob-list-prefix): a server-side prefix filter + a
+    // The `blob-list` capability (a blob-list-prefix request): a server-side prefix filter + a
     // bounded, resumable page over a blob container (the scaling complement to `wasi:blobstore`
     // `list-objects`, which drains the whole container). Rides the SAME `wasi:blobstore` grant +
     // per-container confinement, so it is available whenever the handler engine is compiled (like
@@ -968,7 +968,7 @@ mod tests {
         assert!(host.contains(&"blob-list"));
         // The blob-upload (presigned-ingress) capability is cargo-gated: advertised iff this build
         // enabled it, so `boatramp capabilities` lists it and the `requires` ABI gate is meaningful.
-        // (Its absence in the released image was the construens presigned-blob-upload gap — GATE.)
+        // (Its absence in the released image was a presigned-blob-upload gap — GATE.)
         assert_eq!(host.contains(&"blob-upload"), cfg!(feature = "blob-upload"));
         // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress) is advertised
         // whenever handlers are compiled (the socket host is always linked), so a guest's

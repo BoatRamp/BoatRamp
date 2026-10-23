@@ -349,7 +349,7 @@ impl AccessMode {
     }
 }
 
-/// The **class** of a resolved principal (construens `cron-system-principal`). An identity is either a
+/// The **class** of a resolved principal (a `cron-system-principal` request). An identity is either a
 /// **tenant** (the ordinary case — a tenant id scopes its rows) or a **system** principal (a
 /// platform/super-admin identity that has **no tenant at all**; "tenant" is out of context for it).
 ///

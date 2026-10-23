@@ -149,7 +149,7 @@ pub(super) async fn operator_handler_stats(
     .into_response()
 }
 
-/// Node-global wasm **instance-lifecycle + memory** stats (construens memory-instance-observability):
+/// Node-global wasm **instance-lifecycle + memory** stats (an instance-observability request):
 /// per-lane warm-hit / cold-miss / eviction / instantiation counters + compile & instantiate
 /// durations, the live warm set + capacity, in-flight vs ceiling, and process RSS vs the per-instance
 /// limit — so an operator can see, from DATA, whether components stay warm (and why not) and whether a
@@ -163,7 +163,7 @@ pub(super) async fn node_instance_stats(
     match handlers.instance_stats() {
         Some(stats) => {
             // Additively merge the node `/data` filesystem headroom + per-category composition
-            // (construens node-health-alerting + kv-data-observability): console back-compat preserved
+            // (a node-health-alerting + kv-data-observability request): console back-compat preserved
             // — existing fields are unchanged and the new `data_*` keys + `data_breakdown` object are
             // ignored by older clients; `boatramp stats --instances` (a raw-Value passthrough) surfaces
             // them automatically.
@@ -371,7 +371,7 @@ fn dir_size_recursive(dir: &std::path::Path, depth: u32) -> u64 {
     total
 }
 
-/// `GET /api/node-health` (construens node-health-alerting): the NODE-global health snapshot. Stage 1
+/// `GET /api/node-health` (a node-health-alerting request): the NODE-global health snapshot. Stage 1
 /// surfaces `/data` filesystem headroom — the disk-full incident signal (a silently-full `/data`
 /// bricked managed PG with no alert); managed-SQL health + the alerting loop/channels arrive in a later
 /// stage. Read-only; the authz table gates it `System·Read` (a NODE-global read — disk/health are node

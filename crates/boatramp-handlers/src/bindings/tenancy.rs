@@ -67,7 +67,7 @@ pub enum SealedPrincipal {
         /// The caller's host-verified persona/role, or `None` when none was sealed / usable.
         persona: Option<String>,
     },
-    /// A SYSTEM principal (construens cron-system-principal): a platform/super-admin with NO tenant —
+    /// A SYSTEM principal (a cron-system-principal request): a platform/super-admin with NO tenant —
     /// there is structurally no tenant to read, so a consumer that needs one must handle this arm.
     System {
         /// The caller's host-verified persona/role, or `None`.
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(p.tenant, "acme");
         assert_eq!(p.persona, None);
 
-        // A SYSTEM seal (no-tenant, construens cron-system-principal) is NOT representable by the
+        // A SYSTEM seal (no-tenant, a cron-system-principal request) is NOT representable by the
         // back-compat `sealed-principal` record, so the guest observes `none` and falls to the
         // fail-closed `authenticate_sealed` default. The system CLASS is enforced host-side.
         let system = SealedPrincipal::System {

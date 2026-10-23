@@ -3408,7 +3408,7 @@ impl NodeProjectExport {
     }
 
     // -----------------------------------------------------------------------
-    // inc2 Stage D — MySQL atomic shadow-restore (secondary; construens is pg). Same
+    // inc2 Stage D — MySQL atomic shadow-restore (secondary; production is pg). Same
     // non-superuser-apply split: `mysql <shadow>` applies the attacker dump as the owner role;
     // the maintenance connection runs the trusted `CREATE DATABASE` + atomic `RENAME TABLE` swap.
     // -----------------------------------------------------------------------

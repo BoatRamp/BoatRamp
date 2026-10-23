@@ -27,7 +27,7 @@ impl VethNetwork {
     /// The Linux interface-name limit is 15 chars (`IFNAMSIZ - 1`), so the name must
     /// fit `vth-`/`cth-` (4) + an 11-char body. A plain `truncate(15)` was a **latent
     /// collision**: two distinct long workload names that share a 15-char prefix — e.g.
-    /// two `Single` per-tenant containers `pg-construens_AAAA…` vs `pg-construens_BBBB…`
+    /// two `Single` per-tenant containers `pg-exampleorg_AAAA…` vs `pg-exampleorg_BBBB…`
     /// whose sanitized idents diverge only after char 11 — collapse to the *same*
     /// `vth-…` / `cth-…` name, so the second container's `host_setup` fails (or worse,
     /// silently attaches to the first's veth). Instead, derive the 11-char body from a
@@ -352,11 +352,11 @@ mod tests {
     /// stable across calls (idempotent teardown/relaunch).
     #[test]
     fn long_names_sharing_a_prefix_do_not_collide() {
-        // `pg-construens_xxx…<ident>`: identical through the first 15+ chars (the whole
+        // `pg-exampleorg_xxx…<ident>`: identical through the first 15+ chars (the whole
         // `truncate(15)` window), diverging only in the tail — the exact shape that
         // collapsed under a plain truncation.
-        let a_id = "pg-construens_shared_prefix_AAAAAAAAAAAA";
-        let b_id = "pg-construens_shared_prefix_BBBBBBBBBBBB";
+        let a_id = "pg-exampleorg_shared_prefix_AAAAAAAAAAAA";
+        let b_id = "pg-exampleorg_shared_prefix_BBBBBBBBBBBB";
         assert_eq!(
             &a_id[..15],
             &b_id[..15],

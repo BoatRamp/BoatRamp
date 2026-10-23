@@ -465,7 +465,7 @@ pub(crate) fn build_s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn Objec
 }
 
 // ===================================================================================
-// KV data-observability + offline compaction/GC (construens kv-data-observability).
+// KV data-observability + offline compaction/GC (a data-observability request).
 //
 // The control-plane SlateDB store can grow its PHYSICAL footprint (superseded SSTs + old
 // manifests + old WAL objects) far past its LOGICAL (live) size when the embedded compactor/GC
@@ -854,7 +854,7 @@ fn gc_options(dry_run: bool, min_age: Duration) -> slatedb::config::GarbageColle
         // Disabling the boundary makes the GC go straight to its delete pass (SlateDB supports + tests
         // this path, and never reuses a manifest id, so the fence is unnecessary for our single-writer
         // monotonic-id control plane); it is a safe superset that also works on S3 (where Update IS
-        // implemented). See construens `boatramp-kv-compact-manifest-gc-gap.md`.
+        // implemented). See `boatramp-kv-compact-manifest-gc-gap.md`.
         boundary_files_enabled: false,
         object_store_max_retries: None,
     }
@@ -3678,7 +3678,7 @@ mod tests {
         .await;
     }
 
-    /// GATE (reproduces the PROD leak that v0.33.0 shipped — construens
+    /// GATE (reproduces the PROD leak that v0.33.0 shipped —
     /// `boatramp-kv-compact-manifest-gc-gap.md`). The existing test above runs GC exactly ONCE, which
     /// on a local filesystem takes SlateDB's boundary `PutMode::Create` path and succeeds — so it never
     /// caught the real bug. In prod, GC always runs a SECOND+ time: once a `gc/manifest.boundary` file

@@ -1526,7 +1526,7 @@ mod tests {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             .to_string()
                     };
-                    // Stand-in for the real IdP round-trip latency (the cost that made construens'
+                    // Stand-in for the real IdP round-trip latency (the cost that made production
                     // calls ~1 s): a per-response delay, so a per-request fetch is OBSERVABLE and the
                     // cache's fetch-collapse is measurable.
                     if !delay.is_zero() {
@@ -1628,13 +1628,13 @@ mod tests {
 
     // ---- E2E PERFORMANCE GATE: 20-subgraph federation + JWKS + empty responses + mass-calls ----
 
-    /// E2E PERFORMANCE GATE — the construens `boatramp-federated-gateway-overhead` repro. A route with
-    /// `token_claims:(issuer, jwks_url)` (single-issuer = OWN tier, construens' exact shape) over a
+    /// E2E PERFORMANCE GATE — the `boatramp-federated-gateway-overhead` production repro. A route with
+    /// `token_claims:(issuer, jwks_url)` (single-issuer = OWN tier, this exact shape) over a
     /// **20-subgraph** federation, firing an empty-returning query under a **concurrent mass-call**,
     /// must stay in the **ms** range with **no per-request JWKS fetch** and **no spike**.
     ///
     /// The failure shape is reproduced with a **delayed JWKS mock** (`D` stands in for the ~1 s IdP
-    /// round-trip that made construens' calls ~1 s). The gate PROVES the cache collapses it:
+    /// round-trip that made production calls ~1 s). The gate PROVES the cache collapses it:
     /// - (a) after one warm-up, the mock `/keys` is hit **O(1)** times (not ~N) — the fetch collapsed;
     /// - (b) every **warm** request is **≪ D** — no request paid a JWKS fetch (no spike);
     /// - (c) the whole concurrent batch finishes **≪ D** — no stampede.
@@ -1664,7 +1664,7 @@ mod tests {
         let (port, hits) = spawn_oidc_mock(jwks, D).await;
         let jwks_url = format!("http://127.0.0.1:{port}/keys");
         let issuer = format!("http://127.0.0.1:{port}");
-        // Construens' shape: `token_claims:(issuer, jwks_url)` — single-issuer = OWN tier (guarded=false).
+        // This shape: `token_claims:(issuer, jwks_url)` — single-issuer = OWN tier (guarded=false).
         let cfg = HandlerGraphqlTokenClaims {
             issuer: issuer.clone(),
             jwks_url: Some(jwks_url),
@@ -1701,7 +1701,7 @@ mod tests {
         let variables = serde_json::json!({});
         let cache = Arc::new(crate::graphql_cache::GraphqlCache::default());
 
-        /// Fans out to subgraphs returning empty data — construens' empty/`unauthenticated` response,
+        /// Fans out to subgraphs returning empty data — an empty/`unauthenticated` response,
         /// the least-work path (its real subgraphs answer in 2–75 ms; empty is a fortiori cheaper).
         struct EmptyFetcher;
         #[async_trait::async_trait]

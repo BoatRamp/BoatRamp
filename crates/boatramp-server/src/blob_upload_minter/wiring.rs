@@ -72,7 +72,7 @@ pub enum CloudMinterSpec {
         presigned_only: bool,
         /// The node-level **sealed base S3 credential** to sign the STS/presign SDK config with (#505),
         /// or `None` for the ambient AWS env chain (the historical default). The SAME source the S3 blob
-        /// object backend uses — construens' one Tigris key. Redacted from `Debug` (see [`BaseCredential`]).
+        /// object backend uses — the production fleet's one Tigris key. Redacted from `Debug` (see [`BaseCredential`]).
         base_credential: Option<BaseCredential>,
     },
     /// A GCS backend: broker a V4 signed PUT URL / a downscoped CAB token.

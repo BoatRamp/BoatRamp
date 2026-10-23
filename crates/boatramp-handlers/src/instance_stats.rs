@@ -1,5 +1,5 @@
-//! Host-side observability for the wasm component **instance lifecycle** (construens
-//! memory-instance-observability request): per-lane warm-hit / cold-miss / eviction /
+//! Host-side observability for the wasm component **instance lifecycle** (an
+//! instance-observability request): per-lane warm-hit / cold-miss / eviction /
 //! instantiation counters + compile & instantiate durations, plus the live warm set, snapshotted
 //! read-only for the admin stats surface. So an operator can see, from DATA, whether compiled
 //! components stay warm (and if not, how often they are evicted) and whether a slow request paid a
@@ -114,7 +114,7 @@ impl LaneCounters {
     }
 
     /// A cold miss — the component was (re)compiled. `compile_ns` is the cranelift compile cost that
-    /// a warm hit avoids (the dominant "cold start" term construens is chasing).
+    /// a warm hit avoids (the dominant "cold start" term an operator is chasing).
     pub fn record_cold_miss(&self, compile_ns: u64) {
         self.cold_misses.fetch_add(1, Ordering::Relaxed);
         self.compile_ns_total
