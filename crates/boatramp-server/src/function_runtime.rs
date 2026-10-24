@@ -1715,6 +1715,15 @@ pub(super) async fn build_function_bindings(
     if granted("wasi:sockets") && !config.egress_allowlist.is_empty() {
         bindings = bindings.with_egress_allowlist(config.egress_allowlist.clone());
     }
+    // Host-side DNS resolver (mailroom cap-req #20, the resolver half of the egress story): attach the
+    // shared hickory resolver ONLY when the component is granted `dns-resolve`. Deny-by-default — the
+    // binding is absent otherwise; and even when granted it reaches nothing unless the node posture
+    // `allow_guest_tcp_egress` is on (the binding enforces the SAME posture as a `tcp-egress` dial) and
+    // its `resolve-addr` results are SSRF-floored by the same `is_global_ip` predicate.
+    #[cfg(feature = "tcp-egress")]
+    if granted("dns-resolve") {
+        bindings = bindings.with_dns_resolve(crate::dns_resolve::shared_resolver());
+    }
     Ok(bindings)
 }
 

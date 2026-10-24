@@ -62,6 +62,10 @@ pub use bindings::blobstore::read_object_through_guest_binding;
 pub use bindings::blobstore::{BlobBinding, BlobRefDenied};
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
+/// The host-side DNS resolver capability (mailroom cap-req #20): the injected [`DnsResolver`] backend
+/// (implemented in boatramp-server with hickory) + its host-facing value types.
+#[cfg(feature = "tcp-egress")]
+pub use bindings::dns_resolve::{DnsResolveBinding, DnsResolveError, DnsResolver, MxRecord};
 #[cfg(feature = "email")]
 pub use bindings::email::{EmailSpool, LettreBackend, OutboundEmail, SmtpBackend};
 #[cfg(feature = "graphql")]

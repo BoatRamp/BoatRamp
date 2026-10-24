@@ -1606,3 +1606,57 @@ interface tcp-connection-context {
 world tcp-connection-context-host {
   import tcp-connection-context;
 }
+
+/// Value types + the host-side **DNS resolver** capability (`boatramp:handlers/dns-resolve`, mailroom
+/// cap-req #20): the DNS half of the egress story. `tcp-egress` (#15) dials a KNOWN host; this lets a
+/// guest FIND the host to dial — resolve a domain's MX records (which mail host to deliver to) or a
+/// hostname's addresses — WITHOUT the guest holding `wasi:sockets` or running a resolver itself. The
+/// host does the lookup (with its own cache), so this is the guest-facing resolver `#02`'s verifier
+/// deliberately deferred ("a guest-facing DNS resolver is egress surface").
+///
+/// # Egress-class, gated + SSRF-floored
+/// A resolver IS outbound surface, so it is gated by the SAME node posture as `tcp-egress`
+/// (`allow_guest_tcp_egress`): posture off ⇒ every call is `access-denied`, exactly like a dial.
+/// Deny-by-default per grant (`dns-resolve`). Unlike `tcp-egress` there is NO per-target allowlist —
+/// direct-MX relay must resolve ARBITRARY recipient domains — so the guard is the posture + the grant
+/// + an SSRF floor on RESOLVED ADDRESSES: `resolve-addr` drops every non-globally-routable address
+/// (loopback / private / link-local / ULA) unless the operator also set `allow_private_egress`, so it
+/// can't be an oracle for the metadata endpoint or internal ranges. `resolve-mx` returns hostnames
+/// (public MX data); the follow-on dial to an MX host is itself the SSRF-floored `tcp-egress` connect.
+interface dns-resolve {
+  /// One MX record: the delivery `preference` (lower is tried first) and the `exchange` mail host.
+  record mx-record {
+    preference: u16,
+    exchange: string,
+  }
+
+  /// Why a resolve failed.
+  variant dns-error {
+    /// The `dns-resolve` grant was not conferred, OR the node posture `allow_guest_tcp_egress` is off
+    /// (deny-by-default — resolution is egress-class).
+    access-denied,
+    /// The name was not a syntactically valid domain/host (empty, too long, bad label).
+    invalid-name(string),
+    /// The name resolved to no records of the requested type (NXDOMAIN or an empty answer) — or, for
+    /// `resolve-addr`, every resolved address was dropped by the SSRF floor (so none is returnable).
+    not-found,
+    /// Any other resolver/backend failure (timeout, SERVFAIL, …). Carries a client-safe reason.
+    failed(string),
+  }
+
+  /// Resolve `domain`'s MX records, sorted by ascending `preference` (RFC 5321 delivery order). The
+  /// host resolves + caches; the guest then dials the chosen `exchange` over `tcp-egress`.
+  resolve-mx: func(domain: string) -> result<list<mx-record>, dns-error>;
+
+  /// Resolve `host`'s A/AAAA addresses, as textual IPs (e.g. "93.184.216.34", "2606:2800:220:1::"),
+  /// SSRF-floored: a non-globally-routable address is dropped unless `allow_private_egress` is set, so
+  /// an all-private answer returns `not-found` rather than leaking an internal target.
+  resolve-addr: func(host: string) -> result<list<string>, dns-error>;
+}
+
+/// Import-only world for the `dns-resolve` host binding (the `DnsResolveHost` Host impl). Off by
+/// default (rides the `tcp-egress` cargo feature — it is the resolver half of the same egress story).
+/// A guest WIT addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump.
+world dns-resolve-host {
+  import dns-resolve;
+}

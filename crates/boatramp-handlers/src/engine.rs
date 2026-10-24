@@ -3148,6 +3148,18 @@ impl HandlerEngine {
         bindings::tcp_connection_context::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::tcp_connection_context::ConnContextHost::new(state.conn_security.clone())
         })?;
+        // Host-side DNS resolver (mailroom cap-req #20): the resolver half of the egress story. Gated
+        // deny-by-default (binding `None` ⇒ `access-denied`) AND by the SAME egress posture as
+        // `tcp-egress` (`tcp_egress_enabled`); the SSRF floor on resolved addresses uses the same
+        // `allow_private_egress` flag as a `tcp-egress` dial.
+        #[cfg(feature = "tcp-egress")]
+        bindings::dns_resolve::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::dns_resolve::DnsResolveHost::new(
+                state.bindings.dns_resolve(),
+                state.tcp_egress_enabled,
+                state.http_hooks.allow_private_egress,
+            )
+        })?;
         Ok(linker)
     }
 

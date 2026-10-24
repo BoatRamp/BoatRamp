@@ -394,6 +394,12 @@ const KNOWN_IMPORTS: &[&str] = &[
     // `[serve.listeners.<name>]` — deny-by-default at every layer. Advertised Experimental (not the
     // blanket-Stable KNOWN_IMPORTS lifecycle).
     "tcp-listener",
+    // Host-side DNS resolver capability (`PLAN-handler-tcp-egress` #20, the resolver half of the
+    // egress story). A guest resolves MX / addresses via a host-held resolver (never `wasi:sockets`);
+    // granting it here only lets a component DECLARE it. Reaching anything additionally needs the SAME
+    // posture as a dial (`allow_guest_tcp_egress`); `resolve-addr` results are SSRF-floored.
+    // Deny-by-default. Advertised Experimental.
+    "dns-resolve",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI

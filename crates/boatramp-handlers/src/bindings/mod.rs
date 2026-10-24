@@ -31,6 +31,12 @@ pub mod blob_upload;
 pub mod blobstore;
 #[cfg(feature = "capability")]
 pub mod capability;
+/// The host-side DNS resolver binding (`boatramp:handlers/dns-resolve`, mailroom cap-req #20): a
+/// guest resolves a domain's MX records / a host's addresses via a host-held resolver (never holding
+/// `wasi:sockets`), gated by the egress posture + SSRF-floored. The resolver half of the egress
+/// story — rides the `tcp-egress` feature.
+#[cfg(feature = "tcp-egress")]
+pub mod dns_resolve;
 #[cfg(feature = "email")]
 pub mod email;
 #[cfg(feature = "graphql")]
@@ -173,6 +179,12 @@ pub struct Bindings {
     /// only when the node posture `allow_guest_tcp_egress` is on; even then the gate is
     /// connect-only and SSRF-floored. Never guest-supplied — host config on the deploy record.
     egress_allowlist: Arc<[String]>,
+    /// The `dns-resolve` grant (mailroom cap-req #20): the server-provided host-side DNS resolver
+    /// (MX + addr, with its own cache). `None` ⇒ not granted (every resolve ⇒ `access-denied`). The
+    /// egress POSTURE (`allow_guest_tcp_egress`) + the SSRF floor are applied by the binding from the
+    /// invocation's `HostState`, not carried here.
+    #[cfg(feature = "tcp-egress")]
+    dns_resolve: Option<dns_resolve::DnsResolveBinding>,
     /// HOST-MEDIATED egress only (mailroom cap-req #19): when set, a non-empty `egress_allowlist`
     /// feeds ONLY the host-mediated `tcp-egress` binding (the host dials + terminates TLS), and
     /// `new_store` does NOT install the permissive GUEST `socket_addr_check` — so the guest's own
@@ -370,6 +382,24 @@ impl Bindings {
     /// `wasi:sockets` stays denied.
     pub fn with_host_mediated_egress(mut self) -> Self {
         self.host_mediated_egress_only = true;
+        self
+    }
+
+    /// This invocation's `dns-resolve` grant (`None` ⇒ not granted). Read by the engine's
+    /// `build_linker` closure to build the per-invocation `DnsResolveHost`.
+    #[cfg(feature = "tcp-egress")]
+    pub fn dns_resolve(&self) -> Option<&dns_resolve::DnsResolveBinding> {
+        self.dns_resolve.as_ref()
+    }
+
+    /// Grant the `dns-resolve` capability (mailroom cap-req #20), backed by the server-provided
+    /// `resolver`. The egress posture + SSRF floor are enforced by the binding at use.
+    #[cfg(feature = "tcp-egress")]
+    pub fn with_dns_resolve(
+        mut self,
+        resolver: std::sync::Arc<dyn dns_resolve::DnsResolver>,
+    ) -> Self {
+        self.dns_resolve = Some(dns_resolve::DnsResolveBinding::new(resolver));
         self
     }
 

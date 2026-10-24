@@ -282,6 +282,10 @@ pub(crate) use scheduler::{
     CronNow, acquire_component_admission, acquire_site_permit, effective_limits,
     handler_error_response, handler_unavailable, sql_starting_response,
 };
+/// The hickory-backed DNS resolver for the guest-facing `dns-resolve` capability (mailroom cap-req
+/// #20); the resolver half of the egress story, built once + cached. Rides the `tcp-egress` feature.
+#[cfg(feature = "tcp-egress")]
+pub mod dns_resolve;
 #[cfg(feature = "handlers")]
 mod function_runtime;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the

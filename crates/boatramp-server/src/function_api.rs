@@ -268,11 +268,12 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     // Base grantable capabilities (the KNOWN_IMPORTS tokens) — the established interface grants.
     let mut f: Vec<CapabilityFeature> = boatramp_core::config::known_imports()
         .iter()
-        // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress) and `tcp-listener` (host-owned
-        // inbound-TCP listeners, PLAN-handler-tcp-inbound) are KNOWN_IMPORTS so a deploy may DECLARE
-        // them offline, but both are advertised as Experimental below (not Stable) — new, posture-gated,
-        // off-by-default surfaces. Filtered here so neither is ALSO advertised Stable.
-        .filter(|&&name| name != "wasi:sockets" && name != "tcp-listener")
+        // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress), `tcp-listener` (host-owned
+        // inbound-TCP listeners, PLAN-handler-tcp-inbound), and `dns-resolve` (the resolver half of the
+        // egress story, #20) are KNOWN_IMPORTS so a deploy may DECLARE them offline, but all are
+        // advertised as Experimental below (not Stable) — new, posture-gated, off-by-default surfaces.
+        // Filtered here so none is ALSO advertised Stable.
+        .filter(|&&name| name != "wasi:sockets" && name != "tcp-listener" && name != "dns-resolve")
         .map(|&name| CapabilityFeature {
             name,
             lifecycle: Stable,
@@ -429,6 +430,14 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     if cfg!(feature = "tcp-egress") {
         f.push(CapabilityFeature {
             name: "tcp-egress",
+            lifecycle: Experimental,
+        });
+        // The host-side DNS resolver (mailroom cap-req #20, the resolver half of the egress story):
+        // resolve MX / addresses host-side, gated by the SAME posture as a dial + SSRF-floored. Rides
+        // the `tcp-egress` cargo feature; its OWN grant token (`dns-resolve`) + `requires` name, so a
+        // guest declaring `requires = ["dns-resolve"]` is refused cleanly on a pre-#20 host.
+        f.push(CapabilityFeature {
+            name: "dns-resolve",
             lifecycle: Experimental,
         });
     }

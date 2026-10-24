@@ -204,8 +204,13 @@ tcp-listener = ["handlers", "boatramp-handlers/tcp-listener"]
 # does zero crypto and never receives `wasi:sockets` for this surface). Reuses the SAME gated
 # `wasi:sockets` grant + per-handler `egress_allowlist` + the node posture `allow_guest_tcp_egress`
 # (no new grant kind). Gates the `HandlerRuntime`'s `TcpEgressHost` wiring + the capability advert.
-# Implies `handlers`. Experimental.
-tcp-egress = ["handlers", "boatramp-handlers/tcp-egress"]
+# Also pulls the hickory resolver for the guest-facing `dns-resolve` capability (mailroom cap-req #20,
+# the resolver half of the egress story). Implies `handlers`. Experimental.
+tcp-egress = [
+  "handlers",
+  "boatramp-handlers/tcp-egress",
+  "dep:hickory-resolver",
+]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via

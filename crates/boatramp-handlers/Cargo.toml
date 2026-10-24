@@ -167,7 +167,8 @@ tcp-listener = ["engine"]
 # `connect-tls`/`start-tls`'s `strict` arm reuses verbatim via `guest_egress_client_config`; `start-tls`'s
 # `opportunistic` arm builds its own separate relaxed `rustls::ClientConfig`). Off by default
 # (experimental); the shipped binary turns it on via batteries-included.
-tcp-egress = ["engine"]
+# `dep:async-trait` for the object-safe `DnsResolver` seam the `dns-resolve` binding injects (#20).
+tcp-egress = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

@@ -150,6 +150,11 @@ mod imp {
             // fails a dependent deploy loudly) is the SEPARATE `tcp-connection-context` feature a guest
             // names in `requires`, not this token.
             ("boatramp:handlers", "tcp-connection-context") => Some("tcp-listener"),
+            // The host-side DNS resolver capability (mailroom cap-req #20, the resolver half of the
+            // egress story): a guest imports `dns-resolve` to look up MX / addresses host-side. Its
+            // OWN declarable grant token (distinct from the dial), posture-gated by
+            // `allow_guest_tcp_egress` at runtime + SSRF-floored.
+            ("boatramp:handlers", "dns-resolve") => Some("dns-resolve"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -227,7 +232,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 9, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 10, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
