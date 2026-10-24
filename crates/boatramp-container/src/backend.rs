@@ -1299,9 +1299,17 @@ impl ContainerBackend {
                 BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
             })?;
             if can_shift_ownership() {
-                std::os::unix::fs::chown(&dir, Some(host_uid), Some(host_gid)).map_err(|e| {
+                // Fix ownership so the guest (uid `guest_uid` → host `host_uid`) owns the
+                // volume. A FRESH dir only needs its top-level owner set; a REUSED dir may
+                // carry files written under a DIFFERENT owner — a volume restored/cloned
+                // from an env-export, or one from a prior `userns_base` — and a top-dir-only
+                // chown leaves those files foreign-owned, so a rootless DB (e.g. Postgres as
+                // 999) gets EPERM reading its OWN cluster files (`global/pg_filenode.map:
+                // Permission denied`). Recurse, skipping entries already correctly owned so a
+                // large, already-correct volume stays cheap.
+                chown_tree_to(&dir, host_uid, host_gid).map_err(|e| {
                     BackendError::Launch(format!(
-                        "chown volume {} dir to guest owner: {e}",
+                        "chown volume {} to guest owner {host_uid}:{host_gid}: {e}",
                         vol.name
                     ))
                 })?;
@@ -2126,6 +2134,36 @@ fn shift_rootfs(dir: &Path, base: u32) -> std::io::Result<()> {
             let path = entry?.path();
             let meta = std::fs::symlink_metadata(&path)?;
             relabel(&path, &meta)?;
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively set every entry under `dir` (and `dir` itself) to `(uid, gid)`, not
+/// following symlinks, **skipping entries already correctly owned** so an already-correct
+/// volume costs only a stat per entry (no `lchown` churn). This is the robust managed-DB
+/// volume pre-chown: it repairs a reused/restored/cloned data directory whose files were
+/// written under a different owner, which would otherwise EPERM the rootless DB process
+/// reading its own data directory. Runs blocking at launch time (infrequent for a
+/// never-scale-to-zero managed DB), off the hot path.
+fn chown_tree_to(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fix = |path: &Path, meta: &std::fs::Metadata| -> std::io::Result<()> {
+        if meta.uid() != uid || meta.gid() != gid {
+            std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+        }
+        Ok(())
+    };
+    fix(dir, &std::fs::symlink_metadata(dir)?)?;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            fix(&path, &meta)?;
             if meta.file_type().is_dir() {
                 stack.push(path);
             }
@@ -2974,6 +3012,35 @@ mod tests {
         assert!(backend.remove_volume("a/b").await.is_err());
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn chown_tree_to_walks_the_whole_tree_and_skips_correct_owner() {
+        // Build a Postgres-data-dir-shaped nested tree and target the CURRENT owner (what
+        // freshly-created files already have), so the walk visits every entry while the
+        // skip-already-correct path makes it a no-op — provable WITHOUT root. The foreign-uid
+        // REPAIR (chowning files written under a different owner) needs root and is covered
+        // by the live Linux gate; here we prove the traversal reaches every nested entry
+        // (the bug was a top-dir-only chown that never descended into `global/`, `base/…`).
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir().join(format!("brchown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("global")).unwrap();
+        std::fs::write(tmp.join("global").join("pg_filenode.map"), b"x").unwrap();
+        std::fs::write(tmp.join("PG_VERSION"), b"16").unwrap();
+        std::fs::create_dir_all(tmp.join("base").join("1")).unwrap();
+        std::fs::write(tmp.join("base").join("1").join("1259"), b"y").unwrap();
+        let me = std::fs::symlink_metadata(tmp.join("PG_VERSION")).unwrap();
+        // No-op chown to the current owner: must succeed and leave the deep file intact.
+        chown_tree_to(&tmp, me.uid(), me.gid()).expect("recursive chown walk reaches every entry");
+        let deep = std::fs::symlink_metadata(tmp.join("base").join("1").join("1259")).unwrap();
+        assert_eq!(
+            deep.uid(),
+            me.uid(),
+            "walk descended to the nested cluster file"
+        );
+        assert!(tmp.join("global").join("pg_filenode.map").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
