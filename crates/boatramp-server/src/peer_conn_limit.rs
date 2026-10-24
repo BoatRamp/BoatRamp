@@ -74,7 +74,15 @@ impl PeerConnLimiter {
 
     /// Testable core: admission decision at an explicit `now`.
     fn admit_at(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut map = self.buckets.lock().expect("peer-conn-limit mutex poisoned");
+        // Recover from a poisoned lock rather than panic (security-review INFO): the critical section
+        // is panic-free (float math + HashMap ops on trusted values), so poisoning is unreachable — but
+        // if it ever happened, a panic here would kill the listener's accept loop. The bucket map holds
+        // no cross-op invariant a mid-op panic could corrupt, so continuing with the recovered map is
+        // safe and strictly better than dropping the whole listener.
+        let mut map = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Bound the map: before tracking a NEW ip over the cap, drop idle (full) buckets. Dropping a
         // full bucket is lossless — a re-created one starts full too — so a flooding spray of fresh
         // IPs can never grow the map past `max_tracked` with meaningful state.
