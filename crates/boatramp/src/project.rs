@@ -118,9 +118,16 @@ enum ProjectCommand {
     Export {
         /// The project to export.
         name: String,
-        /// Write the bundle to this file.
-        #[arg(long)]
-        out: std::path::PathBuf,
+        /// Write the bundle to this file (the streamed default). Mutually exclusive with
+        /// `--resumable`; exactly one is required.
+        #[arg(long, required_unless_present = "resumable")]
+        out: Option<std::path::PathBuf>,
+        /// RESUMABLE export: write a member-object directory of this NAME on the NODE (under
+        /// the node's configured `[serve] resumable_export_dir` base) instead of streaming a
+        /// file — an interrupted run RESUMES instead of restarting. The directory is
+        /// node-local (that is what lets it resume); the name is relative and host-confined.
+        #[arg(long, value_name = "DIR_NAME", conflicts_with = "out")]
+        resumable: Option<String>,
         /// Export a FULL bundle (schema + data). Default: `--data-only` (app data only —
         /// no identity/RBAC/routing).
         #[arg(long)]
@@ -140,9 +147,19 @@ enum ProjectCommand {
     Import {
         /// The project to import into.
         name: String,
-        /// The bundle file to import.
-        #[arg(long = "in", value_name = "FILE")]
-        input: std::path::PathBuf,
+        /// The bundle file to import (the streamed default). Mutually exclusive with
+        /// `--resumable`; exactly one is required.
+        #[arg(
+            long = "in",
+            value_name = "FILE",
+            required_unless_present = "resumable"
+        )]
+        input: Option<std::path::PathBuf>,
+        /// RESUMABLE import: read a member-object directory of this NAME on the NODE (under
+        /// the node's configured `[serve] resumable_export_dir` base — the output of a
+        /// resumable export) instead of sending a file. Host-confined relative name.
+        #[arg(long, value_name = "DIR_NAME", conflicts_with = "input")]
+        resumable: Option<String>,
         /// Execute the import (default: a dry-run plan — mutate nothing).
         #[arg(long)]
         apply: bool,
@@ -716,6 +733,7 @@ pub async fn run(
         ProjectCommand::Export {
             name,
             out,
+            resumable,
             full,
             include_identity,
             transport_key_file,
@@ -731,18 +749,40 @@ pub async fn run(
             } else {
                 None
             };
-            cp.project_export(&name, data_only, include_identity, transport_key, &out)
+            if let Some(dir_name) = resumable {
+                // RESUMABLE: the bundle is written to a node-local directory (resuming an
+                // interrupted run); nothing streams back to the client.
+                cp.project_export_resumable(
+                    &name,
+                    data_only,
+                    include_identity,
+                    transport_key,
+                    &dir_name,
+                )
                 .await?;
-            Ok(ProjectOutput::Exported {
-                project: name,
-                data_only,
-                include_identity,
-                out: out.display().to_string(),
-            })
+                Ok(ProjectOutput::Exported {
+                    project: name,
+                    data_only,
+                    include_identity,
+                    out: format!("(resumable node dir: {dir_name})"),
+                })
+            } else {
+                // clap's `required_unless_present = "resumable"` guarantees `out` here.
+                let out = out.expect("clap requires --out unless --resumable");
+                cp.project_export(&name, data_only, include_identity, transport_key, &out)
+                    .await?;
+                Ok(ProjectOutput::Exported {
+                    project: name,
+                    data_only,
+                    include_identity,
+                    out: out.display().to_string(),
+                })
+            }
         }
         ProjectCommand::Import {
             name,
             input,
+            resumable,
             apply,
             force,
             allow_schema_skew,
@@ -758,8 +798,22 @@ pub async fn run(
             } else {
                 None
             };
-            let report = cp
-                .project_import(
+            let report = if let Some(dir_name) = resumable {
+                // RESUMABLE: read the member-object directory on the node (no body sent).
+                cp.project_import_resumable(
+                    &name,
+                    &dir_name,
+                    apply,
+                    force,
+                    allow_schema_skew,
+                    overwrite,
+                    &identity,
+                    transport_key,
+                )
+                .await?
+            } else {
+                let input = input.expect("clap requires --in unless --resumable");
+                cp.project_import(
                     &name,
                     &input,
                     apply,
@@ -769,7 +823,8 @@ pub async fn run(
                     &identity,
                     transport_key,
                 )
-                .await?;
+                .await?
+            };
             Ok(ProjectOutput::Imported {
                 project: name,
                 applied: apply,

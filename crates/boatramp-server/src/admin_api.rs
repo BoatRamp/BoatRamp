@@ -2736,6 +2736,13 @@ pub(super) struct ProjectExportQuery {
     /// Default off — the safe, identity-free bundle.
     #[serde(default)]
     include_identity: bool,
+    /// RESUMABLE mode (T3): a relative directory NAME under the node's configured
+    /// `[serve] resumable_export_dir` base. When set, the export writes a resumable
+    /// member-object directory on the NODE (resuming an interrupted run) instead of
+    /// streaming the bundle in the response body. The host confines the name under the base
+    /// and refuses any escape / when no base is configured.
+    #[serde(default)]
+    resumable: Option<String>,
 }
 
 fn default_data_only() -> bool {
@@ -2753,6 +2760,25 @@ fn transport_key_from_headers(headers: &HeaderMap) -> Option<Vec<u8>> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.as_bytes().to_vec())
         .filter(|b| !b.is_empty())
+}
+
+/// Map a resumable export/import failure to an HTTP response. The resumable path's errors
+/// are predominantly caller-facing (the feature isn't enabled on this node, the directory
+/// name is refused by the host's confinement, or the directory doesn't exist), so an
+/// `Other` maps to `400` with its (already-redacted) message rather than a `500`; the typed
+/// import variants keep their existing codes.
+fn resumable_error_response(e: boatramp_core::project_export::ProjectExportError) -> Response {
+    use boatramp_core::project_export::ProjectExportError as E;
+    match e {
+        E::Unavailable(m) => (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response(),
+        E::SchemaSkew(dbs) => (
+            StatusCode::CONFLICT,
+            format!("schema skew on: {}\n", dbs.join(", ")),
+        )
+            .into_response(),
+        E::Commingle(m) => (StatusCode::CONFLICT, format!("{m}\n")).into_response(),
+        E::Other(m) => (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
+    }
 }
 
 /// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`System·Admin`).
@@ -2800,6 +2826,27 @@ pub(super) async fn project_export(
         include_identity: q.include_identity,
         transport_key,
     };
+    // RESUMABLE mode (T3): write a node-local member-object directory (resuming an
+    // interrupted run) and return a status, instead of streaming the bundle. The host
+    // confines the operator-named dir under the configured base (refusing an escape or when
+    // no base is set), so the capability resolves the path — the handler just passes the name.
+    if let Some(dir_name) = q.resumable.as_deref() {
+        return match cap
+            .export_resumable(&q.project, &export_opts, dir_name)
+            .await
+        {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "project": q.project,
+                    "resumable_dir": dir_name,
+                    "status": "complete",
+                })),
+            )
+                .into_response(),
+            Err(e) => resumable_error_response(e),
+        };
+    }
     // Stream the bundle straight to the response body: the driver writes the `BRPROJ` tar
     // into the write half of an in-memory pipe (bounded) as it produces each member, and the
     // response body drains the read half — so the node's transient on-disk staging stays
@@ -2868,6 +2915,11 @@ pub(super) struct ProjectImportQuery {
     /// transport-key header).
     #[serde(default = "default_identity")]
     identity: String,
+    /// RESUMABLE mode (T3): a relative directory NAME under the node's configured
+    /// `[serve] resumable_export_dir` base to import from (the output of a resumable
+    /// export), instead of a streamed request body. Host-confined under the base.
+    #[serde(default)]
+    resumable: Option<String>,
 }
 
 fn default_identity() -> String {
@@ -2947,6 +2999,15 @@ pub(super) async fn project_import(
         overwrite: q.overwrite,
         identity,
     };
+    // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
+    // resumable export) named relative to the configured base — no request body. The host
+    // confines the operator-named dir under the base (refusing an escape / when unset).
+    if let Some(dir_name) = q.resumable.as_deref() {
+        return match cap.import_resumable(&q.project, dir_name, opts).await {
+            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+            Err(e) => resumable_error_response(e),
+        };
+    }
     // Stream the request body straight into the driver — no stage-to-temp: the node never
     // holds the whole bundle (peak staging is bounded to the largest single member), and the
     // bundle is restored in a single forward pass. `into_async_read` adapts axum's body

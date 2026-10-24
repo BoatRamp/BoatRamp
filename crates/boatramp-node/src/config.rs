@@ -2138,6 +2138,13 @@ pub struct ServeConfig {
     pub addr: Option<SocketAddr>,
     /// Data directory for filesystem backends.
     pub data_dir: Option<PathBuf>,
+    /// Base directory for **resumable** project export/import (T3). When set, `boatramp
+    /// project export --resumable <name>` / `import --resumable <name>` write/read a
+    /// member-object directory `<resumable_export_dir>/<name>` on the NODE (the node-local
+    /// dir is what lets an interrupted export resume instead of restart). The operator
+    /// passes only the relative `<name>`; the host confines it under this base and refuses
+    /// any escape. `None` (the default) ⇒ the resumable surface is DISABLED, fail-closed.
+    pub resumable_export_dir: Option<PathBuf>,
     /// Blob object-store backend (`fs`/`s3`/`gcs`/`azure`) — the config-level analog of the
     /// `--blobs` flag. Absent ⇒ the flag/env decides (`--blobs`/`BOATRAMP_BLOBS`, default `fs`).
     /// The flag/env still wins over this (uniform `serve` precedence). Read primarily by `boatramp

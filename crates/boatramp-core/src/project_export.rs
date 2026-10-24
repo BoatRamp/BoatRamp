@@ -391,6 +391,40 @@ pub trait ProjectExport: Send + Sync {
         src: &mut (dyn AsyncRead + Send + Unpin),
         opts: ImportOptions,
     ) -> Result<ImportReport, ProjectExportError>;
+
+    /// Resumable export of `project` into a member-object directory named by the operator
+    /// relative to the node's configured resumable base (NOT a client path — the directory
+    /// is node-local, which is what lets an interrupted export resume instead of restart).
+    /// `dir_name` is a single relative name under that base; the impl confines it and
+    /// REFUSES when no base is configured or the name escapes the base (fail-closed). On
+    /// re-run it skips members already written + SHA-valid. Unlike [`export`], this does not
+    /// stream to a sink — it writes the dir and returns on completion. Default impl refuses
+    /// (a node without the resumable capability).
+    async fn export_resumable(
+        &self,
+        _project: &str,
+        _opts: &ExportOptions,
+        _dir_name: &str,
+    ) -> Result<(), ProjectExportError> {
+        Err(ProjectExportError::Other(
+            "resumable export is not available on this node".into(),
+        ))
+    }
+
+    /// Import a resumable member-object directory (the output of [`export_resumable`]) named
+    /// by the operator relative to the node's configured resumable base. Confined + refused
+    /// identically to [`export_resumable`]. Restores members in the MANIFEST's authoritative
+    /// order. Default impl refuses.
+    async fn import_resumable(
+        &self,
+        _project: &str,
+        _dir_name: &str,
+        _opts: ImportOptions,
+    ) -> Result<ImportReport, ProjectExportError> {
+        Err(ProjectExportError::Other(
+            "resumable import is not available on this node".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

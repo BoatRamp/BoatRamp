@@ -975,6 +975,105 @@ impl ControlPlane {
         }
     }
 
+    /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `System·Admin`):
+    /// the node writes a member-object directory of `dir_name` (under its configured base,
+    /// resuming an interrupted run) — nothing streams back, so no local file is written.
+    pub async fn project_export_resumable(
+        &self,
+        project: &str,
+        data_only: bool,
+        include_identity: bool,
+        transport_key: Option<Vec<u8>>,
+        dir_name: &str,
+    ) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let mut req = client.post(format!("{server}/api/project-export")).query(&[
+            ("project", project),
+            ("data_only", if data_only { "true" } else { "false" }),
+            (
+                "include_identity",
+                if include_identity { "true" } else { "false" },
+            ),
+            ("resumable", dir_name),
+        ]);
+        if let Some(key) = &transport_key {
+            let value = std::str::from_utf8(key).map_err(|_| {
+                ClientError::Refused(
+                    "transport key must be valid UTF-8 for the request header".into(),
+                )
+            })?;
+            req = req.header("x-boatramp-transport-key", value);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(ClientError::Refused(format!(
+                "resumable project export refused ({status}): {}",
+                text.trim_end()
+            )))
+        }
+    }
+
+    /// RESUMABLE import (`POST /api/project-import?resumable=<dir_name>`, `System·Admin`):
+    /// the node reads a member-object directory of `dir_name` (under its configured base) —
+    /// no request body. Returns the server's report text (JSON), like [`project_import`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn project_import_resumable(
+        &self,
+        project: &str,
+        dir_name: &str,
+        apply: bool,
+        force: bool,
+        allow_schema_skew: bool,
+        overwrite: bool,
+        identity: &str,
+        transport_key: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let mut req = client.post(format!("{server}/api/project-import")).query(&[
+            ("project", project),
+            ("apply", if apply { "true" } else { "false" }),
+            ("force", if force { "true" } else { "false" }),
+            (
+                "allow_schema_skew",
+                if allow_schema_skew { "true" } else { "false" },
+            ),
+            ("overwrite", if overwrite { "true" } else { "false" }),
+            ("identity", identity),
+            ("resumable", dir_name),
+        ]);
+        if let Some(key) = &transport_key {
+            let value = std::str::from_utf8(key).map_err(|_| {
+                ClientError::Refused(
+                    "transport key must be valid UTF-8 for the request header".into(),
+                )
+            })?;
+            req = req.header("x-boatramp-transport-key", value);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(ClientError::Refused(format!(
+                "resumable project import refused ({status}): {}",
+                text.trim_end()
+            )))
+        }
+    }
+
     /// Trigger a schema-migration `verb` (`apply` / `dry-run` / `baseline`) over an
     /// already-uploaded step-set bundle (`POST /api/{seg}/migrate/{db}/{verb}`;
     /// `Project·Admin`). A step failure comes back as `422` whose body is still a valid

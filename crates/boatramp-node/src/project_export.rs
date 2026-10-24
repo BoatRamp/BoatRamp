@@ -467,6 +467,12 @@ pub struct NodeProjectExport {
     /// EXTENSION IF NOT EXISTS <ext>` (e.g. pgvector) in an untrusted dump no-ops. A dump naming an
     /// extension NOT on this list fails fail-closed under the non-superuser apply.
     trusted_extensions: Vec<String>,
+    /// The configured base directory under which operator-named resumable export/import
+    /// directories live (`[serve] resumable_export_dir`). `None` ⇒ the resumable surface is
+    /// DISABLED and every resumable call is refused fail-closed. An operator passes only a
+    /// relative name under this base; the host confines it (no escape) — the caller never
+    /// supplies an absolute node path.
+    resumable_base: Option<PathBuf>,
 }
 
 impl NodeProjectExport {
@@ -500,6 +506,7 @@ impl NodeProjectExport {
             import_member_cap: DEFAULT_IMPORT_MEMBER_CAP,
             import_total_cap: DEFAULT_IMPORT_TOTAL_CAP,
             trusted_extensions: Vec::new(),
+            resumable_base: None,
         }
     }
 
@@ -607,6 +614,90 @@ impl NodeProjectExport {
     pub fn with_libsql(mut self, libsql: Arc<LibsqlSqlBackends>) -> Self {
         self.libsql = Some(libsql);
         self
+    }
+
+    /// Set the base directory under which operator-named resumable export/import dirs live
+    /// (`[serve] resumable_export_dir`). `None`/not-called ⇒ the resumable surface stays
+    /// DISABLED (every resumable call refuses, fail-closed). The operator names only a
+    /// relative subdir under this base; [`resolve_resumable_dir`](Self::resolve_resumable_dir)
+    /// confines it.
+    #[must_use]
+    pub fn with_resumable_base(mut self, base: Option<PathBuf>) -> Self {
+        self.resumable_base = base;
+        self
+    }
+
+    /// Confine an operator-supplied resumable directory NAME to a path under the configured
+    /// [`resumable_base`](Self::resumable_base). The load-bearing control for the resumable
+    /// surface: the name reaches the node from an API caller, so an unconfined path would be
+    /// arbitrary node read/write. Fail-closed:
+    /// - no base configured ⇒ refuse (the surface is disabled);
+    /// - empty, absolute, or any non-`Normal` component (`..`, `.`, root/prefix) ⇒ refuse
+    ///   (kills lexical traversal + absolute escape);
+    /// - after join, canonicalize + assert the result stays under the canonical base ⇒ this
+    ///   catches a SYMLINK escape (a symlink in the path resolves out and fails `starts_with`).
+    ///
+    /// `create` ⇒ create the base + the target dir (export); otherwise the target must exist
+    /// (import). Returns the confined, canonicalized absolute path.
+    pub(crate) async fn resolve_resumable_dir(
+        &self,
+        dir_name: &str,
+        create: bool,
+    ) -> Result<PathBuf, Perr> {
+        use std::path::Component;
+        let base = self.resumable_base.as_ref().ok_or_else(|| {
+            Perr::Other(
+                "resumable export/import is not enabled on this node; set \
+                 `[serve] resumable_export_dir` to a base directory"
+                    .into(),
+            )
+        })?;
+        if dir_name.is_empty() {
+            return Err(Perr::Other("resumable directory name is required".into()));
+        }
+        let rel = Path::new(dir_name);
+        if rel.is_absolute() {
+            return Err(Perr::Other(
+                "resumable directory must be a relative name under the configured base, \
+                 not an absolute path"
+                    .into(),
+            ));
+        }
+        for comp in rel.components() {
+            if !matches!(comp, Component::Normal(_)) {
+                return Err(Perr::Other(
+                    "resumable directory name must not contain `..`, `.`, or a root/prefix \
+                     component"
+                        .into(),
+                ));
+            }
+        }
+        // The base must exist to canonicalize it (create it on the export path).
+        if create {
+            tokio::fs::create_dir_all(base).await.map_err(other)?;
+        }
+        let canon_base = tokio::fs::canonicalize(base).await.map_err(|e| {
+            Perr::Other(format!(
+                "resumable base {} is not accessible: {e}",
+                base.display()
+            ))
+        })?;
+        let joined = canon_base.join(rel);
+        if create {
+            tokio::fs::create_dir_all(&joined).await.map_err(other)?;
+        } else if !tokio::fs::try_exists(&joined).await.map_err(other)? {
+            return Err(Perr::Other(format!(
+                "resumable directory {dir_name:?} does not exist under the configured base"
+            )));
+        }
+        // Canonicalize the target and REFUSE if it escaped the base (symlink guard).
+        let canon = tokio::fs::canonicalize(&joined).await.map_err(other)?;
+        if !canon.starts_with(&canon_base) {
+            return Err(Perr::Other(
+                "resumable directory escapes the configured base (symlink?)".into(),
+            ));
+        }
+        Ok(canon)
     }
 
     /// Attach the secrets-envelope projection so `--include-identity` can carry the project
@@ -2325,6 +2416,30 @@ impl ProjectExport for NodeProjectExport {
         let _ = tokio::fs::remove_dir_all(&session).await;
         Ok(report)
     }
+
+    async fn export_resumable(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        dir_name: &str,
+    ) -> Result<(), Perr> {
+        // Confine the operator-named subdir under the configured base (fail-closed if no
+        // base / on any escape), creating it, then run the core member-object export.
+        let dir = self.resolve_resumable_dir(dir_name, true).await?;
+        self.export_resumable_dir(project, opts, &dir).await
+    }
+
+    async fn import_resumable(
+        &self,
+        project: &str,
+        dir_name: &str,
+        opts: ImportOptions,
+    ) -> Result<ImportReport, Perr> {
+        // Confine the operator-named subdir under the configured base; it must already
+        // exist (read, not create), then run the core member-object import-as-chain.
+        let dir = self.resolve_resumable_dir(dir_name, false).await?;
+        self.import_resumable_dir(project, &dir, opts).await
+    }
 }
 
 impl NodeProjectExport {
@@ -3048,7 +3163,11 @@ impl NodeProjectExport {
     /// resume, reads — an authoritative `MANIFEST`, then one object per member, skipping any
     /// already present + SHA-valid. `dir` is on the NODE's filesystem (a persistent/mounted
     /// path), so a resume actually avoids re-producing the expensive members.
-    pub async fn export_resumable(
+    /// Core resumable export to an ALREADY-CONFINED absolute `dir` (the trait method
+    /// [`ProjectExport::export_resumable`] confines an operator-named subdir under the
+    /// configured base, then calls this). See the member-object layout + per-member resume
+    /// in the body.
+    pub async fn export_resumable_dir(
         &self,
         project: &str,
         opts: &ExportOptions,
@@ -3139,7 +3258,9 @@ impl NodeProjectExport {
     /// Import a resumable member-object directory (the output of [`export_resumable`]):
     /// restore members in the MANIFEST's authoritative order, reusing [`restore_member`]
     /// per member — identical per-member tenancy re-key/enforce as the streaming import.
-    pub async fn import_resumable(
+    /// Core resumable import from an ALREADY-CONFINED absolute `dir` (the trait method
+    /// [`ProjectExport::import_resumable`] confines the operator-named subdir first).
+    pub async fn import_resumable_dir(
         &self,
         project: &str,
         dir: &Path,
@@ -4883,5 +5004,68 @@ mod tests {
             !dir.join(member_object_name(3)).exists(),
             "no member object may be committed when the producer poisoned"
         );
+    }
+
+    /// The load-bearing security control for the resumable surface: an operator-named dir is
+    /// CONFINED under the configured base. No base ⇒ refused (surface disabled); `..` /
+    /// absolute ⇒ refused (traversal); a plain name ⇒ resolved under the base.
+    #[tokio::test]
+    async fn resumable_dir_is_confined_under_the_configured_base() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |base: Option<PathBuf>| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            NodeProjectExport::new(BTreeMap::new(), deploy, kv, blobs, tmp.path().join("work"))
+                .with_resumable_base(base)
+        };
+
+        // No base configured ⇒ the whole surface is refused (fail-closed).
+        assert!(
+            mk(None).resolve_resumable_dir("ok", true).await.is_err(),
+            "no configured base must refuse the resumable surface"
+        );
+
+        let base = tmp.path().join("exports");
+        let drv = mk(Some(base.clone()));
+
+        // A plain name resolves to a dir UNDER the canonical base.
+        let resolved = drv
+            .resolve_resumable_dir("snap1", true)
+            .await
+            .expect("a plain name is confined + created");
+        let canon_base = tokio::fs::canonicalize(&base).await.unwrap();
+        assert!(
+            resolved.starts_with(&canon_base),
+            "resolved {resolved:?} must be under the base {canon_base:?}"
+        );
+
+        // Traversal, absolute, and `.`-components are all refused (lexical + absolute escape).
+        for bad in ["../escape", "a/../../etc", "/etc/passwd", "", "./x"] {
+            assert!(
+                drv.resolve_resumable_dir(bad, true).await.is_err(),
+                "confinement must refuse {bad:?}"
+            );
+        }
+        // A symlink escaping the base is refused (canonicalize + starts_with guard).
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::create_dir_all(&canon_base).await.unwrap();
+        #[cfg(unix)]
+        {
+            let link = base.join("sneaky");
+            let _ = std::os::unix::fs::symlink(&outside, &link);
+            assert!(
+                drv.resolve_resumable_dir("sneaky", false).await.is_err(),
+                "a symlink escaping the base must be refused"
+            );
+        }
     }
 }

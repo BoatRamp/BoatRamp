@@ -911,7 +911,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             export_blobs,
             data_dir.join("project-export"),
         )
-        .with_trusted_extensions(trusted_extensions);
+        .with_trusted_extensions(trusted_extensions)
+        // T3: the configured base for resumable export/import dirs (None ⇒ surface disabled).
+        .with_resumable_base(
+            config
+                .serve
+                .as_ref()
+                .and_then(|s| s.resumable_export_dir.clone()),
+        );
         // Operator digest-pin / override for the ephemeral SQL-client images (the `pg_dump`/
         // `mysqldump`/`psql` one-shots), so a `pgvector/pgvector:pg16@sha256:<hex>` ref can be
         // supplied by env and accepted under the multi-tenant posture without rootfs staging. `None`
