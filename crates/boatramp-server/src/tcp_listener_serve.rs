@@ -264,9 +264,15 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 // -CIDR set, only a connection FROM the trusted proxy may have its header trusted —
                 // drop anything else (fail-closed), so a firewall gap can't become source-IP spoofing.
                 // (Empty set ⇒ firewall-only mode, permitted only with `proxy_protocol_trust_any`.)
+                // Compare the CANONICAL kernel-peer IP: on a dual-stack `[::]` listener an IPv4 proxy
+                // arrives as a v4-mapped `::ffff:a.b.c.d`, which would never match an IPv4 trusted CIDR
+                // (e.g. `10.0.0.0/8`) and would be dropped fail-closed; `to_canonical()` unwraps it so
+                // the operator's IPv4 CIDR matches (a genuine IPv6 peer is left as-is).
                 if proxy_protocol
                     && !proxy_trusted.is_empty()
-                    && !proxy_trusted.iter().any(|net| net.contains(&peer.ip()))
+                    && !proxy_trusted
+                        .iter()
+                        .any(|net| net.contains(&peer.ip().to_canonical()))
                 {
                     tracing::debug!(
                         listener = %name, %peer,

@@ -96,11 +96,19 @@ impl PeerConnLimiter {
         }
     }
 
-    /// The bucket key for `ip`: the IPv4 address in full, or an IPv6 address masked to `ipv6_prefix`.
+    /// The bucket key for `ip`: the IPv4 address in full, or a genuine IPv6 address masked to
+    /// `ipv6_prefix`. A **v4-mapped** IPv6 address (`::ffff:a.b.c.d`, how an IPv4 client arrives on a
+    /// dual-stack `[::]` listener when `bindv6only=0`) is unwrapped to its embedded IPv4 and keyed in
+    /// full FIRST — otherwise masking to the prefix would zero the v4 bits (they live in the low 32),
+    /// collapsing every IPv4 peer to one `::` bucket and defeating per-IPv4 rate limiting (one client
+    /// could then hold the shared bucket empty and lock out the whole IPv4 Internet for the listener).
     fn bucket_key(&self, ip: IpAddr) -> IpAddr {
         match ip {
             IpAddr::V4(_) => ip,
-            IpAddr::V6(v6) => IpAddr::V6(mask_v6(v6, self.ipv6_prefix)),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(mask_v6(v6, self.ipv6_prefix)),
+            },
         }
     }
 
@@ -270,5 +278,30 @@ mod tests {
             lim.admit_at(b, t0),
             "with a /128 prefix a different address has its own bucket"
         );
+    }
+
+    #[test]
+    fn v4_mapped_ipv6_peers_key_as_distinct_ipv4_not_a_collapsed_v6_bucket() {
+        // REGRESSION: on a dual-stack `[::]` listener (bindv6only=0) an IPv4 client arrives as a
+        // v4-mapped IPv6 `::ffff:a.b.c.d`, whose v4 bits live in the low 32. Masking to the /64 prefix
+        // would zero them and collapse EVERY IPv4 peer to one `::` bucket (defeating per-IPv4 limiting
+        // + letting one client lock out all IPv4). Each v4-mapped peer must key as its own /32.
+        let lim = PeerConnLimiter::new(1.0, 1, 1000, DEFAULT_CONN_RATE_IPV6_PREFIX);
+        let t0 = Instant::now();
+        let a: IpAddr = "::ffff:1.2.3.4".parse().unwrap();
+        let b: IpAddr = "::ffff:5.6.7.8".parse().unwrap();
+        assert!(lim.admit_at(a, t0));
+        assert!(
+            lim.admit_at(b, t0),
+            "a different v4-mapped peer must have its own bucket, not a collapsed `::`"
+        );
+        // The v4-mapped and bare forms of the SAME IPv4 are one bucket: a's burst is already spent.
+        let a_bare: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(
+            !lim.admit_at(a_bare, t0),
+            "the v4-mapped and bare forms of one IPv4 must share a single bucket"
+        );
+        // Two distinct IPv4 peers ⇒ two tracked keys, never one collapsed `::`.
+        assert_eq!(lim.tracked(), 2);
     }
 }
