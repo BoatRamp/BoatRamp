@@ -301,6 +301,10 @@ pub(crate) use function_runtime::{
 };
 #[cfg(feature = "handlers")]
 pub use migrate::{MigrateMode, run_migration};
+/// Per-source-IP connection-rate admission for host-owned listeners (cap-req 18): a token bucket
+/// per peer IP checked at the accept loop, so a FaaS listener guest (which can't see the peer IP)
+/// doesn't regress native-daemon brute-force protection.
+pub mod peer_conn_limit;
 /// SSE-out + POST-in serving of the duplex/resumable `session` capability
 /// (PLAN-session-primitive Stage 4): a `GET` opens the resumable outbound stream, a `POST` delivers
 /// an inbound frame that re-enters the guest `session-handler`.

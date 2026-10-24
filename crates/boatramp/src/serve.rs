@@ -3465,6 +3465,29 @@ fn spawn_listeners(
             // Session mode (cap-req 08): drive this listener's connections through the re-entrant
             // session model (no instance pinned between idle inbound batches).
             session_mode: matches!(l.mode, boatramp_node::config::ListenerMode::Session),
+            // Per-source-IP connection-rate admission (cap-req 18). Default ON (brute-force
+            // protection is not opt-in); an explicit `0` rate disables it.
+            peer_conn_limit: {
+                use boatramp_node::config::{
+                    DEFAULT_LISTENER_CONN_BURST_PER_IP, DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED,
+                    DEFAULT_LISTENER_CONN_RATE_PER_IP,
+                };
+                let rate = l
+                    .max_conns_per_ip_per_sec
+                    .unwrap_or(DEFAULT_LISTENER_CONN_RATE_PER_IP);
+                if rate > 0.0 {
+                    let burst = l
+                        .conn_burst_per_ip
+                        .unwrap_or(DEFAULT_LISTENER_CONN_BURST_PER_IP);
+                    Some(boatramp_server::peer_conn_limit::PeerConnLimiter::new(
+                        rate,
+                        burst,
+                        DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED,
+                    ))
+                } else {
+                    None
+                }
+            },
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),

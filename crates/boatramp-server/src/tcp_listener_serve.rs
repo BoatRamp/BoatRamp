@@ -70,6 +70,12 @@ pub struct ListenerParams {
     /// the orchestrator maps the config. TLS/STARTTLS composition is identical — it only decides how the
     /// `(read, write)` halves are produced.
     pub session_mode: bool,
+    /// Per-source-IP connection-rate admission (cap-req 18): `Some` ⇒ each accepted connection is
+    /// admitted through a per-peer-IP token bucket BEFORE any guest work, so a FaaS listener guest
+    /// (which can't see the peer IP) keeps native-daemon brute-force protection; over-rate
+    /// connections are closed cheaply. `None` ⇒ no per-IP limit (the `max_conns` live-cap still
+    /// applies). The orchestrator builds this from the listener config's rate/burst.
+    pub peer_conn_limit: Option<crate::peer_conn_limit::PeerConnLimiter>,
 }
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
@@ -96,6 +102,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         tls,
         starttls,
         session_mode,
+        peer_conn_limit,
     } = params;
 
     let listener = match TcpListener::bind(bind).await {
@@ -132,6 +139,9 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
     // Per-listener live-connection cap: a live connection holds one permit for its whole life; at the
     // ceiling a new connection is dropped (fail-closed backpressure) rather than unboundedly spawned.
     let conn_gate = Arc::new(Semaphore::new(max_conns));
+    // Per-source-IP connection-rate admission (cap-req 18); `None` ⇒ no per-IP limit. Checked in the
+    // accept loop below (single task, so a plain flag throttles the refusal log without a lock).
+    let mut rate_limit_warned = false;
     // Shared, read-only per-connection inputs (cloned cheaply into each spawned task).
     let project = Arc::new(project);
     let site = Arc::new(site);
@@ -154,6 +164,30 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 // Nagle off: a request/response protocol over this stream shouldn't coalesce small
                 // writes behind the delayed-ack timer. Best-effort.
                 let _ = stream.set_nodelay(true);
+                // cap-req 18: per-source-IP connection-rate admission BEFORE any guest work. A peer
+                // over its token-bucket rate is refused + closed cheaply (restoring brute-force
+                // protection a FaaS listener guest can't do itself — it never sees the peer IP). The
+                // FIRST refusal on this listener logs at warn (an operator signal); the rest at debug,
+                // so a flood can't spam the log.
+                if let Some(limiter) = &peer_conn_limit
+                    && !limiter.admit(peer.ip())
+                {
+                    if !rate_limit_warned {
+                        rate_limit_warned = true;
+                        tracing::warn!(
+                            listener = %name, %peer,
+                            "inbound-TCP connection refused by per-source-IP rate limit (cap-req 18); \
+                             further refusals on this listener log at debug"
+                        );
+                    } else {
+                        tracing::debug!(
+                            listener = %name, %peer,
+                            "inbound-TCP connection refused by per-source-IP rate limit"
+                        );
+                    }
+                    drop(stream);
+                    continue;
+                }
                 let Ok(permit) = Arc::clone(&conn_gate).try_acquire_owned() else {
                     tracing::warn!(
                         listener = %name, %peer, max_conns,

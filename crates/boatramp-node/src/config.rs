@@ -2422,6 +2422,19 @@ pub struct ListenerConfig {
     /// Absolute cap (milliseconds) on a single connection's lifetime regardless of activity. `0` is
     /// refused; absent ⇒ [`DEFAULT_LISTENER_MAX_CONN_DURATION_MS`].
     pub max_conn_duration_ms: Option<u64>,
+    /// Per-source-IP connection-rate limit (cap-req 18): the sustained rate (connections/sec) one
+    /// peer IP may open on THIS listener, atop a `conn_burst_per_ip` immediate allowance. A FaaS
+    /// listener guest can't see the peer IP, so the HOST enforces this at the accept loop to keep
+    /// native-daemon brute-force protection (a client otherwise resets its auth-backoff by
+    /// reconnecting). Absent ⇒ ON at [`DEFAULT_LISTENER_CONN_RATE_PER_IP`] (protection is NOT
+    /// opt-in); `0` ⇒ DISABLED (no per-IP limit; the `max_conns` live-cap still applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_conns_per_ip_per_sec: Option<f64>,
+    /// Immediate per-source-IP connection allowance (the token-bucket burst depth) before the
+    /// sustained `max_conns_per_ip_per_sec` throttles. Absent ⇒ [`DEFAULT_LISTENER_CONN_BURST_PER_IP`].
+    /// Ignored when the rate is `0` (limit disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_burst_per_ip: Option<u32>,
     /// How the accepted connection is driven (cap-req 08). [`ListenerMode::Connection`] (default) is the
     /// long-lived model: the guest's `tcp-connection-handler` holds the connection — and ONE wasm
     /// instance — for the connection's whole life. [`ListenerMode::Session`] drives the connection
@@ -2529,6 +2542,22 @@ pub const DEFAULT_LISTENER_IDLE_TIMEOUT_MS: u64 = 60_000;
 /// 1h. Bounds a single connection's lifetime regardless of activity (CPU is wall-clock-bounded here,
 /// since the conn lane disables the per-invocation CPU-fuel budget).
 pub const DEFAULT_LISTENER_MAX_CONN_DURATION_MS: u64 = 3_600_000;
+
+/// Default per-source-IP sustained connection rate (connections/sec) for a listener (cap-req 18),
+/// when `max_conns_per_ip_per_sec` is unset — ON by default so a FaaS listener's brute-force
+/// protection is not opt-in. Generous enough never to throttle a legitimate interactive or
+/// behind-NAT client, low enough to blunt a credential-stuffing reconnect flood; set
+/// `max_conns_per_ip_per_sec = 0` on a listener to disable.
+pub const DEFAULT_LISTENER_CONN_RATE_PER_IP: f64 = 30.0;
+
+/// Default per-source-IP connection burst (token-bucket depth) for a listener (cap-req 18) — the
+/// immediate allowance before [`DEFAULT_LISTENER_CONN_RATE_PER_IP`] throttles.
+pub const DEFAULT_LISTENER_CONN_BURST_PER_IP: u32 = 60;
+
+/// Hard cap on simultaneously-tracked peer IPs in a listener's per-IP rate limiter (cap-req 18) —
+/// bounds the limiter's memory against an IP-spray DoS (idle/full buckets are evicted to stay
+/// within it; dropping a full bucket is lossless).
+pub const DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED: usize = 100_000;
 
 /// `[serve.s3_credential]` — a **node-level base S3 credential source** (#505) sourcing the base AWS
 /// credential from boatramp's `[secrets]` sealed store rather than the ambient env chain. Consumed by
