@@ -851,6 +851,10 @@ async fn operator_sql_targets_the_tenant_not_default() {
 
     let backend = Arc::new(FakeComputeBackend::new(authority));
     let reg = registry(backend);
+    // Two reconcile ticks: the first LAUNCHES acme's `pg-<ident>` (readiness `Starting`), the
+    // second advances the healthy, un-managed replica to `Provisioned` (the readiness lifecycle,
+    // v0.45.0 A2) — which the `Provisioned`-gated routing resolver below requires.
+    reconcile(&deploy, &reg).await;
     reconcile(&deploy, &reg).await;
 
     let acme_wl = tenant_workload_name("acme");
@@ -949,6 +953,10 @@ async fn compute_upstream_resolves_per_project() {
         "both `api`s launch: {:?}",
         report.errors
     );
+    // Second tick: the first pass LAUNCHES (readiness `Starting`); the readiness lifecycle
+    // (v0.45.0 A2) advances a healthy, un-managed replica to `Provisioned` on the next
+    // reconcile, which is what the `Provisioned`-gated routing resolver below requires.
+    reconcile(&deploy, &reg).await;
 
     let acme_ip = backend.ip_of("acme", "api", 0).unwrap();
     let default_ip = backend.ip_of("default", "api", 0).unwrap();
