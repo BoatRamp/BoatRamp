@@ -173,6 +173,14 @@ pub struct Bindings {
     /// only when the node posture `allow_guest_tcp_egress` is on; even then the gate is
     /// connect-only and SSRF-floored. Never guest-supplied — host config on the deploy record.
     egress_allowlist: Arc<[String]>,
+    /// HOST-MEDIATED egress only (mailroom cap-req #19): when set, a non-empty `egress_allowlist`
+    /// feeds ONLY the host-mediated `tcp-egress` binding (the host dials + terminates TLS), and
+    /// `new_store` does NOT install the permissive GUEST `socket_addr_check` — so the guest's own
+    /// `wasi:sockets` stays deny-all. Set for host-owned listener invocations (a `tcp-connection-host`
+    /// / session-socket guest may reach out through `tcp-egress` but NEVER holds a raw socket). Left
+    /// `false` on the request / HTTP-session / consumer lanes, where a non-empty allowlist DOES install
+    /// the gated guest socket check as before.
+    host_mediated_egress_only: bool,
 }
 
 impl Bindings {
@@ -346,6 +354,23 @@ impl Bindings {
     /// gated `wasi:sockets` allowlist was attached for a given import/grant shape.
     pub fn egress_allowlist(&self) -> Arc<[String]> {
         self.egress_allowlist.clone()
+    }
+
+    /// Whether this invocation is HOST-MEDIATED-egress-only (mailroom cap-req #19): a non-empty
+    /// `egress_allowlist` feeds ONLY the host-mediated `tcp-egress` binding and `new_store` installs
+    /// NO permissive guest `socket_addr_check`, so the guest's own `wasi:sockets` stays deny-all. Set
+    /// for host-owned listener invocations. Read by the engine's `new_store` + the conn-lane guards.
+    pub fn host_mediated_egress_only(&self) -> bool {
+        self.host_mediated_egress_only
+    }
+
+    /// Mark this invocation HOST-MEDIATED-egress-only (mailroom cap-req #19) — see
+    /// [`host_mediated_egress_only`](Self::host_mediated_egress_only). The host-owned listener
+    /// dispatch chains this so a listener guest may reach out through `tcp-egress` while its raw
+    /// `wasi:sockets` stays denied.
+    pub fn with_host_mediated_egress(mut self) -> Self {
+        self.host_mediated_egress_only = true;
+        self
     }
 
     /// The granted SQL databases (`name -> backend`).

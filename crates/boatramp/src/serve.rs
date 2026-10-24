@@ -3437,9 +3437,11 @@ fn spawn_listeners(
             imports: l.imports.clone(),
             env: l.env.clone(),
             tenancy: l.tenancy.clone(),
-            // Phase-1 invariant: NO per-listener outbound egress (a tcp-connection-host guest can't
-            // hold wasi:sockets); `validate_listeners` already refuses a non-empty allowlist.
-            egress_allowlist: Vec::new(),
+            // cap-req 19: per-listener outbound egress via the HOST-MEDIATED `tcp-egress` binding
+            // (gated by the egress posture + SSRF floor). The listener dispatch marks its bindings
+            // `host_mediated_egress_only`, so this allowlist drives ONLY the host-terminated dial —
+            // the listener guest never holds raw `wasi:sockets`.
+            egress_allowlist: l.egress_allowlist.clone(),
             ..Default::default()
         };
         let params = boatramp_server::tcp_listener_serve::ListenerParams {

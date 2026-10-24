@@ -1253,18 +1253,21 @@ fn conn_lane_grants_socket_authority() -> bool {
 }
 
 /// The REAL no-raw-sockets invariant (PLAN-handler-tcp-inbound security-review MEDIUM): a conn-lane
-/// dispatch's [`Bindings`] MUST carry an EMPTY outbound-TCP `egress_allowlist`. This is the exact
-/// precondition [`HandlerEngine::new_store`] checks before it would install a permissive
-/// `socket_addr_check` (`self.allow_tcp_egress && !egress_allowlist.is_empty()`), so an empty
-/// allowlist means the socket host's deny-all default stands for this lane — the guest's only network
-/// surface is the handed `wasi:io` streams. [`HandlerEngine::dispatch_tcp_connection`] CALLS this on
-/// the received bindings and fails CLOSED when it is violated (tested == enforced — the gate drives
-/// the SAME predicate, and the `add_socket_authority` mutation injects a non-empty allowlist into the
-/// gate's bindings so this returns `false` ⇒ the gate goes RED). Pure (no mutation seam itself) — the
-/// property is a fact of the bindings, not a flag.
+/// dispatch MUST NOT cause [`HandlerEngine::new_store`] to install a permissive GUEST
+/// `socket_addr_check`. new_store installs it only when
+/// `self.allow_tcp_egress && !egress_allowlist.is_empty() && !host_mediated_egress_only`, so the
+/// guest's raw sockets stay deny-all (its only network surface being the handed `wasi:io` streams)
+/// iff the bindings carry an EMPTY allowlist OR are HOST-MEDIATED-egress-only. The latter is the
+/// cap-req 19 case: a listener guest MAY carry a non-empty allowlist to drive the host-mediated
+/// `tcp-egress` dial (the host dials + terminates TLS — the guest never touches a socket), and
+/// because `host_mediated_egress_only` is set, new_store still installs NO guest socket check. Both
+/// dispatches CALL this on the received bindings and fail CLOSED when it is violated (tested ==
+/// enforced — the gate drives the SAME predicate, and the `add_socket_authority` mutation injects a
+/// non-empty allowlist WITHOUT the host-mediated flag so this returns `false` ⇒ the gate goes RED).
+/// Pure (no mutation seam itself) — the property is a fact of the bindings, not a flag.
 #[cfg(feature = "tcp-listener")]
 fn conn_lane_sockets_denied(bindings: &Bindings) -> bool {
-    bindings.egress_allowlist().is_empty()
+    bindings.egress_allowlist().is_empty() || bindings.host_mediated_egress_only()
 }
 
 /// The active TCP-listener gate mutation (PLAN-handler-tcp-inbound anti-hollow gate), or `None`.
@@ -2711,7 +2714,9 @@ impl HandlerEngine {
         // MEDIUM-1 — the session path must carry the same fail-closed backstop, so a future per-listener
         // egress or a bind-site regression can't silently serve under a disabled posture or grant the
         // guest socket authority). GATE 1: posture + operator-declared. GATE 2: never raw-socket
-        // authority. GATE 3: the bindings carry no outbound-TCP egress allowlist.
+        // authority. GATE 3: no RAW (non-host-mediated) outbound-TCP egress allowlist — cap-req 19
+        // lets a listener carry a host-mediated `tcp-egress` allowlist, which does NOT install a guest
+        // socket check.
         if !tcp_listener_dispatch_decision(self.allow_tcp_listener, listener_declared) {
             return Err(HandlerError::Internal(
                 "session listener dispatch refused (posture `allow_guest_tcp_listener` is off, or the \
@@ -2728,8 +2733,8 @@ impl HandlerEngine {
         }
         if !conn_lane_sockets_denied(&bindings) {
             return Err(HandlerError::Internal(
-                "session listener bindings carry an outbound-TCP egress allowlist — refusing (would \
-                 grant the guest wasi:sockets connect authority)"
+                "session listener bindings carry a non-host-mediated outbound-TCP egress allowlist — \
+                 refusing (would grant the guest raw wasi:sockets connect authority)"
                     .into(),
             ));
         }
@@ -2895,15 +2900,16 @@ impl HandlerEngine {
                     .into(),
             ));
         }
-        // REAL no-raw-sockets invariant (security-review MEDIUM): the received bindings MUST carry no
-        // outbound-TCP egress allowlist — the exact precondition `new_store` checks before it would
-        // install a permissive `socket_addr_check`. Empty ⇒ the socket host's deny-all default stands.
-        // Fail CLOSED if a conn-lane dispatch ever carried one (the serve layer always passes an empty
-        // allowlist; this guards a future refactor from silently handing the guest connect authority).
+        // REAL no-raw-sockets invariant (security-review MEDIUM; cap-req 19): the received bindings
+        // must not cause `new_store` to install a permissive GUEST `socket_addr_check` — i.e. the
+        // allowlist is EMPTY, or the invocation is HOST-MEDIATED-egress-only (a non-empty allowlist
+        // that feeds ONLY the host-mediated `tcp-egress` dial, never the guest's own `wasi:sockets`).
+        // Fail CLOSED if a conn-lane dispatch ever carried a RAW (non-host-mediated) allowlist (a
+        // future-refactor guard against silently handing the guest connect authority).
         if !conn_lane_sockets_denied(&bindings) {
             return Err(HandlerError::Internal(
-                "inbound TCP connection lane bindings carry an outbound-TCP egress allowlist — \
-                 refusing (would grant the guest wasi:sockets connect authority)"
+                "inbound TCP connection lane bindings carry a non-host-mediated outbound-TCP egress \
+                 allowlist — refusing (would grant the guest raw wasi:sockets connect authority)"
                     .into(),
             ));
         }
@@ -3221,8 +3227,15 @@ impl HandlerEngine {
         // capability can't be an SSRF bypass to the metadata endpoint / private ranges. UDP is also
         // blanket-disabled and `ip-name-lookup` is enabled only here (gated to the posture) so a guest
         // can resolve an allowlisted domain before connecting.
+        // cap-req 19: a HOST-MEDIATED-egress-only invocation (a host-owned listener guest) may carry a
+        // non-empty allowlist to drive the `tcp-egress` binding (host dials + terminates TLS), but its
+        // raw `wasi:sockets` must STAY deny-all — so skip the permissive GUEST socket check entirely for
+        // it. `TcpEgressHost` reads the allowlist independently, so host-mediated egress still works.
         let egress_allowlist = bindings.egress_allowlist();
-        if self.allow_tcp_egress && !egress_allowlist.is_empty() {
+        if self.allow_tcp_egress
+            && !egress_allowlist.is_empty()
+            && !bindings.host_mediated_egress_only()
+        {
             let allow_private = self.allow_private_egress;
             let posture_tcp_egress = self.allow_tcp_egress;
             let allowlist = egress_allowlist;
@@ -4056,6 +4069,17 @@ mod tests {
                 &Bindings::default().with_egress_allowlist(vec!["93.184.216.34:443".to_string()])
             ),
             "bindings carrying an egress allowlist must be flagged (they WOULD grant connect authority)"
+        );
+        // (d') cap-req 19: the SAME non-empty allowlist, marked HOST-MEDIATED-egress-only, is NOT a
+        // breach — it feeds only the host-mediated `tcp-egress` dial, so `new_store` installs no guest
+        // socket check and the guest's raw `wasi:sockets` stays deny-all.
+        assert!(
+            conn_lane_sockets_denied(
+                &Bindings::default()
+                    .with_egress_allowlist(vec!["93.184.216.34:443".to_string()])
+                    .with_host_mediated_egress()
+            ),
+            "a host-mediated-egress-only allowlist must NOT grant the guest raw sockets (cap-req 19)"
         );
         // (e) The defense-in-depth constant guard is off in a shipped build.
         assert!(

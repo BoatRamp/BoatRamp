@@ -126,11 +126,11 @@ pub enum ConfigError {
         cure: &'static str,
     },
     /// A `[serve.listeners.<name>]` (host-owned inbound-TCP listener, PLAN-handler-tcp-inbound) is
-    /// invalid: a blank `component`, a non-positive `max_conns`/timeout, a declared-but-unsupported
-    /// `tls` block (Phase 1 is plaintext-only), or a non-empty `egress_allowlist` (a
-    /// `tcp-connection-host` guest imports only `wasi:io` — it cannot hold `wasi:sockets`). Refused at
-    /// config load (fail-closed, boot-LOUD) rather than binding a listener that would silently
-    /// mislead the operator.
+    /// invalid: a blank `component`, a non-positive `max_conns`/timeout, or a declared `tls` block
+    /// missing its `cert_file`/`key_file` (or a malformed STARTTLS grammar). Refused at config load
+    /// (fail-closed, boot-LOUD) rather than binding a listener that would silently mislead the
+    /// operator. (Host-side TLS/STARTTLS and a host-mediated `tcp-egress` `egress_allowlist` are
+    /// supported — cap-req 06 / 19.)
     #[error("inbound TCP listener {name:?}: {reason}{cure}")]
     InvalidListener {
         /// The offending listener key (the `listeners` map key).
@@ -563,14 +563,15 @@ impl ServerConfig {
     }
 
     /// Validate every configured `[serve.listeners.<name>]` (PLAN-handler-tcp-inbound), fail-closed +
-    /// boot-LOUD on the fully merged (file + env) map. A host-owned inbound-TCP listener is a new,
-    /// unproven surface, so a half-declared or Phase-1-unsupported one REFUSES the node rather than
-    /// binding something that would silently mislead the operator:
+    /// boot-LOUD on the fully merged (file + env) map. A host-owned inbound-TCP listener is a
+    /// security-sensitive surface, so a half-declared one REFUSES the node rather than binding
+    /// something that would silently mislead the operator:
     /// - a blank `bind` / `component` / `project` / `site` (all required),
     /// - a `max_conns` / `idle_timeout_ms` / `max_conn_duration_ms` explicitly set to `0`,
-    /// - a declared `tls` block (Phase 1 is plaintext-only — deferred fast-follow),
-    /// - a non-empty `egress_allowlist` (a `tcp-connection-host` guest imports only `wasi:io`; it
-    ///   cannot hold `wasi:sockets`, so per-listener outbound egress is a deferred follow-up).
+    /// - a declared `tls` block missing its `cert_file`/`key_file`, or a malformed STARTTLS grammar.
+    ///
+    /// Host-side per-listener TLS/STARTTLS (cap-req 06) and a host-mediated `tcp-egress`
+    /// `egress_allowlist` (cap-req 19) are now SUPPORTED — no longer refused here.
     fn validate_listeners(&self) -> Result<(), ConfigError> {
         let Some(serve) = self.serve.as_ref() else {
             return Ok(());
@@ -664,13 +665,13 @@ impl ServerConfig {
                     );
                 }
             }
-            if !l.egress_allowlist.is_empty() {
-                return err(
-                    "per-listener outbound `egress_allowlist` is not supported (a tcp-connection-host \
-                     guest imports only wasi:io — it cannot hold wasi:sockets)",
-                    " — remove `egress_allowlist`",
-                );
-            }
+            // cap-req 19: a non-empty `egress_allowlist` is now SUPPORTED — it drives the listener
+            // guest's HOST-MEDIATED `tcp-egress` dials (the host dials + terminates TLS; the guest
+            // never holds raw `wasi:sockets`). It takes effect only when the node posture
+            // `allow_guest_tcp_egress` is on AND the component imports `tcp-egress`; the runtime dial
+            // is connect-only + SSRF-floored (the SAME gate as a request handler's egress). Entries
+            // are validated (and rejected) at that runtime gate, mirroring the handler/function
+            // allowlist, so no config-load format check here.
         }
         Ok(())
     }
@@ -2364,12 +2365,12 @@ pub enum OnDemandChallenge {
 /// node binds + listens + accepts on `bind` and dispatches each accepted connection to the guest
 /// `component`'s `tcp-connection-handler` export, with tenancy OPERATOR-PINNED here (a raw socket
 /// carries no Host/path/principal, so there is nothing per-connection to resolve). The guest is handed
-/// only the connection's `wasi:io` byte streams — it holds NO `wasi:sockets` authority (bind stays
+/// only the connection's `wasi:io` byte streams — it holds NO raw `wasi:sockets` authority (bind stays
 /// host-side). Modeled on [`boatramp_core::function::FunctionConfig`] / the session route config.
 ///
-/// Phase 1 is **plaintext-only** and **no per-listener egress**: a declared `tls` block or a non-empty
-/// `egress_allowlist` is REFUSED at config load (fail-closed, boot-LOUD) rather than silently ignored —
-/// per-listener host-TLS and outbound egress are deferred follow-ups. See [`validate_listeners`].
+/// Host-side per-listener TLS/STARTTLS termination (cap-req 06) and a host-mediated `tcp-egress`
+/// `egress_allowlist` (cap-req 19 — the host dials + terminates TLS, the guest still holds no raw
+/// socket) are both supported. See [`validate_listeners`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ListenerConfig {
@@ -2392,10 +2393,13 @@ pub struct ListenerConfig {
     /// Static environment variables injected into the component (never secrets).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// DEFERRED (Phase 1): a per-listener outbound-TCP allowlist. A `tcp-connection-host` guest imports
-    /// ONLY `wasi:io` — it cannot hold `wasi:sockets` — so this is unusable in Phase 1 and a non-empty
-    /// value is REFUSED at config load (fail-closed) rather than silently dropped. Kept for forward
-    /// parity with the handler/session `egress_allowlist`.
+    /// Per-listener outbound-TCP allowlist (cap-req 19) for the listener guest's HOST-MEDIATED
+    /// `tcp-egress` dials: the `host:port` / `ip:port` / `CIDR:port` targets the host may dial on the
+    /// guest's behalf (the host dials + terminates TLS — the guest NEVER holds raw `wasi:sockets`). It
+    /// takes effect only when the node posture `allow_guest_tcp_egress` is on AND the component imports
+    /// `tcp-egress`; the dial is connect-only + SSRF-floored (the SAME gate as a handler/function
+    /// `egress_allowlist`). Empty ⇒ no egress. Enables e.g. an imap-proxy listener dialing the IMAPS
+    /// upstream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
     /// Operator-pinned Dimension-0 tenancy for this listener's `sql`/`orm` (resolved once from this
@@ -4366,15 +4370,12 @@ mod tests {
             matches!(err, ConfigError::InvalidListener { .. }),
             "{err:?}"
         );
-        // (c) a non-empty egress_allowlist (a tcp-connection-host guest can't hold wasi:sockets).
-        let err = ServerConfig::parse(
+        // (c) a non-empty egress_allowlist now PARSES (cap-req 19: it drives the listener guest's
+        // HOST-MEDIATED `tcp-egress` dials; the guest still never holds raw `wasi:sockets`).
+        ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", egress_allowlist: ["x:443"] ) } ) )"#,
         )
-        .expect_err("a non-empty per-listener egress_allowlist must be refused in Phase 1");
-        assert!(
-            matches!(err, ConfigError::InvalidListener { .. }),
-            "{err:?}"
-        );
+        .expect("a per-listener egress_allowlist is valid (host-mediated tcp-egress, cap-req 19)");
         // (d) a valid plaintext listener parses.
         ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s" ) } ) )"#,

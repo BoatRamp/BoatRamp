@@ -1138,7 +1138,12 @@ impl HandlerRuntime {
             crate::handler_dispatch::BindingsError::NotReady { detail, .. } => {
                 format!("listener bindings not ready (managed dependency starting): {detail}")
             }
-        })?;
+        })?
+        // cap-req 19: a listener may reach out through the host-mediated `tcp-egress` binding (gated
+        // by `fn_config.egress_allowlist` + the egress posture + SSRF floor), but its raw
+        // `wasi:sockets` stays denied — `host_mediated_egress_only` keeps `new_store` from installing
+        // the guest socket check even with a non-empty allowlist.
+        .with_host_mediated_egress();
         let limits = crate::function_runtime::function_limits(fn_config.limits.as_ref());
         inner
             .engine
@@ -1309,13 +1314,17 @@ impl HandlerRuntime {
         )
         .await
         {
-            Ok(b) => b.with_session(std::sync::Arc::new(
-                crate::session_driver::SocketSessionController::new(
-                    state.clone(),
-                    session_limits.max_frame_bytes,
-                    session_limits.max_checkpoint_bytes,
-                ),
-            )),
+            // cap-req 19: host-mediated `tcp-egress` allowed (gated by the allowlist + posture + SSRF
+            // floor), raw `wasi:sockets` stays denied — see the connection-lane wrapper above.
+            Ok(b) => b
+                .with_session(std::sync::Arc::new(
+                    crate::session_driver::SocketSessionController::new(
+                        state.clone(),
+                        session_limits.max_frame_bytes,
+                        session_limits.max_checkpoint_bytes,
+                    ),
+                ))
+                .with_host_mediated_egress(),
             Err(e) => {
                 tracing::warn!(
                     %peer,
@@ -1396,13 +1405,16 @@ impl HandlerRuntime {
             )
             .await
             {
-                Ok(b) => b.with_session(std::sync::Arc::new(
-                    crate::session_driver::SocketSessionController::new(
-                        state.clone(),
-                        session_limits.max_frame_bytes,
-                        session_limits.max_checkpoint_bytes,
-                    ),
-                )),
+                // cap-req 19: host-mediated `tcp-egress` allowed, raw `wasi:sockets` denied (as above).
+                Ok(b) => b
+                    .with_session(std::sync::Arc::new(
+                        crate::session_driver::SocketSessionController::new(
+                            state.clone(),
+                            session_limits.max_frame_bytes,
+                            session_limits.max_checkpoint_bytes,
+                        ),
+                    ))
+                    .with_host_mediated_egress(),
                 Err(e) => {
                     tracing::warn!(%peer, "session listener bindings unavailable; closing: {e:?}");
                     break;
