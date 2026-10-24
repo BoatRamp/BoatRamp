@@ -2005,6 +2005,45 @@ pub(super) async fn ensure_user(
     }
 }
 
+/// `DELETE /api/projects/{proj}/databases/{db}/users/{user}` — drop a login role from an
+/// already-declared managed database, idempotently. `Project·Admin`. Drops the DERIVED
+/// per-tenant role (never an operator-supplied raw name), reassigns/drops what it owns,
+/// and deletes its sealed credential. Dropping an absent role is a clean no-op.
+pub(super) async fn drop_user(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path((db, user)): Path<(String, String)>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
+    if let Some(bad) = reject_invalid_db(&user) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    match declare
+        .drop_user(project.as_ref().as_str(), &db, &user)
+        .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "user": user,
+                "database": db,
+                "existed": outcome.existed,
+                "role_name": outcome.role_name,
+            })),
+        )
+            .into_response(),
+        Err(e) => declare_error_response(e),
+    }
+}
+
 /// `GET /api/projects/{proj}/databases` — list the project's declared managed databases
 /// (read-only; `Project·Read`). Each is the stored typed
 /// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase).

@@ -96,21 +96,27 @@ impl ManagedSqlCredentials {
     /// Idempotent + stable across restarts, so the DB (initialized with it on first
     /// boot) keeps accepting the same credential.
     ///
-    /// Single-node correct (get-then-put). A cluster where two nodes generate
-    /// concurrently would race to a mismatch; that needs a put-if-absent (tracked in
-    /// the plan) — not yet implemented here.
+    /// Idempotent + stable: a re-fetch always returns the first-minted value. The mint
+    /// (get-then-put) is serialized **process-wide** by a mint lock, so two concurrent
+    /// first-mints of the same key can't both generate + put (the in-process TOCTOU — two
+    /// callers would otherwise race to a mismatch). The common already-sealed read below
+    /// takes NO lock. A multi-NODE cluster still needs a KV put-if-absent/CAS to be
+    /// race-free across nodes (tracked as a follow-up — this closes the single-node race).
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub async fn password(&self, project: &str, workload: &str) -> Result<String, String> {
         let key = Self::key(project, workload);
+        // Fast path: an already-sealed credential (the overwhelming common case) — no lock.
         if let Some(sealed) = self.kv.get(&key).await.map_err(|e| e.to_string())? {
-            let plain = self
-                .envelope
-                .unwrap(&sealed)
-                .await
-                .map_err(|e| e.to_string())?;
-            return String::from_utf8(plain).map_err(|_| {
-                format!("managed sql credential for {workload:?} is not valid UTF-8")
-            });
+            return self.unseal(&sealed, workload).await;
+        }
+        // Mint path: serialize so concurrent first-mints don't double-generate. Held only
+        // across the re-check + mint below, never the common read above.
+        static MINT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+            std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+        let _guard = MINT_LOCK.lock().await;
+        // Re-check under the lock — a concurrent mint may have sealed it meanwhile.
+        if let Some(sealed) = self.kv.get(&key).await.map_err(|e| e.to_string())? {
+            return self.unseal(&sealed, workload).await;
         }
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes).map_err(|e| format!("rng: {e}"))?;
@@ -122,6 +128,17 @@ impl ManagedSqlCredentials {
             .map_err(|e| e.to_string())?;
         self.kv.put(&key, sealed).await.map_err(|e| e.to_string())?;
         Ok(password)
+    }
+
+    /// Unseal a stored credential blob to its UTF-8 password.
+    async fn unseal(&self, sealed: &[u8], workload: &str) -> Result<String, String> {
+        let plain = self
+            .envelope
+            .unwrap(sealed)
+            .await
+            .map_err(|e| e.to_string())?;
+        String::from_utf8(plain)
+            .map_err(|_| format!("managed sql credential for {workload:?} is not valid UTF-8"))
     }
 
     /// Whether a workload's sealed credential is already present in the store — a

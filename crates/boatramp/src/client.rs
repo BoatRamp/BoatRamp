@@ -1280,6 +1280,32 @@ impl ControlPlane {
         ))
     }
 
+    /// Drop a managed-DB login role (`DELETE /api/{seg}/{database}/users/{user}`).
+    /// `Project·Admin`; idempotent. Returns `(existed, role_name)` — `existed` whether a
+    /// sealed credential was present, `role_name` the actual cluster principal dropped.
+    pub async fn drop_user(&self, database: &str, user: &str) -> Result<(bool, String)> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let v: serde_json::Value = client
+            .delete(format!("{server}/api/{seg}/{database}/users/{user}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok((
+            v.get("existed").and_then(|b| b.as_bool()).unwrap_or(false),
+            v.get("role_name")
+                .and_then(|r| r.as_str())
+                .unwrap_or(user)
+                .to_string(),
+        ))
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

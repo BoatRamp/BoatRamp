@@ -488,6 +488,44 @@ pub fn ensure_login_role_ddl(
     }
 }
 
+/// Ordered, **idempotent** DDL to DROP an operator-ensured login role (the inverse of
+/// [`ensure_login_role_ddl`]). `role` is the ALREADY-DERIVED cluster principal (the plain
+/// name for Single/default, the per-tenant-qualified [`ensure_user_role_name`] for Shared)
+/// — NEVER an operator-supplied raw name. Run connected to the role's own tenant database
+/// (where any objects it owns live), as the superuser.
+///
+/// # Postgres
+/// 1. `REASSIGN OWNED BY <role> TO CURRENT_USER` — move any objects the role owns in this
+///    database to the superuser (a login role granted only `CONNECT` owns nothing, so this
+///    is a safety net), so the role can be dropped.
+/// 2. `DROP OWNED BY <role>` — drop the role's privileges/defaults in this database.
+/// 3. `DROP ROLE IF EXISTS <role>` — drop the cluster role (no-op if already gone).
+///
+/// Steps 1–2 error if the role does not exist; the caller treats a "role does not exist"
+/// error on them as success (idempotent — the role is already gone), exactly as the
+/// `CREATE DATABASE` already-exists contract. Step 3 is `IF EXISTS` and never errors on
+/// absence.
+///
+/// # MySQL
+/// `DROP USER IF EXISTS '<role>'@'%'` + `FLUSH PRIVILEGES` — privileges drop with the user.
+pub fn drop_login_role_ddl(kind: ExternalSqlKind, role: &str) -> Vec<String> {
+    let role_id = quote_ident(kind, role);
+    match kind {
+        ExternalSqlKind::Postgres => vec![
+            format!("REASSIGN OWNED BY {role_id} TO CURRENT_USER;"),
+            format!("DROP OWNED BY {role_id};"),
+            format!("DROP ROLE IF EXISTS {role_id};"),
+        ],
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(role);
+            vec![
+                format!("DROP USER IF EXISTS {user};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
 /// Ordered, **idempotent** DDL granting a tenant's login `role` the everyday
 /// application privileges on the objects in its **own** database's `public` schema —
 /// run (as the schema-owning superuser, `owner`) *inside the tenant database* after
@@ -1184,6 +1222,24 @@ mod tests {
         );
         assert!(!all.to_ascii_uppercase().contains("ALL PRIVILEGES"));
         assert!(!all.to_ascii_uppercase().contains("CREATE DATABASE"));
+    }
+
+    /// `drop_login_role_ddl` reassigns/drops owned objects then `DROP ROLE IF EXISTS`
+    /// (pg) / `DROP USER IF EXISTS` (mysql), all quoted — the idempotent inverse of ensure.
+    #[test]
+    fn drop_login_role_ddl_is_idempotent_and_quoted() {
+        let pg = drop_login_role_ddl(ExternalSqlKind::Postgres, "app_role").join("\n");
+        assert!(pg.contains("REASSIGN OWNED BY \"app_role\" TO CURRENT_USER"));
+        assert!(pg.contains("DROP OWNED BY \"app_role\""));
+        assert!(
+            pg.contains("DROP ROLE IF EXISTS \"app_role\""),
+            "role drop must be IF EXISTS (idempotent): {pg}"
+        );
+        let my = drop_login_role_ddl(ExternalSqlKind::Mysql, "app_role").join("\n");
+        assert!(
+            my.contains("DROP USER IF EXISTS 'app_role'@'%'"),
+            "mysql user drop must be IF EXISTS + host-scoped: {my}"
+        );
     }
 
     // ---- quoting ---------------------------------------------------------

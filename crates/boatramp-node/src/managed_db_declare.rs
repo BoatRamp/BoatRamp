@@ -187,6 +187,11 @@ pub struct NodeManagedDbDeclare {
     envelope: Arc<dyn KeyEnvelope>,
     /// Per-project ceilings (#501 Stage B MEDIUM-1 — the disk-exhaustion guard).
     quota: DeclareQuota,
+    /// Resolves a `db ensure user --password-secret <ref>` BYO secret the SAME way the
+    /// serve path resolves a binding's `password_env` (an env var via [`EnvSource`]).
+    /// Production is [`SystemEnv`](boatramp_core::env::SystemEnv); a test injects a `MapEnv`
+    /// via [`with_env_source`](Self::with_env_source).
+    env_source: Arc<dyn boatramp_core::env::EnvSource>,
 }
 
 /// The operator-configurable per-project ceilings a `declare` is enforced fail-closed
@@ -240,7 +245,109 @@ impl NodeManagedDbDeclare {
             kv,
             envelope,
             quota,
+            env_source: Arc::new(boatramp_core::env::SystemEnv),
         }
+    }
+
+    /// Override the BYO-secret env source (default [`SystemEnv`](boatramp_core::env::SystemEnv)).
+    /// For tests that inject a `MapEnv`; production uses the process environment.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn with_env_source(mut self, env_source: Arc<dyn boatramp_core::env::EnvSource>) -> Self {
+        self.env_source = env_source;
+        self
+    }
+
+    /// Resolve the shared pieces `ensure_user`/`drop_user` both need: the managed binding
+    /// (own-project merge point; must be managed), the engine kind, the superuser
+    /// connection target, the **DERIVED** cluster role name (per-tenant-qualified on a
+    /// Shared binding, the plain `user` on Single/default), and the superuser password.
+    /// The role name is DERIVED here from `(binding, project, user)` and NEVER taken raw
+    /// from the caller — so `ensure_user` and `drop_user` always act on the SAME principal,
+    /// and a caller can only ever touch THIS project's own role.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    async fn resolve_managed_role(
+        &self,
+        project: &str,
+        database: &str,
+        user: &str,
+    ) -> Result<
+        (
+            boatramp_storage::ExternalSqlKind,
+            crate::managed_sql::OperatorTarget,
+            String,
+            String,
+        ),
+        DeclareError,
+    > {
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", database)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", user)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        let binding =
+            match resolve_binding(&self.static_dbs, &self.deploy, project, database).await? {
+                Some(b) => b,
+                None => return Err(DeclareError::NotDeclared(database.to_string())),
+            };
+        if !binding.is_managed_credential() {
+            return Err(DeclareError::NotDeclared(database.to_string()));
+        }
+        let kind = boatramp_storage::ExternalSqlKind::parse(&binding.kind)
+            .ok_or_else(|| DeclareError::Other(format!("database {database:?}: unknown engine")))?;
+        let target = crate::managed_sql::operator_target(&binding, project, database)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        let creds =
+            crate::managed_sql::ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
+        let superuser_pw = creds
+            .password(&target.cred_project, &target.cred_workload)
+            .await
+            .map_err(DeclareError::Other)?;
+        let compute = binding
+            .compute
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                DeclareError::Other(format!("database {database:?}: not compute-backed"))
+            })?;
+        let (tenant_ident_raw, is_default) =
+            crate::tenant_sql::tenant_key(binding.tenant_scope, project, "");
+        let role_name =
+            if matches!(binding.tenant, crate::config::TenantIsolation::Shared) && !is_default {
+                let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+                boatramp_storage::tenant_provision::ensure_user_role_name(compute, &ident, user)
+            } else {
+                user.to_string()
+            };
+        Ok((kind, target, role_name, superuser_pw))
+    }
+
+    /// Build an UNGATED (the provisioning carve-out) superuser admin connection to
+    /// `database` on the role's server — `ensure_user` targets the maintenance database,
+    /// `drop_user` targets the role's own tenant database (where its objects live).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    fn admin_backend_for(
+        &self,
+        kind: boatramp_storage::ExternalSqlKind,
+        target: &crate::managed_sql::OperatorTarget,
+        database: &str,
+        superuser_pw: String,
+    ) -> boatramp_storage::sql_compute::ComputeResolvedSqlBackend {
+        let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new_ungated(
+            self.deploy.clone(),
+            target.endpoint_project.clone(),
+        ));
+        boatramp_storage::sql_compute::ComputeResolvedSqlBackend::new(
+            resolver,
+            target.workload.clone(),
+            kind,
+            database,
+            target.user.clone(),
+            superuser_pw,
+            Some(1),
+            false,
+            Some(std::time::Duration::from_secs(10)),
+        )
     }
 
     /// Enforce the per-project declaration ceilings fail-closed (#501 Stage B MEDIUM-1),
@@ -452,106 +559,48 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         password_secret: Option<&str>,
     ) -> Result<boatramp_core::sql::EnsureUserOutcome, DeclareError> {
         use boatramp_core::sql::{EnsureUserOutcome, SqlBackend};
-        use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
 
-        boatramp_core::project::validate_resource_name("project", project)
-            .map_err(|e| DeclareError::Other(e.to_string()))?;
-        boatramp_core::project::validate_resource_name("database", database)
-            .map_err(|e| DeclareError::Other(e.to_string()))?;
-        boatramp_core::project::validate_resource_name("database", user)
-            .map_err(|e| DeclareError::Other(e.to_string()))?;
-
-        // BYO credential (`--password-secret`) is a scoped follow-up: the declare service
-        // has no env/secret source wired. Mint+seal is the supported path today.
-        if password_secret.is_some() {
-            return Err(DeclareError::Other(
-                "ensure user --password-secret is not yet supported; omit it to mint and seal \
-                 a managed login credential"
-                    .to_string(),
-            ));
-        }
-
-        // Resolve the target database's managed binding through the merge point (daemon
-        // conflict refuses; own-project only), and require it to be a managed binding.
-        let binding =
-            match resolve_binding(&self.static_dbs, &self.deploy, project, database).await? {
-                Some(b) => b,
-                None => return Err(DeclareError::NotDeclared(database.to_string())),
-            };
-        if !binding.is_managed_credential() {
-            return Err(DeclareError::NotDeclared(database.to_string()));
-        }
-        let kind = boatramp_storage::ExternalSqlKind::parse(&binding.kind)
-            .ok_or_else(|| DeclareError::Other(format!("database {database:?}: unknown engine")))?;
-
-        // The superuser connection target — Single vs Shared, per-tenant derivation + cred
-        // keying — resolved EXACTLY as the operator `sql exec` path does (no re-derivation).
-        let target = crate::managed_sql::operator_target(&binding, project, database)
-            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        // Resolve binding → kind → superuser target → DERIVED role name (shared with
+        // `drop_user`, so both always act on the SAME per-tenant principal).
+        let (kind, target, role_name, superuser_pw) =
+            self.resolve_managed_role(project, database, user).await?;
         let creds =
             crate::managed_sql::ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
-        let superuser_pw = creds
-            .password(&target.cred_project, &target.cred_workload)
-            .await
-            .map_err(DeclareError::Other)?;
-
-        // The ACTUAL cluster principal name. On a Shared binding many tenants share ONE
-        // cluster, so the operator's human `user` must be namespaced per-tenant or two
-        // tenants naming the same user would collide on one cluster-global role (a
-        // cross-tenant password-reset + connect). Single / default-project bindings have a
-        // dedicated cluster per tenant, so the plain `user` is already collision-safe there.
-        let compute = binding
-            .compute
-            .as_deref()
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| {
-                DeclareError::Other(format!("database {database:?}: not compute-backed"))
-            })?;
-        let (tenant_ident_raw, is_default) =
-            crate::tenant_sql::tenant_key(binding.tenant_scope, project, "");
-        let role_name =
-            if matches!(binding.tenant, crate::config::TenantIsolation::Shared) && !is_default {
-                let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
-                boatramp_storage::tenant_provision::ensure_user_role_name(compute, &ident, user)
-            } else {
-                user.to_string()
-            };
-
-        // The login role's OWN credential — minted + sealed under the operator's project,
-        // keyed per (project, user) — NOT per database: one human user is ONE principal with
-        // ONE password, granted CONNECT on each database it's ensured against (so ensuring
-        // the same user on a second database adds a grant, never resets the password). The
-        // credential maps 1:1 to `role_name`. Return-once: an already-sealed credential is a
-        // re-ensure (never re-surface the secret); otherwise mint now. Either way the
-        // idempotent DDL re-runs, so a role lost to a data-dir wipe is re-created.
         let role_key = format!("user:{user}");
-        let was_sealed = creds
-            .is_sealed(project, &role_key)
-            .await
-            .map_err(DeclareError::Other)?;
-        let role_pw = creds
-            .password(project, &role_key)
-            .await
-            .map_err(DeclareError::Other)?;
 
-        // Connect UNGATED (the provisioning carve-out — the server need not be
-        // `Provisioned`) to the maintenance database as the superuser, and run the
-        // idempotent, locked-down `CREATE ROLE` + `GRANT CONNECT`.
-        let resolver =
-            std::sync::Arc::new(crate::managed_sql::DeployEndpointResolver::new_ungated(
-                self.deploy.clone(),
-                target.endpoint_project.clone(),
-            ));
-        let admin = ComputeResolvedSqlBackend::new(
-            resolver,
-            target.workload.clone(),
+        // The role's login password + the created/return-once semantics:
+        // - BYO (`--password-secret <ref>`): resolve the operator-supplied secret via the
+        //   SAME env source the serve path reads `password_env` from. NEVER mint/seal a
+        //   competing credential, and NEVER surface it back (the operator already holds it).
+        // - minted (default): keyed per (project, user) — one principal, one password,
+        //   returned ONCE (on the call that mints it); a re-ensure re-surfaces nothing.
+        let (role_pw, created, surfaced) = if let Some(sref) = password_secret {
+            let pw = self.env_source.get(sref).ok_or_else(|| {
+                DeclareError::Other(format!(
+                    "ensure user: --password-secret env var {sref:?} is unset"
+                ))
+            })?;
+            (pw, false, None)
+        } else {
+            let was_sealed = creds
+                .is_sealed(project, &role_key)
+                .await
+                .map_err(DeclareError::Other)?;
+            let pw = creds
+                .password(project, &role_key)
+                .await
+                .map_err(DeclareError::Other)?;
+            let surfaced = (!was_sealed).then(|| pw.clone());
+            (pw, !was_sealed, surfaced)
+        };
+
+        // Connect UNGATED to the maintenance database as superuser; run the idempotent,
+        // locked-down CREATE ROLE + GRANT CONNECT (additive — a second DB adds a grant).
+        let admin = self.admin_backend_for(
             kind,
+            &target,
             crate::tenant_sql::maintenance_database(kind),
-            target.user.clone(),
             superuser_pw,
-            Some(1),
-            false,
-            Some(std::time::Duration::from_secs(10)),
         );
         for stmt in boatramp_storage::tenant_provision::ensure_login_role_ddl(
             kind,
@@ -560,9 +609,15 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
             &target.database,
         ) {
             if let Err(e) = admin.run_script(&stmt).await {
-                // Redact the role password from any surfaced error: the DDL text embeds it
-                // as a literal, and a driver/backend error could echo the statement.
-                let safe = e.to_string().replace(role_pw.as_str(), "***");
+                // Redact the role password from any surfaced error (the DDL embeds it). The
+                // DDL carries it as a quoted LITERAL (single-quotes doubled), so a BYO secret
+                // containing `'` appears in its doubled form — redact BOTH the raw value and
+                // its `''`-doubled form so a quote-containing secret can't survive an error
+                // that echoes the statement text (minted passwords are hex, but BYO is not).
+                let safe = e
+                    .to_string()
+                    .replace(role_pw.as_str(), "***")
+                    .replace(&role_pw.replace('\'', "''"), "***");
                 return Err(DeclareError::Other(format!(
                     "ensure user {user} on {database}: {safe}"
                 )));
@@ -570,12 +625,55 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         }
 
         Ok(EnsureUserOutcome {
-            created: !was_sealed,
-            // The ACTUAL cluster principal the operator connects as — the plain `user` for
-            // Single/default, the per-tenant-qualified name for a Shared binding.
+            created,
             role_name,
-            password: (!was_sealed).then_some(role_pw),
+            password: surfaced,
         })
+    }
+
+    async fn drop_user(
+        &self,
+        project: &str,
+        database: &str,
+        user: &str,
+    ) -> Result<boatramp_core::sql::DropUserOutcome, DeclareError> {
+        use boatramp_core::sql::{DropUserOutcome, SqlBackend};
+
+        // SAME derived principal as ensure_user — the DROP targets a name DERIVED from
+        // (binding, project, user), NEVER the raw `user`, so a caller can only ever drop
+        // THIS project's own role (not another tenant's or a system role).
+        let (kind, target, role_name, superuser_pw) =
+            self.resolve_managed_role(project, database, user).await?;
+        let creds =
+            crate::managed_sql::ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
+        let role_key = format!("user:{user}");
+        let existed = creds
+            .is_sealed(project, &role_key)
+            .await
+            .map_err(DeclareError::Other)?;
+
+        // Connect to the role's OWN tenant database (where any objects it owns live) as
+        // superuser, and run the idempotent drop. REASSIGN/DROP OWNED error if the role is
+        // already gone — tolerated as success (idempotent); DROP ROLE IF EXISTS never does.
+        let admin = self.admin_backend_for(kind, &target, &target.database, superuser_pw);
+        for stmt in boatramp_storage::tenant_provision::drop_login_role_ddl(kind, &role_name) {
+            if let Err(e) = admin.run_script(&stmt).await {
+                let msg = e.to_string().to_ascii_lowercase();
+                if msg.contains("does not exist") && msg.contains("role") {
+                    continue;
+                }
+                return Err(DeclareError::Other(format!(
+                    "drop user {user} on {database}: {e}"
+                )));
+            }
+        }
+        // Remove the sealed credential (idempotent — deleting an absent key is a no-op).
+        creds
+            .delete(project, &role_key)
+            .await
+            .map_err(DeclareError::Other)?;
+
+        Ok(DropUserOutcome { existed, role_name })
     }
 }
 

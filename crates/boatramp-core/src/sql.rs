@@ -2182,6 +2182,32 @@ pub trait ManagedDbDeclare: Send + Sync {
         user: &str,
         password_secret: Option<&str>,
     ) -> Result<EnsureUserOutcome, DeclareError>;
+
+    /// Drop the login role `user` from the managed `database` in `project`, idempotently —
+    /// the `DELETE /api/databases/{database}/users/{user}` verb. Resolves to the SAME
+    /// derived cluster principal `ensure_user` created (per-tenant-qualified on Shared),
+    /// reassigns/drops anything it owns, drops the role, and deletes its sealed credential.
+    /// Dropping an absent role is a clean no-op. The derived name is NEVER operator-supplied,
+    /// so this can only ever drop THIS project's own role. `NotDeclared` if `database` is not
+    /// a managed declaration in `project`.
+    async fn drop_user(
+        &self,
+        project: &str,
+        database: &str,
+        user: &str,
+    ) -> Result<DropUserOutcome, DeclareError>;
+}
+
+/// The outcome of [`ManagedDbDeclare::drop_user`]. `existed` reflects whether a sealed
+/// credential was present for the user (a minted role existed) — informational; the drop
+/// DDL is idempotent regardless. `role_name` is the actual cluster principal that was
+/// dropped (per-tenant-qualified on Shared).
+#[derive(Debug, Clone)]
+pub struct DropUserOutcome {
+    /// Whether a sealed credential existed for this user before the drop.
+    pub existed: bool,
+    /// The actual cluster/server principal name that was dropped.
+    pub role_name: String,
 }
 
 /// The outcome of [`ManagedDbDeclare::ensure_user`]. `password` is `Some` **only** on the

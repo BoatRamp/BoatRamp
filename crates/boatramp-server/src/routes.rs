@@ -520,6 +520,12 @@ pub fn router_with_fast(
         .route(
             "/api/databases/{name}/users/{user}/ensure",
             post(ensure_user),
+        )
+        // Drop that login role (Project·Admin — same `(&"databases", _)` family gate; the
+        // project-scoped DELETE form rewrites here). Idempotent.
+        .route(
+            "/api/databases/{name}/users/{user}",
+            axum::routing::delete(drop_user),
         );
     // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress §6):
     // mint a short-lived, scoped S3 upload credential for a project+site's blob container. Its OWN

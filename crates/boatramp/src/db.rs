@@ -78,6 +78,24 @@ enum DbCommand {
         #[command(subcommand)]
         what: EnsureWhat,
     },
+    /// Drop an operator-provisioned managed resource idempotently (`Project·Admin`).
+    Drop {
+        #[command(subcommand)]
+        what: DropWhat,
+    },
+}
+
+/// What `db drop` removes. Idempotent: dropping an absent resource is a clean no-op.
+#[derive(Debug, clap::Subcommand)]
+enum DropWhat {
+    /// Drop a login role from a managed database (the role + its sealed credential).
+    User {
+        /// The login role name (as given to `db ensure user`).
+        name: String,
+        /// The managed database whose server the role lives on.
+        #[arg(long)]
+        database: String,
+    },
 }
 
 /// What `db ensure` provisions. `database` ensures a declared managed database exists;
@@ -105,8 +123,9 @@ enum EnsureWhat {
         /// The managed database whose server the role is created on.
         #[arg(long)]
         database: String,
-        /// Use an operator-supplied secret ref for the password instead of minting one
-        /// (BYO). (Not yet supported server-side; omit to mint + seal.)
+        /// Use an operator-supplied secret for the password instead of minting one (BYO):
+        /// the value is the name of an env var the node reads (same resolution as a
+        /// binding's `password_env`). The secret is never surfaced or logged.
         #[arg(long)]
         password_secret: Option<String>,
     },
@@ -159,6 +178,16 @@ pub enum DbOutput {
         role_name: String,
         created: bool,
         password: Option<String>,
+        /// The operator supplied the password (`--password-secret`): nothing is minted or
+        /// surfaced, so render a BYO-aware line rather than a created/already-exists one.
+        byo: bool,
+    },
+    /// `db drop user <name> --database <db>` — the role + its credential were dropped.
+    DropUser {
+        user: String,
+        database: String,
+        role_name: String,
+        existed: bool,
     },
 }
 
@@ -225,6 +254,7 @@ impl crate::output::Rendered for DbOutput {
                 role_name,
                 created,
                 password,
+                byo,
             } => {
                 // On a Shared binding the actual cluster role is per-tenant-qualified, so it
                 // differs from the requested label — surface it as the name to connect as.
@@ -235,6 +265,14 @@ impl crate::output::Rendered for DbOutput {
                         Ok(())
                     }
                 };
+                if *byo {
+                    // BYO: the operator owns the password; nothing is minted or surfaced.
+                    writeln!(
+                        w,
+                        "ensured login role `{role_name}` on database `{database}` with the supplied credential"
+                    )?;
+                    return note_qualified(w);
+                }
                 match password {
                     Some(pw) => {
                         writeln!(
@@ -261,6 +299,28 @@ impl crate::output::Rendered for DbOutput {
                         note_qualified(w)
                     }
                 }
+            }
+            Self::DropUser {
+                user,
+                database,
+                role_name,
+                existed,
+            } => {
+                if *existed {
+                    writeln!(
+                        w,
+                        "dropped login role `{role_name}` on database `{database}`"
+                    )
+                } else {
+                    writeln!(
+                        w,
+                        "dropped login role `{role_name}` on database `{database}` (no sealed credential was present)"
+                    )
+                }?;
+                if role_name != user {
+                    writeln!(w, "  (requested `{user}`)")?;
+                }
+                Ok(())
             }
         }
     }
@@ -300,6 +360,13 @@ pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
                 ensure_user(&cp, &database, &name, password_secret.as_deref()).await
             }
         },
+        DbCommand::Drop { what } => match what {
+            DropWhat::User { name, database } => {
+                validate_name(&name)?;
+                validate_name(&database)?;
+                drop_user(&cp, &database, &name).await
+            }
+        },
     }
 }
 
@@ -318,6 +385,20 @@ async fn ensure_user(
         role_name,
         created,
         password,
+        // BYO: the operator supplied the secret, so the server mints/returns nothing — the
+        // CLI renders a BYO-aware line rather than a created/already-exists one.
+        byo: password_secret.is_some(),
+    })
+}
+
+/// `db drop user <name> --database <db>` — drop the login role + its sealed credential.
+async fn drop_user(cp: &ControlPlane, database: &str, user: &str) -> Result<DbOutput> {
+    let (existed, role_name) = cp.drop_user(database, user).await?;
+    Ok(DbOutput::DropUser {
+        user: user.to_string(),
+        database: database.to_string(),
+        role_name,
+        existed,
     })
 }
 
