@@ -1070,7 +1070,20 @@ async fn tcp_connect_decision(
     if !posture_tcp_egress && !mutating("drop_posture") {
         return false;
     }
-    // (2) Connect-only.
+    // (2a) Permit wasmtime's implicit pre-connect LOCAL bind. wasmtime 50's `TcpSocket::connect`
+    // runs `socket_addr_check(unspecified_addr, TcpBind)` — a permission check for the OS's
+    // ephemeral local bind (0.0.0.0:0 / [::]:0), WITHOUT actually binding (IP_BIND_ADDRESS_NO_PORT)
+    // — immediately BEFORE the real `TcpConnect` check. That is the connect's OWN local bind, not a
+    // guest `bind`/`listen` to a real inbound address, so allow it outright (still gated by the
+    // posture above); the actual peer is fully gated by the `TcpConnect` check `connect` runs next.
+    // Without this, EVERY gated `wasi:sockets` connect is denied under wasmtime 50 — the v0.44.0
+    // regression (older wasmtime ran no such pre-connect bind check). Narrow by construction: a
+    // bind/listen to ANY specific address, or a non-zero port, still falls through to (2b) and is
+    // denied — inbound stays the container/microVM model.
+    if matches!(use_, SocketAddrUse::TcpBind) && addr.ip().is_unspecified() && addr.port() == 0 {
+        return true;
+    }
+    // (2b) Connect-only: every OTHER non-`TcpConnect` use (a real bind/listen, all UDP) is denied.
     if !matches!(use_, SocketAddrUse::TcpConnect) && !mutating("admit_bind_listen") {
         return false;
     }
@@ -3830,6 +3843,53 @@ mod tests {
         assert!(
             !tcp_connect_decision(SocketAddrUse::TcpConnect, global, &allow, true, false).await,
             "posture off must deny every connect"
+        );
+    }
+
+    /// Regression (v0.44.0 wasmtime-50 bump): `TcpSocket::connect` runs a
+    /// `socket_addr_check(unspecified_addr, TcpBind)` for the implicit ephemeral local bind BEFORE
+    /// the `TcpConnect` check, so the gate MUST permit exactly that implicit bind — else every gated
+    /// `wasi:sockets` connect is denied `access-denied` (the reported regression). It must NOT permit
+    /// a bind to any specific address, or the unspecified address with a NON-zero port (inbound stays
+    /// the container model — no guest bind/listen to a real inbound address).
+    #[tokio::test]
+    async fn tcp_connect_decision_permits_wasmtime50_implicit_connect_bind() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let allow = vec!["127.0.0.1:9000".to_string()];
+        // The implicit pre-connect local bind (both families) is permitted with posture on — even
+        // with allow_private off and an allowlist that doesn't list the unspecified address.
+        for implicit in ["0.0.0.0:0", "[::]:0"] {
+            assert!(
+                tcp_connect_decision(SocketAddrUse::TcpBind, sa(implicit), &allow, false, true)
+                    .await,
+                "the implicit pre-connect bind {implicit} must be permitted (the v0.44.0 regression)"
+            );
+        }
+        // A REAL bind — a specific address, or the unspecified address with a non-zero port — stays
+        // denied (only the wildcard:0 ephemeral connect-bind is the special case).
+        for real in ["0.0.0.0:8080", "127.0.0.1:0", "127.0.0.1:9000", "[::]:443"] {
+            assert!(
+                !tcp_connect_decision(SocketAddrUse::TcpBind, sa(real), &allow, true, true).await,
+                "a real bind {real} must stay denied"
+            );
+        }
+        // Posture off ⇒ even the implicit bind is denied.
+        assert!(
+            !tcp_connect_decision(SocketAddrUse::TcpBind, sa("0.0.0.0:0"), &allow, true, false)
+                .await,
+            "posture off must deny even the implicit bind"
+        );
+        // End-to-end intent: the gated loopback connect (allowlisted + allow_private) now succeeds.
+        assert!(
+            tcp_connect_decision(
+                SocketAddrUse::TcpConnect,
+                sa("127.0.0.1:9000"),
+                &allow,
+                true,
+                true
+            )
+            .await,
+            "the gated loopback connect must be permitted"
         );
     }
 
