@@ -306,7 +306,13 @@ impl ManagedDbEnv {
         user: &str,
         password: String,
     ) -> boatramp_storage::sql_compute::ComputeResolvedSqlBackend {
-        let resolver = Arc::new(DeployEndpointResolver::new(self.deploy.clone(), project));
+        // UNGATED (the carve-out): the readiness pass probes + provisions a replica that
+        // is not yet `Provisioned` — it is what produces `Provisioned`, so a gated
+        // resolver would return no endpoint and deadlock the lifecycle.
+        let resolver = Arc::new(DeployEndpointResolver::new_ungated(
+            self.deploy.clone(),
+            project,
+        ));
         boatramp_storage::sql_compute::ComputeResolvedSqlBackend::new(
             resolver,
             workload,
@@ -623,15 +629,71 @@ async fn register_shared_server(
 pub struct DeployEndpointResolver {
     deploy: DeployStore,
     project: String,
+    gate: EndpointGate,
+}
+
+/// The readiness requirement a [`DeployEndpointResolver`] applies on top of
+/// `phase == Running && healthy` (v0.45.0 A2). Routing/answerability resolvers gate at a
+/// configured [`ReadinessLevel`]; the provisioning + repair connections are **`Ungated`**
+/// — the carve-out that must reach a not-yet-`Provisioned` replica, since they are what
+/// *produce* `Provisioned` (gating them would deadlock).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[derive(Clone, Copy)]
+pub(crate) enum EndpointGate {
+    /// Running + healthy only — no readiness requirement (provisioning/repair/probe).
+    Ungated,
+    /// Running + healthy + readiness at least the given level.
+    Readiness(crate::config::ReadinessLevel),
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+impl EndpointGate {
+    /// Whether a replica's readiness satisfies this gate (the `phase`/`healthy` check is
+    /// applied separately by the resolver).
+    fn admits(self, r: &boatramp_core::compute::Readiness) -> bool {
+        use crate::config::ReadinessLevel;
+        match self {
+            Self::Ungated => true,
+            Self::Readiness(ReadinessLevel::Provisioned) => r.is_provisioned(),
+            Self::Readiness(ReadinessLevel::ServiceReady) => r.is_service_ready(),
+        }
+    }
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl DeployEndpointResolver {
+    /// A routing/answerability resolver gating at the strict default (`Provisioned`). Use
+    /// [`new_gated`](Self::new_gated) to apply a configured relaxed level, or
+    /// [`new_ungated`](Self::new_ungated) for a provisioning/repair connection.
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub fn new(deploy: DeployStore, project: impl Into<String>) -> Self {
+        Self::new_gated(deploy, project, crate::config::ReadinessLevel::Provisioned)
+    }
+
+    /// A routing/answerability resolver gating at `level` (the DB's configured
+    /// `readiness_gate` for that surface).
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn new_gated(
+        deploy: DeployStore,
+        project: impl Into<String>,
+        level: crate::config::ReadinessLevel,
+    ) -> Self {
         Self {
             deploy,
             project: project.into(),
+            gate: EndpointGate::Readiness(level),
+        }
+    }
+
+    /// An **ungated** resolver (Running + healthy, no readiness requirement) — the
+    /// carve-out for the provisioning + repair connections, which must reach a
+    /// not-yet-`Provisioned` replica because they are what make it `Provisioned`.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn new_ungated(deploy: DeployStore, project: impl Into<String>) -> Self {
+        Self {
+            deploy,
+            project: project.into(),
+            gate: EndpointGate::Ungated,
         }
     }
 }
@@ -647,7 +709,9 @@ impl ComputeEndpointResolver for DeployEndpointResolver {
             .map_err(SqlError::other)?;
         Ok(states
             .into_iter()
-            .filter(|s| s.phase == ReplicaPhase::Running && s.healthy)
+            .filter(|s| {
+                s.phase == ReplicaPhase::Running && s.healthy && self.gate.admits(&s.readiness)
+            })
             .map(|s| (s.endpoint.host, s.endpoint.port))
             .collect())
     }
@@ -926,9 +990,12 @@ impl NodeOperatorSql {
                 }
             };
 
-            let resolver = Arc::new(DeployEndpointResolver::new(
+            // Operator connection (sql exec / query / migrate) — gate at the DB's
+            // configured `migration` readiness level (default `Provisioned`).
+            let resolver = Arc::new(DeployEndpointResolver::new_gated(
                 self.deploy.clone(),
                 target.endpoint_project,
+                cfg.readiness_gate.migration,
             ));
             Ok(Arc::new(ComputeResolvedSqlBackend::new(
                 resolver,
@@ -1135,7 +1202,10 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
         // then read ALL replicas (healthy or not) from the resolver — bypassing the
         // healthy filter that `query` would hit — and actively TCP-probe each.
         let target = operator_target(cfg, project, db)?;
-        let resolver = DeployEndpointResolver::new(self.deploy.clone(), target.endpoint_project);
+        // UNGATED: ping is a diagnostic that reports ALL replicas (it uses
+        // `replica_diagnostics`, not the gated `endpoints`); the gate is irrelevant here.
+        let resolver =
+            DeployEndpointResolver::new_ungated(self.deploy.clone(), target.endpoint_project);
         let diags = resolver.replica_diagnostics(&target.workload).await;
         let mut out = Vec::with_capacity(diags.len());
         for d in diags {
@@ -2707,6 +2777,77 @@ mod tests {
         );
         // A workload with no replicas resolves to nothing (a clear no-endpoint state).
         assert!(resolver.endpoints("absent").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn endpoint_resolver_gate_filters_by_readiness_level() {
+        use crate::config::ReadinessLevel;
+        use boatramp_core::compute::Readiness;
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let p = ProjectRef::DEFAULT;
+        // Four running + healthy replicas at distinct readiness states.
+        let mk = |rep: u32, host: &str, r: Readiness| {
+            let mut s = replica("pg", rep, host, 5432, true, ReplicaPhase::Running);
+            s.readiness = r;
+            s
+        };
+        for s in [
+            mk(0, "10.0.0.1", Readiness::Provisioned),
+            mk(1, "10.0.0.2", Readiness::ServiceReady),
+            mk(
+                2,
+                "10.0.0.3",
+                Readiness::ProvisionFailed {
+                    reason: "boom".into(),
+                },
+            ),
+            mk(3, "10.0.0.4", Readiness::Starting),
+        ] {
+            deploy.set_replica_state(p, &s).await.unwrap();
+        }
+        let sorted = |mut v: Vec<(String, u16)>| {
+            v.sort();
+            v
+        };
+
+        // The strict default (`Provisioned`) → only the fully-provisioned replica routes.
+        let provisioned = DeployEndpointResolver::new(deploy.clone(), "default");
+        assert_eq!(
+            sorted(provisioned.endpoints("pg").await.unwrap()),
+            vec![("10.0.0.1".to_string(), 5432)],
+            "Provisioned gate admits only Provisioned"
+        );
+
+        // Relaxed to `service_ready` → every replica that ANSWERED its probe
+        // (Provisioned + ServiceReady + ProvisionFailed), but NOT the Starting one.
+        let service = DeployEndpointResolver::new_gated(
+            deploy.clone(),
+            "default",
+            ReadinessLevel::ServiceReady,
+        );
+        assert_eq!(
+            sorted(service.endpoints("pg").await.unwrap()),
+            vec![
+                ("10.0.0.1".to_string(), 5432),
+                ("10.0.0.2".to_string(), 5432),
+                ("10.0.0.3".to_string(), 5432),
+            ],
+            "service_ready gate admits any replica that answered its probe, not Starting"
+        );
+
+        // Ungated (the provisioning/repair carve-out) → every healthy running replica,
+        // readiness ignored, so it can reach a not-yet-Provisioned replica to make it so.
+        let ungated = DeployEndpointResolver::new_ungated(deploy, "default");
+        assert_eq!(
+            sorted(ungated.endpoints("pg").await.unwrap()),
+            vec![
+                ("10.0.0.1".to_string(), 5432),
+                ("10.0.0.2".to_string(), 5432),
+                ("10.0.0.3".to_string(), 5432),
+                ("10.0.0.4".to_string(), 5432),
+            ],
+            "ungated admits every healthy running replica regardless of readiness"
+        );
     }
 
     /// A `Shared` binding registers exactly ONE shared server (bare `<compute>` under

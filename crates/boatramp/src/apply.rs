@@ -2542,6 +2542,7 @@ mod tests {
                 pool_max: None,
                 connect_timeout_secs: None,
                 startup_grace_secs: None,
+                readiness_gate: Default::default(),
             },
             boatramp_core::compute::ApplyDatabase {
                 name: "metrics".into(),
@@ -2559,6 +2560,7 @@ mod tests {
                 pool_max: None,
                 connect_timeout_secs: None,
                 startup_grace_secs: None,
+                readiness_gate: Default::default(),
             },
         ];
         apply_databases(&mock, &dbs, false).await.unwrap();
@@ -2592,6 +2594,7 @@ mod tests {
             pool_max: None,
             connect_timeout_secs: None,
             startup_grace_secs: None,
+            readiness_gate: Default::default(),
         }];
         apply_databases(&mock, &dbs, true).await.unwrap();
         assert!(mock.calls().is_empty(), "dry-run declares nothing");

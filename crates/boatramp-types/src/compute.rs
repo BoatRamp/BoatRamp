@@ -461,6 +461,40 @@ pub enum ApplyDatabaseScope {
     Site,
 }
 
+/// How "ready" a managed-DB replica must be before a surface treats it as usable — the
+/// configurable readiness gate (v0.45.0). The strict default, [`Provisioned`], means the
+/// replica has completed its post-launch provisioning (its `CREATE DATABASE` / role DDL).
+/// Relaxed to [`ServiceReady`], a surface uses the replica as soon as it answers a real
+/// `SELECT 1`, before provisioning has finished. Shared between the manifest
+/// [`ApplyDatabase`] and the serving `ExternalDatabaseConfig`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessLevel {
+    /// Require full post-launch provisioning (the strict default).
+    #[default]
+    Provisioned,
+    /// Require only that the service answers `SELECT 1` (relaxed).
+    ServiceReady,
+}
+
+/// Per-surface readiness gate for a managed database (v0.45.0). Each surface defaults to
+/// [`ReadinessLevel::Provisioned`]; an operator may relax any one independently:
+/// - `answerability` — gateway/internal-DNS: whether a replica is an answerable upstream.
+/// - `routing` — the handler-runtime SQL connection: whether a request is routed to it.
+/// - `migration` — operator `sql exec` / `migrate` / `ensure`-await (container-backed DBs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadinessGate {
+    /// Gate for gateway/internal-DNS answerability. The strict default (`Provisioned`) is
+    /// honored across all workloads today; per-DB relaxation to `service_ready` for this
+    /// surface is a follow-up (the node-global DNS source must become config-aware first).
+    pub answerability: ReadinessLevel,
+    /// Gate for request-path handler SQL routing.
+    pub routing: ReadinessLevel,
+    /// Gate for operator migration/ensure (container-backed DBs).
+    pub migration: ReadinessLevel,
+}
+
 /// A coarse sizing **preset** for a declared managed database — NOT raw VM knobs.
 /// The manifest author picks a t-shirt size; boatramp maps it to concrete
 /// vcpus/mem/volume at lowering time (see [`ApplyDatabaseSize::resources`]), so the
@@ -612,6 +646,17 @@ pub struct ApplyDatabase {
     /// [`apply_db_caps::MAX_STARTUP_GRACE_SECS`] at lowering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_grace_secs: Option<u32>,
+    /// The per-surface **readiness gate** (v0.45.0): the readiness level each surface
+    /// requires before treating a replica as usable. Default: every surface `provisioned`
+    /// (strict). Passes through to the serving config unchanged.
+    #[serde(default, skip_serializing_if = "readiness_gate_is_default")]
+    pub readiness_gate: ReadinessGate,
+}
+
+/// Omit `readiness_gate` from a serialized manifest when it is the all-`provisioned`
+/// default (manifest hygiene — the common case writes nothing).
+fn readiness_gate_is_default(g: &ReadinessGate) -> bool {
+    *g == ReadinessGate::default()
 }
 
 impl ApplyDatabase {

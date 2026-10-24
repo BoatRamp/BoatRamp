@@ -787,11 +787,16 @@ impl Readiness {
         matches!(self, Self::Provisioned)
     }
 
-    /// Whether the service has passed its readiness probe (≥ `ServiceReady`), i.e. it
-    /// is reachable even if its post-launch actions have not all completed. Used by a
-    /// surface whose readiness-gate has been relaxed to `service_ready`.
+    /// Whether the service answered its readiness probe at least once — `ServiceReady`,
+    /// `Provisioned`, OR `ProvisionFailed` (all three got past the `SELECT 1` probe; only
+    /// `Starting` has not). A surface whose readiness-gate is relaxed to `service_ready`
+    /// deliberately admits a replica that is up even if its post-launch provisioning did
+    /// not complete; the strict `Provisioned` default still excludes `ProvisionFailed`.
     pub fn is_service_ready(&self) -> bool {
-        matches!(self, Self::ServiceReady | Self::Provisioned)
+        matches!(
+            self,
+            Self::ServiceReady | Self::Provisioned | Self::ProvisionFailed { .. }
+        )
     }
 }
 

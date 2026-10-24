@@ -131,6 +131,9 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
         tenant_guc: db.tenant_guc.clone(),
         session_guc: db.session_guc.clone(),
         tenant_all_marker: db.tenant_all_marker.clone(),
+        // Passes through unchanged (same shared type) — the manifest author sets the gate;
+        // the serving config honors it.
+        readiness_gate: db.readiness_gate,
     }
 }
 
@@ -464,6 +467,7 @@ mod tests {
             pool_max: Some(1000),
             connect_timeout_secs: Some(9999),
             startup_grace_secs: Some(99999),
+            readiness_gate: Default::default(),
         }
     }
 

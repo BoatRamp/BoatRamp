@@ -486,7 +486,10 @@ async fn provision_shared(
     // Connect to the MAINTENANCE database as the superuser (CREATE DATABASE cannot run
     // inside the database being created). Reuses the same endpoint-resolving backend
     // the handler path uses, so it follows the server across restarts.
-    let resolver = Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
+    let resolver = Arc::new(DeployEndpointResolver::new_ungated(
+        deploy.clone(),
+        DEFAULT_PROJECT,
+    ));
     let admin = ComputeResolvedSqlBackend::new(
         resolver,
         compute,
@@ -536,8 +539,10 @@ async fn provision_shared(
     // the migrate path re-runs it after each apply so newly-created tables are covered too.
     let grants = grant_app_role_ddl(kind, &names.role, &names.owner_role);
     if !grants.is_empty() {
-        let tenant_resolver =
-            Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
+        let tenant_resolver = Arc::new(DeployEndpointResolver::new_ungated(
+            deploy.clone(),
+            DEFAULT_PROJECT,
+        ));
         let tenant_admin = ComputeResolvedSqlBackend::new(
             tenant_resolver,
             compute,
@@ -636,7 +641,10 @@ pub(crate) async fn shared_admin_backend_for_db(
         .password(DEFAULT_PROJECT, compute)
         .await
         .map_err(|e| format!("superuser credential ({compute}): {e}"))?;
-    let resolver = Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
+    let resolver = Arc::new(DeployEndpointResolver::new_ungated(
+        deploy.clone(),
+        DEFAULT_PROJECT,
+    ));
     Ok(ComputeResolvedSqlBackend::new(
         resolver,
         compute,
@@ -1285,10 +1293,14 @@ impl NodeTenantSqlResolver {
             TenantIsolation::Single if !is_default => project.to_string(),
             _ => DEFAULT_PROJECT.to_string(),
         };
-        let resolver: Arc<dyn ComputeEndpointResolver> = Arc::new(DeployEndpointResolver::new(
-            self.deploy.clone(),
-            endpoint_project,
-        ));
+        // Handler-runtime routing — gate at the DB's configured `routing` readiness level
+        // (default `Provisioned`): a request is routed to a replica only once it meets it.
+        let resolver: Arc<dyn ComputeEndpointResolver> =
+            Arc::new(DeployEndpointResolver::new_gated(
+                self.deploy.clone(),
+                endpoint_project,
+                self.binding.readiness_gate.routing,
+            ));
 
         let mut backend = ComputeResolvedSqlBackend::new(
             resolver,

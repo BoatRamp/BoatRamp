@@ -615,7 +615,16 @@ impl boatramp_container::dns_server::InternalDnsSource for DeployDnsSource {
             // list order that `list_all_replica_states` preserves per workload. The
             // compute bridge is IPv4 today, so every endpoint is an `A` record; a
             // future v6 bridge would populate `ResolvedAddrs::v6` here.
-            if st.phase == ReplicaPhase::Running && st.healthy {
+            // Answerability gate (v0.45.0): only a `Provisioned` replica is a valid
+            // answer target — a workload whose post-launch actions have not completed (a
+            // managed DB still provisioning, or one in `ProvisionFailed`, or a generic
+            // workload whose `post_launch` Exec has not finished) is NOT answered, so the
+            // fabric never routes to a not-yet-ready upstream. This is the strict default
+            // across ALL workloads; a generic healthy workload reaches `Provisioned`
+            // immediately, so it is unchanged. (Per-DB relaxation of answerability to
+            // `service_ready` needs the node-global DNS source to become config-aware —
+            // a follow-up; routing + migration are already per-DB-configurable.)
+            if st.phase == ReplicaPhase::Running && st.healthy && st.readiness.is_provisioned() {
                 fleet
                     .addrs
                     .entry(key)

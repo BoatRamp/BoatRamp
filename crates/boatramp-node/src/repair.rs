@@ -2190,7 +2190,9 @@ async fn probe_role_can_connect(
             Err(_) => return ConnectProbe::Refused,
         },
     };
-    let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
+    // UNGATED: repair is the recovery path — it must reach a replica that is not yet
+    // (or no longer) `Provisioned`, since repair is how such a database gets fixed.
+    let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new_ungated(
         deploy.clone(),
         boatramp_core::project::DEFAULT_PROJECT,
     ));
@@ -2383,7 +2385,8 @@ async fn build_compute_backend(
 ) -> Result<Arc<dyn SqlBackend>, BackendBuildError> {
     use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
     let password = resolve_diagnostic_password(creds, cred_project, cred_workload, mode).await?;
-    let resolver = Arc::new(DeployEndpointResolver::new(
+    // UNGATED: repair/diagnostics must reach a not-yet-`Provisioned` replica (see above).
+    let resolver = Arc::new(DeployEndpointResolver::new_ungated(
         deploy.clone(),
         endpoint_project.to_string(),
     ));

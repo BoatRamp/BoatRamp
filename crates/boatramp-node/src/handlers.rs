@@ -839,9 +839,10 @@ async fn build_sql_backends(
                     let password = env_source
                         .get(var)
                         .ok_or_else(|| Error::SqlEnvUnset(var.into()))?;
-                    let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
+                    let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new_gated(
                         deploy.clone(),
                         boatramp_core::project::DEFAULT_PROJECT,
+                        db.readiness_gate.routing,
                     ));
                     let external: Arc<dyn SqlBackend> = Arc::new(
                         boatramp_storage::sql_compute::ComputeResolvedSqlBackend::new(

@@ -1806,6 +1806,14 @@ pub struct ExternalDatabaseConfig {
     /// and none of another tenant's. The reserved `default` project uses the plain
     /// configured name, so a single-tenant install is just one ordinary database.
     pub tenant_scope: TenantScope,
+    /// The per-surface **readiness gate** (v0.45.0): the readiness level each surface
+    /// requires before it treats a managed-DB replica as usable. Default: every surface
+    /// `provisioned` (strict — route/answer/migrate only once post-launch provisioning has
+    /// completed). Relax a surface to `service_ready` to use a replica as soon as it
+    /// answers `SELECT 1`, before provisioning finishes. Ignored for a bring-your-own
+    /// (`url_env`) database.
+    #[serde(default)]
+    pub readiness_gate: ReadinessGate,
     /// **Opt-in** (default `false`): inject the request's `boatramp.project` /
     /// `boatramp.site` into the SQL session at each transaction start (Postgres
     /// `set_config` GUC, MySQL session var), so hand-written **native RLS** policies
@@ -1887,6 +1895,12 @@ pub enum TenantScope {
     /// A tenant is a **site** (finer than project).
     Site,
 }
+
+/// Re-export: the readiness-gate value types live in `boatramp-types` (shared between the
+/// manifest `ApplyDatabase` and this serving config), surfaced here for the
+/// `ExternalDatabaseConfig::readiness_gate` field.
+#[cfg_attr(not(feature = "handlers"), allow(unused_imports))]
+pub use boatramp_core::compute::{ReadinessGate, ReadinessLevel};
 
 impl ExternalDatabaseConfig {
     /// Validate the source is well-formed: **exactly one** of `url_env` /
