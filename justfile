@@ -256,6 +256,13 @@ bump-version version:
     # The internal path-dep pins, anchored on the boatramp path so no external dep
     # is touched.
     perl -i -pe 's/(boatramp-[a-z-]+ = \{ path = "crates\/boatramp-[a-z-]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
+    # Member crates that pin an internal dep DIRECTLY (a relative `../boatramp-*` path with its
+    # own version — e.g. boatramp-overlay-client's feature-selected boatramp-overlay) rather than
+    # through [workspace.dependencies]. Anchored on the `../boatramp-*` relative path so no external
+    # dep is touched, and tolerant of a trailing `, default-features = …, features = [ …` on the line.
+    for m in crates/*/Cargo.toml; do
+      perl -i -pe 's/(boatramp-[a-z-]+ = \{ path = "\.\.\/boatramp-[a-z-]+", )version = "[^"]*"/${1}version = "'"$v"'"/g' "$m"
+    done
     # The workspace-excluded console crate (its own manifest + lockfile).
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
     # The README's install pins (`cargo install boatramp@X`, `nix run …/vX`,
