@@ -1368,14 +1368,16 @@ impl ControlPlane {
         // connect as (per-tenant-qualified on Shared); fall back to the requested name if an
         // older server omits it. `password` is present only when freshly minted (once).
         Ok((
-            v.get("created").and_then(|b| b.as_bool()).unwrap_or(false),
+            v.get("created")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             v.get("role_name")
                 .and_then(|r| r.as_str())
                 .unwrap_or(user)
                 .to_string(),
             v.get("password")
                 .and_then(|p| p.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
         ))
     }
 
@@ -1397,7 +1399,9 @@ impl ControlPlane {
             .json()
             .await?;
         Ok((
-            v.get("existed").and_then(|b| b.as_bool()).unwrap_or(false),
+            v.get("existed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             v.get("role_name")
                 .and_then(|r| r.as_str())
                 .unwrap_or(user)

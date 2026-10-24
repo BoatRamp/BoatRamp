@@ -42,6 +42,7 @@ fn spec() -> ComputeSpec {
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
         bindings: vec![],
+        post_launch: vec![],
     }
 }
 
