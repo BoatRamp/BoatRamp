@@ -57,14 +57,14 @@ pub(crate) use admin_api::{
     compute_dev_bind_messaging, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
     compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
     create_deployment, current_deployment, database_status, declare_database, delete_compute,
-    delete_compute_volume, delete_project_tenancy, delete_site, ensure_database, get_compute,
-    get_daemon_config, get_database, get_deployment, get_project_tenancy, get_site_config,
-    invalidate_cache, list_aliases, list_compute, list_compute_volumes, list_databases,
-    list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run, migrate_status,
-    project_export, project_import, prune_delete, prune_report, put_blob, put_compute,
-    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, repair_apply,
-    repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
-    sql_query,
+    delete_compute_volume, delete_project_tenancy, delete_site, ensure_database, ensure_user,
+    get_compute, get_daemon_config, get_database, get_deployment, get_project_tenancy,
+    get_site_config, invalidate_cache, list_aliases, list_compute, list_compute_volumes,
+    list_databases, list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run,
+    migrate_status, project_export, project_import, prune_delete, prune_report, put_blob,
+    put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
+    repair_apply, repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec,
+    sql_move, sql_ping, sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{

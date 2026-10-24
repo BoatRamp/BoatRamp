@@ -513,7 +513,14 @@ pub fn router_with_fast(
             get(get_database).put(declare_database),
         )
         .route("/api/databases/{name}/status", get(database_status))
-        .route("/api/databases/{name}/ensure", post(ensure_database));
+        .route("/api/databases/{name}/ensure", post(ensure_database))
+        // Ensure a login role on a declared managed database (Project·Admin — the
+        // `(&"databases", _)` family rule gates this deeper path too; the project-scoped
+        // `/api/projects/{proj}/databases/{db}/users/{user}/ensure` form rewrites here).
+        .route(
+            "/api/databases/{name}/users/{user}/ensure",
+            post(ensure_user),
+        );
     // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress §6):
     // mint a short-lived, scoped S3 upload credential for a project+site's blob container. Its OWN
     // prefix, gated at `BlobUpload·Write` (`Right::required`) — deliberately NOT under `/api/blobs`

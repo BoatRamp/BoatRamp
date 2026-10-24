@@ -1243,6 +1243,43 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Ensure a login role on a declared managed database
+    /// (`POST /api/{seg}/databases/{database}/users/{user}/ensure`). `Project·Admin`.
+    /// Returns `(created, password)`: `password` is `Some` ONLY on the call that minted
+    /// the role (return-once), `None` on a re-ensure. `password_secret` is an optional
+    /// operator-supplied secret ref (BYO).
+    pub async fn ensure_user(
+        &self,
+        database: &str,
+        user: &str,
+        password_secret: Option<&str>,
+    ) -> Result<(bool, String, Option<String>)> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let mut req = client.post(format!("{server}/api/{seg}/{database}/users/{user}/ensure"));
+        if let Some(sref) = password_secret {
+            req = req.json(&serde_json::json!({ "password_secret": sref }));
+        }
+        let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        // (created, role_name, password). `role_name` is the ACTUAL cluster principal to
+        // connect as (per-tenant-qualified on Shared); fall back to the requested name if an
+        // older server omits it. `password` is present only when freshly minted (once).
+        Ok((
+            v.get("created").and_then(|b| b.as_bool()).unwrap_or(false),
+            v.get("role_name")
+                .and_then(|r| r.as_str())
+                .unwrap_or(user)
+                .to_string(),
+            v.get("password")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string()),
+        ))
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

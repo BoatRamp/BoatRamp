@@ -1949,6 +1949,62 @@ pub(super) async fn ensure_database(
     }
 }
 
+/// The optional body of the ensure-user verb.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EnsureUserBody {
+    /// An operator-supplied secret ref for the role's password (BYO). Omit to mint + seal
+    /// a managed credential (returned once). (BYO is a scoped follow-up today.)
+    #[serde(default)]
+    pub password_secret: Option<String>,
+}
+
+/// `POST /api/projects/{proj}/databases/{db}/users/{user}/ensure` — ensure a locked-down
+/// login role on an already-declared managed database, idempotently. `Project·Admin`
+/// (same owner-grade gate as declare/ensure, enforced by the middleware AND re-checked
+/// here). On the call that MINTS the role's credential the response carries `password`
+/// once; a re-ensure returns `created:false` and no password (the sealed secret is never
+/// re-surfaced).
+pub(super) async fn ensure_user(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path((db, user)): Path<(String, String)>,
+    body: Option<Json<EnsureUserBody>>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
+    if let Some(bad) = reject_invalid_db(&user) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    let secret = body.and_then(|b| b.0.password_secret);
+    match declare
+        .ensure_user(project.as_ref().as_str(), &db, &user, secret.as_deref())
+        .await
+    {
+        Ok(outcome) => {
+            let mut resp = serde_json::json!({
+                "user": user,
+                "database": db,
+                "created": outcome.created,
+                // The actual cluster principal to connect as (per-tenant-qualified on Shared).
+                "role_name": outcome.role_name,
+            });
+            // Return-once: the minted password appears ONLY on the creating call.
+            if let Some(pw) = outcome.password {
+                resp["password"] = serde_json::Value::String(pw);
+            }
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(e) => declare_error_response(e),
+    }
+}
+
 /// `GET /api/projects/{proj}/databases` — list the project's declared managed databases
 /// (read-only; `Project·Read`). Each is the stored typed
 /// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase).

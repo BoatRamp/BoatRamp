@@ -2166,6 +2166,40 @@ pub trait ManagedDbDeclare: Send + Sync {
     /// WITHOUT re-persisting the binding — the `POST /api/databases/{name}/ensure` verb.
     /// Fails with [`DeclareError::NotDeclared`] if nothing is declared by that name.
     async fn ensure(&self, project: &str, name: &str) -> Result<(), DeclareError>;
+
+    /// Ensure a **login role** `user` exists on the managed `database` in `project`,
+    /// idempotently — the `POST /api/databases/{database}/users/{user}/ensure` verb. The
+    /// role is explicitly non-superuser with `CONNECT` on that database. Its password is
+    /// either minted + sealed (the default — returned ONCE, in
+    /// [`EnsureUserOutcome::password`], only on the call that mints it) or taken from
+    /// `password_secret` (an operator-supplied secret ref). Re-ensuring an existing role
+    /// is a no-op that returns no password. `NotDeclared` if `database` is not a managed
+    /// declaration in `project`.
+    async fn ensure_user(
+        &self,
+        project: &str,
+        database: &str,
+        user: &str,
+        password_secret: Option<&str>,
+    ) -> Result<EnsureUserOutcome, DeclareError>;
+}
+
+/// The outcome of [`ManagedDbDeclare::ensure_user`]. `password` is `Some` **only** on the
+/// call that freshly minted the role's credential (return-once); a re-ensure of an
+/// existing role returns `created: false` and `password: None` — the sealed secret is
+/// never re-surfaced.
+#[derive(Debug, Clone)]
+pub struct EnsureUserOutcome {
+    /// Whether this call created (minted) the role's credential for the first time.
+    pub created: bool,
+    /// The ACTUAL cluster/server principal name the role was provisioned as — the plain
+    /// `user` for a Single or default-project binding, but a per-tenant-qualified name for
+    /// a Shared binding (many tenants, one cluster), which the operator's app MUST connect
+    /// as. The operator sees this so they know the real role name, not just the label.
+    pub role_name: String,
+    /// The minted login password, present ONLY when `created` (shown to the operator
+    /// once). Never set when the role already existed or a `password_secret` was supplied.
+    pub password: Option<String>,
 }
 
 /// Why a [`ManagedDbDeclare`] call was refused (each maps to an HTTP status at the API).

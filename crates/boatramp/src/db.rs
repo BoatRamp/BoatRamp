@@ -97,6 +97,19 @@ enum EnsureWhat {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
+    /// Ensure a login role on a declared managed database (idempotent). By default mints
+    /// and seals the role's password and prints it ONCE; re-ensuring is a no-op.
+    User {
+        /// The login role name to ensure.
+        name: String,
+        /// The managed database whose server the role is created on.
+        #[arg(long)]
+        database: String,
+        /// Use an operator-supplied secret ref for the password instead of minting one
+        /// (BYO). (Not yet supported server-side; omit to mint + seal.)
+        #[arg(long)]
+        password_secret: Option<String>,
+    },
 }
 
 /// Validate a `<name>` through the one canonical resource-identifier validator
@@ -136,6 +149,16 @@ pub enum DbOutput {
         readiness: String,
         reason: Option<String>,
         waited: bool,
+    },
+    /// `db ensure user <name> --database <db>` — the role was ensured. `password` is
+    /// present ONLY when freshly minted (shown once); absent on a re-ensure.
+    EnsureUser {
+        user: String,
+        database: String,
+        /// The actual cluster principal to connect as (per-tenant-qualified on Shared).
+        role_name: String,
+        created: bool,
+        password: Option<String>,
     },
 }
 
@@ -196,6 +219,49 @@ impl crate::output::Rendered for DbOutput {
                 }
                 Ok(())
             }
+            Self::EnsureUser {
+                user,
+                database,
+                role_name,
+                created,
+                password,
+            } => {
+                // On a Shared binding the actual cluster role is per-tenant-qualified, so it
+                // differs from the requested label — surface it as the name to connect as.
+                let note_qualified = |w: &mut dyn std::io::Write| -> std::io::Result<()> {
+                    if role_name != user {
+                        writeln!(w, "  connect as:  {role_name}  (requested `{user}`)")
+                    } else {
+                        Ok(())
+                    }
+                };
+                match password {
+                    Some(pw) => {
+                        writeln!(
+                            w,
+                            "created login role `{role_name}` on database `{database}`"
+                        )?;
+                        note_qualified(w)?;
+                        writeln!(w, "  password:    {pw}")?;
+                        writeln!(w, "  store this now — it will not be shown again")
+                    }
+                    None if *created => {
+                        // Created but no password surfaced (e.g. a BYO secret was used).
+                        writeln!(
+                            w,
+                            "created login role `{role_name}` on database `{database}`"
+                        )?;
+                        note_qualified(w)
+                    }
+                    None => {
+                        writeln!(
+                            w,
+                            "login role `{role_name}` already exists on database `{database}` (no change)"
+                        )?;
+                        note_qualified(w)
+                    }
+                }
+            }
         }
     }
 }
@@ -224,8 +290,35 @@ pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
                 validate_name(&name)?;
                 ensure_database(&cp, &name, wait, timeout).await
             }
+            EnsureWhat::User {
+                name,
+                database,
+                password_secret,
+            } => {
+                validate_name(&name)?;
+                validate_name(&database)?;
+                ensure_user(&cp, &database, &name, password_secret.as_deref()).await
+            }
         },
     }
+}
+
+/// `db ensure user <name> --database <db>` — ensure a login role, printing a freshly
+/// minted password once.
+async fn ensure_user(
+    cp: &ControlPlane,
+    database: &str,
+    user: &str,
+    password_secret: Option<&str>,
+) -> Result<DbOutput> {
+    let (created, role_name, password) = cp.ensure_user(database, user, password_secret).await?;
+    Ok(DbOutput::EnsureUser {
+        user: user.to_string(),
+        database: database.to_string(),
+        role_name,
+        created,
+        password,
+    })
 }
 
 /// `db ls` — list the declared managed databases.

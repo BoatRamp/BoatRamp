@@ -273,6 +273,27 @@ pub fn tenant_owner_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident_capped(&format!("{base}_{tenant_ident}_owner"), MAX_ROLE_IDENT_LEN)
 }
 
+/// Derive the actual cluster/server **principal name** for an operator-ensured login role
+/// (`db ensure user <user>`) on a **Shared** binding, where many tenants share one
+/// cluster. The operator's human `user` is only a label; the real role name MUST be
+/// namespaced per-tenant or two tenants naming the same user would collide on one
+/// cluster-global role (a cross-tenant password-reset + connect). Scheme:
+/// `<compute>_<tenant_ident>_u_<user>`, re-sanitized + length-capped via
+/// [`sanitize_ident`]'s digest. The collision-resistance that matters rides the
+/// `tenant_ident` itself: it already carries an un-forgeable per-project SHA-256 digest,
+/// so two tenants naming the same `user` get distinct roles (a tenant cannot forge
+/// another's digest to collide). It also stays distinct from [`tenant_role_name`] (`_role`),
+/// [`tenant_owner_role_name`] (`_owner`), and [`tenant_db_name`] — the `_u_` marker is
+/// cosmetic; distinctness rides the digest. (Single / default-project bindings have a
+/// dedicated cluster per tenant, so the caller uses the plain `user` there — no
+/// qualification needed.)
+pub fn ensure_user_role_name(compute: &str, tenant_ident: &str, user: &str) -> String {
+    sanitize_ident_capped(
+        &format!("{compute}_{tenant_ident}_u_{user}"),
+        MAX_ROLE_IDENT_LEN,
+    )
+}
+
 /// Quote a SQL **identifier** for `kind`, doubling the embedded quote char and
 /// wrapping it: Postgres uses `"double quotes"`, MySQL uses `` `backticks` ``.
 ///
@@ -404,6 +425,63 @@ pub fn provision_ddl(
                 format!("CREATE USER IF NOT EXISTS {user} IDENTIFIED BY {pw_lit};"),
                 format!("ALTER USER {user} IDENTIFIED BY {pw_lit};"),
                 format!("GRANT ALL PRIVILEGES ON {db_id}.* TO {user};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
+/// Ordered, **idempotent** DDL to ensure a single named **login role** exists on a
+/// managed database's server, locked down (explicitly NON-superuser), with `CONNECT` on
+/// `database`. Backs `boatramp db ensure user` — an operator-provisioned application login
+/// role. `role`, `database`, and `password` are quoted defensively through
+/// [`quote_ident`]/[`quote_literal`] (never interpolated raw). Unlike [`provision_ddl`]
+/// this creates NO database and NO owner role — it provisions one login principal against
+/// an already-existing database.
+///
+/// # Postgres
+/// 1. `DO $$ … IF NOT EXISTS (pg_roles) THEN CREATE ROLE <role> LOGIN NOSUPERUSER
+///    NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD …; END IF; END $$;`
+/// 2. `ALTER ROLE <role> WITH LOGIN NOSUPERUSER … PASSWORD …;` (re-assert the safe
+///    attributes + keep the password in sync on a re-ensure — heals a drifted role).
+/// 3. `GRANT CONNECT ON DATABASE <db> TO <role>;`
+///
+/// # MySQL
+/// 1. `CREATE USER IF NOT EXISTS '<role>'@'%' IDENTIFIED BY …;`
+/// 2. `ALTER USER '<role>'@'%' IDENTIFIED BY …;` (keep the password in sync)
+/// 3. `GRANT USAGE ON *.* TO '<role>'@'%';` (login only — no schema privileges by default)
+/// 4. `FLUSH PRIVILEGES;`
+pub fn ensure_login_role_ddl(
+    kind: ExternalSqlKind,
+    role: &str,
+    password: &str,
+    database: &str,
+) -> Vec<String> {
+    let role_id = quote_ident(kind, role);
+    let db_id = quote_ident(kind, database);
+    let pw_lit = quote_literal(password);
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let role_lit = quote_literal(role);
+            vec![
+                format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {role_lit}) THEN \
+                     CREATE ROLE {role_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit}; \
+                     END IF; END $$;"
+                ),
+                format!(
+                    "ALTER ROLE {role_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit};"
+                ),
+                format!("GRANT CONNECT ON DATABASE {db_id} TO {role_id};"),
+            ]
+        }
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(role);
+            vec![
+                format!("CREATE USER IF NOT EXISTS {user} IDENTIFIED BY {pw_lit};"),
+                format!("ALTER USER {user} IDENTIFIED BY {pw_lit};"),
+                format!("GRANT USAGE ON *.* TO {user};"),
                 "FLUSH PRIVILEGES;".to_string(),
             ]
         }
@@ -905,6 +983,38 @@ mod tests {
         }
     }
 
+    /// `ensure_user_role_name` namespaces an operator-ensured login role per-tenant so the
+    /// same human user on two Shared tenants can never collide on one cluster-global role
+    /// (the HIGH-1 cross-tenant fix), and stays distinct from the auto-provisioned
+    /// runtime/owner roles + the db name, within the MySQL user cap, safe-charset, and
+    /// never the Postgres-reserved `pg_` prefix.
+    #[test]
+    fn ensure_user_role_name_is_per_tenant_and_distinct() {
+        let a = sanitize_ident("acme");
+        let b = sanitize_ident("globex");
+        let ra = ensure_user_role_name("pg", &a, "reporting");
+        // Same user, different tenants → distinct cluster roles.
+        assert_ne!(
+            ra,
+            ensure_user_role_name("pg", &b, "reporting"),
+            "the same user on two tenants must be two distinct cluster roles"
+        );
+        // Different users on the same tenant → distinct.
+        assert_ne!(ra, ensure_user_role_name("pg", &a, "analytics"));
+        // Distinct from the tenant runtime/owner roles + the db name (carried by the digest).
+        assert_ne!(ra, tenant_role_name("pg", &a));
+        assert_ne!(ra, tenant_owner_role_name("pg", &a));
+        assert_ne!(ra, tenant_db_name("pg", &a));
+        // Fits the MySQL user cap, safe charset, never the reserved pg_ prefix, deterministic.
+        assert!(ra.len() <= MAX_ROLE_IDENT_LEN, "role over cap: {ra}");
+        assert!(!ra.starts_with("pg_"), "reserved pg_ prefix: {ra}");
+        assert!(
+            ra.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        );
+        assert_eq!(ra, ensure_user_role_name("pg", &a, "reporting"));
+    }
+
     /// A compute workload named `pg` (the natural name for a Postgres server) is the
     /// role base, so the role must NOT come out `pg_…` — Postgres reserves that prefix
     /// for system roles and rejects `CREATE ROLE "pg_…"`. Regression for the live gate
@@ -1024,6 +1134,56 @@ mod tests {
     #[test]
     fn grant_app_role_ddl_mysql_is_empty() {
         assert!(grant_app_role_ddl(ExternalSqlKind::Mysql, "role", "owner").is_empty());
+    }
+
+    /// `ensure_login_role_ddl` creates a locked-down (NON-superuser) login role, quotes
+    /// the role/db/password, and creates NO database/owner. The anti-escalation asserts
+    /// are the load-bearing ones (a mutation dropping NOSUPERUSER, or leaving the name
+    /// unquoted, must fail this test).
+    #[test]
+    fn ensure_login_role_ddl_postgres_is_locked_down_and_quoted() {
+        let stmts =
+            ensure_login_role_ddl(ExternalSqlKind::Postgres, "app_role", "s3cr'et", "app_db");
+        let all = stmts.join("\n");
+        // The role is created + its attributes re-asserted, and granted CONNECT to the db.
+        assert!(all.contains("CREATE ROLE \"app_role\" LOGIN"));
+        assert!(all.contains("ALTER ROLE \"app_role\" WITH LOGIN"));
+        assert!(all.contains("GRANT CONNECT ON DATABASE \"app_db\" TO \"app_role\""));
+        // Locked down: explicitly non-superuser, no cluster-level reach, RLS-enforced.
+        assert!(
+            all.contains("NOSUPERUSER"),
+            "role must be explicitly non-superuser"
+        );
+        assert!(all.contains("NOCREATEDB") && all.contains("NOCREATEROLE"));
+        assert!(all.contains("NOBYPASSRLS"), "role must not bypass RLS");
+        // Password is a single-quoted literal with the embedded quote doubled, never raw.
+        assert!(
+            all.contains("'s3cr''et'"),
+            "password must be quoted, embedded quote doubled"
+        );
+        assert!(
+            !all.contains("s3cr'et "),
+            "the raw unescaped password must never appear"
+        );
+        // It provisions ONLY a login principal — no database/owner creation.
+        assert!(!all.to_ascii_uppercase().contains("CREATE DATABASE"));
+        assert!(!all.to_ascii_uppercase().contains("OWNER"));
+    }
+
+    /// The MySQL path creates a locked `'<role>'@'%'` user with only `USAGE` (login, no
+    /// schema rights), password quoted, and no database.
+    #[test]
+    fn ensure_login_role_ddl_mysql_is_login_only_and_quoted() {
+        let stmts = ensure_login_role_ddl(ExternalSqlKind::Mysql, "app_role", "p'w", "app_db");
+        let all = stmts.join("\n");
+        assert!(all.contains("CREATE USER IF NOT EXISTS 'app_role'@'%'"));
+        assert!(all.contains("GRANT USAGE ON *.* TO 'app_role'@'%'"));
+        assert!(
+            all.contains("'p''w'"),
+            "password quoted, embedded quote doubled"
+        );
+        assert!(!all.to_ascii_uppercase().contains("ALL PRIVILEGES"));
+        assert!(!all.to_ascii_uppercase().contains("CREATE DATABASE"));
     }
 
     // ---- quoting ---------------------------------------------------------

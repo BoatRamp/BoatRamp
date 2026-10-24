@@ -443,6 +443,140 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         .await;
         self.provision(&binding, project).await
     }
+
+    async fn ensure_user(
+        &self,
+        project: &str,
+        database: &str,
+        user: &str,
+        password_secret: Option<&str>,
+    ) -> Result<boatramp_core::sql::EnsureUserOutcome, DeclareError> {
+        use boatramp_core::sql::{EnsureUserOutcome, SqlBackend};
+        use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
+
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", database)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", user)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+
+        // BYO credential (`--password-secret`) is a scoped follow-up: the declare service
+        // has no env/secret source wired. Mint+seal is the supported path today.
+        if password_secret.is_some() {
+            return Err(DeclareError::Other(
+                "ensure user --password-secret is not yet supported; omit it to mint and seal \
+                 a managed login credential"
+                    .to_string(),
+            ));
+        }
+
+        // Resolve the target database's managed binding through the merge point (daemon
+        // conflict refuses; own-project only), and require it to be a managed binding.
+        let binding =
+            match resolve_binding(&self.static_dbs, &self.deploy, project, database).await? {
+                Some(b) => b,
+                None => return Err(DeclareError::NotDeclared(database.to_string())),
+            };
+        if !binding.is_managed_credential() {
+            return Err(DeclareError::NotDeclared(database.to_string()));
+        }
+        let kind = boatramp_storage::ExternalSqlKind::parse(&binding.kind)
+            .ok_or_else(|| DeclareError::Other(format!("database {database:?}: unknown engine")))?;
+
+        // The superuser connection target — Single vs Shared, per-tenant derivation + cred
+        // keying — resolved EXACTLY as the operator `sql exec` path does (no re-derivation).
+        let target = crate::managed_sql::operator_target(&binding, project, database)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        let creds =
+            crate::managed_sql::ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
+        let superuser_pw = creds
+            .password(&target.cred_project, &target.cred_workload)
+            .await
+            .map_err(DeclareError::Other)?;
+
+        // The ACTUAL cluster principal name. On a Shared binding many tenants share ONE
+        // cluster, so the operator's human `user` must be namespaced per-tenant or two
+        // tenants naming the same user would collide on one cluster-global role (a
+        // cross-tenant password-reset + connect). Single / default-project bindings have a
+        // dedicated cluster per tenant, so the plain `user` is already collision-safe there.
+        let compute = binding
+            .compute
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                DeclareError::Other(format!("database {database:?}: not compute-backed"))
+            })?;
+        let (tenant_ident_raw, is_default) =
+            crate::tenant_sql::tenant_key(binding.tenant_scope, project, "");
+        let role_name =
+            if matches!(binding.tenant, crate::config::TenantIsolation::Shared) && !is_default {
+                let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+                boatramp_storage::tenant_provision::ensure_user_role_name(compute, &ident, user)
+            } else {
+                user.to_string()
+            };
+
+        // The login role's OWN credential — minted + sealed under the operator's project,
+        // keyed per (project, user) — NOT per database: one human user is ONE principal with
+        // ONE password, granted CONNECT on each database it's ensured against (so ensuring
+        // the same user on a second database adds a grant, never resets the password). The
+        // credential maps 1:1 to `role_name`. Return-once: an already-sealed credential is a
+        // re-ensure (never re-surface the secret); otherwise mint now. Either way the
+        // idempotent DDL re-runs, so a role lost to a data-dir wipe is re-created.
+        let role_key = format!("user:{user}");
+        let was_sealed = creds
+            .is_sealed(project, &role_key)
+            .await
+            .map_err(DeclareError::Other)?;
+        let role_pw = creds
+            .password(project, &role_key)
+            .await
+            .map_err(DeclareError::Other)?;
+
+        // Connect UNGATED (the provisioning carve-out — the server need not be
+        // `Provisioned`) to the maintenance database as the superuser, and run the
+        // idempotent, locked-down `CREATE ROLE` + `GRANT CONNECT`.
+        let resolver =
+            std::sync::Arc::new(crate::managed_sql::DeployEndpointResolver::new_ungated(
+                self.deploy.clone(),
+                target.endpoint_project.clone(),
+            ));
+        let admin = ComputeResolvedSqlBackend::new(
+            resolver,
+            target.workload.clone(),
+            kind,
+            crate::tenant_sql::maintenance_database(kind),
+            target.user.clone(),
+            superuser_pw,
+            Some(1),
+            false,
+            Some(std::time::Duration::from_secs(10)),
+        );
+        for stmt in boatramp_storage::tenant_provision::ensure_login_role_ddl(
+            kind,
+            &role_name,
+            &role_pw,
+            &target.database,
+        ) {
+            if let Err(e) = admin.run_script(&stmt).await {
+                // Redact the role password from any surfaced error: the DDL text embeds it
+                // as a literal, and a driver/backend error could echo the statement.
+                let safe = e.to_string().replace(role_pw.as_str(), "***");
+                return Err(DeclareError::Other(format!(
+                    "ensure user {user} on {database}: {safe}"
+                )));
+            }
+        }
+
+        Ok(EnsureUserOutcome {
+            created: !was_sealed,
+            // The ACTUAL cluster principal the operator connects as — the plain `user` for
+            // Single/default, the per-tenant-qualified name for a Shared binding.
+            role_name,
+            password: (!was_sealed).then_some(role_pw),
+        })
+    }
 }
 
 #[cfg(test)]
