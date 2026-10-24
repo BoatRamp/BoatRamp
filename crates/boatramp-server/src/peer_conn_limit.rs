@@ -4,9 +4,11 @@
 //! guest (e.g. an imapd on :993). The guest NEVER sees the peer IP — it only gets the connection's
 //! `wasi:io` streams — so it cannot throttle a brute-force client the way native imapd does (a client
 //! otherwise resets its auth-backoff just by reconnecting, the 28g MEDIUM-1). So the HOST admits
-//! connections at the accept loop: a per-source-IP **token bucket** (steady `rate` tokens/sec, up to
-//! `burst`), checked BEFORE any guest work. A client may open `burst` connections immediately, then
-//! `rate`/sec sustained; over that, the connection is refused and closed cheaply.
+//! each connection through a per-source-IP **token bucket** (steady `rate` tokens/sec, up to
+//! `burst`) BEFORE any guest work — in the accept loop for a direct listener, or just after the
+//! PROXY-protocol header reveals the real client IP (then in the spawned task) on a `proxy_protocol`
+//! listener (cap-req 18 completion). A client may open `burst` connections immediately, then `rate`/sec
+//! sustained; over that, the connection is refused and closed cheaply.
 //!
 //! Memory is bounded against an IP-spray DoS: a bucket refilled to `burst` is **idle** — dropping it
 //! loses no state (a re-created bucket starts full), so when the tracked-IP map would exceed
@@ -20,8 +22,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 /// A per-IP token bucket. `rate` tokens accrue per second up to `burst`; one token is spent per
-/// admitted connection. Cheap to clone-key by IP; all state is behind one mutex (the accept loop is
-/// a single task, and admission is O(1) amortized).
+/// admitted connection. All state is behind one mutex and admission is O(1) amortized. `admit` runs
+/// from the accept loop for a direct listener, but from many concurrently-spawned per-connection
+/// tasks on a `proxy_protocol` listener (the real IP is only known after the header is read) — the
+/// mutex makes that safe; do not reintroduce a single-task assumption.
 pub struct PeerConnLimiter {
     rate_per_sec: f64,
     burst: f64,

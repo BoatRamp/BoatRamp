@@ -3494,6 +3494,9 @@ fn spawn_listeners(
             // behind an L4 proxy. Opt-in; fail-closed when on (default off — never parse on a direct
             // listener, else a client could forge its source IP).
             proxy_protocol: l.proxy_protocol,
+            // security-review MEDIUM-1: trust the header only from these proxy source CIDRs (empty ⇒
+            // firewall-only mode).
+            proxy_protocol_trusted_cidrs: l.proxy_protocol_trusted_cidrs.clone(),
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),

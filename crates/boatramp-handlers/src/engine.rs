@@ -493,6 +493,13 @@ struct HostState {
     /// Per-dial READ/IDLE timeout for `tcp-egress` (copied from the engine).
     #[cfg(feature = "tcp-egress")]
     tcp_egress_idle_timeout: Duration,
+    /// This invocation's remaining `dns-resolve` budget (mailroom cap-req #20, security-review
+    /// HIGH-1). STORE-RESIDENT so it persists across the per-call rebuild of `DnsResolveHost`: the
+    /// binding borrows this counter and `spend()` decrements it, so the 64/invocation cap is actually
+    /// enforced (a view-local counter would reset every call and never limit anything). An `AtomicU32`
+    /// (not a `Cell`) because the async host-call future it is borrowed into must be `Send`.
+    #[cfg(feature = "tcp-egress")]
+    dns_resolve_budget: std::sync::atomic::AtomicU32,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -3174,6 +3181,9 @@ impl HandlerEngine {
                 state.bindings.dns_resolve(),
                 state.tcp_egress_enabled,
                 state.http_hooks.allow_private_egress,
+                // Borrow the STORE-resident budget (security-review HIGH-1): it persists across the
+                // per-call rebuild of this view, so the per-invocation cap is actually enforced.
+                &state.dns_resolve_budget,
             )
         })?;
         Ok(linker)
@@ -3314,6 +3324,10 @@ impl HandlerEngine {
             tcp_egress_connect_timeout: self.tcp_egress_connect_timeout,
             #[cfg(feature = "tcp-egress")]
             tcp_egress_idle_timeout: self.tcp_egress_idle_timeout,
+            #[cfg(feature = "tcp-egress")]
+            dns_resolve_budget: std::sync::atomic::AtomicU32::new(
+                bindings::dns_resolve::MAX_RESOLVES_PER_INVOCATION,
+            ),
             #[cfg(feature = "sql")]
             sql,
             // Set by the listener dispatch after `new_store`; a non-listener invocation leaves it

@@ -99,6 +99,11 @@ pub struct ListenerParams {
     /// otherwise, fail-closed) and that address drives the per-IP limit + the guest's `peer`. `false`
     /// ⇒ the kernel peer is used, unchanged. The orchestrator copies it from the listener config.
     pub proxy_protocol: bool,
+    /// Trusted-proxy source CIDRs for `proxy_protocol` (security-review MEDIUM-1): `ip/prefix` strings.
+    /// When non-empty, a PROXY header is trusted ONLY from a kernel peer inside one of these CIDRs
+    /// (else the connection is dropped). Empty ⇒ trust a header from any source (firewall-only mode).
+    /// Parsed once at [`run_listener`]; a malformed entry fails the listener closed (it is not served).
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
 }
 
 /// How long to wait for a connection's PROXY-protocol header before dropping it (cap-req 18): a
@@ -131,7 +136,29 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         session_mode,
         peer_conn_limit,
         proxy_protocol,
+        proxy_protocol_trusted_cidrs,
     } = params;
+
+    // Parse the trusted-proxy CIDRs once (security-review MEDIUM-1). A malformed entry fails the
+    // listener CLOSED — a misconfigured trusted set must not silently fall back to trusting any
+    // source. Empty ⇒ trust a PROXY header from any kernel peer (firewall-only mode).
+    let proxy_trusted: Vec<ipnet::IpNet> = {
+        let mut nets = Vec::with_capacity(proxy_protocol_trusted_cidrs.len());
+        for entry in &proxy_protocol_trusted_cidrs {
+            match entry.parse::<ipnet::IpNet>() {
+                Ok(net) => nets.push(net),
+                Err(e) => {
+                    tracing::error!(
+                        listener = %name, cidr = %entry, error = %e,
+                        "NOT serving listener: malformed `proxy_protocol_trusted_cidrs` entry \
+                         (fail-closed — a bad trusted set must not trust any source)"
+                    );
+                    return;
+                }
+            }
+        }
+        nets
+    };
 
     let listener = match TcpListener::bind(bind).await {
         Ok(l) => l,
@@ -196,6 +223,21 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 // Nagle off: a request/response protocol over this stream shouldn't coalesce small
                 // writes behind the delayed-ack timer. Best-effort.
                 let _ = stream.set_nodelay(true);
+                // cap-req 18 / security-review MEDIUM-1: on a proxy_protocol listener with a trusted
+                // -CIDR set, only a connection FROM the trusted proxy may have its header trusted —
+                // drop anything else (fail-closed), so a firewall gap can't become source-IP spoofing.
+                // (Empty set ⇒ firewall-only mode: trust a header from any kernel peer.)
+                if proxy_protocol
+                    && !proxy_trusted.is_empty()
+                    && !proxy_trusted.iter().any(|net| net.contains(&peer.ip()))
+                {
+                    tracing::debug!(
+                        listener = %name, %peer,
+                        "dropping connection: kernel peer not in `proxy_protocol_trusted_cidrs`"
+                    );
+                    drop(stream);
+                    continue;
+                }
                 // cap-req 18: per-source-IP connection-rate admission BEFORE any guest work. A peer
                 // over its token-bucket rate is refused + closed cheaply (restoring brute-force
                 // protection a FaaS listener guest can't do itself — it never sees the peer IP). For a

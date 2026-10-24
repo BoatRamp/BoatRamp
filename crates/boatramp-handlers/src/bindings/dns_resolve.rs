@@ -78,17 +78,24 @@ impl DnsResolveBinding {
 /// granted guest as a DNS scanner/amplifier — generous for legitimate use (direct-MX resolves ~one MX
 /// per message), low enough to blunt a scan. The budget resets per invocation; the complement to the
 /// per-source-IP connection-rate limit (cap-req 18) that bounds how fast new invocations arrive.
-const MAX_RESOLVES_PER_INVOCATION: u32 = 64;
+pub(crate) const MAX_RESOLVES_PER_INVOCATION: u32 = 64;
 
 /// The per-invocation host view of the `dns-resolve` capability. Carries the grant plus the egress
 /// POSTURE (`posture_enabled`, the `allow_guest_tcp_egress` flag) and the SSRF posture
-/// (`allow_private`) read from the invocation's `HostState` — exactly like `TcpEgressHost` — and a
-/// per-invocation resolve budget.
+/// (`allow_private`) read from the invocation's `HostState` — exactly like `TcpEgressHost`.
+///
+/// The resolve budget is a BORROW of a store-resident `AtomicU32` (`HostState.dns_resolve_budget`),
+/// NOT a field of this view: wasmtime rebuilds this view on EVERY host call (the `add_to_linker`
+/// getter), so a view-local counter would reset to the max each call and never limit anything
+/// (security-review HIGH-1). Borrowing the store counter makes `spend()` decrement state that PERSISTS
+/// across calls within the invocation — the same reason
+/// [`ConnectionSecurity`](super::tcp_connection_context) lives in an `Arc<AtomicU8>`, not the view.
+/// (An `AtomicU32` rather than a `Cell`: the async host-call future must be `Send`, and `&Cell` is not.)
 pub struct DnsResolveHost<'a> {
     binding: Option<&'a DnsResolveBinding>,
     posture_enabled: bool,
     allow_private: bool,
-    budget: u32,
+    budget: &'a std::sync::atomic::AtomicU32,
 }
 
 impl<'a> DnsResolveHost<'a> {
@@ -96,12 +103,13 @@ impl<'a> DnsResolveHost<'a> {
         binding: Option<&'a DnsResolveBinding>,
         posture_enabled: bool,
         allow_private: bool,
+        budget: &'a std::sync::atomic::AtomicU32,
     ) -> Self {
         Self {
             binding,
             posture_enabled,
             allow_private,
-            budget: MAX_RESOLVES_PER_INVOCATION,
+            budget,
         }
     }
 
@@ -114,14 +122,16 @@ impl<'a> DnsResolveHost<'a> {
         }
     }
 
-    /// Spend one unit of this invocation's resolve budget (counts the ATTEMPT, so probing
-    /// non-existent names still consumes it). `rate-limited` once exhausted.
-    fn spend(&mut self) -> Result<(), dns_resolve::DnsError> {
-        if self.budget == 0 {
-            return Err(dns_resolve::DnsError::RateLimited);
-        }
-        self.budget -= 1;
-        Ok(())
+    /// Spend one unit of this invocation's (store-resident) resolve budget (counts the ATTEMPT, so
+    /// probing non-existent names still consumes it). `rate-limited` once exhausted. `checked_sub`
+    /// floors at 0 (no underflow/wrap); `Relaxed` is fine — a soft per-invocation bound, not a
+    /// synchronization point.
+    fn spend(&self) -> Result<(), dns_resolve::DnsError> {
+        use std::sync::atomic::Ordering;
+        self.budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| dns_resolve::DnsError::RateLimited)
     }
 }
 
@@ -190,6 +200,7 @@ pub fn add_to_linker<T: Send + 'static>(
 mod tests {
     use super::dns_resolve::Host;
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct StubResolver {
         mx: Vec<MxRecord>,
@@ -210,9 +221,15 @@ mod tests {
         DnsResolveBinding::new(Arc::new(StubResolver { mx, addrs }))
     }
 
+    /// A fresh store-resident budget counter (what `HostState.dns_resolve_budget` holds).
+    fn budget() -> AtomicU32 {
+        AtomicU32::new(MAX_RESOLVES_PER_INVOCATION)
+    }
+
     #[tokio::test]
     async fn ungranted_is_access_denied() {
-        let mut host = DnsResolveHost::new(None, true, false);
+        let bud = budget();
+        let mut host = DnsResolveHost::new(None, true, false, &bud);
         assert!(matches!(
             host.resolve_mx("example.com".into()).await,
             Err(dns_resolve::DnsError::AccessDenied)
@@ -223,41 +240,57 @@ mod tests {
         ));
     }
 
+    /// HIGH-1 (security review): the budget MUST persist across the PER-CALL REBUILD of the view (the
+    /// real linker getter rebuilds `DnsResolveHost` every host call). Reproduce that exactly — ONE
+    /// store cell, a NEW view per call sharing it — and assert the cap holds ACROSS views. A
+    /// view-local counter (the bug this replaced) would restart at the max every call and never
+    /// rate-limit, so this test goes RED against that regression.
     #[tokio::test]
-    async fn resolve_budget_exhausts_to_rate_limited() {
+    async fn resolve_budget_persists_across_view_rebuilds() {
         let b = binding(vec![], vec!["93.184.216.34".parse().unwrap()]);
-        let mut host = DnsResolveHost::new(Some(&b), true, false);
-        // The first MAX_RESOLVES_PER_INVOCATION calls succeed; the next is rate-limited.
+        let bud = budget(); // the store-resident cell, shared across rebuilt views
         for _ in 0..MAX_RESOLVES_PER_INVOCATION {
-            assert!(host.resolve_addr("example.com".into()).await.is_ok());
+            let mut view = DnsResolveHost::new(Some(&b), true, false, &bud); // rebuilt per call
+            assert!(view.resolve_addr("example.com".into()).await.is_ok());
         }
+        // A FRESH view on the SAME store cell is now exhausted — proves the cap is store-resident.
+        let mut view = DnsResolveHost::new(Some(&b), true, false, &bud);
         assert!(matches!(
-            host.resolve_addr("example.com".into()).await,
+            view.resolve_addr("example.com".into()).await,
             Err(dns_resolve::DnsError::RateLimited)
         ));
-        // A fresh invocation (new view) gets a fresh budget.
-        let mut fresh = DnsResolveHost::new(Some(&b), true, false);
-        assert!(fresh.resolve_addr("example.com".into()).await.is_ok());
+        // A DIFFERENT store (a new invocation) gets a fresh budget.
+        let bud2 = budget();
+        let mut other = DnsResolveHost::new(Some(&b), true, false, &bud2);
+        assert!(other.resolve_addr("example.com".into()).await.is_ok());
     }
 
     #[tokio::test]
     async fn access_denied_does_not_consume_budget() {
         // An ungranted call is denied BEFORE the budget is touched, so the budget guard can't be a
-        // denial-amplifier (an attacker can't burn a victim invocation's budget — there's no victim).
-        let mut host = DnsResolveHost::new(None, true, false);
+        // denial-amplifier (an attacker can't burn a victim invocation's budget). Across rebuilt views
+        // sharing one store cell, many denied calls must leave the budget untouched.
+        let bud = budget();
         for _ in 0..(MAX_RESOLVES_PER_INVOCATION + 5) {
+            let mut view = DnsResolveHost::new(None, true, false, &bud);
             assert!(matches!(
-                host.resolve_addr("example.com".into()).await,
+                view.resolve_addr("example.com".into()).await,
                 Err(dns_resolve::DnsError::AccessDenied)
             ));
         }
+        assert_eq!(
+            bud.load(Ordering::Relaxed),
+            MAX_RESOLVES_PER_INVOCATION,
+            "denied calls must not consume the budget"
+        );
     }
 
     #[tokio::test]
     async fn posture_off_is_access_denied_even_when_granted() {
         let b = binding(vec![], vec!["93.184.216.34".parse().unwrap()]);
+        let bud = budget();
         // granted (Some) but posture OFF ⇒ denied, fail-closed (resolution is egress-class).
-        let mut host = DnsResolveHost::new(Some(&b), false, false);
+        let mut host = DnsResolveHost::new(Some(&b), false, false, &bud);
         assert!(matches!(
             host.resolve_addr("example.com".into()).await,
             Err(dns_resolve::DnsError::AccessDenied)
@@ -279,7 +312,8 @@ mod tests {
             ],
             vec![],
         );
-        let mut host = DnsResolveHost::new(Some(&b), true, false);
+        let bud = budget();
+        let mut host = DnsResolveHost::new(Some(&b), true, false, &bud);
         let got = host.resolve_mx("example.com".into()).await.unwrap();
         assert_eq!(got[0].preference, 10, "lowest preference first");
         assert_eq!(got[1].preference, 20);
@@ -295,7 +329,8 @@ mod tests {
                 "10.0.0.5".parse().unwrap(),
             ],
         );
-        let mut host = DnsResolveHost::new(Some(&b), true, false);
+        let bud = budget();
+        let mut host = DnsResolveHost::new(Some(&b), true, false, &bud);
         let got = host.resolve_addr("example.com".into()).await.unwrap();
         assert_eq!(
             got,
@@ -310,7 +345,8 @@ mod tests {
             vec![],
             vec!["127.0.0.1".parse().unwrap(), "10.0.0.5".parse().unwrap()],
         );
-        let mut host = DnsResolveHost::new(Some(&b), true, false);
+        let bud = budget();
+        let mut host = DnsResolveHost::new(Some(&b), true, false, &bud);
         assert!(
             matches!(
                 host.resolve_addr("evil.internal".into()).await,
@@ -323,8 +359,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_addr_allow_private_keeps_private() {
         let b = binding(vec![], vec!["10.0.0.5".parse().unwrap()]);
+        let bud = budget();
         // allow_private=true (operator opted in) ⇒ the private address is kept.
-        let mut host = DnsResolveHost::new(Some(&b), true, true);
+        let mut host = DnsResolveHost::new(Some(&b), true, true, &bud);
         let got = host.resolve_addr("db.internal".into()).await.unwrap();
         assert_eq!(got, vec!["10.0.0.5".to_string()]);
     }

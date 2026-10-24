@@ -2448,6 +2448,15 @@ pub struct ListenerConfig {
     /// not present a well-formed header is dropped. Set it ONLY when a proxy actually fronts the port.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proxy_protocol: bool,
+    /// Trusted-proxy source CIDRs for `proxy_protocol` (cap-req 18 / security-review MEDIUM-1): the
+    /// defense-in-depth backstop to the network-isolation assumption. When NON-EMPTY, a PROXY-protocol
+    /// header is trusted ONLY when the kernel peer (the direct TCP source) is inside one of these
+    /// `ip/prefix` CIDRs (e.g. `10.0.0.0/8`, `2001:db8::/32`); a connection from anywhere else is
+    /// dropped — so a firewall gap can't become source-IP spoofing. EMPTY (default) trusts a header
+    /// from any source (the firewall-only mode), which is sound only if the port is truly unreachable
+    /// except via the proxy; set this whenever you can. Ignored unless `proxy_protocol` is `true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
     /// How the accepted connection is driven (cap-req 08). [`ListenerMode::Connection`] (default) is the
     /// long-lived model: the guest's `tcp-connection-handler` holds the connection — and ONE wasm
     /// instance — for the connection's whole life. [`ListenerMode::Session`] drives the connection
