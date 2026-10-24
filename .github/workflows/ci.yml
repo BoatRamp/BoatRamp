@@ -256,7 +256,52 @@ jobs:
           key: test-musl
 
       - name: Test (musl)
-        run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
+        run: |
+          set -o pipefail
+          # T6: the SlateDB-on-musl *teardown* SIGSEGV is a rare process-EXIT race (a slatedb/
+          # libsql background thread outliving its Db and racing the static-musl exit). It could
+          # NOT be reproduced on demand (~160 isolated musl runs on a dev box, zero hits), so
+          # rather than keep masking it with a blind rerun, CAPTURE a core + backtrace the next
+          # time it flakes here — real evidence to root-cause the faulting thread from. Enable
+          # core dumps to a plain file (the runner's default core_pattern pipes to apport).
+          sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
+          echo '/tmp/cores/core.%e.%p.%s' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited
+          cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace \
+            --no-default-features --features boatramp/fs,boatramp/slatedb 2>&1 | tee test-musl.log
+          rc=${PIPESTATUS[0]}
+          echo "musl test exit code: $rc"
+          if ls /tmp/cores/core.* >/dev/null 2>&1; then
+            echo "::warning title=T6 SlateDB-on-musl teardown SIGSEGV::core dump(s) captured — download the musl-test-cores artifact for the backtrace"
+            sudo apt-get update -qq && sudo apt-get install -y -qq gdb || true
+            for core in /tmp/cores/core.*; do
+              exe=$(basename "$core" | cut -d'.' -f2)
+              bin=$(find target/x86_64-unknown-linux-musl/*/deps -maxdepth 1 -type f -executable -name "${exe}*" 2>/dev/null | head -1)
+              echo "===== core: $core (exe=$exe bin=$bin) =====" >> /tmp/cores/backtraces.txt
+              if [ -n "$bin" ]; then
+                cp "$bin" /tmp/cores/ 2>/dev/null || true
+                gdb -batch -nx -ex 'set pagination off' -ex 'thread apply all bt full' "$bin" "$core" \
+                  >> /tmp/cores/backtraces.txt 2>&1 || true
+              else
+                echo "(no matching test binary found for $exe)" >> /tmp/cores/backtraces.txt
+              fi
+            done
+          fi
+          exit "$rc"
+
+      # Hand the captured core(s) + backtraces + log off as an artifact whenever a core was
+      # produced (the rare SlateDB-on-musl teardown SIGSEGV), so the flake can be root-caused
+      # from real evidence instead of rerun past. No core ⇒ nothing uploaded (the common case).
+      - name: Upload musl test cores (on crash)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-test-cores
+          path: |
+            /tmp/cores/
+            test-musl.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       # Minimal lean config: the boatramp binary with ONLY `fs` (NO KV-backend feature).
       # This combo regressed once (v0.31.0): `serve::Error`'s `Kv(#[from] KvError)` variant was
