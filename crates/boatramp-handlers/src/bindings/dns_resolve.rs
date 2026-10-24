@@ -73,13 +73,22 @@ impl DnsResolveBinding {
     }
 }
 
+/// How many lookups ONE invocation (one store — a request, a consumer delivery, a session re-entry,
+/// or one connection-mode listener connection) may issue (mailroom cap-req 20). A bound on using a
+/// granted guest as a DNS scanner/amplifier — generous for legitimate use (direct-MX resolves ~one MX
+/// per message), low enough to blunt a scan. The budget resets per invocation; the complement to the
+/// per-source-IP connection-rate limit (cap-req 18) that bounds how fast new invocations arrive.
+const MAX_RESOLVES_PER_INVOCATION: u32 = 64;
+
 /// The per-invocation host view of the `dns-resolve` capability. Carries the grant plus the egress
 /// POSTURE (`posture_enabled`, the `allow_guest_tcp_egress` flag) and the SSRF posture
-/// (`allow_private`) read from the invocation's `HostState` — exactly like `TcpEgressHost`.
+/// (`allow_private`) read from the invocation's `HostState` — exactly like `TcpEgressHost` — and a
+/// per-invocation resolve budget.
 pub struct DnsResolveHost<'a> {
     binding: Option<&'a DnsResolveBinding>,
     posture_enabled: bool,
     allow_private: bool,
+    budget: u32,
 }
 
 impl<'a> DnsResolveHost<'a> {
@@ -92,6 +101,7 @@ impl<'a> DnsResolveHost<'a> {
             binding,
             posture_enabled,
             allow_private,
+            budget: MAX_RESOLVES_PER_INVOCATION,
         }
     }
 
@@ -102,6 +112,16 @@ impl<'a> DnsResolveHost<'a> {
             Some(b) if self.posture_enabled => Ok(b.resolver.clone()),
             _ => Err(dns_resolve::DnsError::AccessDenied),
         }
+    }
+
+    /// Spend one unit of this invocation's resolve budget (counts the ATTEMPT, so probing
+    /// non-existent names still consumes it). `rate-limited` once exhausted.
+    fn spend(&mut self) -> Result<(), dns_resolve::DnsError> {
+        if self.budget == 0 {
+            return Err(dns_resolve::DnsError::RateLimited);
+        }
+        self.budget -= 1;
+        Ok(())
     }
 }
 
@@ -120,6 +140,7 @@ impl dns_resolve::Host for DnsResolveHost<'_> {
         domain: String,
     ) -> Result<Vec<dns_resolve::MxRecord>, dns_resolve::DnsError> {
         let resolver = self.admit()?;
+        self.spend()?;
         let mut records = resolver.resolve_mx(&domain).await.map_err(map_error)?;
         // Defensive: present in ascending-preference order even if a backend returned them unsorted.
         records.sort_by_key(|r| r.preference);
@@ -134,6 +155,7 @@ impl dns_resolve::Host for DnsResolveHost<'_> {
 
     async fn resolve_addr(&mut self, host: String) -> Result<Vec<String>, dns_resolve::DnsError> {
         let resolver = self.admit()?;
+        self.spend()?;
         let addrs = resolver.resolve_addr(&host).await.map_err(map_error)?;
         // SSRF floor: drop every non-globally-routable address unless the operator opted into private
         // egress. An all-private answer is `not-found` (never leak an internal target to the guest).
@@ -199,6 +221,36 @@ mod tests {
             host.resolve_addr("example.com".into()).await,
             Err(dns_resolve::DnsError::AccessDenied)
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_budget_exhausts_to_rate_limited() {
+        let b = binding(vec![], vec!["93.184.216.34".parse().unwrap()]);
+        let mut host = DnsResolveHost::new(Some(&b), true, false);
+        // The first MAX_RESOLVES_PER_INVOCATION calls succeed; the next is rate-limited.
+        for _ in 0..MAX_RESOLVES_PER_INVOCATION {
+            assert!(host.resolve_addr("example.com".into()).await.is_ok());
+        }
+        assert!(matches!(
+            host.resolve_addr("example.com".into()).await,
+            Err(dns_resolve::DnsError::RateLimited)
+        ));
+        // A fresh invocation (new view) gets a fresh budget.
+        let mut fresh = DnsResolveHost::new(Some(&b), true, false);
+        assert!(fresh.resolve_addr("example.com".into()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn access_denied_does_not_consume_budget() {
+        // An ungranted call is denied BEFORE the budget is touched, so the budget guard can't be a
+        // denial-amplifier (an attacker can't burn a victim invocation's budget — there's no victim).
+        let mut host = DnsResolveHost::new(None, true, false);
+        for _ in 0..(MAX_RESOLVES_PER_INVOCATION + 5) {
+            assert!(matches!(
+                host.resolve_addr("example.com".into()).await,
+                Err(dns_resolve::DnsError::AccessDenied)
+            ));
+        }
     }
 
     #[tokio::test]

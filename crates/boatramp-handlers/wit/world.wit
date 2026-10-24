@@ -1642,6 +1642,10 @@ interface dns-resolve {
     not-found,
     /// Any other resolver/backend failure (timeout, SERVFAIL, …). Carries a client-safe reason.
     failed(string),
+    /// This invocation's resolve budget is exhausted (mailroom cap-req 20): a bound on how many
+    /// lookups one invocation may issue, so a granted guest can't use the host as a DNS
+    /// scanner/amplifier. Back off / batch — the budget resets on the next invocation (re-entry).
+    rate-limited,
   }
 
   /// Resolve `domain`'s MX records, sorted by ascending `preference` (RFC 5321 delivery order). The
