@@ -614,6 +614,30 @@ impl ServerConfig {
                     " — omit it for the default",
                 );
             }
+            // IPv6 rate-limit bucket prefix must be a real prefix length (senior-architect review).
+            if let Some(p) = l.conn_rate_ipv6_prefix
+                && !(1..=128).contains(&p)
+            {
+                return err(
+                    "`conn_rate_ipv6_prefix` must be in 1..=128",
+                    " — e.g. 64 (per-/64), or omit it for the default (/64)",
+                );
+            }
+            // PROXY-protocol requires a trusted source (senior-architect review — OWNER DECISION:
+            // require). Enabling `proxy_protocol` with no `proxy_protocol_trusted_cidrs` would trust a
+            // spoofable header from ANY source; refuse that (fail-closed, boot-loud) unless the operator
+            // explicitly opts into the firewall-only mode via `proxy_protocol_trust_any = true`.
+            if l.proxy_protocol
+                && l.proxy_protocol_trusted_cidrs.is_empty()
+                && !l.proxy_protocol_trust_any
+            {
+                return err(
+                    "`proxy_protocol` requires a non-empty `proxy_protocol_trusted_cidrs` (a header \
+                     from any source would otherwise be trusted and spoofable)",
+                    " — set `proxy_protocol_trusted_cidrs = [\"<proxy CIDR>\"]`, or (only if the port \
+                     is firewalled to the proxy) set `proxy_protocol_trust_any = true`",
+                );
+            }
             // Host-side per-listener TLS termination (cap-req 06): a declared `tls` block is honored,
             // but it MUST name both a cert and a key (the host loads them + terminates TLS, handing the
             // guest a decrypted plaintext stream). This holds for BOTH implicit TLS (465/993) and
@@ -1569,6 +1593,14 @@ pub struct HandlersConfig {
     /// (between-bytes) timeout is left at wasmtime's default so a slow token
     /// stream is not cut mid-flight. Absent ⇒ wasmtime's default.
     pub outbound_timeout_ms: Option<u64>,
+    /// Per-INVOCATION `dns-resolve` budget — how many `boatramp:handlers/dns-resolve` lookups one
+    /// guest invocation (one store) may issue before `rate-limited` (mailroom cap-req #20). For a
+    /// SESSION-mode listener the budget is seeded ONCE per connection and shared across every re-entry
+    /// (so a session guest can't reset it by sending another inbound frame). Absent ⇒
+    /// [`boatramp_handlers::DEFAULT_DNS_RESOLVE_BUDGET`] (256). Takes effect only when the node posture
+    /// `allow_guest_tcp_egress` is on and the component imports `dns-resolve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_resolve_budget: Option<u32>,
     /// **JWKS freshness — `own` (first-party) tier: background-refresh age** (seconds). The soft age at
     /// which a node-fixed `token_claims.jwks_url`/`jwks_env` verifier is refreshed in the BACKGROUND
     /// (the current keys keep serving — no request blocks on the fetch). Absent ⇒ 120 s. Floored at 60 s.
@@ -2439,6 +2471,14 @@ pub struct ListenerConfig {
     /// Ignored when the rate is `0` (limit disabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_burst_per_ip: Option<u32>,
+    /// IPv6 **bucket prefix** (bits) for the per-source-IP connection-rate limit (senior-architect
+    /// review). An IPv6 peer is keyed for rate-limiting by this prefix, not its full `/128`: a single
+    /// site is routinely handed a whole `/64`, so keying on the full address would let one owner rotate
+    /// through addresses to get a fresh bucket per connection (and spray the tracked map). Masking to
+    /// the prefix collapses a site to one bucket. IPv4 is always keyed in full (`/32`). Valid `1..=128`;
+    /// absent ⇒ [`DEFAULT_LISTENER_CONN_RATE_IPV6_PREFIX`] (`/64`). Ignored when the rate limit is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_rate_ipv6_prefix: Option<u8>,
     /// Trust a **PROXY-protocol** (v1/v2) header on each accepted connection (cap-req 18 completion):
     /// when this listener sits behind a trusted L4 proxy/load-balancer, the kernel peer is the
     /// proxy's, so the host reads the prepended header to recover the REAL client address and uses it
@@ -2448,6 +2488,15 @@ pub struct ListenerConfig {
     /// not present a well-formed header is dropped. Set it ONLY when a proxy actually fronts the port.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proxy_protocol: bool,
+    /// Explicitly trust a PROXY-protocol header from ANY source (senior-architect review — OWNER
+    /// DECISION: require trusted CIDRs by default). `proxy_protocol = true` now REQUIRES a non-empty
+    /// `proxy_protocol_trusted_cidrs` UNLESS this is set `true` (the firewall-only mode, where the
+    /// operator asserts the port is unreachable except via the proxy). Default `false` ⇒ a
+    /// `proxy_protocol` listener with no trusted CIDRs is REFUSED at config load (fail-closed,
+    /// boot-loud), so a header is never silently trusted from any source by omission. Set this ONLY
+    /// when you genuinely cannot enumerate the proxy's source CIDRs but the port is firewalled to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_protocol_trust_any: bool,
     /// Trusted-proxy source CIDRs for `proxy_protocol` (cap-req 18 / security-review MEDIUM-1): the
     /// defense-in-depth backstop to the network-isolation assumption. When NON-EMPTY, a PROXY-protocol
     /// header is trusted ONLY when the kernel peer (the direct TCP source) is inside one of these
@@ -2577,9 +2626,15 @@ pub const DEFAULT_LISTENER_CONN_RATE_PER_IP: f64 = 30.0;
 pub const DEFAULT_LISTENER_CONN_BURST_PER_IP: u32 = 60;
 
 /// Hard cap on simultaneously-tracked peer IPs in a listener's per-IP rate limiter (cap-req 18) —
-/// bounds the limiter's memory against an IP-spray DoS (idle/full buckets are evicted to stay
-/// within it; dropping a full bucket is lossless).
+/// bounds the limiter's memory against an IP-spray DoS (the least-recently-used — coldest, idle —
+/// bucket is LRU-evicted to stay within it; dropping it is lossless, a re-created bucket starts full).
 pub const DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED: usize = 100_000;
+
+/// Default IPv6 bucket prefix (bits) for a listener's per-source-IP connection-rate limit
+/// (senior-architect review) — `/64`, so a whole end site (routinely a `/64`) is one rate-limit
+/// bucket and can't rotate addresses to dodge the limit. IPv4 is always keyed in full (`/32`).
+/// Operators override per listener via `conn_rate_ipv6_prefix` (valid `1..=128`).
+pub const DEFAULT_LISTENER_CONN_RATE_IPV6_PREFIX: u8 = 64;
 
 /// `[serve.s3_credential]` — a **node-level base S3 credential source** (#505) sourcing the base AWS
 /// credential from boatramp's `[secrets]` sealed store rather than the ambient env chain. Consumed by
@@ -4457,6 +4512,41 @@ mod tests {
             r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:465", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", on_demand: true, server_names: ["mail.example.test"] ) ) } ) )"#,
         )
         .expect("a listener on_demand with node on-demand TLS enabled is valid");
+        // (l) `proxy_protocol = true` with NO trusted CIDRs and NO trust-any opt-in is REFUSED
+        //     (senior-architect review — OWNER DECISION: require a trusted source; a header from any
+        //     source is spoofable). Fail-closed, boot-loud.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", proxy_protocol: true ) } ) )"#,
+        )
+        .expect_err("proxy_protocol with no trusted CIDRs and no trust-any must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (m) `proxy_protocol = true` with a non-empty trusted-CIDR set parses (the normal case).
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", proxy_protocol: true, proxy_protocol_trusted_cidrs: ["10.0.0.0/8"] ) } ) )"#,
+        )
+        .expect("proxy_protocol with trusted CIDRs is valid");
+        // (n) `proxy_protocol = true` with the explicit `proxy_protocol_trust_any` opt-in (and empty
+        //     CIDRs) parses — the firewall-only mode the operator must now opt into deliberately.
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", proxy_protocol: true, proxy_protocol_trust_any: true ) } ) )"#,
+        )
+        .expect("proxy_protocol with the trust-any opt-in parses");
+        // (o) an out-of-range IPv6 rate-limit bucket prefix is refused; a valid one parses.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", conn_rate_ipv6_prefix: 129 ) } ) )"#,
+        )
+        .expect_err("conn_rate_ipv6_prefix > 128 must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", conn_rate_ipv6_prefix: 56 ) } ) )"#,
+        )
+        .expect("a valid conn_rate_ipv6_prefix parses");
     }
 
     #[test]

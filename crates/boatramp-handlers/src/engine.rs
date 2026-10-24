@@ -352,6 +352,14 @@ const DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "tcp-egress")]
 const DEFAULT_TCP_EGRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Default per-INVOCATION `dns-resolve` budget — how many lookups one invocation (one store) may
+/// issue (mailroom cap-req #20). For a SESSION listener this is instead seeded ONCE per CONNECTION
+/// and shared across every re-entry's store, so an attacker can no longer reset it by sending another
+/// inbound frame (senior-architect review). Overridable per node via
+/// [`HandlerEngine::with_dns_resolve_budget`]. Generous for legitimate direct-MX relay use (≈one MX
+/// resolve + one address resolve per message), low enough to blunt a granted guest used as a scanner.
+pub const DEFAULT_DNS_RESOLVE_BUDGET: u32 = 256;
+
 /// Upper bound (chars) on the guest-returned error text carried by
 /// [`HandlerError::ConsumerError`]. The guest controls this string, so it is bounded here before it
 /// is stored (and the DLQ layer sanitizes control chars before an operator sees it).
@@ -495,11 +503,18 @@ struct HostState {
     tcp_egress_idle_timeout: Duration,
     /// This invocation's remaining `dns-resolve` budget (mailroom cap-req #20, security-review
     /// HIGH-1). STORE-RESIDENT so it persists across the per-call rebuild of `DnsResolveHost`: the
-    /// binding borrows this counter and `spend()` decrements it, so the 64/invocation cap is actually
+    /// binding borrows this counter and `spend()` decrements it, so the per-invocation cap is actually
     /// enforced (a view-local counter would reset every call and never limit anything). An `AtomicU32`
     /// (not a `Cell`) because the async host-call future it is borrowed into must be `Send`.
+    ///
+    /// An `Arc` (not an owned cell) so the SESSION-listener path can make the budget PER-CONNECTION
+    /// rather than per-store: a session re-entry builds a FRESH store per inbound frame, so an owned
+    /// per-store counter re-seeds to the max on every frame (attacker-resettable — senior-architect
+    /// review). The connection driver seeds ONE `Arc<AtomicU32>` per connection and
+    /// `dispatch_session_inner` swaps it into each re-entry's store, so the budget spans the whole
+    /// connection. The request/consumer/HTTP-session paths leave the per-store default (per-invocation).
     #[cfg(feature = "tcp-egress")]
-    dns_resolve_budget: std::sync::atomic::AtomicU32,
+    dns_resolve_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -1685,6 +1700,12 @@ pub struct HandlerEngine {
     /// [`DEFAULT_TCP_EGRESS_IDLE_TIMEOUT`].
     #[cfg(feature = "tcp-egress")]
     tcp_egress_idle_timeout: Duration,
+    /// Default per-INVOCATION `dns-resolve` budget seeded into each new store (mailroom cap-req #20).
+    /// Operator-configurable via [`with_dns_resolve_budget`](Self::with_dns_resolve_budget); defaults
+    /// to [`DEFAULT_DNS_RESOLVE_BUDGET`]. For a session-mode listener this seeds the ONE per-connection
+    /// counter the driver shares across every re-entry (so the budget is per-connection, not per-frame).
+    #[cfg_attr(not(feature = "tcp-egress"), allow(dead_code))]
+    dns_resolve_budget_default: u32,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -1897,6 +1918,7 @@ impl HandlerEngine {
             tcp_egress_connect_timeout: DEFAULT_TCP_EGRESS_CONNECT_TIMEOUT,
             #[cfg(feature = "tcp-egress")]
             tcp_egress_idle_timeout: DEFAULT_TCP_EGRESS_IDLE_TIMEOUT,
+            dns_resolve_budget_default: DEFAULT_DNS_RESOLVE_BUDGET,
             limits,
             epoch_ticker,
         })
@@ -2179,6 +2201,23 @@ impl HandlerEngine {
         self.tcp_egress_connect_timeout = connect;
         self.tcp_egress_idle_timeout = idle;
         self
+    }
+
+    /// Override the per-INVOCATION `dns-resolve` budget (mailroom cap-req #20): how many lookups one
+    /// invocation (one store) may issue before `rate-limited`. For a SESSION-mode listener this seeds
+    /// the ONE per-connection counter the driver shares across every re-entry, so the cap is
+    /// per-connection (an attacker can no longer reset it by sending another inbound frame —
+    /// senior-architect review). Defaults to [`DEFAULT_DNS_RESOLVE_BUDGET`] when never called.
+    #[must_use]
+    pub fn with_dns_resolve_budget(mut self, n: u32) -> Self {
+        self.dns_resolve_budget_default = n;
+        self
+    }
+
+    /// The configured default per-invocation `dns-resolve` budget ([`with_dns_resolve_budget`](Self::with_dns_resolve_budget)).
+    /// The session-listener driver reads this to seed its one per-connection budget counter.
+    pub fn dns_resolve_budget_default(&self) -> u32 {
+        self.dns_resolve_budget_default
     }
 
     /// Add operator-supplied EXTRA trust anchors (DER certs) to a guest's outbound `wasi:http` TLS
@@ -2691,6 +2730,8 @@ impl HandlerEngine {
             .map_err(|_| HandlerError::Overloaded)?;
         // HTTP-driven session: no raw-socket wire security at this layer (the edge terminates TLS);
         // pass no connection-security handle so `tcp-connection-context` fail-closes to plaintext.
+        // No per-connection `dns-resolve` budget either — an HTTP session keeps the per-invocation
+        // (per-store) default `new_store` seeds, exactly as before.
         self.dispatch_session_inner(
             hash,
             wasm,
@@ -2698,6 +2739,8 @@ impl HandlerEngine {
             bindings,
             limits,
             #[cfg(feature = "tcp-listener")]
+            None,
+            #[cfg(feature = "tcp-egress")]
             None,
         )
         .await
@@ -2732,6 +2775,11 @@ impl HandlerEngine {
         // Live wire-security of this connection (mailroom cap-req #16); the driver passes the SAME
         // handle on every re-entry (and, for STARTTLS, a clone is flipped to TLS by the pump).
         conn_security: crate::ConnectionSecurity,
+        // The PER-CONNECTION `dns-resolve` budget (mailroom cap-req #20, senior-architect review): the
+        // driver seeds ONE `Arc<AtomicU32>` per connection and passes the SAME handle on every re-entry
+        // (like `conn_security`), so the budget spans the whole connection instead of resetting per
+        // inbound frame. Gated on `tcp-egress` (the feature that compiles the `dns-resolve` binding).
+        #[cfg(feature = "tcp-egress")] dns_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<(), HandlerError> {
         // The SAME mutation-verified structural gates the connection lane enforces (Security review
         // MEDIUM-1 — the session path must carry the same fail-closed backstop, so a future per-listener
@@ -2770,8 +2818,17 @@ impl HandlerEngine {
             .acquire()
             .await
             .map_err(|_| HandlerError::Overloaded)?;
-        self.dispatch_session_inner(hash, wasm, batch, bindings, limits, Some(conn_security))
-            .await
+        self.dispatch_session_inner(
+            hash,
+            wasm,
+            batch,
+            bindings,
+            limits,
+            Some(conn_security),
+            #[cfg(feature = "tcp-egress")]
+            Some(dns_budget),
+        )
+        .await
     }
 
     /// The body of a session re-entry, AFTER the lane permit is held (shared by the HTTP
@@ -2781,6 +2838,7 @@ impl HandlerEngine {
     /// once with the batch, finalizes the per-invocation SQL txn, and drops the store (so NO instance
     /// survives the call — the hibernation property).
     #[cfg(feature = "session")]
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_session_inner(
         &self,
         hash: &str,
@@ -2793,12 +2851,27 @@ impl HandlerEngine {
         // socket at this layer — fail-closed to plaintext). Only present when the listener surface is
         // compiled in.
         #[cfg(feature = "tcp-listener")] conn_security: Option<crate::ConnectionSecurity>,
+        // The PER-CONNECTION `dns-resolve` budget counter (mailroom cap-req #20, senior-architect
+        // review). `Some` on the SOCKET-session path (the driver seeds one `Arc<AtomicU32>` per
+        // connection and threads it into every re-entry's store, so the budget spans the whole
+        // connection rather than resetting on each inbound frame). `None` on the HTTP-session path,
+        // which keeps the per-store default `new_store` seeds (per-invocation, as before).
+        #[cfg(feature = "tcp-egress")] dns_budget: Option<
+            std::sync::Arc<std::sync::atomic::AtomicU32>,
+        >,
     ) -> Result<(), HandlerError> {
         let session_pre = self.session_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
         #[cfg(feature = "tcp-listener")]
         {
             store.data_mut().conn_security = conn_security;
+        }
+        // Make the `dns-resolve` budget PER-CONNECTION for the socket-session path: replace this
+        // re-entry's fresh per-store counter with the connection-scoped one so a session guest can't
+        // reset its budget by sending another inbound frame (senior-architect review).
+        #[cfg(feature = "tcp-egress")]
+        if let Some(b) = dns_budget {
+            store.data_mut().dns_resolve_budget = b;
         }
         let instantiated_at = std::time::Instant::now();
         let session = session_pre
@@ -3182,8 +3255,10 @@ impl HandlerEngine {
                 state.tcp_egress_enabled,
                 state.http_hooks.allow_private_egress,
                 // Borrow the STORE-resident budget (security-review HIGH-1): it persists across the
-                // per-call rebuild of this view, so the per-invocation cap is actually enforced.
-                &state.dns_resolve_budget,
+                // per-call rebuild of this view, so the per-invocation cap is actually enforced. The
+                // `Arc` is deref'd to the `&AtomicU32` the binding borrows (a session connection shares
+                // one such counter across all its re-entry stores — senior-architect review).
+                state.dns_resolve_budget.as_ref(),
             )
         })?;
         Ok(linker)
@@ -3325,9 +3400,9 @@ impl HandlerEngine {
             #[cfg(feature = "tcp-egress")]
             tcp_egress_idle_timeout: self.tcp_egress_idle_timeout,
             #[cfg(feature = "tcp-egress")]
-            dns_resolve_budget: std::sync::atomic::AtomicU32::new(
-                bindings::dns_resolve::MAX_RESOLVES_PER_INVOCATION,
-            ),
+            dns_resolve_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                self.dns_resolve_budget_default,
+            )),
             #[cfg(feature = "sql")]
             sql,
             // Set by the listener dispatch after `new_store`; a non-listener invocation leaves it

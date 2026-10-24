@@ -10,27 +10,44 @@
 //! listener (cap-req 18 completion). A client may open `burst` connections immediately, then `rate`/sec
 //! sustained; over that, the connection is refused and closed cheaply.
 //!
-//! Memory is bounded against an IP-spray DoS: a bucket refilled to `burst` is **idle** — dropping it
-//! loses no state (a re-created bucket starts full), so when the tracked-IP map would exceed
-//! `max_tracked`, the limiter evicts full (idle) buckets before inserting a new IP. If eviction frees
-//! nothing (every tracked IP mid-drain — a genuine `max_tracked`-wide distributed flood), the new
-//! connection is refused rather than tracked, so the map is hard-bounded at `max_tracked`.
+//! **Bucket keying (senior-architect review).** The bucket key is the peer's IPv4 address in full
+//! (`/32`), but an IPv6 peer is keyed by a **prefix** (default `/64`): a single end site is routinely
+//! handed a whole `/64` (or larger), so keying on the full `/128` would let one owner rotate through
+//! 2⁶⁴ source addresses to get a fresh bucket per connection (limit bypassed) AND to spray the tracked
+//! map with distinct keys. Masking to the `/64` collapses a site to one bucket.
+//!
+//! **Memory bound (senior-architect review).** The tracked-key map is an [`lru::LruCache`] hard-capped
+//! at `max_tracked`: inserting a new key when full evicts the **least-recently-used** bucket in O(1).
+//! For a token bucket the least-recently-touched entry is the one that has had the longest to refill —
+//! i.e. the most-refilled, idle entry — so dropping it is lossless (a re-created bucket starts full).
+//! This replaces the earlier O(n) `retain`-scan-then-refuse eviction; the map can never exceed
+//! `max_tracked`, and under an IP-spray flood the coldest bucket is always the one shed.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use lru::LruCache;
+
+/// Default IPv6 bucket prefix: a peer's IPv6 address is masked to its first `/64` for keying, so a
+/// whole end site (routinely a `/64`) is one bucket. Operators override per listener
+/// (`conn_rate_ipv6_prefix`, validated `1..=128`). IPv4 is always keyed in full (`/32`).
+pub const DEFAULT_CONN_RATE_IPV6_PREFIX: u8 = 64;
+
 /// A per-IP token bucket. `rate` tokens accrue per second up to `burst`; one token is spent per
-/// admitted connection. All state is behind one mutex and admission is O(1) amortized. `admit` runs
-/// from the accept loop for a direct listener, but from many concurrently-spawned per-connection
-/// tasks on a `proxy_protocol` listener (the real IP is only known after the header is read) — the
-/// mutex makes that safe; do not reintroduce a single-task assumption.
+/// admitted connection. All state is behind one mutex and admission is O(1). `admit` runs from the
+/// accept loop for a direct listener, but from many concurrently-spawned per-connection tasks on a
+/// `proxy_protocol` listener (the real IP is only known after the header is read) — the mutex makes
+/// that safe; do not reintroduce a single-task assumption.
 pub struct PeerConnLimiter {
     rate_per_sec: f64,
     burst: f64,
-    max_tracked: usize,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    /// IPv6 bucket prefix length (bits); IPv4 is always full. Clamped to `1..=128` at construction.
+    ipv6_prefix: u8,
+    /// The tracked per-key buckets, hard-capped at `max_tracked` — a new key when full LRU-evicts the
+    /// coldest (idle) bucket in O(1). Keyed by the BUCKET key ([`Self::bucket_key`]), not the raw peer.
+    buckets: Mutex<LruCache<IpAddr, Bucket>>,
 }
 
 #[derive(Clone, Copy)]
@@ -48,22 +65,42 @@ impl Bucket {
             self.last = now;
         }
     }
-    /// A bucket at full tokens is indistinguishable from a freshly-created one, so it holds no state
-    /// worth keeping — safe to evict to bound memory.
-    fn is_idle(&self, burst: f64) -> bool {
-        self.tokens >= burst
-    }
+}
+
+/// Mask an IPv6 address to its first `prefix` bits (the rest zeroed) for bucket keying. `prefix` is
+/// `1..=128` in practice (clamped at construction); `0` is handled defensively (whole address zeroed).
+fn mask_v6(addr: Ipv6Addr, prefix: u8) -> Ipv6Addr {
+    let prefix = u32::from(prefix.min(128));
+    let bits = u128::from(addr);
+    // `u128::MAX << 128` would overflow the shift; guard the `prefix == 0` edge explicitly.
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    Ipv6Addr::from(bits & mask)
 }
 
 impl PeerConnLimiter {
-    /// `rate_per_sec` tokens/sec, `burst` max tokens (the immediate allowance), `max_tracked` the
-    /// hard cap on simultaneously-tracked IPs (eviction of idle buckets keeps the map within it).
-    pub fn new(rate_per_sec: f64, burst: u32, max_tracked: usize) -> Self {
+    /// `rate_per_sec` tokens/sec, `burst` max tokens (the immediate allowance), `max_tracked` the hard
+    /// cap on simultaneously-tracked bucket keys (LRU eviction of the coldest bucket keeps the map
+    /// within it), `ipv6_prefix` the IPv6 bucket-prefix length (bits; clamped `1..=128`; IPv4 keyed in
+    /// full). `max_tracked` is floored at 1.
+    pub fn new(rate_per_sec: f64, burst: u32, max_tracked: usize, ipv6_prefix: u8) -> Self {
+        let cap = NonZeroUsize::new(max_tracked.max(1)).expect("max_tracked.max(1) >= 1");
         Self {
             rate_per_sec,
             burst: f64::from(burst.max(1)),
-            max_tracked: max_tracked.max(1),
-            buckets: Mutex::new(HashMap::new()),
+            ipv6_prefix: ipv6_prefix.clamp(1, 128),
+            buckets: Mutex::new(LruCache::new(cap)),
+        }
+    }
+
+    /// The bucket key for `ip`: the IPv4 address in full, or an IPv6 address masked to `ipv6_prefix`.
+    fn bucket_key(&self, ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(_) => ip,
+            IpAddr::V6(v6) => IpAddr::V6(mask_v6(v6, self.ipv6_prefix)),
         }
     }
 
@@ -74,39 +111,27 @@ impl PeerConnLimiter {
 
     /// Testable core: admission decision at an explicit `now`.
     fn admit_at(&self, ip: IpAddr, now: Instant) -> bool {
+        let key = self.bucket_key(ip);
         // Recover from a poisoned lock rather than panic (security-review INFO): the critical section
-        // is panic-free (float math + HashMap ops on trusted values), so poisoning is unreachable — but
-        // if it ever happened, a panic here would kill the listener's accept loop. The bucket map holds
-        // no cross-op invariant a mid-op panic could corrupt, so continuing with the recovered map is
-        // safe and strictly better than dropping the whole listener.
+        // is panic-free (float math + LruCache ops on trusted values), so poisoning is unreachable —
+        // but if it ever happened, a panic here would kill the listener's accept loop. The bucket map
+        // holds no cross-op invariant a mid-op panic could corrupt, so continuing with the recovered
+        // map is safe and strictly better than dropping the whole listener.
         let mut map = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Bound the map: before tracking a NEW ip over the cap, drop idle (full) buckets. Dropping a
-        // full bucket is lossless — a re-created one starts full too — so a flooding spray of fresh
-        // IPs can never grow the map past `max_tracked` with meaningful state.
-        if map.len() >= self.max_tracked && !map.contains_key(&ip) {
-            let (rate, burst) = (self.rate_per_sec, self.burst);
-            map.retain(|_, b| {
-                b.refill(now, rate, burst);
-                !b.is_idle(burst)
-            });
-            // Hard bound: if eviction freed nothing — every tracked IP is still mid-drain, i.e. a
-            // genuine distributed flood of `max_tracked` simultaneously-active sources — refuse the
-            // new IP rather than grow the map past its cap. Not tracking a refused connection loses
-            // nothing (it is simply not admitted), and declining new sources is the correct backstop
-            // under a flood of that scale. (`ip` is still absent here — retain never inserts it.)
-            if map.len() >= self.max_tracked {
-                return false;
-            }
-        }
-        let burst = self.burst;
-        let bucket = map.entry(ip).or_insert(Bucket {
+        let (rate, burst) = (self.rate_per_sec, self.burst);
+        // O(1) get-or-create, promoting this key to most-recently-used. When the map is at
+        // `max_tracked` and `key` is new, `LruCache` evicts the LEAST-recently-used bucket — the
+        // coldest = longest-untouched = most-refilled (idle) entry, which is lossless to drop (a
+        // re-created bucket starts full). So an IP-spray flood of fresh keys can never grow the map
+        // past `max_tracked`, and the entry shed is always the one carrying the least state.
+        let bucket = map.get_or_insert_mut(key, || Bucket {
             tokens: burst,
             last: now,
         });
-        bucket.refill(now, self.rate_per_sec, burst);
+        bucket.refill(now, rate, burst);
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             true
@@ -115,10 +140,13 @@ impl PeerConnLimiter {
         }
     }
 
-    /// Current tracked-IP count (observability / tests).
+    /// Current tracked-key count (observability / tests).
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.buckets.lock().unwrap().len()
+        self.buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -134,7 +162,7 @@ mod tests {
     #[test]
     fn burst_is_admitted_then_refused_over_rate() {
         // rate 2/s, burst 3: the first 3 (the burst) are admitted at t0, the 4th is refused.
-        let lim = PeerConnLimiter::new(2.0, 3, 1000);
+        let lim = PeerConnLimiter::new(2.0, 3, 1000, DEFAULT_CONN_RATE_IPV6_PREFIX);
         let t0 = Instant::now();
         assert!(lim.admit_at(ip(1), t0));
         assert!(lim.admit_at(ip(1), t0));
@@ -144,7 +172,7 @@ mod tests {
 
     #[test]
     fn bucket_refills_over_time() {
-        let lim = PeerConnLimiter::new(2.0, 3, 1000);
+        let lim = PeerConnLimiter::new(2.0, 3, 1000, DEFAULT_CONN_RATE_IPV6_PREFIX);
         let t0 = Instant::now();
         for _ in 0..3 {
             assert!(lim.admit_at(ip(1), t0));
@@ -159,7 +187,7 @@ mod tests {
 
     #[test]
     fn distinct_ips_have_independent_budgets() {
-        let lim = PeerConnLimiter::new(1.0, 1, 1000);
+        let lim = PeerConnLimiter::new(1.0, 1, 1000, DEFAULT_CONN_RATE_IPV6_PREFIX);
         let t0 = Instant::now();
         assert!(lim.admit_at(ip(1), t0));
         assert!(!lim.admit_at(ip(1), t0), "ip1 exhausted its 1-token burst");
@@ -167,42 +195,80 @@ mod tests {
     }
 
     #[test]
-    fn map_is_bounded_by_evicting_idle_buckets() {
-        // Cap at 2 tracked IPs. Fill 2 (each spends its only token → NOT idle), then a 3rd IP at a
-        // later time when 1+2 have refilled to full (idle) → eviction keeps the map within the cap.
-        let lim = PeerConnLimiter::new(100.0, 1, 2);
-        let t0 = Instant::now();
-        assert!(lim.admit_at(ip(1), t0));
-        assert!(lim.admit_at(ip(2), t0));
-        assert_eq!(lim.tracked(), 2);
-        // Well after refill (rate 100/s, burst 1 → full within 10ms), ip1/ip2 are idle (full).
-        let t1 = t0 + Duration::from_secs(1);
-        assert!(lim.admit_at(ip(3), t1));
-        assert!(
-            lim.tracked() <= 2,
-            "the map must stay within max_tracked by evicting full/idle buckets, got {}",
-            lim.tracked()
-        );
-    }
-
-    #[test]
-    fn map_is_hard_bounded_when_no_bucket_is_idle() {
-        // Cap at 2. Two IPs each spend their only token at t0 (burst 1 → both mid-drain, NOT idle).
-        // A 3rd IP at the SAME instant finds nothing evictable: it must be refused, and the map must
-        // not grow past the cap (the DoS backstop under a max_tracked-wide active flood).
-        let lim = PeerConnLimiter::new(1.0, 1, 2);
+    fn map_is_bounded_by_lru_eviction() {
+        // Cap at 2 tracked keys. Fill 2, then a 3rd key: the LRU (ip1, least-recently-touched) is
+        // evicted in O(1) and the map stays within the cap. (Under the old scheme this depended on a
+        // bucket being refilled-to-idle; with an LRU the coldest entry is shed regardless.)
+        let lim = PeerConnLimiter::new(1.0, 1, 2, DEFAULT_CONN_RATE_IPV6_PREFIX);
         let t0 = Instant::now();
         assert!(lim.admit_at(ip(1), t0));
         assert!(lim.admit_at(ip(2), t0));
         assert_eq!(lim.tracked(), 2);
         assert!(
-            !lim.admit_at(ip(3), t0),
-            "a new IP must be refused when the map is full of active (non-idle) IPs"
+            lim.admit_at(ip(3), t0),
+            "a new key always admits (its bucket starts full)"
         );
         assert_eq!(
             lim.tracked(),
             2,
-            "map must stay hard-bounded at max_tracked"
+            "the map must stay within max_tracked via LRU eviction"
+        );
+    }
+
+    #[test]
+    fn new_key_admits_by_evicting_lru_even_when_all_active() {
+        // The LRU replacement for the old "refuse a new IP when the map is full of active buckets"
+        // backstop: with an LRU map, a new key evicts the least-recently-used bucket and IS admitted
+        // (the shed bucket is the coldest — least state — even under a max_tracked-wide active flood).
+        // Cap at 2; ip1 and ip2 each spend their only token at t0 (both mid-drain, NOT idle).
+        let lim = PeerConnLimiter::new(1.0, 1, 2, DEFAULT_CONN_RATE_IPV6_PREFIX);
+        let t0 = Instant::now();
+        assert!(lim.admit_at(ip(1), t0));
+        assert!(lim.admit_at(ip(2), t0));
+        assert_eq!(lim.tracked(), 2);
+        assert!(
+            lim.admit_at(ip(3), t0),
+            "a new key admits by evicting the LRU bucket, even when every tracked bucket is active"
+        );
+        assert_eq!(lim.tracked(), 2, "map stays hard-bounded at max_tracked");
+        // ip1 was the LRU and was evicted → its bucket is re-created full, so it admits again (its
+        // earlier spend is forgotten — the documented, lossless cost of shedding the coldest entry).
+        assert!(
+            lim.admit_at(ip(1), t0),
+            "the evicted key's bucket is re-created full"
+        );
+    }
+
+    #[test]
+    fn ipv6_is_keyed_by_prefix() {
+        // Default /64 prefix: two distinct /128s inside the SAME /64 share ONE bucket (a /64 owner
+        // can't rotate addresses to dodge the limit); two addresses in DIFFERENT /64s do not.
+        let lim = PeerConnLimiter::new(1.0, 1, 1000, DEFAULT_CONN_RATE_IPV6_PREFIX);
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:abcd:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:abcd:1::2".parse().unwrap(); // same /64 as `a`
+        let c: IpAddr = "2001:db8:abcd:2::1".parse().unwrap(); // a different /64
+        assert!(lim.admit_at(a, t0));
+        assert!(
+            !lim.admit_at(b, t0),
+            "a different /128 in the same /64 shares a's bucket (burst 1 already spent)"
+        );
+        assert!(lim.admit_at(c, t0), "a different /64 has its own bucket");
+        // The two same-/64 addresses collapsed to ONE tracked key; the other /64 is a second.
+        assert_eq!(lim.tracked(), 2);
+    }
+
+    #[test]
+    fn ipv6_full_prefix_keys_each_address_separately() {
+        // With a /128 prefix each full address is its own bucket (prefix = 128 ⇒ no masking).
+        let lim = PeerConnLimiter::new(1.0, 1, 1000, 128);
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:abcd:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:abcd:1::2".parse().unwrap(); // same /64, different /128
+        assert!(lim.admit_at(a, t0));
+        assert!(
+            lim.admit_at(b, t0),
+            "with a /128 prefix a different address has its own bucket"
         );
     }
 }

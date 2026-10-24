@@ -73,12 +73,15 @@ impl DnsResolveBinding {
     }
 }
 
-/// How many lookups ONE invocation (one store — a request, a consumer delivery, a session re-entry,
-/// or one connection-mode listener connection) may issue (mailroom cap-req 20). A bound on using a
-/// granted guest as a DNS scanner/amplifier — generous for legitimate use (direct-MX resolves ~one MX
-/// per message), low enough to blunt a scan. The budget resets per invocation; the complement to the
-/// per-source-IP connection-rate limit (cap-req 18) that bounds how fast new invocations arrive.
-pub(crate) const MAX_RESOLVES_PER_INVOCATION: u32 = 64;
+/// The per-invocation resolve budget this binding's unit tests seed into their store-resident
+/// counter (mailroom cap-req 20). The LIVE default + the knob now live at the engine level
+/// ([`crate::DEFAULT_DNS_RESOLVE_BUDGET`] = 256, overridable via
+/// `HandlerEngine::with_dns_resolve_budget`), and for a SESSION listener the counter is seeded ONCE
+/// per connection and shared across re-entries (senior-architect review) rather than per store. This
+/// crate-level constant is kept only as the binding-unit-test seed — the binding itself just
+/// decrements whatever `&AtomicU32` it is handed, so the exact seed is immaterial to its logic.
+#[cfg(test)]
+const MAX_RESOLVES_PER_INVOCATION: u32 = 64;
 
 /// The per-invocation host view of the `dns-resolve` capability. Carries the grant plus the egress
 /// POSTURE (`posture_enabled`, the `allow_guest_tcp_egress` flag) and the SSRF posture
@@ -128,10 +131,23 @@ impl<'a> DnsResolveHost<'a> {
     /// synchronization point.
     fn spend(&self) -> Result<(), dns_resolve::DnsError> {
         use std::sync::atomic::Ordering;
-        self.budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .map(|_| ())
-            .map_err(|_| dns_resolve::DnsError::RateLimited)
+        // Decrement-if-nonzero via the explicit compare-exchange loop that `fetch_update` wraps.
+        // Spelled out rather than `fetch_update`/`try_update` so it compiles clean on BOTH the pinned
+        // stable toolchain (where `fetch_update` is now deprecation-warned → a `-D warnings` CI error)
+        // and the declared MSRV 1.97 (where `try_update`, its rename, does not yet exist).
+        let mut cur = self.budget.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_sub(1) else {
+                return Err(dns_resolve::DnsError::RateLimited);
+            };
+            match self
+                .budget
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 

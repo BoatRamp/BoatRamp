@@ -466,6 +466,13 @@ pub async fn build_handler_runtime(
             .and_then(|h| h.streaming_idle_timeout_ms)
             .unwrap_or(DEFAULT_STREAMING_IDLE_MS),
     )
+    // Per-invocation `dns-resolve` budget (mailroom cap-req #20); absent ⇒ the engine default (256).
+    // For a session listener the engine seeds this once per connection (not per inbound frame).
+    .with_dns_resolve_budget(
+        handlers_cfg
+            .and_then(|h| h.dns_resolve_budget)
+            .unwrap_or(boatramp_handlers::DEFAULT_DNS_RESOLVE_BUDGET),
+    )
     .with_keep_warm_max(keep_warm_max);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),

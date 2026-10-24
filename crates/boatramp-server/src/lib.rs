@@ -1242,6 +1242,15 @@ impl HandlerRuntime {
                  node-global backstop bound the aggregate socket/checkpoint footprint)"
             ));
         };
+        // Per-CONNECTION `dns-resolve` budget (mailroom cap-req #20, senior-architect review): seed ONE
+        // counter for this connection and share it (by `Arc` clone) across EVERY re-entry's store, so
+        // the lookup budget spans the whole connection. A session re-entry builds a fresh store per
+        // inbound frame, so a per-store budget would reset on every frame — attacker-resettable. The
+        // engine's configured default ([`HandlerEngine::with_dns_resolve_budget`]) seeds it.
+        #[cfg(feature = "tcp-egress")]
+        let dns_budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            inner.engine.dns_resolve_budget_default(),
+        ));
         let project_ref = boatramp_core::project::ProjectRef::new(project);
         // Resolve the component ONCE for the connection's life (a stable deployment; a redeploy is
         // picked up by a reconnect). A component that does not export `session-handler` fails the first
@@ -1356,6 +1365,8 @@ impl HandlerRuntime {
             limits,
             true,
             conn_security.clone(),
+            #[cfg(feature = "tcp-egress")]
+            dns_budget.clone(),
         );
         let mut connect_failed = false;
         tokio::select! {
@@ -1448,6 +1459,8 @@ impl HandlerRuntime {
                 limits,
                 true,
                 conn_security.clone(),
+                #[cfg(feature = "tcp-egress")]
+                dns_budget.clone(),
             );
             tokio::select! {
                 res = reentry => {

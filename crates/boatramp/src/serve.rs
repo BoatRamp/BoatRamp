@@ -3471,8 +3471,8 @@ fn spawn_listeners(
             // protection is not opt-in); an explicit `0` rate disables it.
             peer_conn_limit: {
                 use boatramp_node::config::{
-                    DEFAULT_LISTENER_CONN_BURST_PER_IP, DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED,
-                    DEFAULT_LISTENER_CONN_RATE_PER_IP,
+                    DEFAULT_LISTENER_CONN_BURST_PER_IP, DEFAULT_LISTENER_CONN_RATE_IPV6_PREFIX,
+                    DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED, DEFAULT_LISTENER_CONN_RATE_PER_IP,
                 };
                 let rate = l
                     .max_conns_per_ip_per_sec
@@ -3481,10 +3481,16 @@ fn spawn_listeners(
                     let burst = l
                         .conn_burst_per_ip
                         .unwrap_or(DEFAULT_LISTENER_CONN_BURST_PER_IP);
+                    // IPv6 is bucketed by prefix (default /64) so a /64 owner can't rotate addresses
+                    // to dodge the limit; IPv4 is keyed in full (senior-architect review).
+                    let ipv6_prefix = l
+                        .conn_rate_ipv6_prefix
+                        .unwrap_or(DEFAULT_LISTENER_CONN_RATE_IPV6_PREFIX);
                     Some(boatramp_server::peer_conn_limit::PeerConnLimiter::new(
                         rate,
                         burst,
                         DEFAULT_LISTENER_CONN_RATE_MAX_TRACKED,
+                        ipv6_prefix,
                     ))
                 } else {
                     None
@@ -3495,8 +3501,11 @@ fn spawn_listeners(
             // listener, else a client could forge its source IP).
             proxy_protocol: l.proxy_protocol,
             // security-review MEDIUM-1: trust the header only from these proxy source CIDRs (empty ⇒
-            // firewall-only mode).
+            // firewall-only mode, which config validation now permits only with `proxy_protocol_trust_any`).
             proxy_protocol_trusted_cidrs: l.proxy_protocol_trusted_cidrs.clone(),
+            // senior-architect review: explicit opt-in to trust a header from ANY source (firewall-only
+            // mode). Config validation refuses `proxy_protocol` + empty CIDRs unless this is set.
+            proxy_protocol_trust_any: l.proxy_protocol_trust_any,
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),

@@ -101,14 +101,30 @@ pub struct ListenerParams {
     pub proxy_protocol: bool,
     /// Trusted-proxy source CIDRs for `proxy_protocol` (security-review MEDIUM-1): `ip/prefix` strings.
     /// When non-empty, a PROXY header is trusted ONLY from a kernel peer inside one of these CIDRs
-    /// (else the connection is dropped). Empty ⇒ trust a header from any source (firewall-only mode).
+    /// (else the connection is dropped). Empty ⇒ trust a header from any source (firewall-only mode),
+    /// which is permitted ONLY alongside `proxy_protocol_trust_any` (enforced at config load).
     /// Parsed once at [`run_listener`]; a malformed entry fails the listener closed (it is not served).
     pub proxy_protocol_trusted_cidrs: Vec<String>,
+    /// Explicit opt-in to trust a PROXY header from ANY source when `proxy_protocol_trusted_cidrs` is
+    /// empty (senior-architect review — OWNER DECISION: require trusted CIDRs). Config validation
+    /// refuses `proxy_protocol` + empty CIDRs unless this is `true`; this field is the runtime
+    /// defense-in-depth backstop — [`run_listener`] fails the listener CLOSED (does not serve) if it
+    /// ever sees `proxy_protocol` + empty CIDRs + `!trust_any`, so the "trust any source" posture is
+    /// never reached by omission.
+    pub proxy_protocol_trust_any: bool,
 }
 
 /// How long to wait for a connection's PROXY-protocol header before dropping it (cap-req 18): a
 /// trusted proxy prepends it immediately, so this is short — it only bounds a slow/missing header.
 const PROXY_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper cap on the dedicated PROXY-protocol **pre-admission** slots (senior-architect review, Item
+/// 5). On a `proxy_protocol` listener the header read + per-IP admission run under their OWN modest
+/// semaphore — NOT the main `max_conns` gate — so a stalled/absent header can only pin a cheap,
+/// short-lived (≤ [`PROXY_HEADER_READ_TIMEOUT`]) pre-admission slot, never a whole-connection
+/// `max_conns` permit. The gate is sized `min(max_conns, this)` so a large `max_conns` doesn't allow
+/// unbounded concurrent header-reading tasks.
+const PROXY_PREADMIT_MAX_SLOTS: usize = 2_048;
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
 /// process shutdown signal fires, then drains in-flight connections (bounded by
@@ -137,6 +153,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         peer_conn_limit,
         proxy_protocol,
         proxy_protocol_trusted_cidrs,
+        proxy_protocol_trust_any,
     } = params;
 
     // Parse the trusted-proxy CIDRs once (security-review MEDIUM-1). A malformed entry fails the
@@ -159,6 +176,19 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         }
         nets
     };
+    // Require a trusted source for PROXY-protocol (senior-architect review — OWNER DECISION: require).
+    // Config validation already refuses `proxy_protocol` + empty CIDRs unless `proxy_protocol_trust_any`
+    // is set; this is the runtime defense-in-depth backstop, so even a config path that bypassed that
+    // check can never reach the "trust a header from any source" posture by omission — it fails the
+    // listener CLOSED (not served) exactly like a malformed CIDR.
+    if proxy_protocol && proxy_trusted.is_empty() && !proxy_protocol_trust_any {
+        tracing::error!(
+            listener = %name, %bind,
+            "NOT serving listener: `proxy_protocol` is on with no `proxy_protocol_trusted_cidrs` and \
+             `proxy_protocol_trust_any` is false (fail-closed — a header from any source is spoofable)"
+        );
+        return;
+    }
 
     let listener = match TcpListener::bind(bind).await {
         Ok(l) => l,
@@ -194,6 +224,13 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
     // Per-listener live-connection cap: a live connection holds one permit for its whole life; at the
     // ceiling a new connection is dropped (fail-closed backpressure) rather than unboundedly spawned.
     let conn_gate = Arc::new(Semaphore::new(max_conns));
+    // PROXY-protocol **pre-admission** gate (senior-architect review, Item 5): on a `proxy_protocol`
+    // listener the header read + per-IP admission run under THIS modest semaphore, and the main
+    // `conn_gate` permit is taken only AFTER the real client IP is admitted — so a stalled/absent
+    // header can pin only a cheap, ≤ PROXY_HEADER_READ_TIMEOUT pre-admission slot, never a
+    // whole-connection `max_conns` permit (the pin bug this fixes). Sized modestly relative to
+    // `max_conns`. Inert for a direct listener (it admits before the permit — already correct).
+    let pre_admit_gate = Arc::new(Semaphore::new(max_conns.clamp(1, PROXY_PREADMIT_MAX_SLOTS)));
     // Per-source-IP connection-rate admission (cap-req 18); `None` ⇒ no per-IP limit. Shared via `Arc`
     // so the admission can run EITHER in this accept loop (a DIRECT listener — the real client IP is
     // the kernel peer) OR inside the spawned task after a PROXY-protocol header reveals the real client
@@ -226,7 +263,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 // cap-req 18 / security-review MEDIUM-1: on a proxy_protocol listener with a trusted
                 // -CIDR set, only a connection FROM the trusted proxy may have its header trusted —
                 // drop anything else (fail-closed), so a firewall gap can't become source-IP spoofing.
-                // (Empty set ⇒ firewall-only mode: trust a header from any kernel peer.)
+                // (Empty set ⇒ firewall-only mode, permitted only with `proxy_protocol_trust_any`.)
                 if proxy_protocol
                     && !proxy_trusted.is_empty()
                     && !proxy_trusted.iter().any(|net| net.contains(&peer.ip()))
@@ -238,28 +275,6 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                     drop(stream);
                     continue;
                 }
-                // cap-req 18: per-source-IP connection-rate admission BEFORE any guest work. A peer
-                // over its token-bucket rate is refused + closed cheaply (restoring brute-force
-                // protection a FaaS listener guest can't do itself — it never sees the peer IP). For a
-                // DIRECT listener the real client IP is the kernel peer, so admit here. For a
-                // `proxy_protocol` listener the real IP isn't known until the header is read, so the
-                // admission is deferred into the spawned task below.
-                if !proxy_protocol
-                    && let Some(limiter) = &peer_conn_limit
-                    && !limiter.admit(peer.ip())
-                {
-                    log_rate_refusal(&rate_limit_warned, &name, peer);
-                    drop(stream);
-                    continue;
-                }
-                let Ok(permit) = Arc::clone(&conn_gate).try_acquire_owned() else {
-                    tracing::warn!(
-                        listener = %name, %peer, max_conns,
-                        "inbound-TCP listener at max_conns; dropping connection"
-                    );
-                    drop(stream);
-                    continue;
-                };
                 let runtime = runtime.clone();
                 let deploy = deploy.clone();
                 let name = name.clone();
@@ -271,21 +286,33 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let tls = tls.clone();
                 // Declarative STARTTLS grammar (cap-req 06, Stage B); `None` ⇒ implicit TLS / plaintext.
                 let starttls = starttls.clone();
-                // cap-req 18 completion: the limiter + warn flag (cheap `Arc` clones) for the
-                // proxy-path admission, which runs inside the spawn once the real client IP is known.
-                let peer_conn_limit = peer_conn_limit.clone();
-                let rate_limit_warned = Arc::clone(&rate_limit_warned);
-                tokio::spawn(async move {
-                    // Hold the per-listener permit for the connection's whole life.
-                    let _permit = permit;
-                    let mut stream = stream;
-                    // cap-req 18 completion: behind a trusted proxy, consume the PROXY-protocol header
-                    // (plaintext, BEFORE any TLS) to recover the real client address, then admit on THAT
-                    // IP (deferred from the accept loop). Fail-closed: a missing/malformed header on a
-                    // `proxy_protocol` listener drops the connection (a direct client can't forge one
-                    // because parsing is off unless the operator declared a trusted proxy fronts it).
-                    let peer = if proxy_protocol {
-                        match crate::proxy_protocol::read_proxy_header(
+
+                if proxy_protocol {
+                    // PROXY path (cap-req 18 completion + senior-architect review Item 5): the real
+                    // client IP isn't known until the header is read, so acquire only a cheap
+                    // PRE-ADMISSION slot here (NOT the main `max_conns` permit), read the header + admit
+                    // on the real IP inside the spawn, and take the `conn_gate` permit ONLY AFTER
+                    // admission — so a stalled/absent header can never pin a whole-connection permit.
+                    let Ok(pre_permit) = Arc::clone(&pre_admit_gate).try_acquire_owned() else {
+                        tracing::warn!(
+                            listener = %name, %peer,
+                            "inbound-TCP proxy listener at pre-admission ceiling; dropping connection"
+                        );
+                        drop(stream);
+                        continue;
+                    };
+                    let conn_gate = Arc::clone(&conn_gate);
+                    let peer_conn_limit = peer_conn_limit.clone();
+                    let rate_limit_warned = Arc::clone(&rate_limit_warned);
+                    tokio::spawn(async move {
+                        // Held only for the header read + admission; released before the connection runs.
+                        let pre_permit = pre_permit;
+                        let mut stream = stream;
+                        // Consume the PROXY-protocol header (plaintext, BEFORE any TLS) to recover the
+                        // real client address. Fail-closed: a missing/malformed header drops the
+                        // connection (a direct client can't forge one — parsing is off unless the
+                        // operator declared a trusted proxy fronts this listener).
+                        let peer = match crate::proxy_protocol::read_proxy_header(
                             &mut stream,
                             PROXY_HEADER_READ_TIMEOUT,
                         )
@@ -302,87 +329,64 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                                 );
                                 return;
                             }
+                        };
+                        // Per-source-IP admission on the REAL client IP, still under the pre-admission
+                        // slot — before any whole-connection permit is committed.
+                        if let Some(limiter) = &peer_conn_limit
+                            && !limiter.admit(peer.ip())
+                        {
+                            log_rate_refusal(&rate_limit_warned, &name, peer);
+                            return;
                         }
-                    } else {
-                        peer
-                    };
-                    if proxy_protocol
-                        && let Some(limiter) = &peer_conn_limit
+                        // Admitted: NOW take the whole-connection permit. At the ceiling, drop (the
+                        // header phase cost only a pre-admission slot, not a `max_conns` permit).
+                        let Ok(permit) = Arc::clone(&conn_gate).try_acquire_owned() else {
+                            tracing::warn!(
+                                listener = %name, %peer, max_conns,
+                                "inbound-TCP listener at max_conns; dropping connection"
+                            );
+                            return;
+                        };
+                        // Header phase done — free the pre-admission slot (the main permit now bounds
+                        // this connection for its whole life).
+                        drop(pre_permit);
+                        let _permit = permit;
+                        terminate_and_drive(
+                            &runtime, &deploy, &name, project.as_str(), site.as_str(),
+                            component.as_str(), &fn_config, tls, starttls, stream,
+                            peer.to_string(), idle_timeout, max_conn_duration, session_mode,
+                        )
+                        .await;
+                    });
+                } else {
+                    // DIRECT path (unchanged ordering — already correct): the real client IP is the
+                    // kernel peer, so admit per-source-IP BEFORE committing the `max_conns` permit.
+                    if let Some(limiter) = &peer_conn_limit
                         && !limiter.admit(peer.ip())
                     {
                         log_rate_refusal(&rate_limit_warned, &name, peer);
-                        return;
+                        drop(stream);
+                        continue;
                     }
-                    let peer = peer.to_string();
-                    match (tls, starttls) {
-                        // Host-side TLS termination (cap-req 06, implicit TLS): complete the
-                        // handshake BEFORE the guest sees any bytes, then hand the guest the
-                        // DECRYPTED halves. A failed handshake drops the connection — there is NO
-                        // plaintext fallthrough, and the cert key never reaches the guest.
-                        (Some(acceptor), None) => match acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                let (read_half, write_half) = tokio::io::split(tls_stream);
-                                // Implicit TLS (:993/:465): the wire is TLS-protected for the
-                                // connection's whole life (mailroom cap-req #16).
-                                drive(
-                                    &runtime, &deploy, &name, project.as_str(), site.as_str(),
-                                    component.as_str(), &fn_config, peer, read_half, write_half,
-                                    idle_timeout, max_conn_duration, session_mode,
-                                    boatramp_handlers::ConnectionSecurity::tls(),
-                                )
-                                .await;
-                            }
-                            Err(e) => tracing::warn!(
-                                listener = %name, %peer, error = %e,
-                                "inbound-TLS handshake failed; dropping connection"
-                            ),
-                        },
-                        // STARTTLS (cap-req 06, Stage B): the guest runs on an in-memory duplex while
-                        // the pump owns the socket — forwarding the plaintext dialog, upgrading to TLS
-                        // in-band on the declared trigger (the guest never sees the trigger and does no
-                        // crypto), then passing decrypted bytes through. A failed handshake drops the
-                        // pump, which closes the duplex → the guest reads EOF (no plaintext fallthrough).
-                        (Some(acceptor), Some(grammar)) => {
-                            // STARTTLS (:587/:143): starts plaintext; the pump flips this handle to
-                            // TLS on the in-band upgrade (mailroom cap-req #16). The pump and the
-                            // guest dispatch share the SAME underlying flag (clone of one Arc).
-                            let conn_security =
-                                boatramp_handlers::ConnectionSecurity::starttls_pending();
-                            let (g_read, g_write, pump) = crate::tcp_starttls::spawn_pump(
-                                stream,
-                                acceptor,
-                                grammar,
-                                conn_security.clone(),
-                            );
-                            drive(
-                                &runtime, &deploy, &name, project.as_str(), site.as_str(),
-                                component.as_str(), &fn_config, peer, g_read, g_write,
-                                idle_timeout, max_conn_duration, session_mode,
-                                conn_security,
-                            )
-                            .await;
-                            // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket
-                            // down. If the pump already ended (client gone / handshake failed) this is a
-                            // no-op.
-                            pump.abort();
-                        }
-                        // Plaintext listener — unchanged. A STARTTLS grammar without a cert is refused
-                        // at config validation, so `(None, Some(_))` cannot occur in practice; it is
-                        // handled here as a plaintext connection (fail-safe — never an unterminated
-                        // "STARTTLS" that silently stays cleartext).
-                        (None, _) => {
-                            let (read_half, write_half) = stream.into_split();
-                            // Plaintext listener — no TLS, none negotiable (mailroom cap-req #16).
-                            drive(
-                                &runtime, &deploy, &name, project.as_str(), site.as_str(),
-                                component.as_str(), &fn_config, peer, read_half, write_half,
-                                idle_timeout, max_conn_duration, session_mode,
-                                boatramp_handlers::ConnectionSecurity::plaintext(),
-                            )
-                            .await;
-                        }
-                    }
-                });
+                    let Ok(permit) = Arc::clone(&conn_gate).try_acquire_owned() else {
+                        tracing::warn!(
+                            listener = %name, %peer, max_conns,
+                            "inbound-TCP listener at max_conns; dropping connection"
+                        );
+                        drop(stream);
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        // Hold the per-listener permit for the connection's whole life.
+                        let _permit = permit;
+                        terminate_and_drive(
+                            &runtime, &deploy, &name, project.as_str(), site.as_str(),
+                            component.as_str(), &fn_config, tls, starttls, stream,
+                            peer.to_string(), idle_timeout, max_conn_duration, session_mode,
+                        )
+                        .await;
+                    });
+                }
             }
             _ = &mut shutdown => {
                 tracing::info!(listener = %name, %bind, "inbound-TCP listener shutting down; draining in-flight connections");
@@ -399,6 +403,122 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         conn_gate.acquire_many(max_conns as u32),
     )
     .await;
+}
+
+/// Apply the connection's TLS/STARTTLS/plaintext termination layer, then [`drive`] it (shared by the
+/// direct and proxy accept paths — Item 5 factored this out of the accept loop so both can call it
+/// after acquiring the main `conn_gate` permit at the right point). `stream` is the raw accepted TCP
+/// stream (for the proxy path, positioned just past the consumed PROXY-protocol header). A failed TLS
+/// handshake drops the connection — there is NO plaintext fallthrough and the cert key never reaches
+/// the guest.
+#[allow(clippy::too_many_arguments)]
+async fn terminate_and_drive(
+    runtime: &HandlerRuntime,
+    deploy: &DeployStore,
+    name: &str,
+    project: &str,
+    site: &str,
+    component: &str,
+    fn_config: &boatramp_core::function::FunctionConfig,
+    // Cheap `Arc`-backed clones per connection; `None` ⇒ plaintext listener.
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    starttls: Option<crate::tcp_starttls::StarttlsGrammar>,
+    stream: tokio::net::TcpStream,
+    peer: String,
+    idle_timeout: Duration,
+    max_conn_duration: Duration,
+    session_mode: bool,
+) {
+    match (tls, starttls) {
+        // Host-side TLS termination (cap-req 06, implicit TLS): complete the handshake BEFORE the
+        // guest sees any bytes, then hand the guest the DECRYPTED halves. A failed handshake drops
+        // the connection — NO plaintext fallthrough, and the cert key never reaches the guest.
+        (Some(acceptor), None) => match acceptor.accept(stream).await {
+            Ok(tls_stream) => {
+                let (read_half, write_half) = tokio::io::split(tls_stream);
+                // Implicit TLS (:993/:465): the wire is TLS-protected for the connection's whole
+                // life (mailroom cap-req #16).
+                drive(
+                    runtime,
+                    deploy,
+                    name,
+                    project,
+                    site,
+                    component,
+                    fn_config,
+                    peer,
+                    read_half,
+                    write_half,
+                    idle_timeout,
+                    max_conn_duration,
+                    session_mode,
+                    boatramp_handlers::ConnectionSecurity::tls(),
+                )
+                .await;
+            }
+            Err(e) => tracing::warn!(
+                listener = %name, %peer, error = %e,
+                "inbound-TLS handshake failed; dropping connection"
+            ),
+        },
+        // STARTTLS (cap-req 06, Stage B): the guest runs on an in-memory duplex while the pump owns
+        // the socket — forwarding the plaintext dialog, upgrading to TLS in-band on the declared
+        // trigger (the guest never sees the trigger and does no crypto), then passing decrypted bytes
+        // through. A failed handshake drops the pump, which closes the duplex → the guest reads EOF
+        // (no plaintext fallthrough).
+        (Some(acceptor), Some(grammar)) => {
+            // STARTTLS (:587/:143): starts plaintext; the pump flips this handle to TLS on the
+            // in-band upgrade (mailroom cap-req #16). The pump and the guest dispatch share the SAME
+            // underlying flag (clone of one Arc).
+            let conn_security = boatramp_handlers::ConnectionSecurity::starttls_pending();
+            let (g_read, g_write, pump) =
+                crate::tcp_starttls::spawn_pump(stream, acceptor, grammar, conn_security.clone());
+            drive(
+                runtime,
+                deploy,
+                name,
+                project,
+                site,
+                component,
+                fn_config,
+                peer,
+                g_read,
+                g_write,
+                idle_timeout,
+                max_conn_duration,
+                session_mode,
+                conn_security,
+            )
+            .await;
+            // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket down. If the
+            // pump already ended (client gone / handshake failed) this is a no-op.
+            pump.abort();
+        }
+        // Plaintext listener — unchanged. A STARTTLS grammar without a cert is refused at config
+        // validation, so `(None, Some(_))` cannot occur in practice; it is handled here as a plaintext
+        // connection (fail-safe — never an unterminated "STARTTLS" that silently stays cleartext).
+        (None, _) => {
+            let (read_half, write_half) = stream.into_split();
+            // Plaintext listener — no TLS, none negotiable (mailroom cap-req #16).
+            drive(
+                runtime,
+                deploy,
+                name,
+                project,
+                site,
+                component,
+                fn_config,
+                peer,
+                read_half,
+                write_half,
+                idle_timeout,
+                max_conn_duration,
+                session_mode,
+                boatramp_handlers::ConnectionSecurity::plaintext(),
+            )
+            .await;
+        }
+    }
 }
 
 /// Dispatch one accepted connection (plaintext socket halves OR a host-terminated TLS stream's

@@ -19,21 +19,35 @@ struct HickoryDnsResolver {
     inner: hickory_resolver::TokioResolver,
 }
 
+/// Response-cache size (number of cached DNS responses) for the shared `dns-resolve` resolver
+/// (senior-architect review, pairs with the per-invocation resolve budget cap-req #20). A mail relay
+/// resolving MX + A/AAAA for many distinct recipient domains thrashes a small cache, so set a
+/// generous explicit value rather than depend on the library default (which has varied across
+/// hickory versions). `u64` to match `ResolverOpts::cache_size`.
+const DNS_RESOLVER_CACHE_SIZE: u64 = 32_768;
+
 impl HickoryDnsResolver {
     /// Build the resolver from the system config (resolv.conf), falling back to the default public
-    /// config — the same fallible-builder chain the `domain-verify-dns` probe uses.
+    /// config — the same fallible-builder chain the `domain-verify-dns` probe uses. Both arms set an
+    /// explicit larger response-cache size ([`DNS_RESOLVER_CACHE_SIZE`]) via the builder's
+    /// `options_mut()` (hickory-resolver 0.26) so a high-cardinality mail relay doesn't thrash it.
     fn build() -> Result<Self, String> {
         use hickory_resolver::Resolver;
         use hickory_resolver::config::ResolverConfig;
         use hickory_resolver::net::runtime::TokioRuntimeProvider;
         let inner = hickory_resolver::TokioResolver::builder_tokio()
+            .map(|mut b| {
+                b.options_mut().cache_size = DNS_RESOLVER_CACHE_SIZE;
+                b
+            })
             .and_then(hickory_resolver::ResolverBuilder::build)
             .or_else(|_| {
-                Resolver::builder_with_config(
+                let mut b = Resolver::builder_with_config(
                     ResolverConfig::default(),
                     TokioRuntimeProvider::default(),
-                )
-                .build()
+                );
+                b.options_mut().cache_size = DNS_RESOLVER_CACHE_SIZE;
+                b.build()
             })
             .map_err(|e| format!("building the DNS resolver: {e}"))?;
         Ok(Self { inner })
