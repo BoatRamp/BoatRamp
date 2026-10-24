@@ -1091,6 +1091,9 @@ impl HandlerRuntime {
         write_half: W,
         idle_timeout: std::time::Duration,
         max_conn_duration: std::time::Duration,
+        // Live wire-security of this connection (mailroom cap-req #16), exposed to the guest via
+        // `tcp-connection-context`.
+        conn_security: boatramp_handlers::ConnectionSecurity,
     ) -> Result<(), String>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -1153,6 +1156,7 @@ impl HandlerRuntime {
                 // config map), so the operator-declared gate is satisfied; the posture gate is
                 // enforced inside the engine (`tcp_listener_dispatch_decision`, defense-in-depth).
                 true,
+                conn_security,
             )
             .await
             .map_err(|e| format!("tcp-connection dispatch: {e}"))
@@ -1200,6 +1204,9 @@ impl HandlerRuntime {
         // connection is NOT bound by this — only by `max_conn_duration` + dead-peer EOF.
         reentry_timeout: std::time::Duration,
         max_conn_duration: std::time::Duration,
+        // Live wire-security of this connection (mailroom cap-req #16); the SAME handle is passed on
+        // every re-entry so a guest observes a STARTTLS upgrade the moment the pump flips it.
+        conn_security: boatramp_handlers::ConnectionSecurity,
     ) -> Result<(), String>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -1330,6 +1337,7 @@ impl HandlerRuntime {
             bindings,
             limits,
             true,
+            conn_security.clone(),
         );
         let mut connect_failed = false;
         tokio::select! {
@@ -1411,9 +1419,15 @@ impl HandlerRuntime {
             // (which releases the session-pool permit + the store/instance) and end the connection,
             // rather than pinning a slot/instance for up to `max_conn_duration`. `true` = this is an
             // operator-declared listener (the accept loop only drives declared listeners).
-            let reentry = inner
-                .engine
-                .dispatch_session_socket(&hash, &wasm, batch, bindings, limits, true);
+            let reentry = inner.engine.dispatch_session_socket(
+                &hash,
+                &wasm,
+                batch,
+                bindings,
+                limits,
+                true,
+                conn_security.clone(),
+            );
             tokio::select! {
                 res = reentry => {
                     if let Err(e) = res {

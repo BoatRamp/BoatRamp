@@ -406,6 +406,17 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             name: "tcp-listener",
             lifecycle: Experimental,
         });
+        // The host-owned-listener connection-context capability (mailroom cap-req #16): a listener
+        // guest imports `tcp-connection-context` to read its connection's CURRENT wire security (so it
+        // can refuse AUTH over plaintext / advertise STARTTLS only pre-upgrade). Rides the SAME
+        // `tcp-listener` grant (no new grant kind — see `capability_token`), but is advertised as its
+        // OWN feature so a guest declaring `requires = ["tcp-connection-context"]` is refused cleanly
+        // on a pre-#16 host (which has `tcp-listener` but not this interface) instead of failing to
+        // instantiate. Experimental until the shape settles.
+        f.push(CapabilityFeature {
+            name: "tcp-connection-context",
+            lifecycle: Experimental,
+        });
     }
     // The host-terminated outbound-TLS egress capability (`PLAN-handler-tcp-egress` Build A, mailroom
     // #15): the host dials + terminates TLS on a guest-named `host:port`/`sni` and hands back

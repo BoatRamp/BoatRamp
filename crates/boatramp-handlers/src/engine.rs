@@ -496,6 +496,13 @@ struct HostState {
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
+    /// Live wire-security of THIS host-owned listener connection (mailroom cap-req #16), read by the
+    /// `tcp-connection-context` import. `None` for every non-listener invocation (request / consumer
+    /// / HTTP-session), which the binding fail-closes to `plaintext`. The listener dispatch
+    /// (`dispatch_tcp_connection` / `dispatch_session_inner`) sets it after `new_store`; for a
+    /// STARTTLS listener the pump flips it to TLS on upgrade through the shared handle.
+    #[cfg(feature = "tcp-listener")]
+    conn_security: Option<bindings::tcp_connection_context::ConnectionSecurity>,
 }
 
 impl HostState {
@@ -2656,8 +2663,18 @@ impl HandlerEngine {
             .lane_semaphore(Lane::Async)
             .try_acquire()
             .map_err(|_| HandlerError::Overloaded)?;
-        self.dispatch_session_inner(hash, wasm, batch, bindings, limits)
-            .await
+        // HTTP-driven session: no raw-socket wire security at this layer (the edge terminates TLS);
+        // pass no connection-security handle so `tcp-connection-context` fail-closes to plaintext.
+        self.dispatch_session_inner(
+            hash,
+            wasm,
+            batch,
+            bindings,
+            limits,
+            #[cfg(feature = "tcp-listener")]
+            None,
+        )
+        .await
     }
 
     /// Like [`dispatch_session`](Self::dispatch_session) but AWAITS the Async-lane permit instead of
@@ -2677,6 +2694,7 @@ impl HandlerEngine {
     }
 
     #[cfg(all(feature = "session", feature = "tcp-listener"))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_session_socket(
         &self,
         hash: &str,
@@ -2685,6 +2703,9 @@ impl HandlerEngine {
         bindings: Bindings,
         limits: Limits,
         listener_declared: bool,
+        // Live wire-security of this connection (mailroom cap-req #16); the driver passes the SAME
+        // handle on every re-entry (and, for STARTTLS, a clone is flipped to TLS by the pump).
+        conn_security: crate::ConnectionSecurity,
     ) -> Result<(), HandlerError> {
         // The SAME mutation-verified structural gates the connection lane enforces (Security review
         // MEDIUM-1 — the session path must carry the same fail-closed backstop, so a future per-listener
@@ -2721,7 +2742,7 @@ impl HandlerEngine {
             .acquire()
             .await
             .map_err(|_| HandlerError::Overloaded)?;
-        self.dispatch_session_inner(hash, wasm, batch, bindings, limits)
+        self.dispatch_session_inner(hash, wasm, batch, bindings, limits, Some(conn_security))
             .await
     }
 
@@ -2739,9 +2760,18 @@ impl HandlerEngine {
         batch: SessionBatch,
         bindings: Bindings,
         limits: Limits,
+        // Live wire-security of the socket this session re-entry drives (mailroom cap-req #16),
+        // exposed via `tcp-connection-context`. `None` for the HTTP-driven session path (no raw
+        // socket at this layer — fail-closed to plaintext). Only present when the listener surface is
+        // compiled in.
+        #[cfg(feature = "tcp-listener")] conn_security: Option<crate::ConnectionSecurity>,
     ) -> Result<(), HandlerError> {
         let session_pre = self.session_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
+        #[cfg(feature = "tcp-listener")]
+        {
+            store.data_mut().conn_security = conn_security;
+        }
         let instantiated_at = std::time::Instant::now();
         let session = session_pre
             .instantiate_async(&mut store)
@@ -2835,6 +2865,10 @@ impl HandlerEngine {
         idle_timeout: Duration,
         max_conn_duration: Duration,
         listener_declared: bool,
+        // Live wire-security of this connection (mailroom cap-req #16), exposed to the guest via the
+        // `tcp-connection-context` import. For a STARTTLS listener the pump holds a clone and flips
+        // it to TLS on upgrade.
+        conn_security: crate::ConnectionSecurity,
     ) -> Result<(), HandlerError>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -2886,6 +2920,9 @@ impl HandlerEngine {
             ..self.tcp_conn_limits
         };
         let mut store = self.new_store(bindings, eff);
+        // Expose this connection's live wire-security to the guest's `tcp-connection-context` import
+        // (mailroom cap-req #16).
+        store.data_mut().conn_security = Some(conn_security);
         // Conn lane (security-review HIGH): the per-invocation epoch TRAP deadline + CPU fuel are the
         // wrong bound for a continuous byte stream (a long-lived `handle` would trip the request epoch).
         // But disabling the epoch outright (`u64::MAX`) lets a CPU-bound guest that makes no suspending
@@ -3098,6 +3135,13 @@ impl HandlerEngine {
                 state.tcp_egress_idle_timeout,
             )
         })?;
+        // Host-owned-listener connection-context (mailroom cap-req #16): a listener guest reads the
+        // CURRENT wire security of its connection. Always linked under `tcp-listener`; a non-listener
+        // invocation has `conn_security == None`, which the binding fail-closes to `plaintext`.
+        #[cfg(feature = "tcp-listener")]
+        bindings::tcp_connection_context::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::tcp_connection_context::ConnContextHost::new(state.conn_security.clone())
+        })?;
         Ok(linker)
     }
 
@@ -3230,6 +3274,10 @@ impl HandlerEngine {
             tcp_egress_idle_timeout: self.tcp_egress_idle_timeout,
             #[cfg(feature = "sql")]
             sql,
+            // Set by the listener dispatch after `new_store`; a non-listener invocation leaves it
+            // `None` (the `tcp-connection-context` import fail-closes to `plaintext`).
+            #[cfg(feature = "tcp-listener")]
+            conn_security: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);

@@ -1563,3 +1563,46 @@ interface tcp-egress {
 world tcp-egress-host {
   import tcp-egress;
 }
+
+/// The host-owned-listener **connection-context** capability (mailroom cap-req #16): a host-owned
+/// listener guest — a `tcp-connection-handler`, or a session-mode `session-handler` driven over a
+/// socket — reads the CURRENT wire security of ITS connection, so an IMAP/SMTP guest can refuse
+/// AUTH/credentials over plaintext and advertise STARTTLS only before an upgrade. Bound host-side to
+/// THIS connection (the guest names no id, exactly like `tenancy.current-principal`).
+///
+/// FAIL-CLOSED by construction: the host returns `tls` ONLY when the wire is actually TLS-protected.
+/// A non-listener invocation (or any state the host cannot determine) reads as `plaintext`, never a
+/// false `tls`, so a guest gating AUTH on `tls-active` stays safe under any ambiguity. For a STARTTLS
+/// listener the state is `starttls-pending` until the host completes the in-band upgrade, then flips
+/// to `tls` — the host sets it BEFORE the first decrypted byte reaches the guest, so a guest reading
+/// it while handling any post-upgrade byte always sees `tls`.
+///
+/// This is own-connection metadata (strictly less sensitive than the `peer` address a
+/// `tcp-connection-handler` already receives), but it is still a declarable, deny-by-default grant
+/// (`tcp-connection-context`) + off-by-default cargo feature (`tcp-listener`) + a `requires`
+/// admission entry, so a pre-#16 host fails a dependent deploy LOUDLY rather than silently dropping
+/// the import. A guest WIT addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump.
+interface tcp-connection-context {
+  /// The current wire security of THIS connection.
+  /// - `plaintext`: a plaintext listener (no TLS negotiable) — also the fail-closed answer for a
+  ///   non-listener invocation.
+  /// - `tls`: TLS-protected right now (implicit TLS from connect, OR a completed STARTTLS upgrade).
+  /// - `starttls-pending`: a STARTTLS-capable listener that has NOT yet upgraded (still plaintext on
+  ///   the wire); becomes `tls` once the host completes the in-band STARTTLS upgrade.
+  enum transport-security { plaintext, tls, starttls-pending }
+
+  /// This connection's current security state. FAIL-CLOSED: never `tls` unless the wire is actually
+  /// TLS-protected.
+  security: func() -> transport-security;
+
+  /// Convenience predicate: is the wire TLS-protected right now? (`security() == tls`).
+  tls-active: func() -> bool;
+}
+
+/// Import-only world for the `tcp-connection-context` host binding (the `ConnContextHost` Host impl),
+/// mirroring `target-context-host`. Off by default (cargo feature `tcp-listener`, with which the
+/// host-owned listener surface itself is gated). Imported by a host-owned listener guest alongside
+/// its `tcp-connection-handler` / `session-handler` export.
+world tcp-connection-context-host {
+  import tcp-connection-context;
+}

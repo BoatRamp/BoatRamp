@@ -161,6 +161,7 @@ async fn bind_and_serve(
                 write_half,
                 idle,
                 max_dur,
+                boatramp_handlers::ConnectionSecurity::plaintext(),
             )
             .await
     });
@@ -374,6 +375,7 @@ async fn bind_and_serve_tls(
                 write_half,
                 idle,
                 max_dur,
+                boatramp_handlers::ConnectionSecurity::tls(),
             )
             .await
     });
@@ -469,8 +471,16 @@ async fn bind_and_serve_starttls(
     let handle = tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
         let _ = stream.set_nodelay(true);
-        let (g_read, g_write, pump) =
-            boatramp_server::tcp_starttls::spawn_pump(stream, acceptor, grammar);
+        // Same wiring as the production accept arm (mailroom cap-req #16): one `starttls-pending`
+        // handle shared between the pump (which flips it to TLS on the in-band upgrade) and the guest
+        // dispatch (which exposes it via `tcp-connection-context`).
+        let conn_security = boatramp_handlers::ConnectionSecurity::starttls_pending();
+        let (g_read, g_write, pump) = boatramp_server::tcp_starttls::spawn_pump(
+            stream,
+            acceptor,
+            grammar,
+            conn_security.clone(),
+        );
         let res = runtime
             .dispatch_tcp_connection(
                 &deploy,
@@ -483,6 +493,7 @@ async fn bind_and_serve_starttls(
                 g_write,
                 idle,
                 max_dur,
+                conn_security,
             )
             .await;
         pump.abort(); // guest returned ⇒ tear the pump + socket down (no-op if it already ended)
@@ -757,6 +768,7 @@ async fn bind_and_serve_session(
                 write_half,
                 reentry_timeout,
                 max_dur,
+                boatramp_handlers::ConnectionSecurity::plaintext(),
             )
             .await
     });

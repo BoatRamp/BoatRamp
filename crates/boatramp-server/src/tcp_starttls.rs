@@ -142,6 +142,10 @@ pub(crate) async fn run_starttls_pump(
     host_end: DuplexStream,
     acceptor: TlsAcceptor,
     grammar: StarttlsGrammar,
+    // Live wire-security for this connection (mailroom cap-req #16): flipped to TLS the instant the
+    // handshake completes, BEFORE any decrypted byte is forwarded to the guest, so a guest's
+    // `tcp-connection-context` read is correct for every post-upgrade byte.
+    conn_security: boatramp_handlers::ConnectionSecurity,
 ) -> io::Result<()> {
     let (mut hr, mut hw) = tokio::io::split(host_end);
 
@@ -202,6 +206,12 @@ pub(crate) async fn run_starttls_pump(
     // Any client byte sent after the trigger line's `\n` is still in the socket buffer and is consumed
     // ONLY here, by the TLS record layer — never replayed as plaintext/application data.
     let tls = acceptor.accept(socket).await?;
+    // The wire is now TLS-protected. Flip the live indicator (mailroom cap-req #16) BEFORE the
+    // pass-through below forwards the first decrypted byte to the guest, so a guest reading
+    // `tcp-connection-context` while handling any post-upgrade byte sees `tls` (not `starttls-pending`).
+    // A FAILED handshake returns `?` above and leaves the state `starttls-pending` — but the caller
+    // then drops the pump and the guest reads EOF, so that state is never observed.
+    conn_security.mark_tls_active();
     let (mut tr, mut tw) = tokio::io::split(tls);
     // Decrypted bytes both ways until either side closes. No line discipline past the upgrade.
     tokio::select! {
@@ -220,6 +230,9 @@ pub fn spawn_pump(
     socket: TcpStream,
     acceptor: TlsAcceptor,
     grammar: StarttlsGrammar,
+    // Live wire-security for this connection (mailroom cap-req #16); the pump flips it to TLS on a
+    // successful in-band upgrade. The caller holds the sibling clone it hands to the guest dispatch.
+    conn_security: boatramp_handlers::ConnectionSecurity,
 ) -> (
     tokio::io::ReadHalf<DuplexStream>,
     tokio::io::WriteHalf<DuplexStream>,
@@ -227,7 +240,13 @@ pub fn spawn_pump(
 ) {
     let (guest_end, host_end) = tokio::io::duplex(STARTTLS_DUPLEX_BUF);
     let (g_read, g_write) = tokio::io::split(guest_end);
-    let handle = tokio::spawn(run_starttls_pump(socket, host_end, acceptor, grammar));
+    let handle = tokio::spawn(run_starttls_pump(
+        socket,
+        host_end,
+        acceptor,
+        grammar,
+        conn_security,
+    ));
     (g_read, g_write, handle)
 }
 

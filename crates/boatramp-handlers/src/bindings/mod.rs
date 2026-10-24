@@ -55,6 +55,12 @@ pub mod session;
 pub mod sql;
 #[cfg(feature = "sql")]
 pub mod target_context;
+/// The host-owned-listener connection-context binding (`boatramp:handlers/tcp-connection-context`,
+/// mailroom cap-req #16): a listener guest reads the CURRENT wire security of its connection (so it
+/// can refuse AUTH over plaintext / advertise STARTTLS only pre-upgrade). Pure sync read of a
+/// per-connection flag, fail-closed to plaintext; gated with the host-owned listener surface itself.
+#[cfg(feature = "tcp-listener")]
+pub mod tcp_connection_context;
 /// The host-terminated outbound-TLS egress binding (`boatramp:handlers/tcp-egress`,
 /// `PLAN-handler-tcp-egress` Build A, mailroom cap-req #15): the host dials + terminates TLS on a
 /// guest-named `host:port`/`sni` and hands back plaintext `wasi:io` streams — the guest never holds

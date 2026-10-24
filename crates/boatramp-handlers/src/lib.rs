@@ -81,6 +81,11 @@ pub use bindings::messaging_stats::{
 pub use bindings::migrate::MigrateBinding;
 #[cfg(feature = "session")]
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
+/// The live per-connection wire-security handle for a host-owned listener connection (mailroom
+/// cap-req #16) — the serve layer constructs one per connection and threads it into the engine
+/// dispatch + (for STARTTLS) the pump.
+#[cfg(feature = "tcp-listener")]
+pub use bindings::tcp_connection_context::ConnectionSecurity;
 #[cfg(feature = "messaging")]
 pub use bindings::tenancy::{ProducerContextSource, SealedPrincipal};
 #[cfg(feature = "tenant-secrets")]

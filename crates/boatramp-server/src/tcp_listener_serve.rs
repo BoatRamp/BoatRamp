@@ -219,10 +219,13 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                         (Some(acceptor), None) => match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let (read_half, write_half) = tokio::io::split(tls_stream);
+                                // Implicit TLS (:993/:465): the wire is TLS-protected for the
+                                // connection's whole life (mailroom cap-req #16).
                                 drive(
                                     &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                     component.as_str(), &fn_config, peer, read_half, write_half,
                                     idle_timeout, max_conn_duration, session_mode,
+                                    boatramp_handlers::ConnectionSecurity::tls(),
                                 )
                                 .await;
                             }
@@ -237,12 +240,22 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                         // crypto), then passing decrypted bytes through. A failed handshake drops the
                         // pump, which closes the duplex → the guest reads EOF (no plaintext fallthrough).
                         (Some(acceptor), Some(grammar)) => {
-                            let (g_read, g_write, pump) =
-                                crate::tcp_starttls::spawn_pump(stream, acceptor, grammar);
+                            // STARTTLS (:587/:143): starts plaintext; the pump flips this handle to
+                            // TLS on the in-band upgrade (mailroom cap-req #16). The pump and the
+                            // guest dispatch share the SAME underlying flag (clone of one Arc).
+                            let conn_security =
+                                boatramp_handlers::ConnectionSecurity::starttls_pending();
+                            let (g_read, g_write, pump) = crate::tcp_starttls::spawn_pump(
+                                stream,
+                                acceptor,
+                                grammar,
+                                conn_security.clone(),
+                            );
                             drive(
                                 &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                 component.as_str(), &fn_config, peer, g_read, g_write,
                                 idle_timeout, max_conn_duration, session_mode,
+                                conn_security,
                             )
                             .await;
                             // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket
@@ -256,10 +269,12 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                         // "STARTTLS" that silently stays cleartext).
                         (None, _) => {
                             let (read_half, write_half) = stream.into_split();
+                            // Plaintext listener — no TLS, none negotiable (mailroom cap-req #16).
                             drive(
                                 &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                 component.as_str(), &fn_config, peer, read_half, write_half,
                                 idle_timeout, max_conn_duration, session_mode,
+                                boatramp_handlers::ConnectionSecurity::plaintext(),
                             )
                             .await;
                         }
@@ -302,6 +317,10 @@ async fn drive<R, W>(
     idle_timeout: Duration,
     max_conn_duration: Duration,
     session_mode: bool,
+    // Live wire-security of this connection (mailroom cap-req #16): `tls` for an implicit-TLS
+    // listener, `plaintext` for a plaintext one, `starttls-pending` (flipped to `tls` by the pump)
+    // for STARTTLS. Threaded to the guest's `tcp-connection-context` import.
+    conn_security: boatramp_handlers::ConnectionSecurity,
 ) where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
@@ -327,6 +346,7 @@ async fn drive<R, W>(
                     // a parked quiet connection survives, bounded only by `max_conn_duration`.
                     idle_timeout,
                     max_conn_duration,
+                    conn_security,
                 )
                 .await
             {
@@ -335,7 +355,13 @@ async fn drive<R, W>(
         }
         #[cfg(not(feature = "session"))]
         {
-            let _ = (read_half, write_half, idle_timeout, max_conn_duration);
+            let _ = (
+                read_half,
+                write_half,
+                idle_timeout,
+                max_conn_duration,
+                conn_security,
+            );
             tracing::error!(
                 listener = %name, %peer,
                 "listener is session-mode but this build lacks the `session` feature; dropping connection"
@@ -355,6 +381,7 @@ async fn drive<R, W>(
             write_half,
             idle_timeout,
             max_conn_duration,
+            conn_security,
         )
         .await
     {

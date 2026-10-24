@@ -143,6 +143,13 @@ mod imp {
             ("boatramp:handlers", "tcp-connection-types" | "tcp-connection-handler") => {
                 Some("tcp-listener")
             }
+            // The host-owned-listener connection-context capability (mailroom cap-req #16): a listener
+            // guest IMPORTS `tcp-connection-context` to read its connection's current wire security.
+            // It rides the SAME `tcp-listener` grant (a listener already declares it) — no new grant
+            // kind, exactly as `tcp-egress` reuses `wasi:sockets`. Availability (so a pre-#16 host
+            // fails a dependent deploy loudly) is the SEPARATE `tcp-connection-context` feature a guest
+            // names in `requires`, not this token.
+            ("boatramp:handlers", "tcp-connection-context") => Some("tcp-listener"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -220,7 +227,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 8, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 9, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
