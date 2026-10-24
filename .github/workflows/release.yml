@@ -53,6 +53,9 @@ jobs:
   console-dist:
     name: console SPA (Nix)
     runs-on: ubuntu-latest
+    # Hard cap: a Nix/cachix step that WEDGES (the v0.44.0 release hung ~3h40m in a stuck
+    # cachix push) must fail fast, not burn the 6h default. Generous vs a cold no-cache build.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
@@ -82,6 +85,9 @@ jobs:
     name: build · ${{ matrix.target }}
     needs: console-dist
     runs-on: ${{ matrix.os }}
+    # Hard cap on the per-target build (Nix static build + cachix read/push) — fail a wedge
+    # fast instead of the 6h default. 90m is ample for a cold, cache-miss build.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -289,6 +295,9 @@ jobs:
     # Scopes the release signing key (COSIGN_PRIVATE_KEY) to this job via a protected environment,
     # so the private half is never exposed to the build/test jobs that run untrusted-ish code.
     environment: release-signing
+    # Hard cap: the GHCR image build pushes a large Nix closure to cachix — the exact step
+    # that wedged for ~3h40m in v0.44.0. Fail a stuck push fast instead of the 6h default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       # Building the boatramp binaries through Nix is disk- and memory-heavy on a

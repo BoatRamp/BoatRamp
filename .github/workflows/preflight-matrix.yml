@@ -36,6 +36,8 @@ jobs:
   test:
     name: test (all features)
     runs-on: ubuntu-latest
+    # Fail a wedged infra step fast rather than burn the 6h default (release precondition).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -103,6 +105,9 @@ jobs:
   nix:
     name: nix (${{ matrix.leg.label }})
     runs-on: ubuntu-latest
+    # The Nix build + cachix PUSH leg — exactly where v0.44.0 wedged ~3h40m. Cap it so a
+    # stuck push fails fast; 90m is ample for a cold, cache-miss closure build.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -177,6 +182,8 @@ jobs:
   k8s-e2e:
     name: operator e2e (kind)
     runs-on: ubuntu-latest
+    # Fail a hung kind cluster / pull fast rather than the 6h default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - name: Free disk space
@@ -216,6 +223,8 @@ jobs:
   export-import-live:
     name: test (project export/import live — Postgres pgvector + MySQL)
     runs-on: ubuntu-latest
+    # Fail a hung DB container / live gate fast rather than the 6h default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

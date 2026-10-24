@@ -350,6 +350,14 @@
                   "BOATRAMP_DATA_DIR=/data"
                   "HOME=/data"
                 ];
+                Labels = {
+                  # GHCR auto-links a published package to its source repo via this label,
+                  # so a release Actions push is never `denied` on an unlinked package (the
+                  # v0.44.0 GHCR incident, where the migrated packages had to be hand-linked
+                  # with Actions write access before the push would go through).
+                  "org.opencontainers.image.source" = "https://github.com/BoatRamp/BoatRamp";
+                  "org.opencontainers.image.title" = "boatramp";
+                };
               }
               // lib.optionalAttrs (user != null) { User = user; };
             };
