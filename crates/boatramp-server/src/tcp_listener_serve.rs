@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,6 +25,23 @@ use boatramp_core::deploy::DeployStore;
 /// How long the accept loop waits for in-flight connections to finish on shutdown before abandoning
 /// the drain. Each live connection also has its own `max_conn_duration` cap, so this is a backstop.
 const LISTENER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Log a per-source-IP rate-limit refusal (cap-req 18), warn-once then debit to debug so a flood can't
+/// spam the log. Shared by the direct-listener (accept-loop) and proxy-path (spawned-task) admissions.
+fn log_rate_refusal(warned: &AtomicBool, name: &str, peer: SocketAddr) {
+    if warned.swap(true, Ordering::Relaxed) {
+        tracing::debug!(
+            listener = %name, %peer,
+            "inbound-TCP connection refused by per-source-IP rate limit"
+        );
+    } else {
+        tracing::warn!(
+            listener = %name, %peer,
+            "inbound-TCP connection refused by per-source-IP rate limit (cap-req 18); further \
+             refusals on this listener log at debug"
+        );
+    }
+}
 
 /// The fully-resolved parameters of one `[serve.listeners.<name>]` accept loop (built one layer up
 /// from the config, so this module needs no `boatramp-node` dependency). `fn_config` carries the
@@ -76,7 +94,16 @@ pub struct ListenerParams {
     /// connections are closed cheaply. `None` ⇒ no per-IP limit (the `max_conns` live-cap still
     /// applies). The orchestrator builds this from the listener config's rate/burst.
     pub peer_conn_limit: Option<crate::peer_conn_limit::PeerConnLimiter>,
+    /// Trust a PROXY-protocol (v1/v2) header to recover the real client address behind an L4 proxy
+    /// (cap-req 18 completion). `true` ⇒ each connection must present a well-formed header (dropped
+    /// otherwise, fail-closed) and that address drives the per-IP limit + the guest's `peer`. `false`
+    /// ⇒ the kernel peer is used, unchanged. The orchestrator copies it from the listener config.
+    pub proxy_protocol: bool,
 }
+
+/// How long to wait for a connection's PROXY-protocol header before dropping it (cap-req 18): a
+/// trusted proxy prepends it immediately, so this is short — it only bounds a slow/missing header.
+const PROXY_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
 /// process shutdown signal fires, then drains in-flight connections (bounded by
@@ -103,6 +130,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         starttls,
         session_mode,
         peer_conn_limit,
+        proxy_protocol,
     } = params;
 
     let listener = match TcpListener::bind(bind).await {
@@ -139,9 +167,13 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
     // Per-listener live-connection cap: a live connection holds one permit for its whole life; at the
     // ceiling a new connection is dropped (fail-closed backpressure) rather than unboundedly spawned.
     let conn_gate = Arc::new(Semaphore::new(max_conns));
-    // Per-source-IP connection-rate admission (cap-req 18); `None` ⇒ no per-IP limit. Checked in the
-    // accept loop below (single task, so a plain flag throttles the refusal log without a lock).
-    let mut rate_limit_warned = false;
+    // Per-source-IP connection-rate admission (cap-req 18); `None` ⇒ no per-IP limit. Shared via `Arc`
+    // so the admission can run EITHER in this accept loop (a DIRECT listener — the real client IP is
+    // the kernel peer) OR inside the spawned task after a PROXY-protocol header reveals the real client
+    // IP (cap-req 18 completion, behind a trusted proxy). The warn-once flag is an `AtomicBool` for the
+    // same reason: the proxy-path admission logs from a spawned task.
+    let peer_conn_limit = peer_conn_limit.map(Arc::new);
+    let rate_limit_warned = Arc::new(AtomicBool::new(false));
     // Shared, read-only per-connection inputs (cloned cheaply into each spawned task).
     let project = Arc::new(project);
     let site = Arc::new(site);
@@ -166,25 +198,15 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let _ = stream.set_nodelay(true);
                 // cap-req 18: per-source-IP connection-rate admission BEFORE any guest work. A peer
                 // over its token-bucket rate is refused + closed cheaply (restoring brute-force
-                // protection a FaaS listener guest can't do itself — it never sees the peer IP). The
-                // FIRST refusal on this listener logs at warn (an operator signal); the rest at debug,
-                // so a flood can't spam the log.
-                if let Some(limiter) = &peer_conn_limit
+                // protection a FaaS listener guest can't do itself — it never sees the peer IP). For a
+                // DIRECT listener the real client IP is the kernel peer, so admit here. For a
+                // `proxy_protocol` listener the real IP isn't known until the header is read, so the
+                // admission is deferred into the spawned task below.
+                if !proxy_protocol
+                    && let Some(limiter) = &peer_conn_limit
                     && !limiter.admit(peer.ip())
                 {
-                    if !rate_limit_warned {
-                        rate_limit_warned = true;
-                        tracing::warn!(
-                            listener = %name, %peer,
-                            "inbound-TCP connection refused by per-source-IP rate limit (cap-req 18); \
-                             further refusals on this listener log at debug"
-                        );
-                    } else {
-                        tracing::debug!(
-                            listener = %name, %peer,
-                            "inbound-TCP connection refused by per-source-IP rate limit"
-                        );
-                    }
+                    log_rate_refusal(&rate_limit_warned, &name, peer);
                     drop(stream);
                     continue;
                 }
@@ -207,9 +229,48 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let tls = tls.clone();
                 // Declarative STARTTLS grammar (cap-req 06, Stage B); `None` ⇒ implicit TLS / plaintext.
                 let starttls = starttls.clone();
+                // cap-req 18 completion: the limiter + warn flag (cheap `Arc` clones) for the
+                // proxy-path admission, which runs inside the spawn once the real client IP is known.
+                let peer_conn_limit = peer_conn_limit.clone();
+                let rate_limit_warned = Arc::clone(&rate_limit_warned);
                 tokio::spawn(async move {
                     // Hold the per-listener permit for the connection's whole life.
                     let _permit = permit;
+                    let mut stream = stream;
+                    // cap-req 18 completion: behind a trusted proxy, consume the PROXY-protocol header
+                    // (plaintext, BEFORE any TLS) to recover the real client address, then admit on THAT
+                    // IP (deferred from the accept loop). Fail-closed: a missing/malformed header on a
+                    // `proxy_protocol` listener drops the connection (a direct client can't forge one
+                    // because parsing is off unless the operator declared a trusted proxy fronts it).
+                    let peer = if proxy_protocol {
+                        match crate::proxy_protocol::read_proxy_header(
+                            &mut stream,
+                            PROXY_HEADER_READ_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(Some(real)) => real,
+                            // LOCAL (v2) / UNKNOWN (v1): the proxy's own connection — use the kernel peer.
+                            Ok(None) => peer,
+                            Err(e) => {
+                                tracing::debug!(
+                                    listener = %name, %peer, error = %e,
+                                    "dropping connection: no/malformed PROXY-protocol header on a \
+                                     proxy_protocol listener"
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        peer
+                    };
+                    if proxy_protocol
+                        && let Some(limiter) = &peer_conn_limit
+                        && !limiter.admit(peer.ip())
+                    {
+                        log_rate_refusal(&rate_limit_warned, &name, peer);
+                        return;
+                    }
                     let peer = peer.to_string();
                     match (tls, starttls) {
                         // Host-side TLS termination (cap-req 06, implicit TLS): complete the

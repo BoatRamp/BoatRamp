@@ -3490,6 +3490,10 @@ fn spawn_listeners(
                     None
                 }
             },
+            // cap-req 18 completion: trust a PROXY-protocol header to recover the real client IP
+            // behind an L4 proxy. Opt-in; fail-closed when on (default off — never parse on a direct
+            // listener, else a client could forge its source IP).
+            proxy_protocol: l.proxy_protocol,
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),

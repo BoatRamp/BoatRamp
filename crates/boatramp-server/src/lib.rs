@@ -309,6 +309,11 @@ pub use migrate::{MigrateMode, run_migration};
 /// per peer IP checked at the accept loop, so a FaaS listener guest (which can't see the peer IP)
 /// doesn't regress native-daemon brute-force protection.
 pub mod peer_conn_limit;
+/// PROXY-protocol (v1/v2) header parsing for host-owned listeners (cap-req 18 completion): recover
+/// the real client IP behind a trusted L4 proxy, so the per-source-IP limiter + the `peer` handed to
+/// the guest are correct. Opt-in per listener (`proxy_protocol = true`); fail-closed when enabled.
+#[cfg(feature = "tcp-listener")]
+pub mod proxy_protocol;
 /// SSE-out + POST-in serving of the duplex/resumable `session` capability
 /// (PLAN-session-primitive Stage 4): a `GET` opens the resumable outbound stream, a `POST` delivers
 /// an inbound frame that re-enters the guest `session-handler`.

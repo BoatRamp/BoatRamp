@@ -2439,6 +2439,15 @@ pub struct ListenerConfig {
     /// Ignored when the rate is `0` (limit disabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_burst_per_ip: Option<u32>,
+    /// Trust a **PROXY-protocol** (v1/v2) header on each accepted connection (cap-req 18 completion):
+    /// when this listener sits behind a trusted L4 proxy/load-balancer, the kernel peer is the
+    /// proxy's, so the host reads the prepended header to recover the REAL client address and uses it
+    /// for the per-source-IP rate limit AND the `peer` handed to the guest. **Opt-in + fail-closed**:
+    /// `false` (default) never parses a header (so a direct client can't forge one to spoof its IP);
+    /// `true` asserts the listener is reachable ONLY via the trusted proxy, and a connection that does
+    /// not present a well-formed header is dropped. Set it ONLY when a proxy actually fronts the port.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_protocol: bool,
     /// How the accepted connection is driven (cap-req 08). [`ListenerMode::Connection`] (default) is the
     /// long-lived model: the guest's `tcp-connection-handler` holds the connection — and ONE wasm
     /// instance — for the connection's whole life. [`ListenerMode::Session`] drives the connection
