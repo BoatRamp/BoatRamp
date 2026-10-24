@@ -3025,6 +3025,200 @@ impl NodeProjectExport {
     }
 
     // -----------------------------------------------------------------------
+    // T3 Phase 1 — resumable, chained export (member-object layout)
+    //
+    // The default export streams a single tar to a forward-only `AsyncWrite` sink, so an
+    // interrupted export restarts from scratch. The resumable mode lays the SAME members
+    // out as one object per member under a local directory, each written atomically with
+    // its size+SHA, so a re-run RESUMES: an already-complete member is skipped (presence +
+    // SHA), a partial one is re-produced. Import reads the directory and restores member by
+    // member in the MANIFEST's authoritative order, reusing the SAME per-member producers
+    // (`stage_job` / `open_chunked_producer`) and restorer (`restore_member`) as the tar
+    // path — so the per-project tenancy scoping is byte-for-byte identical and unweakened:
+    // the KV slice's `scope_entries_to_project` lives in `stage_job`, and the import
+    // re-key / target-scope enforcement lives in `restore_member`. This mode adds NO new
+    // data path to a tenant's bytes; it only changes the CONTAINER (a dir of objects).
+    //
+    // HONEST LIMIT: resume is per-MEMBER, not intra-member — a huge single pg_dump redumps
+    // on resume. The win is a many-member export (thousands of blobs, many sites) and
+    // surviving a drop BETWEEN members. (An S3-multipart target + byte-range intra-member
+    // resume are Phase 2; a delta-onto-a-base export is a separate follow-on program.)
+
+    /// Resumable export to a local directory `dir` (member-object layout). Writes — or, on
+    /// resume, reads — an authoritative `MANIFEST`, then one object per member, skipping any
+    /// already present + SHA-valid. `dir` is on the NODE's filesystem (a persistent/mounted
+    /// path), so a resume actually avoids re-producing the expensive members.
+    pub async fn export_resumable(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        dir: &Path,
+    ) -> Result<(), Perr> {
+        check_project_slug(project)?;
+        if opts.data_only && opts.include_identity {
+            return Err(Perr::Other(
+                "--data-only and --include-identity are mutually exclusive".into(),
+            ));
+        }
+        tokio::fs::create_dir_all(dir).await.map_err(other)?;
+        let created_at = now_secs();
+        let session = self
+            .work_dir
+            .join(format!("export-res-{project}-{created_at}"));
+        let stage_dir = session.join("stage");
+        tokio::fs::create_dir_all(&stage_dir).await.map_err(other)?;
+
+        // PLAN (reuse): enumerate members + per-member jobs + source, in restore order.
+        let (specs, jobs, source) = self.plan_export(project, opts, created_at).await?;
+
+        // The MANIFEST is AUTHORITATIVE. First run: write it. Resume: read it and use ITS
+        // member set (members added since are ignored; nothing not in it can be produced) —
+        // strict, MANIFEST-wins. Refuse a dir that already holds another project's manifest.
+        let manifest_path = dir.join(project_bundle::MANIFEST_PATH);
+        let specs = if tokio::fs::try_exists(&manifest_path).await.map_err(other)? {
+            let bytes = tokio::fs::read(&manifest_path).await.map_err(other)?;
+            let m: project_bundle::StreamManifest = serde_json::from_slice(&bytes)
+                .map_err(|e| Perr::Other(format!("read resumable MANIFEST: {e}")))?;
+            if m.source.project != source.project {
+                return Err(Perr::Other(format!(
+                    "resumable export dir holds a MANIFEST for project {:?}, not {:?} — \
+                     refusing to mix projects in one dir",
+                    m.source.project, source.project
+                )));
+            }
+            m.members
+        } else {
+            let m = project_bundle::StreamManifest {
+                magic: project_bundle::BUNDLE_MAGIC.to_string(),
+                format_version: project_bundle::BUNDLE_FORMAT_VERSION_V3,
+                created_at,
+                data_only: opts.data_only,
+                source: source.clone(),
+                members: specs.clone(),
+            };
+            let bytes = serde_json::to_vec_pretty(&m)
+                .map_err(|e| Perr::Other(format!("encode MANIFEST: {e}")))?;
+            write_atomic(&manifest_path, &bytes).await?;
+            specs
+        };
+
+        // Produce each member that is not already complete.
+        for (idx, spec) in specs.iter().enumerate() {
+            let obj = dir.join(member_object_name(idx));
+            let meta = dir.join(member_meta_name(idx));
+            if member_object_valid(&obj, &meta).await? {
+                continue; // resume: already produced + SHA-valid.
+            }
+            // Clear any stale partial before re-producing.
+            let _ = tokio::fs::remove_file(&obj).await;
+            let _ = tokio::fs::remove_file(dir.join(member_part_name(idx))).await;
+            let job = jobs.get(&spec.path);
+            let digest = match spec.framing {
+                project_bundle::MemberFraming::Sidecar => {
+                    let job = job.ok_or_else(|| {
+                        Perr::Other(format!("resumable export: no stage job for {}", spec.path))
+                    })?;
+                    let tmp = self.stage_job(project, job, &stage_dir, idx).await?;
+                    let d = write_member_from_file(dir, idx, &tmp).await?;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    d
+                }
+                project_bundle::MemberFraming::ChunkedTrailer => {
+                    let producer = self.open_chunked_producer(job)?;
+                    write_member_from_producer(dir, idx, producer).await?
+                }
+            };
+            let meta_bytes = serde_json::to_vec(&digest)
+                .map_err(|e| Perr::Other(format!("encode member meta: {e}")))?;
+            write_atomic(&meta, &meta_bytes).await?;
+        }
+        let _ = tokio::fs::remove_dir_all(&session).await;
+        Ok(())
+    }
+
+    /// Import a resumable member-object directory (the output of [`export_resumable`]):
+    /// restore members in the MANIFEST's authoritative order, reusing [`restore_member`]
+    /// per member — identical per-member tenancy re-key/enforce as the streaming import.
+    pub async fn import_resumable(
+        &self,
+        project: &str,
+        dir: &Path,
+        opts: ImportOptions,
+    ) -> Result<ImportReport, Perr> {
+        check_project_slug(project)?;
+        let manifest_path = dir.join(project_bundle::MANIFEST_PATH);
+        let bytes = tokio::fs::read(&manifest_path)
+            .await
+            .map_err(|e| Perr::Other(format!("read resumable MANIFEST: {e}")))?;
+        let manifest: project_bundle::StreamManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| Perr::Other(format!("parse resumable MANIFEST: {e}")))?;
+
+        // The same fresh-target guard as the streaming import (unless overwrite).
+        if !opts.overwrite {
+            for prefix in
+                boatramp_core::project_export::project_owned_prefixes(ProjectRef::new(project))
+            {
+                if !self
+                    .kv
+                    .list_prefix(&prefix)
+                    .await
+                    .map_err(other)?
+                    .is_empty()
+                {
+                    return Err(Perr::Other(format!(
+                        "import refused: target project {project:?} already has control-plane \
+                         data under {prefix:?}; pass overwrite=true"
+                    )));
+                }
+            }
+            if !self
+                .blobs
+                .list(&blob_project_prefix(project))
+                .await
+                .map_err(other)?
+                .is_empty()
+            {
+                return Err(Perr::Other(format!(
+                    "import refused: target project {project:?} already has blobs; pass \
+                     overwrite=true"
+                )));
+            }
+        }
+
+        let session = self
+            .work_dir
+            .join(format!("import-res-{project}-{}", now_secs()));
+        tokio::fs::create_dir_all(&session).await.map_err(other)?;
+
+        let mut report = ImportReport::default();
+        let mut saw_identity = false;
+        for (idx, spec) in manifest.members.iter().enumerate() {
+            let obj = dir.join(member_object_name(idx));
+            let meta = dir.join(member_meta_name(idx));
+            if !member_object_valid(&obj, &meta).await? {
+                return Err(Perr::Other(format!(
+                    "resumable import: member {idx} ({}) is missing or fails its SHA — the \
+                     export directory is incomplete or corrupt",
+                    spec.path
+                )));
+            }
+            self.restore_member(
+                project,
+                manifest.data_only,
+                &manifest.source.project,
+                spec,
+                &obj,
+                &opts,
+                &mut report,
+                &mut saw_identity,
+            )
+            .await?;
+        }
+        let _ = tokio::fs::remove_dir_all(&session).await;
+        Ok(report)
+    }
+
+    // -----------------------------------------------------------------------
     // inc2 Stage C — Postgres atomic shadow-restore
     //
     // THE SECURITY-CRITICAL SPLIT (the pg analogue of Build 1's libsql ATTACH-authorizer fix):
@@ -3782,6 +3976,148 @@ fn mysql_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+// --- T3 Phase 1: resumable member-object layout helpers --------------------------------
+
+/// The object filename for member `idx` in a resumable export directory. Zero-padded so a
+/// directory listing sorts in member (restore) order.
+fn member_object_name(idx: usize) -> String {
+    format!("m{idx:05}")
+}
+/// The per-member `{size, sha256}` sidecar filename (a committed member has both).
+fn member_meta_name(idx: usize) -> String {
+    format!("m{idx:05}.meta")
+}
+/// The in-progress partial filename (renamed to the object only once fully written).
+fn member_part_name(idx: usize) -> String {
+    format!("m{idx:05}.part")
+}
+
+/// Write `bytes` to `path` atomically: a sibling `.tmp` then rename (so a crash never
+/// leaves a half-written manifest/meta that a resume would trust).
+async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Perr> {
+    let tmp = path.with_extension("writing.tmp");
+    tokio::fs::write(&tmp, bytes).await.map_err(other)?;
+    tokio::fs::rename(&tmp, path).await.map_err(other)?;
+    Ok(())
+}
+
+/// Stream-hash a file: its byte length + lowercase-hex SHA-256, read in bounded chunks so a
+/// large member never loads whole into memory (preserving the O(chunk) footprint).
+async fn sha256_and_size_of_file(path: &Path) -> Result<(u64, String), Perr> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await.map_err(other)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await.map_err(other)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((size, hex::encode(hasher.finalize())))
+}
+
+/// Whether member `obj` is COMPLETE: the object + its `.meta` sidecar both exist and the
+/// object's streamed size + SHA-256 match the recorded [`MemberMeta`]. A missing sidecar,
+/// an unparsable meta, or any size/SHA mismatch (a truncated/partial object) ⇒ not complete,
+/// so the resume re-produces it. This is the per-member resume decision.
+async fn member_object_valid(obj: &Path, meta: &Path) -> Result<bool, Perr> {
+    if !tokio::fs::try_exists(obj).await.map_err(other)?
+        || !tokio::fs::try_exists(meta).await.map_err(other)?
+    {
+        return Ok(false);
+    }
+    let meta_bytes = tokio::fs::read(meta).await.map_err(other)?;
+    let recorded: project_bundle::MemberMeta = match serde_json::from_slice(&meta_bytes) {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+    let (size, sha) = sha256_and_size_of_file(obj).await?;
+    Ok(size == recorded.size && sha == recorded.sha256)
+}
+
+/// Produce member `idx`'s object by copying a staged sidecar temp into `dir`, streaming its
+/// bytes through the hasher so no whole-member buffer is held. Writes `m{idx}.part` then
+/// renames to `m{idx}`; returns the member's `{size, sha256}`.
+async fn write_member_from_file(
+    dir: &Path,
+    idx: usize,
+    src: &Path,
+) -> Result<project_bundle::MemberMeta, Perr> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let part = dir.join(member_part_name(idx));
+    let mut rd = tokio::fs::File::open(src).await.map_err(other)?;
+    let mut wr = tokio::fs::File::create(&part).await.map_err(other)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = rd.read(&mut buf).await.map_err(other)?;
+        if n == 0 {
+            break;
+        }
+        wr.write_all(&buf[..n]).await.map_err(other)?;
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    wr.flush().await.map_err(other)?;
+    drop(wr);
+    tokio::fs::rename(&part, dir.join(member_object_name(idx)))
+        .await
+        .map_err(other)?;
+    Ok(project_bundle::MemberMeta {
+        size,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+/// Produce member `idx`'s object by draining a chunked body producer into `m{idx}.part`,
+/// hashing as it goes, then rename to `m{idx}`. Fails LOUD (no rename, no meta) if the
+/// producer POISONED (a short/failed dump) or errored, so a partial member can never be
+/// recorded as complete.
+async fn write_member_from_producer(
+    dir: &Path,
+    idx: usize,
+    producer: ChunkedProducer,
+) -> Result<project_bundle::MemberMeta, Perr> {
+    use std::sync::atomic::Ordering::SeqCst;
+    use tokio::io::AsyncWriteExt;
+    let (mut rx, poison, handle) = producer;
+    let part = dir.join(member_part_name(idx));
+    let mut wr = tokio::fs::File::create(&part).await.map_err(other)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = rx.recv().await {
+        wr.write_all(&chunk).await.map_err(other)?;
+        hasher.update(&chunk);
+        size += chunk.len() as u64;
+    }
+    wr.flush().await.map_err(other)?;
+    drop(wr);
+    // The producer task's own result + the poison flag are the authenticity of the body:
+    // a failed/short dump must NOT be committed as a valid member.
+    match handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(Perr::Other(format!("export member producer panicked: {e}"))),
+    }
+    if poison.load(SeqCst) {
+        return Err(Perr::Other(format!(
+            "export member {idx} producer poisoned (incomplete body) — not committing"
+        )));
+    }
+    tokio::fs::rename(&part, dir.join(member_object_name(idx)))
+        .await
+        .map_err(other)?;
+    Ok(project_bundle::MemberMeta {
+        size,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4460,5 +4796,92 @@ mod tests {
         };
         assert_eq!(fingerprint_rows(&a), fingerprint_rows(&same));
         assert_ne!(fingerprint_rows(&a), fingerprint_rows(&different));
+    }
+
+    // --- T3 Phase 1: resumable member-object layout + per-member resume decision ---------
+
+    #[tokio::test]
+    async fn resumable_member_object_write_and_resume_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Produce member 0 from a staged sidecar temp, then persist its {size,sha256} meta
+        // exactly as `export_resumable` does.
+        let src = dir.join("staged-src");
+        tokio::fs::write(&src, b"hello-member-zero").await.unwrap();
+        let meta = write_member_from_file(dir, 0, &src).await.unwrap();
+        assert_eq!(meta.size, b"hello-member-zero".len() as u64);
+        write_atomic(
+            &dir.join(member_meta_name(0)),
+            &serde_json::to_vec(&meta).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let obj0 = dir.join(member_object_name(0));
+        let meta0 = dir.join(member_meta_name(0));
+        // Complete + SHA-valid → resume SKIPS it.
+        assert!(member_object_valid(&obj0, &meta0).await.unwrap());
+        // The `.part` was renamed away (no stray partial).
+        assert!(!dir.join(member_part_name(0)).exists());
+
+        // A member never produced → not valid (resume must produce it).
+        assert!(
+            !member_object_valid(
+                &dir.join(member_object_name(1)),
+                &dir.join(member_meta_name(1))
+            )
+            .await
+            .unwrap()
+        );
+
+        // A TRUNCATED/corrupt object → fails its SHA → not valid → resume re-produces it.
+        tokio::fs::write(&obj0, b"trunc").await.unwrap();
+        assert!(
+            !member_object_valid(&obj0, &meta0).await.unwrap(),
+            "a truncated object must fail its recorded SHA and be re-produced on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_chunked_member_commits_and_poison_fails_loud() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Happy path: a producer that streams two chunks then returns Ok, poison clear.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let poison = Arc::new(AtomicBool::new(false));
+        let h = tokio::spawn(async move {
+            tx.send(b"ab".to_vec()).await.unwrap();
+            tx.send(b"cd".to_vec()).await.unwrap();
+            Ok(())
+        });
+        let meta = write_member_from_producer(dir, 2, (rx, poison, h))
+            .await
+            .unwrap();
+        assert_eq!(meta.size, 4);
+        assert!(dir.join(member_object_name(2)).exists());
+
+        // Poison path: a producer that writes a partial body then POISONS → must fail loud,
+        // committing NO object (a partial member can never be recorded complete).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let poison = Arc::new(AtomicBool::new(false));
+        let p2 = poison.clone();
+        let h = tokio::spawn(async move {
+            tx.send(b"partial".to_vec()).await.unwrap();
+            p2.store(true, SeqCst);
+            Ok(())
+        });
+        let r = write_member_from_producer(dir, 3, (rx, poison, h)).await;
+        assert!(
+            r.is_err(),
+            "a poisoned (incomplete) producer must fail loud"
+        );
+        assert!(
+            !dir.join(member_object_name(3)).exists(),
+            "no member object may be committed when the producer poisoned"
+        );
     }
 }
