@@ -50,6 +50,7 @@ Top-level sections, all optional:
 | `blob_notify_tier` | `dry-run` \| `provision` \| `verify-only` \| `refuse` | — | Cloud blob-change notification provisioning tier for `blob` triggers on a cloud object store (S3→SQS / GCS→Pub/Sub / Azure→Event Grid). Absent ⇒ no provisioning (blob triggers work only on a self-watching backend like `fs`). See [Cloud blob triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning). |
 | `blob_notify_account_id` | string | — | Scopes the provisioned notification pipeline: the **AWS account id** (S3 queue policy) or **GCP project id** (GCS topic + notificationConfig). Unused by Azure (the queue shares the account's shared-key auth). |
 | `s3_credential` | table | — | Node-level base S3 credential sourced from the sealed `[secrets]` store (shared by the S3 blob backend and the AWS ingress minter). See [`serve.s3_credential`](#serves3_credential). |
+| `resumable_export_dir` | path | — | Node-local base directory for **resumable** project export/import (`POST /api/project-export?resumable=<dir>`). A resumable export writes a member-object directory `<resumable_export_dir>/<dir>` (each member `.part`-then-rename, SHA-verified) so a dropped export/import resumes instead of restarting; the `<dir>` is confined to this base (an absolute/`..`-escaping name is refused). Absent ⇒ resumable export/import is unavailable (`?resumable=` is refused). |
 | `blob_fallback` | table | — | A read-only secondary blob backend for a zero-downtime backend switch. See [`serve.blob_fallback`](#serveblob_fallback). |
 | `s3_ingress_addr` | socket address | — | Bind for the dedicated S3-upload ingress listener; see [S3 upload ingress](#serves3-upload-ingress). |
 | `s3_ingress_secret_file` | path | — | On-node HKDF root for the local S3 ingress face; see [S3 upload ingress](#serves3-upload-ingress). |
@@ -314,10 +315,13 @@ carries no Host/path/principal). The guest is handed only the connection's
 `wasi:io` byte streams — it holds **no** `wasi:sockets` authority. Needs the
 `tcp-listener` feature, and is **posture-gated**: off unless
 `allow_guest_tcp_listener` is set (off under `multi-tenant`) **and** a listener is
-declared here — so compiling the feature in binds nothing by itself. Phase 1 is
-plaintext-only with no per-listener egress: a declared `tls` block or a non-empty
-`egress_allowlist` is **refused at config load** (fail-closed), not silently
-ignored. Env parity: `BOATRAMP_SERVE_LISTENER_<NAME>_*`.
+declared here — so compiling the feature in binds nothing by itself. Env parity:
+`BOATRAMP_SERVE_LISTENER_<NAME>_*`.
+
+A listener guest may read the connection's current wire security through the
+`tcp-connection-context` capability (mailroom cap-req 16) — `security()` returns
+`plaintext` / `tls` / `starttls-pending`, fail-closed — so an IMAP/SMTP guest can
+refuse credentials over plaintext and advertise STARTTLS only before the upgrade.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -325,17 +329,21 @@ ignored. Env parity: `BOATRAMP_SERVE_LISTENER_<NAME>_*`.
 | `component` | string | — | Path to the guest `.wasm` within the pinned site's deployment (exports the connection handler). **Required**. |
 | `project` | string | — | The project whose active deployment holds `component` (host-resolved). **Required**. |
 | `site` | string | — | The site within `project` whose active deployment holds `component`. **Required**. |
-| `imports` | list | `[]` | Requested capability interfaces the component uses per connection (`sql`/`orm`/`kv`/…) — never `wasi:sockets`. |
+| `imports` | list | `[]` | Requested capability interfaces the component uses per connection (`sql`/`orm`/`kv`/…) — never raw `wasi:sockets`. To let the guest dial outbound through the host-mediated `tcp-egress` capability (see `egress_allowlist`), declare the `wasi:sockets` token here (the token `tcp-egress` maps to); a listener that omits it gets an empty allowlist and all host-mediated dials are refused. |
 | `env` | map | — | Static environment variables injected into the component (never secrets). |
 | `tenancy` | tenancy | plain | Operator-pinned Dimension-0 tenancy for this listener's `sql`/`orm`, carried on every connection. Absent ⇒ plain (project = database). |
 | `max_conns` | int | `256` | Cap on simultaneously-live connections for this listener. `0` is refused. |
+| `max_conns_per_ip_per_sec` | float | `30` | Per-source-IP connection-rate limit (cap-req 18): the sustained connections/sec one peer IP may open, atop `conn_burst_per_ip`. **ON by default** (brute-force protection is not opt-in) — a FaaS listener guest can't see the peer IP, so the host throttles at the accept loop. Set `0` to disable (the `max_conns` live-cap still applies). Behind an L4 proxy/NAT without PROXY-protocol all clients share one bucket — raise it or disable there. |
+| `conn_burst_per_ip` | int | `60` | Immediate per-source-IP connection allowance (the token-bucket burst) before `max_conns_per_ip_per_sec` throttles. Ignored when the rate is `0`. |
+| `egress_allowlist` | list | `[]` | Per-listener outbound-TCP allowlist (cap-req 19) for the guest's **host-mediated** `tcp-egress` dials: the `host:port` / `ip:port` / `CIDR:port` targets the host may dial on the guest's behalf (the host dials + terminates TLS — the guest never holds a raw socket). Takes effect only when the node posture `allow_guest_tcp_egress` is on **and** `imports` declares the `wasi:sockets` token; the dial is connect-only + SSRF-floored. Enables e.g. an imap-proxy listener dialing the IMAPS upstream. |
 | `idle_timeout_ms` | int | `60000` | Tear a connection down after this long with no bytes in either direction (in session mode, reinterpreted as the per-re-entry processing deadline). `0` is refused. |
 | `max_conn_duration_ms` | int | `3600000` | Absolute cap on a single connection's lifetime regardless of activity. `0` is refused. |
 | `mode` | `connection` \| `session` | `connection` | How the accepted connection is driven. `connection` pins one wasm instance per connection for its whole life (exports `tcp-connection-handler`). `session` drives it through the re-entrant session model — the host owns the socket, holds no instance between batches, and a protocol-idle-but-alive peer (IMAP IDLE) is never reaped for inactivity (exports `session-handler`). |
+| `tls` | table | — | Host-side TLS termination (cap-req 06): the host terminates TLS and hands the guest a decrypted plaintext stream. Requires `cert_file` + `key_file` (PEM). Add a `starttls` sub-table (`trigger` / `response` / `tag_capture`) for in-band STARTTLS upgrade (SMTP/IMAP/POP3). Omit for a plaintext listener. |
 
-A listener's optional `tls` block (deferred in Phase 1) may set `on_demand = true`
-to share the `[serve.on_demand_tls]` engine for per-SNI issuance on a verified
-custom domain in its own project.
+A listener's optional `tls` block may set `on_demand = true` to share the
+`[serve.on_demand_tls]` engine for per-SNI issuance on a verified custom domain in
+its own project.
 
 ### `serve.on_demand_tls`
 

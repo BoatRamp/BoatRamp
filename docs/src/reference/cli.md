@@ -949,19 +949,23 @@ workloads. See [Run a container or microVM](../how-to/compute.md).
 
 ## `boatramp db`
 
-**Read-only** inspection of a project's **managed databases**. A managed database is
+Inspect and operator-provision a project's **managed databases**. A managed database is
 declared in the `databases:` block of an [`apply`](#boatramp-apply) manifest — boatramp
 then provisions it, mints and seals its credential, and follows the workload across
 restarts. There is deliberately **no `db create`**: the manifest is the sole authoring
-surface (a create verb would compete as a second source of truth), so this group only
-*reads* what `apply` declared. The declaration and provisioning gate at `Project·Admin`;
-these read verbs are `Project·Read`. Takes the common `--server` flag.
+surface (a create verb would compete as a second source of truth). The read verbs
+(`ls`/`get`/`status`) are `Project·Read`; the provisioning verbs (`ensure database`,
+`ensure user`, `drop user`) re-run an idempotent action against an **already-declared**
+database and gate at `Project·Admin`. Takes the common `--server` flag.
 
 | Sub-action | Description |
 | --- | --- |
 | `ls` | List the project's declared managed databases (`NAME`, `KIND`, `TENANT`, `SCOPE`, `SIZE`). |
 | `get <name>` | Show one declared database's declaration. |
-| `status <name>` | Show one declared database's provisioning/health status (declaration + the derived server-workload handle). |
+| `status <name>` | Show one declared database's declaration + its live **readiness** (`starting` / `service-ready` / `provisioned` / `provision-failed` — distinct from bare TCP health; a workload is `provisioned` only once its post-launch provisioning, e.g. a default-project `CREATE DATABASE`, has run). |
+| `ensure database <name>` | Idempotently (re-)provision an already-declared database — e.g. force the default-project database setup to run now rather than waiting for the first binding. `Project·Admin`. |
+| `ensure user <name> <user>` | Idempotently provision a login role `<user>` on the managed database `<name>`. By default the host mints + seals the password; `--password-secret <secret>` binds a **bring-your-own** password from a sealed secret instead. On a shared cluster the role name is per-tenant-qualified so it can't collide across tenants. `Project·Admin`. |
+| `drop user <name> <user>` | Drop the login role `<user>` on `<name>` (idempotent — absent is still success). `Project·Admin`. |
 
 The global `--output-format json` emits the raw record instead of the human table.
 To declare or change a database, edit the manifest's `databases:` block — see

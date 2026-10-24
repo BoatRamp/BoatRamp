@@ -98,12 +98,14 @@ database, its volume, or the credential; teardown stays an explicit imperative
 verb (removal is decoupled from the manifest so an accidental deletion can't
 destroy data).
 
-## 3. Inspect (read-only)
+## 3. Inspect & operator-provision
 
-The `boatramp db` command inspects the project's declared databases. It is
-**read-only** — there is deliberately **no `db create`**: the manifest is the
-sole authoring surface (a create verb would compete as a second source of truth).
-These reads are `Project·Read`.
+The `boatramp db` command inspects and operator-provisions the project's declared
+databases. There is deliberately **no `db create`**: the manifest is the sole
+authoring surface (a create verb would compete as a second source of truth). The
+read verbs (`ls`/`get`/`status`) are `Project·Read`; the provisioning verbs
+(`ensure database`, `ensure user`, `drop user`) re-run an idempotent action against
+an **already-declared** database and gate at `Project·Admin`.
 
 ```console
 $ boatramp db ls
@@ -111,15 +113,49 @@ NAME                      KIND        TENANT    SCOPE     SIZE
 app                       postgres    shared    project   Medium
 
 $ boatramp db get app                  # the full declaration
-$ boatramp db status app               # declaration + derived server-workload handle
+$ boatramp db status app               # declaration + live readiness
 database `app`
-  server workload: <derived-handle>
+  readiness:       provisioned
   declared:        yes
 ```
 
-Add the global `--output-format json` to any of them for the raw structured view. To declare, change, or
-tear down a database, edit the manifest and `apply` (or use the imperative
-teardown verb) — not this command.
+Add the global `--output-format json` to any of them for the raw structured view.
+
+### Readiness (runner vs ready)
+
+`db status` reports a **readiness** that is distinct from bare TCP health: a managed
+workload is `starting` → `service-ready` (the server answers) → `provisioned` (its
+post-launch provisioning has also run — e.g. the default-project `CREATE DATABASE`,
+so the database the binding needs actually exists), or `provision-failed`. Bindings,
+routing, and migrations each wait for a configurable readiness level, defaulting to
+`provisioned` (so a migration never runs against a server that is answering but not
+yet set up). An operator can relax a given gate to `service-ready` with the external
+database config's `readiness_gate` (`answerability` / `routing` / `migration`).
+
+Force the provisioning to run now (rather than on the first binding) with:
+
+```console
+$ boatramp db ensure database app      # idempotent (re-)provision of a declared DB
+```
+
+### Login roles (operator-provisioned users)
+
+Provision a login role on a managed database — for a tool or a human that connects
+with its own credential rather than the binding's:
+
+```console
+$ boatramp db ensure user app analytics                 # host mints + seals the password
+$ boatramp db ensure user app analytics --password-secret analytics_pw   # bring-your-own
+$ boatramp db drop user app analytics                   # idempotent teardown
+```
+
+By default the host mints and seals the role's password; `--password-secret` binds a
+**bring-your-own** password from a sealed secret instead. On a **shared** cluster the
+role name is per-tenant-qualified, so the same `<user>` in two tenants can't collide.
+These are `Project·Admin`.
+
+To declare, change, or tear down a database itself, edit the manifest and `apply` (or
+use the imperative teardown verb) — not this command.
 
 ## How the declaration merges with node config
 

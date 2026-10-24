@@ -48,8 +48,8 @@ full operational picture (format, atomicity, the managed-DB restore constraints)
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. `System·Admin`. |
-| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt]` | Import a `BRPROJ` bundle (the request body) into `project`. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `System·Admin`. |
+| `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false][&resumable=<dir>]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. With `resumable=<dir>` the bundle is instead written as a **member-object directory** under the node's `[serve] resumable_export_dir` base (returns JSON naming `resumable_dir`, not a stream): each member is a separate object written `.part`-then-rename, so a re-run skips members already present + SHA-verified — a dropped export resumes instead of restarting. `System·Admin`. |
+| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt][&resumable=<dir>]` | Import a `BRPROJ` bundle (the request body) into `project`, or — with `resumable=<dir>` — from the member-object directory under `[serve] resumable_export_dir` that a resumable export produced. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `System·Admin`. |
 
 The bundle is **streamed** on both ends — the node never stages the whole bundle to a temp file.
 A small/sidecar-framed member (the control-plane KV slice, small blobs, the identity container)
@@ -540,7 +540,9 @@ are `project` · `read`. Top-level paths target the `default` project;
 | `GET` | `/api/databases/:name` | Get one declared database, or `404`. `project` · `read`. |
 | `PUT` | `/api/databases/:name` | Declare (persist + eagerly provision) a database from an `ApplyDatabase` body. `204` on success. `project` · `admin`. |
 | `POST` | `/api/databases/:name/ensure` | Re-provision an already-declared database idempotently. `204`. `project` · `admin`. |
-| `GET` | `/api/databases/:name/status` | The stored declaration + a coarse provisioned signal. `project` · `read`. |
+| `GET` | `/api/databases/:name/status` | The stored declaration + the workload's live **readiness** (`starting` / `service-ready` / `provisioned` / `provision-failed`, distinct from bare TCP health). `project` · `read`. |
+| `POST` | `/api/databases/:name/users/:user/ensure` | Operator-provision (idempotent) a login role `:user` on the managed database (mailroom C2). The host mints + seals a password by default, or binds a bring-your-own one from a sealed secret (see `boatramp db ensure user`). On a shared cluster the role name is per-tenant-qualified so it can't collide across tenants. `project` · `admin`. |
+| `DELETE` | `/api/databases/:name/users/:user` | Drop the login role `:user` (idempotent — absent ⇒ still `204`). `project` · `admin`. |
 
 The `PUT` body is a typed `ApplyDatabase` (`deny_unknown_fields`) — a **safe projection** that
 carries only the fields a project author may declare. Naming an excluded field (`image`,
