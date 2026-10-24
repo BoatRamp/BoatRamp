@@ -55,11 +55,18 @@ fn validate_name(name: &str) -> Result<(), DnsResolveError> {
 impl DnsResolver for HickoryDnsResolver {
     async fn resolve_mx(&self, domain: &str) -> Result<Vec<MxRecord>, DnsResolveError> {
         use hickory_resolver::proto::rr::RData;
+        let domain = domain.trim();
         validate_name(domain)?;
         let lookup = match self.inner.mx_lookup(domain).await {
             Ok(l) => l,
             Err(e) if e.is_no_records_found() => return Err(DnsResolveError::NotFound),
-            Err(e) => return Err(DnsResolveError::Failed(e.to_string())),
+            // COARSE reason to the guest (security-review LOW-1): hickory's raw error can echo the
+            // host's configured nameserver address / resolv.conf / OS detail. Log it host-side; the
+            // guest gets a fixed string, mirroring `tcp-egress`'s `DnsFailure`.
+            Err(e) => {
+                tracing::debug!(error = %e, %domain, "dns-resolve: mx lookup failed");
+                return Err(DnsResolveError::Failed("mx lookup failed".to_string()));
+            }
         };
         let mut records: Vec<MxRecord> = lookup
             .answers()
@@ -83,11 +90,16 @@ impl DnsResolver for HickoryDnsResolver {
     }
 
     async fn resolve_addr(&self, host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
+        let host = host.trim();
         validate_name(host)?;
         let lookup = match self.inner.lookup_ip(host).await {
             Ok(l) => l,
             Err(e) if e.is_no_records_found() => return Err(DnsResolveError::NotFound),
-            Err(e) => return Err(DnsResolveError::Failed(e.to_string())),
+            // COARSE reason (security-review LOW-1) — see `resolve_mx`.
+            Err(e) => {
+                tracing::debug!(error = %e, %host, "dns-resolve: addr lookup failed");
+                return Err(DnsResolveError::Failed("addr lookup failed".to_string()));
+            }
         };
         let addrs: Vec<IpAddr> = lookup.iter().collect();
         if addrs.is_empty() {
@@ -98,16 +110,21 @@ impl DnsResolver for HickoryDnsResolver {
 }
 
 /// A resolver that always fails to build (the `OnceLock` init saw a broken DNS environment). Returns
-/// `failed` for every call rather than panicking a guest invocation.
-struct UnavailableResolver(String);
+/// a COARSE `failed` for every call (the real build error is logged host-side at init — never echoed
+/// to the guest, security-review LOW-1) rather than panicking a guest invocation.
+struct UnavailableResolver;
 
 #[async_trait::async_trait]
 impl DnsResolver for UnavailableResolver {
     async fn resolve_mx(&self, _domain: &str) -> Result<Vec<MxRecord>, DnsResolveError> {
-        Err(DnsResolveError::Failed(self.0.clone()))
+        Err(DnsResolveError::Failed(
+            "dns resolver unavailable".to_string(),
+        ))
     }
     async fn resolve_addr(&self, _host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
-        Err(DnsResolveError::Failed(self.0.clone()))
+        Err(DnsResolveError::Failed(
+            "dns resolver unavailable".to_string(),
+        ))
     }
 }
 
@@ -122,7 +139,7 @@ pub fn shared_resolver() -> Arc<dyn DnsResolver> {
             Ok(r) => Arc::new(r),
             Err(e) => {
                 tracing::error!(error = %e, "dns-resolve: failed to build the shared DNS resolver");
-                Arc::new(UnavailableResolver(e))
+                Arc::new(UnavailableResolver)
             }
         })
         .clone()

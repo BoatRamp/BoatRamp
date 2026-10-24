@@ -1061,6 +1061,22 @@ async fn tcp_egress_allowed(allowlist: &[String], addr: SocketAddr) -> bool {
 ///    (so an allowlisted private/metadata target still needs that opt-in).
 /// 4. **allowlist** — the peer matches a per-handler [`tcp_egress_allowed`] entry (IP/CIDR/domain + port).
 ///
+/// Whether [`HandlerEngine::new_store`] installs the permissive GUEST `socket_addr_check`
+/// (`allow_tcp(true)` + the gated check) for a store. This is the SINGLE SOURCE OF TRUTH + the REAL
+/// enforcement of the cap-req 19 host-mediated-egress carve-out: a `host_mediated` invocation (a
+/// host-owned listener guest) NEVER gets the guest check even with a non-empty allowlist — its
+/// allowlist feeds ONLY the host-mediated `TcpEgressHost`, so the guest's raw `wasi:sockets` stays
+/// deny-all. Extracted + tested (see `installs_guest_socket_check_honors_host_mediated`) so the
+/// carve-out's actual enforcement point is anti-hollow-covered, not just the sibling
+/// `conn_lane_sockets_denied` guard. Pure.
+fn installs_guest_socket_check(
+    allow_tcp_egress: bool,
+    allowlist_empty: bool,
+    host_mediated: bool,
+) -> bool {
+    allow_tcp_egress && !allowlist_empty && !host_mediated
+}
+
 /// The `tcpegress_mutation()` seam (test/`tcpegress-gate-mutation` only) neuters exactly one check at
 /// a time so the CI gate proves each is load-bearing; a shipped build evaluates all four.
 async fn tcp_connect_decision(
@@ -3244,10 +3260,11 @@ impl HandlerEngine {
         // raw `wasi:sockets` must STAY deny-all — so skip the permissive GUEST socket check entirely for
         // it. `TcpEgressHost` reads the allowlist independently, so host-mediated egress still works.
         let egress_allowlist = bindings.egress_allowlist();
-        if self.allow_tcp_egress
-            && !egress_allowlist.is_empty()
-            && !bindings.host_mediated_egress_only()
-        {
+        if installs_guest_socket_check(
+            self.allow_tcp_egress,
+            egress_allowlist.is_empty(),
+            bindings.host_mediated_egress_only(),
+        ) {
             let allow_private = self.allow_private_egress;
             let posture_tcp_egress = self.allow_tcp_egress;
             let allowlist = egress_allowlist;
@@ -4098,6 +4115,25 @@ mod tests {
             !conn_lane_grants_socket_authority(),
             "the inbound-TCP conn lane must never grant the guest wasi:sockets authority"
         );
+    }
+
+    /// cap-req 19 (security-review LOW-2): the ACTUAL enforcement of the host-mediated-egress carve-out
+    /// is the `installs_guest_socket_check` predicate `new_store` branches on — assert it directly, so
+    /// the no-raw-sockets invariant is anti-hollow-covered at its real site, not only via the sibling
+    /// `conn_lane_sockets_denied` guard.
+    #[test]
+    fn installs_guest_socket_check_honors_host_mediated() {
+        // Request / HTTP-session / consumer lane, posture on + a non-empty allowlist ⇒ INSTALL the
+        // gated guest socket check (the guest's own `wasi:sockets` is permitted, gated).
+        assert!(installs_guest_socket_check(true, false, false));
+        // The SAME posture + allowlist but HOST-MEDIATED (a listener guest) ⇒ do NOT install: the
+        // allowlist feeds only the host-mediated `TcpEgressHost`, and the guest's raw `wasi:sockets`
+        // stays deny-all. This is the real suppression behind the no-raw-sockets invariant.
+        assert!(!installs_guest_socket_check(true, false, true));
+        // Posture off ⇒ never install (the socket host's deny-all default stands).
+        assert!(!installs_guest_socket_check(false, false, false));
+        // Empty allowlist ⇒ never install (nothing to gate-permit).
+        assert!(!installs_guest_socket_check(true, true, false));
     }
 
     /// PLAN-handler-tcp-inbound HIGH-fix: the conn-lane wall-clock watchdog (the enforcer the yield
