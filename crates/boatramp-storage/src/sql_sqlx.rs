@@ -99,6 +99,17 @@ impl ExternalSqlKind {
 
 /// How many pooled connections an external database opens by default.
 const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+/// The warm **floor** of pooled connections kept established while the pool is idle, by
+/// default. `0` (the historical behavior) leaves sqlx's standard reaper to drain an idle
+/// pool all the way to empty, so the next burst re-establishes *every* connection it needs
+/// from cold — serially paying a TCP+TLS+auth handshake per connection. That cold
+/// re-establishment is the proven public-`/media` storefront saturation shape: a drained
+/// managed-pg pool re-opening under a ~48-wide concurrent burst (SQL `serve_us` ~81 ms → ~2.5 s).
+/// A non-zero floor keeps that many connections warm (maintained by sqlx's pool-maintenance
+/// task against the inherited idle/lifetime reaper), so a *steady-state* burst acquires warm
+/// connections instead of paying serial cold re-establishment. Opt-in per pool (the warm
+/// connections cost idle DB sessions); the floor is clamped to `max_connections` at build.
+const DEFAULT_MIN_CONNECTIONS: u32 = 0;
 /// How long to wait for a free/established connection before erroring.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -114,6 +125,10 @@ pub struct ExternalSqlOptions {
     pub read_url: Option<String>,
     /// Maximum pooled connections.
     pub max_connections: u32,
+    /// Warm floor of pooled connections kept established while idle (clamped to
+    /// `max_connections` at build). `0` = no floor: the pool drains fully when idle and
+    /// re-establishes connections serially on the next burst. See [`DEFAULT_MIN_CONNECTIONS`].
+    pub min_connections: u32,
     /// Open every transaction `READ ONLY` (the engine rejects writes). Use for a
     /// database the functions should only read.
     pub read_only: bool,
@@ -129,6 +144,7 @@ impl ExternalSqlOptions {
             url: url.into(),
             read_url: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            min_connections: DEFAULT_MIN_CONNECTIONS,
             read_only: false,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
@@ -144,6 +160,21 @@ impl ExternalSqlOptions {
     pub fn with_max_connections(mut self, max: Option<u32>) -> Self {
         if let Some(max) = max.filter(|m| *m > 0) {
             self.max_connections = max;
+        }
+        self
+    }
+
+    /// Keep a warm **floor** of `min` pooled connections established while idle (clamped to
+    /// `max_connections` at build). Unlike `with_max_connections`, `Some(0)` is honored — it
+    /// means *no* floor (the default): the pool drains fully between bursts and re-establishes
+    /// connections serially on the next one. `None` leaves the current value unchanged. Set a
+    /// small non-zero floor for a hot **shared** pool (the public storefront / control-plane KV)
+    /// so a burst acquires warm connections instead of paying serial cold re-establishment —
+    /// the proven public-`/media` saturation shape. Do NOT default a non-zero floor on a
+    /// per-tenant-fan-out pool, where it multiplies idle DB sessions across tenants.
+    pub fn with_min_connections(mut self, min: Option<u32>) -> Self {
+        if let Some(min) = min {
+            self.min_connections = min;
         }
         self
     }
@@ -650,8 +681,14 @@ mod postgres_backend {
             .map_err(map_err)?
             .log_statements(log::LevelFilter::Off)
             .log_slow_statements(log::LevelFilter::Off, std::time::Duration::default());
+        // Warm floor (clamped to the cap): a non-zero floor keeps that many connections
+        // established while idle so a burst doesn't pay serial cold re-establishment. The
+        // inherited idle/max-lifetime reaper still recycles above the floor. Startup stays
+        // non-blocking — `connect_lazy_with` opens nothing here; the floor is filled by the
+        // pool's maintenance task once the pool is in use.
         Ok(PgPoolOptions::new()
             .max_connections(opts.max_connections)
+            .min_connections(opts.min_connections.min(opts.max_connections))
             .acquire_timeout(opts.connect_timeout)
             .connect_lazy_with(connect_opts))
     }
@@ -938,6 +975,41 @@ mod postgres_backend {
             let opts = ExternalSqlOptions::new("not a url");
             assert!(build_pool(&opts.url, &opts).is_err());
         }
+
+        /// A warm floor keeps the pool from draining to empty between bursts: the built
+        /// pool reports the requested `min_connections` (clamped to `max_connections`), so
+        /// a steady-state burst acquires warm connections rather than paying serial cold
+        /// re-establishment — the public-`/media` saturation fix. Still a lazy pool (it
+        /// holds no live connection until first use, so startup stays non-blocking); the
+        /// floor is filled by the maintenance task once in use.
+        #[tokio::test]
+        async fn build_pool_applies_a_clamped_warm_floor() {
+            let opts = ExternalSqlOptions::new("postgres://app:s3cret@10.0.0.5:5432/analytics")
+                .with_max_connections(Some(8))
+                .with_min_connections(Some(2));
+            let pool = build_pool(&opts.url, &opts).expect("lazy pool builds");
+            assert_eq!(pool.options().get_min_connections(), 2);
+            assert_eq!(pool.options().get_max_connections(), 8);
+            // Lazy: no live connection until first use (non-blocking startup preserved).
+            assert_eq!(pool.size(), 0);
+
+            // A floor above the cap is clamped down to the cap (never exceeds max).
+            let opts = ExternalSqlOptions::new("postgres://app:s3cret@10.0.0.5:5432/analytics")
+                .with_max_connections(Some(4))
+                .with_min_connections(Some(99));
+            let pool = build_pool(&opts.url, &opts).expect("lazy pool builds");
+            assert_eq!(pool.options().get_min_connections(), 4);
+            assert_eq!(pool.options().get_max_connections(), 4);
+        }
+
+        /// The default (no `with_min_connections`) is a zero floor — sqlx's historical
+        /// behavior, so existing callers are unchanged.
+        #[tokio::test]
+        async fn build_pool_default_has_no_warm_floor() {
+            let opts = ExternalSqlOptions::new("postgres://app:s3cret@10.0.0.5:5432/analytics");
+            let pool = build_pool(&opts.url, &opts).expect("lazy pool builds");
+            assert_eq!(pool.options().get_min_connections(), 0);
+        }
     }
 }
 
@@ -998,8 +1070,12 @@ mod mysql_backend {
             .map_err(map_err)?
             .log_statements(log::LevelFilter::Off)
             .log_slow_statements(log::LevelFilter::Off, std::time::Duration::default());
+        // Warm floor (clamped to the cap): see the Postgres `build_pool`. A non-zero floor
+        // keeps connections established while idle so a burst doesn't pay serial cold
+        // re-establishment; startup stays non-blocking (lazy connect opens nothing here).
         Ok(MySqlPoolOptions::new()
             .max_connections(opts.max_connections)
+            .min_connections(opts.min_connections.min(opts.max_connections))
             .acquire_timeout(opts.connect_timeout)
             .connect_lazy_with(connect_opts))
     }
@@ -1371,10 +1447,12 @@ mod tests {
     fn options_builder_applies_and_falls_back() {
         let opts = ExternalSqlOptions::new("postgres://localhost/db")
             .with_max_connections(Some(20))
+            .with_min_connections(Some(4))
             .read_only(true)
             .with_read_url(Some("postgres://replica/db".into()))
             .with_connect_timeout(Some(Duration::from_secs(3)));
         assert_eq!(opts.max_connections, 20);
+        assert_eq!(opts.min_connections, 4);
         assert!(opts.read_only);
         assert_eq!(opts.read_url.as_deref(), Some("postgres://replica/db"));
         assert_eq!(opts.connect_timeout, Duration::from_secs(3));
@@ -1384,6 +1462,28 @@ mod tests {
         assert_eq!(dflt.max_connections, DEFAULT_MAX_CONNECTIONS);
         let dflt = ExternalSqlOptions::new("x").with_max_connections(None);
         assert_eq!(dflt.max_connections, DEFAULT_MAX_CONNECTIONS);
+
+        // The warm floor defaults to 0 (no floor — historical behavior).
+        assert_eq!(
+            ExternalSqlOptions::new("x").min_connections,
+            DEFAULT_MIN_CONNECTIONS
+        );
+        assert_eq!(DEFAULT_MIN_CONNECTIONS, 0);
+        // Unlike `max`, `Some(0)` is a meaningful floor value (disable), and `None` leaves
+        // the current value unchanged.
+        assert_eq!(
+            ExternalSqlOptions::new("x")
+                .with_min_connections(Some(0))
+                .min_connections,
+            0
+        );
+        assert_eq!(
+            ExternalSqlOptions::new("x")
+                .with_min_connections(Some(3))
+                .with_min_connections(None)
+                .min_connections,
+            3
+        );
     }
 
     #[cfg(feature = "sql-postgres")]

@@ -102,6 +102,16 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 const DEFAULT_SQLX_POOL_MAX: u32 = 16;
 
+/// The warm **floor** the SQL control-plane KV keeps established while idle. The KV is a single
+/// *shared* pool per node (there is exactly one `[serve.kv.sql]` backend) sitting on every
+/// request's hot path — host→site resolution and the consistency markers the public `/media`
+/// serve path reads — so an idle-drained pool makes the first requests of each burst pay a cold
+/// TCP+TLS+auth connect in series. A small non-zero floor keeps a handful warm; because the KV is
+/// NOT per-tenant, this does not fan out idle sessions across tenants (unlike a managed per-tenant
+/// pool, which stays opt-in). Clamped to the effective `max_connections` at build.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+const DEFAULT_SQLX_POOL_MIN: u32 = 2;
+
 /// The fixed set of host-authored statements for one SQL dialect. Every field is `&'static` so the
 /// whole set is `Copy` and resolved once at open ([`statements_for`]); the placeholders are the
 /// canonical `?N` form — libsql speaks it natively, and the external Postgres path rewrites `?N` →
@@ -402,7 +412,9 @@ impl SqlKv {
         let max = pool_max
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_SQLX_POOL_MAX);
-        let opts = ExternalSqlOptions::new(url).with_max_connections(Some(max));
+        let opts = ExternalSqlOptions::new(url)
+            .with_max_connections(Some(max))
+            .with_min_connections(Some(DEFAULT_SQLX_POOL_MIN.min(max)));
         let backend = connect(ExternalSqlKind::Postgres, &opts).map_err(sql_err)?;
         // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
         // first (lazy) connection, so a connect failure surfaces here.
@@ -447,7 +459,9 @@ impl SqlKv {
         let max = pool_max
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_SQLX_POOL_MAX);
-        let opts = ExternalSqlOptions::new(url).with_max_connections(Some(max));
+        let opts = ExternalSqlOptions::new(url)
+            .with_max_connections(Some(max))
+            .with_min_connections(Some(DEFAULT_SQLX_POOL_MIN.min(max)));
         let backend = connect(ExternalSqlKind::Mysql, &opts).map_err(sql_err)?;
         // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
         // first (lazy) connection, so a connect failure surfaces here.

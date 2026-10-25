@@ -127,6 +127,13 @@ pub struct ComputeResolvedSqlBackend {
     user: String,
     password: String,
     pool_max: Option<u32>,
+    // Opt-in warm **floor** of pooled connections kept established while idle (`None` = no floor,
+    // the default). For a *shared* managed/storefront pool a floor eliminates the serial cold
+    // re-establishment a drained pool pays under a concurrent burst — the proven public-`/media`
+    // saturation shape (SQL `serve_us` ~81 ms → ~2.5 s at 48-wide). Left opt-in (never a non-zero
+    // default) because this backend is ALSO used per-tenant, where a blanket floor would multiply
+    // idle DB sessions across tenants. Wired from the binding's `pool_min` config by the node.
+    pool_min: Option<u32>,
     read_only: bool,
     connect_timeout: Option<Duration>,
     // Opt-in RLS session context (`rls_session = true`): logical `(key, value)`
@@ -171,12 +178,24 @@ impl ComputeResolvedSqlBackend {
             user: user.into(),
             password: password.into(),
             pool_max,
+            // Opt-in via `with_pool_min`; default off so per-tenant pools are unchanged.
+            pool_min: None,
             read_only,
             connect_timeout,
             session_context: Vec::new(),
             rls: None,
             cached: Mutex::new(None),
         }
+    }
+
+    /// Set an opt-in warm **floor** of pooled connections kept established while idle (clamped to
+    /// `pool_max` at build). `None`/unset = no floor (the default): the pool drains between bursts
+    /// and re-establishes connections serially on the next one. Set a small floor only for a
+    /// *shared* managed pool (e.g. the public storefront), never blanket across per-tenant pools —
+    /// there it would hold idle DB sessions open per tenant. Builder-style; `None` is a no-op.
+    pub fn with_pool_min(mut self, pool_min: Option<u32>) -> Self {
+        self.pool_min = pool_min;
+        self
     }
 
     /// Attach the opt-in RLS **tenant GUC** names (`tenant_guc`/`session_guc`) the handler binding
@@ -360,6 +379,7 @@ impl ComputeResolvedSqlBackend {
         // the async part, which is why the cache guard is dropped above / re-taken below.
         let opts = ExternalSqlOptions::new(url.clone())
             .with_max_connections(self.pool_max)
+            .with_min_connections(self.pool_min)
             .read_only(self.read_only)
             .with_connect_timeout(self.connect_timeout);
         let backend = connect(self.kind, &opts).map_err(|e| self.hint_stale_volume(e))?;
@@ -790,6 +810,42 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "no context ⇒ no statements"
         );
+    }
+
+    /// The pool warm floor is opt-in: unset by default (so per-tenant pools keep their
+    /// historical drain-when-idle behavior and never fan out idle sessions), and set only
+    /// when the node wires a `pool_min` for a shared managed/storefront pool. The value
+    /// flows into `ExternalSqlOptions::with_min_connections` on the next pool (re)build.
+    #[test]
+    fn with_pool_min_is_opt_in_warm_floor() {
+        let mock = Arc::new(MockResolver(Mutex::new(vec![("h".into(), 1)])));
+        let be = ComputeResolvedSqlBackend::new(
+            mock,
+            "w",
+            ExternalSqlKind::Postgres,
+            "db",
+            "u",
+            "p",
+            Some(8),
+            false,
+            None,
+        );
+        assert_eq!(be.pool_min, None, "default is opt-out: no warm floor");
+
+        let mock = Arc::new(MockResolver(Mutex::new(vec![("h".into(), 1)])));
+        let be = ComputeResolvedSqlBackend::new(
+            mock,
+            "w",
+            ExternalSqlKind::Postgres,
+            "db",
+            "u",
+            "p",
+            Some(8),
+            false,
+            None,
+        )
+        .with_pool_min(Some(2));
+        assert_eq!(be.pool_min, Some(2));
     }
 
     // ---- L1: MySQL connection-lifetime var must not leak on pooled reuse -----
