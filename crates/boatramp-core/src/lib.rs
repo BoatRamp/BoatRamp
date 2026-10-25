@@ -59,6 +59,10 @@ pub mod messaging;
 pub mod migrate;
 pub mod mode;
 pub mod orm;
+/// Postgres logical-replication (`pgoutput`, protocol v1) message DECODER — the pure, wasm-safe,
+/// unit-testable core of the pg WAL true-delta (SQL true-delta program). Decodes a drained
+/// `pgoutput` binary change stream into relation schemas + row changes the node replays as SQL.
+pub mod pgoutput;
 pub mod project;
 /// Incremental / delta export — the family-agnostic delta ALGEBRA (differential + incremental,
 /// KV + blob true-deltas, SQL full-dump fallback with the true-delta strategies scaffolded).
