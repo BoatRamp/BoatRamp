@@ -1242,6 +1242,12 @@ enum StageJob {
     Libsql { qsite: String },
     /// A single blob object, streamed from the source store into a staging temp.
     Blob { key: String },
+    /// A control-plane KV **delta** member (`kv.brkvdelta`) — the upserts + tombstones already
+    /// computed + encoded at plan time (a DELTA export only).
+    KvDelta { bytes: Vec<u8> },
+    /// A blob **tombstone** member (`blobs.brtombstones`) — the deleted blob keys already computed
+    /// + encoded at plan time (a DELTA export only).
+    BlobTombstone { bytes: Vec<u8> },
 }
 
 /// The export stager's request: "produce the member at `path`". `chunked` selects a
@@ -2895,6 +2901,11 @@ impl NodeProjectExport {
                 }
                 f.flush().await.map_err(other)?;
             }
+            StageJob::KvDelta { bytes } | StageJob::BlobTombstone { bytes } => {
+                // A delta member whose bytes were computed + encoded at plan time (the KV
+                // upserts+tombstones / the blob tombstone key list). Just persist them.
+                tokio::fs::write(&tmp, bytes).await.map_err(other)?;
+            }
         }
         Ok(tmp)
     }
@@ -3225,6 +3236,104 @@ impl NodeProjectExport {
                     report.kv_records = plan.would_write;
                 }
             }
+            MemberKind::KvDelta => {
+                // The control-plane KV DELTA slice (a delta bundle only): the upserts + tombstones
+                // since the base. A data-only bundle carries no KV, so ignore one if present.
+                if data_only {
+                    return Ok(());
+                }
+                // adopt must have installed the source KEK before any sealed KV byte is written
+                // (same ordering invariant as the full `Kv` arm).
+                if matches!(opts.identity, IdentityChoice::Adopt { .. }) && !*saw_identity {
+                    return Err(Perr::Other(
+                        "--identity adopt requires a bundle exported with --include-identity \
+                         (no identity member present); use --identity fresh"
+                            .into(),
+                    ));
+                }
+                let bytes = tokio::fs::read(temp).await.map_err(other)?;
+                let delta = boatramp_core::project_delta::decode_kv_delta(&bytes).map_err(other)?;
+
+                // UPSERTS: re-key to the TARGET project + the SAME fail-closed tenancy enforcement
+                // as a full KV slice (the upserts are attacker-influenceable — a delta crosses the
+                // same trust boundary — so they must be target-scoped before any write).
+                let mut upserts = delta.upserts;
+                boatramp_core::project_export::rekey_entries_to_target(
+                    &mut upserts,
+                    source_project,
+                    project,
+                );
+                boatramp_core::project_export::enforce_target_scoped_kv(
+                    &upserts,
+                    ProjectRef::new(project),
+                )
+                .map_err(Perr::Other)?;
+
+                // TOMBSTONES: a deleted key is equally attacker-influenceable; a tombstone that
+                // escaped the target's owned scope would be a CROSS-TENANT DELETE. Re-key each then
+                // REFUSE fail-closed any key not under the target's owned prefixes.
+                let mut delete_keys = Vec::with_capacity(delta.tombstones.len());
+                for k in &delta.tombstones {
+                    let rk =
+                        boatramp_core::project_export::rekey_owned_key(k, source_project, project);
+                    if !boatramp_core::project_export::project_owns_key(
+                        &rk,
+                        ProjectRef::new(project),
+                    ) {
+                        return Err(Perr::Other(format!(
+                            "control-plane KV delta import refused: tombstone {k:?} is outside the \
+                             target project {project}'s owned scope after re-key — a delta must not \
+                             delete another tenant's or a global (routing / TLS / daemon) key"
+                        )));
+                    }
+                    delete_keys.push(rk);
+                }
+
+                if opts.apply {
+                    // A delta OVERLAYS the already-restored base, so the KV dest is non-pristine by
+                    // design — force the overlay (the base restore enforced the fresh-target gate).
+                    match boatramp_core::kv_dump::apply_import(self.kv.as_ref(), &upserts, true)
+                        .await
+                    {
+                        Ok(rep) => {
+                            report.kv_records += rep.written;
+                            report.kv_verified += rep.verified;
+                        }
+                        Err(e) => return Err(other(e)),
+                    }
+                    for k in &delete_keys {
+                        self.kv.delete_checkpointed(k).await.map_err(other)?;
+                    }
+                } else {
+                    report.kv_records += upserts.len();
+                }
+                report.notes.push(format!(
+                    "kv delta: {} upsert(s), {} tombstone(s)",
+                    upserts.len(),
+                    delete_keys.len()
+                ));
+            }
+            MemberKind::BlobTombstone => {
+                // The blob tombstone list (a delta bundle only): blob storage keys deleted since
+                // the base. Each key is stored under the SOURCE scope (`hblob/<source>/…`); re-key
+                // to the target + REFUSE fail-closed any wrong-scope key (cross-tenant delete),
+                // reusing the same `blobs/`-prefixed re-qualify the add path uses.
+                let bytes = tokio::fs::read(temp).await.map_err(other)?;
+                let keys =
+                    boatramp_core::project_delta::decode_blob_tombstones(&bytes).map_err(other)?;
+                let mut deleted = 0u64;
+                for storage_key in &keys {
+                    let target_key =
+                        target_blob_key(&format!("blobs/{storage_key}"), source_project, project)?;
+                    if opts.apply {
+                        self.blobs.delete(&target_key).await.map_err(other)?;
+                    }
+                    deleted += 1;
+                }
+                report
+                    .notes
+                    .push(format!("blob delta: {deleted} tombstone(s)"));
+            }
         }
         Ok(())
     }
@@ -3277,8 +3386,22 @@ impl NodeProjectExport {
         let stage_dir = session.join("stage");
         tokio::fs::create_dir_all(&stage_dir).await.map_err(other)?;
 
-        // PLAN (reuse): enumerate members + per-member jobs + source, in restore order.
-        let (specs, jobs, source) = self.plan_export(project, opts, created_at).await?;
+        // PLAN: a FULL export reuses `plan_export`; a DELTA export (`opts.delta`) diffs the
+        // current state against the base chain's frontier and emits delta members (KV delta +
+        // blob adds/tombstones + SQL full-dump fallback). Both return the ordered member set, the
+        // per-member jobs, the source, and — for a delta — the `DeltaInfo` the manifest records.
+        let (specs, jobs, source, delta_info) = match &opts.delta {
+            None => {
+                let (s, j, src) = self.plan_export(project, opts, created_at).await?;
+                (s, j, src, None)
+            }
+            Some(req) => {
+                let (s, j, src, di) = self
+                    .plan_delta_export(project, opts, req, created_at)
+                    .await?;
+                (s, j, src, Some(di))
+            }
+        };
 
         // The MANIFEST is AUTHORITATIVE. First run: write it. Resume: read it and use ITS
         // member set (members added since are ignored; nothing not in it can be produced) —
@@ -3304,6 +3427,7 @@ impl NodeProjectExport {
                 data_only: opts.data_only,
                 source: source.clone(),
                 members: specs.clone(),
+                delta: delta_info,
             };
             let bytes = serde_json::to_vec_pretty(&m)
                 .map_err(|e| Perr::Other(format!("encode MANIFEST: {e}")))?;
@@ -3345,6 +3469,509 @@ impl NodeProjectExport {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Incremental / delta export (follow-on program; owner-RESOLVED 2026-10-25)
+    //
+    // A DELTA export reuses the resumable member-object layout + per-member resume, but its
+    // member SET is the DIFF against a referenced base: only the KV upserts/tombstones and the
+    // changed/new blobs (+ blob tombstones) ride, while the SQL families full-dump as the
+    // all-families-consistent fallback (decision 3) until their true-deltas land (decisions 1/2,
+    // scaffolded in `boatramp_core::project_delta`). `--mode differential` diffs vs a FIXED base;
+    // `--mode incremental` diffs vs the parent (a chain). Restore resolves the chain and applies
+    // base → each delta in order (decision 5). The pure diff/replay algebra lives in core; this
+    // driver wires it to the live KV scan + blob store + the base chain's member objects.
+    // -----------------------------------------------------------------------
+
+    /// Plan a DELTA export: resolve the base/parent chain, replay its frontier (KV key→value +
+    /// blob key→{size,sha}), diff the CURRENT state against it, and emit the delta member set — a
+    /// KV delta member (upserts + tombstones), the new/changed blobs as full members
+    /// (adds-as-full-members), a blob-tombstone member for deletes, and the SQL families as FULL
+    /// dumps (the all-families-consistent fallback). Returns the ordered specs, the per-member
+    /// jobs, the source, and the `DeltaInfo` the manifest records.
+    async fn plan_delta_export(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        req: &boatramp_core::project_delta::DeltaRequest,
+        created_at: u64,
+    ) -> Result<
+        (
+            Vec<MemberSpec>,
+            HashMap<String, StageJob>,
+            SourceInfo,
+            boatramp_core::project_delta::DeltaInfo,
+        ),
+        Perr,
+    > {
+        use boatramp_core::project_delta as pd;
+
+        if opts.data_only {
+            return Err(Perr::Other(
+                "delta export is not supported for a --data-only bundle (a delta carries the \
+                 control-plane KV delta, which a data-only bundle excludes)"
+                    .into(),
+            ));
+        }
+        if opts.include_identity {
+            return Err(Perr::Other(
+                "delta export does not carry the identity transport container; include identity \
+                 only in the FULL base bundle (import it with --identity adopt), then chain deltas"
+                    .into(),
+            ));
+        }
+
+        // Resolve the base/parent resumable dir (confined under the node base) + walk its chain to
+        // the ROOT full bundle. Differential requires a FULL base; incremental may chain a delta.
+        let base_dir = self
+            .resolve_resumable_dir(&req.base_reference, false)
+            .await?;
+        let base_manifest = self.read_resumable_manifest(&base_dir).await?;
+        if matches!(req.mode, pd::DeltaMode::Differential) && base_manifest.delta.is_some() {
+            return Err(Perr::Other(format!(
+                "differential delta requires a FULL base bundle, but {:?} is itself a delta — use \
+                 --mode incremental to chain onto a delta",
+                req.base_reference
+            )));
+        }
+        let chain = self.resolve_chain(&base_dir, &base_manifest).await?;
+        if chain[0].1.data_only {
+            return Err(Perr::Other(
+                "delta export refused: the root base bundle is --data-only; a delta needs a FULL \
+                 base (with the control-plane KV slice) to diff against"
+                    .into(),
+            ));
+        }
+        if chain[0].1.source.project != project {
+            return Err(Perr::Other(format!(
+                "delta export refused: the base chain's root is for project {:?}, not {project:?}",
+                chain[0].1.source.project
+            )));
+        }
+
+        // Frontier = replay the chain (metadata only): the effective KV + blob state at the base.
+        let (kv_frontier, blob_frontier) = self.compute_chain_frontier(&chain).await?;
+
+        // The FULL plan (SQL full-dumps + every blob job + the KV member), then transformed into
+        // the delta member set.
+        let full_opts = ExportOptions {
+            delta: None,
+            ..opts.clone()
+        };
+        let (full_specs, mut full_jobs, source) =
+            self.plan_export(project, &full_opts, created_at).await?;
+
+        // --- KV delta: diff the current scoped scan against the frontier ---
+        let all_kv = boatramp_core::kv_dump::scan_dumpable(self.kv.as_ref())
+            .await
+            .map_err(other)?;
+        let current_kv = boatramp_core::project_export::scope_entries_to_project(
+            all_kv,
+            ProjectRef::new(project),
+        );
+        let base_kv_entries: Vec<boatramp_core::kv::KvDumpEntry> = kv_frontier
+            .iter()
+            .map(|(k, v)| boatramp_core::kv::KvDumpEntry {
+                key: k.clone(),
+                value: v.clone(),
+                version: 1,
+            })
+            .collect();
+        let kv_delta = pd::compute_kv_delta(&base_kv_entries, &current_kv);
+        let kv_delta_bytes = pd::encode_kv_delta(&kv_delta, created_at);
+
+        // --- current blob metadata (sizes) for the cheap diff pre-filter ---
+        let current_blob_metas = self
+            .blobs
+            .list(&blob_project_prefix(project))
+            .await
+            .map_err(other)?;
+        let mut current_sizes: HashMap<String, Option<u64>> = HashMap::new();
+        let mut current_keys: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for m in &current_blob_metas {
+            current_sizes.insert(m.key.clone(), m.size);
+            current_keys.insert(m.key.clone());
+        }
+
+        // --- build the ordered delta member set from the full plan ---
+        let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
+        for spec in &full_specs {
+            match spec.kind {
+                MemberKind::Identity => { /* a delta carries no identity (guarded above) */ }
+                MemberKind::Kv => {
+                    ordered.push((
+                        MemberSpec::sidecar(
+                            project_bundle::KV_DELTA_MEMBER_PATH.to_string(),
+                            MemberKind::KvDelta,
+                            None,
+                        ),
+                        StageJob::KvDelta {
+                            bytes: kv_delta_bytes.clone(),
+                        },
+                    ));
+                }
+                MemberKind::Blob => {
+                    let storage_key = spec
+                        .path
+                        .strip_prefix("blobs/")
+                        .unwrap_or(&spec.path)
+                        .to_string();
+                    let base_sig = blob_frontier.get(&storage_key);
+                    let cur_size = current_sizes.get(&storage_key).copied().flatten();
+                    let is_add = match pd::blob_decision_by_size(base_sig, cur_size) {
+                        pd::BlobDecision::Add => true,
+                        pd::BlobDecision::NeedsContentCheck => match base_sig {
+                            // Size matched (or unknown) → content-check: hash the current object.
+                            Some(b) => self.blob_sha256(&storage_key).await? != b.sha256,
+                            None => true,
+                        },
+                    };
+                    if is_add {
+                        // Reuse the full plan's Blob job + spec verbatim (keeps the chunked framing
+                        // for a large object) — adds-as-full-members.
+                        let job = full_jobs.remove(&spec.path).ok_or_else(|| {
+                            Perr::Other(format!(
+                                "delta export: no stage job for blob {}",
+                                spec.path
+                            ))
+                        })?;
+                        ordered.push((spec.clone(), job));
+                    }
+                }
+                MemberKind::PgDump | MemberKind::MysqlDump | MemberKind::Libsql => {
+                    // SQL full-dump fallback (decision 3): keep the full member verbatim. The
+                    // true-delta (WAL/binlog/changeset) is the scaffolded next increment.
+                    let job = full_jobs.remove(&spec.path).ok_or_else(|| {
+                        Perr::Other(format!("delta export: no stage job for {}", spec.path))
+                    })?;
+                    ordered.push((spec.clone(), job));
+                }
+                MemberKind::KvDelta | MemberKind::BlobTombstone => {
+                    // plan_export never emits these; unreachable in a full plan.
+                }
+            }
+        }
+
+        // --- blob tombstones: base storage keys gone from the current listing ---
+        let base_blob_keys: std::collections::BTreeSet<String> =
+            blob_frontier.keys().cloned().collect();
+        let tombstones = pd::compute_blob_tombstones(&base_blob_keys, &current_keys);
+        if !tombstones.is_empty() {
+            ordered.push((
+                MemberSpec::sidecar(
+                    project_bundle::BLOB_TOMBSTONE_MEMBER_PATH.to_string(),
+                    MemberKind::BlobTombstone,
+                    None,
+                ),
+                StageJob::BlobTombstone {
+                    bytes: pd::encode_blob_tombstones(&tombstones),
+                },
+            ));
+        }
+
+        let specs: Vec<MemberSpec> = ordered.iter().map(|(s, _)| s.clone()).collect();
+        let jobs: HashMap<String, StageJob> =
+            ordered.into_iter().map(|(s, j)| (s.path, j)).collect();
+        let delta_info = pd::DeltaInfo {
+            mode: req.mode,
+            base_reference: req.base_reference.clone(),
+            base_created_at: base_manifest.created_at,
+            sql_strategy: pd::SqlDeltaKind::FullDumpFallback,
+        };
+        Ok((specs, jobs, source, delta_info))
+    }
+
+    /// Read + parse the `MANIFEST` of a resumable member-object directory.
+    async fn read_resumable_manifest(
+        &self,
+        dir: &Path,
+    ) -> Result<project_bundle::StreamManifest, Perr> {
+        let manifest_path = dir.join(project_bundle::MANIFEST_PATH);
+        let bytes = tokio::fs::read(&manifest_path).await.map_err(|e| {
+            Perr::Other(format!(
+                "read base/parent MANIFEST at {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Perr::Other(format!("parse base/parent MANIFEST: {e}")))
+    }
+
+    /// Resolve a delta CHAIN from `start_dir` (a base or parent) back to the ROOT full bundle,
+    /// returning `[root, …, start]` (root first). Walks each manifest's `delta.base_reference`
+    /// (confined under the node base), asserting the recorded `base_created_at` matches the
+    /// resolved parent — a consistency check that catches a stale or mismatched base (NOT a
+    /// cryptographic anti-tamper guarantee: a forged manifest could forge the timestamp too; the
+    /// structural defenses are the base-confinement here + the one-source coherence check on
+    /// import). Has a cycle/length guard.
+    async fn resolve_chain(
+        &self,
+        start_dir: &Path,
+        start_manifest: &project_bundle::StreamManifest,
+    ) -> Result<Vec<(PathBuf, project_bundle::StreamManifest)>, Perr> {
+        let mut chain = vec![(start_dir.to_path_buf(), start_manifest.clone())];
+        let mut guard = 0usize;
+        while let Some(di) = chain.last().unwrap().1.delta.clone() {
+            guard += 1;
+            if guard > 256 {
+                return Err(Perr::Other(
+                    "delta chain exceeds 256 links (cycle or runaway) — refusing".into(),
+                ));
+            }
+            let parent_dir = self
+                .resolve_resumable_dir(&di.base_reference, false)
+                .await?;
+            let parent_manifest = self.read_resumable_manifest(&parent_dir).await?;
+            if parent_manifest.created_at != di.base_created_at {
+                return Err(Perr::Other(format!(
+                    "delta base mismatch: {:?} records base created_at {} but the resolved base has \
+                     {} — refusing a stale or mismatched base",
+                    di.base_reference, di.base_created_at, parent_manifest.created_at
+                )));
+            }
+            chain.push((parent_dir, parent_manifest));
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// Replay a resolved chain `[root, …]` into the effective FRONTIER at its tail: the KV state
+    /// (key → value bytes) and the blob state (key → {size, sha256}). Metadata-only — it reads the
+    /// root's full KV member + each blob member's recorded `{size,sha}` meta, then applies each
+    /// delta's KV upserts/tombstones + blob adds/tombstones in order (the export-side mirror of the
+    /// import-side sequential apply).
+    async fn compute_chain_frontier(
+        &self,
+        chain: &[(PathBuf, project_bundle::StreamManifest)],
+    ) -> Result<
+        (
+            BTreeMap<String, Vec<u8>>,
+            BTreeMap<String, boatramp_core::project_delta::BlobSig>,
+        ),
+        Perr,
+    > {
+        use boatramp_core::project_delta as pd;
+        let mut kv: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut blobs: BTreeMap<String, pd::BlobSig> = BTreeMap::new();
+        for (dir, m) in chain {
+            for (idx, spec) in m.members.iter().enumerate() {
+                match spec.kind {
+                    MemberKind::Kv => {
+                        let bytes = self.read_member_object(dir, idx).await?;
+                        let decoded = boatramp_core::kv_dump::decode_dump(&bytes).map_err(other)?;
+                        for e in decoded.entries {
+                            kv.insert(e.key, e.value);
+                        }
+                    }
+                    MemberKind::KvDelta => {
+                        let bytes = self.read_member_object(dir, idx).await?;
+                        let delta = pd::decode_kv_delta(&bytes).map_err(other)?;
+                        pd::apply_kv_delta_to_frontier(&mut kv, &delta);
+                    }
+                    MemberKind::Blob => {
+                        let storage_key = spec
+                            .path
+                            .strip_prefix("blobs/")
+                            .unwrap_or(&spec.path)
+                            .to_string();
+                        let meta = self.read_member_meta(dir, idx).await?;
+                        blobs.insert(
+                            storage_key,
+                            pd::BlobSig {
+                                size: meta.size,
+                                sha256: meta.sha256,
+                            },
+                        );
+                    }
+                    MemberKind::BlobTombstone => {
+                        let bytes = self.read_member_object(dir, idx).await?;
+                        for k in pd::decode_blob_tombstones(&bytes).map_err(other)? {
+                            blobs.remove(&k);
+                        }
+                    }
+                    // SQL/libsql/identity do not contribute to the KV/blob frontier.
+                    _ => {}
+                }
+            }
+        }
+        Ok((kv, blobs))
+    }
+
+    /// Read the whole member object `m{idx}` bytes from a resumable dir.
+    async fn read_member_object(&self, dir: &Path, idx: usize) -> Result<Vec<u8>, Perr> {
+        tokio::fs::read(dir.join(member_object_name(idx)))
+            .await
+            .map_err(|e| Perr::Other(format!("read member object m{idx:05}: {e}")))
+    }
+
+    /// Read + parse the `{size, sha256}` meta sidecar of member `idx`.
+    async fn read_member_meta(
+        &self,
+        dir: &Path,
+        idx: usize,
+    ) -> Result<project_bundle::MemberMeta, Perr> {
+        let bytes = tokio::fs::read(dir.join(member_meta_name(idx)))
+            .await
+            .map_err(|e| Perr::Other(format!("read member meta m{idx:05}: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Perr::Other(format!("parse member meta m{idx:05}: {e}")))
+    }
+
+    /// Stream a blob from the source store and return its lowercase-hex SHA-256 (the authoritative
+    /// blob content comparator for the delta diff). Never buffers the whole object.
+    async fn blob_sha256(&self, storage_key: &str) -> Result<String, Perr> {
+        let obj = self.blobs.get(storage_key).await.map_err(other)?;
+        let mut body = obj.body;
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(other)?;
+            hasher.update(chunk.as_ref());
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Restore a DELTA member-object directory: resolve the full chain `[root, …, this]` and apply
+    /// base → each delta in order (owner decision 5 — sequential apply). The root's KV+blobs are
+    /// restored in full; each delta's KV-delta + blob adds/tombstones overlay; the SQL families are
+    /// applied ONLY from the NEWEST delta (its full-dump fallback supersedes the base/intermediate
+    /// SQL — so a huge DB is restored once, not once per link). Identity members are not applied on
+    /// the delta path (a delta clone is `--identity fresh` data movement; adopt-recovery restores
+    /// the base bundle directly).
+    async fn import_delta_chain(
+        &self,
+        project: &str,
+        this_dir: &Path,
+        this_manifest: &project_bundle::StreamManifest,
+        opts: &ImportOptions,
+    ) -> Result<ImportReport, Perr> {
+        let di = this_manifest
+            .delta
+            .as_ref()
+            .ok_or_else(|| Perr::Other("import_delta_chain called on a non-delta bundle".into()))?;
+        let base_dir = self
+            .resolve_resumable_dir(&di.base_reference, false)
+            .await?;
+        let base_manifest = self.read_resumable_manifest(&base_dir).await?;
+        let mut chain = self.resolve_chain(&base_dir, &base_manifest).await?; // [root … parent]
+        chain.push((this_dir.to_path_buf(), this_manifest.clone())); // … this
+        if chain[0].1.delta.is_some() {
+            return Err(Perr::Other(
+                "delta chain does not terminate in a FULL base bundle — refusing".into(),
+            ));
+        }
+
+        // Chain coherence: every link must share ONE source project. A delta is only meaningful
+        // against a base from the same logical source, and `restore_member` re-keys each member
+        // from ITS OWN `source.project` → the target — so links that disagree on origin would
+        // re-key from different source prefixes and restore an incoherent mix. (The target may
+        // still differ from the source: a cross-project clone re-keys the whole coherent chain to
+        // `project`. What we forbid is a chain spliced from two different sources.) This defends a
+        // resumable chain assembled on an addressable target against a grafted-in foreign base.
+        let root_src = &chain[0].1.source;
+        if let Some((bad_dir, bad)) = chain
+            .iter()
+            .find(|(_, m)| m.source.project != root_src.project || m.source.site != root_src.site)
+        {
+            return Err(Perr::Other(format!(
+                "delta import refused: chain link {:?} is for source {:?}/{:?}, but the chain root \
+                 is {:?}/{:?} — a delta chain must share one source",
+                bad_dir, bad.source.project, bad.source.site, root_src.project, root_src.site
+            )));
+        }
+
+        // The SAME fresh-target guard as a full resumable import (unless overwrite).
+        if !opts.overwrite {
+            for prefix in
+                boatramp_core::project_export::project_owned_prefixes(ProjectRef::new(project))
+            {
+                if !self
+                    .kv
+                    .list_prefix(&prefix)
+                    .await
+                    .map_err(other)?
+                    .is_empty()
+                {
+                    return Err(Perr::Other(format!(
+                        "import refused: target project {project:?} already has control-plane data \
+                         under {prefix:?}; pass overwrite=true"
+                    )));
+                }
+            }
+            if !self
+                .blobs
+                .list(&blob_project_prefix(project))
+                .await
+                .map_err(other)?
+                .is_empty()
+            {
+                return Err(Perr::Other(format!(
+                    "import refused: target project {project:?} already has blobs; pass \
+                     overwrite=true"
+                )));
+            }
+        }
+
+        let session = self
+            .work_dir
+            .join(format!("import-delta-{project}-{}", now_secs()));
+        tokio::fs::create_dir_all(&session).await.map_err(other)?;
+
+        let mut report = ImportReport::default();
+        let mut saw_identity = false;
+        let last = chain.len() - 1;
+        for (pos, (dir, m)) in chain.iter().enumerate() {
+            let is_newest = pos == last;
+            for (idx, spec) in m.members.iter().enumerate() {
+                let obj = dir.join(member_object_name(idx));
+                let meta = dir.join(member_meta_name(idx));
+                if !member_object_valid(&obj, &meta).await? {
+                    let _ = tokio::fs::remove_dir_all(&session).await;
+                    return Err(Perr::Other(format!(
+                        "delta restore: chain member {idx} ({}) in {} is missing or fails its SHA",
+                        spec.path,
+                        dir.display()
+                    )));
+                }
+                // Which members apply at this chain position: the SQL families only from the
+                // NEWEST delta (full-dump fallback supersedes the base/intermediate SQL); identity
+                // never; KV/blob at every link (base full + each delta's overlay).
+                let apply_here = match spec.kind {
+                    MemberKind::PgDump | MemberKind::MysqlDump | MemberKind::Libsql => is_newest,
+                    MemberKind::Identity => false,
+                    _ => true,
+                };
+                if !apply_here {
+                    continue;
+                }
+                if let Err(e) = self
+                    .restore_member(
+                        project,
+                        m.data_only,
+                        &m.source.project,
+                        spec,
+                        &obj,
+                        opts,
+                        &mut report,
+                        &mut saw_identity,
+                    )
+                    .await
+                {
+                    let _ = tokio::fs::remove_dir_all(&session).await;
+                    return Err(e);
+                }
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&session).await;
+        report.notes.push(format!(
+            "delta restore: applied a {}-link chain ({} base + {} delta(s)) in {} mode",
+            chain.len(),
+            1,
+            chain.len() - 1,
+            di.mode.as_flag()
+        ));
+        Ok(report)
+    }
+
     /// Import a resumable member-object directory (the output of [`export_resumable`]):
     /// restore members in the MANIFEST's authoritative order, reusing [`restore_member`]
     /// per member — identical per-member tenancy re-key/enforce as the streaming import.
@@ -3363,6 +3990,14 @@ impl NodeProjectExport {
             .map_err(|e| Perr::Other(format!("read resumable MANIFEST: {e}")))?;
         let manifest: project_bundle::StreamManifest = serde_json::from_slice(&bytes)
             .map_err(|e| Perr::Other(format!("parse resumable MANIFEST: {e}")))?;
+
+        // A DELTA bundle resolves its base chain and applies base → each delta in order (its own
+        // fresh-target guard runs inside). A FULL bundle takes the straight per-member path below.
+        if manifest.delta.is_some() {
+            return self
+                .import_delta_chain(project, dir, &manifest, &opts)
+                .await;
+        }
 
         // The same fresh-target guard as the streaming import (unless overwrite).
         if !opts.overwrite {
@@ -4613,6 +5248,7 @@ mod tests {
                 data_only: false,
                 include_identity: true,
                 transport_key: Some(pass.clone()),
+                delta: None,
             },
         )
         .await
@@ -4665,6 +5301,7 @@ mod tests {
                     data_only: true,
                     include_identity: true,
                     transport_key: Some(pass.clone()),
+                    delta: None,
                 },
             )
             .await
@@ -4679,6 +5316,7 @@ mod tests {
                     data_only: false,
                     include_identity: true,
                     transport_key: None,
+                    delta: None,
                 },
             )
             .await
@@ -4694,6 +5332,7 @@ mod tests {
                     data_only: false,
                     include_identity: true,
                     transport_key: Some(pass.clone()),
+                    delta: None,
                 },
             )
             .await
@@ -4759,6 +5398,7 @@ mod tests {
                 data_only: false,
                 include_identity: true,
                 transport_key: Some(pass.clone()),
+                delta: None,
             },
         )
         .await
@@ -5302,5 +5942,449 @@ mod tests {
                 "a symlink escaping the base must be refused"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Incremental / delta export — driver-level round trips (in-process; no Docker/SQL).
+    // ---------------------------------------------------------------------------------
+
+    /// Build a delta-capable driver (KV + blob backends, a SHARED resumable base so the base
+    /// chain is resolvable on the importing node), returning it plus its kv + blob handles.
+    #[cfg(test)]
+    fn mk_delta_driver(
+        tmp: &std::path::Path,
+        shared_base: &std::path::Path,
+        tag: &str,
+    ) -> (
+        NodeProjectExport,
+        std::sync::Arc<dyn boatramp_core::kv::KvStore>,
+        std::sync::Arc<dyn boatramp_core::Storage>,
+    ) {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn boatramp_core::Storage> =
+            Arc::new(FsStorage::new(tmp.join(format!("{tag}-blobs"))));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let work = tmp.join(format!("{tag}-work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work)
+            .with_resumable_base(Some(shared_base.to_path_buf()));
+        (drv, kv, blobs)
+    }
+
+    #[cfg(test)]
+    async fn seed_blob(store: &dyn boatramp_core::Storage, key: &str, data: &[u8]) {
+        use boatramp_core::{ByteStream, PutMeta, StorageError};
+        use bytes::Bytes;
+        let data = data.to_vec();
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok::<Bytes, StorageError>(Bytes::from(data)) })
+                .boxed();
+        store
+            .put(key, stream, PutMeta { content_type: None })
+            .await
+            .expect("seed blob");
+    }
+
+    #[cfg(test)]
+    async fn read_blob(store: &dyn boatramp_core::Storage, key: &str) -> Option<Vec<u8>> {
+        match store.get(key).await {
+            Ok(obj) => {
+                let mut body = obj.body;
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    buf.extend_from_slice(chunk.ok()?.as_ref());
+                }
+                Some(buf)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// END-TO-END (decisions 3/4/5): a FULL base + a DIFFERENTIAL delta carrying only the KV
+    /// upserts/tombstones + the changed/new blobs (+ a blob tombstone), restored onto a FRESH node
+    /// = base reconstructed + the drift applied. Proves base-reference resolution, adds-as-full +
+    /// deletes-as-tombstones drift, and the sequential shadow apply, all without SQL/Docker.
+    #[tokio::test]
+    async fn delta_differential_round_trip_kv_and_blobs() {
+        use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+        use boatramp_core::project_export::ProjectExport;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_base = tmp.path().join("exports");
+        let (src, kv_s, blobs_s) = mk_delta_driver(tmp.path(), &shared_base, "src");
+
+        // Seed the source: two KV config keys + two blobs (all project-owned/scoped).
+        kv_s.put("project/acme/config/a", b"one".to_vec())
+            .await
+            .unwrap();
+        kv_s.put("project/acme/config/b", b"two".to_vec())
+            .await
+            .unwrap();
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/x", b"X-v1").await;
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/y", b"Y-v1").await;
+
+        // FULL base export.
+        src.export_resumable("acme", &ExportOptions::default(), "base")
+            .await
+            .expect("full base export");
+
+        // DRIFT: change b, add c, delete a; change x's bytes, add z, delete y.
+        kv_s.put("project/acme/config/b", b"TWO".to_vec())
+            .await
+            .unwrap();
+        kv_s.put("project/acme/config/c", b"new".to_vec())
+            .await
+            .unwrap();
+        kv_s.delete("project/acme/config/a").await.unwrap();
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/x", b"X-v2-longer").await;
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/z", b"Z-v1").await;
+        blobs_s.delete("hblob/acme/web/y").await.unwrap();
+
+        // DIFFERENTIAL delta against the fixed base.
+        let delta_opts = ExportOptions {
+            delta: Some(DeltaRequest {
+                mode: DeltaMode::Differential,
+                base_reference: "base".to_string(),
+            }),
+            ..Default::default()
+        };
+        src.export_resumable("acme", &delta_opts, "d1")
+            .await
+            .expect("differential delta export");
+
+        // Inspect the delta MANIFEST: it is a delta, names the base, and carries ONLY the drift
+        // (a KV-delta member, the two changed/new blobs, a blob-tombstone member — NO full KV
+        // member, NO member for the unchanged/deleted blobs).
+        let d1_dir = src.resolve_resumable_dir("d1", false).await.unwrap();
+        let m = src.read_resumable_manifest(&d1_dir).await.unwrap();
+        let di = m.delta.as_ref().expect("delta manifest carries DeltaInfo");
+        assert_eq!(di.mode, DeltaMode::Differential);
+        assert_eq!(di.base_reference, "base");
+        assert_eq!(
+            di.sql_strategy,
+            boatramp_core::project_delta::SqlDeltaKind::FullDumpFallback
+        );
+        let kinds: Vec<MemberKind> = m.members.iter().map(|s| s.kind).collect();
+        assert!(
+            kinds.contains(&MemberKind::KvDelta),
+            "a delta carries a KV-delta member"
+        );
+        assert!(
+            kinds.contains(&MemberKind::BlobTombstone),
+            "a delta with a deleted blob carries a blob-tombstone member"
+        );
+        assert!(
+            !kinds.contains(&MemberKind::Kv),
+            "a delta carries NO full KV member"
+        );
+        let blob_adds: Vec<&str> = m
+            .members
+            .iter()
+            .filter(|s| s.kind == MemberKind::Blob)
+            .map(|s| s.path.as_str())
+            .collect();
+        assert_eq!(
+            blob_adds.len(),
+            2,
+            "exactly the changed (x) + new (z) blobs ship, got {blob_adds:?}"
+        );
+        assert!(
+            blob_adds
+                .iter()
+                .all(|p| p.contains("/x") || p.contains("/z"))
+        );
+
+        // RESTORE onto a FRESH target node (shares the export base so the chain resolves).
+        let (tgt, kv_t, blobs_t) = mk_delta_driver(tmp.path(), &shared_base, "tgt");
+        let report = tgt
+            .import_resumable(
+                "acme",
+                "d1",
+                ImportOptions {
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delta chain restore");
+        assert!(
+            report.notes.iter().any(|n| n.contains("delta restore")),
+            "{:?}",
+            report.notes
+        );
+
+        // Final KV state = base + delta: a DELETED, b CHANGED, c ADDED.
+        assert_eq!(
+            kv_t.get("project/acme/config/a").await.unwrap(),
+            None,
+            "a was tombstoned"
+        );
+        assert_eq!(
+            kv_t.get("project/acme/config/b").await.unwrap().as_deref(),
+            Some(b"TWO".as_slice())
+        );
+        assert_eq!(
+            kv_t.get("project/acme/config/c").await.unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
+        // Final blob state: x CHANGED, z ADDED, y DELETED.
+        assert_eq!(
+            read_blob(blobs_t.as_ref(), "hblob/acme/web/x")
+                .await
+                .as_deref(),
+            Some(b"X-v2-longer".as_slice())
+        );
+        assert_eq!(
+            read_blob(blobs_t.as_ref(), "hblob/acme/web/z")
+                .await
+                .as_deref(),
+            Some(b"Z-v1".as_slice())
+        );
+        assert_eq!(
+            read_blob(blobs_t.as_ref(), "hblob/acme/web/y").await,
+            None,
+            "y was tombstoned"
+        );
+    }
+
+    /// INCREMENTAL chain (decision 4): base ← d1 ← d2, each diffed against its parent, restored as
+    /// base + replay(d1, d2). Proves chain resolution (walking parent links to the root) and the
+    /// cumulative drift of a multi-link chain.
+    #[tokio::test]
+    async fn delta_incremental_chain_round_trip() {
+        use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+        use boatramp_core::project_export::ProjectExport;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_base = tmp.path().join("exports");
+        let (src, kv_s, blobs_s) = mk_delta_driver(tmp.path(), &shared_base, "src");
+
+        // Base: k1, k2 + blob p.
+        kv_s.put("project/acme/config/k1", b"1".to_vec())
+            .await
+            .unwrap();
+        kv_s.put("project/acme/config/k2", b"2".to_vec())
+            .await
+            .unwrap();
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/p", b"P1").await;
+        src.export_resumable("acme", &ExportOptions::default(), "base")
+            .await
+            .expect("base");
+
+        // d1 (incremental vs base): change k1, add blob q.
+        kv_s.put("project/acme/config/k1", b"1b".to_vec())
+            .await
+            .unwrap();
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/q", b"Q1").await;
+        let inc = |base: &str| ExportOptions {
+            delta: Some(DeltaRequest {
+                mode: DeltaMode::Incremental,
+                base_reference: base.to_string(),
+            }),
+            ..Default::default()
+        };
+        src.export_resumable("acme", &inc("base"), "d1")
+            .await
+            .expect("d1");
+
+        // d2 (incremental vs d1): delete k2, delete blob p, add k3.
+        kv_s.delete("project/acme/config/k2").await.unwrap();
+        kv_s.put("project/acme/config/k3", b"3".to_vec())
+            .await
+            .unwrap();
+        blobs_s.delete("hblob/acme/web/p").await.unwrap();
+        src.export_resumable("acme", &inc("d1"), "d2")
+            .await
+            .expect("d2");
+
+        // d2's manifest chains onto d1 (its parent), proving the incremental linkage.
+        let d2_dir = src.resolve_resumable_dir("d2", false).await.unwrap();
+        let m2 = src.read_resumable_manifest(&d2_dir).await.unwrap();
+        assert_eq!(m2.delta.as_ref().unwrap().base_reference, "d1");
+        assert_eq!(m2.delta.as_ref().unwrap().mode, DeltaMode::Incremental);
+
+        // Restore d2 onto a fresh node = base + d1 + d2 replayed.
+        let (tgt, kv_t, blobs_t) = mk_delta_driver(tmp.path(), &shared_base, "tgt");
+        tgt.import_resumable(
+            "acme",
+            "d2",
+            ImportOptions {
+                apply: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("incremental chain restore");
+
+        // k1 changed (d1), k2 deleted (d2), k3 added (d2); blob p deleted (d2), q present (d1).
+        assert_eq!(
+            kv_t.get("project/acme/config/k1").await.unwrap().as_deref(),
+            Some(b"1b".as_slice())
+        );
+        assert_eq!(
+            kv_t.get("project/acme/config/k2").await.unwrap(),
+            None,
+            "k2 tombstoned in d2"
+        );
+        assert_eq!(
+            kv_t.get("project/acme/config/k3").await.unwrap().as_deref(),
+            Some(b"3".as_slice())
+        );
+        assert_eq!(
+            read_blob(blobs_t.as_ref(), "hblob/acme/web/p").await,
+            None,
+            "p tombstoned in d2"
+        );
+        assert_eq!(
+            read_blob(blobs_t.as_ref(), "hblob/acme/web/q")
+                .await
+                .as_deref(),
+            Some(b"Q1".as_slice())
+        );
+    }
+
+    /// SECURITY (chain coherence): a delta is only valid against a base from the SAME source.
+    /// A resumable chain lives on an addressable target, so a base exported from a FOREIGN source
+    /// could be grafted under a delta. `import_delta_chain` refuses a chain whose links disagree on
+    /// `source.project` — without it, `restore_member` would re-key each link from a different
+    /// source prefix and restore an incoherent cross-tenant mix. The mutation that drops this
+    /// refusal is exactly the foreign-base-graft it guards.
+    #[tokio::test]
+    async fn delta_import_refuses_a_chain_with_a_foreign_base_source() {
+        use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+        use boatramp_core::project_export::ProjectExport;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_base = tmp.path().join("exports");
+        let (src, kv_s, blobs_s) = mk_delta_driver(tmp.path(), &shared_base, "src");
+
+        // A valid base + one incremental delta, both for project "acme".
+        kv_s.put("project/acme/config/k1", b"1".to_vec())
+            .await
+            .unwrap();
+        seed_blob(blobs_s.as_ref(), "hblob/acme/web/p", b"P1").await;
+        src.export_resumable("acme", &ExportOptions::default(), "base")
+            .await
+            .expect("base");
+        kv_s.put("project/acme/config/k1", b"1b".to_vec())
+            .await
+            .unwrap();
+        src.export_resumable(
+            "acme",
+            &ExportOptions {
+                delta: Some(DeltaRequest {
+                    mode: DeltaMode::Incremental,
+                    base_reference: "base".into(),
+                }),
+                ..Default::default()
+            },
+            "d1",
+        )
+        .await
+        .expect("d1");
+
+        // Tamper the ROOT base MANIFEST on disk to claim a FOREIGN source project (simulating a
+        // base grafted in from another tenant on the shared addressable target).
+        let base_dir = src.resolve_resumable_dir("base", false).await.unwrap();
+        let mpath = base_dir.join(project_bundle::MANIFEST_PATH);
+        let mut m: project_bundle::StreamManifest =
+            serde_json::from_slice(&tokio::fs::read(&mpath).await.unwrap()).unwrap();
+        m.source.project = "evil".into();
+        tokio::fs::write(&mpath, serde_json::to_vec_pretty(&m).unwrap())
+            .await
+            .unwrap();
+
+        // Importing d1 now resolves a chain [base(evil), d1(acme)] — mismatched sources → refuse,
+        // before any member is applied.
+        let (tgt, _kv_t, _blobs_t) = mk_delta_driver(tmp.path(), &shared_base, "tgt");
+        let err = tgt
+            .import_resumable(
+                "acme",
+                "d1",
+                ImportOptions {
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a foreign-base chain must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must share one source"),
+            "expected a one-source coherence refusal, got: {msg}"
+        );
+    }
+
+    /// SECURITY (the tenancy-critical delta seam): a KV-delta's tombstone keys are
+    /// attacker-influenceable; a tombstone that escapes the target's owned scope would be a
+    /// CROSS-TENANT delete. The `KvDelta` restore arm REFUSES it fail-closed. The mutation that
+    /// drops this refuse is exactly the cross-tenant-delete bug it guards.
+    #[tokio::test]
+    async fn delta_restore_refuses_a_cross_tenant_kv_tombstone() {
+        use boatramp_core::kv::KvDumpEntry;
+        use boatramp_core::project_delta::{self as pd, KvDelta};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_base = tmp.path().join("exports");
+        let (drv, kv, _blobs) = mk_delta_driver(tmp.path(), &shared_base, "t");
+        // A victim key another tenant owns — it must survive a hostile delta aimed at it.
+        kv.put("project/globex/secret/x", b"victim".to_vec())
+            .await
+            .unwrap();
+
+        // A hostile delta: a legit target upsert, but a tombstone pointed at the victim's key.
+        let hostile = KvDelta {
+            upserts: vec![KvDumpEntry {
+                key: "project/acme/config/ok".to_string(),
+                value: b"v".to_vec(),
+                version: 1,
+            }],
+            tombstones: vec!["project/globex/secret/x".to_string()],
+        };
+        let temp = tmp.path().join("hostile.brkvdelta");
+        tokio::fs::write(&temp, pd::encode_kv_delta(&hostile, 0))
+            .await
+            .unwrap();
+
+        let spec = project_bundle::MemberSpec::sidecar(
+            project_bundle::KV_DELTA_MEMBER_PATH.to_string(),
+            MemberKind::KvDelta,
+            None,
+        );
+        let mut report = ImportReport::default();
+        let mut saw = false;
+        // Import AS "acme": the tombstone re-keys to itself (globex is not acme's source), lands
+        // outside acme's owned scope → REFUSED fail-closed.
+        let r = drv
+            .restore_member(
+                "acme",
+                false,
+                "acme",
+                &spec,
+                &temp,
+                &ImportOptions {
+                    apply: true,
+                    ..Default::default()
+                },
+                &mut report,
+                &mut saw,
+            )
+            .await;
+        assert!(r.is_err(), "a cross-tenant tombstone must be refused");
+        assert!(
+            format!("{}", r.unwrap_err()).contains("outside the target project"),
+            "the refusal names the cross-tenant scope violation"
+        );
+        // The victim's key is UNTOUCHED (fail-closed BEFORE any delete).
+        assert_eq!(
+            kv.get("project/globex/secret/x").await.unwrap().as_deref(),
+            Some(b"victim".as_slice()),
+            "a refused delta deletes NOTHING"
+        );
     }
 }

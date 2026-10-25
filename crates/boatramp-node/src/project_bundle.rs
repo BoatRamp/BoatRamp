@@ -45,6 +45,14 @@ pub const MANIFEST_PATH: &str = "MANIFEST";
 /// The control-plane KV slice's tar-entry path (the `kv_dump::export_to_bytes` bytes).
 pub const KV_MEMBER_PATH: &str = "kv.brkvdump";
 
+/// The control-plane KV **delta** slice's member path (a DELTA bundle only — the
+/// `boatramp_core::project_delta::encode_kv_delta` bytes: upserts + tombstones).
+pub const KV_DELTA_MEMBER_PATH: &str = "kv.brkvdelta";
+
+/// The blob **tombstone** list's member path (a DELTA bundle only — the
+/// `boatramp_core::project_delta::encode_blob_tombstones` bytes).
+pub const BLOB_TOMBSTONE_MEMBER_PATH: &str = "blobs.brtombstones";
+
 /// The identity transport-container's tar-entry path (`--include-identity` only): the
 /// passphrase-wrapped KEK, produced by `boatramp_server::envelope::transport_wrap`.
 pub const IDENTITY_MEMBER_PATH: &str = "identity/identity.brid";
@@ -67,6 +75,14 @@ pub enum MemberKind {
     /// present only under `--include-identity`. Carries the project's KEK (transport-wrapped)
     /// so an `--identity adopt` (recovery) can unseal the KV slice's sealed secrets.
     Identity,
+    /// A control-plane KV **delta** slice (`kv.brkvdelta`) — present only in a DELTA bundle: the
+    /// changed/new KV upserts + the deleted-key tombstones since the base (the
+    /// `boatramp_core::project_delta` framing). Replaces the full `Kv` member in a delta.
+    KvDelta,
+    /// A blob **tombstone** list (`blobs.brtombstones`) — present only in a DELTA bundle: the blob
+    /// keys deleted since the base (deletes-as-tombstones). The blobs that were ADDED/CHANGED ride
+    /// as ordinary `Blob` members (adds-as-full-members).
+    BlobTombstone,
 }
 
 /// SQL-dump provenance for a `PgDump`/`MysqlDump` member: the detected server version,
@@ -583,6 +599,11 @@ pub struct StreamManifest {
     pub source: SourceInfo,
     /// Every non-manifest member, in the order the reader must restore them.
     pub members: Vec<MemberSpec>,
+    /// DELTA bundle metadata (the mode + base/parent reference). Absent ⇒ an ordinary FULL bundle
+    /// (so a v2/v3 full manifest round-trips byte-identically — `skip_serializing_if`), present ⇒
+    /// the restore resolves the base chain and applies this bundle's per-family deltas onto it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<boatramp_core::project_delta::DeltaInfo>,
 }
 
 impl StreamManifest {
@@ -673,6 +694,9 @@ impl<W: Write> BundleStreamWriter<W> {
             data_only,
             source,
             members: specs.clone(),
+            // The forward-only streaming writer never emits a delta bundle (a delta needs a
+            // re-readable base ⇒ the resumable member-object target only).
+            delta: None,
         };
         manifest.validate()?;
         let mut builder = tar::Builder::new(out);
@@ -1905,6 +1929,7 @@ mod tests {
                     framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
+                delta: None,
             };
             append_bytes(
                 &mut b,
@@ -1958,6 +1983,7 @@ mod tests {
                     framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
+                delta: None,
             };
             append_bytes(
                 &mut b,
@@ -2147,6 +2173,7 @@ mod tests {
                     framing: MemberFraming::Sidecar,
                     pg: None,
                 }],
+                delta: None,
             };
             append_bytes(
                 &mut b,
@@ -2407,6 +2434,7 @@ mod tests {
                     MemberKind::Libsql,
                     None,
                 )],
+                delta: None,
             };
             append_bytes(
                 &mut b,
@@ -2475,6 +2503,7 @@ mod tests {
                     MemberKind::Libsql,
                     None,
                 )],
+                delta: None,
             };
             append_bytes(
                 &mut b,

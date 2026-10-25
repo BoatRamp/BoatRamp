@@ -2856,6 +2856,10 @@ pub(super) async fn project_export(
         data_only: q.data_only,
         include_identity: q.include_identity,
         transport_key,
+        // The delta (`--mode differential|incremental` + base) surface is not yet wired through the
+        // admin-API query; a full/resumable export leaves it None. (Driver-level capability only in
+        // this increment — see the delta export/import path on `NodeProjectExport`.)
+        delta: None,
     };
     // RESUMABLE mode (T3): write a node-local member-object directory (resuming an
     // interrupted run) and return a status, instead of streaming the bundle. The host

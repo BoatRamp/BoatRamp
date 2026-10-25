@@ -2309,6 +2309,7 @@ async fn project_export_roundtrip_driver_live() {
                     data_only: false,
                     include_identity: false,
                     transport_key: None,
+                    delta: None,
                 },
                 &mut sink,
             )

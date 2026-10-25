@@ -60,6 +60,9 @@ pub mod migrate;
 pub mod mode;
 pub mod orm;
 pub mod project;
+/// Incremental / delta export — the family-agnostic delta ALGEBRA (differential + incremental,
+/// KV + blob true-deltas, SQL full-dump fallback with the true-delta strategies scaffolded).
+pub mod project_delta;
 /// The operator-facing project export/import capability (native env-clone) — a core
 /// trait node implements and the admin API / CLI consume.
 pub mod project_export;

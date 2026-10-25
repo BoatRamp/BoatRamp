@@ -239,6 +239,12 @@ pub struct ExportOptions {
     /// caller from `--transport-key-file` / env / prompt. Required iff `include_identity`.
     /// Secret — never logged (see the hand-written `Debug`).
     pub transport_key: Option<Vec<u8>>,
+    /// When set, produce an INCREMENTAL / DELTA bundle chaining onto a prior base (the
+    /// `--mode differential|incremental` + base-reference surface). `None` ⇒ an ordinary full
+    /// bundle. A delta is only meaningful for the resumable member-object target (the base must be
+    /// re-readable), so it is honoured by `export_resumable` / `import_resumable`, not the
+    /// forward-only streaming `export`.
+    pub delta: Option<crate::project_delta::DeltaRequest>,
 }
 
 impl std::fmt::Debug for ExportOptions {
@@ -250,6 +256,7 @@ impl std::fmt::Debug for ExportOptions {
                 "transport_key",
                 &self.transport_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("delta", &self.delta)
             .finish()
     }
 }
