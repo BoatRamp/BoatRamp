@@ -130,6 +130,7 @@ async fn open_endpoint(
         url_env,
         path,
         pool_max: None,
+        pool_min: None,
     };
     let built = match scheme {
         "memory" => {
