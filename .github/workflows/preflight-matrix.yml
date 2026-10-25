@@ -120,6 +120,19 @@ jobs:
           # target that catches glibc-only lints the musl gate can't.
           - label: nixos-service vm
             build: .#checks.x86_64-linux.nixos-service
+          # NixOS-VM real-path GATES (PLAN-nixos-vm-testing.md decisions 1+2: correctness VM
+          # tests gate in nightly + release-preflight, alongside nixos-service). Each boots a
+          # real VM via the NixOS test driver on this KVM-capable runner.
+          #   • tunnel-tun       — a real /dev/net/tun device + route + systemd-resolved
+          #                        split-DNS round-trip (overlay tunneler R2; supersedes the old
+          #                        tunnel.yml privileged-netns job).
+          #   • export-import-live — the project export/import round-trip against real Postgres
+          #                        (pgvector) + MySQL in an in-VM docker daemon fed from an offline
+          #                        registry mirror (institutionalizes the host-runner live-export job).
+          - label: tunnel-tun gate vm
+            build: .#checks.x86_64-linux.tunnel-tun
+          - label: export-import-live gate vm
+            build: .#checks.x86_64-linux.export-import-live
           - label: release artifacts + OCI images
             build: .#boatramp-static .#container .#container-cloudflare
     steps:

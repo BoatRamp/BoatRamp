@@ -338,6 +338,118 @@
                   -out $out/server.crt -keyout $out/server.key
               '';
 
+          # Build a single workspace INTEGRATION-TEST binary (crane, dependency-split +
+          # cachix-cached like the clippy/musl derivations) and install it under a stable
+          # name, so a `mkBoatrampVmTest` gate can ship + run the REAL test binary inside
+          # the VM — the same test the host-runner CI job runs, just driven declaratively.
+          # `cargo test … --no-run` compiles the `#[ignore]`d live/privileged tests in but
+          # runs nothing at build time; the VM's testScript runs them (as root, against the
+          # VM's real kernel/DBs). The dep layer is built once per (package,features) via
+          # `buildDepsOnly` (a plain `--tests` build of the dummy workspace — no `--test
+          # <name>`, which the dummy has no target for), so a code-only change reuses it.
+          mkWorkspaceTestBin =
+            {
+              pname,
+              package, # cargo `-p` target
+              features, # comma-list for `--features`, or "" for none
+              testName, # the `--test <name>` integration target (and the installed binary name)
+            }:
+            let
+              featArgs = lib.optionalString (features != "") "--features ${features}";
+              commonCrane = {
+                inherit pname;
+                version = "0.1.0";
+                src = workspaceSrc;
+                strictDeps = true;
+                # pkg-config + openssl match the workspace clippy check; cmake + nasm cover
+                # any aws-lc-rs (`tls`/`s3`) that a feature set drags in, exactly as the
+                # all-features preflight job installs them.
+                nativeBuildInputs = nativeBuildInputs ++ [
+                  pkgs.cmake
+                  pkgs.nasm
+                ];
+                inherit buildInputs;
+              };
+              depArgs = commonCrane // {
+                pname = "${pname}-deps";
+                cargoExtraArgs = "-p ${package} ${featArgs} --tests";
+              };
+            in
+            craneLib.mkCargoDerivation (
+              commonCrane
+              // {
+                cargoArtifacts = craneLib.buildDepsOnly depArgs;
+                doInstallCargoArtifacts = false;
+                doCheck = false;
+                buildPhaseCargoCommand = ''
+                  cargo test -p ${package} ${featArgs} --test ${testName} --no-run --release --locked
+                '';
+                installPhaseCommand = ''
+                  mkdir -p $out/bin
+                  bin=$(find target/release/deps -maxdepth 1 -type f -perm -u+x \
+                    -name '${testName}-*' ! -name '*.d' | head -n1)
+                  if [ -z "$bin" ]; then
+                    echo "mkWorkspaceTestBin(${pname}): no ${testName} test binary under target/release/deps" >&2
+                    exit 1
+                  fi
+                  install -m755 "$bin" "$out/bin/${testName}"
+                '';
+              }
+            );
+
+          # #3 (overlay tunneler R2) — the privileged TUN test binary (device + route +
+          # embedded DNS + the systemd-resolved split-DNS path), shipped into the
+          # `tunnel-tun` gate VM below.
+          overlayTunnelTunTestBin = mkWorkspaceTestBin {
+            pname = "boatramp-overlay-tunnel-tun-test";
+            package = "boatramp-overlay-tunnel";
+            features = "tun";
+            testName = "tun_privileged";
+          };
+
+          # #7 (project export/import) — the live round-trip test binary, shipped into the
+          # `export-import-live` gate VM below (which stands up the DBs + a docker daemon
+          # it drives for the ephemeral pg_dump/pg_restore/mysqldump client containers).
+          projectExportTestBin = mkWorkspaceTestBin {
+            pname = "boatramp-node-project-export-test";
+            package = "boatramp-node";
+            features = "project-export";
+            testName = "project_export_roundtrip";
+          };
+
+          # The exact Docker-Hub images the live export/import round-trip drives — pulled
+          # reproducibly from the nix store as fixed-output derivations (digest + output hash both pinned) so the
+          # hermetic `export-import-live` VM can serve them from its own offline registry
+          # mirror with no internet. These are the SAME tags the nightly host-runner job
+          # uses and the SAME tags the driver's version->image map asks for:
+          #   • pgvector/pgvector:pg16 — the pg16 server AND its pg_dump/pg_restore/psql client
+          #   • postgres:16            — the version-probe psql client image
+          #   • mysql:8.0              — the mysql server AND its mysqldump/mysql client
+          # Digests + hashes are produced with `nix run nixpkgs#nix-prefetch-docker`.
+          exportImportImages = {
+            pgvector = pkgs.dockerTools.pullImage {
+              imageName = "pgvector/pgvector";
+              imageDigest = "sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a";
+              hash = "sha256-pCdu2IPv8DWKoh85Kzbixv12Xmn9QMWh04Io00CrUzY=";
+              finalImageName = "pgvector/pgvector";
+              finalImageTag = "pg16";
+            };
+            postgres = pkgs.dockerTools.pullImage {
+              imageName = "postgres";
+              imageDigest = "sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97";
+              hash = "sha256-R2bFd9dpDZ3vmP2uXouuWn7j3wt6Sr0h5DHRcffVlko=";
+              finalImageName = "postgres";
+              finalImageTag = "16";
+            };
+            mysql = pkgs.dockerTools.pullImage {
+              imageName = "mysql";
+              imageDigest = "sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b";
+              hash = "sha256-MKIVSoXyndEJFtQ0QV2ZLiHdNEH5OxuBbiN9WNqF5j8=";
+              finalImageName = "mysql";
+              finalImageTag = "8.0";
+            };
+          };
+
           # Shared builder for the reproducible, Nix-first OCI images. Both targets
           # ship the *same* batteries-included binary and differ only in runtime
           # posture: the base `container` runs as root so it can own a mounted state
@@ -452,6 +564,14 @@
             # The single, batteries-included `boatramp` binary (server + CLI): every
             # backend is compiled in and selected at runtime (`--blobs`/`--kv`/`--tls`).
             default = boatrampBin;
+
+            # The workspace integration-test binaries the NixOS-VM gates ship + run inside
+            # the VM (nix/vmtest.nix + the `tunnel-tun` / `export-import-live` checks).
+            # Exposed so a dev can `nix build` the exact test binary a gate runs, standalone
+            # — the framework's "each is `nix build`-able standalone" ethos
+            # (PLAN-nixos-vm-testing.md §Wiring).
+            tunnel-tun-test-bin = overlayTunnelTunTestBin;
+            project-export-test-bin = projectExportTestBin;
 
             # ---- Reproducible microVM kernel (`nix build .#vmlinux`) --------
             # The uncompressed `vmlinux` ELF the embedded VMM boots via
@@ -866,6 +986,223 @@
                     f.write(tls)
                     f.write("\n===== non-TLS (sslmode=disable) =====\n")
                     f.write(plain)
+              '';
+            };
+
+            # #3 (overlay tunneler R2) — the REAL-kernel TUN gate. A NixOS VM with a real
+            # `/dev/net/tun` and a real `systemd-resolved`, running the privileged TUN test
+            # binary as root: device open + route install + the embedded-DNS round-trip
+            # (the netns job's exact test), PLUS the split-DNS path the netns job can't do
+            # (it runs `skip_resolver = true`) — a real `resolvectl` per-link, zone-scoped
+            # override, proven by a lookup THROUGH systemd-resolved returning a synthetic IP
+            # that a real TCP connection then drives an overlay dial through. kind = "gate":
+            # the testScript ASSERTS (a regression fails the check), and it supersedes
+            # `tunnel.yml`'s bespoke privileged-netns job (plan decision 3).
+            tunnel-tun = vmtest.mkBoatrampVmTest {
+              name = "boatramp-tunnel-tun";
+              kind = "gate";
+              services = {
+                # Only the VM + its kernel/resolver are needed — not the boatramp service
+                # (keeps the full server binary out of this VM's closure).
+                services.boatramp.enable = false;
+                # The split-DNS half needs a real resolver to apply the `resolvectl`
+                # per-link override against (plan §3.6 preferred path). Disable mDNS +
+                # LLMNR: systemd-resolved's mDNS responder otherwise binds UDP :5353,
+                # which is exactly the loopback port the embedded DNS responder uses —
+                # leaving it on makes every bind fail `AddrInUse`.
+                services.resolved = {
+                  enable = true;
+                  # No upstream/fallback DNS in a hermetic VM — so resolved answers the in-zone
+                  # name straight from the TUN link's responder and never stalls on unreachable
+                  # fallback servers (8.8.8.8/1.1.1.1/…) for anything it can't resolve locally.
+                  fallbackDns = [ ];
+                  settings.Resolve = {
+                    MulticastDNS = "no";
+                    LLMNR = "no";
+                  };
+                };
+                # Guarantee the TUN kernel module + its /dev/net/tun node are present.
+                boot.kernelModules = [ "tun" ];
+                # The real TCP round-trip through the TUN relies on the kernel delivering the
+                # netstack's SYN-ACK (src = a synthetic CIDR address) back to the connecting
+                # socket. Turn OFF reverse-path filtering (a synthetic src on the TUN link can
+                # otherwise be dropped as a martian) and the firewall (its INPUT policy must not
+                # drop traffic arriving on the TUN), and allow forwarding — the production
+                # posture is an operator's box, not this hardened test VM's defaults.
+                boot.kernel.sysctl = {
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                  "net.ipv4.ip_forward" = 1;
+                };
+                networking.firewall.enable = false;
+                environment.systemPackages = [
+                  overlayTunnelTunTestBin
+                  pkgs.iproute2
+                ];
+              };
+              testScript = ''
+                machine.wait_for_unit("multi-user.target")
+                machine.wait_for_unit("systemd-resolved.service")
+                # The real kernel TUN device node — the whole point of a VM over the fast gate.
+                machine.succeed("test -c /dev/net/tun")
+                # The embedded DNS responder needs loopback :5353 free — assert nothing (e.g.
+                # resolved's mDNS) is holding it, so a bind failure can't masquerade as a logic bug.
+                machine.succeed("! ss -H -lun 'sport = :5353' | grep -q .")
+
+                # Run BOTH #[ignore]d privileged tests as root against the VM's real kernel +
+                # resolver. --test-threads=1 so the two tests' TUN devices / routes / DNS
+                # responders (both bind 127.0.0.1:5353) never overlap.
+                out = machine.succeed(
+                    "tun_privileged --ignored --test-threads=1 --nocapture 2>&1"
+                )
+                print(out)
+
+                # Guard against a vacuous green (0 tests run, or one silently filtered out):
+                # BOTH named tests must actually have run and the suite must report 2 passed.
+                assert (
+                    "a_real_tcp_connection_through_the_kernel_tun_device_drives_a_dial_attempt" in out
+                ), "the device/route/embedded-DNS test did not run"
+                assert (
+                    "split_dns_via_the_host_resolver_scopes_only_the_zone_and_a_lookup_drives_a_dial" in out
+                ), "the split-DNS (resolvectl) test did not run"
+                assert "test result: ok. 2 passed" in out, "both privileged TUN tests must pass"
+              '';
+            };
+
+            # #7 (project export/import) — the LIVE round-trip GATE, as a declarative
+            # nixosTest institutionalizing the nightly "project export/import live — Postgres
+            # pgvector + MySQL" host-runner job. A single VM runs its own docker daemon (fed
+            # offline from the nix store — the hermetic test sandbox has no registry access)
+            # with the pgvector + mysql server containers AND the ephemeral pg_dump /
+            # pg_restore / mysqldump CLIENT containers the real `NodeProjectExport` driver
+            # launches via `run_ephemeral`, then runs the REAL test binary and greps for every
+            # one of its success markers (a self-skip would still print `ok`, so the markers
+            # are the gate). kind = "gate".
+            export-import-live = vmtest.mkBoatrampVmTest {
+              name = "boatramp-export-import-live";
+              kind = "gate";
+              # A docker-in-VM run of two DB servers + several ephemeral client containers +
+              # the loaded image closure needs headroom over the default guest disk/RAM.
+              memoryMB = 6144;
+              services = {
+                services.boatramp.enable = false;
+                virtualisation.docker.enable = true;
+                # An offline Docker-Hub mirror: a native registry (no image needed) that the
+                # daemon consults FIRST for every docker.io pull — so the driver's
+                # `run_ephemeral` pull of `pgvector/pgvector:pg16` / `mysql:8.0` / `postgres:16`
+                # resolves against local blobs, never the (unreachable) internet.
+                services.dockerRegistry = {
+                  enable = true;
+                  listenAddress = "127.0.0.1";
+                  port = 5000;
+                };
+                virtualisation.docker.daemon.settings = {
+                  registry-mirrors = [ "http://127.0.0.1:5000" ];
+                };
+                # Bigger guest disk for the loaded image layers + the dump/restore temp files.
+                virtualisation.diskSize = 12000;
+                environment.systemPackages = [
+                  projectExportTestBin
+                  pkgs.skopeo
+                ];
+                # Seed the mirror from the nix-store image tarballs BEFORE the test runs. Each
+                # is copied under the SAME docker.io repo path the daemon will ask the mirror
+                # for (official images under `library/`).
+                systemd.services.seed-registry = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "docker-registry.service" ];
+                  requires = [ "docker-registry.service" ];
+                  path = [ pkgs.skopeo ];
+                  serviceConfig = {
+                    Type = "oneshot";
+                    RemainAfterExit = true;
+                  };
+                  script = ''
+                    set -euo pipefail
+                    # `--insecure-policy`: this minimal VM ships no containers trust
+                    # policy.json; accept any image signature policy for the copy (the
+                    # images are pinned-by-digest nix-store fixed-output derivations, not fetched at runtime).
+                    copy() {
+                      skopeo --insecure-policy copy --dest-tls-verify=false --retry-times 3 \
+                        "docker-archive:$1" "docker://127.0.0.1:5000/$2"
+                    }
+                    copy ${exportImportImages.pgvector} pgvector/pgvector:pg16
+                    copy ${exportImportImages.postgres} library/postgres:16
+                    copy ${exportImportImages.mysql}    library/mysql:8.0
+                  '';
+                };
+              };
+              testScript = ''
+                import re
+
+                machine.wait_for_unit("multi-user.target")
+                machine.wait_for_unit("docker.service")
+                machine.wait_for_unit("docker-registry.service")
+                machine.wait_for_unit("seed-registry.service")
+
+                # Stand the two DB servers up exactly as the host-runner job does — on the
+                # docker default bridge, so both the test process AND the ephemeral client
+                # containers it launches (siblings on that bridge) reach them by container IP.
+                machine.succeed(
+                    "docker run -d --name brexport-pg -e POSTGRES_PASSWORD=postgres "
+                    "pgvector/pgvector:pg16"
+                )
+                machine.succeed(
+                    "docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql "
+                    "mysql:8.0 --default-authentication-plugin=mysql_native_password"
+                )
+
+                # Wait for both to accept connections (readiness, not a fixed sleep).
+                machine.wait_until_succeeds(
+                    "docker exec brexport-pg pg_isready -U postgres", timeout=120
+                )
+                machine.wait_until_succeeds(
+                    "docker exec brexport-mysql mysqladmin ping -h 127.0.0.1 -uroot -pmysql",
+                    timeout=180,
+                )
+
+                pg_ip = machine.succeed(
+                    "docker inspect -f "
+                    "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-pg"
+                ).strip()
+                my_ip = machine.succeed(
+                    "docker inspect -f "
+                    "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-mysql"
+                ).strip()
+                print(f"pg={pg_ip} mysql={my_ip}")
+
+                env = (
+                    f"BOATRAMP_TEST_PG_URL=postgres://postgres:postgres@{pg_ip}:5432/postgres "
+                    f"BOATRAMP_TEST_MYSQL_URL=mysql://root:mysql@{my_ip}:3306/mysql"
+                )
+                out = machine.succeed(
+                    f"{env} project_export_roundtrip --nocapture --test-threads=1 2>&1",
+                    timeout=1200,
+                )
+                print(out)
+
+                # HARD gate: every live/always-on test must actually run (both DBs reachable,
+                # docker usable for the ephemeral client containers) — a self-skip still prints
+                # `ok`, so require the exact passed count AND every success marker, exactly like
+                # the host-runner job's grep gate.
+                assert re.search(r"test result: ok\. 13 passed", out), "not all 13 tests ran (silent skip?)"
+                for marker in [
+                    "PROJECT EXPORT ROUNDTRIP OK",
+                    "PROJECT EXPORT PG CHUNKED SHADOW OK",
+                    "PROJECT EXPORT PG CORRUPTION ABORT OK",
+                    "PROJECT EXPORT PG CRAFTED ESCAPE REFUSED OK",
+                    "PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK",
+                    "PROJECT EXPORT PG PGVECTOR ROUNDTRIP OK",
+                    "PROJECT EXPORT DRIVER ROUNDTRIP OK",
+                    "PROJECT EXPORT MYSQL ROUNDTRIP OK",
+                    "PROJECT EXPORT MYSQL SHADOW OK",
+                    "PROJECT EXPORT LIBSQL ROUNDTRIP OK",
+                    "PROJECT EXPORT LIBSQL CHUNKED ATOMIC OK",
+                    "PROJECT EXPORT CROSS-TENANT LEAK GATE OK",
+                ]:
+                    assert marker in out, f"missing success marker: {marker}"
+
+                machine.succeed("docker rm -f brexport-pg brexport-mysql || true")
               '';
             };
           };

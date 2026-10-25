@@ -1,16 +1,19 @@
-# Overlay service tunneler — TUN front-end device/route smoke (plan §3/§6/§8, release R2, Linux
-# only). Build-and-test this crate's `tun` feature on every push/PR (cheap, no privilege needed),
-# plus a SEPARATE, privileged job that opens a REAL Linux TUN device inside its own network
-# namespace and drives one connection through it — the "per-OS TUN smoke needs a device/privilege"
-# half of plan §6 that the Linux merge gate (ci.yml) deliberately does NOT cover (that gate tests
-# only what every push's `cargo test`/`clippy` already proves without any privilege: the allocator,
-# the DNS zone handler, and the `smoltcp`-direct E2E test in `tun::netstack`'s own test module,
-# which plan §6 itself calls out as giving "most of the coverage without privilege").
+# Overlay service tunneler — TUN front-end BUILD + unprivileged tests (plan §3/§6/§8, release R2,
+# Linux only). Builds + tests this crate's `tun` feature on every push/PR (cheap, no privilege
+# needed) — the allocator, the DNS zone handler, and the `smoltcp`-direct E2E test in
+# `tun::netstack`'s own test module, which plan §6 itself calls out as giving "most of the coverage
+# without privilege".
 #
-# NON-BLOCKING TO START (mirrors the `mobile.yml` precedent exactly): the privileged job sets
-# `continue-on-error: true` and is NOT a required check. Promote it once reliably green (plan §8
-# R5 — "promote `tunnel.yml` toward required").
-name: Tunnel TUN smoke (R2)
+# The PRIVILEGED half — opening a REAL Linux TUN device, installing its route, and driving a real
+# connection through the kernel into the netstack — used to live here as a bespoke `ip netns exec`
+# job (`linux-tun-device-smoke`). It has been RETIRED in favour of the declarative `tunnel-tun`
+# nixosTest gate (`nix build .#checks.x86_64-linux.tunnel-tun`, wired into preflight-matrix.yml /
+# nightly), which boots a full VM with a real `/dev/net/tun` AND a real systemd-resolved — so it
+# ALSO exercises the split-DNS (`resolvectl` per-link, zone-scoped) path the netns shim could not,
+# runs the SAME `tun_privileged` test binary, and is `nix build`-able standalone by any dev
+# (PLAN-nixos-vm-testing.md decision 3 — "converge on one mechanism"). This workflow keeps only the
+# cheap, REQUIRED-eligible per-push build + unprivileged-test job below.
+name: Tunnel TUN build + unprivileged tests (R2)
 
 on:
   push:
@@ -64,56 +67,9 @@ jobs:
       - name: cargo check -p boatramp --features overlay,tun
         run: cargo check -p boatramp --features overlay,tun --locked
 
-  # The privileged half (plan §6): open a REAL TUN device, install its route, run a real TCP
-  # connection through the kernel into it — inside a dedicated network namespace so it can never
-  # collide with routes already on the runner, and running the test binary with EXACTLY
-  # `CAP_NET_ADMIN` (via `setcap`, as a non-root user) rather than full root, matching the
-  # production-recommended posture `device.rs`'s own doc comment describes.
-  linux-tun-device-smoke:
-    name: Linux TUN device + route smoke (privileged, netns, non-blocking)
-    runs-on: ubuntu-latest
-    # NON-BLOCKING (module doc above) — this job's own failure never blocks a merge.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: tunnel-device-smoke
-
-      # Build-only here (no `--ignored`, so the usual unprivileged run is a no-op skip) — the
-      # privileged run happens as its own step below, directly against the built binary, so it can
-      # control exactly which capabilities/namespace it runs under.
-      - name: Build the privileged integration test binary
-        run: cargo test -p boatramp-overlay-tunnel --features tun --test tun_privileged --no-run --locked
-
-      - name: Run it as a non-root user with ONLY CAP_NET_ADMIN, inside its own network namespace
-        run: |
-          set -euo pipefail
-
-          bin=$(find target/debug/deps -maxdepth 1 -type f -name 'tun_privileged-*' \
-            ! -name '*.d' -perm -u+x | head -n1)
-          if [ -z "$bin" ]; then
-            echo "::error::could not find the built tun_privileged test binary under target/debug/deps"
-            exit 1
-          fi
-          echo "test binary: $bin"
-
-          # Exactly the capability the TUN front-end actually needs (plan §3.7) — not full root.
-          sudo setcap cap_net_admin+ep "$bin"
-          getcap "$bin"
-
-          # A dedicated namespace so this test's route/interface can never collide with (or be
-          # confused for) anything already on the runner's default namespace.
-          sudo ip netns add brtun-ci
-
-          # Creating/entering the namespace needs root (the first `sudo`); `sudo -u "$(id -un)"`
-          # immediately drops back to the normal CI user for the actual test run, which then only
-          # has whatever the `setcap` grant above gave the BINARY — CAP_NET_ADMIN, nothing more.
-          sudo ip netns exec brtun-ci \
-            sudo -u "$(id -un)" "$bin" --ignored --nocapture --test-threads=1 \
-            a_real_tcp_connection_through_the_kernel_tun_device_drives_a_dial_attempt
-
-      - name: Clean up the network namespace
-        if: always()
-        run: sudo ip netns delete brtun-ci || true
+  # NOTE: the former `linux-tun-device-smoke` job (a bespoke `ip netns exec` + `setcap` run of the
+  # privileged `tun_privileged` test) has been RETIRED — superseded by the `tunnel-tun` nixosTest
+  # gate (`nix build .#checks.x86_64-linux.tunnel-tun`), wired into preflight-matrix.yml / nightly.
+  # The VM gate boots a real `/dev/net/tun` AND a real systemd-resolved, so it runs the SAME test
+  # binary plus the split-DNS (`resolvectl`) path the netns shim could not reach, as one declarative,
+  # reproducible mechanism (PLAN-nixos-vm-testing.md decision 3). See the module doc at the top.

@@ -1,0 +1,92 @@
+name: Weekly perf bench
+
+# The scheduled, NON-BLOCKING home for the `kind = "bench"` NixOS-VM real-path
+# benchmarks (PLAN-nixos-vm-testing.md, owner decision 2: "benches run in a
+# separate scheduled (weekly) non-blocking perf workflow that publishes the
+# recorded numbers as a trend artifact — so heavy benches don't bloat nightly
+# or slow a cut"). It NEVER gates a release: a bench records numbers (host
+# variance makes a QEMU latency threshold too noisy to assert), so this workflow
+# only builds the bench check and publishes its recorded `media-latency.txt` as a
+# downloadable artifact. Correctness VM tests GATE instead, and live in nightly +
+# release-preflight (preflight-matrix.yml), not here.
+#
+# First (and so far only) instance: `media-latency` — the #2 /media pool
+# warm-floor bench (a 2-core NixOS VM + a real postgres node running the real
+# sqlx pool drain->burst pattern). FIDELITY CAVEAT, stated wherever the number is
+# cited: a 2-core QEMU guest approximates a small box but does NOT reproduce
+# cloud hypervisor CPU-steal (not attempted here) — the recorded numbers show the
+# mechanism + direction on the real path, not a prod number.
+#
+# Modeled on the repo's other scheduled nix workflows (tunnel.yml / vmlinux.yml):
+# a KVM-capable GitHub-hosted runner, the project cachix for the warm dependency
+# closure, weekly cron + manual dispatch.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly, Monday 06:00 UTC — after the nightly cadence, off the release path.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  media-latency:
+    name: media-latency bench (2-core VM + real postgres, non-blocking)
+    runs-on: ubuntu-latest
+    # A bench is informational only — its own failure must NEVER fail a run that
+    # anything could mistake for a gate. Belt-and-suspenders on top of this
+    # workflow never being a required check or a release precondition.
+    continue-on-error: true
+    # A VM build + a 3-trial x 2-arm drain->burst run is minutes, not seconds;
+    # fail a wedged build fast rather than burn the 6h default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # The nixosTest driver boots a QEMU guest; nested virt (/dev/kvm) keeps the
+      # 2-core constrained run honest (software emulation would swamp the signal).
+      - name: Confirm KVM is available
+        run: |
+          test -e /dev/kvm && echo "kvm present" || (echo "no /dev/kvm on this runner" && exit 1)
+          ls -l /dev/kvm
+
+      # A NixOS VM image + postgres + the driver compile into /nix/store on the
+      # runner's cramped root disk. Reclaim the preinstalled toolchains we don't
+      # use (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      # The project's own cachix (kept warm by cache.yml on every push to main):
+      # substitute the compiled dependency closure instead of recompiling the
+      # driver + the VM's postgres closure from scratch.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build the media-latency bench (records numbers to the result)
+        run: nix build .#checks.x86_64-linux.media-latency --print-build-logs --max-jobs 1 --cores 4
+
+      # The bench's testScript writes its recorded per-request latency (min=0 vs
+      # the warm floor, TLS + non-TLS, 3 trials) to `$out/media-latency.txt`.
+      # Surface it in the run log AND publish it as the trend artifact.
+      - name: Show the recorded numbers
+        run: cat result/media-latency.txt
+
+      - name: Publish the recorded numbers as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-latency-${{ github.run_id }}
+          path: result/media-latency.txt
+          if-no-files-found: error
+          retention-days: 90
