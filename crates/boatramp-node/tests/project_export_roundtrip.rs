@@ -3850,6 +3850,27 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
     )
     .await;
     assert_eq!(c, 0, "mutate source: {o}");
+    // Also land, WITHIN the delta's binlog range: (a) an account-DDL disclosure probe — a `CREATE
+    // USER` carrying a password that the MEDIUM finding warns could leak into a tenant-downloadable
+    // member; and (b) a foreign-tenant write. The db-scoped capture MUST drop BOTH from the member.
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        "CREATE USER 'mytd_leak_probe'@'%' IDENTIFIED BY 'LEAKHASH987';",
+    )
+    .await;
+    assert_eq!(c, 0, "create in-range disclosure-probe account: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "INSERT INTO b VALUES (8,'B_INRANGE');",
+    )
+    .await;
+    assert_eq!(c, 0, "foreign-tenant in-range write: {o}");
 
     // --- INCREMENTAL delta export: streams the binlog into a MysqlBinlogDelta member ---
     let delta_opts = ExportOptions {
@@ -3884,51 +3905,130 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
         "the full mysql dump must be SUPERSEDED by the binlog delta member"
     );
 
-    // --- CRAFTED-ESCAPE: a copy of d1 whose binlog member is garbage must be REFUSED fail-closed;
-    // the victim table (+ tenant B) must be UNTOUCHED (shadow dropped, no swap). ---
-    let d1_dir = resumable.join("d1");
-    let evil_dir = resumable.join("evil");
-    std::fs::create_dir_all(&evil_dir).unwrap();
-    for ent in std::fs::read_dir(&d1_dir).unwrap() {
-        let ent = ent.unwrap();
-        if ent.file_type().unwrap().is_file() {
-            std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
-        }
+    // --- DISCLOSURE gate (MEDIUM): the exported member must be db-SCOPED — ZERO account DDL /
+    // password hash / foreign-tenant events. The in-range `CREATE USER … IDENTIFIED BY 'LEAKHASH987'`
+    // and the `tenant_b` write above are in the SERVER binlog, but the `--rewrite-db`/`--database`
+    // db-scoping at capture must keep them OUT of the tenant-downloadable member. ---
+    let member_bytes = std::fs::read(resumable.join("d1").join(format!("m{bin_idx:05}"))).unwrap();
+    let member_text = String::from_utf8_lossy(&member_bytes);
+    for needle in [
+        "mytd_leak_probe",
+        "LEAKHASH987",
+        "CREATE USER",
+        "ALTER USER",
+        "SET PASSWORD",
+        tenant_b_db.as_str(),
+        "B_INRANGE",
+    ] {
+        assert!(
+            !member_text.contains(needle),
+            "DISCLOSURE: the exported binlog member leaked {needle:?} (db-scoping at capture failed)"
+        );
     }
-    // Overwrite the binlog member object + its meta so it PASSES the SHA check and reaches the
-    // replay, where the mysqlbinlog decode must reject it ("bad magic number") → the import fails
-    // closed (nothing partial reaches live).
-    let crafted =
-        b"not a binlog file at all \x00\x01\x02 DROP TABLE victim; -- escape attempt".to_vec();
-    let obj = evil_dir.join(format!("m{bin_idx:05}"));
-    std::fs::write(&obj, &crafted).unwrap();
-    {
+    // ...but it MUST carry the app db's events, rewritten to the delta shadow.
+    assert!(
+        member_text.contains("__shadow_brdelta"),
+        "the member must carry the app db's row events rewritten to the delta shadow"
+    );
+    // Tidy the probe account.
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        "DROP USER IF EXISTS 'mytd_leak_probe'@'%';",
+    )
+    .await;
+
+    // --- plant a sentinel in `t` BEFORE the evil imports, so each refusal is PROVABLY a no-swap
+    //     (`t` stays the sentinel), not a base-swap. ---
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+
+    // Build a fresh evil-copy of d1 whose binlog member is overwritten with `bytes` (+ fixed meta so
+    // it passes the SHA integrity check and reaches the replay).
+    let d1_dir = resumable.join("d1");
+    let make_evil = |name: &str, bytes: &[u8]| {
         use sha2::{Digest, Sha256};
+        let evil_dir = resumable.join(name);
+        let _ = std::fs::remove_dir_all(&evil_dir);
+        std::fs::create_dir_all(&evil_dir).unwrap();
+        for ent in std::fs::read_dir(&d1_dir).unwrap() {
+            let ent = ent.unwrap();
+            if ent.file_type().unwrap().is_file() {
+                std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
+            }
+        }
+        std::fs::write(evil_dir.join(format!("m{bin_idx:05}")), bytes).unwrap();
         let meta = project_bundle::MemberMeta {
-            size: crafted.len() as u64,
-            sha256: hex::encode(Sha256::digest(&crafted)),
+            size: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(bytes)),
         };
         std::fs::write(
             evil_dir.join(format!("m{bin_idx:05}.meta")),
             serde_json::to_vec(&meta).unwrap(),
         )
         .unwrap();
-    }
-    let evil_res = drv
-        .import_resumable(
-            "default",
-            "evil",
-            ImportOptions {
-                apply: true,
-                overwrite: true,
-                force: true,
-                ..Default::default()
-            },
-        )
+    };
+    let evil_opts = || ImportOptions {
+        apply: true,
+        overwrite: true,
+        force: true,
+        ..Default::default()
+    };
+
+    // --- CRAFTED #1 (garbage): a member that is not valid SQL → the `mysql` apply errors → refused
+    //     fail-closed (shadow dropped, nothing partial reaches live). ---
+    make_evil(
+        "evil_garbage",
+        b"\x00\x01\x02 not valid binlog SQL at all; )(*&^ DROP TABLE victim; \xff\xfe",
+    );
+    let garbage_res = drv
+        .import_resumable("default", "evil_garbage", evil_opts())
         .await;
     assert!(
-        evil_res.is_err(),
-        "a crafted/garbage binlog delta MUST be refused fail-closed; got: {evil_res:?}"
+        garbage_res.is_err(),
+        "a crafted/garbage binlog member MUST be refused fail-closed; got: {garbage_res:?}"
+    );
+
+    // --- CRAFTED #2 (WELL-FORMED but malicious): a VALID SQL member whose statements target the
+    //     VICTIM / foreign-tenant db. The apply user (ALL on the shadow ONLY) is DENIED → `mysql`
+    //     errors → import refused. Proves the GRANT confinement (not just a decode failure): a
+    //     well-formed member cannot reach any table outside the shadow. ---
+    let evil_sql = format!(
+        "INSERT INTO `{tenant_b_db}`.b VALUES (999,'ESCAPE_ATTEMPT');\n\
+         DROP TABLE `{live_db}`.victim;\n"
+    );
+    make_evil("evil_wellformed", evil_sql.as_bytes());
+    let wf_res = drv
+        .import_resumable("default", "evil_wellformed", evil_opts())
+        .await;
+    assert!(
+        wf_res.is_err(),
+        "a well-formed member targeting another db MUST be DENIED by the shadow-scoped apply grants; \
+         got: {wf_res:?}"
+    );
+
+    // After BOTH refused evil imports: `t` is still the sentinel (NO swap — distinguishes no-swap
+    // from a base-swap), and the victim table + the second tenant's db are UNTOUCHED.
+    let (_c, t_after_evil) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        t_after_evil, "99:SENTINEL_PRE_IMPORT",
+        "`t` must be UNCHANGED (no swap) after the refused evil imports"
     );
     let (_c, victim) = mysql_run(
         backend.as_ref(),
@@ -3941,19 +4041,20 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
     assert_eq!(
         victim.trim(),
         "1",
-        "the crafted delta must NOT have touched the victim table (shadow dropped, no swap)"
+        "the victim table must be untouched after the refused evil imports"
     );
-
-    // --- plant a sentinel so the happy-path assertion PROVES the restore actually ran ---
-    let (c, _o) = mysql_run(
+    let (_c, b_after_evil) = mysql_run(
         backend.as_ref(),
         image,
         &admin,
-        Some(&live_db),
-        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+        Some(&tenant_b_db),
+        "SELECT CONCAT(id, ':', v) FROM b ORDER BY id;",
     )
     .await;
-    assert_eq!(c, 0, "plant the pre-import sentinel");
+    assert_eq!(
+        b_after_evil, "7:TENANT_B_SENTINEL\n8:B_INRANGE",
+        "the second tenant's db must be untouched after the refused evil imports"
+    );
 
     // --- IMPORT the real delta chain: base dump → replay binlog → atomic swap ---
     let report = drv
@@ -3999,8 +4100,9 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
     )
     .await;
     assert_eq!(
-        b_rows, "7:TENANT_B_SENTINEL",
-        "the second tenant's db must be UNTOUCHED by the restore"
+        b_rows, "7:TENANT_B_SENTINEL\n8:B_INRANGE",
+        "the second tenant's db must be UNTOUCHED by the restore (its own rows, incl. the in-range \
+         write, intact)"
     );
 
     // --- cleanup (best-effort) ---

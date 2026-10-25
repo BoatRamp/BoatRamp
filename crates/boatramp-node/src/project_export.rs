@@ -80,9 +80,9 @@ use crate::config::ExternalDatabaseConfig;
 use crate::managed_sql::{ManagedSqlCredentials, operator_target};
 use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
-    mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqlbinlog_replay_decode_args,
-    mysqldump_capture_base_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
-    pg_dump_invocation, pg_restore_invocation, pg_restore_shadow_invocation, psql_invocation,
+    mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
+    mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
+    pg_restore_invocation, pg_restore_shadow_invocation, psql_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -4796,11 +4796,15 @@ impl NodeProjectExport {
         }
         // Refuse SUPER/FILE (global-only escape privileges) or any NON-trivial `*.*` grant. The
         // baseline `GRANT USAGE ON *.* TO …` that every user carries is harmless (USAGE = "no
-        // privileges") and must NOT trip the probe.
+        // privileges") and must NOT trip the probe. Match the privilege TOKENS (the part BEFORE
+        // " ON "), never the whole line — else a db named e.g. `supervisors`/`profiles` in the grant
+        // TARGET (`GRANT ALL ON \`profiles\`.* …` → "FILE"/"SUPER" substring) false-refuses a legit
+        // restore.
         for line in out.lines() {
+            let privs = mysql_grant_privileges(line).to_ascii_uppercase();
             let up = line.to_ascii_uppercase();
-            let dangerous_global = up.contains("ON *.*") && !up.contains("USAGE ON *.*");
-            if up.contains("SUPER") || up.contains("FILE") || dangerous_global {
+            let dangerous_global = up.contains(" ON *.*") && !up.contains("USAGE ON *.*");
+            if privs.contains("SUPER") || privs.contains("FILE") || dangerous_global {
                 return Err(Perr::Other(format!(
                     "mysql shadow REFUSED: the resolved apply user holds SUPER/FILE/*.* privileges; \
                      an untrusted bundle dump must only be applied by a least-privilege user. \
@@ -5975,6 +5979,19 @@ fn mysql_binlog_image(client_image: &str) -> String {
     }
 }
 
+/// The transient SHADOW database name a mysql binlog true-delta is captured-rewritten to AND restored
+/// into. Derived deterministically from the binding's live db so the CAPTURE rewrite target
+/// (`mysqlbinlog --rewrite-db='<live>-><this>'`) and the RESTORE shadow are the SAME db — the member
+/// is decoded SQL text (not re-rewritable at replay), so the rewrite is baked at capture against this
+/// name. The `__shadow_` infix makes the startup `%__shadow_%` sweep reclaim a crashed one.
+///
+/// NOTE: this is FIXED per db (not per-import), so two concurrent true-delta imports of the SAME db
+/// would collide on `CREATE DATABASE` (a clean refusal, never corruption — the restore never drops a
+/// pre-existing shadow). Concurrent-import support is a tracked follow-up.
+fn mysql_delta_shadow_db(live_db: &str) -> String {
+    format!("{live_db}__shadow_brdelta")
+}
+
 /// Whether a dump line is one of mysqldump's privileged `SQL_LOG_BIN` toggles (emitted by
 /// `--source-data`). These need `SESSION_VARIABLES_ADMIN`, which the least-privilege shadow apply
 /// user does NOT hold, so the capture-base producer STRIPS them — leaving the COMMENTED GTID/file
@@ -5982,6 +5999,16 @@ fn mysql_binlog_image(client_image: &str) -> String {
 fn mysql_line_is_sql_log_bin_toggle(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("SET @MYSQLDUMP_TEMP_LOG_BIN") || t.starts_with("SET @@SESSION.SQL_LOG_BIN")
+}
+
+/// The PRIVILEGE part of a `SHOW GRANTS` line — everything BEFORE the first " ON " (which separates
+/// the privilege list from the grant TARGET, e.g. `GRANT ALL PRIVILEGES ON \`db\`.* TO …`). The
+/// confinement probes match dangerous privilege TOKENS against THIS, never the whole line, so a db
+/// NAMED after " ON " (e.g. `supervisors`, `filestore`, `profiles` → "SUPER"/"FILE") cannot
+/// false-trip the SUPER/FILE/BINLOG_ADMIN substring checks. A backticked target db that itself
+/// contains " ON " stays after the first split, so the privilege part is unaffected.
+fn mysql_grant_privileges(line: &str) -> &str {
+    line.split(" ON ").next().unwrap_or(line)
 }
 
 /// Parse the base snapshot coordinate `(base_gtid, start_log)` from a `--source-data=2
@@ -6259,6 +6286,8 @@ impl NodeProjectExport {
     ) -> Result<Option<Vec<u8>>, Perr> {
         let (op, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let binlog_image = mysql_binlog_image(&image);
+        let live_db = cfg.database.clone().unwrap_or_else(|| db.to_string());
+        let shadow_db = mysql_delta_shadow_db(&live_db);
         // A SHORT suffix: `brexp_rd_<suffix>` must fit MySQL's 32-char USER-name cap.
         let suffix = mysql_eph_suffix();
         let reader = format!("brexp_rd_{suffix}");
@@ -6282,17 +6311,24 @@ impl NodeProjectExport {
             )));
         }
 
-        // CAPTURE as the reader user: raw binlog from the base start log, to the current end, tar'd to
-        // stdout. `set -e` so a purged/absent start log aborts BEFORE tar (empty stdout, non-zero
-        // exit) ⇒ a clean full-dump fallback. STDERR is discarded (the stdout must stay a clean tar).
+        // CAPTURE as the reader user: DB-SCOPED + REWRITTEN + gtid-filtered at capture (NOT --raw),
+        // decoding straight to stdout = the member. `--rewrite-db='<live>-><shadow>' --database=
+        // <shadow>' make the member contain ONLY the app db's events (retargeted to the shadow) — no
+        // `mysql`-schema account DDL / other-tenant rows ever enter the exported member (the
+        // disclosure fix). `--skip-gtids --exclude-gtids=<base>` give a clean, overlap-free, directly-
+        // replayable stream. STDERR is discarded so a failure (purged start log) is a clean non-zero
+        // exit ⇒ full-dump fallback, not a corrupt member.
         let reader_conn = mysql_reader_conn(&op, &reader, &reader_pw);
-        let cap = mysqlbinlog_capture_invocation(&reader_conn, &entry.start_log, "/tmp/brraw/");
-        let cmd = format!(
-            "set -e; mkdir -p /tmp/brraw; {} 2>/tmp/caperr; tar -C /tmp/brraw -cf - .",
-            sh_join(&cap.argv)
+        let cap = mysqlbinlog_capture_invocation(
+            &reader_conn,
+            &live_db,
+            &shadow_db,
+            &entry.base_gtid,
+            &entry.start_log,
         );
+        let cmd = format!("exec {} 2>/tmp/caperr", sh_join(&cap.argv));
         let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
-        let member_path = stage_dir.join(format!("mysqlbinlog-{suffix}.tar"));
+        let member_path = stage_dir.join(format!("mysqlbinlog-{suffix}.sql"));
         let code = self
             .run_sql_client(&binlog_image, &argv, &cap.env, None, &member_path)
             .await;
@@ -6305,77 +6341,25 @@ impl NodeProjectExport {
 
         let code = code?;
         if code != 0 {
-            // Purged start log / unreachable / tmpfs overflow ⇒ best-effort fallback to a full dump.
+            // Purged start log / unreachable ⇒ best-effort fallback to a full dump.
             let _ = tokio::fs::remove_file(&member_path).await;
-            tracing::info!(db = %db, "mysql delta: binlog capture exited non-zero (start log purged, or delta exceeds the capture tmpfs) — falling back to a full dump");
+            tracing::info!(db = %db, "mysql delta: binlog capture exited non-zero (start log purged, or server unreachable) — falling back to a full dump");
             return Ok(None);
         }
         let bytes = tokio::fs::read(&member_path).await.map_err(other)?;
         let _ = tokio::fs::remove_file(&member_path).await;
 
-        // DDL-in-range guard: decode the captured tar locally (no rewrite — just to inspect) and fall
-        // back to a full dump if the range carries a DDL QUERY_EVENT (a schema change the base→delta
-        // row replay cannot faithfully reproduce). The fingerprint check already caught NET schema
-        // changes; this catches any DDL even if net-neutral.
-        if self
-            .mysql_binlog_range_has_ddl(&binlog_image, &bytes, db, &entry.base_gtid, stage_dir)
-            .await?
-        {
-            tracing::info!(db = %db, "mysql delta: a DDL event is present in the binlog range — falling back to a full dump");
+        // DDL-in-range guard: the member is already decoded (db-scoped) SQL text, so scan it directly
+        // and fall back to a full dump if the range carries a DDL statement (a schema change the
+        // base→delta row replay cannot faithfully reproduce). The fingerprint check already caught NET
+        // schema changes; this catches any app-db DDL even if net-neutral. (`mysql`-schema account DDL
+        // is already dropped by `--database=<shadow>`, so it never trips this.)
+        let decoded = String::from_utf8_lossy(&bytes);
+        if mysql_binlog_decoded_has_ddl(&decoded) {
+            tracing::info!(db = %db, "mysql delta: a DDL statement is present in the binlog range — falling back to a full dump");
             return Ok(None);
         }
         Ok(Some(bytes))
-    }
-
-    /// Decode a captured binlog-delta `tar` LOCALLY (no server connection) and report whether it
-    /// carries a DDL `QUERY_EVENT` for the source db (⇒ fall back to a full dump). Runs
-    /// `mysqlbinlog --database=<live>` over the untarred raw files in the bounded `/tmp` tmpfs.
-    async fn mysql_binlog_range_has_ddl(
-        &self,
-        binlog_image: &str,
-        member_tar: &[u8],
-        db: &str,
-        base_gtid: &str,
-        stage_dir: &Path,
-    ) -> Result<bool, Perr> {
-        let cfg = self
-            .databases
-            .get(db)
-            .ok_or_else(|| Perr::Other(format!("mysql delta: no database named {db:?}")))?;
-        let live_db = cfg.database.clone().unwrap_or_else(|| db.to_string());
-        let tar_path = stage_dir.join(format!("mysqlddl-{}.tar", shadow_suffix()));
-        tokio::fs::write(&tar_path, member_tar)
-            .await
-            .map_err(other)?;
-        // Decode to stdout the SAME event set the replay applies — `--skip-gtids --exclude-gtids=
-        // <base>` drops the pre-base events the raw capture carries from the start binlog file (the
-        // base's binlog file holds events before the snapshot GTID; without excluding them the scan
-        // would false-positive on prior DDL, e.g. the base-time CREATE DATABASE), `--database=<live>`
-        // keeps only the live db's events — then inspect THAT for a DDL statement. `--force-read` so
-        // a benign unknown event never aborts the scan.
-        let exclude = format!("--exclude-gtids={base_gtid}");
-        let database = format!("--database={live_db}");
-        let cmd = format!(
-            "mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; mysqlbinlog --force-read --skip-gtids {} {} /tmp/brd/* 2>/dev/null",
-            sh_join(&[exclude]),
-            sh_join(&[database]),
-        );
-        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
-        let out_path = stage_dir.join(format!("mysqlddl-{}.out", shadow_suffix()));
-        let r = self
-            .run_sql_client(binlog_image, &argv, &[], Some(&tar_path), &out_path)
-            .await;
-        let _ = tokio::fs::remove_file(&tar_path).await;
-        let code = r?;
-        let decoded = tokio::fs::read_to_string(&out_path)
-            .await
-            .unwrap_or_default();
-        let _ = tokio::fs::remove_file(&out_path).await;
-        if code != 0 {
-            // A decode failure here is treated conservatively as "not safe to true-delta".
-            return Ok(true);
-        }
-        Ok(mysql_binlog_decoded_has_ddl(&decoded))
     }
 }
 
@@ -6461,7 +6445,13 @@ impl NodeProjectExport {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?
                 .clone();
-            let plan = self.mysql_shadow_plan(project, &db, &cfg).await?;
+            let mut plan = self.mysql_shadow_plan(project, &db, &cfg).await?;
+            // The delta member's row events were db-REWRITTEN at capture to the deterministic delta
+            // shadow name (the member is SQL text, not re-rewritable at replay), so the shadow MUST be
+            // exactly that name — override the per-import `__shadow_<hex>` the plan minted. The base
+            // tables-only dump restores into any name, so it lands here too; the `RENAME TABLE` swap
+            // then moves these tables onto the live db.
+            plan.shadow_db = mysql_delta_shadow_db(&plan.live_db);
             if let Err(e) = self.mysql_create_shadow(&plan, stage_dir).await {
                 self.mysql_drop_shadow(&plan, stage_dir).await;
                 return Err(e);
@@ -6493,27 +6483,15 @@ impl NodeProjectExport {
                 self.mysql_drop_shadow(&plan, stage_dir).await;
                 return Err(e);
             }
-            // The base cursor the deltas replay from — the newest base's recorded snapshot GTID (the
-            // deltas in the chain all follow this base; each delta carries its own base cursor, but a
-            // chain's deltas share the base dump, so each delta's `--exclude-gtids` uses ITS cursor).
+            // Replay each `MysqlBinlogDelta` member onto the shadow. The member is db-scoped SQL text
+            // (`BINLOG '…'` row events) already rewritten to the shadow at capture, so the replay is a
+            // direct `mysql <shadow> < member` as the ephemeral apply user — no `mysqlbinlog` decode,
+            // no rewrite, no gtid flags (all baked at capture).
             for (dir, idx) in &plan_db.binlog {
                 let member = tokio::fs::read(dir.join(member_object_name(*idx)))
                     .await
                     .map_err(other)?;
-                let base_gtid = self
-                    .mysqlbinlog_member_base_gtid(dir, *idx)
-                    .await
-                    .ok_or_else(|| {
-                        Perr::Other(format!(
-                            "mysql true-delta restore: the binlog delta member {idx} in {} carries \
-                             no base GTID cursor — refusing (a true-delta member must name its base)",
-                            dir.display()
-                        ))
-                    })?;
-                if let Err(e) = self
-                    .mysql_replay_binlog(&plan, &member, &base_gtid, stage_dir)
-                    .await
-                {
+                if let Err(e) = self.mysql_replay_binlog(&plan, &member, stage_dir).await {
                     self.mysql_drop_shadow(&plan, stage_dir).await;
                     return Err(e);
                 }
@@ -6525,18 +6503,6 @@ impl NodeProjectExport {
             report.pg_databases += 1;
         }
         Ok(())
-    }
-
-    /// Read the base-GTID cursor recorded in a `MysqlBinlogDelta` member's manifest entry (its
-    /// `sql_cursor`). The cursor is the authenticity of the delta's starting point (the exact GTID
-    /// `--exclude-gtids` replays from), so a member with no `MysqlGtid` cursor is refused upstream.
-    async fn mysqlbinlog_member_base_gtid(&self, dir: &Path, idx: usize) -> Option<String> {
-        let manifest = self.read_resumable_manifest(dir).await.ok()?;
-        let spec = manifest.members.get(idx)?;
-        match spec.sql_cursor.as_ref()? {
-            boatramp_core::project_delta::SqlMemberCursor::MysqlGtid { gtid } => Some(gtid.clone()),
-            _ => None,
-        }
     }
 
     /// Restore a base full-dump member object into the freshly-created shadow via `mysql <shadow>`
@@ -6615,24 +6581,28 @@ impl NodeProjectExport {
             )));
         }
         for line in out.lines() {
+            // Match the privilege TOKENS (BEFORE " ON "), never the whole line — else a db named e.g.
+            // `supervisors`/`filestore`/`profiles` in the grant TARGET false-refuses a legit restore.
+            let privs = mysql_grant_privileges(line).to_ascii_uppercase();
             let up = line.to_ascii_uppercase();
-            if up.contains("SUPER") || up.contains("FILE") || up.contains("BINLOG_ADMIN") {
+            if privs.contains("SUPER") || privs.contains("FILE") || privs.contains("BINLOG_ADMIN") {
                 return Err(Perr::Other(format!(
                     "mysql replay REFUSED: the apply user holds SUPER/FILE/BINLOG_ADMIN; an untrusted \
                      binlog must only be replayed by a least-privilege user. grants: {out}"
                 )));
             }
-            // A `… ON *.*` grant is allowed ONLY when it is exactly the replay dynamics (or USAGE).
-            if up.contains("ON *.*") {
-                let ok = up.contains("USAGE ON *.*")
-                    || (up.contains("REPLICATION_APPLIER")
-                        || up.contains("SESSION_VARIABLES_ADMIN"));
-                let has_broad_dml = up.contains("ALL PRIVILEGES ON *.*")
-                    || up.contains("INSERT")
-                    || up.contains("UPDATE")
-                    || up.contains("DELETE")
-                    || up.contains("CREATE")
-                    || up.contains("DROP");
+            // A `… ON *.*` grant is allowed ONLY when its PRIVILEGES are exactly the replay dynamics
+            // (or USAGE). The db-scoped `ALL ON \`<shadow>\`.*` grant has no " ON *.*" and is fine.
+            if up.contains(" ON *.*") {
+                let ok = privs.contains("USAGE")
+                    || privs.contains("REPLICATION_APPLIER")
+                    || privs.contains("SESSION_VARIABLES_ADMIN");
+                let has_broad_dml = privs.contains("ALL PRIVILEGES")
+                    || privs.contains("INSERT")
+                    || privs.contains("UPDATE")
+                    || privs.contains("DELETE")
+                    || privs.contains("CREATE")
+                    || privs.contains("DROP");
                 if !ok || has_broad_dml {
                     return Err(Perr::Other(format!(
                         "mysql replay REFUSED: the apply user holds a global `*.*` privilege beyond \
@@ -6645,49 +6615,36 @@ impl NodeProjectExport {
         Ok(())
     }
 
-    /// Decode + EXECUTE one `MysqlBinlogDelta` member (a `tar` of raw binlog files) onto the shadow,
-    /// as the ephemeral apply user. The raw files are untarred into the replay container's bounded
-    /// `/tmp` tmpfs, then `mysqlbinlog --skip-gtids --exclude-gtids=<base> --rewrite-db='<live>->
-    /// <shadow>' --database=<shadow> … | mysql <shadow>`: the rewrite redirects the source db's row
-    /// events to the shadow, `--exclude-gtids` drops anything in the base, `--skip-gtids` stops each
-    /// embedded source GTID being seen as already-executed (and skipped) on this server, and
-    /// `--database=<shadow>` (filtered AFTER the rewrite) DROPS any foreign-db event in the range.
-    /// `bash -o pipefail` so a decode error (a corrupt/crafted member ⇒ "bad magic number") fails the
-    /// run; the caller then drops the shadow, so nothing partial reaches live.
+    /// EXECUTE one `MysqlBinlogDelta` member onto the shadow, as the ephemeral apply user. The member
+    /// is already-decoded, db-SCOPED SQL text (`BINLOG '…'` row events) rewritten to the shadow AT
+    /// CAPTURE, so the replay is a direct `mysql <shadow> < member` — NO `mysqlbinlog`, NO rewrite, NO
+    /// gtid flags (all baked at capture). The apply user holds `REPLICATION_APPLIER` (to run the
+    /// `BINLOG` events) + `SESSION_VARIABLES_ADMIN` (the session-context SETs) + `ALL ON <shadow>.*`
+    /// only, and `--local-infile=0` disables client-side `LOAD DATA LOCAL`. CONFINEMENT: a tampered
+    /// member whose events name a db outside the shadow is DENIED by the table-privilege check (the
+    /// applier privilege does NOT bypass it — validated), `mysql` errors, and the caller drops the
+    /// shadow — nothing partial reaches live. Garbage bytes likewise fail to parse and are refused.
     async fn mysql_replay_binlog(
         &self,
         plan: &MysqlShadowPlan,
-        member_tar: &[u8],
-        base_gtid: &str,
+        member: &[u8],
         stage_dir: &Path,
     ) -> Result<(), Perr> {
-        let binlog_image = mysql_binlog_image(&plan.image);
         let apply = plan.apply_conn();
-        // The decode FLAGS (no file args yet) — the same builder the unit test guards — then the
-        // untarred-files glob (`/tmp/brd/*`, left unquoted so bash expands it).
-        let flags = mysqlbinlog_replay_decode_args(base_gtid, &plan.live_db, &plan.shadow_db, &[]);
-        // The apply (`mysql`) side: driver-derived conn args + the shadow default db; password in env.
-        let mut mysql_argv = vec!["mysql".to_string()];
-        mysql_argv.extend(apply.conn_args());
-        mysql_argv.push(format!("--connect-timeout={}", apply.connect_timeout_secs));
-        mysql_argv.push(plan.shadow_db.clone());
-        let cmd = format!(
-            "set -eo pipefail; mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; \
-             {flags} /tmp/brd/* 2>/tmp/brd_derr | {mysqlc} 2>&1; \
-             rc=${{PIPESTATUS[0]}}; if [ \"$rc\" != 0 ]; then cat /tmp/brd_derr >&2; fi; exit $rc",
-            flags = sh_join(&flags),
-            mysqlc = sh_join(&mysql_argv),
-        );
-        let argv = vec!["bash".to_string(), "-c".to_string(), cmd];
-        let tar_path = stage_dir.join(format!("mysqlreplay-{}.tar", shadow_suffix()));
-        tokio::fs::write(&tar_path, member_tar)
+        // `mysql <shadow> --local-infile=0` reading the member SQL text on stdin, as the apply user.
+        // `merge_stderr_argv` folds the client's STDERR (a denied/failed statement) into the captured
+        // sink so a refusal is diagnosable (run_ephemeral drops stderr on a non-zero exit).
+        let inv = mysql_shadow_invocation(&apply, &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let member_path = stage_dir.join(format!("mysqlreplay-{}.sql", shadow_suffix()));
+        tokio::fs::write(&member_path, member)
             .await
             .map_err(other)?;
         let out = stage_dir.join(format!("mysqlreplay-{}.out", shadow_suffix()));
         let code = self
-            .run_sql_client(&binlog_image, &argv, &apply.env(), Some(&tar_path), &out)
+            .run_sql_client(&plan.image, &merged, &inv.env, Some(&member_path), &out)
             .await;
-        let _ = tokio::fs::remove_file(&tar_path).await;
+        let _ = tokio::fs::remove_file(&member_path).await;
         let diag = tokio::fs::read_to_string(&out).await.unwrap_or_default();
         let _ = tokio::fs::remove_file(&out).await;
         let code = code?;
@@ -7058,6 +7015,42 @@ mod tests {
         assert_eq!(log, "node-bin.000003");
         // A dump with no coordinate (binlog/gtid off) ⇒ None ⇒ the delta full-dumps.
         assert_eq!(parse_mysql_base_coord("DROP TABLE IF EXISTS `t`;"), None);
+    }
+
+    #[test]
+    fn mysql_grant_privileges_splits_before_the_target_db() {
+        // The privilege part is everything before the first " ON " — the db NAME in the target must
+        // never bleed into a SUPER/FILE/BINLOG_ADMIN substring match (LOW-1).
+        let g = |l: &str| mysql_grant_privileges(l).to_ascii_uppercase();
+        // A legit least-priv grant on a db whose NAME contains "SUPER"/"FILE"/"PROFILE".
+        assert_eq!(
+            g("GRANT ALL PRIVILEGES ON `supervisors__shadow_ab`.* TO 'x'@'%'"),
+            "GRANT ALL PRIVILEGES"
+        );
+        assert!(!g("GRANT ALL PRIVILEGES ON `supervisors`.* TO 'x'@'%'").contains("SUPER"));
+        assert!(!g("GRANT ALL PRIVILEGES ON `filestore`.* TO 'x'@'%'").contains("FILE"));
+        assert!(!g("GRANT ALL PRIVILEGES ON `profiles`.* TO 'x'@'%'").contains("FILE"));
+        // A genuinely dangerous privilege IS in the privilege part.
+        assert!(g("GRANT SUPER ON *.* TO 'x'@'%'").contains("SUPER"));
+        assert!(g("GRANT FILE ON *.* TO 'x'@'%'").contains("FILE"));
+        assert!(
+            g("GRANT REPLICATION_APPLIER, SESSION_VARIABLES_ADMIN ON *.* TO 'x'@'%'")
+                .contains("REPLICATION_APPLIER")
+        );
+        // The replay dynamics do NOT contain the dangerous tokens.
+        let dyn_privs = g("GRANT REPLICATION_APPLIER, SESSION_VARIABLES_ADMIN ON *.* TO 'x'@'%'");
+        assert!(
+            !dyn_privs.contains("SUPER")
+                && !dyn_privs.contains("FILE")
+                && !dyn_privs.contains("BINLOG_ADMIN")
+        );
+    }
+
+    #[test]
+    fn mysql_delta_shadow_db_is_deterministic_and_sweepable() {
+        assert_eq!(mysql_delta_shadow_db("app"), "app__shadow_brdelta");
+        // Carries the `__shadow_` infix so the startup `%__shadow_%` sweep reclaims a crashed one.
+        assert!(mysql_delta_shadow_db("tenant_x").contains("__shadow_"));
     }
 
     #[test]

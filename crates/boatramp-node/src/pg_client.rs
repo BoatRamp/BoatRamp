@@ -410,22 +410,35 @@ pub fn mysqldump_capture_base_invocation(conn: &MysqlConnection) -> SqlInvocatio
     }
 }
 
-/// Build the `mysqlbinlog --read-from-remote-server --raw` invocation that CAPTURES the binlog since
-/// the base (SQL true-delta delta drain). Connects to the live server like a replica (so it needs no
-/// filesystem access to the server's data dir) as the EPHEMERAL least-privilege capture user
-/// (`REPLICATION SLAVE, REPLICATION CLIENT` only — the driver mints + drops it), reading from
-/// `start_log` (the base dump's recorded `MASTER_LOG_FILE`) `--to-last-log` (through rotations to the
-/// current end). `--raw` writes the binlog files VERBATIM into `result_dir` (one file per source
-/// binlog) — the faithful bytes the delta member frames; GTID filtering + db-rewrite happen at REPLAY
-/// (local decode), because `--raw` and `--exclude-gtids` are mutually exclusive on a remote read.
+/// Build the `mysqlbinlog --read-from-remote-server` invocation that CAPTURES + DB-SCOPES + REWRITES
+/// the binlog delta (SQL true-delta drain). Connects to the live server like a replica (no
+/// filesystem access to the data dir) as the EPHEMERAL least-privilege capture user (`REPLICATION
+/// SLAVE, REPLICATION CLIENT` only), reading from `start_log` (the base dump's recorded
+/// `MASTER_LOG_FILE`) `--to-last-log`, and DECODES to stdout (NOT `--raw`) — the member IS this SQL
+/// stream (`BINLOG '…'` row events), directly pipeable to `mysql` at replay with no re-decode. The
+/// flags are the SECURITY + correctness core:
+/// - `--rewrite-db='<live>-><shadow>'` retargets the source db's events to the SHADOW at CAPTURE (the
+///   member is applied verbatim at restore; SQL text cannot be rewritten after the fact).
+/// - `--database=<shadow>` (applied AFTER the rewrite, filtering on the REWRITTEN name) keeps ONLY
+///   the shadow's events and DROPS every other db's events — so the member NEVER contains `mysql`-
+///   schema account DDL (`CREATE USER`/`GRANT`/`SET PASSWORD` with password hashes) or any other
+///   tenant/db's rows. This is the DISCLOSURE fix: the exported member is strictly the app db's data,
+///   never the server-global binlog (unlike a `--raw` capture, which byte-copies everything).
+/// - `--skip-gtids` omits the `SET @@SESSION.GTID_NEXT=<source gtid>` statements, so the replay onto
+///   the (same) server does not see each source GTID as already-executed and SKIP the transaction;
+///   the replayed rows get fresh auto-assigned GTID values.
+/// - `--exclude-gtids=<base_gtid>` drops everything already in the base dump's snapshot (the start
+///   binlog file holds pre-base events) — no overlap.
 ///
-/// `result_dir` MUST end in `/` (mysqlbinlog treats a `--result-file` ending in `/` as a directory
-/// prefix, naming each output after its source binlog). Host/port/user are explicit flags;
-/// `mysqlbinlog` honors `MYSQL_PWD`, so the password rides in the env, NEVER argv.
+/// `shadow`/`live`/`base_gtid`/`start_log` are driver-derived (binding + parsed dump coordinate),
+/// never credentials. Host/port/user explicit; `mysqlbinlog` honors `MYSQL_PWD`, so the password
+/// rides in the env, NEVER argv.
 pub fn mysqlbinlog_capture_invocation(
     conn: &MysqlConnection,
+    live_db: &str,
+    shadow_db: &str,
+    base_gtid: &str,
     start_log: &str,
-    result_dir: &str,
 ) -> SqlInvocation {
     let argv = vec![
         "mysqlbinlog".to_string(),
@@ -433,8 +446,10 @@ pub fn mysqlbinlog_capture_invocation(
         format!("--host={}", conn.host),
         format!("--port={}", conn.port),
         format!("--user={}", conn.user),
-        "--raw".to_string(),
-        format!("--result-file={result_dir}"),
+        format!("--rewrite-db={live_db}->{shadow_db}"),
+        format!("--database={shadow_db}"),
+        "--skip-gtids".to_string(),
+        format!("--exclude-gtids={base_gtid}"),
         "--to-last-log".to_string(),
         start_log.to_string(),
     ];
@@ -442,41 +457,6 @@ pub fn mysqlbinlog_capture_invocation(
         argv,
         env: conn.env(),
     }
-}
-
-/// Build the `mysqlbinlog` DECODE argv for the TRUE-DELTA REPLAY — the LEFT side of the
-/// `mysqlbinlog … | mysql <shadow>` pipe the driver runs (local decode of the captured raw files;
-/// NO server connection, so it carries no credential). The flags are the confinement + correctness
-/// core:
-/// - `--exclude-gtids=<base_gtid>` drops every event already in the base dump's snapshot (the raw
-///   capture starts at the base's binlog file, which may hold pre-base events) — no overlap.
-/// - `--skip-gtids` omits the `SET @@SESSION.GTID_NEXT=<source gtid>` statements mysqlbinlog embeds;
-///   without it the replay onto the (same) server would see each source GTID as already-executed and
-///   SKIP the transaction. The replayed rows get fresh auto-assigned GTID values instead.
-/// - `--rewrite-db='<live>-><shadow>'` redirects the source db's row events to the SHADOW (the
-///   events' table-map names the live db), so the replay lands in the isolated shadow, never live.
-/// - `--database=<shadow>` (applied AFTER the rewrite, so it filters on the REWRITTEN name) keeps
-///   ONLY the shadow's events, DROPPING any foreign-db event in the range (e.g. a `mysql.*` write
-///   from the ephemeral-user DDL, or a crafted event naming another tenant) — defense in depth atop
-///   the shadow-scoped apply grants.
-///
-/// `raw_files` are the per-binlog temp paths (in capture order); `live`/`shadow`/`base_gtid` are
-/// driver-derived (binding name + parsed dump coordinate), never credentials, so argv is correct.
-pub fn mysqlbinlog_replay_decode_args(
-    base_gtid: &str,
-    live_db: &str,
-    shadow_db: &str,
-    raw_files: &[String],
-) -> Vec<String> {
-    let mut argv = vec![
-        "mysqlbinlog".to_string(),
-        "--skip-gtids".to_string(),
-        format!("--exclude-gtids={base_gtid}"),
-        format!("--rewrite-db={live_db}->{shadow_db}"),
-        format!("--database={shadow_db}"),
-    ];
-    argv.extend(raw_files.iter().cloned());
-    argv
 }
 
 /// Build the `mysql` invocation that applies the **attacker-crafted** tables-only dump into a
@@ -487,10 +467,17 @@ pub fn mysqlbinlog_replay_decode_args(
 /// `USE`) is fed on stdin and lands in `shadow_db` because it is named as the default database
 /// positionally. Host/port/user explicit; password in `MYSQL_PWD`; `shadow_db` is a driver-derived
 /// identifier (not a credential), so argv is correct.
+///
+/// Used for BOTH the inc2 tables-only base restore AND the binlog true-delta member replay (both
+/// apply attacker-crafted SQL as the least-privilege shadow user). `--local-infile=0` is
+/// belt-and-suspenders: it disables client-side `LOAD DATA LOCAL INFILE`, so a crafted dump/member
+/// cannot read a file off the ephemeral client container (the apply user already lacks `FILE`, which
+/// blocks server-side `LOAD DATA INFILE`/`INTO OUTFILE`).
 pub fn mysql_shadow_invocation(conn: &MysqlConnection, shadow_db: &str) -> SqlInvocation {
     let mut argv = vec!["mysql".to_string()];
     argv.extend(conn.conn_args());
     argv.push(conn.connect_timeout_arg());
+    argv.push("--local-infile=0".to_string());
     argv.push(shadow_db.to_string());
     SqlInvocation {
         argv,
@@ -730,6 +717,8 @@ mod tests {
         assert_eq!(apply.argv[0], "mysql");
         assert!(apply.argv.iter().any(|a| a == "app__shadow_1"));
         assert!(!apply.argv.iter().any(|a| a == "app"));
+        // The untrusted apply disables client-side LOAD DATA LOCAL INFILE (defense in depth).
+        assert!(apply.argv.iter().any(|a| a == "--local-infile=0"));
         // The trusted admin side names NO default db (so CREATE/DROP DATABASE + schema-qualified
         // RENAME TABLE work) and asks for header-less tab output for the table enumeration.
         let admin = mysql_admin_invocation(&c);
@@ -774,36 +763,42 @@ mod tests {
         assert!(!base.argv.iter().any(|a| a == "--databases")); // tables-only (shadow-restorable)
         assert_eq!(base.argv.last().map(String::as_str), Some("app"));
 
-        // CAPTURE: remote-read raw binlog from the base's start log, to-last-log; password in env.
-        let cap = mysqlbinlog_capture_invocation(&c, "mysql-bin.000007", "/stage/raw/");
+        // CAPTURE: db-SCOPED + REWRITTEN at capture (member is app-only SQL text targeting the
+        // shadow). NOT --raw (which byte-copies the whole-server binlog incl. account-DDL hashes);
+        // `--database` filters on the REWRITTEN name (applied after `--rewrite-db`) — the DISCLOSURE
+        // fix: foreign-db / `mysql`-schema events never enter the member.
+        let cap = mysqlbinlog_capture_invocation(
+            &c,
+            "app",
+            "app__shadow_1",
+            "uuid:1-9",
+            "mysql-bin.000007",
+        );
         assert_eq!(cap.argv[0], "mysqlbinlog");
         assert!(cap.argv.iter().any(|a| a == "--read-from-remote-server"));
-        assert!(cap.argv.iter().any(|a| a == "--raw"));
-        assert!(cap.argv.iter().any(|a| a == "--result-file=/stage/raw/"));
+        assert!(
+            !cap.argv.iter().any(|a| a == "--raw"),
+            "capture is NON-raw (db-scoped SQL text), never --raw (whole-server disclosure): {:?}",
+            cap.argv
+        );
+        assert!(
+            cap.argv
+                .iter()
+                .any(|a| a == "--rewrite-db=app->app__shadow_1")
+        );
+        assert!(
+            cap.argv.iter().any(|a| a == "--database=app__shadow_1"),
+            "--database must filter on the REWRITTEN (shadow) name: {:?}",
+            cap.argv
+        );
+        assert!(cap.argv.iter().any(|a| a == "--skip-gtids"));
+        assert!(cap.argv.iter().any(|a| a == "--exclude-gtids=uuid:1-9"));
         assert!(cap.argv.iter().any(|a| a == "--to-last-log"));
         assert_eq!(
             cap.argv.last().map(String::as_str),
             Some("mysql-bin.000007")
         );
         assert!(cap.argv.iter().any(|a| a == &format!("--user={}", c.user)));
-
-        // REPLAY decode args: the confinement + correctness flags, in the order that matters
-        // (--database filters on the REWRITTEN name, so it must name the shadow, not the live db).
-        let dec = mysqlbinlog_replay_decode_args(
-            "uuid:1-9",
-            "app",
-            "app__shadow_1",
-            &["/t/b0".to_string(), "/t/b1".to_string()],
-        );
-        assert_eq!(dec[0], "mysqlbinlog");
-        assert!(dec.iter().any(|a| a == "--skip-gtids"));
-        assert!(dec.iter().any(|a| a == "--exclude-gtids=uuid:1-9"));
-        assert!(dec.iter().any(|a| a == "--rewrite-db=app->app__shadow_1"));
-        assert!(
-            dec.iter().any(|a| a == "--database=app__shadow_1"),
-            "--database must filter on the REWRITTEN (shadow) name: {dec:?}"
-        );
-        assert_eq!(&dec[dec.len() - 2..], &["/t/b0", "/t/b1"]);
 
         // The capture dump + remote capture carry the password ONLY in MYSQL_PWD, never argv.
         for inv in [&base, &cap] {
@@ -817,11 +812,8 @@ mod tests {
                     !a.contains(&c.password),
                     "credential leaked into argv: {a:?}"
                 );
+                assert!(!a.contains("://"), "no DSN in argv: {a:?}");
             }
-        }
-        // The decode args reference local files only — no host/credential at all.
-        for a in &dec {
-            assert!(!a.contains(&c.password) && !a.contains("://"));
         }
     }
 
