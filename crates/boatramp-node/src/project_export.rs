@@ -80,7 +80,8 @@ use crate::config::ExternalDatabaseConfig;
 use crate::managed_sql::{ManagedSqlCredentials, operator_target};
 use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
-    mysql_shadow_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
+    mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqlbinlog_replay_decode_args,
+    mysqldump_capture_base_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
     pg_dump_invocation, pg_restore_invocation, pg_restore_shadow_invocation, psql_invocation,
 };
 use crate::project_bundle::{
@@ -215,6 +216,17 @@ fn mysql_member_path(db: &str) -> String {
 fn db_from_mysql_member(path: &str) -> Option<&str> {
     path.strip_prefix("sql/")
         .and_then(|s| s.strip_suffix(".sql"))
+}
+
+/// The bundle member path for a MySQL binlog **true-delta** (SQL true-delta program).
+fn mysqlbinlog_member_path(db: &str) -> String {
+    format!("sql/{db}.mysqlbinlog")
+}
+
+/// Recover the database name from a `sql/<db>.mysqlbinlog` true-delta member path.
+fn db_from_mysqlbinlog_member(path: &str) -> Option<&str> {
+    path.strip_prefix("sql/")
+        .and_then(|s| s.strip_suffix(".mysqlbinlog"))
 }
 
 /// The bundle member path for a site's default libsql database.
@@ -1269,6 +1281,12 @@ enum StageJob {
     /// incremental DELTA export of a managed pg db with `delta_capture`). Replayed onto the
     /// restored base inside the atomic shadow (see `restore_pg_true_delta_in_chain`).
     PgWalDelta { bytes: Vec<u8> },
+    /// A MySQL binlog **delta** member (`sql/<db>.mysqlbinlog`) — the framed raw binlog captured
+    /// (via `mysqlbinlog --read-from-remote-server --raw`) since the parent base's snapshot GTID,
+    /// already produced at plan time (an incremental DELTA export of a managed mysql db with
+    /// `delta_capture`). Replayed onto the restored base inside the atomic shadow (see
+    /// `restore_mysql_true_delta_in_chain`).
+    MysqlBinlogDelta { bytes: Vec<u8> },
 }
 
 /// The export stager's request: "produce the member at `path`". `chunked` selects a
@@ -2930,10 +2948,11 @@ impl NodeProjectExport {
             }
             StageJob::KvDelta { bytes }
             | StageJob::BlobTombstone { bytes }
-            | StageJob::PgWalDelta { bytes } => {
+            | StageJob::PgWalDelta { bytes }
+            | StageJob::MysqlBinlogDelta { bytes } => {
                 // A delta member whose bytes were computed + encoded at plan time (the KV
                 // upserts+tombstones / the blob tombstone key list / the drained + framed
-                // pgoutput WAL change stream). Just persist them.
+                // pgoutput WAL change stream / the framed raw mysql binlog). Just persist them.
                 tokio::fs::write(&tmp, bytes).await.map_err(other)?;
             }
         }
@@ -3504,25 +3523,54 @@ impl NodeProjectExport {
             // Clear any stale partial before re-producing.
             let _ = tokio::fs::remove_file(&obj).await;
             let _ = tokio::fs::remove_file(dir.join(member_part_name(idx))).await;
-            let job = jobs.get(&spec.path);
-            let digest = match spec.framing {
-                project_bundle::MemberFraming::Sidecar => {
-                    let job = job.ok_or_else(|| {
-                        Perr::Other(format!("resumable export: no stage job for {}", spec.path))
-                    })?;
-                    let tmp = self.stage_job(project, job, &stage_dir, idx).await?;
-                    let d = write_member_from_file(dir, idx, &tmp).await?;
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    d
-                }
-                project_bundle::MemberFraming::ChunkedTrailer => {
-                    let producer = self.open_chunked_producer(job)?;
-                    write_member_from_producer(dir, idx, producer).await?
+            // SQL true-delta (mysql binlog, PLAN-sql-true-delta Stage 3): a BASE (full) resumable
+            // export of a capture-eligible managed mysql db dumps it SNAPSHOT-PINNED (`--source-data`,
+            // SQL_LOG_BIN stripped) so a later incremental delta can stream the binlog since the
+            // base's recorded GTID. Produced specially (staged + stripped) regardless of the spec's
+            // framing — in the resumable layout every member is one `m{idx}` object, so framing is
+            // irrelevant here. A delta export (`opts.delta`) keeps the normal production (it drains
+            // the parent's binlog at plan time, see `plan_delta_export`).
+            let capture_base_mysql = opts.delta.is_none()
+                && spec.kind == MemberKind::MysqlDump
+                && db_from_mysql_member(&spec.path)
+                    .and_then(|d| self.databases.get(d))
+                    .is_some_and(Self::mysql_capture_eligible);
+            let digest = if capture_base_mysql {
+                let db = db_from_mysql_member(&spec.path).expect("mysql member path");
+                let cfg = self.databases.get(db).expect("capture-eligible db").clone();
+                self.produce_mysql_capture_base(project, dir, idx, db, &cfg, &stage_dir)
+                    .await?
+            } else {
+                let job = jobs.get(&spec.path);
+                match spec.framing {
+                    project_bundle::MemberFraming::Sidecar => {
+                        let job = job.ok_or_else(|| {
+                            Perr::Other(format!("resumable export: no stage job for {}", spec.path))
+                        })?;
+                        let tmp = self.stage_job(project, job, &stage_dir, idx).await?;
+                        let d = write_member_from_file(dir, idx, &tmp).await?;
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        d
+                    }
+                    project_bundle::MemberFraming::ChunkedTrailer => {
+                        let producer = self.open_chunked_producer(job)?;
+                        write_member_from_producer(dir, idx, producer).await?
+                    }
                 }
             };
             let meta_bytes = serde_json::to_vec(&digest)
                 .map_err(|e| Perr::Other(format!("encode member meta: {e}")))?;
             write_atomic(&meta, &meta_bytes).await?;
+        }
+
+        // SQL true-delta capture (mysql binlog, PLAN-sql-true-delta Stage 3): a BASE export records
+        // the snapshot GTID + start binlog of each capture-eligible managed mysql db in
+        // `mysql_capture.json` (parsed from the just-produced base member headers), so a later
+        // incremental delta can stream the binlog since the base. (The mysql analogue of
+        // `pg_capture_base_slots` — but AFTER member production, because the coordinate lives in the
+        // base dump itself; there is no long-lived slot to create beforehand.)
+        if opts.delta.is_none() {
+            self.mysql_capture_base_gtids(project, dir, &specs).await;
         }
         let _ = tokio::fs::remove_dir_all(&session).await;
         Ok(())
@@ -3662,13 +3710,21 @@ impl NodeProjectExport {
         } else {
             None
         };
+        // The mysql analogue (PLAN-sql-true-delta Stage 3): only an INCREMENTAL delta whose PARENT
+        // base recorded a snapshot coordinate (in `mysql_capture.json`) can ship a binlog delta.
+        let parent_mysql_capture = if matches!(req.mode, pd::DeltaMode::Incremental) {
+            read_mysql_capture_sidecar(&base_dir).await
+        } else {
+            None
+        };
         let cap_dir = self
             .work_dir
             .join(format!("delta-capture-{project}-{created_at}"));
-        if parent_capture.is_some() {
+        if parent_capture.is_some() || parent_mysql_capture.is_some() {
             tokio::fs::create_dir_all(&cap_dir).await.map_err(other)?;
         }
         let mut any_pg_true_delta = false;
+        let mut any_mysql_true_delta = false;
 
         // --- build the ordered delta member set from the full plan ---
         let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
@@ -3751,9 +3807,44 @@ impl NodeProjectExport {
                         ordered.push((spec.clone(), job));
                     }
                 }
-                MemberKind::MysqlDump | MemberKind::Libsql => {
+                MemberKind::MysqlDump => {
+                    // mysql binlog true-delta (PLAN-sql-true-delta Stage 3): if this db is a managed,
+                    // capture-eligible binding whose PARENT base recorded a snapshot coordinate, and
+                    // the schema is unchanged + no DDL in the range, STREAM the binlog since the base
+                    // into a `MysqlBinlogDelta` member IN PLACE OF the full dump. Any miss falls back
+                    // to the full dump (the all-families-consistent invariant + best-effort delta).
+                    let db = db_from_mysql_member(&spec.path);
+                    let binlog_member = match (db, parent_mysql_capture.as_ref()) {
+                        (Some(db), Some(sidecar)) => {
+                            self.try_mysql_binlog_delta(project, db, sidecar, &cap_dir)
+                                .await
+                        }
+                        _ => None,
+                    };
+                    if let Some((bytes, cursor)) = binlog_member {
+                        any_mysql_true_delta = true;
+                        let db = db.expect("binlog_member implies a parsed db");
+                        ordered.push((
+                            MemberSpec::sidecar(
+                                mysqlbinlog_member_path(db),
+                                MemberKind::MysqlBinlogDelta,
+                                None,
+                            )
+                            .with_sql_cursor(cursor),
+                            StageJob::MysqlBinlogDelta { bytes },
+                        ));
+                        let _ = full_jobs.remove(&spec.path);
+                    } else {
+                        // SQL full-dump fallback (decision 3): keep the full member verbatim.
+                        let job = full_jobs.remove(&spec.path).ok_or_else(|| {
+                            Perr::Other(format!("delta export: no stage job for {}", spec.path))
+                        })?;
+                        ordered.push((spec.clone(), job));
+                    }
+                }
+                MemberKind::Libsql => {
                     // SQL full-dump fallback (decision 3): keep the full member verbatim. The
-                    // mysql binlog / libsql changeset true-deltas are separate later engines.
+                    // libsql changeset true-delta is a separate later engine.
                     let job = full_jobs.remove(&spec.path).ok_or_else(|| {
                         Perr::Other(format!("delta export: no stage job for {}", spec.path))
                     })?;
@@ -3799,11 +3890,14 @@ impl NodeProjectExport {
             mode: req.mode,
             base_reference: req.base_reference.clone(),
             base_created_at: base_manifest.created_at,
-            // Record `PgWalReplay` when at least one pg member shipped as a true WAL delta (so a
-            // reader can tell a true row-delta bundle from an all-full-dump fallback); else the
-            // all-families full-dump fallback.
+            // Record a true-delta strategy when at least one SQL member shipped as a true row-delta
+            // (so a reader can tell a true row-delta bundle from an all-full-dump fallback); else the
+            // all-families full-dump fallback. The per-member `sql_cursor` carries the authoritative
+            // per-engine strategy, so when a bundle mixes engines this single hint names pg first.
             sql_strategy: if any_pg_true_delta {
                 pd::SqlDeltaKind::PgWalReplay
+            } else if any_mysql_true_delta {
+                pd::SqlDeltaKind::MysqlBinlogReplay
             } else {
                 pd::SqlDeltaKind::FullDumpFallback
             },
@@ -4077,7 +4171,18 @@ impl NodeProjectExport {
                             && is_newest
                     }
                     MemberKind::PgWalDelta => false,
-                    MemberKind::MysqlDump | MemberKind::Libsql => is_newest,
+                    // Managed mysql SQL — a full dump OR a binlog true-delta — is restored by the
+                    // atomic shadow pass (`restore_mysql_true_delta_in_chain`) AFTER this loop
+                    // (restore_member fail-closes on a managed mysql member). An EXTERNAL mysql full
+                    // dump still restores here via restore_member, newest-link only.
+                    MemberKind::MysqlDump => {
+                        !db_from_mysql_member(&spec.path)
+                            .map(|db| self.is_managed_mysql(db))
+                            .unwrap_or(false)
+                            && is_newest
+                    }
+                    MemberKind::MysqlBinlogDelta => false,
+                    MemberKind::Libsql => is_newest,
                     MemberKind::Identity => false,
                     _ => true,
                 };
@@ -4107,6 +4212,16 @@ impl NodeProjectExport {
         // ephemeral non-superuser role, then swap. Independent of the KV/blob overlay above.
         if let Err(e) = self
             .restore_pg_true_delta_in_chain(project, &chain, opts, &mut report, &session)
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&session).await;
+            return Err(e);
+        }
+        // Managed mysql SQL families (full-dump fallback OR binlog true-delta): restore the chain's
+        // newest full dump into a fresh atomic shadow, replay each subsequent MysqlBinlogDelta onto
+        // it as the ephemeral apply user, then swap. Independent of the KV/blob overlay above.
+        if let Err(e) = self
+            .restore_mysql_true_delta_in_chain(project, &chain, opts, &mut report, &session)
             .await
         {
             let _ = tokio::fs::remove_dir_all(&session).await;
@@ -5038,10 +5153,13 @@ impl NodeProjectExport {
                         }
                     }
                 }
-                // Orphan ephemeral apply USERS (`brexp_apply_%`) left by a crash — drop them after
-                // their shadow dbs are gone (tidiness: each has a random, never-persisted password
-                // and only ever held a grant on the now-dropped shadow db).
-                let user_sql = "SELECT user FROM mysql.user WHERE user LIKE 'brexp\\_apply\\_%';";
+                // Orphan ephemeral apply USERS (`brexp_apply_%`) + binlog-capture READER USERS
+                // (`brexp_rd_%`) left by a crash — drop them after their shadow dbs are gone
+                // (tidiness: each has a random, never-persisted password and only ever held a grant
+                // on the now-dropped shadow db, or REPLICATION SLAVE/CLIENT for the read). The reader
+                // user pins no server resource (unlike a pg slot), so this is pure tidiness.
+                let user_sql = "SELECT user FROM mysql.user \
+                                WHERE user LIKE 'brexp\\_apply\\_%' OR user LIKE 'brexp\\_rd\\_%';";
                 if let Ok((0, out)) = self.mysql_run_admin(&plan, user_sql, &session).await {
                     for u in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
                         let user_lit = mysql_lit(u);
@@ -5761,6 +5879,819 @@ fn mysql_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+// ===========================================================================================
+// MySQL binlog true-delta: CAPTURE (export) + REPLAY (restore) — PLAN-sql-true-delta Stage 3.
+// (Kept textually separate from the pg engine above to minimize merge conflict; it reuses only the
+// shared primitives — the inc2 mysql atomic shadow + the resumable member-object layout.)
+//
+// CAPTURE. A managed, dedicated/Single mysql db with `delta_capture` (the launch argv carries
+// `--log-bin --binlog-format=ROW --gtid-mode=ON …`) sources a row-level delta from the server's
+// binlog. Unlike pg (whose slot pins a point BEFORE the base dump, leaving an overlap window), the
+// mysql base is SNAPSHOT-PINNED: the BASE (full) resumable export dumps it with
+// `mysqldump --source-data=2 --set-gtid-purged=COMMENTED` so the dump header records its OWN
+// consistent-snapshot `gtid_executed` + binlog file. The driver STRIPS the privileged
+// `SET @@SESSION.SQL_LOG_BIN` toggles mysqldump injects (so the member still restores under the
+// least-privilege shadow apply user) and records `{base_gtid, start_log, schema_fingerprint}` in a
+// `mysql_capture.json` sidecar — the mysql analogue of `pg_capture.json`. There is NO long-lived
+// slot: the server retains the binlog (`binlog_expire_logs_seconds`), so an INCREMENTAL delta mints
+// an EPHEMERAL `REPLICATION SLAVE, REPLICATION CLIENT` reader user, streams the binlog since the base
+// (`mysqlbinlog --read-from-remote-server --raw` — no server-filesystem access), `tar`s the raw files
+// into the `MysqlBinlogDelta` member, then drops the reader user. A schema change since the base
+// (fingerprint), a DDL `QUERY_EVENT` in the range, a purged start log, or a drain error all fall back
+// to a full dump for that db (best-effort true-delta; the delta bundle is always restorable).
+//
+// REPLAY. `restore_mysql_true_delta_in_chain` restores the chain's newest FULL dump into the inc2
+// atomic mysql shadow, then replays each subsequent `MysqlBinlogDelta` onto it. The raw files are
+// decoded LOCALLY (so `--exclude-gtids` + `--rewrite-db` are both allowed, unlike a remote read):
+// `mysqlbinlog --skip-gtids --exclude-gtids=<base> --rewrite-db='<live>-><shadow>' --database=<shadow>
+// … | mysql <shadow>`, EXECUTED as an EPHEMERAL apply user holding `REPLICATION_APPLIER` +
+// `SESSION_VARIABLES_ADMIN` + `ALL ON <shadow>.*` ONLY (NO SUPER/FILE/BINLOG_ADMIN, NO global DML) —
+// so a crafted binlog's `BINLOG` row event targeting any table outside the shadow is REFUSED by the
+// table-privilege check (validated: the applier privilege does NOT bypass it), and the
+// `--rewrite-db`/`--database` pair redirects the source db's events to the shadow + DROPS every
+// foreign-db event (defense in depth). Then the atomic `RENAME TABLE` swap. A decode/replay failure
+// drops the shadow (live untouched) and fails the import loud.
+//
+// IMAGE. `mysqlbinlog` ships in the DEBIAN variant of the mysql image, not the (Oracle-Linux) default
+// `mysql:<maj.min>` the dump/restore use — so capture + replay run in `mysql:<maj.min>-debian`
+// (see `mysql_binlog_image`). SCOPE: managed dedicated/Single mysql only (Shared refused, like pg).
+// ===========================================================================================
+
+/// The mysql-capture sidecar filename written beside a resumable export dir's member objects.
+const MYSQL_CAPTURE_SIDECAR: &str = "mysql_capture.json";
+
+/// One managed-mysql db's base capture coordinate, recorded in the resumable dir's
+/// `mysql_capture.json` so a later INCREMENTAL delta can stream the binlog since the base. Carries
+/// only NON-secret coordinates (no credential — the ephemeral reader user is minted fresh at drain
+/// with a never-persisted password).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MysqlCaptureEntry {
+    /// The `gtid_executed` at the base dump's consistent snapshot (parsed from its COMMENTED
+    /// `SET @@GLOBAL.GTID_PURGED`). The delta's `--exclude-gtids` replays from exactly this point.
+    base_gtid: String,
+    /// The binlog file at the base snapshot (parsed from the dump's COMMENTED `CHANGE MASTER TO
+    /// MASTER_LOG_FILE`). The delta's `mysqlbinlog -R` streams from this file to the current end.
+    start_log: String,
+    /// The source schema-ledger fingerprint at capture time. A delta whose current fingerprint
+    /// differs MUST fall back to a full dump (binlog ROW events carry no faithful cross-DDL replay).
+    #[serde(default)]
+    schema_fingerprint: Option<String>,
+}
+
+/// A resumable dir's mysql-capture sidecar: per-db base coordinates keyed by the node's binding name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MysqlCaptureSidecar {
+    dbs: BTreeMap<String, MysqlCaptureEntry>,
+}
+
+/// Read the mysql-capture sidecar from a resumable dir (absent/corrupt ⇒ `None`).
+async fn read_mysql_capture_sidecar(dir: &Path) -> Option<MysqlCaptureSidecar> {
+    let bytes = tokio::fs::read(dir.join(MYSQL_CAPTURE_SIDECAR))
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The `mysqlbinlog`-bearing client image for a resolved `mysql:<maj.min>` dump/restore image: the
+/// DEBIAN variant. The Oracle-Linux default `mysql:<maj.min>` ships `mysql`/`mysqldump` but NOT
+/// `mysqlbinlog`; the `-debian` variant ships the full client suite. Idempotent (never double-adds).
+fn mysql_binlog_image(client_image: &str) -> String {
+    if client_image.ends_with("-debian") {
+        client_image.to_string()
+    } else {
+        format!("{client_image}-debian")
+    }
+}
+
+/// Whether a dump line is one of mysqldump's privileged `SQL_LOG_BIN` toggles (emitted by
+/// `--source-data`). These need `SESSION_VARIABLES_ADMIN`, which the least-privilege shadow apply
+/// user does NOT hold, so the capture-base producer STRIPS them — leaving the COMMENTED GTID/file
+/// coordinates (which the sidecar parses) but no executable privileged statement.
+fn mysql_line_is_sql_log_bin_toggle(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("SET @MYSQLDUMP_TEMP_LOG_BIN") || t.starts_with("SET @@SESSION.SQL_LOG_BIN")
+}
+
+/// Parse the base snapshot coordinate `(base_gtid, start_log)` from a `--source-data=2
+/// --set-gtid-purged=COMMENTED` dump header: the COMMENTED `SET @@GLOBAL.GTID_PURGED='+<gtid>'` and
+/// the COMMENTED `CHANGE MASTER TO MASTER_LOG_FILE='<file>'`. `None` if either is absent (⇒ the db
+/// is not binlog/GTID-enabled as expected, so the delta falls back to a full dump).
+fn parse_mysql_base_coord(header: &str) -> Option<(String, String)> {
+    let between = |hay: &str, open: &str| -> Option<String> {
+        let start = hay.find(open)? + open.len();
+        let rest = &hay[start..];
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
+    };
+    let gtid = between(header, "GTID_PURGED='")?;
+    // The COMMENTED form prefixes the set with a `+` (`'+<gtid>'`); drop it for the raw GTID set.
+    let gtid = gtid.trim_start_matches('+').to_string();
+    let start_log = between(header, "MASTER_LOG_FILE='")?;
+    if gtid.is_empty() || start_log.is_empty() {
+        return None;
+    }
+    Some((gtid, start_log))
+}
+
+/// Whether a `mysqlbinlog`-decoded delta carries a DDL `QUERY_EVENT` in the range — in which case the
+/// delta MUST fall back to a full dump (binlog ROW events replay DML faithfully, but a schema change
+/// between base and delta cannot be row-replayed onto the base). In `binlog_format=ROW`, DML is a
+/// `BINLOG '…'` base64 statement (zero bare SQL), so the ONLY bare SQL statements a clean ROW delta
+/// emits are the session-context `SET`s + transaction control (`BEGIN`/`COMMIT`/…); ANY other bare
+/// statement (a `CREATE`/`ALTER`/`DROP`/`RENAME`/`TRUNCATE`/`GRANT`/…) is a DDL event ⇒ fall back.
+fn mysql_binlog_decoded_has_ddl(decoded: &str) -> bool {
+    for raw in decoded.lines() {
+        let line = raw.trim();
+        if line.is_empty()
+            || line.starts_with('#') // event header / verbose comment
+            || line.starts_with("/*") // conditional-comment-wrapped directive
+            || line.starts_with("DELIMITER")
+            || line.starts_with("SET ") // session context + GTID_NEXT + PSEUDO_SLAVE_MODE
+            || line.starts_with("BINLOG ") // the base64 ROW payload opener
+            || line == "'" // BINLOG payload terminators / `'/*!*/;`
+            || line.starts_with("'/*")
+        {
+            continue;
+        }
+        let up = line.to_ascii_uppercase();
+        // Transaction control is not DDL.
+        if up.starts_with("BEGIN")
+            || up.starts_with("COMMIT")
+            || up.starts_with("ROLLBACK")
+            || up.starts_with("START TRANSACTION")
+            || up.starts_with("SAVEPOINT")
+            || up.starts_with("RELEASE SAVEPOINT")
+        {
+            continue;
+        }
+        // A base64 payload body line (no SQL keywords, just base64) — treat as continuation.
+        if line
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+        {
+            continue;
+        }
+        // Anything else that reaches here is a bare SQL statement ⇒ a DDL event in the range.
+        return true;
+    }
+    false
+}
+
+/// Build a reader connection (ephemeral `REPLICATION SLAVE, REPLICATION CLIENT` user) by swapping the
+/// identity of the superuser/operator connection (same host/port; fresh user + never-persisted pw).
+fn mysql_reader_conn(op: &MysqlConnection, user: &str, password: &str) -> MysqlConnection {
+    let mut c = op.clone();
+    c.user = user.to_string();
+    c.password = password.to_string();
+    c
+}
+
+impl NodeProjectExport {
+    /// Whether a db binding is eligible for mysql binlog true-delta capture: MANAGED + mysql +
+    /// `delta_capture` on + dedicated/Single (NOT external, NOT Shared — the inc2 shadow-path
+    /// restriction; a Shared multi-tenant server's cross-db binlog is out of scope).
+    fn mysql_capture_eligible(cfg: &ExternalDatabaseConfig) -> bool {
+        is_managed_binding(cfg)
+            && kind_is_mysql(&cfg.kind)
+            && cfg.delta_capture
+            && !matches!(cfg.tenant, crate::config::TenantIsolation::Shared)
+    }
+
+    /// Whether a configured db is a MANAGED mysql binding (its SQL members take the atomic shadow
+    /// true-delta restore path, not `restore_member`).
+    fn is_managed_mysql(&self, db: &str) -> bool {
+        self.databases
+            .get(db)
+            .map(|c| is_managed_binding(c) && kind_is_mysql(&c.kind))
+            .unwrap_or(false)
+    }
+
+    /// Run ONE trusted/driver-generated mysql statement on a bare connection (no shadow plan), as
+    /// `-N --batch` admin SQL fed on stdin. Used for the ephemeral reader-user lifecycle (which has no
+    /// shadow). Returns `(exit_code, trimmed stdout+stderr)`.
+    async fn mysql_admin_sql(
+        &self,
+        conn: &MysqlConnection,
+        image: &str,
+        sql: &str,
+        stage_dir: &Path,
+    ) -> Result<(i32, String), Perr> {
+        let inv = mysql_admin_invocation(conn);
+        let in_path = stage_dir.join(format!("mysql-adm-{}.sql", shadow_suffix()));
+        tokio::fs::write(&in_path, sql).await.map_err(other)?;
+        let r = self
+            .run_sql_capture(image, &inv.argv, &inv.env, Some(&in_path), stage_dir)
+            .await;
+        let _ = tokio::fs::remove_file(&in_path).await;
+        r
+    }
+
+    /// Produce ONE capture-eligible managed-mysql db's BASE member object (resumable layout): dump it
+    /// `--source-data=2 --set-gtid-purged=COMMENTED` (tables-only, snapshot-pinned) to a staging temp,
+    /// STRIP the privileged `SET @@SESSION.SQL_LOG_BIN` toggles so the member restores under the
+    /// least-privilege shadow apply user, then write it as `m{idx}` (+ meta). The COMMENTED GTID/file
+    /// coordinates survive the strip for `mysql_capture_base_gtids` to parse. Mirrors the generic
+    /// Sidecar production (stage → `write_member_from_file`) but with the capture dump + strip.
+    async fn produce_mysql_capture_base(
+        &self,
+        project: &str,
+        dir: &Path,
+        idx: usize,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        stage_dir: &Path,
+    ) -> Result<project_bundle::MemberMeta, Perr> {
+        let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
+        let inv = mysqldump_capture_base_invocation(&conn);
+        let raw = stage_dir.join(format!("mysqlcap-raw-{idx}"));
+        let code = self
+            .run_sql_client(&image, &inv.argv, &inv.env, None, &raw)
+            .await?;
+        if code != 0 {
+            let _ = tokio::fs::remove_file(&raw).await;
+            return Err(Perr::Other(format!(
+                "mysql capture base dump for {db:?} exited {code}"
+            )));
+        }
+        // Strip the privileged SQL_LOG_BIN toggles, streaming line-by-line (header+footer only, but
+        // scan the whole file) into the final staged temp.
+        let stripped = stage_dir.join(format!("mysqlcap-strip-{idx}"));
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let rd = tokio::fs::File::open(&raw).await.map_err(other)?;
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            let mut wr = tokio::fs::File::create(&stripped).await.map_err(other)?;
+            while let Some(line) = lines.next_line().await.map_err(other)? {
+                if mysql_line_is_sql_log_bin_toggle(&line) {
+                    continue;
+                }
+                wr.write_all(line.as_bytes()).await.map_err(other)?;
+                wr.write_all(b"\n").await.map_err(other)?;
+            }
+            wr.flush().await.map_err(other)?;
+        }
+        let _ = tokio::fs::remove_file(&raw).await;
+        let meta = write_member_from_file(dir, idx, &stripped).await?;
+        let _ = tokio::fs::remove_file(&stripped).await;
+        Ok(meta)
+    }
+
+    /// Write the `mysql_capture.json` base sidecar from the committed base member objects (post the
+    /// resumable member loop, mirror of pg's `pg_capture_base_slots` but READING the produced dumps):
+    /// for each capture-eligible managed-mysql db, parse the base GTID + start binlog file from its
+    /// `sql/<db>.sql` member header + record the schema fingerprint. Idempotent on resume (skips if a
+    /// sidecar already exists). A db whose coordinate can't be parsed simply has no entry (its future
+    /// delta full-dumps). Non-fatal throughout — true-delta is best-effort.
+    async fn mysql_capture_base_gtids(&self, project: &str, dir: &Path, specs: &[MemberSpec]) {
+        if read_mysql_capture_sidecar(dir).await.is_some() {
+            return; // resume: coordinates already recorded.
+        }
+        let mut sidecar = MysqlCaptureSidecar::default();
+        for (idx, spec) in specs.iter().enumerate() {
+            if spec.kind != MemberKind::MysqlDump {
+                continue;
+            }
+            let Some(db) = db_from_mysql_member(&spec.path) else {
+                continue;
+            };
+            let Some(cfg) = self.databases.get(db) else {
+                continue;
+            };
+            if !Self::mysql_capture_eligible(cfg) {
+                continue;
+            }
+            // Read just the dump header (the COMMENTED coordinates are near the top).
+            let obj = dir.join(member_object_name(idx));
+            let header = match read_file_prefix(&obj, 16 * 1024).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, db = %db, "mysql delta: could not read base member header; this db's delta will fall back to a full dump");
+                    continue;
+                }
+            };
+            let Some((base_gtid, start_log)) = parse_mysql_base_coord(&header) else {
+                tracing::warn!(db = %db, "mysql delta: base dump carries no GTID/binlog coordinate (binlog/gtid not enabled?); this db's delta will fall back to a full dump");
+                continue;
+            };
+            let schema_fingerprint = self.schema_fingerprint(project, db).await;
+            sidecar.dbs.insert(
+                db.to_string(),
+                MysqlCaptureEntry {
+                    base_gtid,
+                    start_log,
+                    schema_fingerprint,
+                },
+            );
+        }
+        if !sidecar.dbs.is_empty()
+            && let Ok(bytes) = serde_json::to_vec_pretty(&sidecar)
+        {
+            let _ = write_atomic(&dir.join(MYSQL_CAPTURE_SIDECAR), &bytes).await;
+        }
+    }
+
+    /// Try to produce a mysql binlog true-delta member for one db from the PARENT base's capture
+    /// sidecar. Returns `Some((member_tar_bytes, MysqlGtid cursor))` when a faithful binlog delta is
+    /// available, or `None` to keep the full-dump fallback. Falls back when: the db is not
+    /// capture-eligible, the parent recorded no coordinate, the SCHEMA FINGERPRINT changed since the
+    /// base, the range carries a DDL `QUERY_EVENT`, the start binlog was purged, or the drain errors.
+    async fn try_mysql_binlog_delta(
+        &self,
+        project: &str,
+        db: &str,
+        sidecar: &MysqlCaptureSidecar,
+        cap_dir: &Path,
+    ) -> Option<(Vec<u8>, boatramp_core::project_delta::SqlMemberCursor)> {
+        let cfg = self.databases.get(db)?;
+        if !Self::mysql_capture_eligible(cfg) {
+            return None;
+        }
+        let entry = sidecar.dbs.get(db)?;
+        // SCHEMA-FINGERPRINT FALLBACK (mirror pg): a DDL change base→delta cannot be row-replayed.
+        let current_fp = self.schema_fingerprint(project, db).await;
+        if current_fp != entry.schema_fingerprint {
+            tracing::info!(db = %db, "mysql delta: schema fingerprint changed since the base — falling back to a full dump");
+            return None;
+        }
+        match self
+            .mysql_drain_binlog(project, db, cfg, entry, cap_dir)
+            .await
+        {
+            Ok(Some(bytes)) => Some((
+                bytes,
+                boatramp_core::project_delta::SqlMemberCursor::MysqlGtid {
+                    gtid: entry.base_gtid.clone(),
+                },
+            )),
+            Ok(None) => None, // purged start log / DDL in range ⇒ full-dump fallback
+            Err(e) => {
+                tracing::warn!(error = %e, db = %db, "mysql delta: binlog drain failed — falling back to a full dump");
+                None
+            }
+        }
+    }
+
+    /// Stream one managed-mysql db's binlog since the base into a `tar` of raw binlog files (the
+    /// `MysqlBinlogDelta` member). Mints an EPHEMERAL `REPLICATION SLAVE, REPLICATION CLIENT` reader
+    /// user (superuser-created, random never-persisted password), runs `mysqlbinlog -R --raw` from the
+    /// base's start binlog `--to-last-log` into the container's bounded `/tmp` tmpfs, `tar`s the raw
+    /// files to stdout, then DROPS the reader user. Returns `Ok(None)` (full-dump fallback) when the
+    /// start binlog is purged (capture exits non-zero) or the range carries a DDL event.
+    async fn mysql_drain_binlog(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        entry: &MysqlCaptureEntry,
+        stage_dir: &Path,
+    ) -> Result<Option<Vec<u8>>, Perr> {
+        let (op, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
+        let binlog_image = mysql_binlog_image(&image);
+        let suffix = shadow_suffix();
+        let reader = format!("brexp_rd_{suffix}");
+        let reader_pw = random_token();
+        let reader_lit = mysql_lit(&reader);
+
+        // SUPERUSER: mint the ephemeral least-privilege reader user (so the binlog stream is NOT read
+        // as the bootstrap superuser — defence in depth). REPLICATION SLAVE + CLIENT are exactly what
+        // `mysqlbinlog --read-from-remote-server` needs; nothing else.
+        let create = format!(
+            "CREATE USER {reader_lit}@'%' IDENTIFIED BY {}; \
+             GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO {reader_lit}@'%';",
+            mysql_lit(&reader_pw)
+        );
+        let (code, out) = self
+            .mysql_admin_sql(&op, &image, &create, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql capture: CREATE reader user for {db:?} exited {code}: {out}"
+            )));
+        }
+
+        // CAPTURE as the reader user: raw binlog from the base start log, to the current end, tar'd to
+        // stdout. `set -e` so a purged/absent start log aborts BEFORE tar (empty stdout, non-zero
+        // exit) ⇒ a clean full-dump fallback. STDERR is discarded (the stdout must stay a clean tar).
+        let reader_conn = mysql_reader_conn(&op, &reader, &reader_pw);
+        let cap = mysqlbinlog_capture_invocation(&reader_conn, &entry.start_log, "/tmp/brraw/");
+        let cmd = format!(
+            "set -e; mkdir -p /tmp/brraw; {} 2>/tmp/caperr; tar -C /tmp/brraw -cf - .",
+            sh_join(&cap.argv)
+        );
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        let member_path = stage_dir.join(format!("mysqlbinlog-{suffix}.tar"));
+        let code = self
+            .run_sql_client(&binlog_image, &argv, &cap.env, None, &member_path)
+            .await;
+
+        // Drop the ephemeral reader user regardless of capture outcome (bounded retention).
+        let drop_sql = format!("DROP USER IF EXISTS {reader_lit}@'%';");
+        let _ = self
+            .mysql_admin_sql(&op, &image, &drop_sql, stage_dir)
+            .await;
+
+        let code = code?;
+        if code != 0 {
+            // Purged start log / unreachable / tmpfs overflow ⇒ best-effort fallback to a full dump.
+            let _ = tokio::fs::remove_file(&member_path).await;
+            tracing::info!(db = %db, "mysql delta: binlog capture exited non-zero (start log purged, or delta exceeds the capture tmpfs) — falling back to a full dump");
+            return Ok(None);
+        }
+        let bytes = tokio::fs::read(&member_path).await.map_err(other)?;
+        let _ = tokio::fs::remove_file(&member_path).await;
+
+        // DDL-in-range guard: decode the captured tar locally (no rewrite — just to inspect) and fall
+        // back to a full dump if the range carries a DDL QUERY_EVENT (a schema change the base→delta
+        // row replay cannot faithfully reproduce). The fingerprint check already caught NET schema
+        // changes; this catches any DDL even if net-neutral.
+        if self
+            .mysql_binlog_range_has_ddl(&binlog_image, &bytes, db, stage_dir)
+            .await?
+        {
+            tracing::info!(db = %db, "mysql delta: a DDL event is present in the binlog range — falling back to a full dump");
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Decode a captured binlog-delta `tar` LOCALLY (no server connection) and report whether it
+    /// carries a DDL `QUERY_EVENT` for the source db (⇒ fall back to a full dump). Runs
+    /// `mysqlbinlog --database=<live>` over the untarred raw files in the bounded `/tmp` tmpfs.
+    async fn mysql_binlog_range_has_ddl(
+        &self,
+        binlog_image: &str,
+        member_tar: &[u8],
+        db: &str,
+        stage_dir: &Path,
+    ) -> Result<bool, Perr> {
+        let cfg = self
+            .databases
+            .get(db)
+            .ok_or_else(|| Perr::Other(format!("mysql delta: no database named {db:?}")))?;
+        let live_db = cfg.database.clone().unwrap_or_else(|| db.to_string());
+        let tar_path = stage_dir.join(format!("mysqlddl-{}.tar", shadow_suffix()));
+        tokio::fs::write(&tar_path, member_tar)
+            .await
+            .map_err(other)?;
+        // Decode to stdout, keeping only the live db's events; `--force-read` so a benign unknown
+        // event never aborts the scan. No rewrite/exclude — we only inspect for DDL statements.
+        let cmd = format!(
+            "mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; mysqlbinlog --force-read --database={} /tmp/brd/* 2>/dev/null",
+            sh_join(&[live_db])
+        );
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        let out_path = stage_dir.join(format!("mysqlddl-{}.out", shadow_suffix()));
+        let r = self
+            .run_sql_client(binlog_image, &argv, &[], Some(&tar_path), &out_path)
+            .await;
+        let _ = tokio::fs::remove_file(&tar_path).await;
+        let code = r?;
+        let decoded = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out_path).await;
+        if code != 0 {
+            // A decode failure here is treated conservatively as "not safe to true-delta".
+            return Ok(true);
+        }
+        Ok(mysql_binlog_decoded_has_ddl(&decoded))
+    }
+}
+
+impl NodeProjectExport {
+    /// Restore every managed-mysql db covered by a resolved delta chain via the atomic shadow: the
+    /// newest FULL dump in the chain is restored into a fresh shadow, every subsequent
+    /// `MysqlBinlogDelta` is REPLAYED onto it as the ephemeral apply user (REPLICATION_APPLIER +
+    /// SESSION_VARIABLES_ADMIN + ALL on the shadow ONLY), then the shadow is atomically swapped in.
+    /// A render/replay/restore failure drops the shadow (live untouched) and fails the import loud.
+    /// (An external mysql db never produces a `MysqlBinlogDelta` — capture is managed-only — so a
+    /// chain carrying one for a non-managed db is a malformed bundle and is refused.)
+    async fn restore_mysql_true_delta_in_chain(
+        &self,
+        project: &str,
+        chain: &[(PathBuf, project_bundle::StreamManifest)],
+        opts: &ImportOptions,
+        report: &mut ImportReport,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        // Per managed-mysql db: the newest FULL dump (base/fallback) + the binlog deltas AFTER it.
+        struct DbPlan {
+            base: Option<(PathBuf, usize)>,
+            binlog: Vec<(PathBuf, usize)>,
+        }
+        let mut per_db: BTreeMap<String, DbPlan> = BTreeMap::new();
+        for (dir, m) in chain {
+            for (idx, spec) in m.members.iter().enumerate() {
+                match spec.kind {
+                    MemberKind::MysqlDump => {
+                        if let Some(db) =
+                            db_from_mysql_member(&spec.path).filter(|d| self.is_managed_mysql(d))
+                        {
+                            let e = per_db.entry(db.to_string()).or_insert(DbPlan {
+                                base: None,
+                                binlog: Vec::new(),
+                            });
+                            e.base = Some((dir.clone(), idx));
+                            e.binlog.clear();
+                        }
+                    }
+                    MemberKind::MysqlBinlogDelta => {
+                        if let Some(db) = db_from_mysqlbinlog_member(&spec.path) {
+                            if !self.is_managed_mysql(db) {
+                                return Err(Perr::Other(format!(
+                                    "mysql true-delta restore: a MysqlBinlogDelta member {:?} names \
+                                     db {db:?} which is not a managed mysql binding on this node — \
+                                     malformed bundle",
+                                    spec.path
+                                )));
+                            }
+                            per_db
+                                .entry(db.to_string())
+                                .or_insert(DbPlan {
+                                    base: None,
+                                    binlog: Vec::new(),
+                                })
+                                .binlog
+                                .push((dir.clone(), idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if per_db.is_empty() {
+            return Ok(());
+        }
+        if !opts.apply {
+            report.pg_databases += per_db.len();
+            return Ok(());
+        }
+        for (db, plan_db) in per_db {
+            let Some((base_dir, base_idx)) = plan_db.base else {
+                return Err(Perr::Other(format!(
+                    "mysql true-delta restore: db {db:?} has binlog delta member(s) but no full base \
+                     dump in the chain — cannot replay onto nothing"
+                )));
+            };
+            let cfg = self
+                .databases
+                .get(&db)
+                .ok_or_else(|| {
+                    Perr::Other(format!("import: no database named {db:?} on this node"))
+                })?
+                .clone();
+            let plan = self.mysql_shadow_plan(project, &db, &cfg).await?;
+            if let Err(e) = self.mysql_create_shadow(&plan, stage_dir).await {
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            // The binlog replay needs the apply user to run `BINLOG` row events + the session-context
+            // SETs mysqlbinlog emits — grant REPLICATION_APPLIER + SESSION_VARIABLES_ADMIN (on top of
+            // the shadow-only ALL). FAIL-CLOSED: then PROVE the apply user is still confined (no
+            // SUPER/FILE/BINLOG_ADMIN, no `ALL`/DML on `*.*`), so a crafted binlog cannot escape.
+            if let Err(e) = self.mysql_grant_replay(&plan, stage_dir).await {
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            if let Err(e) = self
+                .mysql_assert_replay_user_confined(&plan, stage_dir)
+                .await
+            {
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            // Restore the base tables-only dump into the shadow AS the apply user (the inc2 split).
+            if let Err(e) = self
+                .mysql_restore_base_into_shadow(
+                    &plan,
+                    &base_dir.join(member_object_name(base_idx)),
+                    stage_dir,
+                )
+                .await
+            {
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            // The base cursor the deltas replay from — the newest base's recorded snapshot GTID (the
+            // deltas in the chain all follow this base; each delta carries its own base cursor, but a
+            // chain's deltas share the base dump, so each delta's `--exclude-gtids` uses ITS cursor).
+            for (dir, idx) in &plan_db.binlog {
+                let member = tokio::fs::read(dir.join(member_object_name(*idx)))
+                    .await
+                    .map_err(other)?;
+                let base_gtid = self
+                    .mysqlbinlog_member_base_gtid(dir, *idx)
+                    .await
+                    .ok_or_else(|| {
+                        Perr::Other(format!(
+                            "mysql true-delta restore: the binlog delta member {idx} in {} carries \
+                             no base GTID cursor — refusing (a true-delta member must name its base)",
+                            dir.display()
+                        ))
+                    })?;
+                if let Err(e) = self
+                    .mysql_replay_binlog(&plan, &member, &base_gtid, stage_dir)
+                    .await
+                {
+                    self.mysql_drop_shadow(&plan, stage_dir).await;
+                    return Err(e);
+                }
+            }
+            if let Err(e) = self.mysql_swap_shadow(&plan, stage_dir).await {
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            report.pg_databases += 1;
+        }
+        Ok(())
+    }
+
+    /// Read the base-GTID cursor recorded in a `MysqlBinlogDelta` member's manifest entry (its
+    /// `sql_cursor`). The cursor is the authenticity of the delta's starting point (the exact GTID
+    /// `--exclude-gtids` replays from), so a member with no `MysqlGtid` cursor is refused upstream.
+    async fn mysqlbinlog_member_base_gtid(&self, dir: &Path, idx: usize) -> Option<String> {
+        let manifest = self.read_resumable_manifest(dir).await.ok()?;
+        let spec = manifest.members.get(idx)?;
+        match spec.sql_cursor.as_ref()? {
+            boatramp_core::project_delta::SqlMemberCursor::MysqlGtid { gtid } => Some(gtid.clone()),
+            _ => None,
+        }
+    }
+
+    /// Restore a base full-dump member object into the freshly-created shadow via `mysql <shadow>`
+    /// (as the ephemeral apply user). The member is the tables-only base dump; a non-zero exit
+    /// surfaces the client's error (the caller tears the shadow down).
+    async fn mysql_restore_base_into_shadow(
+        &self,
+        plan: &MysqlShadowPlan,
+        base_obj: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let out = stage_dir.join(format!("mysqlbase-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(&plan.image, &merged, &inv.env, Some(base_obj), &out)
+            .await?;
+        let diag = tokio::fs::read_to_string(&out).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out).await;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql true-delta base restore into shadow {:?} exited {code}: {}",
+                plan.shadow_db,
+                diag.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// TRUSTED DDL: grant the shadow apply user the two dynamic privileges the binlog replay needs —
+    /// `REPLICATION_APPLIER` (to execute `BINLOG` row events) and `SESSION_VARIABLES_ADMIN` (to set
+    /// the session-context vars mysqlbinlog emits, e.g. `pseudo_slave_mode`/`pseudo_thread_id`).
+    /// NEITHER grants table access outside the shadow nor `SUPER`/`FILE`/`BINLOG_ADMIN`, so the apply
+    /// stays confined (asserted next). Run by the SUPERUSER / maintenance connection.
+    async fn mysql_grant_replay(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let user_lit = mysql_lit(&plan.eph_user);
+        let sql =
+            format!("GRANT REPLICATION_APPLIER, SESSION_VARIABLES_ADMIN ON *.* TO {user_lit}@'%';");
+        let (code, out) = self.mysql_run_admin(plan, &sql, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql true-delta: GRANT replay privileges to the apply user exited {code}: {out}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fail-closed probe: refuse the untrusted binlog replay unless the apply user's grants carry NO
+    /// `SUPER`, `FILE`, or `BINLOG_ADMIN`, and NO privilege on `*.*` BEYOND the exact two replay
+    /// dynamics (`REPLICATION_APPLIER`, `SESSION_VARIABLES_ADMIN`) plus the harmless `USAGE`. So a
+    /// crafted binlog applied as this user cannot escape the shadow (its DML on any table outside the
+    /// shadow is refused by the table-privilege check — the applier privilege does NOT bypass it).
+    async fn mysql_assert_replay_user_confined(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let apply = plan.apply_conn();
+        let inv = mysql_admin_invocation(&apply);
+        let in_path = stage_dir.join(format!("mysql-replay-probe-{}.sql", shadow_suffix()));
+        tokio::fs::write(&in_path, "SHOW GRANTS FOR CURRENT_USER();")
+            .await
+            .map_err(other)?;
+        let r = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, Some(&in_path), stage_dir)
+            .await;
+        let _ = tokio::fs::remove_file(&in_path).await;
+        let (code, out) = r?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql replay: could not probe the apply user's grants (exit {code}): {out}"
+            )));
+        }
+        for line in out.lines() {
+            let up = line.to_ascii_uppercase();
+            if up.contains("SUPER") || up.contains("FILE") || up.contains("BINLOG_ADMIN") {
+                return Err(Perr::Other(format!(
+                    "mysql replay REFUSED: the apply user holds SUPER/FILE/BINLOG_ADMIN; an untrusted \
+                     binlog must only be replayed by a least-privilege user. grants: {out}"
+                )));
+            }
+            // A `… ON *.*` grant is allowed ONLY when it is exactly the replay dynamics (or USAGE).
+            if up.contains("ON *.*") {
+                let ok = up.contains("USAGE ON *.*")
+                    || (up.contains("REPLICATION_APPLIER")
+                        || up.contains("SESSION_VARIABLES_ADMIN"));
+                let has_broad_dml = up.contains("ALL PRIVILEGES ON *.*")
+                    || up.contains("INSERT")
+                    || up.contains("UPDATE")
+                    || up.contains("DELETE")
+                    || up.contains("CREATE")
+                    || up.contains("DROP");
+                if !ok || has_broad_dml {
+                    return Err(Perr::Other(format!(
+                        "mysql replay REFUSED: the apply user holds a global `*.*` privilege beyond \
+                         the replay dynamics (REPLICATION_APPLIER / SESSION_VARIABLES_ADMIN); an \
+                         untrusted binlog must stay confined to the shadow. grants: {out}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode + EXECUTE one `MysqlBinlogDelta` member (a `tar` of raw binlog files) onto the shadow,
+    /// as the ephemeral apply user. The raw files are untarred into the replay container's bounded
+    /// `/tmp` tmpfs, then `mysqlbinlog --skip-gtids --exclude-gtids=<base> --rewrite-db='<live>->
+    /// <shadow>' --database=<shadow> … | mysql <shadow>`: the rewrite redirects the source db's row
+    /// events to the shadow, `--exclude-gtids` drops anything in the base, `--skip-gtids` stops each
+    /// embedded source GTID being seen as already-executed (and skipped) on this server, and
+    /// `--database=<shadow>` (filtered AFTER the rewrite) DROPS any foreign-db event in the range.
+    /// `bash -o pipefail` so a decode error (a corrupt/crafted member ⇒ "bad magic number") fails the
+    /// run; the caller then drops the shadow, so nothing partial reaches live.
+    async fn mysql_replay_binlog(
+        &self,
+        plan: &MysqlShadowPlan,
+        member_tar: &[u8],
+        base_gtid: &str,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let binlog_image = mysql_binlog_image(&plan.image);
+        let apply = plan.apply_conn();
+        // The decode FLAGS (no file args yet) — the same builder the unit test guards — then the
+        // untarred-files glob (`/tmp/brd/*`, left unquoted so bash expands it).
+        let flags = mysqlbinlog_replay_decode_args(base_gtid, &plan.live_db, &plan.shadow_db, &[]);
+        // The apply (`mysql`) side: driver-derived conn args + the shadow default db; password in env.
+        let mut mysql_argv = vec!["mysql".to_string()];
+        mysql_argv.extend(apply.conn_args());
+        mysql_argv.push(format!("--connect-timeout={}", apply.connect_timeout_secs));
+        mysql_argv.push(plan.shadow_db.clone());
+        let cmd = format!(
+            "set -eo pipefail; mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; \
+             {flags} /tmp/brd/* 2>/tmp/brd_derr | {mysqlc} 2>&1; \
+             rc=${{PIPESTATUS[0]}}; if [ \"$rc\" != 0 ]; then cat /tmp/brd_derr >&2; fi; exit $rc",
+            flags = sh_join(&flags),
+            mysqlc = sh_join(&mysql_argv),
+        );
+        let argv = vec!["bash".to_string(), "-c".to_string(), cmd];
+        let tar_path = stage_dir.join(format!("mysqlreplay-{}.tar", shadow_suffix()));
+        tokio::fs::write(&tar_path, member_tar)
+            .await
+            .map_err(other)?;
+        let out = stage_dir.join(format!("mysqlreplay-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(&binlog_image, &argv, &apply.env(), Some(&tar_path), &out)
+            .await;
+        let _ = tokio::fs::remove_file(&tar_path).await;
+        let diag = tokio::fs::read_to_string(&out).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out).await;
+        let code = code?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql binlog delta replay into shadow {:?} exited {code}: {}",
+                plan.shadow_db,
+                diag.trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Read up to `max` bytes from the start of `path` as a UTF-8 (lossy) string — for parsing a dump's
+/// header (the COMMENTED GTID/binlog coordinate) without loading a large member whole.
+async fn read_file_prefix(path: &Path, max: usize) -> Result<String, Perr> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await.map_err(other)?;
+    let mut buf = vec![0u8; max];
+    let n = f.read(&mut buf).await.map_err(other)?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 // --- T3 Phase 1: resumable member-object layout helpers --------------------------------
 
 /// The object filename for member `idx` in a resumable export directory. Zero-padded so a
@@ -6049,6 +6980,90 @@ mod tests {
         assert_eq!(pg_member_path("app"), "sql/app.pgc");
         assert_eq!(db_from_pg_member("sql/app.pgc"), Some("app"));
         assert_eq!(db_from_pg_member("libsql/x.sqlite"), None);
+    }
+
+    #[test]
+    fn mysqlbinlog_member_path_round_trips() {
+        assert_eq!(mysqlbinlog_member_path("app"), "sql/app.mysqlbinlog");
+        assert_eq!(
+            db_from_mysqlbinlog_member("sql/app.mysqlbinlog"),
+            Some("app")
+        );
+        // The full-dump and true-delta member paths are distinct namespaces.
+        assert_eq!(db_from_mysqlbinlog_member("sql/app.sql"), None);
+        assert_eq!(db_from_mysql_member("sql/app.mysqlbinlog"), None);
+    }
+
+    #[test]
+    fn mysql_binlog_image_appends_debian_once() {
+        // mysqlbinlog ships in the DEBIAN variant, not the Oracle-Linux default image.
+        assert_eq!(mysql_binlog_image("mysql:8.0"), "mysql:8.0-debian");
+        assert_eq!(mysql_binlog_image("mysql:8.4"), "mysql:8.4-debian");
+        // Idempotent — never double-adds.
+        assert_eq!(mysql_binlog_image("mysql:8.0-debian"), "mysql:8.0-debian");
+    }
+
+    #[test]
+    fn mysql_sql_log_bin_toggle_detection() {
+        // The exact privileged lines `--source-data` injects (stripped from the capture base so the
+        // least-privilege shadow user can restore it).
+        assert!(mysql_line_is_sql_log_bin_toggle(
+            "SET @MYSQLDUMP_TEMP_LOG_BIN = @@SESSION.SQL_LOG_BIN;"
+        ));
+        assert!(mysql_line_is_sql_log_bin_toggle(
+            "SET @@SESSION.SQL_LOG_BIN= 0;"
+        ));
+        assert!(mysql_line_is_sql_log_bin_toggle(
+            "SET @@SESSION.SQL_LOG_BIN = @MYSQLDUMP_TEMP_LOG_BIN;"
+        ));
+        // A normal dump statement is NOT stripped.
+        assert!(!mysql_line_is_sql_log_bin_toggle(
+            "INSERT INTO `t` VALUES (1,'a');"
+        ));
+        assert!(!mysql_line_is_sql_log_bin_toggle(
+            "/* SET @@GLOBAL.GTID_PURGED='+uuid:1-9';*/"
+        ));
+    }
+
+    #[test]
+    fn parse_mysql_base_coord_extracts_gtid_and_log_file() {
+        let header = "-- Server version\tn8.0.46\n\
+            SET @@SESSION.SQL_LOG_BIN= 0;\n\
+            /* SET @@GLOBAL.GTID_PURGED='+142694f1-d0bc-11f1:1-9';*/\n\
+            -- CHANGE MASTER TO MASTER_LOG_FILE='node-bin.000003', MASTER_LOG_POS=1068;\n\
+            DROP TABLE IF EXISTS `t`;\n";
+        let (gtid, log) = parse_mysql_base_coord(header).expect("coord parses");
+        assert_eq!(gtid, "142694f1-d0bc-11f1:1-9"); // leading '+' stripped
+        assert_eq!(log, "node-bin.000003");
+        // A dump with no coordinate (binlog/gtid off) ⇒ None ⇒ the delta full-dumps.
+        assert_eq!(parse_mysql_base_coord("DROP TABLE IF EXISTS `t`;"), None);
+    }
+
+    #[test]
+    fn mysql_binlog_ddl_scan_distinguishes_row_dml_from_ddl() {
+        // A clean ROW-only delta: comments, session SETs, a BINLOG base64 block, BEGIN/COMMIT.
+        let row_only = "/*!50530 SET @@SESSION.PSEUDO_SLAVE_MODE=1*/;\n\
+            # at 197\n\
+            SET @@session.sql_mode=1168113696/*!*/;\n\
+            BEGIN\n\
+            /*!*/;\n\
+            BINLOG '\n\
+            jnneag8BAAAAegAAAH4AAAA=\n\
+            '/*!*/;\n\
+            COMMIT\n\
+            /*!*/;\n";
+        assert!(
+            !mysql_binlog_decoded_has_ddl(row_only),
+            "a pure ROW/DML delta carries no DDL"
+        );
+        // A DDL event in the range (statement-logged even in ROW format) ⇒ fall back to a full dump.
+        let with_ddl = format!("{row_only}ALTER TABLE `t` ADD COLUMN `c` int\n/*!*/;\n");
+        assert!(
+            mysql_binlog_decoded_has_ddl(&with_ddl),
+            "an ALTER in the range must be detected as DDL"
+        );
+        let with_create = format!("{row_only}CREATE TABLE `u` (id int)\n/*!*/;\n");
+        assert!(mysql_binlog_decoded_has_ddl(&with_create));
     }
 
     #[test]
