@@ -264,6 +264,233 @@ pub fn relation_cache(changes: &[Change]) -> BTreeMap<u32, Relation> {
     m
 }
 
+// ===========================================================================================
+// Replay rendering — decoded changes → parameterized SQL (the untrusted-delta trust boundary)
+// ===========================================================================================
+
+/// A loud replay-render error. A delta that cannot be rendered to faithful SQL is REFUSED (the
+/// engine falls back to a full dump), never applied partially.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReplayError {
+    /// A change referenced a relation id with no preceding `Relation` message.
+    #[error("change references unknown relation id {0}")]
+    UnknownRelation(u32),
+    /// An UPDATE/DELETE on a table whose `REPLICA IDENTITY` is `nothing` — no way to match the
+    /// row, so the delta cannot be replayed faithfully (⇒ full-dump fallback).
+    #[error("table {0:?} has REPLICA IDENTITY NOTHING — cannot replay row updates/deletes")]
+    NoReplicaIdentity(String),
+    /// An UPDATE/DELETE whose old/key tuple is missing (the stream did not carry the row identity).
+    #[error("missing old/key tuple for an update/delete on {0:?}")]
+    MissingOldTuple(String),
+    /// An INSERT carried an unchanged-TOAST column (only valid in an UPDATE's new tuple).
+    #[error("unchanged-TOAST column in an INSERT on {0:?} (malformed stream)")]
+    ToastInInsert(String),
+    /// A tuple's column count did not match its relation's.
+    #[error("tuple has {got} columns, relation {table:?} has {want}")]
+    Arity {
+        table: String,
+        got: usize,
+        want: usize,
+    },
+}
+
+/// Quote a Postgres identifier (double-quote, escaping embedded quotes) — the ONLY way a decoded
+/// relation/column name reaches the replay SQL, so an adversarial name is inert.
+#[must_use]
+pub fn quote_ident(ident: &str) -> String {
+    let mut s = String::with_capacity(ident.len() + 2);
+    s.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            s.push('"');
+        }
+        s.push(ch);
+    }
+    s.push('"');
+    s
+}
+
+/// Quote a value as a Postgres string LITERAL (`'…'`, doubling embedded quotes). A string literal
+/// has the `unknown` type, so Postgres coerces it to the target column's type on apply — which is
+/// why replay inlines values this way rather than binding typed `text` params (a `text` param will
+/// NOT implicitly coerce to e.g. `int4`). SAFE only with `standard_conforming_strings = on` (the
+/// modern default), which the node SETs on the replay session; combined with [`quote_ident`] for
+/// every identifier, a crafted delta value/name cannot inject (the inc2 trust-boundary lesson),
+/// and replay also runs as the ephemeral NON-superuser role on the isolated shadow as defence in depth.
+#[must_use]
+pub fn quote_literal(value: &str) -> String {
+    let mut s = String::with_capacity(value.len() + 2);
+    s.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            s.push('\'');
+        }
+        s.push(ch);
+    }
+    s.push('\'');
+    s
+}
+
+/// The SQL literal for one tuple value: `NULL`, a quoted string literal, or — for an
+/// unchanged-TOAST column — `None` (the caller decides: skip it in an UPDATE SET, refuse it in an
+/// INSERT or a row-identity position).
+fn lit(v: &TupleValue) -> Option<String> {
+    match v {
+        TupleValue::Null => Some("NULL".to_string()),
+        TupleValue::Text(t) => Some(quote_literal(t)),
+        TupleValue::UnchangedToast => None,
+    }
+}
+
+/// Render a decoded `pgoutput` change stream into ordered replay SQL statements (Begin/Commit
+/// become `BEGIN`/`COMMIT`, so a source transaction stays atomic on replay). Each statement is
+/// complete, self-contained SQL with identifiers [`quote_ident`]'d and values inlined as
+/// [`quote_literal`]'d literals (see that fn for why literals, not params). Maintains its own
+/// relation cache from the `Relation` messages. Any change it cannot render faithfully is a loud
+/// [`ReplayError`] — the engine then falls back to a full dump rather than apply a partial.
+pub fn render_changes(changes: &[Change]) -> Result<Vec<String>, ReplayError> {
+    let mut cache: BTreeMap<u32, &Relation> = BTreeMap::new();
+    let mut out = Vec::new();
+    for c in changes {
+        match c {
+            Change::Begin { .. } => out.push("BEGIN".to_string()),
+            Change::Commit { .. } => out.push("COMMIT".to_string()),
+            Change::Relation(r) => {
+                cache.insert(r.rel_id, r);
+            }
+            Change::Insert { rel_id, new } => {
+                let rel = *cache
+                    .get(rel_id)
+                    .ok_or(ReplayError::UnknownRelation(*rel_id))?;
+                check_arity(rel, new)?;
+                let mut cols = Vec::new();
+                let mut vals = Vec::new();
+                for (col, val) in rel.columns.iter().zip(&new.values) {
+                    let v = lit(val).ok_or_else(|| ReplayError::ToastInInsert(rel.name.clone()))?;
+                    cols.push(quote_ident(&col.name));
+                    vals.push(v);
+                }
+                out.push(format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    qtable(rel),
+                    cols.join(", "),
+                    vals.join(", ")
+                ));
+            }
+            Change::Update {
+                rel_id,
+                key_or_old,
+                new,
+            } => {
+                let rel = *cache
+                    .get(rel_id)
+                    .ok_or(ReplayError::UnknownRelation(*rel_id))?;
+                check_arity(rel, new)?;
+                // SET: every column whose new value is concrete or NULL (skip unchanged-TOAST —
+                // the old value is retained).
+                let mut sets = Vec::new();
+                for (col, val) in rel.columns.iter().zip(&new.values) {
+                    if let Some(v) = lit(val) {
+                        sets.push(format!("{} = {}", quote_ident(&col.name), v));
+                    }
+                }
+                let where_sql = render_where(rel, key_or_old.as_ref(), Some(new))?;
+                out.push(format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    qtable(rel),
+                    sets.join(", "),
+                    where_sql
+                ));
+            }
+            Change::Delete { rel_id, key_or_old } => {
+                let rel = *cache
+                    .get(rel_id)
+                    .ok_or(ReplayError::UnknownRelation(*rel_id))?;
+                let where_sql = render_where(rel, key_or_old.as_ref(), None)?;
+                out.push(format!("DELETE FROM {} WHERE {}", qtable(rel), where_sql));
+            }
+            Change::Truncate { rel_ids } => {
+                for rel_id in rel_ids {
+                    let rel = *cache
+                        .get(rel_id)
+                        .ok_or(ReplayError::UnknownRelation(*rel_id))?;
+                    out.push(format!("TRUNCATE {}", qtable(rel)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `"ns"."table"` — both halves quoted.
+fn qtable(rel: &Relation) -> String {
+    format!("{}.{}", quote_ident(&rel.namespace), quote_ident(&rel.name))
+}
+
+fn check_arity(rel: &Relation, t: &Tuple) -> Result<(), ReplayError> {
+    if t.values.len() != rel.columns.len() {
+        return Err(ReplayError::Arity {
+            table: rel.name.clone(),
+            got: t.values.len(),
+            want: rel.columns.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Build the `WHERE` fragment that identifies the row for an UPDATE/DELETE, per the relation's
+/// `REPLICA IDENTITY`: `full` matches on ALL columns of the old tuple; `default`/`index` match on
+/// the key columns (old tuple if present, else the new tuple at the key positions); `nothing`
+/// cannot match (loud error → full-dump fallback). Values inlined as literals.
+fn render_where(
+    rel: &Relation,
+    old: Option<&Tuple>,
+    new: Option<&Tuple>,
+) -> Result<String, ReplayError> {
+    // Columns that identify the row, with the tuple to read their values from.
+    let (match_cols, source): (Vec<usize>, &Tuple) = match rel.replica_identity {
+        b'f' => {
+            // FULL: every column, from the old tuple (which carries all old values).
+            let src = old.ok_or_else(|| ReplayError::MissingOldTuple(rel.name.clone()))?;
+            check_arity(rel, src)?;
+            ((0..rel.columns.len()).collect(), src)
+        }
+        b'd' | b'i' => {
+            let keys: Vec<usize> = rel
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.key)
+                .map(|(i, _)| i)
+                .collect();
+            if keys.is_empty() {
+                return Err(ReplayError::NoReplicaIdentity(rel.name.clone()));
+            }
+            // Prefer the old/key tuple (present when the key changed or on DELETE); else the new
+            // tuple carries the current key (an UPDATE that left the key unchanged).
+            let src = old
+                .or(new)
+                .ok_or_else(|| ReplayError::MissingOldTuple(rel.name.clone()))?;
+            check_arity(rel, src)?;
+            (keys, src)
+        }
+        _ => return Err(ReplayError::NoReplicaIdentity(rel.name.clone())),
+    };
+    let mut frags = Vec::new();
+    for i in match_cols {
+        let col = quote_ident(&rel.columns[i].name);
+        match &source.values[i] {
+            TupleValue::Null => frags.push(format!("{col} IS NULL")),
+            TupleValue::Text(t) => frags.push(format!("{col} = {}", quote_literal(t))),
+            // An unchanged-TOAST value in a row-identity position cannot be matched — refuse.
+            TupleValue::UnchangedToast => {
+                return Err(ReplayError::MissingOldTuple(rel.name.clone()));
+            }
+        }
+    }
+    Ok(frags.join(" AND "))
+}
+
 /// A big-endian reader with loud bounds checks (mirrors the project_delta `FrameReader`).
 struct Be<'a> {
     buf: &'a [u8],
@@ -505,5 +732,132 @@ mod tests {
             decode_framed(&0u32.to_le_bytes()),
             Err(PgoutputError::EmptyFrame(_))
         ));
+    }
+
+    // ---- replay rendering ----
+
+    fn rel(rel_id: u32, ns: &str, name: &str, ri: u8, cols: &[(&str, bool)]) -> Change {
+        Change::Relation(Relation {
+            rel_id,
+            namespace: ns.into(),
+            name: name.into(),
+            replica_identity: ri,
+            columns: cols
+                .iter()
+                .map(|(n, k)| RelationColumn {
+                    key: *k,
+                    name: (*n).into(),
+                    type_oid: 25,
+                })
+                .collect(),
+        })
+    }
+    fn txt(s: &str) -> TupleValue {
+        TupleValue::Text(s.into())
+    }
+    fn tup(vs: Vec<TupleValue>) -> Tuple {
+        Tuple { values: vs }
+    }
+
+    #[test]
+    fn renders_insert_update_delete_with_default_identity() {
+        let changes = vec![
+            rel(1, "public", "t", b'd', &[("id", true), ("c", false)]),
+            Change::Insert {
+                rel_id: 1,
+                new: tup(vec![txt("1"), txt("hi")]),
+            },
+            // UPDATE that left the key unchanged (no key tuple) → WHERE on new's key col.
+            Change::Update {
+                rel_id: 1,
+                key_or_old: None,
+                new: tup(vec![txt("1"), txt("bye")]),
+            },
+            Change::Delete {
+                rel_id: 1,
+                key_or_old: Some(tup(vec![txt("1"), TupleValue::Null])),
+            },
+        ];
+        let stmts = render_changes(&changes).expect("render");
+        assert_eq!(
+            stmts,
+            vec![
+                r#"INSERT INTO "public"."t" ("id", "c") VALUES ('1', 'hi')"#.to_string(),
+                // UPDATE sets both columns, matches on the key column from the new tuple.
+                r#"UPDATE "public"."t" SET "id" = '1', "c" = 'bye' WHERE "id" = '1'"#.to_string(),
+                r#"DELETE FROM "public"."t" WHERE "id" = '1'"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_identity_matches_all_columns_and_unchanged_toast_skipped_in_set() {
+        let changes = vec![
+            rel(5, "app", "doc", b'f', &[("id", false), ("body", false)]),
+            // UPDATE with FULL identity: old = all old values; new body is unchanged-TOAST.
+            Change::Update {
+                rel_id: 5,
+                key_or_old: Some(tup(vec![txt("7"), txt("old-body")])),
+                new: tup(vec![txt("7"), TupleValue::UnchangedToast]),
+            },
+        ];
+        let stmts = render_changes(&changes).expect("render");
+        // SET only the id (body is unchanged-TOAST → omitted); WHERE on ALL old columns.
+        assert_eq!(
+            stmts[0],
+            r#"UPDATE "app"."doc" SET "id" = '7' WHERE "id" = '7' AND "body" = 'old-body'"#
+        );
+    }
+
+    #[test]
+    fn crafted_name_and_value_cannot_inject() {
+        // A malicious table/column NAME (quoted as an identifier) AND a malicious VALUE (quoted as
+        // a string literal) must both be escaped, not executed.
+        let changes = vec![
+            rel(
+                9,
+                r#"ns"x"#,
+                r#"t"; DROP TABLE users; --"#,
+                b'd',
+                &[("id", true), ("c", false)],
+            ),
+            Change::Insert {
+                rel_id: 9,
+                new: tup(vec![txt("1"), txt("x'); DROP TABLE users; --")]),
+            },
+        ];
+        let stmts = render_changes(&changes).expect("render");
+        assert_eq!(
+            stmts[0],
+            r#"INSERT INTO "ns""x"."t""; DROP TABLE users; --" ("id", "c") VALUES ('1', 'x''); DROP TABLE users; --')"#
+        );
+        // The dangerous name is inside a quoted identifier; the dangerous value inside a quoted
+        // string literal (the `'` doubled) — both inert.
+        assert!(stmts[0].contains(r#""t""; DROP TABLE users; --""#));
+        assert!(stmts[0].contains(r#"'x''); DROP TABLE users; --'"#));
+    }
+
+    #[test]
+    fn replay_refuses_unknown_relation_and_no_identity() {
+        // No Relation message for the id → UnknownRelation.
+        assert_eq!(
+            render_changes(&[Change::Insert {
+                rel_id: 1,
+                new: tup(vec![txt("1")])
+            }]),
+            Err(ReplayError::UnknownRelation(1))
+        );
+        // REPLICA IDENTITY NOTHING on a DELETE → cannot match → refuse (full-dump fallback).
+        let changes = vec![
+            rel(2, "public", "noident", b'n', &[("a", false)]),
+            Change::Delete {
+                rel_id: 2,
+                key_or_old: Some(tup(vec![txt("x")])),
+            },
+        ];
+        assert_eq!(
+            render_changes(&changes),
+            Err(ReplayError::NoReplicaIdentity("noident".into()))
+        );
     }
 }
