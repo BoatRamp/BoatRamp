@@ -115,6 +115,38 @@ pub struct DeltaInfo {
     pub sql_strategy: SqlDeltaKind,
 }
 
+/// The per-SQL-member base CURSOR recorded in a TRUE-delta member's manifest entry — the point the
+/// delta was captured since, so restore replays from exactly there. Absent on a member ⇒ a
+/// full-dump member (the all-families-consistent fallback, decision 3), which has no replay. Tagged
+/// by engine so a reader can tell which replay path a member needs. (SQL true-delta program — see
+/// `PLAN-sql-true-delta.md`; the cursor is small metadata stored in the manifest JSON, not framed.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "engine")]
+pub enum SqlMemberCursor {
+    /// Postgres logical-replication LSN — the capture slot's consistent point at the base. The delta
+    /// member carries the decoded change stream since this LSN.
+    PgLsn { lsn: String },
+    /// MySQL GTID set executed as of the base. The delta member carries the binlog events since it.
+    MysqlGtid { gtid: String },
+    /// libsql/SQLite: the SHA-256 of the base DB SNAPSHOT the changeset was diffed against (no
+    /// page-version watermark exists, so the base file itself is the cursor). The delta member
+    /// carries the changeset applied onto the base.
+    LibsqlChangesetBase { base_sha256: String },
+}
+
+impl SqlMemberCursor {
+    /// The SQL-delta strategy this cursor belongs to (keeps the cursor and the member's
+    /// [`SqlDeltaKind`] in lockstep).
+    #[must_use]
+    pub fn kind(&self) -> SqlDeltaKind {
+        match self {
+            Self::PgLsn { .. } => SqlDeltaKind::PgWalReplay,
+            Self::MysqlGtid { .. } => SqlDeltaKind::MysqlBinlogReplay,
+            Self::LibsqlChangesetBase { .. } => SqlDeltaKind::LibsqlChangeset,
+        }
+    }
+}
+
 // ===========================================================================================
 // KV delta — decision 2 (KV is the most natural: adds-as-upserts + deletes-as-tombstones)
 // ===========================================================================================
@@ -727,6 +759,37 @@ mod tests {
             matches!(decode_blob_tombstones(&blob), Err(DeltaError::Truncated(_))),
             "a forged huge count must fail loud, not allocate ~u32::MAX entries"
         );
+    }
+
+    /// The per-member SQL cursor's wire shape is DURABLE (stored in the manifest JSON), so lock it:
+    /// `engine`-tagged, snake_case, and each variant maps back to its strategy kind.
+    #[test]
+    fn sql_member_cursor_wire_shape_and_kind() {
+        let pg = SqlMemberCursor::PgLsn {
+            lsn: "0/16B3748".into(),
+        };
+        let j = serde_json::to_string(&pg).unwrap();
+        assert_eq!(j, r#"{"engine":"pg_lsn","lsn":"0/16B3748"}"#);
+        assert_eq!(pg.kind(), SqlDeltaKind::PgWalReplay);
+        assert_eq!(serde_json::from_str::<SqlMemberCursor>(&j).unwrap(), pg);
+
+        let my = SqlMemberCursor::MysqlGtid {
+            gtid: "3E11FA47-71CA:1-5".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&my).unwrap(),
+            r#"{"engine":"mysql_gtid","gtid":"3E11FA47-71CA:1-5"}"#
+        );
+        assert_eq!(my.kind(), SqlDeltaKind::MysqlBinlogReplay);
+
+        let ls = SqlMemberCursor::LibsqlChangesetBase {
+            base_sha256: "deadbeef".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&ls).unwrap(),
+            r#"{"engine":"libsql_changeset_base","base_sha256":"deadbeef"}"#
+        );
+        assert_eq!(ls.kind(), SqlDeltaKind::LibsqlChangeset);
     }
 
     /// The SQL-delta scaffold: the fallback is NOT a true delta; the scaffolded strategies would be.

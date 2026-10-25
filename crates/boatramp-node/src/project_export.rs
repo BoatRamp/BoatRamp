@@ -3334,6 +3334,24 @@ impl NodeProjectExport {
                     .notes
                     .push(format!("blob delta: {deleted} tombstone(s)"));
             }
+            // SQL TRUE-delta members (the SQL true-delta program, PLAN-sql-true-delta.md): each is
+            // REPLAYED onto the base already restored in the shadow, using the member's `sql_cursor`
+            // as the replay point. The per-engine replay lands in its own stage (pg WAL / mysql
+            // binlog / libsql changeset); Stage 0 wires the dispatch seam and fails closed until the
+            // engine is built, so a bundle carrying one of these on this build is refused loudly
+            // rather than silently skipped (never a partial restore).
+            MemberKind::PgWalDelta | MemberKind::MysqlBinlogDelta | MemberKind::LibsqlChangeset => {
+                return Err(Perr::Other(format!(
+                    "this build cannot restore a SQL true-delta member ({:?}) — the {} replay \
+                     engine is not yet compiled into this node (SQL true-delta program)",
+                    spec.kind,
+                    match spec.kind {
+                        MemberKind::PgWalDelta => "Postgres WAL",
+                        MemberKind::MysqlBinlogDelta => "MySQL binlog",
+                        _ => "libsql changeset",
+                    }
+                )));
+            }
         }
         Ok(())
     }
@@ -3646,8 +3664,15 @@ impl NodeProjectExport {
                     })?;
                     ordered.push((spec.clone(), job));
                 }
-                MemberKind::KvDelta | MemberKind::BlobTombstone => {
-                    // plan_export never emits these; unreachable in a full plan.
+                MemberKind::KvDelta
+                | MemberKind::BlobTombstone
+                | MemberKind::PgWalDelta
+                | MemberKind::MysqlBinlogDelta
+                | MemberKind::LibsqlChangeset => {
+                    // plan_export (a FULL plan) never emits delta/true-delta members; unreachable
+                    // here. The SQL arm above keeps the full dump (fallback); the per-engine
+                    // true-delta capture that would REPLACE a PgDump/MysqlDump/Libsql member with a
+                    // PgWalDelta/MysqlBinlogDelta/LibsqlChangeset lands in its own stage.
                 }
             }
         }

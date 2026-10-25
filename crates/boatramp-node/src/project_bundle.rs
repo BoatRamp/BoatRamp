@@ -83,6 +83,18 @@ pub enum MemberKind {
     /// keys deleted since the base (deletes-as-tombstones). The blobs that were ADDED/CHANGED ride
     /// as ordinary `Blob` members (adds-as-full-members).
     BlobTombstone,
+    /// A Postgres logical-WAL **delta** (`sql/<db>.pgwal`) — present only in a TRUE-delta bundle: the
+    /// decoded change stream since the member's `sql_cursor` LSN, replayed onto the restored base.
+    /// (SQL true-delta program; replaces the full `PgDump` member for that DB when a true-delta was
+    /// captured.)
+    PgWalDelta,
+    /// A MySQL binlog **delta** (`sql/<db>.mysqlbinlog`) — the binlog events since the member's
+    /// `sql_cursor` GTID, replayed onto the restored base.
+    MysqlBinlogDelta,
+    /// A libsql/SQLite **changeset** (`libsql/<project>/<site>/<db>.changeset`) — the row-level
+    /// changeset diffed against the base snapshot named by the member's `sql_cursor`, applied onto
+    /// the restored base.
+    LibsqlChangeset,
 }
 
 /// SQL-dump provenance for a `PgDump`/`MysqlDump` member: the detected server version,
@@ -119,6 +131,11 @@ pub struct ManifestMember {
     /// Postgres provenance (only for `PgDump` members).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg: Option<PgMemberInfo>,
+    /// The base CURSOR for a TRUE-delta SQL member (`PgWalDelta`/`MysqlBinlogDelta`/
+    /// `LibsqlChangeset`) — the point the delta was captured since, so restore replays from there.
+    /// `None` for every other member (incl. a full-dump SQL member in the all-families fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_cursor: Option<boatramp_core::project_delta::SqlMemberCursor>,
 }
 
 /// What the bundle was exported from.
@@ -323,6 +340,9 @@ pub fn write_bundle(
             size,
             sha256,
             pg: m.pg.clone(),
+            // The v1 whole-staging path never emits a true-delta member (those flow through the
+            // v3 streaming writer via `MemberSpec::with_sql_cursor`), so no cursor here.
+            sql_cursor: None,
         });
     }
     let manifest = Manifest {
@@ -547,6 +567,11 @@ pub struct MemberSpec {
     /// Postgres/MySQL provenance (only for `PgDump`/`MysqlDump` members).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg: Option<PgMemberInfo>,
+    /// The base CURSOR for a TRUE-delta SQL member (see [`ManifestMember::sql_cursor`]); `None` for
+    /// every full member. Carried here too so the MANIFEST (written before members are produced)
+    /// already declares the replay point a reader will need.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_cursor: Option<boatramp_core::project_delta::SqlMemberCursor>,
 }
 
 impl MemberSpec {
@@ -557,6 +582,7 @@ impl MemberSpec {
             kind,
             framing: MemberFraming::Sidecar,
             pg,
+            sql_cursor: None,
         }
     }
 
@@ -567,7 +593,19 @@ impl MemberSpec {
             kind,
             framing: MemberFraming::ChunkedTrailer,
             pg,
+            sql_cursor: None,
         }
+    }
+
+    /// Attach a TRUE-delta base cursor to this member spec (builder; used by the SQL true-delta
+    /// capture when it emits a `PgWalDelta`/`MysqlBinlogDelta`/`LibsqlChangeset` member).
+    #[must_use]
+    pub fn with_sql_cursor(
+        mut self,
+        cursor: boatramp_core::project_delta::SqlMemberCursor,
+    ) -> Self {
+        self.sql_cursor = Some(cursor);
+        self
     }
 }
 
@@ -1721,6 +1759,7 @@ mod tests {
                     size: 3,
                     sha256: "00".repeat(32), // deliberately wrong
                     pg: None,
+                    sql_cursor: None,
                 }],
             };
             let j = serde_json::to_vec(&m).unwrap();
@@ -1761,6 +1800,7 @@ mod tests {
                     kind: MemberKind::Identity,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 },
                 b"IDENTITY-KEK-TRANSPORT".to_vec(),
             ),
@@ -1770,6 +1810,7 @@ mod tests {
                     kind: MemberKind::Blob,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 },
                 vec![0xAB; 4096],
             ),
@@ -1783,6 +1824,7 @@ mod tests {
                         client_image: "pgvector/pgvector:pg16".to_string(),
                         schema_fingerprint: Some("deadbeef".to_string()),
                     }),
+                    sql_cursor: None,
                 },
                 vec![7u8; 50_000],
             ),
@@ -1792,6 +1834,7 @@ mod tests {
                     kind: MemberKind::Kv,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 },
                 b"BRKVDUMP\x01\x02\x03".to_vec(),
             ),
@@ -1928,6 +1971,7 @@ mod tests {
                     kind: MemberKind::PgDump,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 }],
                 delta: None,
             };
@@ -1982,6 +2026,7 @@ mod tests {
                     kind: MemberKind::PgDump,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 }],
                 delta: None,
             };
@@ -2012,12 +2057,14 @@ mod tests {
                 kind: MemberKind::Blob,
                 framing: MemberFraming::Sidecar,
                 pg: None,
+                sql_cursor: None,
             },
             MemberSpec {
                 path: "b".to_string(),
                 kind: MemberKind::Blob,
                 framing: MemberFraming::Sidecar,
                 pg: None,
+                sql_cursor: None,
             },
         ];
         let td = tempfile::tempdir().unwrap();
@@ -2090,6 +2137,7 @@ mod tests {
                 kind: MemberKind::Blob,
                 framing: MemberFraming::Sidecar,
                 pg: None,
+                sql_cursor: None,
             })
             .collect();
 
@@ -2172,6 +2220,7 @@ mod tests {
                     kind: MemberKind::PgDump,
                     framing: MemberFraming::Sidecar,
                     pg: None,
+                    sql_cursor: None,
                 }],
                 delta: None,
             };
@@ -2234,6 +2283,7 @@ mod tests {
                 kind: MemberKind::Kv,
                 framing: MemberFraming::Sidecar,
                 pg: None,
+                sql_cursor: None,
             }],
             |_s| {
                 let p = stage.join("m");
