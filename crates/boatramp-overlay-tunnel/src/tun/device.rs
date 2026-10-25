@@ -88,7 +88,63 @@ pub async fn install_route(cidr: Ipv4Cidr, if_index: u32) -> Result<(), DeviceEr
         .with_ifindex(if_index);
     match handle.add(&route).await {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if is_route_already_exists(&e) => Ok(()),
         Err(e) => Err(DeviceError::Route { cidr, source: e }),
+    }
+}
+
+/// Is this route-add error the benign "that route already exists"? Assigning `interface_addr` with
+/// `cidr`'s prefix (in [`open`]) makes the kernel add the identical connected route for free, so the
+/// explicit add here is an expected duplicate on a real Linux box, NOT a failure.
+///
+/// `net-route`'s rtnetlink backend does NOT map the kernel's `EEXIST` to
+/// [`std::io::ErrorKind::AlreadyExists`] — it surfaces it as an `ErrorKind::Other` whose message
+/// carries the raw `"File exists (os error 17)"` text. So the obvious `e.kind() == AlreadyExists`
+/// check alone silently misses the one case it exists to tolerate (this bit on a real kernel: the
+/// `tunnel-tun` nixosTest caught the resulting start-up failure the bare dev `cargo test` never
+/// could). Match the mapped kind, the raw errno, AND the textual form so the tolerance is robust to
+/// however the backend chooses to represent it.
+fn is_route_already_exists(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(17) {
+        return true;
+    }
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("file exists") || msg.contains("already exists") || msg.contains("os error 17")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_route_already_exists;
+    use std::io;
+
+    #[test]
+    fn classifies_the_mapped_already_exists_kind() {
+        assert!(is_route_already_exists(&io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "route exists"
+        )));
+    }
+
+    #[test]
+    fn classifies_the_raw_eexist_errno() {
+        assert!(is_route_already_exists(&io::Error::from_raw_os_error(17)));
+    }
+
+    #[test]
+    fn classifies_net_routes_textual_netlink_eexist() {
+        // The exact shape net-route's rtnetlink backend returns (kind = Other, no raw errno) — the
+        // case the bare `AlreadyExists` check missed and the `tunnel-tun` nixosTest exposed.
+        let e = io::Error::other("Received a netlink error message File exists (os error 17)");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(e.raw_os_error(), None);
+        assert!(is_route_already_exists(&e));
+    }
+
+    #[test]
+    fn does_not_classify_an_unrelated_error() {
+        assert!(!is_route_already_exists(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "operation not permitted"
+        )));
     }
 }

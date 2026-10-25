@@ -293,8 +293,10 @@ fn accept_fresh_syns(
         // THE plan §5 gate: a destination this process never allocated (via DNS, plan §3.3) gets
         // no socket at all — scanning other addresses in the routed CIDR dials nothing.
         let Some(service) = allocator.resolve(info.dst.0) else {
+            tracing::debug!(dst = ?info.dst, "boatramp tunnel: fresh SYN to an unallocated address — ignored");
             continue;
         };
+        tracing::debug!(dst = ?info.dst, %service, "boatramp tunnel: fresh SYN to a known service — creating a listening socket");
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; RX_BUFFER_SIZE]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TX_BUFFER_SIZE]);
@@ -349,6 +351,7 @@ fn service_connections(
         // only narrows WHEN the dial fires, not how long an incomplete attempt occupies a slot.
         if !conn.bridge_started && socket.state() == tcp::State::Established {
             conn.bridge_started = true;
+            tracing::debug!(service = %conn.service, dst = ?conn.dst, "boatramp tunnel: TUN connection established — starting overlay bridge/dial");
             listening.remove(&conn.dst);
             let to_app_rx = conn
                 .to_app_rx_holder

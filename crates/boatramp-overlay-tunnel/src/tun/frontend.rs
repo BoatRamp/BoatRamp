@@ -330,10 +330,23 @@ fn spawn_device_pumps(device: Arc<tun_rs::AsyncDevice>, mtu: usize) -> DevicePum
             // Headroom over the configured MTU: some platforms prepend a small per-packet header
             // (e.g. Linux's optional 4-byte "packet information" prefix) ahead of the IP payload.
             let mut buf = vec![0u8; mtu + 64];
+            let mut logged_first = false;
             loop {
                 match device.recv(&mut buf).await {
                     Ok(0) => continue,
                     Ok(n) => {
+                        if !logged_first {
+                            logged_first = true;
+                            // One-shot: the leading bytes of the first frame the kernel hands us —
+                            // a raw IPv4 frame starts with 0x45 (v4, IHL 5); a 0x00 0x00 prefix
+                            // would mean the device is delivering a 4-byte packet-information header
+                            // that would misalign the IP parser.
+                            tracing::debug!(
+                                n,
+                                head = ?&buf[..n.min(8)],
+                                "boatramp tunnel: first frame read from the TUN device"
+                            );
+                        }
                         if raw_in_tx.send(buf[..n].to_vec()).await.is_err() {
                             break; // the netstack task is gone
                         }
