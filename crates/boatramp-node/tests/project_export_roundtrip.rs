@@ -3177,3 +3177,471 @@ async fn project_export_cross_tenant_leak_gate() {
 
     println!("PROJECT EXPORT CROSS-TENANT LEAK GATE OK");
 }
+
+// ===========================================================================================
+// pg WAL true-delta (PLAN-sql-true-delta Stage 2)
+// ===========================================================================================
+
+/// A raw `pgoutput` (proto v1) message body is big-endian: these build the bytes the capture
+/// drain would frame, so the tests exercise the real `frame → decode_framed → render_changes`
+/// replay pipeline.
+fn po_be32(n: u32) -> [u8; 4] {
+    n.to_be_bytes()
+}
+fn po_tcol(s: &str) -> Vec<u8> {
+    let mut v = vec![b't'];
+    v.extend_from_slice(&po_be32(s.len() as u32));
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+fn po_msg(tag: char, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag as u8];
+    v.extend_from_slice(body);
+    v
+}
+
+/// A framed `pgoutput` stream whose Relation namespace + table + the INSERT value all carry
+/// SQL-injection payloads — a CRAFTED true-delta member. `render_changes` must quote every piece
+/// INERT (identifiers via `quote_ident`, the value via `quote_literal`); executed against a
+/// restored base it targets a NONEXISTENT (quoted) table and fails fail-closed — the embedded
+/// `DROP TABLE victim` never runs.
+fn crafted_injection_pgwal() -> Vec<u8> {
+    use boatramp_core::pgoutput::frame_message;
+    let evil_ns = r#"public"; DROP TABLE victim; --"#;
+    let evil_tbl = r#"t"; DROP TABLE victim; --"#;
+    let evil_val = r#"99'); DROP TABLE victim; --"#;
+    let mut rel = Vec::new();
+    rel.extend_from_slice(&po_be32(1)); // rel_id
+    rel.extend_from_slice(evil_ns.as_bytes());
+    rel.push(0);
+    rel.extend_from_slice(evil_tbl.as_bytes());
+    rel.push(0);
+    rel.push(b'd'); // REPLICA IDENTITY default
+    rel.extend_from_slice(&1u16.to_be_bytes()); // 1 column
+    rel.push(1); // key
+    rel.extend_from_slice(b"id\0");
+    rel.extend_from_slice(&po_be32(23)); // int4 oid
+    rel.extend_from_slice(&po_be32(0xFFFF_FFFF)); // typmod -1
+    let mut ins = Vec::new();
+    ins.extend_from_slice(&po_be32(1));
+    ins.push(b'N');
+    ins.extend_from_slice(&1u16.to_be_bytes());
+    ins.extend_from_slice(&po_tcol(evil_val));
+    [
+        frame_message(&po_msg('R', &rel)),
+        frame_message(&po_msg('I', &ins)),
+    ]
+    .concat()
+}
+
+/// MERGE-GATE (no Docker / no Postgres): the untrusted pg-WAL delta trust boundary the node crosses
+/// on replay. A crafted framed delta whose change carries SQL-injection payloads in every
+/// identifier + value must `decode_framed` + `render_changes` to INERT, fully-quoted SQL; and a
+/// change on a `REPLICA IDENTITY NOTHING` table is REFUSED (so the engine falls back to a full
+/// dump rather than replay a row it cannot match). This is the pg-WAL analogue of the ≥2-tenant
+/// leak gate's "a crafted change cannot escape its scope", proven at the render boundary.
+#[test]
+fn pg_wal_delta_crafted_change_renders_inert() {
+    use boatramp_core::pgoutput::{ReplayError, decode_framed, frame_message, render_changes};
+
+    let changes =
+        decode_framed(&crafted_injection_pgwal()).expect("decode the crafted framed delta");
+    let stmts = render_changes(&changes).expect("render the crafted change");
+    assert_eq!(stmts.len(), 1);
+    // Deterministic, mutation-sensitive: every `"`/`'` is doubled, so the `; DROP TABLE victim; --`
+    // lives ONLY inside a quoted identifier or a quoted string literal — never a bare statement.
+    assert_eq!(
+        stmts[0],
+        r#"INSERT INTO "public""; DROP TABLE victim; --"."t""; DROP TABLE victim; --" ("id") VALUES ('99''); DROP TABLE victim; --')"#,
+        "a crafted delta must render to inert, fully-quoted SQL (no injection)"
+    );
+
+    // A REPLICA IDENTITY NOTHING delete cannot be faithfully matched → render REFUSES it (the engine
+    // then falls back to a full dump; never a partial/guessed replay).
+    let mut rel = Vec::new();
+    rel.extend_from_slice(&po_be32(2));
+    rel.extend_from_slice(b"public\0noident\0");
+    rel.push(b'n'); // REPLICA IDENTITY NOTHING
+    rel.extend_from_slice(&1u16.to_be_bytes());
+    rel.push(0);
+    rel.extend_from_slice(b"a\0");
+    rel.extend_from_slice(&po_be32(25));
+    rel.extend_from_slice(&po_be32(0xFFFF_FFFF));
+    let mut del = Vec::new();
+    del.extend_from_slice(&po_be32(2));
+    del.push(b'O');
+    del.extend_from_slice(&1u16.to_be_bytes());
+    del.extend_from_slice(&po_tcol("x"));
+    let stream = [
+        frame_message(&po_msg('R', &rel)),
+        frame_message(&po_msg('D', &del)),
+    ]
+    .concat();
+    let ch = decode_framed(&stream).expect("decode");
+    assert!(
+        matches!(render_changes(&ch), Err(ReplayError::NoReplicaIdentity(_))),
+        "a REPLICA IDENTITY NOTHING delta must be refused → full-dump fallback"
+    );
+}
+
+/// LIVE gate (Docker + a `wal_level=logical` Postgres): the pg logical-WAL true-delta round-trip.
+/// Seeds a base, creates a BASE resumable export (which creates the pgoutput capture slot), mutates
+/// rows (insert/update/delete), takes an INCREMENTAL delta export (which drains the slot into a
+/// `PgWalDelta` member), then imports the chain and asserts the restored db EXACTLY equals the
+/// MUTATED source — a result ONLY base-dump + WAL-replay can produce (the base dump alone is the
+/// pre-mutation state). Also proves: the delta is a TRUE WAL delta (not a full-dump fallback), the
+/// drain drops the slot (bounded retention §4), a CRAFTED delta is refused fail-closed with the
+/// victim table + a SECOND tenant's db left untouched. Marker: `PROJECT EXPORT PG TRUE-DELTA OK`.
+#[tokio::test]
+async fn project_export_pg_true_delta_roundtrip_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pg true-delta round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pg true-delta not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let s = now_suffix();
+    let live_db = format!("brexp_td_live_{s}");
+    let tenant_b_db = format!("brexp_td_tenantb_{s}");
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // PRECONDITION: logical decoding must be enabled (managed_db_spec sets `wal_level=logical` at
+    // launch; a bring-your-own test pg must be started with it + replication slots too).
+    let (_c, wal_level) = psql(backend.as_ref(), &image, &maint, "SHOW wal_level").await;
+    assert_eq!(
+        wal_level.trim(),
+        "logical",
+        "the test Postgres must run with wal_level=logical for the WAL true-delta gate (launch \
+         pgvector with `-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10`)"
+    );
+
+    // --- a source live DB (base rows + a victim table) + a SECOND tenant's DB (sentinel) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db}"),
+        format!("DROP DATABASE IF EXISTS {tenant_b_db}"),
+        format!("CREATE DATABASE {tenant_b_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+    let live = conn(&user, &password, &host, port, &live_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "CREATE TABLE t(id int primary key, v text); \
+         CREATE TABLE victim(id int primary key); INSERT INTO victim VALUES (1); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed base rows: {o}");
+    let tenant_b = conn(&user, &password, &host, port, &tenant_b_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &tenant_b,
+        "CREATE TABLE b(id int primary key, v text); \
+         INSERT INTO b VALUES (7,'TENANT_B_SENTINEL');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed tenant B: {o}");
+
+    // --- the driver: a MANAGED Single/default pg binding with delta_capture, at the test DSN ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            compute: Some("pg".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            delta_capture: true,
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/pg", sealed).await.unwrap();
+    }
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "pg".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        .with_resumable_base(Some(resumable.clone()));
+
+    // --- BASE export: creates the pgoutput capture slot + the full dump ---
+    let full = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    drv.export_resumable("default", &full, "base")
+        .await
+        .expect("base resumable export");
+    let (_c, slots) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'brexp_slot_%'",
+    )
+    .await;
+    assert_eq!(
+        slots.trim(),
+        "1",
+        "the base export must create exactly one pgoutput capture slot"
+    );
+
+    // --- mutate the source: an INSERT, an UPDATE, and a DELETE ---
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "INSERT INTO t VALUES (4,'delta'); UPDATE t SET v='beta2' WHERE id=2; DELETE FROM t WHERE id=3;",
+    )
+    .await;
+    assert_eq!(c, 0, "mutate source: {o}");
+
+    // --- INCREMENTAL delta export: drains the slot into a PgWalDelta member ---
+    let delta_opts = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base".to_string(),
+        }),
+    };
+    drv.export_resumable("default", &delta_opts, "d1")
+        .await
+        .expect("incremental delta export");
+
+    // PROVE it is a TRUE WAL delta, not a full-dump fallback: the d1 manifest declares PgWalReplay
+    // and carries a `sql/app.pgwal` member instead of the full `sql/app.pgc` dump.
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::PgWalReplay,
+        "the delta must have WAL-captured the pg db (not fallen back to a full dump)"
+    );
+    let pgwal_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.path == "sql/app.pgwal" && m.kind == MemberKind::PgWalDelta)
+        .expect("the delta must carry a sql/app.pgwal true-delta member");
+    assert!(
+        !d1_manifest.members.iter().any(|m| m.path == "sql/app.pgc"),
+        "the full pg dump must be SUPERSEDED by the WAL delta member"
+    );
+    // The drain DROPPED the slot (bounded retention, §4 disk-fill guard).
+    let (_c, slots_after) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'brexp_slot_%'",
+    )
+    .await;
+    assert_eq!(
+        slots_after.trim(),
+        "0",
+        "the delta drain must drop the capture slot (bounded retention)"
+    );
+
+    // --- CRAFTED-ESCAPE: a copy of d1 whose PgWalDelta member is a malicious injection stream must
+    // be REFUSED fail-closed; the victim table (+ tenant B) must be UNTOUCHED (shadow dropped, no
+    // swap). This is the ≥2-tenant leak gate's crafted case at the LIVE pg-WAL boundary. ---
+    let d1_dir = resumable.join("d1");
+    let evil_dir = resumable.join("evil");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    for ent in std::fs::read_dir(&d1_dir).unwrap() {
+        let ent = ent.unwrap();
+        if ent.file_type().unwrap().is_file() {
+            std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
+        }
+    }
+    // Overwrite the pgwal member object + its `{size,sha256}` meta so it PASSES the integrity check
+    // and reaches the replay (where the quoting + non-superuser confinement must neutralize it).
+    let crafted = crafted_injection_pgwal();
+    let obj = evil_dir.join(format!("m{pgwal_idx:05}"));
+    std::fs::write(&obj, &crafted).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let meta = project_bundle::MemberMeta {
+            size: crafted.len() as u64,
+            sha256: hex::encode(Sha256::digest(&crafted)),
+        };
+        std::fs::write(
+            evil_dir.join(format!("m{pgwal_idx:05}.meta")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+    let evil_res = drv
+        .import_resumable(
+            "default",
+            "evil",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        evil_res.is_err(),
+        "a crafted injection WAL delta MUST be refused fail-closed; got: {evil_res:?}"
+    );
+    let (_c, victim) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM victim",
+    )
+    .await;
+    assert_eq!(
+        victim.trim(),
+        "1",
+        "the crafted delta's injected `DROP TABLE victim` must NOT have run (quoted inert; shadow dropped)"
+    );
+
+    // --- set a sentinel so the happy-path assertion PROVES the restore actually ran (a no-op import
+    // would leave the sentinel; only a real base-dump + WAL-replay + swap yields the mutated set) ---
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+
+    // --- IMPORT the real delta chain: base dump → replay WAL → atomic swap ---
+    let report = drv
+        .import_resumable(
+            "default",
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delta chain import (base dump restore + WAL replay + swap)");
+    assert!(report.pg_databases >= 1, "the pg db must be restored");
+
+    // --- ASSERT source == target. The base dump alone is {1:alpha,2:beta,3:gamma}; ONLY replaying
+    // the WAL delta (INSERT 4, UPDATE 2→beta2, DELETE 3) onto it yields exactly this set. ---
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:alpha\n2:beta2\n4:delta",
+        "the restored db must equal the MUTATED source (base dump + WAL replay) — not the base \
+         state, not the pre-import sentinel"
+    );
+
+    // --- the SECOND tenant's db must be UNTOUCHED by the restore (≥2-tenant isolation) ---
+    let (_c, b_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &tenant_b,
+        "SELECT id || ':' || v FROM b ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        b_rows, "7:TENANT_B_SENTINEL",
+        "the second tenant's db must be UNTOUCHED by the restore"
+    );
+
+    // --- cleanup (best-effort) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {tenant_b_db}"),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT EXPORT PG TRUE-DELTA OK");
+}

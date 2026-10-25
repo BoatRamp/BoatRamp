@@ -254,8 +254,12 @@ jobs:
           # colocated-reachability shape the driver handles. No sudo: the test drives the docker
           # API as the runner user (docker group), not the native container backend.
           docker rm -f brexport-pg >/dev/null 2>&1 || true
+          # `-c wal_level=logical …` enables logical decoding so the pg WAL true-delta gate can
+          # create a pgoutput capture slot (a bring-your-own test pg must be launched with it, the
+          # way `managed_db_spec` bakes it into a managed DB's launch argv under `delta_capture`).
           docker run -d --name brexport-pg -e POSTGRES_PASSWORD=postgres \
-            pgvector/pgvector:pg16 >/dev/null
+            pgvector/pgvector:pg16 \
+            -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10 >/dev/null
           for _ in $(seq 1 60); do
             docker exec brexport-pg pg_isready -U postgres >/dev/null 2>&1 && break
             sleep 2
@@ -283,13 +287,13 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 12 live/always-on tests + the 1 pure-unit URL-parser test must
-          # ALL actually run (both live DBs reachable, docker usable for the ephemeral client
-          # containers) — a self-skip (unset env / unreachable docker) still prints
-          # `test result: ok`, so require the exact passed-count AND every one of the file's
-          # success markers below.
-          grep -qE 'test result: ok\. 13 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 13 tests (silent skip or failure?)" >&2; exit 1; }
+          # HARD gate: the file's 13 live/always-on tests + the 1 pure-unit URL-parser + the 1
+          # pure-unit WAL-render-inertness test must ALL actually run (both live DBs reachable,
+          # docker usable for the ephemeral client containers) — a self-skip (unset env /
+          # unreachable docker) still prints `test result: ok`, so require the exact passed-count
+          # AND every one of the file's success markers below.
+          grep -qE 'test result: ok\. 15 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 15 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -306,6 +310,8 @@ jobs:
             || { echo "::error::live pgvector FULL round-trip through the real driver never reached its marker (silent skip or a regression — needs pgvector/pgvector:pg16)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT DRIVER ROUNDTRIP OK' project-export-live.log \
             || { echo "::error::live full-driver pg round-trip (NodeProjectExport::export/import, not the reconstructed primitives) never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG TRUE-DELTA OK' project-export-live.log \
+            || { echo "::error::live pg logical-WAL TRUE-DELTA round-trip never reached its marker (silent skip, a WAL-capture/replay regression, or the test pg lacks wal_level=logical)" >&2; exit 1; }
 
           # --- live mysql (needs BOATRAMP_TEST_MYSQL_URL + docker) ---
           grep -q 'PROJECT EXPORT MYSQL ROUNDTRIP OK' project-export-live.log \

@@ -211,3 +211,6 @@ http-body-util.workspace = true
 # fail-closed check verifies `key == sha256(body)`).
 sha2.workspace = true
 hex.workspace = true
+# Parse a resumable delta MANIFEST + rewrite a crafted member's `{size,sha256}` meta in the
+# pg WAL true-delta live gate (project_export_roundtrip.rs).
+serde_json.workspace = true

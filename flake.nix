@@ -1143,9 +1143,13 @@
                 # Stand the two DB servers up exactly as the host-runner job does — on the
                 # docker default bridge, so both the test process AND the ephemeral client
                 # containers it launches (siblings on that bridge) reach them by container IP.
+                # `-c wal_level=logical …` enables logical decoding so the pg WAL true-delta gate
+                # can create a pgoutput capture slot (a bring-your-own test pg must be launched
+                # with it, as `managed_db_spec` bakes it into a managed DB's launch argv).
                 machine.succeed(
                     "docker run -d --name brexport-pg -e POSTGRES_PASSWORD=postgres "
-                    "pgvector/pgvector:pg16"
+                    "pgvector/pgvector:pg16 "
+                    "-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10"
                 )
                 machine.succeed(
                     "docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql "
@@ -1185,7 +1189,7 @@
                 # docker usable for the ephemeral client containers) — a self-skip still prints
                 # `ok`, so require the exact passed count AND every success marker, exactly like
                 # the host-runner job's grep gate.
-                assert re.search(r"test result: ok\. 13 passed", out), "not all 13 tests ran (silent skip?)"
+                assert re.search(r"test result: ok\. 15 passed", out), "not all 15 tests ran (silent skip?)"
                 for marker in [
                     "PROJECT EXPORT ROUNDTRIP OK",
                     "PROJECT EXPORT PG CHUNKED SHADOW OK",
@@ -1194,6 +1198,7 @@
                     "PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK",
                     "PROJECT EXPORT PG PGVECTOR ROUNDTRIP OK",
                     "PROJECT EXPORT DRIVER ROUNDTRIP OK",
+                    "PROJECT EXPORT PG TRUE-DELTA OK",
                     "PROJECT EXPORT MYSQL ROUNDTRIP OK",
                     "PROJECT EXPORT MYSQL SHADOW OK",
                     "PROJECT EXPORT LIBSQL ROUNDTRIP OK",
