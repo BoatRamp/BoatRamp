@@ -1590,6 +1590,20 @@ pub fn managed_db_spec(
                     entrypoint.push("-c".to_string());
                     entrypoint.push(flag.to_string());
                 }
+                // §4 disk-fill guard (PLAN-sql-true-delta, MANDATORY): a logical slot pins WAL
+                // from its `restart_lsn` forward, so a forgotten / un-drained capture slot would
+                // fill the data disk — the EXACT incident this whole export program exists to
+                // fix. `max_slot_wal_keep_size` (PG13+) is the HARD, server-enforced ceiling:
+                // once a slot would pin more WAL than this, Postgres invalidates it (its
+                // `pg_replication_slots.wal_status` → `lost`) and RECLAIMS the WAL — so disk
+                // safety is NOT best-effort. A delta capture that finds its slot lost/gone then
+                // FALLS BACK to a full dump for that member (true-delta is best-effort; disk
+                // safety is not). The budget is a fraction of the data volume (a quarter),
+                // clamped to a sane band, so a tiny volume still gets a floor and a large one
+                // never pins an unbounded amount of WAL between a base and its delta.
+                let ceiling_mib = (volume_size_mib / 4).clamp(256, 8192);
+                entrypoint.push("-c".to_string());
+                entrypoint.push(format!("max_slot_wal_keep_size={ceiling_mib}MB"));
             }
             ManagedDbEngine::Mysql => {
                 // Row-format binlog + GTID so a delta can ship the binlog events since a base
@@ -2354,6 +2368,38 @@ mod tests {
                 .entrypoint
                 .iter()
                 .any(|a| a == "max_replication_slots=10")
+        );
+        // §4 disk-fill guard: delta_capture MUST set a hard WAL-pinned ceiling so a forgotten
+        // slot cannot fill the disk (a quarter of the 2048 MiB volume = 512 MiB, within the band).
+        assert!(
+            pg_on
+                .entrypoint
+                .iter()
+                .any(|a| a == "max_slot_wal_keep_size=512MB"),
+            "delta_capture must cap WAL a slot can pin (disk-fill guard); argv: {:?}",
+            pg_on.entrypoint
+        );
+        // The clamp floors a tiny volume and caps a huge one.
+        let tiny = managed_db_spec(ManagedDbEngine::Postgres, None, 64, true);
+        assert!(
+            tiny.entrypoint
+                .iter()
+                .any(|a| a == "max_slot_wal_keep_size=256MB"),
+            "a tiny volume still gets the 256 MiB floor"
+        );
+        let huge = managed_db_spec(ManagedDbEngine::Postgres, None, 1_048_576, true);
+        assert!(
+            huge.entrypoint
+                .iter()
+                .any(|a| a == "max_slot_wal_keep_size=8192MB"),
+            "a huge volume is capped at the 8192 MiB ceiling"
+        );
+        // delta_capture OFF never pins WAL.
+        assert!(
+            !pg_off
+                .entrypoint
+                .iter()
+                .any(|a| a.starts_with("max_slot_wal_keep_size"))
         );
         assert_ne!(
             pg_off.id(),
