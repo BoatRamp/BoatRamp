@@ -195,6 +195,17 @@ fn db_from_pg_member(path: &str) -> Option<&str> {
         .and_then(|s| s.strip_suffix(".pgc"))
 }
 
+/// The bundle member path for a Postgres logical-WAL **true-delta** (SQL true-delta program).
+fn pgwal_member_path(db: &str) -> String {
+    format!("sql/{db}.pgwal")
+}
+
+/// Recover the database name from a `sql/<db>.pgwal` true-delta member path.
+fn db_from_pgwal_member(path: &str) -> Option<&str> {
+    path.strip_prefix("sql/")
+        .and_then(|s| s.strip_suffix(".pgwal"))
+}
+
 /// The bundle member path for a MySQL database dump.
 fn mysql_member_path(db: &str) -> String {
     format!("sql/{db}.sql")
@@ -1248,6 +1259,11 @@ enum StageJob {
     /// A blob **tombstone** member (`blobs.brtombstones`) — the deleted blob keys already computed
     /// + encoded at plan time (a DELTA export only).
     BlobTombstone { bytes: Vec<u8> },
+    /// A Postgres logical-WAL **delta** member (`sql/<db>.pgwal`) — the framed `pgoutput` change
+    /// stream drained from the parent base's capture slot, already produced at plan time (an
+    /// incremental DELTA export of a managed pg db with `delta_capture`). Replayed onto the
+    /// restored base inside the atomic shadow (see `restore_pg_true_delta_in_chain`).
+    PgWalDelta { bytes: Vec<u8> },
 }
 
 /// The export stager's request: "produce the member at `path`". `chunked` selects a
@@ -2901,9 +2917,12 @@ impl NodeProjectExport {
                 }
                 f.flush().await.map_err(other)?;
             }
-            StageJob::KvDelta { bytes } | StageJob::BlobTombstone { bytes } => {
+            StageJob::KvDelta { bytes }
+            | StageJob::BlobTombstone { bytes }
+            | StageJob::PgWalDelta { bytes } => {
                 // A delta member whose bytes were computed + encoded at plan time (the KV
-                // upserts+tombstones / the blob tombstone key list). Just persist them.
+                // upserts+tombstones / the blob tombstone key list / the drained + framed
+                // pgoutput WAL change stream). Just persist them.
                 tokio::fs::write(&tmp, bytes).await.map_err(other)?;
             }
         }
@@ -3334,19 +3353,21 @@ impl NodeProjectExport {
                     .notes
                     .push(format!("blob delta: {deleted} tombstone(s)"));
             }
-            // SQL TRUE-delta members (the SQL true-delta program, PLAN-sql-true-delta.md): each is
-            // REPLAYED onto the base already restored in the shadow, using the member's `sql_cursor`
-            // as the replay point. The per-engine replay lands in its own stage (pg WAL / mysql
-            // binlog / libsql changeset); Stage 0 wires the dispatch seam and fails closed until the
-            // engine is built, so a bundle carrying one of these on this build is refused loudly
-            // rather than silently skipped (never a partial restore).
+            // SQL TRUE-delta members (the SQL true-delta program, PLAN-sql-true-delta.md). The pg
+            // WAL true-delta is REPLAYED onto the restored base inside the atomic shadow by
+            // `restore_pg_true_delta_in_chain` (the delta-chain import SKIPS a managed `PgWalDelta`
+            // here and hands it to that pass). So this arm is reached ONLY by a path that does not
+            // run the shadow pass — a `PgWalDelta` in a non-delta bundle, a non-managed pg binding,
+            // or the (unbuilt) mysql binlog / libsql changeset engines — all of which this build
+            // cannot faithfully restore, so it refuses loudly (never a silent/partial restore).
             MemberKind::PgWalDelta | MemberKind::MysqlBinlogDelta | MemberKind::LibsqlChangeset => {
                 return Err(Perr::Other(format!(
-                    "this build cannot restore a SQL true-delta member ({:?}) — the {} replay \
-                     engine is not yet compiled into this node (SQL true-delta program)",
+                    "this build cannot restore a SQL true-delta member ({:?}) here — a pg WAL delta \
+                     is replayed only via the managed-pg atomic-shadow chain restore; the {} replay \
+                     engine is not available on this path (SQL true-delta program)",
                     spec.kind,
                     match spec.kind {
-                        MemberKind::PgWalDelta => "Postgres WAL",
+                        MemberKind::PgWalDelta => "Postgres WAL (non-managed/non-chain)",
                         MemberKind::MysqlBinlogDelta => "MySQL binlog",
                         _ => "libsql changeset",
                     }
@@ -3452,6 +3473,15 @@ impl NodeProjectExport {
             write_atomic(&manifest_path, &bytes).await?;
             specs
         };
+
+        // SQL true-delta capture (PLAN-sql-true-delta Stage 2): a BASE (full) resumable export of a
+        // `delta_capture` managed pg db creates the pgoutput slot + publication + ephemeral role
+        // NOW — BEFORE the base dump is produced, so the slot's `restart_lsn` precedes the dump and
+        // a later incremental delta's WAL-since-base is complete. A delta export (`opts.delta`) does
+        // not create slots; it drains the PARENT's slot at plan time (see `plan_delta_export`).
+        if opts.delta.is_none() {
+            self.pg_capture_base_slots(project, dir, &stage_dir).await;
+        }
 
         // Produce each member that is not already complete.
         for (idx, spec) in specs.iter().enumerate() {
@@ -3611,6 +3641,24 @@ impl NodeProjectExport {
             current_keys.insert(m.key.clone());
         }
 
+        // --- SQL true-delta (pg WAL) setup: only an INCREMENTAL delta whose PARENT base recorded a
+        // capture slot (in its `pg_capture.json` sidecar) can ship a WAL delta; a differential delta
+        // keeps the full-dump fallback (a single advancing slot cannot re-emit the same base→N
+        // interval for every differential delta). The drain is a live, slot-advancing operation, so
+        // it runs here at plan time and its bytes ride as a `StageJob::PgWalDelta`.
+        let parent_capture = if matches!(req.mode, pd::DeltaMode::Incremental) {
+            read_pg_capture_sidecar(&base_dir).await
+        } else {
+            None
+        };
+        let cap_dir = self
+            .work_dir
+            .join(format!("delta-capture-{project}-{created_at}"));
+        if parent_capture.is_some() {
+            tokio::fs::create_dir_all(&cap_dir).await.map_err(other)?;
+        }
+        let mut any_pg_true_delta = false;
+
         // --- build the ordered delta member set from the full plan ---
         let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
         for spec in &full_specs {
@@ -3656,9 +3704,45 @@ impl NodeProjectExport {
                         ordered.push((spec.clone(), job));
                     }
                 }
-                MemberKind::PgDump | MemberKind::MysqlDump | MemberKind::Libsql => {
+                MemberKind::PgDump => {
+                    // pg WAL true-delta (PLAN-sql-true-delta Stage 2): if this db is a managed,
+                    // capture-eligible binding whose PARENT base recorded a slot, and the schema is
+                    // unchanged since the base, DRAIN the slot into a `PgWalDelta` member IN PLACE
+                    // OF the full dump. Any miss (not eligible, no parent slot, schema drifted,
+                    // slot lost, or the drain fails) FALLS BACK to the full dump — the
+                    // all-families-consistent invariant (decision 3) + best-effort true-delta.
+                    let db = db_from_pg_member(&spec.path);
+                    let wal_member = match (db, parent_capture.as_ref()) {
+                        (Some(db), Some(sidecar)) => {
+                            self.try_pg_wal_delta(project, db, sidecar, &cap_dir).await
+                        }
+                        _ => None,
+                    };
+                    if let Some((bytes, cursor)) = wal_member {
+                        any_pg_true_delta = true;
+                        let db = db.expect("wal_member implies a parsed db");
+                        ordered.push((
+                            MemberSpec::sidecar(
+                                pgwal_member_path(db),
+                                MemberKind::PgWalDelta,
+                                None,
+                            )
+                            .with_sql_cursor(cursor),
+                            StageJob::PgWalDelta { bytes },
+                        ));
+                        // The full dump job for this db is now superseded — drop it.
+                        let _ = full_jobs.remove(&spec.path);
+                    } else {
+                        // SQL full-dump fallback (decision 3): keep the full member verbatim.
+                        let job = full_jobs.remove(&spec.path).ok_or_else(|| {
+                            Perr::Other(format!("delta export: no stage job for {}", spec.path))
+                        })?;
+                        ordered.push((spec.clone(), job));
+                    }
+                }
+                MemberKind::MysqlDump | MemberKind::Libsql => {
                     // SQL full-dump fallback (decision 3): keep the full member verbatim. The
-                    // true-delta (WAL/binlog/changeset) is the scaffolded next increment.
+                    // mysql binlog / libsql changeset true-deltas are separate later engines.
                     let job = full_jobs.remove(&spec.path).ok_or_else(|| {
                         Perr::Other(format!("delta export: no stage job for {}", spec.path))
                     })?;
@@ -3694,6 +3778,9 @@ impl NodeProjectExport {
             ));
         }
 
+        // The capture temp dir only held transient psql stdout for the drain — reclaim it.
+        let _ = tokio::fs::remove_dir_all(&cap_dir).await;
+
         let specs: Vec<MemberSpec> = ordered.iter().map(|(s, _)| s.clone()).collect();
         let jobs: HashMap<String, StageJob> =
             ordered.into_iter().map(|(s, j)| (s.path, j)).collect();
@@ -3701,7 +3788,14 @@ impl NodeProjectExport {
             mode: req.mode,
             base_reference: req.base_reference.clone(),
             base_created_at: base_manifest.created_at,
-            sql_strategy: pd::SqlDeltaKind::FullDumpFallback,
+            // Record `PgWalReplay` when at least one pg member shipped as a true WAL delta (so a
+            // reader can tell a true row-delta bundle from an all-full-dump fallback); else the
+            // all-families full-dump fallback.
+            sql_strategy: if any_pg_true_delta {
+                pd::SqlDeltaKind::PgWalReplay
+            } else {
+                pd::SqlDeltaKind::FullDumpFallback
+            },
         };
         Ok((specs, jobs, source, delta_info))
     }
@@ -3961,7 +4055,18 @@ impl NodeProjectExport {
                 // NEWEST delta (full-dump fallback supersedes the base/intermediate SQL); identity
                 // never; KV/blob at every link (base full + each delta's overlay).
                 let apply_here = match spec.kind {
-                    MemberKind::PgDump | MemberKind::MysqlDump | MemberKind::Libsql => is_newest,
+                    // Managed pg SQL — a full dump OR a WAL true-delta — is restored by the atomic
+                    // shadow pass (`restore_pg_true_delta_in_chain`) AFTER this loop (restore_member
+                    // fail-closes on a managed pg member). An EXTERNAL pg full dump still restores
+                    // here via restore_member, newest-link only.
+                    MemberKind::PgDump => {
+                        !db_from_pg_member(&spec.path)
+                            .map(|db| self.is_managed_pg(db))
+                            .unwrap_or(false)
+                            && is_newest
+                    }
+                    MemberKind::PgWalDelta => false,
+                    MemberKind::MysqlDump | MemberKind::Libsql => is_newest,
                     MemberKind::Identity => false,
                     _ => true,
                 };
@@ -3985,6 +4090,16 @@ impl NodeProjectExport {
                     return Err(e);
                 }
             }
+        }
+        // Managed pg SQL families (full-dump fallback OR WAL true-delta): restore the chain's newest
+        // full dump into a fresh atomic shadow, replay each subsequent PgWalDelta onto it as the
+        // ephemeral non-superuser role, then swap. Independent of the KV/blob overlay above.
+        if let Err(e) = self
+            .restore_pg_true_delta_in_chain(project, &chain, opts, &mut report, &session)
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&session).await;
+            return Err(e);
         }
         let _ = tokio::fs::remove_dir_all(&session).await;
         report.notes.push(format!(
@@ -4744,6 +4859,9 @@ impl NodeProjectExport {
         if tokio::fs::create_dir_all(&session).await.is_err() {
             return 0;
         }
+        // The capture artifacts a PENDING base→delta chain still references (so the orphan sweep
+        // never reclaims a slot a legitimately-pending base still needs). §4 orphan sweep.
+        let wanted_capture = self.collect_pending_capture_names().await;
         for (db, cfg) in &self.databases {
             if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
                 continue; // external bindings have no shadow dbs of ours
@@ -4794,6 +4912,100 @@ impl NodeProjectExport {
                             }
                         }
                     }
+                    // Orphan pg WAL CAPTURE artifacts (PLAN-sql-true-delta §4): a `brexp_slot_%`
+                    // logical slot PINS WAL, so a slot left by an abandoned base→delta chain must be
+                    // reclaimed — unless a PENDING base still references it (`wanted_capture`). The
+                    // WAL ceiling already bounds the disk; this reclaims the pin promptly. Drop
+                    // inactive orphan slots, then their capture roles, then (on the tenant db) their
+                    // publications.
+                    let slot_sql = "SELECT slot_name FROM pg_replication_slots \
+                                    WHERE slot_name LIKE 'brexp\\_slot\\_%' AND NOT active";
+                    let slot_inv = psql_invocation(&plan.maint, slot_sql);
+                    if let Ok((0, out)) = self
+                        .run_sql_capture(&plan.image, &slot_inv.argv, &slot_inv.env, None, &session)
+                        .await
+                    {
+                        for slot in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            if wanted_capture.contains(slot) {
+                                continue;
+                            }
+                            if self
+                                .pg_run_ddl(
+                                    &plan,
+                                    &format!("SELECT pg_drop_replication_slot({})", pg_lit(slot)),
+                                    &session,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                dropped += 1;
+                            }
+                        }
+                    }
+                    let crole_sql =
+                        "SELECT rolname FROM pg_roles WHERE rolname LIKE 'brexp\\_capture\\_%'";
+                    let crole_inv = psql_invocation(&plan.maint, crole_sql);
+                    if let Ok((0, out)) = self
+                        .run_sql_capture(
+                            &plan.image,
+                            &crole_inv.argv,
+                            &crole_inv.env,
+                            None,
+                            &session,
+                        )
+                        .await
+                    {
+                        for role in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            if wanted_capture.contains(role) {
+                                continue;
+                            }
+                            let q = quote_ident(ExternalSqlKind::Postgres, role);
+                            if self
+                                .pg_run_ddl(&plan, &format!("DROP ROLE IF EXISTS {q}"), &session)
+                                .await
+                                .is_ok()
+                            {
+                                dropped += 1;
+                            }
+                        }
+                    }
+                    // Publications are per-db — connect to the tenant db to reclaim orphans (tidiness;
+                    // a publication pins no WAL on its own).
+                    let maint_live = {
+                        let mut c = plan.maint.clone();
+                        c.database = plan.live_db.clone();
+                        c
+                    };
+                    let pub_sql =
+                        "SELECT pubname FROM pg_publication WHERE pubname LIKE 'brexp\\_pub\\_%'";
+                    let pub_inv = psql_invocation(&maint_live, pub_sql);
+                    if let Ok((0, out)) = self
+                        .run_sql_capture(&plan.image, &pub_inv.argv, &pub_inv.env, None, &session)
+                        .await
+                    {
+                        for p in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            if wanted_capture.contains(p) {
+                                continue;
+                            }
+                            let q = quote_ident(ExternalSqlKind::Postgres, p);
+                            let pdrop = psql_invocation(
+                                &maint_live,
+                                &format!("DROP PUBLICATION IF EXISTS {q}"),
+                            );
+                            if let Ok((0, _)) = self
+                                .run_sql_capture(
+                                    &plan.image,
+                                    &pdrop.argv,
+                                    &pdrop.env,
+                                    None,
+                                    &session,
+                                )
+                                .await
+                            {
+                                dropped += 1;
+                            }
+                        }
+                    }
                 }
             } else if kind_is_mysql(&cfg.kind)
                 && let Ok(plan) = self.mysql_shadow_plan(project, db, cfg).await
@@ -4838,6 +5050,691 @@ impl NodeProjectExport {
         }
         let _ = tokio::fs::remove_dir_all(&session).await;
         dropped
+    }
+}
+
+// ===========================================================================================
+// pg logical-WAL true-delta: CAPTURE (export) + REPLAY (restore) — PLAN-sql-true-delta Stage 2.
+//
+// CAPTURE. A managed, dedicated/Single pg db with `delta_capture` sources a row-level delta from
+// the server's logical WAL. A BASE (full) resumable export of such a db creates a `pgoutput`
+// logical replication SLOT + a `FOR ALL TABLES` publication + an ephemeral `REPLICATION
+// NOSUPERUSER …` role, recording their names + the slot's consistent-point LSN + the schema
+// fingerprint in a `pg_capture.json` sidecar beside the resumable member objects. An INCREMENTAL
+// delta export then DRAINS the parent's slot (`pg_logical_slot_get_binary_changes` — GET, not peek,
+// so it advances the slot + releases the pinned WAL), length-frames each drained message
+// (`pgoutput::frame_message`) into the `PgWalDelta` member, and DROPS the slot+publication+role
+// (bounded retention, §4). A schema change since the base, a lost/missing slot, or `--mode
+// differential` all fall back to a full dump for that db.
+//
+// REPLAY. `restore_pg_true_delta_in_chain` restores the chain's newest FULL dump into the inc2
+// atomic shadow, then replays each subsequent `PgWalDelta` onto it — `pgoutput::decode_framed` +
+// `pgoutput::render_changes` (injection-safe: identifiers quote_ident'd, values quote_literal'd),
+// EXECUTED as the ephemeral NON-superuser owner role (the inc2 HIGH-1 confinement) under
+// `standard_conforming_strings = on` + `ON_ERROR_STOP` — before the atomic swap. A render error
+// (e.g. `REPLICA IDENTITY NOTHING`) or a replay failure fails the import LOUD (never a partial).
+//
+// SCOPE: managed dedicated/Single pg only (same as the inc2 shadow path; external + Shared refused).
+// Only BASE exports create slots, so an incremental chain WAL-deltas its FIRST delta and full-dumps
+// any later link (graceful, consistent). mysql/libsql true-delta are separate later engines.
+// ===========================================================================================
+
+/// The capture-sidecar filename written beside a resumable export dir's member objects.
+const PG_CAPTURE_SIDECAR: &str = "pg_capture.json";
+
+/// One managed-pg db's capture artifacts, recorded in the resumable dir's `pg_capture.json` so a
+/// later INCREMENTAL delta (which references this dir as its parent) can drain the slot. Carries
+/// only NON-secret names + the base LSN + the base schema fingerprint — never the ephemeral role's
+/// password (the superuser mints it fresh at create and resets it fresh at drain, so no credential
+/// is ever persisted on disk).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PgCaptureEntry {
+    /// The `pgoutput` logical replication slot name (`brexp_slot_<suffix>`).
+    slot: String,
+    /// The `FOR ALL TABLES` publication name (`brexp_pub_<suffix>`).
+    publication: String,
+    /// The ephemeral `REPLICATION NOSUPERUSER …` capture role (`brexp_capture_<suffix>`).
+    role: String,
+    /// The slot's consistent-point LSN at creation (the point a delta replays FROM).
+    base_lsn: String,
+    /// The source schema-ledger fingerprint at capture time. A delta whose current fingerprint
+    /// differs MUST fall back to a full dump (logical decoding carries no DDL).
+    #[serde(default)]
+    schema_fingerprint: Option<String>,
+}
+
+/// A resumable dir's capture sidecar: per-db capture artifacts keyed by the node's DB binding name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PgCaptureSidecar {
+    dbs: BTreeMap<String, PgCaptureEntry>,
+}
+
+/// Read the capture sidecar from a resumable dir (absent/corrupt ⇒ `None`).
+async fn read_pg_capture_sidecar(dir: &Path) -> Option<PgCaptureSidecar> {
+    let bytes = tokio::fs::read(dir.join(PG_CAPTURE_SIDECAR)).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Build a capture-role connection by swapping the identity of a superuser connection (same
+/// host/port/db; the ephemeral role + its freshly-minted password).
+fn capture_role_conn(su: &PgConnection, role: &str, password: &str) -> PgConnection {
+    let mut c = su.clone();
+    c.user = role.to_string();
+    c.password = password.to_string();
+    c
+}
+
+impl NodeProjectExport {
+    /// Whether a db binding is eligible for pg WAL true-delta capture: MANAGED + postgres +
+    /// `delta_capture` on + dedicated/Single (NOT external, NOT Shared — the inc2 shadow-path
+    /// restriction). A Shared multi-tenant server's cross-tenant publication is out of scope.
+    fn pg_capture_eligible(cfg: &ExternalDatabaseConfig) -> bool {
+        is_managed_binding(cfg)
+            && kind_is_postgres(&cfg.kind)
+            && cfg.delta_capture
+            && !matches!(cfg.tenant, crate::config::TenantIsolation::Shared)
+    }
+
+    /// Whether a configured db is a MANAGED postgres binding (its SQL members take the atomic
+    /// shadow true-delta restore path, not `restore_member`).
+    fn is_managed_pg(&self, db: &str) -> bool {
+        self.databases
+            .get(db)
+            .map(|c| is_managed_binding(c) && kind_is_postgres(&c.kind))
+            .unwrap_or(false)
+    }
+
+    /// Run ONE trusted/driver-generated pg statement as `conn` (psql `-tAc`, ON_ERROR_STOP),
+    /// returning `(exit_code, trimmed stdout+stderr)`. A thin wrapper over the containerized client.
+    async fn pg_capture_sql(
+        &self,
+        conn: &PgConnection,
+        image: &str,
+        sql: &str,
+        stage_dir: &Path,
+    ) -> Result<(i32, String), Perr> {
+        let inv = psql_invocation(conn, sql);
+        self.run_sql_capture(image, &inv.argv, &inv.env, None, stage_dir)
+            .await
+    }
+
+    /// Create one managed pg db's capture artifacts at the CURRENT consistent point: an ephemeral
+    /// `REPLICATION NOSUPERUSER …` role + a `FOR ALL TABLES` publication (both by the SUPERUSER),
+    /// then a `pgoutput` logical slot CREATED BY the capture role (least-privilege: the bootstrap
+    /// superuser never creates or reads the WAL stream). Returns the recorded [`PgCaptureEntry`]
+    /// (names + base LSN + schema fingerprint). Rolls back a partial create on failure.
+    async fn pg_begin_capture(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        stage_dir: &Path,
+    ) -> Result<PgCaptureEntry, Perr> {
+        let (su, image, _ver) = self.resolve_pg(project, db, cfg).await?;
+        let suffix = shadow_suffix();
+        let slot = format!("brexp_slot_{suffix}");
+        let publication = format!("brexp_pub_{suffix}");
+        let role = format!("brexp_capture_{suffix}");
+        let role_pw = random_token();
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &role);
+        let pub_q = quote_ident(ExternalSqlKind::Postgres, &publication);
+
+        // SUPERUSER: the ephemeral least-privilege REPLICATION role (so the WAL drain is NOT run as
+        // the bootstrap superuser — defence in depth), then the publication. `FOR ALL TABLES`
+        // requires superuser; a dedicated/Single db is wholly one tenant's, so it is correct here.
+        let create_role = format!(
+            "CREATE ROLE {role_q} LOGIN PASSWORD {} REPLICATION NOSUPERUSER NOCREATEDB \
+             NOCREATEROLE NOBYPASSRLS",
+            pg_lit(&role_pw)
+        );
+        let (code, out) = self
+            .pg_capture_sql(&su, &image, &create_role, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: CREATE capture role for {db:?} exited {code}: {out}"
+            )));
+        }
+        let (code, out) = self
+            .pg_capture_sql(
+                &su,
+                &image,
+                &format!("CREATE PUBLICATION {pub_q} FOR ALL TABLES"),
+                stage_dir,
+            )
+            .await?;
+        if code != 0 {
+            let _ = self
+                .pg_capture_sql(
+                    &su,
+                    &image,
+                    &format!("DROP ROLE IF EXISTS {role_q}"),
+                    stage_dir,
+                )
+                .await;
+            return Err(Perr::Other(format!(
+                "pg capture: CREATE PUBLICATION for {db:?} exited {code}: {out}"
+            )));
+        }
+
+        // CAPTURE ROLE: create + own the pgoutput slot (a REPLICATION role may create a logical
+        // slot). The function returns (slot_name, lsn); read the consistent-point LSN as the base.
+        let role_conn = capture_role_conn(&su, &role, &role_pw);
+        let create_slot = format!(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot({}, 'pgoutput')",
+            pg_lit(&slot)
+        );
+        let (code, out) = self
+            .pg_capture_sql(&role_conn, &image, &create_slot, stage_dir)
+            .await?;
+        let base_lsn = out.trim().lines().next().unwrap_or("").trim().to_string();
+        if code != 0 || base_lsn.is_empty() {
+            let _ = self
+                .pg_capture_sql(
+                    &su,
+                    &image,
+                    &format!("DROP PUBLICATION IF EXISTS {pub_q}"),
+                    stage_dir,
+                )
+                .await;
+            let _ = self
+                .pg_capture_sql(
+                    &su,
+                    &image,
+                    &format!("DROP ROLE IF EXISTS {role_q}"),
+                    stage_dir,
+                )
+                .await;
+            return Err(Perr::Other(format!(
+                "pg capture: create logical slot for {db:?} exited {code}: {out}"
+            )));
+        }
+        let schema_fingerprint = self.schema_fingerprint(project, db).await;
+        Ok(PgCaptureEntry {
+            slot,
+            publication,
+            role,
+            base_lsn,
+            schema_fingerprint,
+        })
+    }
+
+    /// Drain one managed pg db's capture slot into a framed `pgoutput` byte stream (the `PgWalDelta`
+    /// member), then DROP the slot+publication+role (bounded retention, §4). The superuser resets
+    /// the capture role's password to a fresh value (so no role credential is persisted), then the
+    /// drain runs AS the capture role (non-superuser). Returns `Ok(None)` when the slot is
+    /// gone/invalid (reclaimed by the WAL ceiling) — the caller then falls back to a full dump.
+    async fn pg_drain_capture(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        entry: &PgCaptureEntry,
+        stage_dir: &Path,
+    ) -> Result<Option<Vec<u8>>, Perr> {
+        let (su, image, _ver) = self.resolve_pg(project, db, cfg).await?;
+        let slot_lit = pg_lit(&entry.slot);
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &entry.role);
+
+        // Is the slot still present + usable? A slot the WAL ceiling invalidated has wal_status
+        // 'lost'; a dropped/absent slot has no row. Either ⇒ no faithful WAL-delta ⇒ full-dump.
+        let probe = format!(
+            "SELECT coalesce((SELECT wal_status FROM pg_replication_slots WHERE slot_name = \
+             {slot_lit}), 'missing')"
+        );
+        let (code, status) = self.pg_capture_sql(&su, &image, &probe, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: probe slot {:?} exited {code}: {status}",
+                entry.slot
+            )));
+        }
+        let status = status.trim();
+        if status == "missing" || status == "lost" {
+            self.pg_drop_capture(project, db, cfg, entry, stage_dir)
+                .await;
+            return Ok(None);
+        }
+
+        // Reset the capture role's password (superuser), so no credential is persisted on disk.
+        let role_pw = random_token();
+        let (code, out) = self
+            .pg_capture_sql(
+                &su,
+                &image,
+                &format!("ALTER ROLE {role_q} PASSWORD {}", pg_lit(&role_pw)),
+                stage_dir,
+            )
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: reset capture-role password for {db:?} exited {code}: {out}"
+            )));
+        }
+
+        // Drain AS the capture role: GET (not peek) advances the slot + releases its pinned WAL.
+        // Each row is one raw pgoutput message; hex-encode it over psql's text output (so a binary
+        // stream survives the client cleanly), decode, and length-frame for the delta member.
+        let role_conn = capture_role_conn(&su, &entry.role, &role_pw);
+        let drain = format!(
+            "SELECT encode(data, 'hex') FROM pg_logical_slot_get_binary_changes({slot_lit}, NULL, \
+             NULL, 'proto_version', '1', 'publication_names', {})",
+            pg_lit(&entry.publication)
+        );
+        let (code, out) = self
+            .pg_capture_sql(&role_conn, &image, &drain, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: drain slot {:?} for {db:?} exited {code}: {out}",
+                entry.slot
+            )));
+        }
+        let mut framed = Vec::new();
+        for line in out.lines() {
+            let h = line.trim();
+            if h.is_empty() {
+                continue;
+            }
+            let raw = hex::decode(h).map_err(|e| {
+                Perr::Other(format!(
+                    "pg capture: a drained row is not valid hex for {db:?}: {e}"
+                ))
+            })?;
+            framed.extend_from_slice(&boatramp_core::pgoutput::frame_message(&raw));
+        }
+
+        // Bounded retention: the delta is captured ⇒ drop the slot+publication+role now.
+        self.pg_drop_capture(project, db, cfg, entry, stage_dir)
+            .await;
+        Ok(Some(framed))
+    }
+
+    /// Best-effort teardown of one db's capture artifacts (slot ⇒ publication ⇒ role), as the
+    /// SUPERUSER. Called on drain completion, on abort, and from the startup orphan sweep. The slot
+    /// is dropped before the role that owns it.
+    async fn pg_drop_capture(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        entry: &PgCaptureEntry,
+        stage_dir: &Path,
+    ) {
+        let Ok((su, image, _ver)) = self.resolve_pg(project, db, cfg).await else {
+            return;
+        };
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &entry.role);
+        let pub_q = quote_ident(ExternalSqlKind::Postgres, &entry.publication);
+        let slot_lit = pg_lit(&entry.slot);
+        // Drop the slot only if it still exists (the SQL-function drain leaves no active backend,
+        // so a plain drop succeeds). `WHERE EXISTS` keeps it a no-op if already gone.
+        let _ = self
+            .pg_capture_sql(
+                &su,
+                &image,
+                &format!(
+                    "SELECT pg_drop_replication_slot({slot_lit}) WHERE EXISTS (SELECT 1 FROM \
+                     pg_replication_slots WHERE slot_name = {slot_lit})"
+                ),
+                stage_dir,
+            )
+            .await;
+        let _ = self
+            .pg_capture_sql(
+                &su,
+                &image,
+                &format!("DROP PUBLICATION IF EXISTS {pub_q}"),
+                stage_dir,
+            )
+            .await;
+        let _ = self
+            .pg_capture_sql(
+                &su,
+                &image,
+                &format!("DROP ROLE IF EXISTS {role_q}"),
+                stage_dir,
+            )
+            .await;
+    }
+
+    /// Try to produce a pg WAL true-delta member for one db from the PARENT base's capture sidecar.
+    /// Returns `Some((framed_pgoutput_bytes, PgLsn cursor))` when a faithful WAL delta is available,
+    /// or `None` to signal the caller to keep the full-dump fallback. A capture hiccup (drain error)
+    /// is logged + treated as a fallback — the delta export itself never fails for a best-effort
+    /// true-delta. Falls back when: the db is not capture-eligible, the parent recorded no slot for
+    /// it, the SCHEMA FINGERPRINT changed since the base (logical decoding carries no DDL), or the
+    /// slot is gone/lost (reclaimed by the WAL ceiling).
+    async fn try_pg_wal_delta(
+        &self,
+        project: &str,
+        db: &str,
+        sidecar: &PgCaptureSidecar,
+        cap_dir: &Path,
+    ) -> Option<(Vec<u8>, boatramp_core::project_delta::SqlMemberCursor)> {
+        let cfg = self.databases.get(db)?;
+        if !Self::pg_capture_eligible(cfg) {
+            return None;
+        }
+        let entry = sidecar.dbs.get(db)?;
+        // SCHEMA-FINGERPRINT FALLBACK: a DDL change between base and delta cannot be WAL-replayed.
+        // Treat None==None as "unchanged"; any difference (incl. one side absent) forces a dump.
+        let current_fp = self.schema_fingerprint(project, db).await;
+        if current_fp != entry.schema_fingerprint {
+            tracing::info!(db = %db, "pg delta: schema fingerprint changed since the base — falling back to a full dump");
+            return None;
+        }
+        match self
+            .pg_drain_capture(project, db, cfg, entry, cap_dir)
+            .await
+        {
+            Ok(Some(bytes)) => Some((
+                bytes,
+                boatramp_core::project_delta::SqlMemberCursor::PgLsn {
+                    lsn: entry.base_lsn.clone(),
+                },
+            )),
+            Ok(None) => None, // slot lost/missing ⇒ full-dump fallback
+            Err(e) => {
+                tracing::warn!(error = %e, db = %db, "pg delta: WAL drain failed — falling back to a full dump");
+                None
+            }
+        }
+    }
+
+    /// Collect every capture artifact name (slot / role / publication) a PENDING base still
+    /// references, by scanning the resumable base for `pg_capture.json` sidecars. The orphan sweep
+    /// drops only `brexp_*` artifacts NOT in this set, so a legitimately-pending base→delta chain's
+    /// slot is never reclaimed from under it. Bounded walk; no resumable base ⇒ empty set.
+    async fn collect_pending_capture_names(&self) -> std::collections::HashSet<String> {
+        let mut wanted = std::collections::HashSet::new();
+        let Some(base) = self.resumable_base.as_ref() else {
+            return wanted;
+        };
+        let mut stack = vec![base.clone()];
+        let mut budget = 4096usize; // bound the walk against a pathological tree
+        while let Some(dir) = stack.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if let Some(sidecar) = read_pg_capture_sidecar(&dir).await {
+                for e in sidecar.dbs.values() {
+                    wanted.insert(e.slot.clone());
+                    wanted.insert(e.role.clone());
+                    wanted.insert(e.publication.clone());
+                }
+            }
+            if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+                while let Ok(Some(ent)) = rd.next_entry().await {
+                    if ent.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        stack.push(ent.path());
+                    }
+                }
+            }
+        }
+        wanted
+    }
+
+    /// Create fresh capture artifacts for every capture-eligible pg db covered by a BASE (full)
+    /// resumable export, writing them to the dir's `pg_capture.json` sidecar so a later incremental
+    /// delta can drain the slot. The slot's `restart_lsn` must precede the base dump, so this runs
+    /// BEFORE member production. Idempotent on resume (skips if a sidecar already exists). Failure to
+    /// capture one db is NON-fatal: that db simply has no sidecar entry and its future delta
+    /// full-dumps (true-delta is best-effort; the export itself must not fail for it).
+    async fn pg_capture_base_slots(&self, project: &str, dir: &Path, stage_dir: &Path) {
+        if read_pg_capture_sidecar(dir).await.is_some() {
+            return; // resume: slots already created on the first run.
+        }
+        let mut sidecar = PgCaptureSidecar::default();
+        for (db, cfg) in &self.databases {
+            if !Self::pg_capture_eligible(cfg) {
+                continue;
+            }
+            match self.pg_begin_capture(project, db, cfg, stage_dir).await {
+                Ok(entry) => {
+                    sidecar.dbs.insert(db.clone(), entry);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, db = %db, "pg delta capture: could not create a base slot; this db's delta will fall back to a full dump");
+                }
+            }
+        }
+        if !sidecar.dbs.is_empty() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&sidecar) {
+                let _ = write_atomic(&dir.join(PG_CAPTURE_SIDECAR), &bytes).await;
+            }
+        }
+    }
+
+    /// Restore every managed-pg db covered by a resolved delta chain via the atomic shadow: the
+    /// newest FULL dump in the chain is restored into a fresh shadow, every subsequent `PgWalDelta`
+    /// is REPLAYED onto it as the ephemeral NON-superuser role, then the shadow is atomically
+    /// swapped in. A render/replay/restore failure drops the shadow (live untouched) and fails the
+    /// import loud. (An external pg db never produces a `PgWalDelta` — capture is managed-only — so
+    /// a chain carrying one for a non-managed db is a malformed bundle and is refused.)
+    async fn restore_pg_true_delta_in_chain(
+        &self,
+        project: &str,
+        chain: &[(PathBuf, project_bundle::StreamManifest)],
+        opts: &ImportOptions,
+        report: &mut ImportReport,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        // Per managed-pg db: the newest FULL dump (base, or a fallback delta) + the WAL deltas AFTER
+        // it, in chain order (a newer full dump supersedes earlier WAL).
+        struct DbPlan {
+            base: Option<(PathBuf, usize)>,
+            wal: Vec<(PathBuf, usize)>,
+        }
+        let mut per_db: BTreeMap<String, DbPlan> = BTreeMap::new();
+        for (dir, m) in chain {
+            for (idx, spec) in m.members.iter().enumerate() {
+                match spec.kind {
+                    MemberKind::PgDump => {
+                        if let Some(db) =
+                            db_from_pg_member(&spec.path).filter(|d| self.is_managed_pg(d))
+                        {
+                            let e = per_db.entry(db.to_string()).or_insert(DbPlan {
+                                base: None,
+                                wal: Vec::new(),
+                            });
+                            e.base = Some((dir.clone(), idx));
+                            e.wal.clear();
+                        }
+                    }
+                    MemberKind::PgWalDelta => {
+                        if let Some(db) = db_from_pgwal_member(&spec.path) {
+                            if !self.is_managed_pg(db) {
+                                return Err(Perr::Other(format!(
+                                    "pg true-delta restore: a PgWalDelta member {:?} names db {db:?} \
+                                     which is not a managed pg binding on this node — malformed bundle",
+                                    spec.path
+                                )));
+                            }
+                            per_db
+                                .entry(db.to_string())
+                                .or_insert(DbPlan {
+                                    base: None,
+                                    wal: Vec::new(),
+                                })
+                                .wal
+                                .push((dir.clone(), idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if per_db.is_empty() {
+            return Ok(());
+        }
+        if !opts.apply {
+            // Dry-run: account for each db, touch nothing live.
+            report.pg_databases += per_db.len();
+            return Ok(());
+        }
+        for (db, plan_db) in per_db {
+            let Some((base_dir, base_idx)) = plan_db.base else {
+                return Err(Perr::Other(format!(
+                    "pg true-delta restore: db {db:?} has WAL delta member(s) but no full base dump \
+                     in the chain — cannot replay onto nothing"
+                )));
+            };
+            let cfg = self
+                .databases
+                .get(&db)
+                .ok_or_else(|| {
+                    Perr::Other(format!("import: no database named {db:?} on this node"))
+                })?
+                .clone();
+            let plan = self.pg_shadow_plan(project, &db, &cfg).await?;
+            if let Err(e) = self.pg_create_shadow(&plan, stage_dir).await {
+                self.pg_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            // FAIL-CLOSED: the replay applies UNTRUSTED decoded SQL, so the apply role MUST be a
+            // provable non-superuser (inc2 HIGH-1) — the same guard the chunked dump restore uses.
+            if let Err(e) = self
+                .pg_assert_not_superuser(&plan.apply_conn(), &plan.image, stage_dir)
+                .await
+            {
+                self.pg_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            let base_obj = base_dir.join(member_object_name(base_idx));
+            if let Err(e) = self
+                .pg_restore_base_into_shadow(&plan, &base_obj, stage_dir)
+                .await
+            {
+                self.pg_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            for (dir, idx) in &plan_db.wal {
+                let framed = tokio::fs::read(dir.join(member_object_name(*idx)))
+                    .await
+                    .map_err(other)?;
+                if let Err(e) = self.pg_replay_wal(&plan, &framed, stage_dir).await {
+                    self.pg_drop_shadow(&plan, stage_dir).await;
+                    return Err(e);
+                }
+            }
+            if let Err(e) = self.pg_swap_shadow(&plan, stage_dir).await {
+                self.pg_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+            report.pg_databases += 1;
+        }
+        Ok(())
+    }
+
+    /// Stream a base full-dump member object into a freshly-created shadow via `pg_restore` (as the
+    /// ephemeral non-superuser role). A non-zero exit drops nothing here (the caller tears the
+    /// shadow down) but surfaces the client's error.
+    async fn pg_restore_base_into_shadow(
+        &self,
+        plan: &PgShadowPlan,
+        base_obj: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let out_path = stage_dir.join(format!("pgwal-base-restore-{}.out", shadow_suffix()));
+        let restore = self.spawn_pg_restore(plan, rx, out_path.clone())?;
+        // Feed the base dump member object (the raw `pg_dump -Fc` bytes) into the restore's stdin.
+        let src = base_obj.to_path_buf();
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut f = tokio::fs::File::open(&src).await?;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = f.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let code = restore.await;
+        let _ = feeder.await;
+        let out = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out_path).await;
+        match code {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(c)) => Err(Perr::Other(format!(
+                "pg true-delta base restore into shadow {:?} exited {c}: {out}",
+                plan.shadow_db
+            ))),
+            Ok(Err(e)) => Err(e),
+            Err(je) => Err(other(je)),
+        }
+    }
+
+    /// Decode + render + EXECUTE one `PgWalDelta` member onto the shadow, as the ephemeral
+    /// NON-superuser owner role. The decode/render is the UNTRUSTED-delta trust boundary: a value
+    /// that cannot be rendered faithfully (e.g. `REPLICA IDENTITY NOTHING`) is a loud error (the
+    /// bundle should then have fallen back to a full dump). `standard_conforming_strings = on`
+    /// makes `quote_literal`'s single-quote-doubling the only escaping; `ON_ERROR_STOP` aborts the
+    /// psql run on the first failed statement (and the caller drops the shadow — live untouched).
+    async fn pg_replay_wal(
+        &self,
+        plan: &PgShadowPlan,
+        framed: &[u8],
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let changes = boatramp_core::pgoutput::decode_framed(framed)
+            .map_err(|e| Perr::Other(format!("pg WAL delta: decode failed: {e}")))?;
+        let stmts = boatramp_core::pgoutput::render_changes(&changes).map_err(|e| {
+            Perr::Other(format!(
+                "pg WAL delta: cannot faithfully replay ({e}); such a delta must fall back to a \
+                 full dump — refusing a partial restore"
+            ))
+        })?;
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        // The replay script: SCS on (so the rendered literals are the only quoting), then each
+        // rendered statement `;`-terminated. `render_changes` emits BEGIN/COMMIT so a source
+        // transaction stays atomic on replay; a mid-script failure under ON_ERROR_STOP aborts the
+        // run (the caller drops the shadow, so nothing partial reaches live).
+        let mut script = String::from("SET standard_conforming_strings = on;\n");
+        for s in &stmts {
+            script.push_str(s);
+            script.push_str(";\n");
+        }
+        let script_path = stage_dir.join(format!("pgwal-replay-{}.sql", shadow_suffix()));
+        tokio::fs::write(&script_path, script.as_bytes())
+            .await
+            .map_err(other)?;
+        let apply = plan.apply_conn();
+        // psql reads the replay script from STDIN (so the delta's quoted data never enters argv).
+        let argv = vec![
+            "psql".to_string(),
+            "-v".to_string(),
+            "ON_ERROR_STOP=1".to_string(),
+        ];
+        let r = self
+            .run_sql_capture(
+                &plan.image,
+                &argv,
+                &apply.env(),
+                Some(&script_path),
+                stage_dir,
+            )
+            .await;
+        let _ = tokio::fs::remove_file(&script_path).await;
+        let (code, out) = r?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg WAL delta replay into shadow {:?} exited {code}: {out}",
+                plan.shadow_db
+            )));
+        }
+        Ok(())
     }
 }
 
