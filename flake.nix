@@ -305,6 +305,39 @@
             src = workspaceSrc;
           };
 
+          # ---- NixOS-VM real-path test framework ----------------------------
+          # `mkBoatrampVmTest` (nix/vmtest.nix) institutionalizes VM-based
+          # real-path verification — constrained-CPU benches, live-integration,
+          # real-kernel features — as versioned, `nix build`-able flake checks,
+          # extending the `nixos-service` pattern. See PLAN-nixos-vm-testing.md.
+          vmtest = import ./nix/vmtest.nix {
+            inherit pkgs lib;
+            boatrampPackage = self'.packages.default;
+            boatrampModule = inputs.self.nixosModules.default;
+          };
+
+          # First instance (#2 /media pool warm-floor): the pool-level load driver
+          # (a faithful replica of boatramp-storage's `build_pool`; see its
+          # Cargo.toml), built from the pinned toolchain and shipped into the VM.
+          mediaLatencyDriver = rustPlatform.buildRustPackage {
+            pname = "boatramp-media-latency-driver";
+            version = "0.0.0";
+            src = ./nix/vmtests/media-latency;
+            cargoLock.lockFile = ./nix/vmtests/media-latency/Cargo.lock;
+          };
+
+          # Self-signed cert so the VM's postgres node can serve TLS (the faithful
+          # prod shape: a cold connect pays a TLS handshake, which the warm floor
+          # skips). `sslmode=require` encrypts without CA verification, so a
+          # self-signed cert suffices for the bench.
+          mediaLatencyPgCert =
+            pkgs.runCommand "boatramp-media-latency-pg-cert" { nativeBuildInputs = [ pkgs.openssl ]; }
+              ''
+                mkdir -p $out
+                openssl req -new -x509 -days 3650 -nodes -subj "/CN=pg" \
+                  -out $out/server.crt -keyout $out/server.key
+              '';
+
           # Shared builder for the reproducible, Nix-first OCI images. Both targets
           # ship the *same* batteries-included binary and differ only in runtime
           # posture: the base `container` runs as root so it can own a mounted state
@@ -720,6 +753,119 @@
               testScript = ''
                 machine.wait_for_unit("boatramp.service")
                 machine.wait_for_open_port(8080)
+              '';
+            };
+
+            # #2 (/media pool warm-floor) — the first `mkBoatrampVmTest` instance.
+            # A `cores = 2` NixOS VM + a real postgres node (TLS), running the
+            # drain->burst pattern and RECORDING per-request latency for
+            # `min_connections = 0` vs a warm floor. kind = "bench": records to $out,
+            # never asserts a latency threshold.
+            #
+            # #2's warm-floor fix is accepted on its own merits (mechanism-verified);
+            # this is a reproducible in-repo regression/bench HARNESS, not a gate on
+            # #2 and not a steal certification.
+            #
+            # SCOPE (honest): this drives the pool-level driver (the real sqlx 0.8.6
+            # pool, a replica of `build_pool`) INSIDE the constrained 2-core VM
+            # against a real pg node — a real, reproducible, constrained-VM run. The
+            # full HTTP storefront serve path (a wasm guest doing the SQL) is deferred
+            # (needs a deployed component fixture). A 2-core QEMU guest approximates a
+            # small box but does NOT reproduce cloud hypervisor CPU-steal (not
+            # attempted here); it demonstrates the mechanism + direction, not a prod
+            # number.
+            media-latency = vmtest.mkBoatrampVmTest {
+              name = "boatramp-media-latency";
+              kind = "bench";
+              cores = 2;
+              # The measured path is the SQL pool (the pool-level driver), not the
+              # boatramp HTTP serve path, so the boatramp service is left OFF here —
+              # that keeps the full boatramp binary out of the VM closure (lean,
+              # fast build). The helper still defaults the service ON for gate
+              # instances that DO exercise it (e.g. a future full-serve-path test).
+              services = {
+                services.boatramp.enable = false;
+                environment.systemPackages = [ mediaLatencyDriver ];
+              };
+              extraNodes.pg =
+                { lib, ... }:
+                {
+                  services.postgresql = {
+                    enable = true;
+                    enableTCPIP = true;
+                    ensureDatabases = [ "bench" ];
+                    ensureUsers = [
+                      {
+                        name = "bench";
+                        ensureClauses.login = true;
+                      }
+                    ];
+                    # Trust auth over the VM subnet — the bench measures pool
+                    # connection establishment, not authn; no password needed.
+                    authentication = lib.mkForce ''
+                      local all all trust
+                      host  all all 0.0.0.0/0 trust
+                      host  all all ::/0      trust
+                    '';
+                    settings = {
+                      ssl = "on";
+                      ssl_cert_file = "/var/lib/postgresql/server.crt";
+                      ssl_key_file = "/var/lib/postgresql/server.key";
+                      max_connections = 200;
+                    };
+                  };
+                  # Install the self-signed cert as a root oneshot ordered BEFORE
+                  # postgres (not via the module's own preStart, which we must not
+                  # clobber). Postgres refuses a world-readable key, so copy it 0600.
+                  systemd.services.pg-tls-cert = {
+                    wantedBy = [ "multi-user.target" ];
+                    before = [ "postgresql.service" ];
+                    serviceConfig = {
+                      Type = "oneshot";
+                      RemainAfterExit = true;
+                    };
+                    script = ''
+                      install -D -m 0600 -o postgres -g postgres \
+                        ${mediaLatencyPgCert}/server.key /var/lib/postgresql/server.key
+                      install -D -m 0644 -o postgres -g postgres \
+                        ${mediaLatencyPgCert}/server.crt /var/lib/postgresql/server.crt
+                    '';
+                  };
+                  networking.firewall.allowedTCPPorts = [ 5432 ];
+                };
+              testScript = ''
+                import os
+
+                start_all()
+                pg.wait_for_unit("postgresql.service")
+                pg.wait_for_open_port(5432)
+                machine.wait_for_unit("multi-user.target")
+
+                # Fail fast if the real pool driver can't reach the real pg at all
+                # (guards against a vacuous green). This asserts the driver RAN, not
+                # any latency threshold — appropriate for a bench.
+                tls_url = "postgres://bench@pg:5432/bench?sslmode=require"
+                plain_url = "postgres://bench@pg:5432/bench?sslmode=disable"
+
+                env = "MAX=8 BURST=48 IDLE_MS=1500 DRAIN_MS=3000 TRIALS=3"
+                tls = machine.succeed(f"DATABASE_URL='{tls_url}' {env} media-latency-driver")
+                print(tls)
+                plain = machine.succeed(f"DATABASE_URL='{plain_url}' {env} media-latency-driver")
+                print(plain)
+
+                os.makedirs(os.environ["out"], exist_ok=True)
+                with open(os.path.join(os.environ["out"], "media-latency.txt"), "w") as f:
+                    f.write("# boatramp #2 /media pool warm-floor bench (min=0 vs warm floor)\n")
+                    f.write("# 2-core NixOS VM + real postgres node; pool-level driver\n")
+                    f.write("# (real sqlx 0.8.6 pool, replica of build_pool).\n")
+                    f.write("# A reproducible in-repo bench harness (NOT a gate; #2's fix\n")
+                    f.write("# is accepted on its merits). QEMU 2-core approximates a small\n")
+                    f.write("# box, NOT cloud hypervisor CPU-steal (not attempted): it shows\n")
+                    f.write("# the mechanism + direction, not a prod number.\n\n")
+                    f.write("===== TLS (sslmode=require) =====\n")
+                    f.write(tls)
+                    f.write("\n===== non-TLS (sslmode=disable) =====\n")
+                    f.write(plain)
               '';
             };
           };

@@ -1,0 +1,28 @@
+[package]
+name = "media-latency-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The #2 (/media) warm-floor load driver for the `media-latency` nixos VM bench.
+#
+# It is a FAITHFUL REPLICA of boatramp-storage's external SQL pool config
+# (crates/boatramp-storage/src/sql_sqlx.rs::build_pool, Postgres): same sqlx
+# major/minor (0.8.6), same PgPoolOptions chain (connect_lazy_with,
+# max_connections, min_connections, acquire_timeout, log_statements(Off)), and
+# the same per-request transaction shape as sql_sqlx::begin_on +
+# sql_compute::apply_session_context (BEGIN READ ONLY; two bound set_config GUCs;
+# SELECT; COMMIT). It drives the drain->burst pattern and records per-request
+# latency for `min_connections = 0` vs a warm floor. It replicates the pool op
+# rather than linking boatramp-storage so the VM bench stays self-contained; the
+# shipped change itself is unit-tested in-tree.
+[dependencies]
+sqlx = { version = "=0.8.6", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "postgres",
+] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+
+[profile.release]
+opt-level = 2
