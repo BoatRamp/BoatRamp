@@ -1242,6 +1242,11 @@ enum StageJob {
         /// The detected `SHOW server_version_num` — selects the `pg_dump` comment-handling
         /// strategy (PG17+ `--exclude-extension` vs the blunt `--no-comments`).
         server_version_num: String,
+        /// Dump with `--no-publications` — set for a `delta_capture` db, so the ephemeral
+        /// `brexp_pub_*` capture publication (which must exist from base time for pgoutput's
+        /// historical decode) never lands in the dump and cannot fail the non-superuser shadow
+        /// restore (`CREATE PUBLICATION … FOR ALL TABLES` is superuser-only). PLAN-sql-true-delta.
+        no_publications: bool,
     },
     /// A MySQL `mysqldump` into a staging temp.
     Mysql {
@@ -2627,6 +2632,7 @@ impl NodeProjectExport {
                         image,
                         data_only,
                         server_version_num,
+                        no_publications: cfg.delta_capture,
                     },
                 ));
             } else if kind_is_mysql(&cfg.kind) && dumpable {
@@ -2760,6 +2766,7 @@ impl NodeProjectExport {
                 conn,
                 image,
                 server_version_num,
+                no_publications,
                 ..
             }) => {
                 // FULL `pg_dump -Fc` stdout → body channel, NO temp (inc2 Stage C). The chunked pg
@@ -2769,6 +2776,7 @@ impl NodeProjectExport {
                 let conn = conn.clone();
                 let image = image.clone();
                 let server_version_num = server_version_num.clone();
+                let no_publications = *no_publications;
                 // The chunked member is applied into a SHADOW that pre-creates the operator
                 // trusted-extension allowlist, so (on PG17+) the dump can `--exclude-extension`
                 // exactly those and keep every other object comment (see `pg_dump_invocation`).
@@ -2781,6 +2789,7 @@ impl NodeProjectExport {
                             false,
                             &server_version_num,
                             &exclude_extensions,
+                            no_publications,
                         );
                         let code = backend
                             .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
@@ -2872,12 +2881,14 @@ impl NodeProjectExport {
                 image,
                 data_only,
                 server_version_num,
+                no_publications,
             } => {
                 // SIDECAR (data-only, Shared, or external bring-your-own-URL): the restore applies
                 // the dump's OWN `CREATE EXTENSION` (we never pre-create extensions on a non-shadow
                 // target), so pass an EMPTY exclude list — this keeps the conservative
                 // `--no-comments` regardless of server version (see `pg_dump_invocation`).
-                let inv = pg_dump_invocation(conn, *data_only, server_version_num, &[]);
+                let inv =
+                    pg_dump_invocation(conn, *data_only, server_version_num, &[], *no_publications);
                 let code = self
                     .run_sql_client(image, &inv.argv, &inv.env, None, &tmp)
                     .await?;
@@ -5180,8 +5191,14 @@ impl NodeProjectExport {
         let pub_q = quote_ident(ExternalSqlKind::Postgres, &publication);
 
         // SUPERUSER: the ephemeral least-privilege REPLICATION role (so the WAL drain is NOT run as
-        // the bootstrap superuser — defence in depth), then the publication. `FOR ALL TABLES`
-        // requires superuser; a dedicated/Single db is wholly one tenant's, so it is correct here.
+        // the bootstrap superuser — defence in depth), then the publication. The publication MUST
+        // exist from BASE time (before any change the delta will carry): pgoutput decodes the WAL
+        // against the HISTORICAL catalog snapshot at each change's LSN, so a publication created
+        // later is "not visible" at those LSNs and the drain errors. `FOR ALL TABLES` is
+        // superuser-only; a dedicated/Single db is wholly one tenant's, so it is correct here. The
+        // base full dump of a delta_capture db is taken with `pg_dump --no-publications` (see
+        // `StageJob::Pg.no_publications`) so this capture publication never lands in the dump and
+        // cannot fail the non-superuser shadow restore (`CREATE PUBLICATION` is superuser-only).
         let create_role = format!(
             "CREATE ROLE {role_q} LOGIN PASSWORD {} REPLICATION NOSUPERUSER NOCREATEDB \
              NOCREATEROLE NOBYPASSRLS",

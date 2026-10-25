@@ -125,12 +125,21 @@ pub fn pg_dump_invocation(
     data_only: bool,
     server_version_num: &str,
     exclude_extensions: &[String],
+    no_publications: bool,
 ) -> SqlInvocation {
     let mut argv = vec![
         "pg_dump".to_string(),
         "--no-owner".to_string(),
         "--no-privileges".to_string(),
     ];
+    // `--no-publications` for a `delta_capture` db (SQL true-delta): the ephemeral `brexp_pub_*`
+    // capture publication must exist from base time (pgoutput decodes the WAL against the
+    // historical catalog), but it is superuser-only to CREATE — so it must be kept OUT of the dump
+    // or the non-superuser atomic-shadow restore fails. Excludes any publication from the dump (an
+    // accepted fidelity limitation for a capture-enabled db, like `--no-comments` for extensions).
+    if no_publications {
+        argv.push("--no-publications".to_string());
+    }
     let narrow = !exclude_extensions.is_empty()
         && pg_server_major(server_version_num).is_some_and(|m| m >= PG_EXCLUDE_EXTENSION_MIN_MAJOR);
     if narrow {
@@ -415,8 +424,8 @@ mod tests {
     fn data_only_toggles_the_flag_on_both_sides() {
         // The data-only path MUST diverge from the full path (anti-hollow mutation (b):
         // drop the data_only honoring and this divergence vanishes).
-        let dump_do = pg_dump_invocation(&conn(), true, "160004", &[]);
-        let dump_full = pg_dump_invocation(&conn(), false, "160004", &[]);
+        let dump_do = pg_dump_invocation(&conn(), true, "160004", &[], false);
+        let dump_full = pg_dump_invocation(&conn(), false, "160004", &[], false);
         assert!(dump_do.argv.iter().any(|a| a == "--data-only"));
         assert!(!dump_full.argv.iter().any(|a| a == "--data-only"));
         // A --data-only dump EXCLUDES the migration ledger's rows so a restore into an
@@ -464,6 +473,17 @@ mod tests {
     }
 
     #[test]
+    fn no_publications_toggles_the_dump_flag() {
+        // A `delta_capture` db dumps with `--no-publications` so the ephemeral `brexp_pub_*`
+        // capture publication (superuser-only to CREATE) never lands in the dump and cannot fail
+        // the non-superuser atomic-shadow restore. Off ⇒ the flag is absent (publications dumped).
+        let with = pg_dump_invocation(&conn(), false, "160004", &[], true);
+        assert!(with.argv.iter().any(|a| a == "--no-publications"));
+        let without = pg_dump_invocation(&conn(), false, "160004", &[], false);
+        assert!(!without.argv.iter().any(|a| a == "--no-publications"));
+    }
+
+    #[test]
     fn exclude_extension_narrows_no_comments_only_on_pg17_with_a_shadow_allowlist() {
         let exts = vec!["vector".to_string(), "pg_trgm".to_string()];
         let has = |inv: &SqlInvocation, a: &str| inv.argv.iter().any(|x| x == a);
@@ -475,13 +495,13 @@ mod tests {
 
         // PG17 + a shadow-pre-created allowlist: NARROW — exclude exactly those extensions and
         // DROP `--no-comments`, so all OTHER (table/column) comments survive the export.
-        let pg17 = pg_dump_invocation(&conn(), false, "170000", &exts);
+        let pg17 = pg_dump_invocation(&conn(), false, "170000", &exts, false);
         assert!(!has(&pg17, "--no-comments"), "PG17 keeps object comments");
         assert!(has_exclude(&pg17, "vector") && has_exclude(&pg17, "pg_trgm"));
 
         // PG16 + the SAME allowlist: no `--exclude-extension` exists, so fall back to the blunt
         // `--no-comments` and NEVER emit an `--exclude-extension` (unknown flag on PG16).
-        let pg16 = pg_dump_invocation(&conn(), false, "160004", &exts);
+        let pg16 = pg_dump_invocation(&conn(), false, "160004", &exts, false);
         assert!(
             has(&pg16, "--no-comments"),
             "PG16 has no --exclude-extension → blunt strip"
@@ -496,7 +516,7 @@ mod tests {
 
         // PG17 but NO shadow allowlist (the sidecar/external path): the restore needs the dump's
         // own CREATE EXTENSION, so stay on `--no-comments` and exclude nothing.
-        let sidecar = pg_dump_invocation(&conn(), false, "170000", &[]);
+        let sidecar = pg_dump_invocation(&conn(), false, "170000", &[], false);
         assert!(has(&sidecar, "--no-comments"));
         assert!(
             !sidecar
@@ -506,7 +526,7 @@ mod tests {
         );
 
         // An unparseable banner is conservative: blunt strip, no exclude.
-        let unknown = pg_dump_invocation(&conn(), false, "garbage", &exts);
+        let unknown = pg_dump_invocation(&conn(), false, "garbage", &exts, false);
         assert!(has(&unknown, "--no-comments"));
         assert!(
             !unknown
@@ -627,9 +647,9 @@ mod tests {
     fn credential_is_in_the_env_never_in_argv() {
         let c = conn();
         for inv in [
-            pg_dump_invocation(&c, true, "160004", &[]),
+            pg_dump_invocation(&c, true, "160004", &[], false),
             // PG17 narrowing path too: the generated `--exclude-extension` args carry no credential.
-            pg_dump_invocation(&c, false, "170000", &["vector".to_string()]),
+            pg_dump_invocation(&c, false, "170000", &["vector".to_string()], false),
             pg_restore_invocation(&c, false),
         ] {
             // The password is present in the environment...
