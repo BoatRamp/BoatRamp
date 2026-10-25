@@ -2774,10 +2774,57 @@ pub(super) struct ProjectExportQuery {
     /// and refuses any escape / when no base is configured.
     #[serde(default)]
     resumable: Option<String>,
+    /// DELTA mode: `differential` or `incremental` (see [`DeltaMode`]). Only valid alongside
+    /// `resumable` + `base` — a delta is written as a node-local member-object directory that
+    /// chains onto `base`. Absent ⇒ a full (non-delta) bundle.
+    #[serde(default)]
+    mode: Option<String>,
+    /// The base (differential) / parent (incremental) resumable-dir NAME to chain the delta
+    /// onto. Required with `mode`; the host confines it under the configured base like
+    /// `resumable`.
+    #[serde(default)]
+    base: Option<String>,
 }
 
 fn default_data_only() -> bool {
     true
+}
+
+/// Build the optional [`DeltaRequest`] from the export query's `mode`/`base`, enforcing that a
+/// delta (a) names both `mode` and `base`, (b) runs only in `resumable` mode (the base is a
+/// node-local member-object dir, so a streamed delta is meaningless), and (c) uses a known mode.
+/// Returns `Ok(None)` for a plain full/resumable export. Errors are caller-facing `400` text.
+fn parse_export_delta(
+    mode: Option<&str>,
+    base: Option<&str>,
+    resumable: Option<&str>,
+) -> Result<Option<boatramp_core::project_delta::DeltaRequest>, String> {
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+    match (mode, base) {
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            Err("delta export: `mode` requires `base` (the resumable dir to chain onto)".into())
+        }
+        (None, Some(_)) => {
+            Err("delta export: `base` requires `mode` (differential|incremental)".into())
+        }
+        (Some(m), Some(b)) => {
+            if resumable.is_none() {
+                return Err(
+                    "delta export requires `resumable` — a delta is written as a \
+                            node-local member-object directory, not a streamed bundle"
+                        .into(),
+                );
+            }
+            let mode = DeltaMode::parse_flag(m).ok_or_else(|| {
+                format!("delta export: unknown `mode` {m:?} (expected differential|incremental)")
+            })?;
+            Ok(Some(DeltaRequest {
+                mode,
+                base_reference: b.to_string(),
+            }))
+        }
+    }
 }
 
 /// The HTTP header carrying the operator transport passphrase for `--include-identity`
@@ -2852,14 +2899,18 @@ pub(super) async fn project_export(
         )
             .into_response();
     }
+    // The delta (`mode` + `base`) surface: present ⇒ write a delta member-object dir chaining
+    // onto `base`; absent ⇒ a full/resumable export. Bad combinations are caller-facing 400s.
+    let delta =
+        match parse_export_delta(q.mode.as_deref(), q.base.as_deref(), q.resumable.as_deref()) {
+            Ok(d) => d,
+            Err(m) => return (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
+        };
     let export_opts = boatramp_core::project_export::ExportOptions {
         data_only: q.data_only,
         include_identity: q.include_identity,
         transport_key,
-        // The delta (`--mode differential|incremental` + base) surface is not yet wired through the
-        // admin-API query; a full/resumable export leaves it None. (Driver-level capability only in
-        // this increment — see the delta export/import path on `NodeProjectExport`.)
-        delta: None,
+        delta,
     };
     // RESUMABLE mode (T3): write a node-local member-object directory (resuming an
     // interrupted run) and return a status, instead of streaming the bundle. The host
@@ -3872,6 +3923,41 @@ pub(super) struct InvalidateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_delta_query_parses_and_refuses_bad_combos() {
+        use boatramp_core::project_delta::DeltaMode;
+
+        // No mode/base ⇒ a plain full/resumable export (None).
+        assert!(
+            parse_export_delta(None, None, Some("snap1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_export_delta(None, None, None).unwrap().is_none());
+
+        // A well-formed delta: mode + base + resumable.
+        let d = parse_export_delta(Some("incremental"), Some("snap1"), Some("snap2"))
+            .unwrap()
+            .expect("a delta request");
+        assert_eq!(d.mode, DeltaMode::Incremental);
+        assert_eq!(d.base_reference, "snap1");
+        assert_eq!(
+            parse_export_delta(Some("differential"), Some("base"), Some("d1"))
+                .unwrap()
+                .unwrap()
+                .mode,
+            DeltaMode::Differential
+        );
+
+        // mode without base, base without mode, and an unknown mode all refuse.
+        assert!(parse_export_delta(Some("incremental"), None, Some("d")).is_err());
+        assert!(parse_export_delta(None, Some("base"), Some("d")).is_err());
+        assert!(parse_export_delta(Some("sideways"), Some("base"), Some("d")).is_err());
+
+        // A delta REQUIRES resumable (the base is a node-local member-object dir).
+        assert!(parse_export_delta(Some("incremental"), Some("base"), None).is_err());
+    }
 
     #[test]
     fn bundle_parses_function_sql_extension_and_rejects_ambiguity() {

@@ -128,6 +128,16 @@ enum ProjectCommand {
         /// node-local (that is what lets it resume); the name is relative and host-confined.
         #[arg(long, value_name = "DIR_NAME", conflicts_with = "out")]
         resumable: Option<String>,
+        /// DELTA export: `differential` (vs a fixed base) or `incremental` (vs the parent,
+        /// forming a chain). Only with `--resumable`; requires `--base`. Ships only what changed
+        /// since the base (KV + blob true-deltas today; SQL falls back to a full dump within the
+        /// delta bundle). Default: a full (non-delta) export.
+        #[arg(long, value_parser = ["differential", "incremental"], requires = "base")]
+        mode: Option<String>,
+        /// The base (differential) / parent (incremental) resumable-dir NAME to chain the delta
+        /// onto (a prior `--resumable` export on the same node). Required with `--mode`.
+        #[arg(long, value_name = "DIR_NAME", requires = "mode")]
+        base: Option<String>,
         /// Export a FULL bundle (schema + data). Default: `--data-only` (app data only —
         /// no identity/RBAC/routing).
         #[arg(long)]
@@ -734,6 +744,8 @@ pub async fn run(
             name,
             out,
             resumable,
+            mode,
+            base,
             full,
             include_identity,
             transport_key_file,
@@ -741,6 +753,15 @@ pub async fn run(
             // `--include-identity` implies a FULL bundle (data-only carries no
             // control-plane / identity), and needs a transport key to wrap the KEK.
             let data_only = !full && !include_identity;
+            // A delta (`--mode` + `--base`, enforced paired by clap `requires`) only makes sense
+            // for a resumable export — the base is a node-local member-object dir.
+            if mode.is_some() && resumable.is_none() {
+                return Err(Error::Aborted(
+                    "--mode/--base (delta export) require --resumable: a delta chains onto a \
+                     node-local member-object directory"
+                        .into(),
+                ));
+            }
             let transport_key = if include_identity {
                 Some(resolve_transport_key(
                     transport_key_file.as_deref(),
@@ -751,20 +772,27 @@ pub async fn run(
             };
             if let Some(dir_name) = resumable {
                 // RESUMABLE: the bundle is written to a node-local directory (resuming an
-                // interrupted run); nothing streams back to the client.
+                // interrupted run); nothing streams back to the client. A delta export also
+                // passes --mode/--base so the node chains onto the named base.
                 cp.project_export_resumable(
                     &name,
                     data_only,
                     include_identity,
                     transport_key,
                     &dir_name,
+                    mode.as_deref(),
+                    base.as_deref(),
                 )
                 .await?;
+                let kind = match mode.as_deref() {
+                    Some(m) => format!("{m} delta onto {}", base.as_deref().unwrap_or("?")),
+                    None => "full".to_string(),
+                };
                 Ok(ProjectOutput::Exported {
                     project: name,
                     data_only,
                     include_identity,
-                    out: format!("(resumable node dir: {dir_name})"),
+                    out: format!("(resumable node dir: {dir_name}; {kind})"),
                 })
             } else {
                 // clap's `required_unless_present = "resumable"` guarantees `out` here.

@@ -978,6 +978,10 @@ impl ControlPlane {
     /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `System·Admin`):
     /// the node writes a member-object directory of `dir_name` (under its configured base,
     /// resuming an interrupted run) — nothing streams back, so no local file is written.
+    ///
+    /// A DELTA export passes `mode` (`differential`|`incremental`) + `base` (the base/parent
+    /// resumable-dir name to chain onto); both `None` ⇒ a full resumable export.
+    #[allow(clippy::too_many_arguments)]
     pub async fn project_export_resumable(
         &self,
         project: &str,
@@ -985,13 +989,15 @@ impl ControlPlane {
         include_identity: bool,
         transport_key: Option<Vec<u8>>,
         dir_name: &str,
+        mode: Option<&str>,
+        base: Option<&str>,
     ) -> Result<()> {
         let Self {
             http: client,
             base: server,
             ..
         } = self;
-        let mut req = client.post(format!("{server}/api/project-export")).query(&[
+        let mut query: Vec<(&str, &str)> = vec![
             ("project", project),
             ("data_only", if data_only { "true" } else { "false" }),
             (
@@ -999,7 +1005,16 @@ impl ControlPlane {
                 if include_identity { "true" } else { "false" },
             ),
             ("resumable", dir_name),
-        ]);
+        ];
+        if let Some(m) = mode {
+            query.push(("mode", m));
+        }
+        if let Some(b) = base {
+            query.push(("base", b));
+        }
+        let mut req = client
+            .post(format!("{server}/api/project-export"))
+            .query(&query);
         if let Some(key) = &transport_key {
             let value = std::str::from_utf8(key).map_err(|_| {
                 ClientError::Refused(
