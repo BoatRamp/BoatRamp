@@ -5517,10 +5517,10 @@ impl NodeProjectExport {
                 }
             }
         }
-        if !sidecar.dbs.is_empty() {
-            if let Ok(bytes) = serde_json::to_vec_pretty(&sidecar) {
-                let _ = write_atomic(&dir.join(PG_CAPTURE_SIDECAR), &bytes).await;
-            }
+        if !sidecar.dbs.is_empty()
+            && let Ok(bytes) = serde_json::to_vec_pretty(&sidecar)
+        {
+            let _ = write_atomic(&dir.join(PG_CAPTURE_SIDECAR), &bytes).await;
         }
     }
 
