@@ -930,9 +930,18 @@ impl NodeProjectExport {
     }
 
     /// Run a SQL client capturing its stdout as a trimmed string (plus the exit code) — for the
-    /// trusted-DDL utility queries of the inc2 shadow swap (pg `SELECT 1 FROM pg_database …`, mysql
+    /// trusted-DDL / maintenance statements + probe queries of the inc2 shadow swap (pg `CREATE
+    /// DATABASE`/`ALTER … RENAME`/`SELECT rolsuper …`/`SELECT 1 FROM pg_database …`, mysql
     /// `information_schema` table enumeration). The stdout temp lives under `stage_dir` and is
     /// removed after.
+    ///
+    /// The run is wrapped with [`merge_stderr_argv`] so the client's STDERR — where psql/mysql
+    /// write a failed statement's error ("ERROR: database … already exists", "permission denied",
+    /// a refused untrusted object) — merges into the captured string; without it `run_ephemeral`
+    /// drops stderr on a non-zero exit and a failed DDL surfaces causelessly. A SUCCESSFUL psql/
+    /// mysql SELECT or DDL emits nothing on stderr, so the parsed probes are unaffected on success
+    /// and only gain the diagnostic on failure. Safe here because stdout is a small parsed result
+    /// or discarded — never a dump member (which must NOT merge stderr; see `merge_stderr_argv`).
     async fn run_sql_capture(
         &self,
         image: &str,
@@ -942,8 +951,9 @@ impl NodeProjectExport {
         stage_dir: &Path,
     ) -> Result<(i32, String), Perr> {
         let out = stage_dir.join(format!("cap-{}.out", shadow_suffix()));
+        let merged = merge_stderr_argv(argv);
         let code = self
-            .run_sql_client(image, argv, env, stdin_path, &out)
+            .run_sql_client(image, &merged, env, stdin_path, &out)
             .await?;
         let s = tokio::fs::read_to_string(&out).await.unwrap_or_default();
         let _ = tokio::fs::remove_file(&out).await;
@@ -978,6 +988,31 @@ fn sh_join(argv: &[String]) -> String {
         .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Wrap a driver-composed SQL-client invocation so the container's STDERR merges into the
+/// captured stdout sink (`sh -c 'exec … 2>&1'`). `run_ephemeral` keeps only the container's
+/// stdout and DROPS stderr on a non-zero exit, so a failed trusted-DDL / maintenance / sidecar
+/// restore run otherwise surfaces causelessly ("exited N" with no reason) — the psql / pg_restore
+/// / mysql client writes its error text to stderr. Merging lets that text reach the error message.
+///
+/// MUST NOT be used where stdout is a DATA payload (a `pg_dump`/`mysqldump` whose stdout IS the
+/// bundle member, or a chunked producer streaming into the bundle body) — merging stderr would
+/// corrupt the member. It is only for runs whose stdout is a small parsed result (a probe) or
+/// discarded (a maintenance DDL / a sidecar restore to a throwaway sink): a successful psql/mysql
+/// SELECT emits NOTHING on stderr, so a parsed probe is unaffected on success and only GAINS the
+/// diagnostic on failure. `exec` keeps the reported exit status the client's own; each token is
+/// POSIX single-quoted by [`sh_join`]. The connection password is NOT composed in (it rides in the
+/// env — PGPASSWORD/MYSQL_PWD); the only secret that can appear is a we-generate-it SQL literal (the
+/// ephemeral role's random password in a `CREATE ROLE … PASSWORD` the maintenance DDL already placed
+/// in psql's argv), whose exposure is unchanged by this wrap — it stays argv-resident on the same
+/// ephemeral DB-client container, an exposure the trusted-DDL path already accepts.
+fn merge_stderr_argv(argv: &[String]) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("exec {} 2>&1", sh_join(argv)),
+    ]
 }
 
 /// The resolved reachable endpoint of a SQL database (managed or external) — the raw
@@ -1193,6 +1228,9 @@ enum StageJob {
         conn: PgConnection,
         image: String,
         data_only: bool,
+        /// The detected `SHOW server_version_num` — selects the `pg_dump` comment-handling
+        /// strategy (PG17+ `--exclude-extension` vs the blunt `--no-comments`).
+        server_version_num: String,
     },
     /// A MySQL `mysqldump` into a staging temp.
     Mysql {
@@ -2551,7 +2589,7 @@ impl NodeProjectExport {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
                 let pg = Some(PgMemberInfo {
-                    server_version_num,
+                    server_version_num: server_version_num.clone(),
                     client_image: image.clone(),
                     schema_fingerprint,
                 });
@@ -2566,6 +2604,7 @@ impl NodeProjectExport {
                         conn,
                         image,
                         data_only,
+                        server_version_num,
                     },
                 ));
             } else if kind_is_mysql(&cfg.kind) && dumpable {
@@ -2695,17 +2734,32 @@ impl NodeProjectExport {
                     r
                 })
             }
-            Some(StageJob::Pg { conn, image, .. }) => {
+            Some(StageJob::Pg {
+                conn,
+                image,
+                server_version_num,
+                ..
+            }) => {
                 // FULL `pg_dump -Fc` stdout → body channel, NO temp (inc2 Stage C). The chunked pg
                 // path is FULL-only (default #1), so `data_only` is ignored here (plan_export only
                 // frames pg chunked when !data_only).
                 let backend = self.require_backend()?.clone();
                 let conn = conn.clone();
                 let image = image.clone();
+                let server_version_num = server_version_num.clone();
+                // The chunked member is applied into a SHADOW that pre-creates the operator
+                // trusted-extension allowlist, so (on PG17+) the dump can `--exclude-extension`
+                // exactly those and keep every other object comment (see `pg_dump_invocation`).
+                let exclude_extensions = self.trusted_extensions.clone();
                 tokio::spawn(async move {
                     let mut sink = AsyncChannelWriter::new(body_tx);
                     let r: Result<(), Perr> = async {
-                        let inv = pg_dump_invocation(&conn, false);
+                        let inv = pg_dump_invocation(
+                            &conn,
+                            false,
+                            &server_version_num,
+                            &exclude_extensions,
+                        );
                         let code = backend
                             .run_ephemeral(&image, &inv.argv, &inv.env, None, &mut sink)
                             .await
@@ -2795,8 +2849,13 @@ impl NodeProjectExport {
                 conn,
                 image,
                 data_only,
+                server_version_num,
             } => {
-                let inv = pg_dump_invocation(conn, *data_only);
+                // SIDECAR (data-only, Shared, or external bring-your-own-URL): the restore applies
+                // the dump's OWN `CREATE EXTENSION` (we never pre-create extensions on a non-shadow
+                // target), so pass an EMPTY exclude list — this keeps the conservative
+                // `--no-comments` regardless of server version (see `pg_dump_invocation`).
+                let inv = pg_dump_invocation(conn, *data_only, server_version_num, &[]);
                 let code = self
                     .run_sql_client(image, &inv.argv, &inv.env, None, &tmp)
                     .await?;
@@ -2973,6 +3032,17 @@ impl NodeProjectExport {
                     // EXTERNAL bring-your-own-URL binding applies with the OPERATOR'S OWN credential
                     // against the OPERATOR'S OWN database (their trust boundary, not our managed
                     // cluster), so it is still applied.
+                    //
+                    // DO NOT relax this on the reasoning "data-only carries no DDL, so it's safe": the
+                    // confinement is NON-SUPERUSER-APPLY, not DDL-inspection. `data_only` here is an
+                    // UNTRUSTED MANIFEST FLAG (the bundle is attacker-crafted) — it does NOT constrain
+                    // the member's bytes, which the `pg_restore` run executes verbatim. An attacker
+                    // sets `data_only: true` and ships a member full of superuser escapes; trusting the
+                    // flag to skip the shadow/non-superuser path reintroduces the exact RCE. The only
+                    // safe enablement is a real least-privilege sidecar apply (an ephemeral
+                    // non-superuser role, as the chunked path mints) — which raises OPEN owner
+                    // decisions (its grant surface on LIVE tenant tables, FK/trigger ordering without
+                    // superuser, non-atomic partial-apply semantics). Until those are settled, refuse.
                     if is_managed_binding(cfg) {
                         return Err(Perr::Unavailable(format!(
                             "import refused: a MANAGED pg database ({db:?}) can only be restored via \
@@ -2984,14 +3054,25 @@ impl NodeProjectExport {
                         )));
                     }
                     let inv = pg_restore_invocation(&conn, data_only);
-                    let devnull = temp.with_extension("restore.out");
+                    // Capture stderr (where pg_restore reports a failed object) into the stdout
+                    // sink via `sh -c '… 2>&1'`, so a failed EXTERNAL restore is diagnosable
+                    // instead of a causeless "exited N" (run_ephemeral drops stderr on nonzero).
+                    let merged = merge_stderr_argv(&inv.argv);
+                    let outfile = temp.with_extension("restore.out");
                     let code = self
-                        .run_sql_client(&image, &inv.argv, &inv.env, Some(temp), &devnull)
+                        .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
                         .await?;
-                    let _ = tokio::fs::remove_file(&devnull).await;
                     if code != 0 {
-                        return Err(Perr::Other(format!("pg_restore for {db:?} exited {code}")));
+                        let diag = tokio::fs::read_to_string(&outfile)
+                            .await
+                            .unwrap_or_default();
+                        let _ = tokio::fs::remove_file(&outfile).await;
+                        return Err(Perr::Other(format!(
+                            "pg_restore for {db:?} exited {code}: {}",
+                            diag.trim()
+                        )));
                     }
+                    let _ = tokio::fs::remove_file(&outfile).await;
                 }
                 report.pg_databases += 1;
             }
@@ -3026,16 +3107,25 @@ impl NodeProjectExport {
                         )));
                     }
                     let inv = mysql_restore_invocation(&conn, data_only);
-                    let devnull = temp.with_extension("myrestore.out");
+                    // Capture the mysql client's stderr (a failed statement's error) via
+                    // `sh -c '… 2>&1'` so a failed EXTERNAL restore is diagnosable, not a
+                    // causeless "exited N" (run_ephemeral drops stderr on nonzero).
+                    let merged = merge_stderr_argv(&inv.argv);
+                    let outfile = temp.with_extension("myrestore.out");
                     let code = self
-                        .run_sql_client(&image, &inv.argv, &inv.env, Some(temp), &devnull)
+                        .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
                         .await?;
-                    let _ = tokio::fs::remove_file(&devnull).await;
                     if code != 0 {
+                        let diag = tokio::fs::read_to_string(&outfile)
+                            .await
+                            .unwrap_or_default();
+                        let _ = tokio::fs::remove_file(&outfile).await;
                         return Err(Perr::Other(format!(
-                            "mysql restore for {db:?} exited {code}"
+                            "mysql restore for {db:?} exited {code}: {}",
+                            diag.trim()
                         )));
                     }
+                    let _ = tokio::fs::remove_file(&outfile).await;
                 }
                 report.pg_databases += 1;
             }
@@ -4820,6 +4910,151 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a refused adopt must not have written the source-sealed KV slice"
+        );
+    }
+
+    /// A blob LARGER than the chunk size takes the ChunkedTrailer streaming framing and round-trips
+    /// byte-identical through export AND import into a re-keyed target scope — the per-member
+    /// streaming guarantee (never buffer a whole large blob): export streams the body O(chunk) with
+    /// no whole-object temp, import stages the chunk stream to a bounded temp then streams it into
+    /// the target store. A small blob stays Sidecar. Round-trip equality over a 5 KB body (≫ the
+    /// 16 B test chunk) proves the `.part` framing reassembles the large body exactly.
+    #[tokio::test]
+    async fn large_blob_round_trips_through_the_chunked_streaming_path() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mk = |tag: &str| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("{tag}-blobs"))));
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            let work = tmp.path().join(format!("{tag}-work"));
+            std::fs::create_dir_all(&work).unwrap();
+            // chunk size 16 B so a modest blob is framed ChunkedTrailer.
+            let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv, blobs.clone(), work)
+                .with_chunk_size(16);
+            (drv, blobs)
+        };
+
+        let (src, src_blobs) = mk("src");
+
+        // A blob much larger than the chunk size (→ ChunkedTrailer) + a tiny one (→ Sidecar);
+        // distinct, non-trivial bytes so a wrongly reassembled body is caught.
+        let big: Vec<u8> = (0u32..5000).map(|i| (i % 251) as u8).collect();
+        let small = b"tiny".to_vec();
+        let put = |blobs: Arc<dyn Storage>, key: &'static str, bytes: Vec<u8>| async move {
+            let body: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            blobs
+                .put(key, body, boatramp_core::PutMeta { content_type: None })
+                .await
+                .unwrap();
+        };
+        put(
+            src_blobs.clone(),
+            "hblob/acme/web/assets/big.bin",
+            big.clone(),
+        )
+        .await;
+        put(
+            src_blobs.clone(),
+            "hblob/acme/web/assets/small.txt",
+            small.clone(),
+        )
+        .await;
+
+        // data-only export: carries blobs (never gated on data_only) but no KV/identity — keeps the
+        // round-trip focused on the blob streaming path.
+        let bundle = export_to_buf(
+            &src,
+            "acme",
+            &ExportOptions {
+                data_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export");
+
+        // The bundle is v3 (it carries a chunked member); the v2-only `read_members` helper cannot
+        // read it, so parse the MANIFEST (first tar entry) directly to assert the LARGE blob took
+        // the ChunkedTrailer streaming framing and the small one stayed Sidecar. The large body's
+        // byte-identity is proven by the import round-trip below (which DOES read v3).
+        let manifest: project_bundle::StreamManifest = {
+            use std::io::Read as _;
+            let mut ar = tar::Archive::new(std::io::Cursor::new(&bundle));
+            let mut first = ar
+                .entries()
+                .unwrap()
+                .next()
+                .expect("manifest entry")
+                .unwrap();
+            let mut json = String::new();
+            first.read_to_string(&mut json).unwrap();
+            serde_json::from_str(&json).expect("parse the v3 StreamManifest")
+        };
+        assert_eq!(
+            manifest.format_version,
+            project_bundle::BUNDLE_FORMAT_VERSION_V3,
+            "a bundle carrying a chunked member is v3"
+        );
+        let framing = |path: &str| {
+            manifest
+                .members
+                .iter()
+                .find(|m| m.path == path)
+                .map(|m| m.framing)
+        };
+        assert_eq!(
+            framing("blobs/hblob/acme/web/assets/big.bin"),
+            Some(project_bundle::MemberFraming::ChunkedTrailer),
+            "a blob larger than the chunk size must take the chunked streaming framing"
+        );
+        assert_eq!(
+            framing("blobs/hblob/acme/web/assets/small.txt"),
+            Some(project_bundle::MemberFraming::Sidecar),
+            "a small blob stays sidecar"
+        );
+
+        // Import into a FRESH target project "acme2": the large blob streams per-member back into
+        // the target store under the re-keyed scope, byte-identical.
+        let (tgt, tgt_blobs) = mk("tgt");
+        let report = import_buf(
+            &tgt,
+            "acme2",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("import");
+        assert!(
+            report.blobs >= 2,
+            "both blobs imported (got {})",
+            report.blobs
+        );
+
+        let got = tgt_blobs
+            .get("hblob/acme2/web/assets/big.bin")
+            .await
+            .expect("the large blob landed under the re-keyed target scope");
+        let mut body = got.body;
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        assert_eq!(
+            buf, big,
+            "the large blob is byte-identical after a chunked export+import round-trip"
         );
     }
 

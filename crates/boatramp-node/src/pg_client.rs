@@ -73,6 +73,22 @@ pub struct SqlInvocation {
     pub env: Vec<(String, String)>,
 }
 
+/// The first `pg_dump` major version that supports `--exclude-extension` (PG17). Below this,
+/// the extension-comment problem (see [`pg_dump_invocation`]) can only be handled with the
+/// blunt `--no-comments`.
+const PG_EXCLUDE_EXTENSION_MIN_MAJOR: u32 = 17;
+
+/// Parse the server's major version from the integer `SHOW server_version_num` banner
+/// (`major*10000 + minor`, PG10+: `"160004"` → 16, `"170000"` → 17). Returns `None` for a
+/// banner we cannot parse (the caller then stays on the conservative `--no-comments` path).
+pub fn pg_server_major(server_version_num: &str) -> Option<u32> {
+    server_version_num
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .map(|n| n / 10000)
+}
+
 /// Build the `pg_dump` invocation for an EXPORT. Custom format (`-Fc`): compressed and
 /// the natural input to `pg_restore`. `--data-only` emits only the data AND EXCLUDES the
 /// host-owned migration ledger's rows (`boatramp_migrations.*`): the ledger is a schema
@@ -81,23 +97,53 @@ pub struct SqlInvocation {
 /// matching-fingerprint case — the PRIMARY use) would hit a primary-key conflict on the
 /// ledger and abort. Excluding it keeps the target's own `boatramp_migrations` ledger
 /// intact (the stated property).
-pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation {
+///
+/// ## Extension-comment handling (`--no-comments` vs `--exclude-extension`)
+/// The atomic shadow-restore applies the dump as a NON-SUPERUSER ephemeral role (the inc2
+/// RCE-on-import guard), which cannot run a `COMMENT ON EXTENSION <ext>` — that is OWNER-only,
+/// and a superuser pre-creates the operator trusted-extension allowlist (e.g. pgvector, whose
+/// control file sets no `trusted = true`) in the shadow, so those extensions are SUPERUSER-owned
+/// there. So a dump carrying `COMMENT ON EXTENSION <allowlisted>` would FAIL the non-superuser
+/// apply. Two ways to keep it out of the dump:
+/// - **PG16 and below** (no `--exclude-extension`): the blunt `--no-comments` — strips ALL
+///   comments. Object (table/column) comments are then NOT carried through a project export; an
+///   accepted FIDELITY limitation, not a correctness one.
+/// - **PG17+**: `--exclude-extension=<ext>` per shadow-pre-created extension — drops just those
+///   extensions (their `CREATE EXTENSION` + `COMMENT ON EXTENSION`) from the dump, which the
+///   shadow already holds, so ALL OTHER comments (table/column/…) survive. The dump's objects
+///   that USE the extension (e.g. a `vector`-typed column) still dump fine — the type exists in
+///   the pre-created shadow. This narrowing applies ONLY where the shadow pre-creates the
+///   extensions (the chunked managed path): pass `exclude_extensions` empty for the sidecar/
+///   external path, whose restore NEEDS the dump's own `CREATE EXTENSION` (we never pre-create on
+///   an operator's own DB), so it stays on `--no-comments` regardless of version.
+///
+/// A dump naming an extension NOT in `exclude_extensions` is unaffected: on the shadow path a
+/// non-allowlisted `CREATE EXTENSION` still fails-closed under the non-superuser apply (correct —
+/// an untrusted bundle must not install an arbitrary extension), the same outcome in both modes.
+pub fn pg_dump_invocation(
+    conn: &PgConnection,
+    data_only: bool,
+    server_version_num: &str,
+    exclude_extensions: &[String],
+) -> SqlInvocation {
     let mut argv = vec![
         "pg_dump".to_string(),
         "--no-owner".to_string(),
         "--no-privileges".to_string(),
-        // `--no-comments`: the atomic shadow-restore applies the dump as a NON-SUPERUSER
-        // ephemeral role (the inc2 RCE-on-import guard), which cannot run a `COMMENT ON
-        // EXTENSION <ext>` — that is OWNER-only, and a NON-trusted extension (e.g. pgvector,
-        // whose control file sets no `trusted = true`) can only be installed, hence owned, by
-        // the superuser that pre-creates it in the shadow. The extension's own comment is
-        // redundant anyway (CREATE EXTENSION re-sets it from the control file), so stripping
-        // comments loses nothing for the extension. PG16's pg_dump has no `--exclude-extension`
-        // (PG17+) to scope this to extensions only, so object comments are not carried through a
-        // project export; that is an accepted fidelity limitation, not a correctness one.
-        "--no-comments".to_string(),
-        "-Fc".to_string(),
     ];
+    let narrow = !exclude_extensions.is_empty()
+        && pg_server_major(server_version_num).is_some_and(|m| m >= PG_EXCLUDE_EXTENSION_MIN_MAJOR);
+    if narrow {
+        // PG17+ with shadow-pre-created extensions: exclude exactly those, keep all other comments.
+        for ext in exclude_extensions {
+            argv.push(format!("--exclude-extension={ext}"));
+        }
+    } else {
+        // PG16 (no --exclude-extension), or no shadow-pre-created extensions (sidecar/external):
+        // the blunt strip. Object comments are not carried (accepted fidelity limitation).
+        argv.push("--no-comments".to_string());
+    }
+    argv.push("-Fc".to_string());
     if data_only {
         argv.push("--data-only".to_string());
         // Exclude the host-owned migration ledger's DATA (schema-qualified pattern) so
@@ -369,8 +415,8 @@ mod tests {
     fn data_only_toggles_the_flag_on_both_sides() {
         // The data-only path MUST diverge from the full path (anti-hollow mutation (b):
         // drop the data_only honoring and this divergence vanishes).
-        let dump_do = pg_dump_invocation(&conn(), true);
-        let dump_full = pg_dump_invocation(&conn(), false);
+        let dump_do = pg_dump_invocation(&conn(), true, "160004", &[]);
+        let dump_full = pg_dump_invocation(&conn(), false, "160004", &[]);
         assert!(dump_do.argv.iter().any(|a| a == "--data-only"));
         assert!(!dump_full.argv.iter().any(|a| a == "--data-only"));
         // A --data-only dump EXCLUDES the migration ledger's rows so a restore into an
@@ -407,6 +453,67 @@ mod tests {
                 "the target database must follow -d"
             );
         }
+    }
+
+    #[test]
+    fn pg_server_major_parses_the_version_num_banner() {
+        assert_eq!(pg_server_major("160004"), Some(16));
+        assert_eq!(pg_server_major("170000"), Some(17));
+        assert_eq!(pg_server_major(" 180002 "), Some(18));
+        assert_eq!(pg_server_major("not-a-number"), None);
+    }
+
+    #[test]
+    fn exclude_extension_narrows_no_comments_only_on_pg17_with_a_shadow_allowlist() {
+        let exts = vec!["vector".to_string(), "pg_trgm".to_string()];
+        let has = |inv: &SqlInvocation, a: &str| inv.argv.iter().any(|x| x == a);
+        let has_exclude = |inv: &SqlInvocation, e: &str| {
+            inv.argv
+                .iter()
+                .any(|x| x == &format!("--exclude-extension={e}"))
+        };
+
+        // PG17 + a shadow-pre-created allowlist: NARROW — exclude exactly those extensions and
+        // DROP `--no-comments`, so all OTHER (table/column) comments survive the export.
+        let pg17 = pg_dump_invocation(&conn(), false, "170000", &exts);
+        assert!(!has(&pg17, "--no-comments"), "PG17 keeps object comments");
+        assert!(has_exclude(&pg17, "vector") && has_exclude(&pg17, "pg_trgm"));
+
+        // PG16 + the SAME allowlist: no `--exclude-extension` exists, so fall back to the blunt
+        // `--no-comments` and NEVER emit an `--exclude-extension` (unknown flag on PG16).
+        let pg16 = pg_dump_invocation(&conn(), false, "160004", &exts);
+        assert!(
+            has(&pg16, "--no-comments"),
+            "PG16 has no --exclude-extension → blunt strip"
+        );
+        assert!(
+            !pg16
+                .argv
+                .iter()
+                .any(|a| a.starts_with("--exclude-extension")),
+            "PG16's pg_dump does not know --exclude-extension"
+        );
+
+        // PG17 but NO shadow allowlist (the sidecar/external path): the restore needs the dump's
+        // own CREATE EXTENSION, so stay on `--no-comments` and exclude nothing.
+        let sidecar = pg_dump_invocation(&conn(), false, "170000", &[]);
+        assert!(has(&sidecar, "--no-comments"));
+        assert!(
+            !sidecar
+                .argv
+                .iter()
+                .any(|a| a.starts_with("--exclude-extension"))
+        );
+
+        // An unparseable banner is conservative: blunt strip, no exclude.
+        let unknown = pg_dump_invocation(&conn(), false, "garbage", &exts);
+        assert!(has(&unknown, "--no-comments"));
+        assert!(
+            !unknown
+                .argv
+                .iter()
+                .any(|a| a.starts_with("--exclude-extension"))
+        );
     }
 
     #[test]
@@ -520,7 +627,9 @@ mod tests {
     fn credential_is_in_the_env_never_in_argv() {
         let c = conn();
         for inv in [
-            pg_dump_invocation(&c, true),
+            pg_dump_invocation(&c, true, "160004", &[]),
+            // PG17 narrowing path too: the generated `--exclude-extension` args carry no credential.
+            pg_dump_invocation(&c, false, "170000", &["vector".to_string()]),
             pg_restore_invocation(&c, false),
         ] {
             // The password is present in the environment...

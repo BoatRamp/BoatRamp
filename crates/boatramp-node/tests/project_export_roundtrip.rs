@@ -238,7 +238,8 @@ async fn project_export_roundtrip_live() {
     let dump = td.path().join("dump.pgc");
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let inv = pg_dump_invocation(&src, /* data_only = */ false);
+        // Direct dump+restore (no shadow pre-create) → empty exclude list keeps `--no-comments`.
+        let inv = pg_dump_invocation(&src, /* data_only = */ false, "160000", &[]);
         let f = tokio::fs::File::create(&dump).await.unwrap();
         let mut sink = f.compat_write();
         let code = backend
@@ -468,7 +469,7 @@ async fn project_export_pg_chunked_shadow_live() {
     let dump = td.path().join("dump.pgc");
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let inv = pg_dump_invocation(&src_conn, false);
+        let inv = pg_dump_invocation(&src_conn, false, "160000", &[]);
         let f = tokio::fs::File::create(&dump).await.unwrap();
         let mut sink = f.compat_write();
         let code = backend
@@ -645,7 +646,7 @@ async fn project_export_pg_corruption_aborts_live() {
     let dump = td.path().join("dump.pgc");
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let inv = pg_dump_invocation(&src_conn, false);
+        let inv = pg_dump_invocation(&src_conn, false, "160000", &[]);
         let f = tokio::fs::File::create(&dump).await.unwrap();
         let mut sink = f.compat_write();
         let code = backend
@@ -988,7 +989,7 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     let dumpf = td.path().join("src.pgc");
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let inv = pg_dump_invocation(&src, false);
+        let inv = pg_dump_invocation(&src, false, "160000", &[]);
         let f = tokio::fs::File::create(&dumpf).await.unwrap();
         let mut sink = f.compat_write();
         let code = backend
@@ -1224,7 +1225,7 @@ async fn project_export_pg_pgvector_roundtrip_via_driver_live() {
     let dumpf = td.path().join("src.pgc");
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
-        let inv = pg_dump_invocation(&src, false);
+        let inv = pg_dump_invocation(&src, false, "160000", &[]);
         let f = tokio::fs::File::create(&dumpf).await.unwrap();
         let mut sink = f.compat_write();
         let code = backend
