@@ -3651,3 +3651,367 @@ async fn project_export_pg_true_delta_roundtrip_live() {
 
     println!("PROJECT EXPORT PG TRUE-DELTA OK");
 }
+
+/// LIVE gate (Docker + a `gtid_mode=ON --log-bin --binlog-format=ROW` MySQL): the mysql binlog
+/// true-delta round-trip. Seeds a base, creates a BASE resumable export (which records the snapshot
+/// GTID + start binlog in `mysql_capture.json`), mutates rows (insert/update/delete), takes an
+/// INCREMENTAL delta export (which streams the binlog since the base into a `MysqlBinlogDelta`
+/// member), then imports the chain into the live db and asserts it EXACTLY equals the MUTATED source
+/// — a result ONLY base-dump + binlog-replay can produce (the base dump alone is the pre-mutation
+/// state). Also proves: the delta is a TRUE binlog delta (not a full-dump fallback), a CRAFTED delta
+/// is refused fail-closed with the victim table + a SECOND tenant's db left untouched (shadow
+/// dropped, no swap). Marker: `PROJECT EXPORT MYSQL TRUE-DELTA OK`.
+#[tokio::test]
+async fn project_export_mysql_true_delta_roundtrip_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (live mysql true-delta round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live mysql true-delta not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    let s = now_suffix();
+    let live_db = format!("brexp_mytd_live_{s}");
+    let tenant_b_db = format!("brexp_mytd_tenantb_{s}");
+    let mkconn = |db: &str| MysqlConnection {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        password: password.clone(),
+        database: db.to_string(),
+        connect_timeout_secs: 10,
+    };
+    let admin = mkconn("");
+
+    // PRECONDITION: the server must run with GTID + row binlog (what `managed_db_spec` bakes into a
+    // managed DB's launch argv under `delta_capture`). SELF-SKIP when it does not — so a mysql server
+    // launched without the binlog argv (e.g. the env-clone capability gate) runs the OTHER tests
+    // cleanly; the binlog true-delta GATE (preflight-matrix.yml + flake.nix) launches mysql WITH the
+    // argv and gates on the `PROJECT EXPORT MYSQL TRUE-DELTA OK` marker, so a skip there FAILS the job
+    // (the marker is never printed).
+    let (_c, gtid_mode) =
+        mysql_run(backend.as_ref(), image, &admin, None, "SELECT @@gtid_mode;").await;
+    if gtid_mode.trim() != "ON" {
+        eprintln!(
+            "SKIP: the test MySQL is not gtid_mode=ON (binlog true-delta gate needs \
+             `--log-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON`)"
+        );
+        return;
+    }
+
+    // --- a source live DB (base rows + a victim table) + a SECOND tenant's DB (sentinel) ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "DROP DATABASE IF EXISTS {live_db}; CREATE DATABASE {live_db}; \
+             DROP DATABASE IF EXISTS {tenant_b_db}; CREATE DATABASE {tenant_b_db};"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "setup dbs: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         CREATE TABLE victim(id INT PRIMARY KEY); INSERT INTO victim VALUES (1); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed base rows: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "CREATE TABLE b(id INT PRIMARY KEY, v TEXT); INSERT INTO b VALUES (7,'TENANT_B_SENTINEL');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed tenant B: {o}");
+
+    // --- the driver: a MANAGED Single/default mysql binding with delta_capture, at the test DSN ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "mysql".to_string(),
+            compute: Some("mysql".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            delta_capture: true,
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/mysql", sealed)
+            .await
+            .unwrap();
+    }
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "mysql".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        .with_resumable_base(Some(resumable.clone()));
+
+    // --- BASE export: records the snapshot GTID + start binlog in mysql_capture.json ---
+    let full = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    drv.export_resumable("default", &full, "base")
+        .await
+        .expect("base resumable export");
+    let cap_sidecar = std::fs::read_to_string(resumable.join("base").join("mysql_capture.json"))
+        .expect("the base export must write a mysql_capture.json sidecar");
+    assert!(
+        cap_sidecar.contains("base_gtid") && cap_sidecar.contains("start_log"),
+        "the base sidecar must record the snapshot GTID + start binlog: {cap_sidecar}"
+    );
+
+    // --- mutate the source: an INSERT, an UPDATE, and a DELETE ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "INSERT INTO t VALUES (4,'delta'); UPDATE t SET v='beta2' WHERE id=2; DELETE FROM t WHERE id=3;",
+    )
+    .await;
+    assert_eq!(c, 0, "mutate source: {o}");
+
+    // --- INCREMENTAL delta export: streams the binlog into a MysqlBinlogDelta member ---
+    let delta_opts = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base".to_string(),
+        }),
+    };
+    drv.export_resumable("default", &delta_opts, "d1")
+        .await
+        .expect("incremental delta export");
+
+    // PROVE it is a TRUE binlog delta, not a full-dump fallback.
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::MysqlBinlogReplay,
+        "the delta must have binlog-captured the mysql db (not fallen back to a full dump)"
+    );
+    let bin_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.path == "sql/app.mysqlbinlog" && m.kind == MemberKind::MysqlBinlogDelta)
+        .expect("the delta must carry a sql/app.mysqlbinlog true-delta member");
+    assert!(
+        !d1_manifest.members.iter().any(|m| m.path == "sql/app.sql"),
+        "the full mysql dump must be SUPERSEDED by the binlog delta member"
+    );
+
+    // --- CRAFTED-ESCAPE: a copy of d1 whose binlog member is garbage must be REFUSED fail-closed;
+    // the victim table (+ tenant B) must be UNTOUCHED (shadow dropped, no swap). ---
+    let d1_dir = resumable.join("d1");
+    let evil_dir = resumable.join("evil");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    for ent in std::fs::read_dir(&d1_dir).unwrap() {
+        let ent = ent.unwrap();
+        if ent.file_type().unwrap().is_file() {
+            std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
+        }
+    }
+    // Overwrite the binlog member object + its meta so it PASSES the SHA check and reaches the
+    // replay, where the mysqlbinlog decode must reject it ("bad magic number") → the import fails
+    // closed (nothing partial reaches live).
+    let crafted =
+        b"not a binlog file at all \x00\x01\x02 DROP TABLE victim; -- escape attempt".to_vec();
+    let obj = evil_dir.join(format!("m{bin_idx:05}"));
+    std::fs::write(&obj, &crafted).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let meta = project_bundle::MemberMeta {
+            size: crafted.len() as u64,
+            sha256: hex::encode(Sha256::digest(&crafted)),
+        };
+        std::fs::write(
+            evil_dir.join(format!("m{bin_idx:05}.meta")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+    let evil_res = drv
+        .import_resumable(
+            "default",
+            "evil",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        evil_res.is_err(),
+        "a crafted/garbage binlog delta MUST be refused fail-closed; got: {evil_res:?}"
+    );
+    let (_c, victim) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT COUNT(*) FROM victim;",
+    )
+    .await;
+    assert_eq!(
+        victim.trim(),
+        "1",
+        "the crafted delta must NOT have touched the victim table (shadow dropped, no swap)"
+    );
+
+    // --- plant a sentinel so the happy-path assertion PROVES the restore actually ran ---
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+
+    // --- IMPORT the real delta chain: base dump → replay binlog → atomic swap ---
+    let report = drv
+        .import_resumable(
+            "default",
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delta chain import (base dump restore + binlog replay + swap)");
+    assert!(report.pg_databases >= 1, "the mysql db must be restored");
+
+    // --- ASSERT source == target. The base dump alone is {1:alpha,2:beta,3:gamma}; ONLY replaying
+    // the binlog delta (INSERT 4, UPDATE 2→beta2, DELETE 3) onto it yields exactly this set. ---
+    let (_c, rows) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        // One row per line (NOT GROUP_CONCAT — `mysql -N --batch` escapes an embedded newline as a
+        // literal `\n`), so the batch output is the three rows joined by real newlines.
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:alpha\n2:beta2\n4:delta",
+        "the restored db must equal the MUTATED source (base dump + binlog replay) — not the base \
+         state, not the pre-import sentinel"
+    );
+
+    // --- the SECOND tenant's db must be UNTOUCHED by the restore (≥2-tenant isolation) ---
+    let (_c, b_rows) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "SELECT CONCAT(id, ':', v) FROM b ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        b_rows, "7:TENANT_B_SENTINEL",
+        "the second tenant's db must be UNTOUCHED by the restore"
+    );
+
+    // --- cleanup (best-effort) ---
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS {live_db}; DROP DATABASE IF EXISTS {tenant_b_db};"),
+    )
+    .await;
+
+    println!("PROJECT EXPORT MYSQL TRUE-DELTA OK");
+}

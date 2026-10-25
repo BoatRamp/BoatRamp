@@ -130,9 +130,11 @@ sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 # Native project export/import driver (env-clone): the cross-crate orchestration that
 # runs `pg_dump`/`pg_restore` in an ephemeral docker container, snapshots libsql,
 # exports the control-plane KV slice, and copies blobs, assembling/reading a BRPROJ
-# bundle. Needs the managed-pg DSN seam (sql-postgres => handlers => the libsql engine)
-# and a local blob backend (fs) for the blob staging store.
-project-export = ["sql-postgres", "fs", "dep:tokio-util"]
+# bundle. Needs the managed pg + mysql DSN seams (sql-postgres/sql-mysql => handlers =>
+# the libsql engine; the mysql seam resolves a managed mysql binding's version/endpoint
+# for the shadow restore + the binlog true-delta engine) and a local blob backend (fs)
+# for the blob staging store.
+project-export = ["sql-postgres", "sql-mysql", "fs", "dep:tokio-util"]
 # The per-project SMTP email gateway (`boatramp:handlers/email`): wires the profile
 # store + delivery spool into the handler runtime. Enables the server's `email`
 # feature (which pulls `boatramp-handlers/email` + lettre); implies handlers.

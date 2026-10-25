@@ -984,6 +984,17 @@ impl NodeProjectExport {
     }
 }
 
+/// A SHORT process-unique suffix for a MySQL ephemeral identifier. MySQL caps a USER name at 32
+/// chars, and the general `shadow_suffix()` (`<nanos>_<pid>`, ~27 chars) overflows `brexp_apply_` /
+/// `brexp_rd_` — so the mysql shadow + binlog-capture ephemeral users use this 16-hex-char suffix
+/// instead (`brexp_apply_<16hex>` = 28 chars). Random, so collision-free across concurrent imports;
+/// the `brexp_apply_%` / `brexp_rd_%` / `%__shadow_%` sweep LIKE-patterns match it unchanged.
+fn mysql_eph_suffix() -> String {
+    let mut b = [0u8; 8];
+    getrandom::getrandom(&mut b).expect("os rng for mysql ephemeral suffix");
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// A process-unique shadow suffix (`<nanos>_<pid>`) — same shape libsql's `shadow_path_for` uses,
 /// so two imports in the same second never collide and the `*__shadow_*` / `*__old_*` sweep matches.
 fn shadow_suffix() -> String {
@@ -4744,7 +4755,8 @@ impl NodeProjectExport {
         let (operator_conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
         let maint = operator_conn; // mysql names no default db for the admin SQL
-        let suffix = shadow_suffix();
+        // A SHORT suffix: `brexp_apply_<suffix>` must fit MySQL's 32-char USER-name cap.
+        let suffix = mysql_eph_suffix();
         let shadow_db = format!("{live_db}__shadow_{suffix}");
         let eph_user = format!("brexp_apply_{suffix}");
         Ok(MysqlShadowPlan {
@@ -6247,7 +6259,8 @@ impl NodeProjectExport {
     ) -> Result<Option<Vec<u8>>, Perr> {
         let (op, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let binlog_image = mysql_binlog_image(&image);
-        let suffix = shadow_suffix();
+        // A SHORT suffix: `brexp_rd_<suffix>` must fit MySQL's 32-char USER-name cap.
+        let suffix = mysql_eph_suffix();
         let reader = format!("brexp_rd_{suffix}");
         let reader_pw = random_token();
         let reader_lit = mysql_lit(&reader);
@@ -6305,7 +6318,7 @@ impl NodeProjectExport {
         // row replay cannot faithfully reproduce). The fingerprint check already caught NET schema
         // changes; this catches any DDL even if net-neutral.
         if self
-            .mysql_binlog_range_has_ddl(&binlog_image, &bytes, db, stage_dir)
+            .mysql_binlog_range_has_ddl(&binlog_image, &bytes, db, &entry.base_gtid, stage_dir)
             .await?
         {
             tracing::info!(db = %db, "mysql delta: a DDL event is present in the binlog range — falling back to a full dump");
@@ -6322,6 +6335,7 @@ impl NodeProjectExport {
         binlog_image: &str,
         member_tar: &[u8],
         db: &str,
+        base_gtid: &str,
         stage_dir: &Path,
     ) -> Result<bool, Perr> {
         let cfg = self
@@ -6333,11 +6347,18 @@ impl NodeProjectExport {
         tokio::fs::write(&tar_path, member_tar)
             .await
             .map_err(other)?;
-        // Decode to stdout, keeping only the live db's events; `--force-read` so a benign unknown
-        // event never aborts the scan. No rewrite/exclude — we only inspect for DDL statements.
+        // Decode to stdout the SAME event set the replay applies — `--skip-gtids --exclude-gtids=
+        // <base>` drops the pre-base events the raw capture carries from the start binlog file (the
+        // base's binlog file holds events before the snapshot GTID; without excluding them the scan
+        // would false-positive on prior DDL, e.g. the base-time CREATE DATABASE), `--database=<live>`
+        // keeps only the live db's events — then inspect THAT for a DDL statement. `--force-read` so
+        // a benign unknown event never aborts the scan.
+        let exclude = format!("--exclude-gtids={base_gtid}");
+        let database = format!("--database={live_db}");
         let cmd = format!(
-            "mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; mysqlbinlog --force-read --database={} /tmp/brd/* 2>/dev/null",
-            sh_join(&[live_db])
+            "mkdir -p /tmp/brd; tar -C /tmp/brd -xf -; mysqlbinlog --force-read --skip-gtids {} {} /tmp/brd/* 2>/dev/null",
+            sh_join(&[exclude]),
+            sh_join(&[database]),
         );
         let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
         let out_path = stage_dir.join(format!("mysqlddl-{}.out", shadow_suffix()));

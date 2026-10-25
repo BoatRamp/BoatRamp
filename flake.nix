@@ -425,6 +425,8 @@
           #   • pgvector/pgvector:pg16 — the pg16 server AND its pg_dump/pg_restore/psql client
           #   • postgres:16            — the version-probe psql client image
           #   • mysql:8.0              — the mysql server AND its mysqldump/mysql client
+          #   • mysql:8.0-debian       — the mysqlbinlog-bearing client for the binlog true-delta
+          #                              capture/replay (the Oracle-Linux `mysql:8.0` omits it)
           # Digests + hashes are produced with `nix run nixpkgs#nix-prefetch-docker`.
           exportImportImages = {
             pgvector = pkgs.dockerTools.pullImage {
@@ -447,6 +449,15 @@
               hash = "sha256-MKIVSoXyndEJFtQ0QV2ZLiHdNEH5OxuBbiN9WNqF5j8=";
               finalImageName = "mysql";
               finalImageTag = "8.0";
+            };
+            # The DEBIAN variant ships `mysqlbinlog` (absent from the Oracle-Linux `mysql:8.0`), used
+            # by the binlog true-delta capture (`mysqlbinlog -R --raw`) + replay (`mysqlbinlog | mysql`).
+            mysqlDebian = pkgs.dockerTools.pullImage {
+              imageName = "mysql";
+              imageDigest = "sha256:9382e4f6f7f013231049ab854de9d0810594d028f4237b67102acc7ade8e3a99";
+              hash = "sha256-9nBCHhhjnBOXzxWojZRm53JYTnp8BGLDIoX+PzfAZ/A=";
+              finalImageName = "mysql";
+              finalImageTag = "8.0-debian";
             };
           };
 
@@ -1126,9 +1137,10 @@
                       skopeo --insecure-policy copy --dest-tls-verify=false --retry-times 3 \
                         "docker-archive:$1" "docker://127.0.0.1:5000/$2"
                     }
-                    copy ${exportImportImages.pgvector} pgvector/pgvector:pg16
-                    copy ${exportImportImages.postgres} library/postgres:16
-                    copy ${exportImportImages.mysql}    library/mysql:8.0
+                    copy ${exportImportImages.pgvector}    pgvector/pgvector:pg16
+                    copy ${exportImportImages.postgres}    library/postgres:16
+                    copy ${exportImportImages.mysql}       library/mysql:8.0
+                    copy ${exportImportImages.mysqlDebian} library/mysql:8.0-debian
                   '';
                 };
               };
@@ -1151,9 +1163,13 @@
                     "pgvector/pgvector:pg16 "
                     "-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10"
                 )
+                # `--log-bin --binlog-format=ROW --gtid-mode=ON …` enables the row binlog + GTID so
+                # the mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta.
                 machine.succeed(
                     "docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql "
-                    "mysql:8.0 --default-authentication-plugin=mysql_native_password"
+                    "mysql:8.0 --default-authentication-plugin=mysql_native_password "
+                    "--log-bin --binlog-format=ROW --gtid-mode=ON "
+                    "--enforce-gtid-consistency=ON --server-id=1"
                 )
 
                 # Wait for both to accept connections (readiness, not a fixed sleep).
@@ -1189,7 +1205,7 @@
                 # docker usable for the ephemeral client containers) — a self-skip still prints
                 # `ok`, so require the exact passed count AND every success marker, exactly like
                 # the host-runner job's grep gate.
-                assert re.search(r"test result: ok\. 15 passed", out), "not all 15 tests ran (silent skip?)"
+                assert re.search(r"test result: ok\. 16 passed", out), "not all 16 tests ran (silent skip?)"
                 for marker in [
                     "PROJECT EXPORT ROUNDTRIP OK",
                     "PROJECT EXPORT PG CHUNKED SHADOW OK",
@@ -1201,6 +1217,7 @@
                     "PROJECT EXPORT PG TRUE-DELTA OK",
                     "PROJECT EXPORT MYSQL ROUNDTRIP OK",
                     "PROJECT EXPORT MYSQL SHADOW OK",
+                    "PROJECT EXPORT MYSQL TRUE-DELTA OK",
                     "PROJECT EXPORT LIBSQL ROUNDTRIP OK",
                     "PROJECT EXPORT LIBSQL CHUNKED ATOMIC OK",
                     "PROJECT EXPORT CROSS-TENANT LEAK GATE OK",

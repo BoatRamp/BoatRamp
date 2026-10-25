@@ -270,9 +270,15 @@ jobs:
           # bridge connection works; 8.0 is pinned because `--default-authentication-plugin` is
           # gone in 8.4. The ephemeral mysqldump/mysql client containers the test launches reach
           # it by its bridge IP.
+          # `--log-bin --binlog-format=ROW --gtid-mode=ON …` enables the row binlog + GTID so the
+          # mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta (a bring-your-own
+          # test mysql must launch with it, the way `managed_db_spec` bakes it into a managed DB's
+          # launch argv under `delta_capture`).
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
           docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql \
-            mysql:8.0 --default-authentication-plugin=mysql_native_password >/dev/null
+            mysql:8.0 --default-authentication-plugin=mysql_native_password \
+            --log-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON \
+            --server-id=1 >/dev/null
           for _ in $(seq 1 90); do
             docker exec brexport-mysql mysqladmin ping -h 127.0.0.1 -uroot -pmysql >/dev/null 2>&1 && break
             sleep 2
@@ -287,13 +293,13 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 13 live/always-on tests + the 1 pure-unit URL-parser + the 1
+          # HARD gate: the file's 14 live/always-on tests + the 1 pure-unit URL-parser + the 1
           # pure-unit WAL-render-inertness test must ALL actually run (both live DBs reachable,
           # docker usable for the ephemeral client containers) — a self-skip (unset env /
           # unreachable docker) still prints `test result: ok`, so require the exact passed-count
           # AND every one of the file's success markers below.
-          grep -qE 'test result: ok\. 15 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 15 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 16 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 16 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -318,6 +324,8 @@ jobs:
             || { echo "::error::live mysql export/import round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL SHADOW OK' project-export-live.log \
             || { echo "::error::live mysql ATOMIC shadow-restore round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT MYSQL TRUE-DELTA OK' project-export-live.log \
+            || { echo "::error::live mysql binlog TRUE-DELTA round-trip never reached its marker (silent skip, a binlog-capture/replay regression, or the test mysql lacks gtid_mode=ON)" >&2; exit 1; }
 
           # --- no-docker members of the SAME test binary (always run) — gating on their markers
           #     too proves the whole file executed, not just the live-pg/mysql subset above (e.g.
