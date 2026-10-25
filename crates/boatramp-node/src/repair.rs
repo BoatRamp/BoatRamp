@@ -1206,6 +1206,12 @@ fn owner_role_ddl(d: &Derived, owner_pw: &str) -> Vec<String> {
 /// Probe the owner role's safe attributes (must be NOSUPERUSER / NOCREATEDB / NOCREATEROLE
 /// / NOBYPASSRLS); on drift converge = `ALTER ROLE … NOSUPERUSER NOCREATEDB NOCREATEROLE
 /// NOBYPASSRLS NOREPLICATION`.
+///
+/// Scope note (SQL true-delta program): this convergence targets ONLY the single derived per-db
+/// OWNER role (`d.owner_role`) — it never enumerates roles, so the ephemeral `brexp_capture_*`
+/// WAL-capture role (which carries `REPLICATION` by design, is owned + dropped by the export, and
+/// lives only across one base→delta window) is structurally OUT of scope here and is NOT stripped
+/// of `REPLICATION`. The export's own startup orphan sweep reclaims any stray `brexp_capture_*`.
 async fn check_owner_role_attrs(
     maint: &Arc<dyn SqlBackend>,
     d: &Derived,
