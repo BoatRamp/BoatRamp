@@ -110,7 +110,7 @@ pub fn prepare(plan: &SandboxPlan) -> Result<(), WorkerError> {
 /// [`ContainerBackend::with_host_root`]: crate::backend::ContainerBackend::with_host_root
 pub(crate) const USERNS_HOST_BASE: u32 = 100_000;
 /// The number of ids mapped from the container into the host range.
-const USERNS_COUNT: u32 = 65_536;
+pub(crate) const USERNS_COUNT: u32 = 65_536;
 
 /// The `/proc/<pid>/{uid,gid}_map` line mapping container id `0` onto host `base` for
 /// [`USERNS_COUNT`] ids. Written by the **launcher** (which holds `CAP_SETUID`/
@@ -250,11 +250,13 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
         fs::write("/etc/resolv.conf", body).map_err(|e| WorkerError::Io("write resolv.conf", e))?;
     }
 
-    // Persistent volumes are already owned by the guest's uid/gid: the host-root launcher
-    // pre-chowns each backing dir to `USERNS_HOST_BASE + guest_uid` (see
-    // `ContainerBackend::stage_volumes`). Chowning here in the user namespace can't work —
-    // the backing dir would be host-root-owned, i.e. `nobody` in the namespace, which
-    // namespace-root cannot chown (EPERM) — so ownership is the launcher's job, not ours.
+    // Persistent volumes are already mapped into the guest's view by the launcher: for a REUSED
+    // volume it DERIVES the container's user-namespace base from the data's existing owner so the
+    // data maps onto the DB's runtime uid and is read as-is (no chown); a FRESH volume (or an
+    // as-root in-place remap of host-owned data) is chowned to `mapping.base + <target uid>` (see
+    // `ContainerBackend::resolve_volume_mapping` / `stage_volumes`). Chowning here in the user
+    // namespace can't work — a backing dir owned outside the map range is `nobody` in the
+    // namespace, which namespace-root cannot chown (EPERM) — so ownership is the launcher's job.
 
     // One-shot ephemeral mode: remount the pivoted root **read-only** now — after the
     // resolv.conf write (which needs `/etc` writable) and the standard sub-mounts

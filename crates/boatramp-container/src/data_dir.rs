@@ -21,6 +21,15 @@ use std::path::Path;
 /// — enough to warn and sample without walking a large tree once the fault is established.
 pub(crate) const OWNERSHIP_SCAN_BUDGET: u64 = 64;
 
+/// How many entries [`scan_consistent_owner`] stats before accepting a uniform consensus. Set
+/// high enough to cover a real database data directory (a fresh Postgres cluster is a few
+/// thousand files) so a MIXED-ownership (partial-corruption) data dir is caught as a clean,
+/// actionable launch REFUSAL rather than deferred to a runtime DB `FATAL`. Still bounded, so a
+/// pathologically huge, consistent tree can't stall the launch (a derived base from a tree
+/// that's uniform across this many entries is as confined as any other — a conflict beyond it
+/// can't make the mapping more permissive, only degrade to the safe runtime-FATAL path).
+pub(crate) const CONSISTENT_OWNER_SCAN_BUDGET: u64 = 65_536;
+
 /// The result of a read-only data-dir-ownership scan — the counts a repair
 /// (`chown_tree_to`) would act on, gathered without changing anything.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -95,6 +104,91 @@ pub(crate) fn scan_data_dir_ownership(
     Ok(scan)
 }
 
+/// The uniform-ownership consensus of a persistent volume's data directory — the input to
+/// the **derive-the-userns-base** repair (`crate::backend`'s `resolve_volume_mapping`).
+///
+/// When the launcher canNOT chown a reused volume into the guest's mapped-owner range, it
+/// derives the workload's user-namespace base from the data dir's EXISTING owner so the files
+/// are readable with no chown. That is only sound when the data dir has a SINGLE, consistent
+/// `(uid, gid)` owner across every entry (the root and all descendants): a mixed-ownership
+/// tree has no single base that makes it all readable, so the launch must fail closed rather
+/// than guess. This scan is the read-only detector of that consensus; it changes nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerConsensus {
+    /// The directory does not exist, or exists but holds no entries below its root — a fresh
+    /// volume with nothing to derive from.
+    Empty,
+    /// Every entry (the root dir and all descendants) is owned by this single `(uid, gid)`.
+    Uniform { uid: u32, gid: u32, entries: u64 },
+    /// Entries disagree on their owner. Carries the first owner seen (the root's) and the
+    /// first entry that differs from it, for a fail-closed, actionable error.
+    Mixed {
+        first_uid: u32,
+        first_gid: u32,
+        /// Path (relative to the scanned root) of the first conflicting entry.
+        conflict_path: String,
+        conflict_uid: u32,
+        conflict_gid: u32,
+    },
+}
+
+/// Walk `dir` (and every descendant, not following symlinks) READ-ONLY and report whether it
+/// has a single consistent `(uid, gid)` owner ([`OwnerConsensus`]). Symlinks are stat'd by
+/// themselves and never followed, so a symlink inside the volume can't redirect the scan
+/// outside it. Returns on the FIRST conflicting entry (a faulty tree is cheap). `budget` bounds
+/// the number of entries stat'd so a huge, consistent tree can't stall the launch (DoS): once
+/// `budget` entries agree, the consensus is accepted as [`OwnerConsensus::Uniform`] without
+/// walking the rest — the caller only derives a base from this, which a later conflicting entry
+/// could not make MORE permissive (the derived mapping is confined regardless). A missing
+/// directory, or one with only its (existing) root and no contents, is [`OwnerConsensus::Empty`]
+/// — a fresh volume the caller does not derive from.
+pub(crate) fn scan_consistent_owner(dir: &Path, budget: u64) -> std::io::Result<OwnerConsensus> {
+    use std::os::unix::fs::MetadataExt;
+    let root_meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OwnerConsensus::Empty),
+        Err(e) => return Err(e),
+    };
+    let (first_uid, first_gid) = (root_meta.uid(), root_meta.gid());
+    let mut entries: u64 = 1; // the root itself
+    let mut children: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    'walk: while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            entries += 1;
+            children += 1;
+            if meta.uid() != first_uid || meta.gid() != first_gid {
+                let rel = path.strip_prefix(dir).unwrap_or(&path);
+                return Ok(OwnerConsensus::Mixed {
+                    first_uid,
+                    first_gid,
+                    conflict_path: rel.display().to_string(),
+                    conflict_uid: meta.uid(),
+                    conflict_gid: meta.gid(),
+                });
+            }
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            }
+            if entries >= budget {
+                // Budget reached with no conflict: accept the consensus established so far.
+                break 'walk;
+            }
+        }
+    }
+    if children == 0 {
+        // Only the (existing) root dir, no contents: a fresh/empty volume — don't derive.
+        return Ok(OwnerConsensus::Empty);
+    }
+    Ok(OwnerConsensus::Uniform {
+        uid: first_uid,
+        gid: first_gid,
+        entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +261,49 @@ mod tests {
             "scan stopped once the budget was reached"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn consistent_owner_uniform_empty_and_missing() {
+        use std::os::unix::fs::MetadataExt;
+        // Missing dir ⇒ nothing to derive from.
+        let missing = std::env::temp_dir().join(format!("brco-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(
+            scan_consistent_owner(&missing, OWNERSHIP_SCAN_BUDGET).expect("missing is Empty"),
+            OwnerConsensus::Empty
+        );
+
+        // An existing but childless dir ⇒ Empty (a fresh volume, not yet populated).
+        let empty = std::env::temp_dir().join(format!("brco-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            scan_consistent_owner(&empty, OWNERSHIP_SCAN_BUDGET).expect("childless is Empty"),
+            OwnerConsensus::Empty
+        );
+
+        // A populated, Postgres-shaped tree, entirely owned by the current user (we can't
+        // chown to a foreign uid without root), is Uniform at that owner — the input the
+        // backend turns into a derived base. The `entries` count proves the FULL walk (root
+        // + global/ + map + PG_VERSION + base/ + 1/ + 1259 = 7).
+        let tree = std::env::temp_dir().join(format!("brco-uniform-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(tree.join("global")).unwrap();
+        std::fs::write(tree.join("global").join("pg_filenode.map"), b"x").unwrap();
+        std::fs::write(tree.join("PG_VERSION"), b"16").unwrap();
+        std::fs::create_dir_all(tree.join("base").join("1")).unwrap();
+        std::fs::write(tree.join("base").join("1").join("1259"), b"y").unwrap();
+        let me = std::fs::symlink_metadata(&tree).unwrap();
+        match scan_consistent_owner(&tree, OWNERSHIP_SCAN_BUDGET).expect("uniform scan") {
+            OwnerConsensus::Uniform { uid, gid, entries } => {
+                assert_eq!((uid, gid), (me.uid(), me.gid()));
+                assert!(entries >= 7, "walked every nested entry, got {entries}");
+            }
+            other => panic!("expected Uniform, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&missing);
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&tree);
     }
 }

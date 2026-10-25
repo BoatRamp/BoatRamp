@@ -365,6 +365,410 @@ async fn container_live_postgres_host_root() {
     run_pg_e2e(true).await;
 }
 
+/// Build the managed-Postgres spec exactly as [`run_pg_e2e`] does (the SHARED synthesizer the
+/// node's auto-register path uses), with the rootless `999:999` privilege directive + the
+/// managed init-credential env — so this gate proves the workload that actually ships.
+/// The managed-Postgres spec, driving the REAL stock pgvector entrypoint. Uses the `Rootless`
+/// privilege model (the stock node default): the entrypoint runs AS the `postgres` uid 999, so
+/// `gosu` isn't needed — which is what lighthouse can run (its kernel/userns returns "operation
+/// not supported" when the worker tries to grant a `Caps`-model container CAP_SETUID/CAP_CHOWN,
+/// so the Provisor's entrypoint-as-root posture can't be driven here). The CORE failure the fix
+/// addresses — the DB (running as its runtime uid) cannot read a reused data dir owned OUTSIDE
+/// the container's userns map — is identical in both models and is exercised here; the
+/// runtime-uid-vs-entrypoint-uid distinction the `Caps` model adds is covered by the unit tests.
+fn managed_pg_spec(pw: &str) -> ComputeSpec {
+    let mut spec = boatramp_core::compute::managed_db_spec(
+        boatramp_core::compute::ManagedDbEngine::Postgres,
+        Some("pgvector/pgvector:pg16"),
+        512,
+        false,
+    );
+    boatramp_core::compute::PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
+    spec.env
+        .insert("POSTGRES_USER".to_string(), "app".to_string());
+    spec.env
+        .insert("POSTGRES_PASSWORD".to_string(), pw.to_string());
+    spec.env
+        .insert("POSTGRES_DB".to_string(), "app".to_string());
+    spec
+}
+
+/// Materialize + launch the managed-pg `spec` on `backend` as workload `wl`.
+async fn launch_managed_pg(
+    backend: &ContainerBackend,
+    spec: &ComputeSpec,
+    wl: &str,
+) -> boatramp_core::compute::Instance {
+    let artifact = backend
+        .materialize(spec)
+        .await
+        .expect("materialize (pull) pgvector image");
+    let req = LaunchRequest {
+        project: "default".into(),
+        workload: wl.into(),
+        replica: 0,
+        spec: spec.clone(),
+        artifact,
+    };
+    backend
+        .launch(&req)
+        .await
+        .expect("launch pgvector container")
+}
+
+/// Poll `select 1` over TCP; `true` once Postgres answers. ~40 s budget (first boot initdb).
+fn pg_answers(host: &str, port: u16, pw: &str) -> bool {
+    let conn = format!("postgresql://app:{pw}@{host}:{port}/app");
+    for _ in 0..80 {
+        if let Ok(out) = std::process::Command::new("psql")
+            .args([&conn, "-tAc", "select 1"])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).trim() == "1"
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// The `(uid, gid)` owning a host path (not following symlinks).
+fn owner_of(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).expect("stat volume file");
+    (m.uid(), m.gid())
+}
+
+/// **Reused-volume data preservation (the v0.45.0 managed-DB regression fix).** The CORE of the
+/// Provisor failure: a managed Postgres data dir carried across a `fly machine update` /
+/// `userns_base` change is owned, on the host, at a PRIOR base — OUTSIDE the current container's
+/// userns map range, so it is `nobody` inside and the DB (running as its runtime uid) cannot
+/// read its own cluster files (`global/pg_filenode.map: Permission denied`). v0.45.0's
+/// worker-side recursive `chown_tree_to` either doesn't reach it or destructively rewrites the
+/// user's whole data dir. (On the Provisor the entrypoint runs as userns-root and its root-path
+/// `chown -R` EPERMs first; that `Caps` posture can't be driven on this box — the kernel/userns
+/// refuses to grant the container CAP_CHOWN/CAP_SETUID — so this gate drives the REAL entrypoint
+/// in the `Rootless` model, where it runs AS postgres 999 and the SAME out-of-map read failure
+/// occurs; the runtime-vs-entrypoint-uid distinction is unit-tested.)
+///
+/// The fix makes **derive-base the primary, always-on strategy for a reused volume**: it picks
+/// the userns base `D` so the data's existing host owner maps onto the DB's RUNTIME uid detected
+/// from the image's `/etc/passwd` (NOT the spec/entrypoint uid), reading the data AS-IS — NO
+/// chown, NO reinit. This gate, with a REAL pgvector cluster + a SENTINEL row:
+///   1. Seed a real cluster (real `docker-entrypoint.sh`) and write a SENTINEL row.
+///   2. Rewrite the data dir to `200999:200999` — a volume from a prior subuid base 200000
+///      (`200999 = 200000 + the image postgres uid 999`), OUTSIDE the current map range
+///      [100000,165535] → `nobody` inside.
+///   3. Relaunch (WITH the fix): the launcher detects the runtime uid 999 and derives base
+///      200000, so Postgres reads the cluster AS-IS — HEALTHY, the SENTINEL row SURVIVES, and
+///      the data dir is left byte-for-byte at 200999 (ownership NOT mutated, no reinit).
+///   4. Relaunch once more: the derived volume stays healthy (no regression).
+///
+/// Mutation-sensitive: (a) neuter the derive so the base stays 100000 — the data is `nobody`
+/// inside and Postgres FATALs (`up` is false); (b) the shipped recursive chown (or deriving with
+/// the entrypoint/guest uid instead of the runtime uid) rewrites the owner away from 200999 —
+/// the "owner unchanged" assertion fails. Needs Linux + root + a bridge + psql; pulls pgvector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_live_postgres_reused_volume_preserves_data_on_euid_root() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_live_postgres_reuse: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-cpgreuse-{}", std::process::id()));
+    let pw = "s3cr3t-pw";
+    let spec = managed_pg_spec(pw);
+
+    // The DEFAULT container backend — host root on this test box, the live Fly posture (euid-root
+    // worker, rootless user-namespace, base 100000). No chown override: the fix must engage on
+    // the default managed-pg path.
+    let mk = || {
+        ContainerBackend::new(
+            // Storage is unused for the OCI Image path (the pull is over HTTP).
+            Arc::new(FileBlob(Vec::new())),
+            data_dir.clone(),
+            bridge.clone(),
+            &subnet,
+            PathBuf::from(&bin),
+        )
+        .expect("backend")
+    };
+
+    // 1) Seed a real healthy cluster (real entrypoint → initdb) + a SENTINEL row.
+    let seed = mk();
+    let inst = launch_managed_pg(&seed, &spec, "cpgreuse").await;
+    let (host, port) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    assert!(
+        pg_answers(&host, port, pw),
+        "seed: a fresh cluster must answer select 1"
+    );
+    let (wrote, out) = psql_exec(
+        &host,
+        port,
+        pw,
+        "create table sentinel(v text); insert into sentinel values('SENTINEL-OK')",
+    );
+    assert!(wrote, "seed: write the sentinel row (out: {out})");
+    let _ = seed.stop(&inst.handle).await;
+
+    let vol = data_dir.join("compute").join("volumes").join("data");
+    let sample = vol.join("PG_VERSION");
+    assert!(sample.exists(), "seed produced a real cluster data dir");
+
+    // 2) Simulate a volume carried across a userns_base change: rewrite the whole data dir to
+    //    200999 (prior subuid base 200000 + the image postgres uid 999), OUTSIDE the current
+    //    map range [100000,165535] → `nobody` inside the base-100000 container.
+    let st = std::process::Command::new("chown")
+        .args(["-R", "200999:200999", &vol.display().to_string()])
+        .status()
+        .expect("spawn chown fixture");
+    assert!(st.success(), "fixture chown -R 200999:200999 must succeed");
+    assert_eq!(
+        owner_of(&sample),
+        (200999, 200999),
+        "fixture: the reused data dir is now owned under the prior subuid base"
+    );
+
+    // 3) Relaunch (WITH the fix): detect the runtime uid 999 + derive base 200000, so the real
+    //    entrypoint + Postgres read the reused data in-map, as-is.
+    let fixed = mk();
+    let inst = launch_managed_pg(&fixed, &spec, "cpgreuse").await;
+    let (host, port) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let up = pg_answers(&host, port, pw);
+    let sentinel = if up {
+        let (ok, o) = psql_exec(&host, port, pw, "select v from sentinel");
+        eprintln!("sentinel read: ok={ok} out={}", o.trim());
+        ok && o.trim() == "SENTINEL-OK"
+    } else {
+        false
+    };
+    if !up {
+        let log = data_dir.join("compute").join("logs").join("cpgreuse-0.log");
+        eprintln!(
+            "reuse FAIL — guest log:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    let _ = fixed.stop(&inst.handle).await;
+    let owner_after = owner_of(&sample);
+
+    assert!(
+        up,
+        "fix: a reused volume at a prior mapping must come up HEALTHY (derive-base reads it \
+         as-is); without the derive it is `nobody` inside and Postgres FATALs on \
+         global/pg_filenode.map"
+    );
+    assert!(
+        sentinel,
+        "fix: the SENTINEL row must SURVIVE — the data is read in place, never reinitialized"
+    );
+    assert_eq!(
+        owner_after,
+        (200999, 200999),
+        "fix: the data is read AS-IS — ownership is NOT mutated (the shipped recursive chown, or \
+         deriving with the entrypoint uid, would rewrite it)"
+    );
+
+    // 4) No-regress: relaunching the derived volume stays healthy with the sentinel intact.
+    let inst = launch_managed_pg(&fixed, &spec, "cpgreuse").await;
+    let (host, port) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let up2 = pg_answers(&host, port, pw);
+    let sentinel2 = up2 && {
+        let (ok, o) = psql_exec(&host, port, pw, "select v from sentinel");
+        ok && o.trim() == "SENTINEL-OK"
+    };
+    let _ = fixed.stop(&inst.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+    assert!(
+        sentinel2,
+        "relaunch of the derived volume must stay healthy with the sentinel intact (no regress)"
+    );
+    eprintln!(
+        "reused-volume data preservation OK: detected runtime uid 999, derived base 200000, \
+         Postgres read its cluster as-is, sentinel survived, ownership left at 200999, \
+         no-regress relaunch"
+    );
+}
+
+/// Run one SQL statement via `psql`, returning `(success, combined stdout+stderr)`.
+fn psql_exec(host: &str, port: u16, pw: &str, sql: &str) -> (bool, String) {
+    let conn = format!("postgresql://app:{pw}@{host}:{port}/app");
+    match std::process::Command::new("psql")
+        .args([&conn, "-tAc", sql])
+        .output()
+    {
+        Ok(out) => (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ),
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+/// `ls -lan` a host path (numeric owners), for ownership evidence in the diagnostic.
+fn ls_lan(path: &std::path::Path) -> String {
+    std::process::Command::new("ls")
+        .args(["-lan", &path.display().to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Read the running container's `/proc/<pid>/uid_map` by finding a pid in its cgroup.
+fn container_uid_map(id: &str) -> String {
+    let procs = std::fs::read_to_string(format!("/sys/fs/cgroup/boatramp/{id}/cgroup.procs"))
+        .unwrap_or_default();
+    let Some(pid) = procs.split_whitespace().next() else {
+        return "(no pid in cgroup)".into();
+    };
+    std::fs::read_to_string(format!("/proc/{pid}/uid_map"))
+        .unwrap_or_else(|e| format!("(err: {e})"))
+}
+
+/// **DIAGNOSTIC (full host visibility).** Reproduce the Provisor shape and MEASURE it:
+/// euid-root worker + DEFAULT rootless-userns backend (recursive worker chown ON — the
+/// shipped v0.45.0 behaviour) + managed-pg `Rootless(999)` + a reused data volume whose host
+/// owner is a subuid mapping under a DIFFERENT base than the current launch. Prints host-side
+/// `ls -lan`, the container `uid_map`, the guest log, and whether a SENTINEL row survives.
+///
+/// Env knobs (so scenarios can be probed without recompiling):
+///   DIAG_FOREIGN_UID / DIAG_FOREIGN_GID  the owner to rewrite the reused volume to (default 70999)
+///   DIAG_USER                            the launch `user` ("999:999" default; "" leaves it unset → guest 0)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic: needs Linux + root + bridge + psql; pulls pgvector"]
+async fn container_diag_reused_volume_mapping() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("diag: set BOATRAMP_BIN");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let foreign_uid: u32 = std::env::var("DIAG_FOREIGN_UID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(70999);
+    let foreign_gid: u32 = std::env::var("DIAG_FOREIGN_GID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(70999);
+    let user = std::env::var("DIAG_USER").unwrap_or_else(|_| "999:999".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-diag-{}", std::process::id()));
+    let pw = "s3cr3t-pw";
+
+    let mut spec = boatramp_core::compute::managed_db_spec(
+        boatramp_core::compute::ManagedDbEngine::Postgres,
+        Some("pgvector/pgvector:pg16"),
+        512,
+        false,
+    );
+    if !user.is_empty() {
+        let (u, g) = user
+            .split_once(':')
+            .unwrap_or((user.as_str(), user.as_str()));
+        boatramp_core::compute::PrivilegeDirective::Rootless {
+            uid: u.parse().unwrap(),
+            gid: g.parse().unwrap(),
+        }
+        .apply(&mut spec);
+    }
+    spec.env.insert("POSTGRES_USER".into(), "app".into());
+    spec.env.insert("POSTGRES_PASSWORD".into(), pw.into());
+    spec.env.insert("POSTGRES_DB".into(), "app".into());
+    eprintln!(
+        "DIAG spec.user = {:?}  foreign={foreign_uid}:{foreign_gid}",
+        spec.user
+    );
+
+    let mk = || {
+        ContainerBackend::new(
+            Arc::new(FileBlob(Vec::new())),
+            data_dir.clone(),
+            bridge.clone(),
+            &subnet,
+            PathBuf::from(&bin),
+        )
+        .expect("backend")
+    };
+
+    let vol = data_dir.join("compute").join("volumes").join("data");
+
+    // Phase A: fresh init under the current mapping; insert a sentinel.
+    let b = mk();
+    let inst = launch_managed_pg(&b, &spec, "diag").await;
+    let (host, port) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let up = pg_answers(&host, port, pw);
+    eprintln!("[A] fresh launch: pg answers = {up}");
+    eprintln!("[A] uid_map: {}", container_uid_map("diag-0").trim());
+    if up {
+        let (ok, o) = psql_exec(
+            &host,
+            port,
+            pw,
+            "create table sentinel(v text); insert into sentinel values('ALIVE-42'); select v from sentinel",
+        );
+        eprintln!("[A] sentinel write: ok={ok} out={}", o.trim());
+    }
+    eprintln!("[A] host ls -lan (volume root):\n{}", ls_lan(&vol));
+    eprintln!(
+        "[A] host ls -lan (global/):\n{}",
+        ls_lan(&vol.join("global"))
+    );
+    let _ = b.stop(&inst.handle).await;
+
+    // Phase B: rewrite the reused volume to a foreign (prior-base) owner.
+    let st = std::process::Command::new("chown")
+        .args([
+            "-R",
+            &format!("{foreign_uid}:{foreign_gid}"),
+            &vol.display().to_string(),
+        ])
+        .status()
+        .expect("chown fixture");
+    eprintln!(
+        "[B] chown -R {foreign_uid}:{foreign_gid} success={}",
+        st.success()
+    );
+    eprintln!("[B] host ls -lan (volume root):\n{}", ls_lan(&vol));
+
+    // Phase C: relaunch under current (recursive-chown) code; measure.
+    let b = mk();
+    let inst = launch_managed_pg(&b, &spec, "diag").await;
+    let (host, port) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let up = pg_answers(&host, port, pw);
+    eprintln!("[C] relaunch: pg answers = {up}");
+    eprintln!("[C] uid_map: {}", container_uid_map("diag-0").trim());
+    eprintln!(
+        "[C] host ls -lan AFTER worker chown (volume root):\n{}",
+        ls_lan(&vol)
+    );
+    eprintln!(
+        "[C] host ls -lan (global/):\n{}",
+        ls_lan(&vol.join("global"))
+    );
+    let sentinel = if up {
+        let (ok, o) = psql_exec(&host, port, pw, "select v from sentinel");
+        eprintln!("[C] sentinel read: ok={ok} out={}", o.trim());
+        o.trim() == "ALIVE-42"
+    } else {
+        false
+    };
+    let log = data_dir.join("compute").join("logs").join("diag-0.log");
+    eprintln!(
+        "[C] guest log:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let _ = b.stop(&inst.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+    eprintln!("[SUMMARY] relaunch-healthy={up} sentinel-survived={sentinel}");
+}
+
 /// Poll the container's `/nonce` endpoint over HTTP, returning the body or empty.
 fn probe_nonce(host: &str, port: u16) -> String {
     let url = format!("http://{host}:{port}/nonce");

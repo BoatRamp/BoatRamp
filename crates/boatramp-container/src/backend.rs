@@ -564,14 +564,16 @@ impl ContainerBackend {
     /// entry-count cap, path-escaping entry, or io) tears the partial,
     /// marker-less staging dir + temp blob back down so a half-extracted dir can
     /// never be mistaken for ready and a retry starts clean.
-    async fn stage_rootfs(&self, hash: &str) -> Result<PathBuf, BackendError> {
+    async fn stage_rootfs(&self, hash: &str, base: u32) -> Result<PathBuf, BackendError> {
         // Keyed by the userns base too: the unpacked tree is ownership-shifted for that
-        // base (see `shift_rootfs`), so a different base needs its own staging.
+        // base (see `shift_rootfs`), so a different base needs its own staging. `base` is the
+        // workload's EFFECTIVE base (normally `self.userns_base`, but a per-launch derived
+        // base on the reused-volume path — see `resolve_volume_mapping`).
         let dir = self
             .data_dir
             .join("compute")
             .join("rootfs")
-            .join(format!("{hash}.b{}", self.userns_base));
+            .join(format!("{hash}.b{base}"));
         let ready = dir.join(".boatramp-ready");
         if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
             return Ok(dir);
@@ -581,7 +583,10 @@ impl ContainerBackend {
             .join("compute")
             .join("rootfs")
             .join(format!(".{hash}.tar.gz"));
-        match self.stage_rootfs_inner(hash, &dir, &ready, &tmp).await {
+        match self
+            .stage_rootfs_inner(hash, &dir, &ready, &tmp, base)
+            .await
+        {
             Ok(()) => Ok(dir),
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
@@ -600,6 +605,7 @@ impl ContainerBackend {
         dir: &Path,
         ready: &Path,
         tmp: &Path,
+        base: u32,
     ) -> Result<(), BackendError> {
         tokio::fs::create_dir_all(dir)
             .await
@@ -635,7 +641,6 @@ impl ContainerBackend {
         // entries.
         let unpack_dir = dir.to_path_buf();
         let unpack_tmp = tmp.to_path_buf();
-        let base = self.userns_base;
         tokio::task::spawn_blocking(move || {
             unpack_tar_gz(&unpack_tmp, &unpack_dir, ArchiveCaps::DEFAULT)?;
             // Shift the extracted ownership into the container's mapped host range so the
@@ -660,12 +665,14 @@ impl ContainerBackend {
     /// The pull builds into a sibling temp dir and is published to its final path with
     /// an atomic rename only after the ready marker is written, so a partial or
     /// interrupted pull can never be mistaken for a complete rootfs.
-    async fn stage_image(&self, image: &str) -> Result<PathBuf, BackendError> {
+    async fn stage_image(&self, image: &str, base: u32) -> Result<PathBuf, BackendError> {
         // Keyed by the image reference AND the userns base (the overlaid tree is
-        // ownership-shifted for that base — see `shift_rootfs`).
+        // ownership-shifted for that base — see `shift_rootfs`). `base` is the workload's
+        // EFFECTIVE base (normally `self.userns_base`, but a per-launch derived base on the
+        // reused-volume path — see `resolve_volume_mapping`).
         let key = boatramp_types::manifest::sha256_hex(image.as_bytes());
         let images = self.data_dir.join("compute").join("images");
-        let dir = images.join(format!("{key}.b{}", self.userns_base));
+        let dir = images.join(format!("{key}.b{base}"));
         if tokio::fs::try_exists(dir.join(".boatramp-ready"))
             .await
             .unwrap_or(false)
@@ -675,14 +682,14 @@ impl ContainerBackend {
         tokio::fs::create_dir_all(&images)
             .await
             .map_err(|e| BackendError::Materialize(format!("create {}: {e}", images.display())))?;
-        let tmp = images.join(format!(".{key}.b{}.tmp", self.userns_base));
+        let tmp = images.join(format!(".{key}.b{base}.tmp"));
         // Clear any leftover partial from a prior interrupted pull.
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         match boatramp_firecracker::oci::build_rootfs_dir(image, &tmp).await {
             Ok(()) => {
                 // Shift the overlaid ownership into the container's mapped host range so
                 // the guest's namespace-root owns its rootfs (a no-op when base == 0).
-                let (shift_dir, base) = (tmp.clone(), self.userns_base);
+                let shift_dir = tmp.clone();
                 tokio::task::spawn_blocking(move || shift_rootfs(&shift_dir, base))
                     .await
                     .map_err(|e| BackendError::Materialize(format!("join: {e}")))?
@@ -815,16 +822,20 @@ impl ComputeBackend for ContainerBackend {
         // a **tar** blob from the shared store (staged + unpacked), or an **OCI
         // image** reference (pulled over the registry HTTP API + its layers
         // overlaid — no Docker daemon). A `Rootfs` block image is the micro-VM's.
-        let dir =
-            match &spec.root {
-                RootSource::Tar(hash) => self.stage_rootfs(hash).await?,
-                RootSource::Image(image) => self.stage_image(image).await?,
-                RootSource::Rootfs(_) => return Err(BackendError::Materialize(
-                    "container backend requires a tar rootfs archive or an OCI image reference \
-                     (RootSource::Tar | RootSource::Image)"
-                        .into(),
-                )),
-            };
+        // Stage a probe rootfs at the CONFIGURED base first: it is the default rootfs AND the
+        // source we read the image's DB runtime uid from (`/etc/passwd`), which the mapping
+        // derive needs (and whose content is identical across ownership-shift bases).
+        let probe = self.stage_rootfs_source(spec, self.userns_base).await?;
+        // Resolve the workload's userns mapping ONCE here (threaded to launch via the staged
+        // rootfs's `.b<base>` path, which `launch_inner` re-asserts): the configured base
+        // normally, but a per-launch base DERIVED from a REUSED volume's own owner so the rootfs,
+        // the userns map, and the volume all agree and the reused data is read as-is (no chown).
+        let mapping = self.resolve_volume_mapping(spec, &probe).await?;
+        let dir = if mapping.base == self.userns_base {
+            probe
+        } else {
+            self.stage_rootfs_source(spec, mapping.base).await?
+        };
         Ok(Artifact::Rootfs {
             dir: dir.display().to_string(),
         })
@@ -1271,6 +1282,12 @@ impl ComputeBackend for ContainerBackend {
             return None;
         }
         let (guest_uid, guest_gid) = spec_uid_gid(spec);
+        // A read-only health sample against the configured mapped owner. With the reused-volume
+        // repair ([`Self::resolve_volume_mapping`]) a mismatched reused volume is instead served
+        // by a derived base (read as-is) or fails closed at launch, so this diagnostic — only
+        // consulted when a replica is stuck up-but-not-answering — is a best-effort sample for an
+        // operator, not an authoritative mapping (it does not re-derive, which would need the
+        // staged rootfs to detect the runtime uid).
         let host_uid = self.userns_base + guest_uid;
         let host_gid = self.userns_base + guest_gid;
         let mut clean: Option<DataDirOwnership> = None;
@@ -1335,34 +1352,34 @@ impl ContainerBackend {
     /// `pivot_root`). The bind is a plain directory, so `size_mib` is advisory
     /// here (block-device size enforcement is the VMM volume path); the data
     /// persists across restarts because it lives outside the ephemeral rootfs.
-    async fn stage_volumes(&self, spec: &ComputeSpec) -> Result<Vec<VolumeMount>, BackendError> {
-        // Pre-own each volume dir (as the host-root launcher) at the host id the guest's
-        // entrypoint uid/gid maps onto — `USERNS_HOST_BASE + guest_uid`. Without this the
-        // dir is host-root-owned, which is `nobody` inside the container's user namespace,
-        // so the guest (and even the worker's in-ns chown) can't write or chown it —
-        // EPERM. A fresh dir gets the guest as owner; a reused dir already is (no-op).
-        let (guest_uid, guest_gid) = spec_uid_gid(spec);
-        let host_uid = self.userns_base + guest_uid;
-        let host_gid = self.userns_base + guest_gid;
+    async fn stage_volumes(
+        &self,
+        spec: &ComputeSpec,
+        mapping: &ResolvedMapping,
+    ) -> Result<Vec<VolumeMount>, BackendError> {
+        // A dir owned outside the container's user-namespace map range is `nobody` inside, so the
+        // workload can't read it — EPERM (`global/pg_filenode.map: Permission denied`).
+        //
+        // Each `mapping.chowns[i]` (decided by `resolve_mapping_decision`, PER volume) says
+        // whether we touch that volume's ownership:
+        //  * None — a REUSED volume read AS-IS: `base` was DERIVED from the volume's own existing
+        //    owner so the data already maps onto the workload's runtime uid. We DO NOT chown; the
+        //    user's data dir is left byte-for-byte unchanged (data-preserving + idempotent).
+        //  * Some((uid, gid)) — a FRESH dir (needs an owned dir to init into) or an in-place
+        //    REMAP of host-owned data the mapping can't express. `chown_tree_to` relabels to that
+        //    host `(uid, gid)`, SKIPPING entries already correct (never a reinit — only ownership
+        //    changes, never content). A remap is only ever reached as host root.
         let mut mounts = Vec::with_capacity(spec.volumes.len());
-        for vol in &spec.volumes {
+        for (i, vol) in spec.volumes.iter().enumerate() {
             validate_volume(&vol.name, &vol.mount)?;
             let dir = self.volume_dir(&vol.name);
             tokio::fs::create_dir_all(&dir).await.map_err(|e| {
                 BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
             })?;
-            if can_shift_ownership() {
-                // Fix ownership so the guest (uid `guest_uid` → host `host_uid`) owns the
-                // volume. A FRESH dir only needs its top-level owner set; a REUSED dir may
-                // carry files written under a DIFFERENT owner — a volume restored/cloned
-                // from an env-export, or one from a prior `userns_base` — and a top-dir-only
-                // chown leaves those files foreign-owned, so a rootless DB (e.g. Postgres as
-                // 999) gets EPERM reading its OWN cluster files (`global/pg_filenode.map:
-                // Permission denied`). Recurse, skipping entries already correctly owned so a
-                // large, already-correct volume stays cheap.
+            if let Some(Some((host_uid, host_gid))) = mapping.chowns.get(i).copied() {
                 chown_tree_to(&dir, host_uid, host_gid).map_err(|e| {
                     BackendError::Launch(format!(
-                        "chown volume {} to guest owner {host_uid}:{host_gid}: {e}",
+                        "chown volume {} to {host_uid}:{host_gid}: {e}",
                         vol.name
                     ))
                 })?;
@@ -1373,6 +1390,121 @@ impl ContainerBackend {
             });
         }
         Ok(mounts)
+    }
+
+    /// Stage this spec's rootfs source (tar blob or OCI image) ownership-shifted for `base`.
+    async fn stage_rootfs_source(
+        &self,
+        spec: &ComputeSpec,
+        base: u32,
+    ) -> Result<PathBuf, BackendError> {
+        match &spec.root {
+            RootSource::Tar(hash) => self.stage_rootfs(hash, base).await,
+            RootSource::Image(image) => self.stage_image(image, base).await,
+            RootSource::Rootfs(_) => Err(BackendError::Materialize(
+                "container backend requires a tar rootfs archive or an OCI image reference \
+                 (RootSource::Tar | RootSource::Image)"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Detect the managed database's RUNTIME (post-privilege-drop) `(uid, gid)` from the staged
+    /// image's `/etc/passwd` — the id the DB process actually runs as, which the derive maps the
+    /// data onto. ASSERTS the image's real id instead of assuming 999 or using the entrypoint/spec
+    /// uid (which, for a root-entrypoint image, is 0 while the DB runs as e.g. `postgres`:999).
+    /// `None` if the engine or user can't be resolved. `/etc/passwd` content is identical across
+    /// ownership-shift bases, so any staged rootfs works.
+    async fn db_runtime_ids(&self, rootfs_dir: &Path, spec: &ComputeSpec) -> Option<(u32, u32)> {
+        let user = db_user_for_spec(spec)?;
+        let passwd = tokio::fs::read_to_string(rootfs_dir.join("etc/passwd"))
+            .await
+            .ok()?;
+        parse_passwd_ids(&passwd, user)
+    }
+
+    /// Resolve the user-namespace mapping to launch this workload's container with, chosen so a
+    /// REUSED persistent volume's data dir is read **as-is** without rewriting its ownership.
+    ///
+    /// # Reused-volume repair (the v0.45.0 managed-DB regression fix)
+    /// v0.45.0's `stage_volumes` recursively chowns a reused volume to `userns_base + guest_uid`.
+    /// On a rootless node a data dir written under a DIFFERENT mapping — a prior `userns_base`, a
+    /// reused volume carried across a `fly machine update` — sits at a host owner OUTSIDE the
+    /// container's map range (→ `nobody` inside): the stock image's root-path entrypoint
+    /// `chown -R` then `EPERM`s on the unmappable data-root, and the DB (post-privilege-drop)
+    /// can't read its own files (`global/pg_filenode.map: Permission denied`). Relaunching a
+    /// previously-healthy DB regresses the same way.
+    ///
+    /// The data-preserving repair, made the **primary, always-on** strategy for a reused volume
+    /// (host-root nodes too): DERIVE the per-launch base `D` so that `D + pg_uid` equals the data
+    /// dir's EXISTING consistent owner, where `pg_uid` is the DB's RUNTIME uid detected from the
+    /// image ([`Self::db_runtime_ids`]) — NOT the entrypoint/spec uid. Then the data maps onto
+    /// the uid the DB runs as, so it is read with **NO chown** and **NO reinit**, left
+    /// byte-for-byte unchanged (idempotent), and the entrypoint's own `chown -R` now operates on
+    /// in-map files (a harmless no-op). The rootfs is staged + ownership-shifted for `D`
+    /// ([`Self::materialize`]) and the userns map is written with `D` ([`Self::launch_inner`]),
+    /// so the mapping, the rootfs, and the volume all agree.
+    ///
+    /// Scoped to this workload's OWN volume dirs (`compute/volumes/<name>`, never a sibling
+    /// tenant's on a shared host volume). The pure decision + its fail-closed guards live in
+    /// [`resolve_mapping_decision`]; this method is the I/O that feeds it (detect the runtime id
+    /// + scan each volume's owner, budget-bounded).
+    async fn resolve_volume_mapping(
+        &self,
+        spec: &ComputeSpec,
+        rootfs_dir: &Path,
+    ) -> Result<ResolvedMapping, BackendError> {
+        let (guest_uid, guest_gid) = spec_uid_gid(spec);
+        if spec.volumes.is_empty() {
+            return Ok(ResolvedMapping {
+                base: self.userns_base,
+                chowns: Vec::new(),
+            });
+        }
+        // The id the workload's process ends up running as, which a REUSED volume's data must map
+        // onto. A managed DB's stock entrypoint drops to a fixed image user — detect THAT from
+        // the image (refuse to guess if the image can't be read). Any OTHER workload runs AS its
+        // spec `user` (= `guest_uid`), so that IS its runtime uid — which keeps the data-preserving
+        // derive (read-as-is) working for non-DB stateful workloads too, instead of refusing.
+        let runtime = if db_user_for_spec(spec).is_some() {
+            self.db_runtime_ids(rootfs_dir, spec).await
+        } else {
+            Some((guest_uid, guest_gid))
+        };
+        let mut volumes = Vec::with_capacity(spec.volumes.len());
+        for vol in &spec.volumes {
+            let dir = self.volume_dir(&vol.name);
+            let name = vol.name.clone();
+            let consensus = tokio::task::spawn_blocking(move || {
+                crate::data_dir::scan_consistent_owner(
+                    &dir,
+                    crate::data_dir::CONSISTENT_OWNER_SCAN_BUDGET,
+                )
+            })
+            .await
+            .map_err(|e| BackendError::Launch(format!("scan volume {name} owner: {e}")))?
+            .map_err(|e| BackendError::Launch(format!("scan volume {name} owner: {e}")))?;
+            volumes.push((vol.name.clone(), consensus));
+        }
+        let mapping = resolve_mapping_decision(
+            &volumes,
+            guest_uid,
+            guest_gid,
+            runtime,
+            self.userns_base == 0,
+            self.userns_base,
+            can_shift_ownership(),
+        )?;
+        if mapping.base != self.userns_base {
+            tracing::info!(
+                derived_base = mapping.base,
+                configured_base = self.userns_base,
+                runtime_uid = runtime.map(|(u, _)| u),
+                "reused-volume repair: derived this workload's user-namespace base from the \
+                 volume's existing owner — reading the data dir as-is (no chown, no reinit)"
+            );
+        }
+        Ok(mapping)
     }
 
     /// Wire the guest-log sink: a single writer appends to
@@ -1418,8 +1550,26 @@ impl ContainerBackend {
         ip: Ipv4Addr,
     ) -> Result<Instance, BackendError> {
         let (uid, gid) = spec_uid_gid(&req.spec);
+        // The workload's resolved userns mapping, re-resolved from the SAME staged rootfs
+        // `materialize` produced (its `.b<base>` path pins the base). Re-assert the two agree:
+        // if a concurrent/overlapping relaunch changed the volume's owner between materialize and
+        // now, the rootfs base and the freshly-derived base could diverge (rootfs shifted for one
+        // base, map/volume for another → a boot failure). Fail closed + retry instead (LOW-1).
+        let mapping = self
+            .resolve_volume_mapping(&req.spec, Path::new(rootfs))
+            .await?;
+        if let Some(staged) = parse_rootfs_base(Path::new(rootfs))
+            && staged != mapping.base
+        {
+            return Err(BackendError::Launch(format!(
+                "user-namespace base diverged between materialize (rootfs staged for base \
+                 {staged}) and launch (resolved {}): the volume's ownership changed under a \
+                 concurrent relaunch. Refusing to boot a mismatched rootfs/mapping; retry.",
+                mapping.base
+            )));
+        }
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
-        plan.volumes = self.stage_volumes(&req.spec).await?;
+        plan.volumes = self.stage_volumes(&req.spec, &mapping).await?;
         // Point the guest at boatramp's internal DNS on the bridge gateway (when the
         // resolver is enabled), scoped to this container's project so a bare peer name
         // resolves within the tenant. Written per-container by the worker (the staged
@@ -1501,7 +1651,7 @@ impl ContainerBackend {
         // `/proc/<pid>/{uid,gid}_map` directly. Same pid-based handshake as the netns
         // setup below.
         if plan.namespaces.user {
-            write_userns_maps(pid, self.userns_base)
+            write_userns_maps(pid, mapping.base)
                 .map_err(|e| BackendError::Launch(format!("write userns maps: {e}")))?;
         }
 
@@ -1576,8 +1726,9 @@ impl ContainerBackend {
                     "air-gap client rootfs for {image:?} not found at {preloaded}"
                 )));
             }
-            // A Storage blob hash of a rootfs tar — staged like a RootSource::Tar.
-            return self.stage_rootfs(preloaded).await;
+            // A Storage blob hash of a rootfs tar — staged like a RootSource::Tar. A one-shot
+            // ephemeral client has no persistent volume, so it always uses the configured base.
+            return self.stage_rootfs(preloaded, self.userns_base).await;
         }
         // Not air-gap-mapped: an on-demand registry pull. Under the multi-tenant posture, refuse
         // a MUTABLE tag — a compromised/MITM'd registry could substitute a malicious image that
@@ -1592,8 +1743,9 @@ impl ContainerBackend {
                  (`<image>@sha256:<hex>`), so a registry cannot substitute the bytes."
             )));
         }
-        // Default: daemonless OCI pull + layer overlay, cached + idempotent.
-        self.stage_image(image).await
+        // Default: daemonless OCI pull + layer overlay, cached + idempotent. The one-shot
+        // ephemeral client has no persistent volume, so it always uses the configured base.
+        self.stage_image(image, self.userns_base).await
     }
 
     /// The one-shot body: build the hardened sandbox plan, (optionally) set up the
@@ -2130,6 +2282,278 @@ fn unpack_tar_gz(tar_path: &Path, dir: &Path, caps: ArchiveCaps) -> Result<(), A
 /// that once we *are* root, a chown failure is a real error and still propagates.
 fn can_shift_ownership() -> bool {
     nix::unistd::geteuid().is_root()
+}
+
+/// The user-namespace mapping [`ContainerBackend::resolve_volume_mapping`] chose for a
+/// workload: the single `base` to map the container (and shift the rootfs) with — all the
+/// workload's volumes share ONE userns map — plus a PER-VOLUME chown decision (`chowns[i]` for
+/// `spec.volumes[i]`). A REUSED volume read as-is via the derived base has `None` — its data is
+/// never mutated; a FRESH volume, or an in-place remap of host-owned data, has
+/// `Some((uid, gid))`. Per-volume so a reused data dir and a fresh sibling can share one base
+/// yet be handled differently (the fresh one chowns, the reused one is read as-is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedMapping {
+    base: u32,
+    chowns: Vec<Option<(u32, u32)>>,
+}
+
+/// Why deriving a per-launch user-namespace base from a reused volume's existing owner was
+/// refused — the pure, security-critical validation behind the reused-volume repair
+/// ([`ContainerBackend::resolve_volume_mapping`]). Each variant is a fail-closed refusal, never
+/// a silent fallback: the launch stops with an actionable error rather than mapping the database
+/// onto an owner the mapping cannot safely express. The caller may instead REMAP (host root
+/// only) for an `Unmappable`/`WouldMapHostRoot`/`BelowFloor` owner, which relabels ownership in
+/// place but never reinitializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseDeriveError {
+    /// No single base maps the database's runtime uid onto the owner: the owner uid/gid is
+    /// below the runtime id (would underflow), or the uid and gid offsets differ (one
+    /// `0 base count` map line shifts uid and gid by the SAME amount, so they must agree).
+    Unmappable,
+    /// The base would be `0` — in-container root mapped onto HOST root (host 0) — on a node NOT
+    /// configured for the host-root posture. Refused to preserve rootless isolation.
+    WouldMapHostRoot,
+    /// The base is below [`USERNS_HOST_BASE`] (off host-root), i.e. it would map the container
+    /// onto low/system host uids outside the dedicated per-container window. Refused as
+    /// defense-in-depth: a derived base is only trusted within the rootless subuid range.
+    BelowFloor,
+    /// The mapped window `[base, base + USERNS_COUNT)` would overflow `u32`.
+    RangeOverflow,
+}
+
+/// Derive the user-namespace base `D` such that the database's **runtime** `(pg_uid, pg_gid)`
+/// (the uid it runs as AFTER the image entrypoint drops privileges — NOT the entrypoint/spec
+/// uid, which for a root-entrypoint image is 0) maps onto the data dir's existing
+/// `(owner_uid, owner_gid)` — i.e. `D + pg == owner` — so the data is read as-is. Validates the
+/// security invariants against `userns_base` (the configured rootless base) and `host_root`
+/// (the host-root posture, under which base 0 and a sub-floor base are legitimate). Pure (no
+/// I/O) so the security logic is unit-tested on every host.
+fn derive_base(
+    owner_uid: u32,
+    owner_gid: u32,
+    pg_uid: u32,
+    pg_gid: u32,
+    host_root: bool,
+    userns_base: u32,
+) -> Result<u32, BaseDeriveError> {
+    // One `0 base count` map line shifts uid and gid by the same `base`, so both must solve
+    // to the same non-negative offset.
+    let base = match (owner_uid.checked_sub(pg_uid), owner_gid.checked_sub(pg_gid)) {
+        (Some(bu), Some(bg)) if bu == bg => bu,
+        _ => return Err(BaseDeriveError::Unmappable),
+    };
+    if !host_root {
+        if base == 0 {
+            return Err(BaseDeriveError::WouldMapHostRoot);
+        }
+        if base < userns_base {
+            return Err(BaseDeriveError::BelowFloor);
+        }
+    }
+    if base.checked_add(crate::worker::USERNS_COUNT - 1).is_none() {
+        return Err(BaseDeriveError::RangeOverflow);
+    }
+    Ok(base)
+}
+
+/// Render a [`BaseDeriveError`] into an operator-actionable launch error naming the volume, the
+/// data dir's actual owner, the database's runtime uid, and the remedies.
+fn derive_error_message(
+    volume: &str,
+    owner_uid: u32,
+    owner_gid: u32,
+    pg_uid: u32,
+    pg_gid: u32,
+    err: BaseDeriveError,
+) -> String {
+    match err {
+        BaseDeriveError::Unmappable => format!(
+            "volume {volume:?} data dir is owned {owner_uid}:{owner_gid} but the database runs \
+             as {pg_uid}:{pg_gid}: no single user-namespace base maps it onto that owner (the \
+             owner must be >= the runtime id and the uid/gid offsets must match). Your data is \
+             left untouched. Remedies: re-provision/restore the volume under the current \
+             mapping, or run this node host-root."
+        ),
+        BaseDeriveError::WouldMapHostRoot => format!(
+            "volume {volume:?} data dir is owned {owner_uid}:{owner_gid}, equal to the database \
+             runtime id {pg_uid}:{pg_gid} with no offset: deriving a mapping would put \
+             in-container root on HOST root (base 0), breaking rootless isolation. Your data is \
+             left untouched. Remedies: re-provision the volume under the rootless mapping, or \
+             set the host-root posture explicitly if that is intended."
+        ),
+        BaseDeriveError::BelowFloor => format!(
+            "volume {volume:?} data dir owner {owner_uid}:{owner_gid} (database runs as \
+             {pg_uid}:{pg_gid}) derives a user-namespace base below the rootless subuid floor, \
+             which would map the container onto low/system host uids. Refused as a hardening \
+             guard; your data is left untouched. Remedies: re-provision the volume under the \
+             rootless mapping, or run this node host-root."
+        ),
+        BaseDeriveError::RangeOverflow => format!(
+            "volume {volume:?} data dir owner {owner_uid}:{owner_gid} derives a user-namespace \
+             base that overflows the mappable id range for runtime id {pg_uid}:{pg_gid}; \
+             re-provision the volume with a smaller owner id."
+        ),
+    }
+}
+
+/// The in-image OS username the managed DB's entrypoint drops privileges to (`gosu`/`su-exec`
+/// target), inferred from the spec's engine. `None` for a non-managed-DB spec.
+fn db_user_for_spec(spec: &ComputeSpec) -> Option<&'static str> {
+    if spec.env.contains_key("PGDATA") || spec.entrypoint.iter().any(|a| a == "postgres") {
+        return Some("postgres");
+    }
+    if spec
+        .entrypoint
+        .iter()
+        .any(|a| a == "mysqld" || a == "mariadbd")
+    {
+        return Some("mysql");
+    }
+    None
+}
+
+/// Parse `/etc/passwd` contents for `user`'s `(uid, gid)` (fields 3 and 4). Pure.
+fn parse_passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next() == Some(user) {
+            let _pw = f.next()?;
+            let uid = f.next()?.parse().ok()?;
+            let gid = f.next()?.parse().ok()?;
+            return Some((uid, gid));
+        }
+    }
+    None
+}
+
+/// Parse the userns base a staged rootfs dir was shifted for, from its `…​.b<base>` suffix
+/// (written by [`ContainerBackend::stage_rootfs`]/`stage_image`). Pure.
+fn parse_rootfs_base(dir: &Path) -> Option<u32> {
+    let name = dir.file_name()?.to_str()?;
+    name.rsplit_once(".b")?.1.parse().ok()
+}
+
+/// The PURE decision behind [`ContainerBackend::resolve_volume_mapping`] — given each volume's
+/// owner [`consensus`](crate::data_dir::OwnerConsensus), the workload's `runtime` `(uid, gid)`
+/// (the id its process runs as: the DB user detected from the image for a managed DB, else the
+/// spec's own guest uid — `None` only for a DB whose runtime uid couldn't be read), the
+/// fresh-init `(guest_uid, guest_gid)`, and the posture, pick the [`ResolvedMapping`] or the
+/// fail-closed reason. The workload gets ONE `base` (all reused volumes must agree); each
+/// volume's chown is decided independently (`chowns[i]` for `volumes[i]`):
+///
+/// * **Empty (fresh)** — chown to `base + guest` (needs an owned dir to init into).
+/// * **Uniform (reused)** — DERIVE `D = owner − runtime` and read AS-IS (chown `None`). If the
+///   owner is unmappable (underflow / base-0 / below the subuid floor / overflow) the launch is
+///   REFUSED unless `can_remap` (host root), in which case the data is remapped in place to
+///   `base + runtime` (relabel only — never a reinit).
+/// * **Mixed** — refused: no single base makes it all readable.
+/// * **Conflicting volumes** — refused only when two REUSED volumes derive DIFFERENT bases (a
+///   container has ONE userns map); a fresh/remap sibling adopts the derived base, never
+///   conflicts.
+///
+/// Scoped to this workload's OWN volumes (the caller passes only this workload's `spec.volumes`,
+/// each a distinct `compute/volumes/<name>` dir — never a sibling tenant's). Pure (no I/O) so
+/// the fail-closed plumbing is unit-tested on every host.
+fn resolve_mapping_decision(
+    volumes: &[(String, crate::data_dir::OwnerConsensus)],
+    guest_uid: u32,
+    guest_gid: u32,
+    runtime: Option<(u32, u32)>,
+    host_root: bool,
+    userns_base: u32,
+    can_remap: bool,
+) -> Result<ResolvedMapping, BackendError> {
+    use crate::data_dir::OwnerConsensus;
+    enum Kind {
+        Fresh,
+        ReadAsIs,
+        Remap,
+    }
+    // First pass: classify each volume and agree on the single base the reused ones derive.
+    let mut kinds = Vec::with_capacity(volumes.len());
+    let mut derived: Option<u32> = None;
+    for (name, consensus) in volumes {
+        let kind = match consensus {
+            OwnerConsensus::Empty => Kind::Fresh,
+            OwnerConsensus::Mixed {
+                first_uid,
+                first_gid,
+                conflict_path,
+                conflict_uid,
+                conflict_gid,
+            } => {
+                return Err(BackendError::Launch(format!(
+                    "volume {name:?} data dir has MIXED ownership, so no single user-namespace \
+                     mapping makes it readable: the root is owned {first_uid}:{first_gid} but \
+                     {conflict_path:?} is {conflict_uid}:{conflict_gid}. Refusing to launch \
+                     (your data is left untouched — never reinitialized). Remedies: \
+                     re-provision/restore the volume to one owner, or run this node host-root.",
+                )));
+            }
+            OwnerConsensus::Uniform {
+                uid: owner_uid,
+                gid: owner_gid,
+                ..
+            } => {
+                let (run_uid, run_gid) = runtime.ok_or_else(|| {
+                    BackendError::Launch(format!(
+                        "volume {name:?} is a reused data dir but the database's runtime uid \
+                         could not be determined from the image's /etc/passwd; refusing to \
+                         derive a mapping (your data is left untouched)."
+                    ))
+                })?;
+                match derive_base(
+                    *owner_uid,
+                    *owner_gid,
+                    run_uid,
+                    run_gid,
+                    host_root,
+                    userns_base,
+                ) {
+                    Ok(d) => {
+                        // All reused volumes must derive the SAME base (one userns map); a
+                        // fresh/remap sibling imposes none, so only reused ones can conflict.
+                        match derived {
+                            Some(prev) if prev != d => {
+                                return Err(BackendError::Launch(format!(
+                                    "workload has reused volumes that need CONFLICTING \
+                                     user-namespace bases ({prev} vs {d}): a container has ONE \
+                                     mapping, so its reused volumes must share one owner. \
+                                     Re-provision them to a single owner (data left untouched).",
+                                )));
+                            }
+                            _ => derived = Some(d),
+                        }
+                        Kind::ReadAsIs
+                    }
+                    Err(_) if can_remap => Kind::Remap,
+                    Err(e) => {
+                        return Err(BackendError::Launch(derive_error_message(
+                            name, *owner_uid, *owner_gid, run_uid, run_gid, e,
+                        )));
+                    }
+                }
+            }
+        };
+        kinds.push(kind);
+    }
+    // The workload base: the (agreed) derived base from reused volumes, else the configured one.
+    let base = derived.unwrap_or(userns_base);
+    let chowns = kinds
+        .into_iter()
+        .map(|k| match k {
+            Kind::ReadAsIs => None,
+            Kind::Fresh => Some((
+                base.saturating_add(guest_uid),
+                base.saturating_add(guest_gid),
+            )),
+            // Remap an unmappable reused dir to the runtime user UNDER the workload base, so it
+            // is readable as-is afterwards (relabel only — never a reinit). `runtime` is `Some`
+            // here (an unmappable Uniform already required it above).
+            Kind::Remap => runtime.map(|(u, g)| (base.saturating_add(u), base.saturating_add(g))),
+        })
+        .collect();
+    Ok(ResolvedMapping { base, chowns })
 }
 
 /// Sum the on-disk size (bytes) of every regular file under `dir`, recursively
@@ -2888,6 +3312,253 @@ mod tests {
         assert_eq!(spec_uid_gid(&spec), (GUEST_UID, GUEST_GID));
     }
 
+    const UB: u32 = crate::worker::USERNS_HOST_BASE; // 100_000
+
+    #[test]
+    fn derive_base_maps_the_runtime_uid_onto_the_volumes_existing_owner() {
+        // The reused-volume repair: a data dir owned at a prior subuid base's target (200000 +
+        // the RUNTIME postgres uid 999) derives base 200000 so postgres 999 maps onto 200999
+        // with NO chown — regardless of the entrypoint/spec uid.
+        assert_eq!(
+            derive_base(200_999, 200_999, 999, 999, false, UB),
+            Ok(200_000)
+        );
+        // A healthy volume at the configured rootless target (100000+999) derives the SAME
+        // configured base — a relaunch is a no-op, never a regression.
+        assert_eq!(
+            derive_base(100_999, 100_999, 999, 999, false, UB),
+            Ok(100_000)
+        );
+    }
+
+    #[test]
+    fn derive_base_fails_closed_on_unsafe_or_unmappable_owners() {
+        // Owner == runtime id (no offset) ⇒ base 0 ⇒ in-container root → HOST root: refused off
+        // host-root (the caller then REMAPs as host root instead; see the decision test).
+        assert_eq!(
+            derive_base(999, 999, 999, 999, false, UB),
+            Err(BaseDeriveError::WouldMapHostRoot)
+        );
+        // Host-root posture (base 0) is the ONE place a 0 base is legitimate.
+        assert_eq!(derive_base(999, 999, 999, 999, true, 0), Ok(0));
+        // A base in (0, USERNS_HOST_BASE) would map onto low/system host uids ⇒ floor refusal.
+        assert_eq!(
+            derive_base(70_999, 70_999, 999, 999, false, UB),
+            Err(BaseDeriveError::BelowFloor)
+        );
+        // …but host-root posture has no floor.
+        assert_eq!(derive_base(70_999, 70_999, 999, 999, true, 0), Ok(70_000));
+        // Owner below the runtime id ⇒ underflow ⇒ no base can map it.
+        assert_eq!(
+            derive_base(500, 500, 999, 999, false, UB),
+            Err(BaseDeriveError::Unmappable)
+        );
+        // uid and gid demand DIFFERENT offsets ⇒ one map line can't satisfy both.
+        assert_eq!(
+            derive_base(200_999, 201_000, 999, 999, false, UB),
+            Err(BaseDeriveError::Unmappable)
+        );
+        // An owner so high the mapped 65536-id window overflows u32 ⇒ refused.
+        assert_eq!(
+            derive_base(u32::MAX, u32::MAX, 0, 0, false, UB),
+            Err(BaseDeriveError::RangeOverflow)
+        );
+    }
+
+    #[test]
+    fn parse_passwd_and_rootfs_base_helpers() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\npostgres:x:999:999:PG:/var/lib/postgresql:/bin/bash\n";
+        assert_eq!(parse_passwd_ids(passwd, "postgres"), Some((999, 999)));
+        assert_eq!(parse_passwd_ids(passwd, "root"), Some((0, 0)));
+        assert_eq!(parse_passwd_ids(passwd, "mysql"), None);
+        assert_eq!(
+            parse_rootfs_base(Path::new("/x/abc.b200000")),
+            Some(200_000)
+        );
+        assert_eq!(parse_rootfs_base(Path::new("/x/abc.b0")), Some(0));
+        assert_eq!(parse_rootfs_base(Path::new("/x/no-suffix")), None);
+    }
+
+    // The fail-closed PLUMBING of the mapping decision (not just the pure arithmetic): injecting
+    // an `OwnerConsensus` + the detected runtime ids, with NO filesystem/root needed.
+    use crate::data_dir::OwnerConsensus;
+    fn vol(name: &str, c: OwnerConsensus) -> (String, OwnerConsensus) {
+        (name.to_string(), c)
+    }
+
+    #[test]
+    fn mapping_decision_reads_reused_as_is_via_derived_base() {
+        // Reused at a prior subuid base (200999 = 200000 + postgres 999): derive base 200000,
+        // read AS-IS (chown None).
+        let v = [vol(
+            "data",
+            OwnerConsensus::Uniform {
+                uid: 200_999,
+                gid: 200_999,
+                entries: 10,
+            },
+        )];
+        let m = resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, true).expect("ok");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: 200_000,
+                chowns: vec![None]
+            },
+            "reused data read as-is at the derived base, never chowned"
+        );
+    }
+
+    #[test]
+    fn mapping_decision_non_db_reused_maps_via_the_spec_uid() {
+        // A NON-DB stateful workload (runtime == its own spec/guest uid, passed by the caller as
+        // the fallback): a reused volume maps (read as-is), NOT refused. Here guest 1000, reused
+        // owner 201000 → derive base 200000.
+        let v = [vol(
+            "state",
+            OwnerConsensus::Uniform {
+                uid: 201_000,
+                gid: 201_000,
+                entries: 10,
+            },
+        )];
+        let m = resolve_mapping_decision(&v, 1000, 1000, Some((1000, 1000)), false, UB, true)
+            .expect("non-DB reused must map, not refuse");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: 200_000,
+                chowns: vec![None]
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_decision_reused_plus_fresh_sibling_no_false_conflict() {
+        // A reused data volume + a FRESH sibling must NOT false-conflict: both share the derived
+        // base; the reused one reads as-is (None), the fresh one chowns to base+guest.
+        let v = [
+            vol(
+                "data",
+                OwnerConsensus::Uniform {
+                    uid: 200_999,
+                    gid: 200_999,
+                    entries: 10,
+                },
+            ),
+            vol("cache", OwnerConsensus::Empty),
+        ];
+        let m = resolve_mapping_decision(&v, 999, 999, Some((999, 999)), false, UB, true)
+            .expect("reused + fresh sibling must launch");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: 200_000,
+                chowns: vec![None, Some((200_999, 200_999))]
+            },
+            "shared base 200000; reused read as-is, fresh chowned to base+guest"
+        );
+    }
+
+    #[test]
+    fn mapping_decision_fresh_volume_chowns_to_the_configured_base() {
+        let v = [vol("data", OwnerConsensus::Empty)];
+        let m =
+            resolve_mapping_decision(&v, 999, 999, Some((999, 999)), false, UB, true).expect("ok");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: UB,
+                chowns: vec![Some((UB + 999, UB + 999))]
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_decision_mixed_ownership_is_refused() {
+        let v = [vol(
+            "data",
+            OwnerConsensus::Mixed {
+                first_uid: 200_999,
+                first_gid: 200_999,
+                conflict_path: "global/pg_filenode.map".into(),
+                conflict_uid: 0,
+                conflict_gid: 0,
+            },
+        )];
+        let e = resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, true)
+            .expect_err("mixed must fail closed");
+        assert!(format!("{e}").contains("MIXED ownership"), "got {e}");
+    }
+
+    #[test]
+    fn mapping_decision_owner_equals_runtime_remaps_not_base_zero() {
+        // Owner == runtime id (999) ⇒ base-0 derive refused; host root REMAPS in place to
+        // userns_base+runtime (NOT a base-0 host-root mapping).
+        let v = [vol(
+            "data",
+            OwnerConsensus::Uniform {
+                uid: 999,
+                gid: 999,
+                entries: 10,
+            },
+        )];
+        let m =
+            resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, true).expect("remap");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: UB,
+                chowns: vec![Some((UB + 999, UB + 999))]
+            },
+            "owner==runtime is remapped in place (base stays the rootless base, never 0)"
+        );
+        // …but WITHOUT host root (can_remap=false) it fails closed — never base 0, never reinit.
+        let e = resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, false)
+            .expect_err("no remap without host root");
+        assert!(format!("{e}").contains("HOST root"), "got {e}");
+    }
+
+    #[test]
+    fn mapping_decision_conflicting_volumes_are_refused() {
+        let v = [
+            vol(
+                "data",
+                OwnerConsensus::Uniform {
+                    uid: 200_999,
+                    gid: 200_999,
+                    entries: 5,
+                },
+            ),
+            vol(
+                "wal",
+                OwnerConsensus::Uniform {
+                    uid: 300_999,
+                    gid: 300_999,
+                    entries: 5,
+                },
+            ),
+        ];
+        let e = resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, true)
+            .expect_err("two owners need two bases");
+        assert!(format!("{e}").contains("CONFLICTING"), "got {e}");
+    }
+
+    #[test]
+    fn mapping_decision_reused_without_detectable_runtime_uid_fails_closed() {
+        let v = [vol(
+            "data",
+            OwnerConsensus::Uniform {
+                uid: 200_999,
+                gid: 200_999,
+                entries: 5,
+            },
+        )];
+        let e = resolve_mapping_decision(&v, 0, 0, None, false, UB, true)
+            .expect_err("no runtime uid ⇒ refuse to guess");
+        assert!(format!("{e}").contains("runtime uid"), "got {e}");
+    }
+
     #[tokio::test]
     async fn materialize_stages_and_unpacks_rootfs_idempotently() {
         let data_dir = unique_dir("data");
@@ -3001,7 +3672,16 @@ mod tests {
             },
         ];
 
-        let mounts = backend.stage_volumes(&spec).await.expect("stage volumes");
+        // Per-volume chowns (here both read-as-is — the chown path itself is the root-gated live
+        // seam); a mapping with one entry per volume exercises the multi-volume plumbing.
+        let mapping = ResolvedMapping {
+            base: backend.userns_base,
+            chowns: vec![None, None],
+        };
+        let mounts = backend
+            .stage_volumes(&spec, &mapping)
+            .await
+            .expect("stage volumes");
         assert_eq!(mounts.len(), 2);
         // Each maps the host backing dir → the in-guest mount, and the dir exists.
         assert_eq!(mounts[0].mount, "/data");
@@ -3011,7 +3691,10 @@ mod tests {
         assert!(PathBuf::from(&mounts[1].source).is_dir());
 
         // Idempotent: staging again re-uses the existing dirs.
-        let again = backend.stage_volumes(&spec).await.expect("stage volumes 2");
+        let again = backend
+            .stage_volumes(&spec, &mapping)
+            .await
+            .expect("stage volumes 2");
         assert_eq!(again, mounts);
 
         let _ = std::fs::remove_dir_all(&data_dir);
