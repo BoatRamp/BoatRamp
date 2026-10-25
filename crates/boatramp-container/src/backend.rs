@@ -19,9 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::Storage;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
-    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
-    VolumeInfo, compute_instance_id,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, DataDirOwnership, Endpoint,
+    ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
+    RootSource, Scheme, Snapshot, VolumeInfo, compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use futures::StreamExt;
@@ -1255,6 +1255,59 @@ impl ComputeBackend for ContainerBackend {
                 dir.display()
             ))),
         }
+    }
+
+    /// See [`ComputeBackend::data_dir_ownership`]. Scan each of the spec's volume backing
+    /// directories for entries not owned by the guest process's mapped host uid:gid
+    /// (`userns_base + guest_uid/gid` — the same target `stage_volumes` pre-chowns to) and
+    /// report the first volume carrying a foreign-owned file, with a sample; otherwise
+    /// report the last clean scan so `db status` can state the data directory is NOT the
+    /// cause. READ-ONLY (no chown). `None` when the spec declares no volumes, or when
+    /// ownership-shifting is unavailable on this node (unprivileged — the uids aren't
+    /// shifted, so an owner mismatch isn't meaningful), or when a volume's backing
+    /// directory can't be scanned (not yet created / vanished — not a fault we can assert).
+    async fn data_dir_ownership(&self, spec: &ComputeSpec) -> Option<DataDirOwnership> {
+        if spec.volumes.is_empty() || !can_shift_ownership() {
+            return None;
+        }
+        let (guest_uid, guest_gid) = spec_uid_gid(spec);
+        let host_uid = self.userns_base + guest_uid;
+        let host_gid = self.userns_base + guest_gid;
+        let mut clean: Option<DataDirOwnership> = None;
+        for vol in &spec.volumes {
+            let dir = self.volume_dir(&vol.name);
+            let name = vol.name.clone();
+            // The walk is blocking (a stat per entry); keep it off the reconcile's async
+            // runtime. A scan error (dir not yet created / vanished mid-walk) ⇒ skip this
+            // volume rather than reporting a phantom fault.
+            let Ok(Ok(scan)) = tokio::task::spawn_blocking(move || {
+                crate::data_dir::scan_data_dir_ownership(
+                    &dir,
+                    host_uid,
+                    host_gid,
+                    crate::data_dir::OWNERSHIP_SCAN_BUDGET,
+                )
+            })
+            .await
+            else {
+                continue;
+            };
+            let obs = DataDirOwnership {
+                volume: name,
+                ok: scan.foreign == 0,
+                expected_uid: host_uid,
+                expected_gid: host_gid,
+                foreign_count: scan.foreign,
+                sample: scan
+                    .sample
+                    .map(|(path, uid, gid)| ForeignOwnedEntry { path, uid, gid }),
+            };
+            if !obs.ok {
+                return Some(obs);
+            }
+            clean = Some(obs);
+        }
+        clean
     }
 }
 

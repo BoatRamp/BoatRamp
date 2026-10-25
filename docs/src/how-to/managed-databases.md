@@ -132,6 +132,36 @@ routing, and migrations each wait for a configurable readiness level, defaulting
 yet set up). An operator can relax a given gate to `service-ready` with the external
 database config's `readiness_gate` (`answerability` / `routing` / `migration`).
 
+### Data-dir ownership (why a managed DB is stuck `starting`)
+
+A managed database runs rootless inside its container (Postgres/MySQL as uid `999`), so
+its launch pre-chowns the volume's data directory to that owner. If the data directory
+instead carries **foreign-owned** files — a volume restored or cloned from an
+env-export, carried over from a different user-namespace base, or a custom image whose
+real uid differs — the database process gets `EPERM` reading its own cluster files, never
+answers, and the replica sits at `starting`, which on its own looks just like a slow init.
+
+When that is the cause, `db status` surfaces a **`data-dir`** signal naming the fault — the
+volume, how many foreign-owned files, and a sample offending path with its actual owner:
+
+```console
+$ boatramp db status app
+database `app`
+  readiness:       starting
+  data-dir:        FOREIGN-OWNED (12 file(s) under volume `data` not owned by the database process)
+                   e.g. `global/pg_filenode.map` is owned by 0:0, expected 100999:100999
+                   the database cannot read its own cluster files; relaunch re-chowns the
+                   volume, or correct the volume/image uid. `/api/repair` does not fix
+                   filesystem permissions.
+```
+
+This is deliberately the one blind spot `boatramp project repair` / `/api/repair` leaves:
+repair reconciles in-pg provisioning drift (roles, ownership, grants), **never** the
+filesystem permissions of the data directory. The signal is read-only — it reports, it
+never chowns; the repair paths are the launch-time pre-chown (a relaunch) or correcting
+the volume/image uid. It is omitted entirely once the database answers (it can read its
+data directory, so ownership is fine).
+
 Force the provisioning to run now (rather than on the first binding) with:
 
 ```console

@@ -39,6 +39,9 @@ pub mod backend;
 /// `criu` dump/restore drivers.
 #[cfg(target_os = "linux")]
 pub mod criu;
+/// Data-dir-ownership scanning — the pure, host-testable detection half of the managed-
+/// database data-dir health signal (`db status`). Cross-platform; the backend wires it.
+pub mod data_dir;
 /// Per-project internal DNS — the pure, host-testable query-handling core
 /// (parse question → decide answer/NXDOMAIN/refused/forward). Cross-platform.
 pub mod dns;

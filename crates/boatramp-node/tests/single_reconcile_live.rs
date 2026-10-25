@@ -592,6 +592,7 @@ async fn launch_from_registered_spec(
         started_at: None,
         phase: ReplicaPhase::Running,
         readiness: boatramp_core::compute::Readiness::Provisioned,
+        data_dir: None,
         snapshot: None,
     };
     deploy

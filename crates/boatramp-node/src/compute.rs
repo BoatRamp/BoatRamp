@@ -1167,6 +1167,7 @@ mod tests {
                     started_at: None,
                     phase,
                     readiness: boatramp_core::compute::Readiness::Provisioned,
+                    data_dir: None,
                     snapshot: None,
                 },
             )

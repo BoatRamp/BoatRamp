@@ -5352,6 +5352,7 @@ mod tests {
             } else {
                 boatramp_core::compute::Readiness::Starting
             },
+            data_dir: None,
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
                 project: project.into(),
                 workload: workload.into(),

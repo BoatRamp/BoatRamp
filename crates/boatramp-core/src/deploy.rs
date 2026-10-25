@@ -8083,6 +8083,7 @@ mod tests {
                     started_at: None,
                     phase: ReplicaPhase::Running,
                     readiness: crate::compute::Readiness::Provisioned,
+                    data_dir: None,
                     snapshot: None::<Snapshot>,
                 },
             )

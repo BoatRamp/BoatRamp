@@ -2120,13 +2120,21 @@ pub(super) async fn database_status(
         .await
         .unwrap_or_default();
     let readiness = summarize_readiness(&states);
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "database": db,
         "workload": workload,
         "declared": true,
         "readiness": readiness,
-    }))
-    .into_response()
+    });
+    // Surface the data-dir-ownership health signal when a replica recorded one: a
+    // filesystem-level fault (foreign-owned files the rootless DB can't read) that leaves a
+    // replica stuck `starting`, which `/api/repair` does NOT cover (it reconciles only
+    // in-pg drift). Omitted entirely when nothing was observed, so a healthy status view
+    // stays unchanged.
+    if let Some(data_dir) = summarize_data_dir(&states) {
+        body["data_dir"] = data_dir;
+    }
+    Json(body).into_response()
 }
 
 /// Reduce a managed workload's replica states to one readiness signal for `db status`.
@@ -2157,6 +2165,29 @@ fn summarize_readiness(states: &[boatramp_core::compute::ObservedInstance]) -> s
         return serde_json::json!({ "state": "service_ready" });
     }
     serde_json::json!({ "state": "starting" })
+}
+
+/// Surface the most actionable data-dir-ownership observation across a managed workload's
+/// running replicas for `db status`: a detected **fault** (`ok == false`, naming the
+/// volume + a sample foreign entry) wins over a clean check, which wins over no
+/// observation at all. This is the signal `/api/repair` can't give — it reconciles in-pg
+/// drift (roles/ownership/grants), never filesystem permissions. `None` when no running
+/// replica recorded one (not in the diagnostic window, or a backend with no on-node data
+/// directory) — so the field is simply absent from a status view with nothing to report.
+fn summarize_data_dir(
+    states: &[boatramp_core::compute::ObservedInstance],
+) -> Option<serde_json::Value> {
+    use boatramp_core::compute::ReplicaPhase;
+    let mut clean: Option<&boatramp_core::compute::DataDirOwnership> = None;
+    for s in states.iter().filter(|s| s.phase == ReplicaPhase::Running) {
+        if let Some(dd) = &s.data_dir {
+            if !dd.ok {
+                return serde_json::to_value(dd).ok();
+            }
+            clean.get_or_insert(dd);
+        }
+    }
+    clean.and_then(|dd| serde_json::to_value(dd).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -4106,6 +4137,7 @@ mod tests {
             } else {
                 boatramp_core::compute::Readiness::Starting
             },
+            data_dir: None,
             snapshot: None,
         }
     }
@@ -4177,6 +4209,50 @@ mod tests {
             .find(|r| r["project"] == "globex")
             .expect("globex present");
         assert_eq!(globex["healthy"], true);
+    }
+
+    #[test]
+    fn summarize_data_dir_surfaces_a_fault_over_a_clean_check_and_omits_when_absent() {
+        use boatramp_core::compute::{DataDirOwnership, ForeignOwnedEntry};
+
+        // No observation on any replica → absent (the field is simply not surfaced).
+        let mut clean = obs("p", "pg", 0, "10.0.0.2", true, None);
+        assert!(
+            summarize_data_dir(std::slice::from_ref(&clean)).is_none(),
+            "nothing recorded → no data_dir in the status view"
+        );
+
+        // A clean check present → surfaced as ok (rules data-dir out as the cause).
+        clean.data_dir = Some(DataDirOwnership {
+            volume: "data".into(),
+            ok: true,
+            expected_uid: 100_999,
+            expected_gid: 100_999,
+            foreign_count: 0,
+            sample: None,
+        });
+        let v = summarize_data_dir(std::slice::from_ref(&clean)).expect("clean surfaced");
+        assert_eq!(v["ok"], true);
+
+        // A fault on another replica WINS over the clean one — the actionable signal.
+        let mut faulty = obs("p", "pg", 1, "10.0.0.3", true, None);
+        faulty.data_dir = Some(DataDirOwnership {
+            volume: "data".into(),
+            ok: false,
+            expected_uid: 100_999,
+            expected_gid: 100_999,
+            foreign_count: 7,
+            sample: Some(ForeignOwnedEntry {
+                path: "global/pg_filenode.map".into(),
+                uid: 0,
+                gid: 0,
+            }),
+        });
+        let v = summarize_data_dir(&[clean, faulty]).expect("fault surfaced");
+        assert_eq!(v["ok"], false, "the fault wins over the clean sibling");
+        assert_eq!(v["foreign_count"], 7);
+        assert_eq!(v["volume"], "data");
+        assert_eq!(v["sample"]["path"], "global/pg_filenode.map");
     }
 
     #[tokio::test]

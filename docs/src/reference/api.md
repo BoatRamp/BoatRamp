@@ -540,7 +540,7 @@ are `project` · `read`. Top-level paths target the `default` project;
 | `GET` | `/api/databases/:name` | Get one declared database, or `404`. `project` · `read`. |
 | `PUT` | `/api/databases/:name` | Declare (persist + eagerly provision) a database from an `ApplyDatabase` body. `204` on success. `project` · `admin`. |
 | `POST` | `/api/databases/:name/ensure` | Re-provision an already-declared database idempotently. `204`. `project` · `admin`. |
-| `GET` | `/api/databases/:name/status` | The stored declaration + the workload's live **readiness** (`starting` / `service-ready` / `provisioned` / `provision-failed`, distinct from bare TCP health). `project` · `read`. |
+| `GET` | `/api/databases/:name/status` | The stored declaration + the workload's live **readiness** (`starting` / `service-ready` / `provisioned` / `provision-failed`, distinct from bare TCP health), plus a **`data_dir`** ownership signal (`ok` + a sample foreign-owned entry) when a replica is stuck up-but-not-answering because its data directory carries foreign-owned files — the filesystem fault `/api/repair` does not cover. `project` · `read`. |
 | `POST` | `/api/databases/:name/users/:user/ensure` | Operator-provision (idempotent) a login role `:user` on the managed database (mailroom C2). The host mints + seals a password by default, or binds a bring-your-own one from a sealed secret (see `boatramp db ensure user`). On a shared cluster the role name is per-tenant-qualified so it can't collide across tenants. `project` · `admin`. |
 | `DELETE` | `/api/databases/:name/users/:user` | Drop the login role `:user` (idempotent — absent ⇒ still `204`). `project` · `admin`. |
 

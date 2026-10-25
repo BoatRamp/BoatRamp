@@ -1047,6 +1047,7 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
                 started_at: None,
                 phase: ReplicaPhase::Running,
                 readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
                 snapshot: None,
             },
         )
@@ -1279,6 +1280,7 @@ async fn project_export_pg_pgvector_roundtrip_via_driver_live() {
                 started_at: None,
                 phase: ReplicaPhase::Running,
                 readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
                 snapshot: None,
             },
         )

@@ -226,7 +226,58 @@ impl crate::output::Rendered for DbOutput {
                 {
                     write!(w, " ({reason})")?;
                 }
-                writeln!(w)
+                writeln!(w)?;
+                // The data-dir-ownership health signal: a filesystem fault (foreign-owned
+                // files the managed database can't read) behind an otherwise-opaque
+                // `starting` stall — the signal `/api/repair` can't give. Shown only when a
+                // replica recorded an observation; a fault carries its own cure.
+                if let Some(dd) = view.get("data_dir") {
+                    let ok = dd
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    if ok {
+                        writeln!(w, "  data-dir:        ownership ok")?;
+                    } else {
+                        let vol = dd.get("volume").and_then(|v| v.as_str()).unwrap_or("?");
+                        let count = dd
+                            .get("foreign_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        writeln!(
+                            w,
+                            "  data-dir:        FOREIGN-OWNED ({count} file(s) under volume `{vol}` not owned by the database process)"
+                        )?;
+                        if let Some(sample) = dd.get("sample") {
+                            let path = sample.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                            let uid = sample
+                                .get("uid")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            let gid = sample
+                                .get("gid")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            let euid = dd
+                                .get("expected_uid")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            let egid = dd
+                                .get("expected_gid")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0);
+                            writeln!(
+                                w,
+                                "                   e.g. `{path}` is owned by {uid}:{gid}, expected {euid}:{egid}"
+                            )?;
+                        }
+                        writeln!(
+                            w,
+                            "                   the database cannot read its own cluster files; relaunch re-chowns the volume, or correct the volume/image uid. `/api/repair` does not fix filesystem permissions."
+                        )?;
+                    }
+                }
+                Ok(())
             }
             Self::Ensure {
                 name,
@@ -559,6 +610,72 @@ mod tests {
         assert!(out.contains("readiness: pending"), "{out}");
         assert!(out.contains("provisioning initiated"), "{out}");
         assert!(out.contains("--wait"), "{out}");
+    }
+
+    #[test]
+    fn status_renders_a_data_dir_ownership_fault_with_its_cure() {
+        // A managed pg stuck `starting` because its data dir carries foreign-owned files:
+        // the status view carries a `data_dir` fault, and the human render names the
+        // volume, a sample offending entry, and the fix — the signal `/api/repair` can't
+        // give (it fixes only in-pg drift, never filesystem perms).
+        let view = serde_json::json!({
+            "workload": "bramp-db-acme-default",
+            "declared": true,
+            "readiness": { "state": "starting" },
+            "data_dir": {
+                "volume": "data",
+                "ok": false,
+                "expected_uid": 100_999,
+                "expected_gid": 100_999,
+                "foreign_count": 12,
+                "sample": { "path": "global/pg_filenode.map", "uid": 0, "gid": 0 },
+            },
+        });
+        let out = render(&DbOutput::Status {
+            name: "default".into(),
+            view,
+        });
+        assert!(out.contains("readiness:       starting"), "{out}");
+        assert!(out.contains("FOREIGN-OWNED"), "{out}");
+        assert!(out.contains("volume `data`"), "{out}");
+        assert!(out.contains("global/pg_filenode.map"), "{out}");
+        assert!(out.contains("0:0"), "{out}");
+        assert!(out.contains("100999:100999"), "{out}");
+        assert!(
+            out.contains("/api/repair"),
+            "names the plane relationship: {out}"
+        );
+    }
+
+    #[test]
+    fn status_renders_a_clean_data_dir_check() {
+        let view = serde_json::json!({
+            "workload": "bramp-db-acme-default",
+            "declared": true,
+            "readiness": { "state": "starting" },
+            "data_dir": { "volume": "data", "ok": true, "expected_uid": 100_999, "expected_gid": 100_999, "foreign_count": 0 },
+        });
+        let out = render(&DbOutput::Status {
+            name: "default".into(),
+            view,
+        });
+        assert!(out.contains("data-dir:        ownership ok"), "{out}");
+        assert!(!out.contains("FOREIGN-OWNED"), "{out}");
+    }
+
+    #[test]
+    fn status_without_a_data_dir_observation_omits_the_line() {
+        let view = serde_json::json!({
+            "workload": "bramp-db-acme-default",
+            "declared": true,
+            "readiness": { "state": "provisioned" },
+        });
+        let out = render(&DbOutput::Status {
+            name: "default".into(),
+            view,
+        });
+        assert!(out.contains("readiness:       provisioned"), "{out}");
+        assert!(!out.contains("data-dir:"), "no signal → no line: {out}");
     }
 
     #[test]

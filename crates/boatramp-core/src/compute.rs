@@ -476,6 +476,24 @@ pub trait ComputeBackend: Send + Sync {
     async fn remove_volume(&self, _name: &str) -> Result<bool, BackendError> {
         Err(BackendError::Unsupported)
     }
+
+    /// Inspect a volume-backed workload's persistent data directory for a
+    /// **data-dir-ownership fault** — files not owned by the guest process's uid:gid,
+    /// which make a rootless managed database (Postgres/MySQL as uid `999`) `EPERM`
+    /// reading its own cluster files. Returns a [`DataDirOwnership`] observation (`ok`
+    /// plus, on a fault, a count and a sample) for a backend that owns an on-node volume
+    /// directory (the native `container` backend); every other backend returns `None`
+    /// (not applicable — it owns no local data directory to inspect, e.g. edge/VM
+    /// backends, or docker where the daemon owns the volume).
+    ///
+    /// **Read-only**: it NEVER chowns — the repair is the launch-time pre-chown
+    /// ([`stage_volumes`](ComputeBackend::launch)) or an operator volume/image fix, not
+    /// this read. The reconcile calls it only while a managed replica is up-but-not-
+    /// answering, and `db status` surfaces the result so an operator can tell a
+    /// data-dir-ownership stall from a slow init — the signal `/api/repair` cannot give.
+    async fn data_dir_ownership(&self, _spec: &ComputeSpec) -> Option<DataDirOwnership> {
+        None
+    }
 }
 
 /// A persistent volume as seen by an operator listing (`GET /api/compute/volumes`
@@ -808,6 +826,63 @@ fn readiness_provisioned_backcompat() -> Readiness {
     Readiness::Provisioned
 }
 
+/// A **read-only** data-dir-ownership health observation for a volume-backed managed
+/// database replica, surfaced by `boatramp db status`.
+///
+/// A managed database runs rootless inside its container (Postgres/MySQL as uid:gid
+/// `999:999`), so its launch pre-chowns the volume's data directory to the guest process's
+/// mapped host owner (`stage_volumes` → `chown_tree_to` in the container backend). When a
+/// data directory instead carries **foreign-owned** files — a volume restored/cloned from
+/// an env-export, carried over from a different user-namespace base, or a custom image
+/// whose real uid differs from the assumed default — the database process gets `EPERM`
+/// reading its own cluster files (`global/pg_filenode.map: Permission denied`), never
+/// answers, and the replica is stuck [`Starting`](Readiness::Starting). That stall is
+/// indistinguishable from a slow init on its own.
+///
+/// This observation names the data-dir-ownership fault explicitly (which volume, how many
+/// foreign entries, a sample offending path + its actual owner), so an operator sees the
+/// root cause and the fix — a **filesystem** repair (relaunch re-chowns the volume, or
+/// correct the volume/image uid). That is exactly the blind spot `/api/repair` leaves: it
+/// reconciles only in-pg provisioning drift (roles / ownership / grants), **never**
+/// filesystem permissions.
+///
+/// Purely diagnostic: computing it NEVER chowns — repair stays the launch-time
+/// `stage_volumes` path and the operator's volume/image fix, not this status read. The
+/// uids are **host-level** (the on-disk owners after the user-namespace shift), so
+/// `expected_*` and a sample entry's `uid`/`gid` compare like-for-like.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataDirOwnership {
+    /// The volume whose data directory was scanned.
+    pub volume: String,
+    /// `true` iff every scanned entry is owned by the expected guest uid:gid. `false`
+    /// means the database process will `EPERM` reading its own files — a filesystem repair
+    /// is needed before it can ever become ready.
+    pub ok: bool,
+    /// The (host-level, namespace-mapped) uid the guest database process runs as — what
+    /// the data directory's files SHOULD be owned by.
+    pub expected_uid: u32,
+    /// See [`expected_uid`](Self::expected_uid) — the expected gid.
+    pub expected_gid: u32,
+    /// Count of entries found NOT owned by the expected uid:gid, up to the scan's
+    /// early-stop budget (`0` iff `ok`; a lower bound when the budget was hit).
+    pub foreign_count: u64,
+    /// A sample foreign-owned entry (its path relative to the volume root — no
+    /// host-absolute path is leaked — plus its actual owner), set when `!ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<ForeignOwnedEntry>,
+}
+
+/// One foreign-owned entry sampled by a [`DataDirOwnership`] scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignOwnedEntry {
+    /// Path relative to the volume's data-directory root.
+    pub path: String,
+    /// The entry's actual owner uid (host-level).
+    pub uid: u32,
+    /// The entry's actual owner gid (host-level).
+    pub gid: u32,
+}
+
 /// An observed replica (the persisted control-plane state at
 /// `compute_state/<workload>/<replica>`; also the gateway's upstream source).
 /// Usually [`Running`](ReplicaPhase::Running); a scale-to-zero replica persists
@@ -851,6 +926,18 @@ pub struct ObservedInstance {
     /// routing across the upgrade; the next tick recomputes it. Schema stays v1.
     #[serde(default = "readiness_provisioned_backcompat")]
     pub readiness: Readiness,
+    /// A **read-only** data-dir-ownership health observation ([`DataDirOwnership`]), set by
+    /// the reconcile only while a managed-database replica is up (`healthy`) but its
+    /// service is not yet answering ([`Starting`](Readiness::Starting)) — the one window
+    /// where a filesystem data-dir-ownership fault (foreign-owned files the rootless
+    /// database process can't read) is the suspect behind an otherwise-opaque stall.
+    /// `Some` with `ok == false` names the fault so `db status` shows the root cause
+    /// `/api/repair` can't (it fixes only in-pg drift, never filesystem permissions).
+    /// Cleared to `None` once the replica answers (it could read its data directory, so
+    /// ownership is fine) or for a backend/workload with no on-node data directory to
+    /// inspect. `#[serde(default)]` keeps older records deserializing — schema stays v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<DataDirOwnership>,
     /// The snapshot to restore from — `Some` iff `phase == Zero`.
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
@@ -1595,6 +1682,35 @@ pub async fn reconcile_once(
                     state.readiness = new_readiness;
                     changed = true;
                 }
+                // 3) Data-dir-ownership diagnosis (READ-ONLY). A rootless managed database
+                //    whose data directory carries foreign-owned files `EPERM`s reading its
+                //    own cluster files and FATALs *before* it ever binds its port — so the
+                //    signature is "launched but not listening" (`!healthy` while `Running`),
+                //    NOT a healthy-but-recovering server (which has its port up and simply
+                //    answers "starting up"). Scan only once the replica is past its startup
+                //    grace, so a normally-initializing container (briefly not-yet-listening)
+                //    isn't scanned and a large, healthy data directory in recovery is never
+                //    walked. A still-not-listening replica past its grace is genuinely stuck,
+                //    and a data-dir-ownership fault is the prime suspect — the signal
+                //    `/api/repair` can't give (it reconciles only in-pg drift, never
+                //    filesystem permissions). Clears once the port comes up (the database
+                //    could read its data directory, so ownership is fine). Backends with no
+                //    on-node data directory return `None`. NEVER chowns — repair is a
+                //    relaunch (re-chowns) or an operator volume/image fix.
+                let data_dir = if should_diagnose_data_dir(
+                    state.healthy,
+                    state.started_at,
+                    crate::time::now_unix(),
+                    u64::from(spec.startup_grace_secs),
+                ) {
+                    backend.data_dir_ownership(&spec).await
+                } else {
+                    None
+                };
+                if data_dir != state.data_dir {
+                    state.data_dir = data_dir;
+                    changed = true;
+                }
                 if changed && let Err(e) = deploy.set_replica_state(project, state).await {
                     report.errors.push(format!(
                         "{}/{}: persist state: {e}",
@@ -1797,6 +1913,8 @@ pub async fn reconcile_once(
                                 // A woken replica re-advances through the readiness pass
                                 // so its (idempotent) post-launch actions re-run.
                                 readiness: Readiness::Starting,
+                                // Recomputed by the next reconcile tick's readiness pass.
+                                data_dir: None,
                                 snapshot: None,
                             };
                             match deploy.set_replica_state(project, &state).await {
@@ -1830,6 +1948,23 @@ pub async fn reconcile_once(
     }
 
     Ok(report)
+}
+
+/// Whether the reconcile should run the **read-only** data-dir-ownership diagnosis for a
+/// `Running` replica this tick. A rootless managed database whose data directory carries
+/// foreign-owned files `EPERM`s its own cluster files and FATALs *before* binding its
+/// port, so the fault signature is "launched but not listening" (`!healthy`) that persists
+/// past the replica's startup grace. A healthy server (port up) is never scanned — it
+/// could read its data directory, so ownership is fine — and neither is a normally-
+/// initializing one still inside its grace. A record with no `started_at` (older/restored)
+/// is treated as past-grace. Pure, so the window is unit-tested without a full reconcile.
+fn should_diagnose_data_dir(
+    healthy: bool,
+    started_at: Option<u64>,
+    now: u64,
+    grace_secs: u64,
+) -> bool {
+    !healthy && started_at.is_none_or(|at| now.saturating_sub(at) >= grace_secs)
 }
 
 /// The region of node `id` in `nodes`, for tagging a replica's endpoint (FA-8).
@@ -1998,6 +2133,8 @@ async fn launch_one(
         // Freshly launched: the reconcile's readiness pass probes service-readiness +
         // runs post-launch actions to advance this to Provisioned (or ProvisionFailed).
         readiness: Readiness::Starting,
+        // Diagnosed by the reconcile only if this replica stays stuck up-but-not-answering.
+        data_dir: None,
         snapshot: None,
     })
 }
@@ -2598,6 +2735,7 @@ mod tests {
             } else {
                 Readiness::Starting
             },
+            data_dir: None,
             snapshot: None,
         }
     }
@@ -3638,6 +3776,7 @@ mod tests {
             started_at: None,
             phase: ReplicaPhase::Zero,
             readiness: Readiness::Starting,
+            data_dir: None,
             snapshot: Some(Snapshot {
                 project: "default".into(),
                 workload: "w".into(),
@@ -3784,6 +3923,35 @@ mod tests {
             advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await,
             Readiness::Starting
         );
+    }
+
+    #[test]
+    fn data_dir_diagnosis_runs_only_when_unlistening_past_the_startup_grace() {
+        // The data-dir-ownership fault FATALs the database before it binds its port, so the
+        // signature is "launched but not listening" (`!healthy`) that persists past the
+        // startup grace — NOT a healthy server still answering "starting up" during recovery.
+        let grace = 30;
+        // Healthy (port up) → never diagnosed, even long past the grace (it can read its
+        // data directory, so ownership is definitively fine).
+        assert!(!should_diagnose_data_dir(true, Some(0), 10_000, grace));
+        // Launched but not listening, still inside the startup grace → not yet (a normally
+        // initializing container is briefly not-yet-listening; don't scan / false-warn).
+        assert!(!should_diagnose_data_dir(
+            false,
+            Some(100),
+            100 + grace - 1,
+            grace
+        ));
+        // Launched but STILL not listening once past the grace → diagnose (genuinely stuck;
+        // a data-dir-ownership fault is the prime suspect).
+        assert!(should_diagnose_data_dir(
+            false,
+            Some(100),
+            100 + grace,
+            grace
+        ));
+        // No launch timestamp (older record / restored replica) → treated as past-grace.
+        assert!(should_diagnose_data_dir(false, None, 0, grace));
     }
 
     #[tokio::test]
