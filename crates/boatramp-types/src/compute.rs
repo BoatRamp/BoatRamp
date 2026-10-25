@@ -513,6 +513,31 @@ pub enum ApplyDatabaseSize {
     Large,
 }
 
+/// How a managed-DB **config change that only takes effect at server start** is applied
+/// (e.g. toggling `delta_capture`, which flips `wal_level`/binlog in the launch argv and so
+/// remints the content-addressed spec). The change is always STAGED by rolling the workload's
+/// active spec; this policy decides whether the DB is also restarted to adopt it NOW.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbRestartPolicy {
+    /// Stage the change and mark the DB "restart pending" — the operator restarts it
+    /// explicitly (`boatramp db restart`) at a chosen time. The safe default: a managed DB
+    /// holds production data, so never cause surprise downtime on a config re-apply.
+    #[default]
+    Manual,
+    /// Apply the change and restart the DB immediately so it takes effect at once (brief
+    /// downtime while the container relaunches onto the reattached data volume).
+    Auto,
+}
+
+impl DbRestartPolicy {
+    /// Whether a staged restart-requiring change should restart the DB immediately.
+    #[must_use]
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
 impl ApplyDatabaseSize {
     /// The `(vcpus, mem_mib, volume_size_mib)` this preset maps to. The single
     /// authority for the preset → resources mapping, so the CLI (rendering) and the
@@ -651,6 +676,22 @@ pub struct ApplyDatabase {
     /// (strict). Passes through to the serving config unchanged.
     #[serde(default, skip_serializing_if = "readiness_gate_is_default")]
     pub readiness_gate: ReadinessGate,
+    /// **Opt-in** (default `false`): enable row-level change capture on this managed DB so it
+    /// can be the source of an incremental/delta export's SQL true-delta (Postgres logical WAL
+    /// / MySQL binlog). Flips `wal_level=logical` / `--log-bin` in the launch argv, so turning
+    /// it on remints the spec and needs a restart (see `restart_policy`). Off ⇒ no WAL/binlog
+    /// cost; a delta export of this DB falls back to a full dump. Ignored for a bring-your-own DB.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delta_capture: bool,
+    /// How a restart-requiring config change (e.g. toggling `delta_capture`) is applied —
+    /// `manual` (default: stage + mark pending) or `auto` (apply + restart now).
+    #[serde(default, skip_serializing_if = "restart_policy_is_default")]
+    pub restart_policy: DbRestartPolicy,
+}
+
+/// Omit `restart_policy` from a serialized manifest when it is the `manual` default.
+fn restart_policy_is_default(p: &DbRestartPolicy) -> bool {
+    *p == DbRestartPolicy::default()
 }
 
 /// Omit `readiness_gate` from a serialized manifest when it is the all-`provisioned`

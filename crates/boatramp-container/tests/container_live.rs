@@ -260,6 +260,7 @@ async fn run_pg_e2e(host_root: bool) {
         boatramp_core::compute::ManagedDbEngine::Postgres,
         Some("pgvector/pgvector:pg16"),
         512,
+        false,
     );
     boatramp_core::compute::PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
     spec.env

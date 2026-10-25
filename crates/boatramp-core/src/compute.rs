@@ -1527,6 +1527,7 @@ pub fn managed_db_spec(
     engine: ManagedDbEngine,
     image: Option<&str>,
     volume_size_mib: u32,
+    delta_capture: bool,
 ) -> ComputeSpec {
     // A stock database's *first* boot runs `initdb` before it opens its port, so the
     // reconcile loop must not mistake a still-initializing container for a broken
@@ -1541,7 +1542,7 @@ pub fn managed_db_spec(
         ManagedDbEngine::Mysql => MYSQL_STARTUP_GRACE_SECS,
     };
     let data_dir = engine.data_dir();
-    let (entrypoint, env) = match engine {
+    let (mut entrypoint, env) = match engine {
         ManagedDbEngine::Postgres => (
             vec![
                 "/usr/local/bin/docker-entrypoint.sh".to_string(),
@@ -1571,6 +1572,42 @@ pub fn managed_db_spec(
             )]),
         ),
     };
+    // SQL true-delta capture opt-in (PLAN-sql-true-delta Stage 1): enable the engine's row-level
+    // change stream so a delta export can ship a WAL/binlog true-delta instead of a full dump.
+    // These are START-ONLY server settings, so a flip of `delta_capture` remints this
+    // content-addressed spec and the DB must relaunch to adopt them (the restart primitive). Off
+    // by default so a DB nobody delta-exports pays no WAL amplification / binlog disk.
+    if delta_capture {
+        match engine {
+            ManagedDbEngine::Postgres => {
+                // Logical decoding + room for the per-export capture slots. `wal_level=logical`
+                // is the load-bearing one (default is `replica`, which cannot be decoded).
+                for flag in [
+                    "wal_level=logical",
+                    "max_wal_senders=10",
+                    "max_replication_slots=10",
+                ] {
+                    entrypoint.push("-c".to_string());
+                    entrypoint.push(flag.to_string());
+                }
+            }
+            ManagedDbEngine::Mysql => {
+                // Row-format binlog + GTID so a delta can ship the binlog events since a base
+                // GTID. `server-id` must be nonzero for binary logging.
+                entrypoint.extend(
+                    [
+                        "--log-bin",
+                        "--binlog-format=ROW",
+                        "--gtid-mode=ON",
+                        "--enforce-gtid-consistency=ON",
+                        "--server-id=1",
+                    ]
+                    .into_iter()
+                    .map(str::to_string),
+                );
+            }
+        }
+    }
     ComputeSpec {
         version: 1,
         root: RootSource::Image(image.unwrap_or_else(|| engine.default_image()).to_string()),
@@ -2263,7 +2300,7 @@ mod tests {
         // Postgres: default image, port, one volume at the data dir, explicit
         // entrypoint (the shared-kernel backends don't apply OCI config), and
         // `user`/`cap_add` LEFT UNSET so the privilege directive owns them.
-        let pg = managed_db_spec(ManagedDbEngine::Postgres, None, 2048);
+        let pg = managed_db_spec(ManagedDbEngine::Postgres, None, 2048, false);
         assert_eq!(pg.root, RootSource::Image("pgvector/pgvector:pg16".into()));
         assert_eq!(pg.port, 5432);
         assert!(pg.user.is_none(), "rootless directive sets user at launch");
@@ -2287,8 +2324,11 @@ mod tests {
         assert_eq!(launched.user.as_deref(), Some("999:999"));
 
         // An explicit image override is honored; MySQL uses its own port/data dir.
-        let my = managed_db_spec(ManagedDbEngine::Mysql, Some("mysql:8.4"), 512);
+        let my = managed_db_spec(ManagedDbEngine::Mysql, Some("mysql:8.4"), 512, false);
         assert_eq!(my.root, RootSource::Image("mysql:8.4".into()));
+        // delta_capture=false ⇒ no replication flags in either engine's argv.
+        assert!(!pg.entrypoint.iter().any(|a| a == "wal_level=logical"));
+        assert!(!my.entrypoint.iter().any(|a| a.starts_with("--log-bin")));
         assert_eq!(my.port, 3306);
         assert_eq!(my.volumes[0].mount, "/var/lib/mysql");
 
@@ -2298,6 +2338,33 @@ mod tests {
         assert_eq!(my.startup_grace_secs, 120);
         assert_eq!(default_startup_grace_secs(), 30);
         assert_eq!(spec(1, 64).startup_grace_secs, 30);
+    }
+
+    /// `delta_capture=true` adds the engine's row-level-change flags to the launch argv (so a
+    /// delta export can ship a WAL/binlog true-delta), and — because these are start-only server
+    /// settings baked into the content-addressed spec — it CHANGES the spec id, which is exactly
+    /// what forces a relaunch to adopt the change (the restart primitive).
+    #[test]
+    fn delta_capture_adds_replication_argv_and_remints_the_spec() {
+        let pg_off = managed_db_spec(ManagedDbEngine::Postgres, None, 2048, false);
+        let pg_on = managed_db_spec(ManagedDbEngine::Postgres, None, 2048, true);
+        assert!(pg_on.entrypoint.iter().any(|a| a == "wal_level=logical"));
+        assert!(
+            pg_on
+                .entrypoint
+                .iter()
+                .any(|a| a == "max_replication_slots=10")
+        );
+        assert_ne!(
+            pg_off.id(),
+            pg_on.id(),
+            "flipping delta_capture must remint the spec so a relaunch adopts it"
+        );
+
+        let my_on = managed_db_spec(ManagedDbEngine::Mysql, None, 512, true);
+        assert!(my_on.entrypoint.iter().any(|a| a == "--log-bin"));
+        assert!(my_on.entrypoint.iter().any(|a| a == "--binlog-format=ROW"));
+        assert!(my_on.entrypoint.iter().any(|a| a == "--gtid-mode=ON"));
     }
 
     #[test]

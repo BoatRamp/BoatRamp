@@ -414,6 +414,7 @@ async fn provision_single(
         engine_of(kind),
         binding.image.as_deref(),
         binding.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
+        binding.delta_capture,
     );
     // An operator-set startup grace overrides the engine default the synthesizer picked.
     // Applied identically here and in the shared `auto_register` path so the two
@@ -1796,7 +1797,8 @@ mod tests {
         // The stored spec equals `managed_db_spec(...)` + the same grace override the
         // shared auto-register path applies — proving both paths are byte-identical
         // (the default tenant keeps the base volume name, so no per-tenant divergence).
-        let mut expected = managed_db_spec(ManagedDbEngine::Postgres, None, DEFAULT_VOLUME_MIB);
+        let mut expected =
+            managed_db_spec(ManagedDbEngine::Postgres, None, DEFAULT_VOLUME_MIB, false);
         expected.startup_grace_secs = binding.startup_grace_secs.unwrap();
         assert_eq!(
             stored.id(),

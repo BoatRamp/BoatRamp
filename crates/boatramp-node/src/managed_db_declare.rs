@@ -138,6 +138,11 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
         // Passes through unchanged (same shared type) — the manifest author sets the gate;
         // the serving config honors it.
         readiness_gate: db.readiness_gate,
+        // Delta-capture opt-in + its restart policy pass through unchanged (shared types): the
+        // manifest author opts a managed DB into SQL true-delta capture; lowering carries it to
+        // the serving config, where it drives the launch argv + the restart-on-change policy.
+        delta_capture: db.delta_capture,
+        restart_policy: db.restart_policy,
     }
 }
 
@@ -704,6 +709,8 @@ mod tests {
             connect_timeout_secs: Some(9999),
             startup_grace_secs: Some(99999),
             readiness_gate: Default::default(),
+            delta_capture: false,
+            restart_policy: Default::default(),
         }
     }
 

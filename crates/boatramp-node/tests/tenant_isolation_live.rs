@@ -236,6 +236,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
         ManagedDbEngine::Postgres,
         Some("pgvector/pgvector:pg16"),
         512,
+        false,
     );
     PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
     // The server-init credential env (`POSTGRES_*`) from the sealed superuser password —

@@ -2543,6 +2543,8 @@ mod tests {
                 connect_timeout_secs: None,
                 startup_grace_secs: None,
                 readiness_gate: Default::default(),
+                delta_capture: false,
+                restart_policy: Default::default(),
             },
             boatramp_core::compute::ApplyDatabase {
                 name: "metrics".into(),
@@ -2561,6 +2563,8 @@ mod tests {
                 connect_timeout_secs: None,
                 startup_grace_secs: None,
                 readiness_gate: Default::default(),
+                delta_capture: false,
+                restart_policy: Default::default(),
             },
         ];
         apply_databases(&mock, &dbs, false).await.unwrap();
@@ -2595,6 +2599,8 @@ mod tests {
             connect_timeout_secs: None,
             startup_grace_secs: None,
             readiness_gate: Default::default(),
+            delta_capture: false,
+            restart_policy: Default::default(),
         }];
         apply_databases(&mock, &dbs, true).await.unwrap();
         assert!(mock.calls().is_empty(), "dry-run declares nothing");

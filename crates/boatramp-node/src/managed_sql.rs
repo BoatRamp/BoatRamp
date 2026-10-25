@@ -603,6 +603,7 @@ async fn register_shared_server(
         engine,
         image,
         db.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
+        db.delta_capture,
     );
     // An operator-set startup grace overrides the engine default the synthesizer picked.
     // Applied identically here and in `provision_single` so the two managed-registration

@@ -256,6 +256,7 @@ async fn rls_session_guard_holds_live_postgres() {
         ManagedDbEngine::Postgres,
         Some("pgvector/pgvector:pg16"),
         512,
+        false,
     );
     PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
     // The server-init credential env from the sealed superuser password.

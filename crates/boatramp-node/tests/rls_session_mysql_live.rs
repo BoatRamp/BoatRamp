@@ -227,7 +227,7 @@ async fn rls_session_guard_holds_live_mysql() {
     )
     .expect("backend");
 
-    let mut spec = managed_db_spec(ManagedDbEngine::Mysql, Some("mysql:8.0"), 512);
+    let mut spec = managed_db_spec(ManagedDbEngine::Mysql, Some("mysql:8.0"), 512, false);
     PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
     // The server-init credential env from the sealed root password. MySQL refuses
     // `MYSQL_USER=root`, so only the root password + default database are set here; the

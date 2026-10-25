@@ -1835,6 +1835,21 @@ pub struct ExternalDatabaseConfig {
     /// When set it overrides the engine default the synthesizer picks (Postgres 60,
     /// MySQL 120). Omit to use that default. Ignored for a bring-your-own database.
     pub startup_grace_secs: Option<u32>,
+    /// **Opt-in** (default `false`): enable row-level change capture on this **managed
+    /// co-located** database so it can source a delta export's SQL true-delta (Postgres
+    /// logical WAL / MySQL binlog). Flips `wal_level=logical` / `--log-bin` in the launch
+    /// argv — a start-only server setting — so toggling it remints the content-addressed spec
+    /// and requires a restart (governed by `restart_policy`). Off ⇒ no WAL/binlog overhead and
+    /// a delta export of this DB falls back to a full dump. Ignored for a bring-your-own
+    /// (`url_env`) database.
+    #[serde(default)]
+    pub delta_capture: bool,
+    /// How a restart-requiring config change on this **managed co-located** database (today:
+    /// toggling `delta_capture`) is applied: `manual` (default — stage it and mark the DB
+    /// restart-pending for an explicit `boatramp db restart`) or `auto` (apply + restart the
+    /// DB immediately). Ignored for a bring-your-own database.
+    #[serde(default)]
+    pub restart_policy: DbRestartPolicy,
     /// **Isolation mechanism** for a compute-backed managed database (2×2 axis 1).
     /// `single` (default) — a *dedicated* database server (its own container) per
     /// tenant; `shared` — *one* server hosting a permission-separated database + role
@@ -1941,7 +1956,7 @@ pub enum TenantScope {
 /// manifest `ApplyDatabase` and this serving config), surfaced here for the
 /// `ExternalDatabaseConfig::readiness_gate` field.
 #[cfg_attr(not(feature = "handlers"), allow(unused_imports))]
-pub use boatramp_core::compute::{ReadinessGate, ReadinessLevel};
+pub use boatramp_core::compute::{DbRestartPolicy, ReadinessGate, ReadinessLevel};
 
 impl ExternalDatabaseConfig {
     /// Validate the source is well-formed: **exactly one** of `url_env` /
