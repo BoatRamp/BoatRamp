@@ -3021,6 +3021,19 @@ pub(super) async fn build_bindings(
     if granted("wasi:sockets") && !egress_allowlist.is_empty() {
         bindings = bindings.with_egress_allowlist(egress_allowlist.to_vec());
     }
+    // Host-side DNS resolver (mailroom cap-req #20/#21, the resolver half of the egress story): attach
+    // the shared hickory resolver ONLY when the component is granted `dns-resolve`. This is the SAME
+    // wiring the function/listener lanes carry ([`build_function_bindings`]); without it a bus CONSUMER
+    // could hold `tcp-egress` + `egress_allowlist` yet NOT resolve a hostname, blocking direct-MX mail
+    // relay from a consumer. Deny-by-default — the binding is absent otherwise; and even when granted it
+    // reaches nothing unless the node posture `allow_guest_tcp_egress` is on (the binding enforces the
+    // SAME posture as a `tcp-egress` dial) and its `resolve-addr` results are SSRF-floored by the same
+    // `is_global_ip` predicate. The per-invocation DNS budget is seeded by the engine per store (one
+    // consumed message = one store), so a consumer is budgeted automatically — no extra plumbing here.
+    #[cfg(feature = "tcp-egress")]
+    if granted("dns-resolve") {
+        bindings = bindings.with_dns_resolve(crate::dns_resolve::shared_resolver());
+    }
     Ok(bindings)
 }
 
@@ -4729,6 +4742,112 @@ mod aot_consumer_tests {
         assert!(
             !hydrate_verified_artifact(&consumer, &deploy(), &key, None, "absent").await,
             "a cache miss returns false (the caller compiles from source)"
+        );
+    }
+}
+
+/// Mailroom cap-req #21 — the CONSUMER (bus-handler) lane. `build_bindings` is the single binding
+/// assembler the async consumer dispatch flows through (`ConsumerRebuild::bindings_for` →
+/// `build_bindings`, the once-per-message rebuild), so attaching `dns-resolve` here is what gives a
+/// consumer the resolver half of the egress story. Before this, a consumer could be granted
+/// `tcp-egress` + a non-empty `egress_allowlist` yet carry NO DNS resolver — it could dial a literal
+/// IP but never resolve an MX hostname, blocking direct-MX mail relay from a consumer. This asserts
+/// the SERVER-side wiring (the attach); the posture gate, SSRF floor, and per-invocation DNS budget
+/// are enforced lane-agnostically by the binding itself (proven by the handlers-crate gate).
+#[cfg(all(test, feature = "handlers", feature = "tcp-egress"))]
+mod consumer_dns_resolve_tests {
+    use super::*;
+    use crate::tests::MemStorage;
+    use boatramp_core::config::HandlersSiteConfig;
+    use boatramp_core::project::ProjectRef;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::Arc;
+
+    /// Build consumer bindings through the REAL `build_bindings` with the given granted `imports`
+    /// (the site `allow_imports` ceiling mirrors them, so `granted(..)` holds for each) and the
+    /// outbound-TCP `egress_allowlist`. Tenancy `Disabled` — this is about the capability attach,
+    /// not tenant resolution. No SQL/messaging provider (the consumer here needs neither).
+    async fn consumer_bindings(
+        imports: &[&str],
+        egress_allowlist: &[&str],
+    ) -> boatramp_handlers::Bindings {
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let storage: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = crate::HandlerRuntime::new(engine, kv, storage, None, None);
+        let inner = rt.inner.as_ref().unwrap();
+        let site = HandlersSiteConfig {
+            enabled: true,
+            allow_imports: imports.iter().map(|s| (*s).to_string()).collect(),
+            tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
+            ..Default::default()
+        };
+        let imports: Vec<String> = imports.iter().map(|s| (*s).to_string()).collect();
+        let allow: Vec<String> = egress_allowlist.iter().map(|s| (*s).to_string()).collect();
+        let env = std::collections::BTreeMap::new();
+        build_bindings(
+            inner,
+            ProjectRef::new("default"),
+            "shop",
+            "shop",
+            None,
+            &imports,
+            &site,
+            &env,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &allow,
+            &[],
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("a consumer builds its bindings")
+    }
+
+    /// A direct-MX relay consumer: granted BOTH the outbound-TCP dial (`wasi:sockets` + a non-empty
+    /// allowlist) AND `dns-resolve`. Both halves must be attached on the consumer lane.
+    #[tokio::test]
+    async fn a_dns_resolve_granted_consumer_carries_the_resolver() {
+        let bindings =
+            consumer_bindings(&["wasi:sockets", "dns-resolve"], &["smtp.example.com:25"]).await;
+        assert!(
+            bindings.dns_resolve().is_some(),
+            "a dns-resolve-granted consumer must carry the host DNS resolver (cap-req #21)"
+        );
+        assert_eq!(
+            &*bindings.egress_allowlist(),
+            &["smtp.example.com:25".to_string()],
+            "and its outbound-TCP allowlist (unchanged by this fix)"
+        );
+    }
+
+    /// The pre-#21 gap shape: a consumer with `tcp-egress` + a non-empty allowlist but WITHOUT the
+    /// `dns-resolve` grant. The allowlist still attaches, but NO resolver — deny-by-default.
+    #[tokio::test]
+    async fn a_consumer_without_the_grant_carries_no_resolver() {
+        let bindings = consumer_bindings(&["wasi:sockets"], &["smtp.example.com:25"]).await;
+        assert!(
+            bindings.dns_resolve().is_none(),
+            "an ungranted consumer must carry NO DNS resolver (deny-by-default)"
+        );
+        assert!(
+            !bindings.egress_allowlist().is_empty(),
+            "but it still carries the outbound-TCP allowlist it WAS granted"
         );
     }
 }
