@@ -1162,6 +1162,10 @@ pub struct NodeTenantSqlResolver {
     scope: TenantScope,
     rls_session: bool,
     pool_max: Option<u32>,
+    // Opt-in warm floor for the per-tenant storefront pool. Held PER TENANT (one pool per
+    // resolved tenant), so a non-zero value keeps that many idle DB sessions per tenant —
+    // honored only because it is explicit per-binding `pool_min` config. Default none.
+    pool_min: Option<u32>,
     read_only: bool,
     connect_timeout: Option<Duration>,
     // The full binding, kept so `resolve` can lazily provision the tenant (idempotent)
@@ -1194,6 +1198,7 @@ impl NodeTenantSqlResolver {
             scope: binding.tenant_scope,
             rls_session: binding.rls_session,
             pool_max: binding.pool_max,
+            pool_min: binding.pool_min,
             read_only: binding.read_only,
             connect_timeout: binding.connect_timeout_secs.map(Duration::from_secs),
             binding: binding.clone(),
@@ -1312,7 +1317,8 @@ impl NodeTenantSqlResolver {
             self.pool_max,
             self.read_only,
             self.connect_timeout,
-        );
+        )
+        .with_pool_min(self.pool_min);
         if self.rls_session {
             backend = backend.with_session_context(vec![
                 (SESSION_KEY_PROJECT, project.to_string()),

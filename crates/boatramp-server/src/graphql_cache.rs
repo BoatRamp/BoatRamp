@@ -893,7 +893,7 @@ mod tests {
             return;
         };
         let backing: Arc<dyn KvStore> = Arc::new(
-            boatramp_storage::SqlKv::open_postgres(url, Some(8))
+            boatramp_storage::SqlKv::open_postgres(url, Some(8), None)
                 .await
                 .expect("open Postgres SqlKv"),
         );

@@ -1805,6 +1805,14 @@ pub struct ExternalDatabaseConfig {
     pub password_env: Option<String>,
     /// Maximum pooled connections (default 8).
     pub pool_max: Option<u32>,
+    /// Warm **floor** of pooled connections kept established while idle (default none).
+    /// `0`/unset lets an idle pool drain fully, so the next burst re-establishes every
+    /// connection from cold — serially paying a TCP+TLS+auth handshake per connection
+    /// (the proven public-storefront saturation). Set a small floor for a hot **shared**
+    /// storefront pool so a burst acquires warm connections. NOTE: on a per-tenant managed
+    /// binding this floor is held *per tenant*, so each tenant's pool keeps that many idle
+    /// DB sessions — set it only where that fan-out is acceptable. Clamped to `pool_max`.
+    pub pool_min: Option<u32>,
     /// Open every transaction `READ ONLY` (the engine rejects writes) — for a
     /// database functions should only read.
     pub read_only: bool,
@@ -2904,6 +2912,11 @@ pub struct SqlKvConfig {
     /// Maximum pooled connections for a `postgres`/`mysql` KV (later workstreams). Ignored for the
     /// embedded `sqlite` path (one `Database` handle, connections opened per op).
     pub pool_max: Option<u32>,
+    /// Warm **floor** of pooled connections the `postgres`/`mysql` KV keeps established while idle
+    /// (default: a small internal floor — the KV is a single shared pool on every request's hot
+    /// path, so warming a handful avoids serial cold re-establishment on a burst). `0` disables the
+    /// floor. Ignored for the embedded `sqlite` path. Clamped to `pool_max`.
+    pub pool_min: Option<u32>,
 }
 
 /// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
@@ -3325,7 +3338,7 @@ mod tests {
             r#"(
                 handlers: ( bindings: ( sql: (
                     databases: {
-                        "analytics": ( kind: "postgres", url_env: "FILE_PG_URL", pool_max: 4 ),
+                        "analytics": ( kind: "postgres", url_env: "FILE_PG_URL", pool_max: 4, pool_min: 2 ),
                     },
                 ) ) ),
             )"#,
@@ -3333,6 +3346,8 @@ mod tests {
         cfg.apply_env_overrides(&env(&[
             // Override the file database's pool size (merge by key, per field).
             ("BOATRAMP_HANDLERS_SQL_DB_analytics_POOL_MAX", "32"),
+            // ...and its warm floor (the env `POOL_MIN` maps to the `pool_min` field).
+            ("BOATRAMP_HANDLERS_SQL_DB_analytics_POOL_MIN", "8"),
             // Add a brand-new database whose name has an underscore, exercising the
             // longest-suffix name isolation (`_READ_URL_ENV`, not `_URL_ENV`).
             ("BOATRAMP_HANDLERS_SQL_DB_events_log_KIND", "mysql"),
@@ -3355,6 +3370,11 @@ mod tests {
             "env pool_max wins over the file"
         );
         assert_eq!(
+            analytics.pool_min,
+            Some(8),
+            "env pool_min (the warm floor) maps + wins over the file's 2"
+        );
+        assert_eq!(
             analytics.url_env, "FILE_PG_URL",
             "the file's url_env survives (env didn't touch it)"
         );
@@ -3364,6 +3384,7 @@ mod tests {
         assert_eq!(events.url_env, "EVENTS_URL");
         assert_eq!(events.read_url_env.as_deref(), Some("EVENTS_RO_URL"));
         assert!(events.read_only);
+        assert_eq!(events.pool_min, None, "an unset warm floor stays None");
     }
 
     #[test]
@@ -5387,6 +5408,10 @@ pub(crate) mod figment_resolve {
             "BOATRAMP_KV_SQL_POOL_MAX",
             &["serve", "kv", "sql", "pool_max"],
         ),
+        (
+            "BOATRAMP_KV_SQL_POOL_MIN",
+            &["serve", "kv", "sql", "pool_min"],
+        ),
     ];
 
     /// Insert `value` at the nested `path`, creating intermediate dicts as needed.
@@ -5627,6 +5652,7 @@ pub(crate) mod figment_resolve {
                 ("USER", "user"),
                 ("PASSWORD_ENV", "password_env"),
                 ("POOL_MAX", "pool_max"),
+                ("POOL_MIN", "pool_min"),
                 ("READ_ONLY", "read_only"),
                 ("ALLOW_PREVIEW", "allow_preview"),
                 ("CONNECT_TIMEOUT_SECS", "connect_timeout_secs"),

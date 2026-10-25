@@ -109,6 +109,10 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
         user: Some(db.name.clone()),
         // The SAFE, capped tuning knobs.
         pool_max: db.pool_max.map(|n| n.min(apply_db_caps::MAX_POOL)),
+        // A declarative managed DB does not (yet) expose a warm floor — a per-tenant pool
+        // would fan the floor out across tenants, so it stays an explicit serving-config
+        // opt-in rather than a declarative default.
+        pool_min: None,
         connect_timeout_secs: db
             .connect_timeout_secs
             .map(|n| n.min(apply_db_caps::MAX_CONNECT_TIMEOUT_SECS)),

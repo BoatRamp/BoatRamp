@@ -176,7 +176,7 @@ fn resolve_kv_url(cfg: &crate::config::SqlKvConfig, engine: &str) -> Result<Stri
 async fn build_pg_kv(cfg: &crate::config::SqlKvConfig, engine: &str) -> Result<Arc<dyn KvStore>> {
     let url = resolve_kv_url(cfg, engine)?;
     Ok(Arc::new(
-        boatramp_storage::SqlKv::open_postgres(url, cfg.pool_max).await?,
+        boatramp_storage::SqlKv::open_postgres(url, cfg.pool_max, cfg.pool_min).await?,
     ))
 }
 
@@ -197,7 +197,7 @@ async fn build_mysql_kv(
 ) -> Result<Arc<dyn KvStore>> {
     let url = resolve_kv_url(cfg, engine)?;
     Ok(Arc::new(
-        boatramp_storage::SqlKv::open_mysql(url, cfg.pool_max).await?,
+        boatramp_storage::SqlKv::open_mysql(url, cfg.pool_max, cfg.pool_min).await?,
     ))
 }
 

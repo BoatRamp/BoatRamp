@@ -862,7 +862,10 @@ async fn build_sql_backends(
                             db.pool_max,
                             db.read_only,
                             timeout(db),
-                        ),
+                        )
+                        // A brought-credential binding is a single shared endpoint, so a warm
+                        // floor doesn't fan out across tenants — honor the configured `pool_min`.
+                        .with_pool_min(db.pool_min),
                     );
                     composite = composite.with_external(name.clone(), external, db.allow_preview);
                     continue;
@@ -906,6 +909,8 @@ async fn build_sql_backends(
                 let opts = ExternalSqlOptions::new(url)
                     .with_read_url(read_url)
                     .with_max_connections(db.pool_max)
+                    // Bring-your-own is a single shared endpoint — a warm floor is safe here.
+                    .with_min_connections(db.pool_min)
                     .read_only(db.read_only)
                     .with_connect_timeout(timeout(db));
                 let external: Arc<dyn SqlBackend> =

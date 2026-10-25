@@ -1928,7 +1928,7 @@ mod pg_shared_authz_gates {
             eprintln!("skip pg shared-authz gate: BOATRAMP_TEST_PG_URL unset");
             return None;
         };
-        let kv = SqlKv::open_postgres(url, Some(8))
+        let kv = SqlKv::open_postgres(url, Some(8), None)
             .await
             .expect("open Postgres SqlKv");
         // Clean slate: clear the control-plane keyspace used by these gates.

@@ -407,14 +407,18 @@ impl SqlKv {
     pub async fn open_postgres(
         url: impl Into<String>,
         pool_max: Option<u32>,
+        pool_min: Option<u32>,
     ) -> Result<Self, KvError> {
         use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
         let max = pool_max
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_SQLX_POOL_MAX);
+        // Warm floor: the operator's `pool_min` when set, else the small default (the KV is a
+        // single shared pool on every request's hot path). Clamped to `max`.
+        let min = pool_min.unwrap_or(DEFAULT_SQLX_POOL_MIN).min(max);
         let opts = ExternalSqlOptions::new(url)
             .with_max_connections(Some(max))
-            .with_min_connections(Some(DEFAULT_SQLX_POOL_MIN.min(max)));
+            .with_min_connections(Some(min));
         let backend = connect(ExternalSqlKind::Postgres, &opts).map_err(sql_err)?;
         // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
         // first (lazy) connection, so a connect failure surfaces here.
@@ -454,14 +458,18 @@ impl SqlKv {
     pub async fn open_mysql(
         url: impl Into<String>,
         pool_max: Option<u32>,
+        pool_min: Option<u32>,
     ) -> Result<Self, KvError> {
         use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
         let max = pool_max
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_SQLX_POOL_MAX);
+        // Warm floor: the operator's `pool_min` when set, else the small default (the KV is a
+        // single shared pool on every request's hot path). Clamped to `max`.
+        let min = pool_min.unwrap_or(DEFAULT_SQLX_POOL_MIN).min(max);
         let opts = ExternalSqlOptions::new(url)
             .with_max_connections(Some(max))
-            .with_min_connections(Some(DEFAULT_SQLX_POOL_MIN.min(max)));
+            .with_min_connections(Some(min));
         let backend = connect(ExternalSqlKind::Mysql, &opts).map_err(sql_err)?;
         // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
         // first (lazy) connection, so a connect failure surfaces here.
@@ -2026,7 +2034,7 @@ mod pg_tests {
             eprintln!("skip sqlkv pg gate: BOATRAMP_TEST_PG_URL unset");
             return None;
         };
-        let kv = SqlKv::open_postgres(url, Some(16))
+        let kv = SqlKv::open_postgres(url, Some(16), None)
             .await
             .expect("open Postgres SqlKv");
         // Clean slate: the conformance suite asserts exact list contents, and the race gate counts
@@ -2622,7 +2630,7 @@ mod mysql_tests {
             eprintln!("skip sqlkv mysql gate: BOATRAMP_TEST_MYSQL_URL unset");
             return None;
         };
-        let kv = SqlKv::open_mysql(url, Some(16))
+        let kv = SqlKv::open_mysql(url, Some(16), None)
             .await
             .expect("open MySQL SqlKv");
         reset_tables(&kv).await;
