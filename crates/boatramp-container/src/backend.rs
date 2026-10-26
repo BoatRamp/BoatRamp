@@ -1495,13 +1495,28 @@ impl ContainerBackend {
             self.userns_base,
             can_shift_ownership(),
         )?;
-        if mapping.base != self.userns_base {
+        // Surface the FULL per-volume mapping decision on the daemon's default subscriber. The
+        // target MUST be under `boatramp::*` — the default `boatramp=info` filter (main.rs) matches
+        // `boatramp::guest`/`boatramp::repair` but NOT the implicit `boatramp_container::backend`
+        // module target, so an operator reading `fly logs` never saw the derive decision at all.
+        // Logged unconditionally (every volume, every launch) so a chosen base == configured base
+        // (fresh/remap) is as visible as a derived one — the field an operator needs to diagnose a
+        // reused-volume mount failure without host-side `ls` (which a distroless, exec-disabled node
+        // cannot run).
+        for (idx, (name, consensus)) in volumes.iter().enumerate() {
+            let chown = mapping.chowns.get(idx).copied().flatten();
             tracing::info!(
-                derived_base = mapping.base,
-                configured_base = self.userns_base,
+                target: "boatramp::repair",
+                volume = name.as_str(),
+                consensus = ?consensus,
                 runtime_uid = runtime.map(|(u, _)| u),
-                "reused-volume repair: derived this workload's user-namespace base from the \
-                 volume's existing owner — reading the data dir as-is (no chown, no reinit)"
+                runtime_gid = runtime.map(|(_, g)| g),
+                configured_base = self.userns_base,
+                chosen_base = mapping.base,
+                chown = ?chown,
+                "reused-volume mapping decision: chown=None ⇒ data read AS-IS (no chown/reinit); \
+                 chosen_base != configured_base ⇒ the data dir's existing owner was mapped onto the \
+                 runtime uid; chown=Some ⇒ a fresh/remap volume chowned under the chosen base"
             );
         }
         Ok(mapping)
