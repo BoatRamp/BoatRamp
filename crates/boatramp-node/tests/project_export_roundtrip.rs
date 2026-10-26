@@ -4105,6 +4105,146 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
          write, intact)"
     );
 
+    // ===== RACE GUARD (the HIGH fix): the binlog-delta shadow name is DETERMINISTIC per db, so a
+    // concurrent same-db import owns `<live>__shadow_brdelta` while it is populated + about to swap.
+    // THIS import must refuse WITHOUT dropping that shadow — dropping another import's populated
+    // shadow would leave ITS swap seeing an empty shadow and DESTROY live data. live is now the
+    // mutated set; simulate "import A in flight" with a POPULATED shadow + marker. =====
+    let delta_shadow = format!("{live_db}__shadow_brdelta");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "CREATE DATABASE `{delta_shadow}`; \
+             CREATE TABLE `{delta_shadow}`.marker(id INT PRIMARY KEY); \
+             INSERT INTO `{delta_shadow}`.marker VALUES (1);"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "pre-create a populated in-flight shadow: {o}");
+    let collide = drv
+        .import_resumable(
+            "default",
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        collide.is_err(),
+        "a same-db import whose deterministic shadow already exists MUST refuse (collision); got: {collide:?}"
+    );
+    // fix 1: the colliding import did NOT drop the in-flight shadow — the marker survives. (The
+    // un-fixed code ran `mysql_drop_shadow` on the CREATE collision → this would be 0.)
+    let (_c, marker) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&delta_shadow),
+        "SELECT COUNT(*) FROM marker;",
+    )
+    .await;
+    assert_eq!(
+        marker.trim(),
+        "1",
+        "the colliding import MUST NOT drop the other import's populated shadow (data-loss race)"
+    );
+    // live is untouched (the colliding import refused before any swap).
+    let (_c, t_after_collide) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        t_after_collide, "1:alpha\n2:beta2\n4:delta",
+        "live must be untouched by the refused colliding import"
+    );
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS `{delta_shadow}`;"),
+    )
+    .await;
+
+    // ===== SWAP-SAFETY (fix 2, data-preservation): drive the restore to a swap where the shadow is
+    // EMPTY while live is non-empty — the swap MUST abort, leaving live INTACT. Reach that state via
+    // an EMPTY-db base/delta chain imported over a sentinel-populated live. The UN-FIXED swap would
+    // RENAME the live tables aside + DROP them (nothing to put back) → empty the tenant db. =====
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "DROP TABLE IF EXISTS t; DROP TABLE IF EXISTS victim;",
+    )
+    .await;
+    assert_eq!(c, 0, "empty the source db for the swap-safety base");
+    drv.export_resumable("default", &full, "base2")
+        .await
+        .expect("empty base export");
+    let delta2 = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base2".to_string(),
+        }),
+    };
+    drv.export_resumable("default", &delta2, "d2")
+        .await
+        .expect("empty delta export");
+    // Now populate live with a sentinel, so the swap sees an EMPTY shadow vs a NON-EMPTY live.
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); INSERT INTO t VALUES (42,'SWAP_SAFETY_SENTINEL');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the swap-safety sentinel");
+    let swap_res = drv
+        .import_resumable(
+            "default",
+            "d2",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        swap_res.is_err(),
+        "importing an empty-shadow chain over a non-empty live MUST abort the swap (data-loss \
+         guard); got: {swap_res:?}"
+    );
+    let (_c, sentinel) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        sentinel, "42:SWAP_SAFETY_SENTINEL",
+        "the swap-safety guard must leave LIVE INTACT; the un-fixed swap would EMPTY the live db"
+    );
+
     // --- cleanup (best-effort) ---
     let _ = mysql_run(
         backend.as_ref(),

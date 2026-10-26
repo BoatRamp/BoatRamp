@@ -122,6 +122,14 @@ const DEFAULT_IMPORT_MEMBER_CAP: u64 = 256 * 1024 * 1024 * 1024; // 256 GiB
 /// once the TOTAL bytes streamed from the source exceed this, so a bundle can't stream forever.
 const DEFAULT_IMPORT_TOTAL_CAP: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 
+/// Max size of a MySQL binlog TRUE-delta member (SQL true-delta). Unlike every other member, this
+/// one is read WHOLE INTO MEMORY on both sides (drained into a buffer at export, read into a Vec at
+/// restore to pipe into `mysql`), so it carries its own fail-closed RAM bound (LOW-4). A capture
+/// whose drained member exceeds this falls back to a full dump (graceful); a restore whose member
+/// exceeds it is refused (fail-closed). Generous — a real row-delta since the base is far smaller —
+/// but finite, so a crafted/pathological member cannot OOM the node.
+const MYSQL_DELTA_MEMBER_MAX: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-mutation-gated in the merge gate)
 // ---------------------------------------------------------------------------
@@ -4595,6 +4603,19 @@ impl NodeProjectExport {
         let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_user);
         let old_db = format!("{}__old_{}", plan.live_db, plan.suffix);
         let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
+        // SWAP-SAFETY INVARIANT (defense in depth; mirror of the mysql guard): never rename live
+        // aside + drop the aside without the shadow REPLACEMENT present. pg renames the whole shadow
+        // DATABASE in, so the invariant is "the shadow db must EXIST before we touch live" — abort
+        // leaving live intact otherwise. (pg's shadow name is per-process random — `<live>__shadow_
+        // <nanos>_<pid>` — so it does NOT suffer the mysql true-delta deterministic-name collision
+        // race; this guard is cheap insurance, not a fix for a known pg hole.)
+        if !self.pg_db_exists(plan, &plan.shadow_db, stage_dir).await? {
+            return Err(Perr::Other(format!(
+                "pg shadow swap REFUSED: the shadow database {:?} is absent — refusing to rename \
+                 live {:?} aside without a replacement. Live left intact.",
+                plan.shadow_db, plan.live_db
+            )));
+        }
         // Reassign the restored objects (owned by the ephemeral role after a `--no-owner` restore)
         // to the configured owner, then re-own the database, so the swapped-in live db has its usual
         // ownership and the ephemeral role can be dropped. REASSIGN OWNED must run connected to the
@@ -4858,6 +4879,29 @@ impl NodeProjectExport {
             .collect())
     }
 
+    /// Whether a database `name` exists (via `information_schema.schemata`, maintenance connection) —
+    /// the mysql analogue of [`pg_db_exists`](Self::pg_db_exists). Used by the true-delta restore's
+    /// COLLISION guard: the binlog-delta shadow name is deterministic per db, so a pre-existing one
+    /// means a concurrent same-db import is in flight and this import must refuse WITHOUT dropping it.
+    async fn mysql_db_exists(
+        &self,
+        plan: &MysqlShadowPlan,
+        name: &str,
+        stage_dir: &Path,
+    ) -> Result<bool, Perr> {
+        let sql = format!(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = {};",
+            mysql_lit(name)
+        );
+        let (code, out) = self.mysql_run_admin(plan, &sql, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not probe database {name:?} (exit {code}): {out}"
+            )));
+        }
+        Ok(out.trim() == "1")
+    }
+
     /// TRUSTED DDL: create the shadow database + mint the EPHEMERAL apply user granted ONLY on the
     /// shadow db (never `*.*`, `SUPER`, or `FILE`), so a crafted dump applied as that user cannot
     /// escape. The ephemeral user is dropped on swap/abort.
@@ -4919,6 +4963,20 @@ impl NodeProjectExport {
         let shadow_tables = self
             .mysql_list_tables(plan, &plan.shadow_db, stage_dir)
             .await?;
+        // SWAP-SAFETY INVARIANT: never move live aside + drop the aside without a populated shadow
+        // replacement present. An empty shadow while live is non-empty (e.g. a concurrent same-db
+        // import dropped this import's populated shadow) would DESTROY tenant data — abort, leaving
+        // LIVE INTACT (no RENAME-aside, no DROP). The caller tears down the (bogus/empty) shadow.
+        if swap_would_destroy_live(&live_tables, &shadow_tables) {
+            return Err(Perr::Other(format!(
+                "mysql shadow swap REFUSED: the shadow {:?} is EMPTY while live {:?} has \
+                 {} table(s) — swapping would destroy live data (a concurrent same-db import may \
+                 have dropped this import's shadow). Live left intact.",
+                plan.shadow_db,
+                plan.live_db,
+                live_tables.len()
+            )));
+        }
         let liveq = |t: &str| {
             format!(
                 "{}.{}",
@@ -5992,6 +6050,18 @@ fn mysql_delta_shadow_db(live_db: &str) -> String {
     format!("{live_db}__shadow_brdelta")
 }
 
+/// SWAP-SAFETY INVARIANT (data-loss guard): `true` when swapping the shadow in for live would move
+/// the LIVE tables aside with NO shadow replacement to put back — i.e. the shadow is EMPTY while
+/// live is non-empty. A swap in this state would `RENAME` live aside + `DROP` the aside, DESTROYING
+/// tenant data (the same-db import collision race: a colliding import can drop another import's
+/// populated shadow, leaving this swap to see an empty shadow). The swap MUST abort here, leaving
+/// live intact, rather than empty a tenant's database. (Importing a legitimately-empty database over
+/// a non-empty live is also refused by this — an accepted trade for never destroying live data; a
+/// genuine "empty the db" is done out of band.)
+fn swap_would_destroy_live(live_tables: &[String], shadow_tables: &[String]) -> bool {
+    !live_tables.is_empty() && shadow_tables.is_empty()
+}
+
 /// Whether a dump line is one of mysqldump's privileged `SQL_LOG_BIN` toggles (emitted by
 /// `--source-data`). These need `SESSION_VARIABLES_ADMIN`, which the least-privilege shadow apply
 /// user does NOT hold, so the capture-base producer STRIPS them — leaving the COMMENTED GTID/file
@@ -6346,6 +6416,18 @@ impl NodeProjectExport {
             tracing::info!(db = %db, "mysql delta: binlog capture exited non-zero (start log purged, or server unreachable) — falling back to a full dump");
             return Ok(None);
         }
+        // LOW-4 bound (export side): the member is read whole into RAM here + at restore; a delta
+        // larger than the cap FALLS BACK to a full dump (graceful) rather than ship an unbounded
+        // member. The restore enforces the same cap fail-closed for a crafted/oversized member.
+        let member_len = tokio::fs::metadata(&member_path)
+            .await
+            .map_err(other)?
+            .len();
+        if member_len > MYSQL_DELTA_MEMBER_MAX {
+            let _ = tokio::fs::remove_file(&member_path).await;
+            tracing::info!(db = %db, member_len, "mysql delta: binlog delta exceeds the member cap — falling back to a full dump");
+            return Ok(None);
+        }
         let bytes = tokio::fs::read(&member_path).await.map_err(other)?;
         let _ = tokio::fs::remove_file(&member_path).await;
 
@@ -6452,10 +6534,28 @@ impl NodeProjectExport {
             // tables-only dump restores into any name, so it lands here too; the `RENAME TABLE` swap
             // then moves these tables onto the live db.
             plan.shadow_db = mysql_delta_shadow_db(&plan.live_db);
-            if let Err(e) = self.mysql_create_shadow(&plan, stage_dir).await {
-                self.mysql_drop_shadow(&plan, stage_dir).await;
-                return Err(e);
+            // COLLISION guard (data-loss race fix): the delta shadow name is DETERMINISTIC per db,
+            // so a pre-existing one means a concurrent same-db import owns it (populated + about to
+            // swap). We MUST refuse WITHOUT dropping it — dropping another import's populated shadow
+            // would leave ITS swap seeing an empty shadow and destroy live data. Refuse cleanly.
+            if self
+                .mysql_db_exists(&plan, &plan.shadow_db, stage_dir)
+                .await?
+            {
+                return Err(Perr::Unavailable(format!(
+                    "mysql true-delta restore: the delta shadow {:?} already exists — a concurrent \
+                     import of db {db:?} is in flight (the binlog-delta shadow name is \
+                     deterministic). Retry after it completes.",
+                    plan.shadow_db
+                )));
             }
+            // Now CREATE it (we own it from here). If CREATE fails — including a TOCTOU race where a
+            // concurrent import created it between the check above and here — we did NOT create it,
+            // so DO NOT drop it (dropping a shadow we don't own is the exact data-loss race): `?`
+            // propagates the error WITHOUT a teardown, unlike the drop-on-failure steps below. The
+            // ephemeral apply USER is per-import-random, so a create failure is a DB collision, not
+            // our user/grant; a startup `%__shadow_%` sweep reclaims any rare half-created leak.
+            self.mysql_create_shadow(&plan, stage_dir).await?;
             // The binlog replay needs the apply user to run `BINLOG` row events + the session-context
             // SETs mysqlbinlog emits — grant REPLICATION_APPLIER + SESSION_VARIABLES_ADMIN (on top of
             // the shadow-only ALL). FAIL-CLOSED: then PROVE the apply user is still confined (no
@@ -6488,9 +6588,25 @@ impl NodeProjectExport {
             // direct `mysql <shadow> < member` as the ephemeral apply user — no `mysqlbinlog` decode,
             // no rewrite, no gtid flags (all baked at capture).
             for (dir, idx) in &plan_db.binlog {
-                let member = tokio::fs::read(dir.join(member_object_name(*idx)))
+                let member_path = dir.join(member_object_name(*idx));
+                // LOW-4: the member is read WHOLE into RAM here (the db-scoped SQL-text member is
+                // applied via stdin). Cap it fail-closed so a crafted/oversized member cannot OOM the
+                // node (the previous `--raw`-to-tmpfs path bounded this at 64 MiB; the SQL-text path
+                // needs its own bound). A legit delta beyond the cap full-dumps at EXPORT instead.
+                let member_len = tokio::fs::metadata(&member_path)
                     .await
-                    .map_err(other)?;
+                    .map_err(other)?
+                    .len();
+                if member_len > MYSQL_DELTA_MEMBER_MAX {
+                    self.mysql_drop_shadow(&plan, stage_dir).await;
+                    return Err(Perr::Other(format!(
+                        "mysql true-delta restore REFUSED: binlog delta member {} is {member_len} \
+                         bytes, over the {MYSQL_DELTA_MEMBER_MAX}-byte cap — refusing to read an \
+                         oversized untrusted member into memory",
+                        member_path.display()
+                    )));
+                }
+                let member = tokio::fs::read(&member_path).await.map_err(other)?;
                 if let Err(e) = self.mysql_replay_binlog(&plan, &member, stage_dir).await {
                     self.mysql_drop_shadow(&plan, stage_dir).await;
                     return Err(e);
@@ -7051,6 +7167,23 @@ mod tests {
         assert_eq!(mysql_delta_shadow_db("app"), "app__shadow_brdelta");
         // Carries the `__shadow_` infix so the startup `%__shadow_%` sweep reclaims a crashed one.
         assert!(mysql_delta_shadow_db("tenant_x").contains("__shadow_"));
+    }
+
+    #[test]
+    fn swap_safety_refuses_empty_shadow_over_nonempty_live() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // THE data-loss state: live has tables, shadow is EMPTY → swapping would move live aside +
+        // drop it with nothing to put back → DESTROY live. MUST be flagged (the swap aborts).
+        assert!(swap_would_destroy_live(&s(&["t", "victim"]), &s(&[])));
+        // Safe: a populated shadow replaces live (the normal swap).
+        assert!(!swap_would_destroy_live(&s(&["t"]), &s(&["t"])));
+        // Safe: live is empty (first import into a fresh db) — nothing to lose.
+        assert!(!swap_would_destroy_live(&s(&[]), &s(&["t"])));
+        assert!(!swap_would_destroy_live(&s(&[]), &s(&[])));
+        // The pre-fix swap built RENAME moves from exactly this (empty-shadow, nonempty-live) state
+        // and processed it destructively — the guard above is what the fix adds, so this is not a
+        // tautology: a shadow with ANY table is NOT flagged (a partial restore is a separate concern).
+        assert!(!swap_would_destroy_live(&s(&["t", "victim"]), &s(&["t"])));
     }
 
     #[test]
