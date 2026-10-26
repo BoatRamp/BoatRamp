@@ -191,7 +191,12 @@ impl ComputeBackend for FakeComputeBackend {
         }
     }
 
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+    async fn materialize(
+        &self,
+        _project: &str,
+        _workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError> {
         // The fake doesn't stage a real rootfs; echo an opaque image ref.
         Ok(Artifact::Image {
             reference: format!("fake:{}", spec.port),

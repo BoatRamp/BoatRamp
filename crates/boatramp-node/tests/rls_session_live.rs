@@ -268,7 +268,7 @@ async fn rls_session_guard_holds_live_postgres() {
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize(DEFAULT_PROJECT, COMPUTE, &spec)
         .await
         .expect("materialize (pull) pgvector image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));

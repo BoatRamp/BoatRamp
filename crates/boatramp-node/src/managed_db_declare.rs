@@ -143,6 +143,11 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
         // the serving config, where it drives the launch argv + the restart-on-change policy.
         delta_capture: db.delta_capture,
         restart_policy: db.restart_policy,
+        // A declaratively-applied managed DB does not designate itself the legacy-shared-volume
+        // owner (a one-time serving-config migration knob); the sole-managed-DB case still
+        // auto-adopts via `legacy_data_volume_claimant`, and a contended upgrade is designated
+        // explicitly in the serving config.
+        adopt_legacy_data_volume: false,
     }
 }
 

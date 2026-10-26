@@ -56,7 +56,7 @@ async fn docker_round_trip() {
     let spec = spec();
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize("default", "ittest", &spec)
         .await
         .expect("materialize (pull)");
     let req = LaunchRequest {

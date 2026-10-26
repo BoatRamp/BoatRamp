@@ -134,15 +134,55 @@ pub struct InstanceHandle {
 /// `default`). This stem keys the cgroup path, the container/VM id, the hostname,
 /// the veth/tap stem, and the guest log filename; the bare default form keeps
 /// existing default-project deployments byte-identical on disk (mirroring how the
-/// managed-volume/credential names keep `default` bare). Project names carry no
-/// `/` ([`validate_resource_name`]) so the single `-` join stays unambiguous, and
-/// the components are all cgroup/interface/hostname-safe (resource names are
-/// `[a-z0-9-]`).
+/// managed-volume/credential names keep `default` bare). Components are all
+/// cgroup/interface/hostname-safe (resource names are `[a-z0-9-]`) and carry no `/`
+/// ([`validate_resource_name`]).
+///
+/// NOTE — the `-` join is NOT injective: because a slug may contain an interior `-`,
+/// `("a","b-c")` and `("a-b","c")` both derive `a-b-c-<replica>`. So two *distinct*
+/// non-`default` `(project, workload)` pairs can, for crafted names, collapse to the same
+/// id/cgroup/veth/hostname. This pre-existing identity keying inherits that collision; it is
+/// NOT changed here (re-encoding would move every existing container's on-disk cgroup/veth/
+/// hostname). The per-volume scope ([`compute_volume_scope`]) uses an injective `@` join
+/// instead, since it is new and data-at-rest keying must not alias across tenants.
 pub fn compute_instance_id(project: &str, workload: &str, replica: u32) -> String {
     if project.is_empty() || project == crate::project::DEFAULT_PROJECT {
         format!("{workload}-{replica}")
     } else {
         format!("{project}-{workload}-{replica}")
+    }
+}
+
+/// The **per-(project, workload) scope** a backend keys a persistent volume's host
+/// backing directory under, so two co-located workloads that name a volume identically
+/// never collide on one host directory. It identifies `(project, workload)` (a volume
+/// persists across a workload's replicas, so no replica ordinal): the bare `<workload>` for
+/// the reserved `default` project (and for an empty project string — a not-yet-backfilled
+/// legacy handle — treated as `default`), and `<project>@<workload>` for a non-`default`
+/// project.
+///
+/// The join uses `@`, NOT `-`, and this is load-bearing: `@` is outside the resource-slug
+/// alphabet (`[A-Za-z0-9_-]`) that both components are drawn from, so the join is INJECTIVE —
+/// distinct `(project, workload)` pairs always map to distinct scopes. A `-` join is not
+/// (`("a","b-c")` and `("a-b","c")` would both give `a-b-c`), which would reopen the very
+/// cross-tenant collision this closes for crafted multi-project names. `@` also keeps a
+/// non-`default` scope disjoint from every bare-`default` scope (which, being a lone slug,
+/// never contains `@`). The scope is a single, filesystem-safe path component accepted by the
+/// backend's `validate_volume_scope`.
+///
+/// Closing a cross-tenant collision: every managed database is handed a volume literally
+/// named `"data"` (see [`managed_db_spec`]) and the native container backend used to back
+/// it at `<data_dir>/compute/volumes/data` keyed by that bare name alone — so two
+/// co-located managed DBs (a control-plane DB and a default-project DB, two shared servers,
+/// …) shared ONE PGDATA on disk. Keying the backing directory by this scope gives each
+/// `(project, workload)` its own directory. The bare `default` form keeps existing
+/// default-project deployments byte-identical on disk, mirroring the managed-volume/credential
+/// naming.
+pub fn compute_volume_scope(project: &str, workload: &str) -> String {
+    if project.is_empty() || project == crate::project::DEFAULT_PROJECT {
+        workload.to_string()
+    } else {
+        format!("{project}@{workload}")
     }
 }
 
@@ -339,9 +379,21 @@ pub trait ComputeBackend: Send + Sync {
     /// What this backend can do here (used by the scheduler + policy gate).
     fn capabilities(&self) -> Capabilities;
 
-    /// Stage `spec`'s artifact into whatever this backend boots from.
-    /// Idempotent + content-addressed (cache/dedup by spec id).
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError>;
+    /// Stage `spec`'s artifact into whatever this backend boots from, for the replica
+    /// identified by `(project, workload)`. Idempotent + content-addressed (cache/dedup by
+    /// spec id). The identity is threaded in so a backend that backs persistent volumes on
+    /// local disk (the native `container` backend) can key each volume's backing directory
+    /// by the collision-free [`compute_volume_scope`] — the SAME identity its container
+    /// id/cgroup/veth already use — closing the cross-tenant collision where two co-located
+    /// workloads that name a volume identically (every managed DB's `"data"`) shared one
+    /// host directory. A backend that delegates storage (cloudflare/docker) or derives
+    /// nothing from the volume ignores the identity.
+    async fn materialize(
+        &self,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError>;
 
     /// **Adopt** the guest IPs already assigned to persisted/running replicas of
     /// this backend, so a fresh-on-boot IP pool reflects addresses in use before it
@@ -491,8 +543,29 @@ pub trait ComputeBackend: Send + Sync {
     /// this read. The reconcile calls it only while a managed replica is up-but-not-
     /// answering, and `db status` surfaces the result so an operator can tell a
     /// data-dir-ownership stall from a slow init — the signal `/api/repair` cannot give.
-    async fn data_dir_ownership(&self, _spec: &ComputeSpec) -> Option<DataDirOwnership> {
+    async fn data_dir_ownership(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _spec: &ComputeSpec,
+    ) -> Option<DataDirOwnership> {
         None
+    }
+
+    /// **Node-authorized bulk migration** of managed-tenant legacy volume directories into the
+    /// per-`(project, workload)` scoped layout (the proactive counterpart to the launch-time
+    /// adoption). The node passes the `authorized` triples `(project, workload, volume_name)` it
+    /// derived ENTIRELY from its OWN trusted control-plane state — never from a workload spec —
+    /// so this safely migrates the digest-named managed-`Single` tenant directories that the
+    /// launch-time path (correctly) REFUSES to adopt from an untrusted spec. For each triple
+    /// whose legacy flat directory exists and whose scoped directory does not, a backend that
+    /// backs on-node volumes performs the SAME atomic, refuse-on-exist rename as the launch path
+    /// (bytes + ownership preserved, read-as-is; never a copy/chown/merge/delete). Idempotent
+    /// (re-run safe: an already-scoped directory is skipped), and it touches ONLY the directories
+    /// named by `authorized`. Backends that delegate storage default to a no-op. Returns the
+    /// number of directories migrated.
+    async fn migrate_legacy_volumes(&self, _authorized: &[(String, String, String)]) -> usize {
+        0
     }
 }
 
@@ -1754,7 +1827,9 @@ pub async fn reconcile_once(
                     crate::time::now_unix(),
                     u64::from(spec.startup_grace_secs),
                 ) {
-                    backend.data_dir_ownership(&spec).await
+                    backend
+                        .data_dir_ownership(&project_name, &state.handle.workload, &spec)
+                        .await
                 } else {
                     None
                 };
@@ -2130,7 +2205,7 @@ async fn launch_one(
     // The launch wall-clock time, so the next reconcile tick can grant this replica a
     // startup grace before treating it as a broken launch (see `reconcile_plan`).
     let started_at = crate::time::now_unix();
-    let artifact = backend.materialize(spec).await?;
+    let artifact = backend.materialize(project, workload, spec).await?;
     // Fold the resolved binding env into the launched spec. The workload's own env
     // wins on a collision, so a hand-set value is never clobbered by a binding.
     let mut spec = spec.clone();
@@ -2307,6 +2382,44 @@ mod tests {
             compute_instance_id("acme", "web", 0),
             compute_instance_id("default", "web", 0)
         );
+    }
+
+    #[test]
+    fn compute_volume_scope_is_injective_over_project_and_workload() {
+        // Bare `<workload>` for the default project (and an empty/legacy project);
+        // `<project>@<workload>` otherwise — an `@` join, outside the slug alphabet.
+        assert_eq!(compute_volume_scope("default", "pg"), "pg");
+        assert_eq!(compute_volume_scope("", "pg"), "pg");
+        assert_eq!(compute_volume_scope("acme", "pg"), "acme@pg");
+
+        // The collision the scope closes: two co-located DEFAULT-project managed DBs — each
+        // handed the bare volume name `"data"` — used to share one backing dir; keyed by the
+        // workload they are now DISTINCT.
+        assert_ne!(
+            compute_volume_scope("default", "pg"),
+            compute_volume_scope("default", "control"),
+            "two default-project managed DBs must get distinct volume scopes"
+        );
+        // Two projects' same-named workloads never collide, and never collide with the bare
+        // default form.
+        assert_ne!(
+            compute_volume_scope("acme", "pg"),
+            compute_volume_scope("beta", "pg")
+        );
+        assert_ne!(
+            compute_volume_scope("acme", "pg"),
+            compute_volume_scope("default", "pg")
+        );
+        // INJECTIVE even for crafted names with interior `-`: a `-` join would alias
+        // ("a","b-c") with ("a-b","c"); the `@` join keeps them distinct (the bug a `-`
+        // join would reopen).
+        assert_ne!(
+            compute_volume_scope("a", "b-c"),
+            compute_volume_scope("a-b", "c"),
+            "the @ join must be injective where a - join is not"
+        );
+        assert_eq!(compute_volume_scope("a", "b-c"), "a@b-c");
+        assert_eq!(compute_volume_scope("a-b", "c"), "a-b@c");
     }
 
     #[test]
@@ -3288,7 +3401,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
             })
@@ -3336,7 +3454,7 @@ mod tests {
         let backend: Box<dyn ComputeBackend> = Box::new(FakeBackend);
         assert_eq!(backend.id(), "fake");
         let s = spec(1, 128);
-        let artifact = backend.materialize(&s).await.unwrap();
+        let artifact = backend.materialize("default", "fake", &s).await.unwrap();
         let inst = backend
             .launch(&LaunchRequest {
                 project: "default".into(),
@@ -3373,7 +3491,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
             })
@@ -3540,7 +3663,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
             })
@@ -3818,7 +3946,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
             })

@@ -152,7 +152,7 @@ async fn container_live_launch_and_hold() {
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
     let artifact = backend
-        .materialize(&spec)
+        .materialize("default", "clive", &spec)
         .await
         .expect("materialize rootfs");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
@@ -271,7 +271,7 @@ async fn run_pg_e2e(host_root: bool) {
         .insert("POSTGRES_DB".to_string(), "app".to_string());
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize("default", &format!("cpg{tag}"), &spec)
         .await
         .expect("materialize (pull) pgvector image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
@@ -400,7 +400,7 @@ async fn launch_managed_pg(
     wl: &str,
 ) -> boatramp_core::compute::Instance {
     let artifact = backend
-        .materialize(spec)
+        .materialize("default", wl, spec)
         .await
         .expect("materialize (pull) pgvector image");
     let req = LaunchRequest {
@@ -514,7 +514,13 @@ async fn container_live_postgres_reused_volume_preserves_data_on_euid_root() {
     assert!(wrote, "seed: write the sentinel row (out: {out})");
     let _ = seed.stop(&inst.handle).await;
 
-    let vol = data_dir.join("compute").join("volumes").join("data");
+    // The backing dir is now keyed by the per-(project, workload) scope: default project +
+    // workload "cpgreuse" ⇒ `<volumes>/cpgreuse/data`.
+    let vol = data_dir
+        .join("compute")
+        .join("volumes")
+        .join("@cpgreuse")
+        .join("data");
     let sample = vol.join("PG_VERSION");
     assert!(sample.exists(), "seed produced a real cluster data dir");
 
@@ -590,6 +596,360 @@ async fn container_live_postgres_reused_volume_preserves_data_on_euid_root() {
         "reused-volume data preservation OK: detected runtime uid 999, derived base 200000, \
          Postgres read its cluster as-is, sentinel survived, ownership left at 200999, \
          no-regress relaunch"
+    );
+}
+
+/// **Cross-tenant volume-collision fix (the CRITICAL defect).** TWO co-located managed
+/// Postgres workloads — modeling the Provisor's `default` DB and its `control` DB — are
+/// each handed the bare volume name `"data"` (the managed-DB synthesizer's default). Before
+/// the fix the container backend keyed a volume's backing dir by that bare name alone, so
+/// BOTH mounted the SAME host directory `<data_dir>/compute/volumes/data`: the second
+/// Postgres either crash-loops on the first's cluster (fail-closed DoS, the observed shape)
+/// or, worse, serves the neighbor's data (fail-open cross-tenant disclosure / two postmasters
+/// on one PGDATA → corruption). The fix keys the backing dir by the collision-free
+/// `(project, workload)` scope, so each DB gets its OWN cluster.
+///
+/// This is a TRUE multi-tenant fixture (two DISTINCT clusters, each with its own sentinel
+/// row) proving ZERO cross-read. **Mutation-sensitive**: neuter the scope (make
+/// `compute_volume_scope`/`scoped_volume_dir` ignore the workload) and both DBs collapse onto
+/// `<volumes>/data` again — the second either fails to come up (the `_up` assert fires) or
+/// reads the first's `sentinel` row (the cross-read assert fires). Needs Linux + root + a
+/// bridge + psql; pulls pgvector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_colocated_managed_dbs_get_isolated_volumes() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_colocated_managed_dbs: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-colo-{}", std::process::id()));
+    let pw = "s3cr3t-pw";
+    let spec = managed_pg_spec(pw); // the bare `"data"` volume, exactly as shipped
+
+    // ONE node-global backend (data_dir shared across workloads), exactly like the node builds
+    // it. Both managed DBs run under the reserved `default` project (the Provisor's posture).
+    let backend = ContainerBackend::new(
+        Arc::new(FileBlob(Vec::new())),
+        data_dir.clone(),
+        bridge.clone(),
+        &subnet,
+        PathBuf::from(&bin),
+    )
+    .expect("backend");
+
+    // Launch BOTH co-located managed DBs, each requesting the bare `"data"` volume.
+    let pg = launch_managed_pg(&backend, &spec, "pg").await;
+    let control = launch_managed_pg(&backend, &spec, "control").await;
+    let (pg_host, pg_port) = (pg.endpoint.host.clone(), pg.endpoint.port);
+    let (ct_host, ct_port) = (control.endpoint.host.clone(), control.endpoint.port);
+
+    // Both come up healthy, side by side (pre-fix the second collided on the first's cluster
+    // and either crash-looped or served the neighbor's data). `pg_answers` polls until each
+    // has finished `initdb` and is answering, so the on-disk cluster assertions below are not
+    // racing a still-initializing container.
+    let pg_up = pg_answers(&pg_host, pg_port, pw);
+    let ct_up = pg_answers(&ct_host, ct_port, pw);
+    assert!(pg_up, "pg must be healthy");
+    assert!(
+        ct_up,
+        "control must be healthy co-located with pg (no collision)"
+    );
+
+    // Each landed on its OWN per-(project, workload) scoped backing dir; the legacy flat
+    // shared dir was never created.
+    let pg_dir = data_dir.join("compute/volumes/@pg/data");
+    let ct_dir = data_dir.join("compute/volumes/@control/data");
+    let legacy = data_dir.join("compute/volumes/data");
+    assert!(
+        pg_dir.join("PG_VERSION").exists(),
+        "pg got its own cluster dir"
+    );
+    assert!(
+        ct_dir.join("PG_VERSION").exists(),
+        "control got its own cluster dir"
+    );
+    assert!(
+        !legacy.exists(),
+        "the collision-prone flat <volumes>/data must NOT be used anymore"
+    );
+    assert_ne!(pg_dir, ct_dir, "distinct backing dirs");
+
+    // Seed a DISTINCT sentinel in each, then prove ZERO cross-read: each DB sees ONLY its own.
+    let (w1, o1) = psql_exec(
+        &pg_host,
+        pg_port,
+        pw,
+        "create table sentinel(v text); insert into sentinel values('PG-SENTINEL')",
+    );
+    assert!(w1, "seed pg sentinel (out: {o1})");
+    let (w2, o2) = psql_exec(
+        &ct_host,
+        ct_port,
+        pw,
+        "create table sentinel(v text); insert into sentinel values('CONTROL-SENTINEL')",
+    );
+    assert!(w2, "seed control sentinel (out: {o2})");
+
+    let (_, pg_read) = psql_exec(
+        &pg_host,
+        pg_port,
+        pw,
+        "select string_agg(v, ',') from sentinel",
+    );
+    let (_, ct_read) = psql_exec(
+        &ct_host,
+        ct_port,
+        pw,
+        "select string_agg(v, ',') from sentinel",
+    );
+    let _ = backend.stop(&pg.handle).await;
+    let _ = backend.stop(&control.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    assert_eq!(
+        pg_read.trim(),
+        "PG-SENTINEL",
+        "pg must see ONLY its own row — never control's (cross-tenant read)"
+    );
+    assert_eq!(
+        ct_read.trim(),
+        "CONTROL-SENTINEL",
+        "control must see ONLY its own row — never pg's (cross-tenant read)"
+    );
+    eprintln!(
+        "colocated isolation OK: pg→{pg_dir:?} control→{ct_dir:?}, both healthy, zero cross-read"
+    );
+}
+
+/// **Legacy single-claimant adoption + fail-closed refuse.** On upgrade, an existing
+/// deployment holds a managed cluster at the pre-fix bare `<volumes>/data`. EXACTLY ONE
+/// workload — the proven owner — adopts it (data preserved, read AS-IS via the derive-base
+/// repair); every other co-located DB gets a FRESH dir and NEVER touches the shared one; and
+/// when the owner is NOT proven, the launch fails closed rather than fresh-initializing over a
+/// neighbor's cluster. Drives real pgvector clusters. Needs Linux + root + a bridge + psql.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_legacy_data_volume_adopted_only_by_the_claimant() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_legacy_data_adoption: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-legacy-{}", std::process::id()));
+    let pw = "s3cr3t-pw";
+    let spec = managed_pg_spec(pw);
+    let mk = || {
+        ContainerBackend::new(
+            Arc::new(FileBlob(Vec::new())),
+            data_dir.clone(),
+            bridge.clone(),
+            &subnet,
+            PathBuf::from(&bin),
+        )
+        .expect("backend")
+    };
+    let legacy = data_dir.join("compute/volumes/data");
+
+    // 1) Seed a real cluster as "pg", write a SENTINEL row, then MOVE it to the pre-fix flat
+    //    `<volumes>/data` to model an upgraded deployment (an atomic rename preserves ownership).
+    {
+        let b = mk();
+        let inst = launch_managed_pg(&b, &spec, "pg").await;
+        let (h, p) = (inst.endpoint.host.clone(), inst.endpoint.port);
+        assert!(pg_answers(&h, p, pw), "seed cluster must answer");
+        let (w, o) = psql_exec(
+            &h,
+            p,
+            pw,
+            "create table sentinel(v text); insert into sentinel values('LEGACY-OWNER')",
+        );
+        assert!(w, "seed the legacy sentinel (out: {o})");
+        let _ = b.stop(&inst.handle).await;
+    }
+    let scoped_pg = data_dir.join("compute/volumes/@pg/data");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(&scoped_pg, &legacy).expect("stage the legacy flat <volumes>/data");
+    // pg's scope dir is now empty; remove it so the adoption path (scoped dir absent) engages.
+    let _ = std::fs::remove_dir_all(data_dir.join("compute/volumes/@pg"));
+    assert!(
+        legacy.join("PG_VERSION").exists(),
+        "legacy flat cluster staged"
+    );
+
+    // 2) The PROVEN claimant ("default"/"pg") adopts the legacy dir (atomic rename, read as-is).
+    let claimant = mk().with_legacy_data_claimant(Some(("default".into(), "pg".into())));
+    let inst = launch_managed_pg(&claimant, &spec, "pg").await;
+    let (h, p) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let pg_up = pg_answers(&h, p, pw);
+    let (_, read) = psql_exec(&h, p, pw, "select string_agg(v, ',') from sentinel");
+    let _ = claimant.stop(&inst.handle).await;
+    assert!(pg_up, "the claimant must come up on the adopted cluster");
+    assert_eq!(
+        read.trim(),
+        "LEGACY-OWNER",
+        "the claimant adopted the legacy cluster AS-IS — the owner's data is preserved"
+    );
+    assert!(
+        !legacy.exists(),
+        "the legacy flat dir was migrated away (atomic rename, not a copy)"
+    );
+    assert!(
+        scoped_pg.join("PG_VERSION").exists(),
+        "the data now lives under the claimant's scoped dir"
+    );
+
+    // 3) A co-located NON-claimant ("control") gets a FRESH cluster and never sees the owner's
+    //    data (the legacy dir is already adopted/gone, so it simply fresh-inits in its own scope).
+    let inst = launch_managed_pg(&claimant, &spec, "control").await;
+    let (h, p) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let ct_up = pg_answers(&h, p, pw);
+    let (cross_ok, cross) = psql_exec(&h, p, pw, "select v from sentinel");
+    let _ = claimant.stop(&inst.handle).await;
+    assert!(ct_up, "the non-claimant must come up on a FRESH cluster");
+    assert!(
+        !(cross_ok && cross.trim() == "LEGACY-OWNER"),
+        "the non-claimant must NOT see the owner's data (fresh cluster has no `sentinel` table)"
+    );
+    assert!(
+        data_dir
+            .join("compute/volumes/@control/data/PG_VERSION")
+            .exists(),
+        "the non-claimant got its own scoped dir"
+    );
+
+    // 4) REFUSE-ON-UNPROVEN: re-stage a legacy flat dir and launch a NOT-YET-MIGRATED managed
+    //    DB ("analytics") with NO proven owner (claimant = None) → the launch FAILS CLOSED, the
+    //    legacy data untouched. (A fresh workload name whose scoped dir does not yet exist, so
+    //    the adoption path actually engages rather than skipping an already-migrated dir.)
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("PG_VERSION"), "16").unwrap();
+    std::fs::write(legacy.join("marker"), "OWNER-DATA").unwrap();
+    let ambiguous = mk(); // claimant: None
+    let refused = ambiguous.materialize("default", "analytics", &spec).await;
+    assert!(
+        refused.is_err(),
+        "with no proven owner, a managed DB must refuse to launch over an unclaimed legacy dir"
+    );
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("marker")).unwrap(),
+        "OWNER-DATA",
+        "the refusal left the legacy data byte-for-byte in place"
+    );
+    let _ = std::fs::remove_dir_all(&data_dir);
+    eprintln!("legacy single-claimant adoption + refuse-on-unproven OK");
+}
+
+/// **F4 node-side bulk migration — the ENV-configured turnkey recovery topology.** The mainline
+/// deployment runs a NODE-DEFAULT managed pg (workload `pg`, DEFAULT project) that owns the
+/// historical bare `<volumes>/data` cluster, with a co-located applied `control` DB (no data) that
+/// also collided on it — and NO node-static `[databases]` config / NO `adopt_legacy_data_volume`
+/// flag. The node recognizes the node-default pg as the trusted claimant and F4 proactively
+/// migrates its cluster into `<volumes>/@pg/data` BEFORE launch, so the working pg comes up with
+/// its data preserved and the declared `control` gets a FRESH scoped dir — both healthy, zero
+/// cross-read. This drives F4's backend migration (`migrate_legacy_volumes`) on real pgvector
+/// clusters with the exact (project, workload, volume) triple the node computes. Mutation-
+/// sensitive: skip the migration and pg fails closed on the unadopted `<volumes>/data`. Needs
+/// Linux + root + a bridge + psql.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_f4_node_default_pg_adopts_data_colocated_control_fresh() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_f4_node_default_pg: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-f4-{}", std::process::id()));
+    let pw = "s3cr3t-pw";
+    let spec = managed_pg_spec(pw);
+    let mk = || {
+        ContainerBackend::new(
+            Arc::new(FileBlob(Vec::new())),
+            data_dir.clone(),
+            bridge.clone(),
+            &subnet,
+            PathBuf::from(&bin),
+        )
+        .expect("backend")
+    };
+    let legacy = data_dir.join("compute/volumes/data");
+
+    // 1) Seed the node-default pg's cluster + a SENTINEL, then stage it at the pre-fix flat
+    //    `<volumes>/data` (model the historical turnkey on-disk state).
+    {
+        let b = mk();
+        let inst = launch_managed_pg(&b, &spec, "pg").await;
+        let (h, p) = (inst.endpoint.host.clone(), inst.endpoint.port);
+        assert!(pg_answers(&h, p, pw), "seed cluster answers");
+        let (w, o) = psql_exec(
+            &h,
+            p,
+            pw,
+            "create table sentinel(v text); insert into sentinel values('PROVISOR')",
+        );
+        assert!(w, "seed the node-default pg sentinel (out: {o})");
+        let _ = b.stop(&inst.handle).await;
+    }
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(data_dir.join("compute/volumes/@pg/data"), &legacy)
+        .expect("stage the legacy flat <volumes>/data");
+    let _ = std::fs::remove_dir_all(data_dir.join("compute/volumes/@pg"));
+    assert!(
+        legacy.join("PG_VERSION").exists(),
+        "legacy flat cluster staged"
+    );
+
+    // 2) F4: the node computes the node-trusted authorized set (node-default pg owns `data`) and
+    //    the backend migrates it into the scoped layout BEFORE launch — no config flag involved.
+    let backend = mk();
+    let authorized = vec![("default".to_string(), "pg".to_string(), "data".to_string())];
+    assert_eq!(
+        backend.migrate_legacy_volumes(&authorized).await,
+        1,
+        "F4 migrated the node-default pg's legacy `data` cluster"
+    );
+    assert!(!legacy.exists(), "legacy flat dir migrated away");
+    assert!(
+        data_dir
+            .join("compute/volumes/@pg/data/PG_VERSION")
+            .exists()
+    );
+
+    // 3) The node-default pg launches on the ADOPTED cluster (data preserved, read as-is).
+    let inst = launch_managed_pg(&backend, &spec, "pg").await;
+    let (pg_h, pg_p) = (inst.endpoint.host.clone(), inst.endpoint.port);
+    let pg_up = pg_answers(&pg_h, pg_p, pw);
+    let (_, pg_read) = psql_exec(&pg_h, pg_p, pw, "select string_agg(v, ',') from sentinel");
+
+    // 4) The co-located declared `control` gets a FRESH scoped dir (the legacy `data` is gone) —
+    //    healthy, and it CANNOT see the node-default pg's data.
+    let ctrl = launch_managed_pg(&backend, &spec, "control").await;
+    let (ct_h, ct_p) = (ctrl.endpoint.host.clone(), ctrl.endpoint.port);
+    let ct_up = pg_answers(&ct_h, ct_p, pw);
+    let (cross_ok, cross) = psql_exec(&ct_h, ct_p, pw, "select v from sentinel");
+    let _ = backend.stop(&inst.handle).await;
+    let _ = backend.stop(&ctrl.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    assert!(pg_up, "the node-default pg came up on its adopted cluster");
+    assert_eq!(
+        pg_read.trim(),
+        "PROVISOR",
+        "the node-default pg's data is preserved, read as-is"
+    );
+    assert!(
+        ct_up,
+        "the co-located declared `control` came up on a FRESH scoped dir"
+    );
+    assert!(
+        !(cross_ok && cross.trim() == "PROVISOR"),
+        "the declared `control` must NOT see the node-default pg's data (zero cross-read)"
+    );
+    eprintln!(
+        "F4 turnkey OK: node-default pg adopted <volumes>/data, control fresh, zero cross-read"
     );
 }
 
@@ -697,7 +1057,13 @@ async fn container_diag_reused_volume_mapping() {
         .expect("backend")
     };
 
-    let vol = data_dir.join("compute").join("volumes").join("data");
+    // Backing dir keyed by the per-(project, workload) scope: default project + workload
+    // "diag" ⇒ `<volumes>/diag/data`.
+    let vol = data_dir
+        .join("compute")
+        .join("volumes")
+        .join("@diag")
+        .join("data");
 
     // Phase A: fresh init under the current mapping; insert a sentinel.
     let b = mk();
@@ -827,7 +1193,10 @@ async fn container_criu_roundtrip() {
 
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
-    let artifact = backend.materialize(&spec).await.expect("materialize");
+    let artifact = backend
+        .materialize("default", "ccriu", &spec)
+        .await
+        .expect("materialize");
     let req = LaunchRequest {
         project: "default".into(),
         workload: "ccriu".into(),
@@ -903,7 +1272,10 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
 
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
-    let artifact = backend.materialize(&spec).await.expect("materialize");
+    let artifact = backend
+        .materialize("default", "cexec", &spec)
+        .await
+        .expect("materialize");
     let req = LaunchRequest {
         project: "default".into(),
         workload: "cexec".into(),

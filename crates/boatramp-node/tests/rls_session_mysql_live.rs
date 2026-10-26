@@ -239,7 +239,7 @@ async fn rls_session_guard_holds_live_mysql() {
         .insert("MYSQL_DATABASE".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize(DEFAULT_PROJECT, COMPUTE, &spec)
         .await
         .expect("materialize (pull) mysql image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));

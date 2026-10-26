@@ -525,6 +525,20 @@ impl ServerConfig {
                     cure: " — rename the `compute` workload to not start with `bramp-db-`",
                 });
             }
+            // The `compute` value becomes the workload name, which keys the container
+            // id/cgroup/veth AND the per-(project, workload) volume-scope directory. Slug-validate
+            // it through the one canonical checker so it can never carry a `/`, `..`, or other
+            // path-unsafe byte into a derived filesystem path (defense in depth — fail-closed at
+            // boot).
+            if let Some(compute) = db.compute.as_deref().filter(|c| !c.is_empty())
+                && let Err(err) = boatramp_core::project::validate_resource_name("compute", compute)
+            {
+                return Err(ConfigError::InvalidDbName {
+                    name: err.value,
+                    reason: err.reason,
+                    cure: boatramp_core::project::INVALID_NAME_CURE,
+                });
+            }
         }
         Ok(())
     }
@@ -1835,6 +1849,29 @@ pub struct ExternalDatabaseConfig {
     /// When set it overrides the engine default the synthesizer picks (Postgres 60,
     /// MySQL 120). Omit to use that default. Ignored for a bring-your-own database.
     pub startup_grace_secs: Option<u32>,
+    /// **One-time migration designation** (default `false`): mark THIS binding as the owner
+    /// of the pre-v0.46 shared legacy data volume. Before co-located managed databases keyed
+    /// their on-disk data directory per `(project, workload)`, EVERY default-project / shared
+    /// managed DB shared one bare `<data_dir>/compute/volumes/data` directory. On upgrade the
+    /// container backend adopts that legacy directory into the owning workload's per-workload
+    /// scoped directory by an atomic, data-preserving rename. When **exactly one** managed DB
+    /// is configured, it is the unambiguous owner and no flag is needed. When **two or more**
+    /// co-located managed DBs exist, boatramp cannot prove from disk which one initialized the
+    /// shared cluster, so it **fails closed** (refuses to launch them, leaving the data
+    /// untouched) until an operator sets this flag on the ONE binding whose data lives there.
+    /// Set it on at most one binding; setting it on two is itself ambiguous (fail closed).
+    /// Ignored for a bring-your-own (`url_env`) database and once the volume is migrated.
+    ///
+    /// **Upgrade constraint (v0.46):** the legacy-data owner is inferred from the managed
+    /// `databases` bindings present at boot, so do NOT remove or rename a managed `databases`
+    /// binding across the upgrade that first scopes volumes — if the removed/renamed binding
+    /// owned the shared `data` cluster, the surviving binding could auto-adopt a cluster that
+    /// is not its own (fail-closed in practice: a per-(project, workload) sealed credential
+    /// will not authenticate against a foreign cluster's roles, so the DB comes up unusable
+    /// rather than leaking). If you must change bindings during that upgrade, set this flag on
+    /// the ONE binding that owns the on-disk cluster so adoption is explicit.
+    #[serde(default)]
+    pub adopt_legacy_data_volume: bool,
     /// **Opt-in** (default `false`): enable row-level change capture on this **managed
     /// co-located** database so it can source a delta export's SQL true-delta (Postgres
     /// logical WAL / MySQL binlog). Flips `wal_level=logical` / `--log-bin` in the launch

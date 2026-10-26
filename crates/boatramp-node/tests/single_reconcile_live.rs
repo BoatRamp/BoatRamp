@@ -536,7 +536,7 @@ async fn launch_from_registered_spec(
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize("default", &workload.name, &spec)
         .await
         .map_err(|e| format!("materialize (pull) image: {e}"))?;
     if !matches!(artifact, Artifact::Rootfs { .. }) {
@@ -548,14 +548,20 @@ async fn launch_from_registered_spec(
         .await
         .map_err(|e| format!("store staged spec: {e}"))?;
 
-    // Confirm the per-tenant volume dir exists (the v0.3.11/v0.3.12 per-tenant volume;
-    // relaunches reuse it, so initdb is skipped on the second reconcile).
+    // Confirm the per-tenant volume dir exists. The backing dir is now keyed per
+    // `(project, workload)` scope (`<volumes>/<scope>/<name>`), closing the cross-tenant
+    // collision; relaunches reuse it, so initdb is skipped on the second reconcile.
     let vol_name = spec
         .volumes
         .first()
         .map(|v| v.name.clone())
         .ok_or_else(|| "managed Single spec must carry a data volume".to_string())?;
-    let vol_dir = data_dir.join("compute").join("volumes").join(&vol_name);
+    let scope = boatramp_core::compute::compute_volume_scope("default", &workload.name);
+    let vol_dir = data_dir
+        .join("compute")
+        .join("volumes")
+        .join(format!("@{scope}"))
+        .join(&vol_name);
 
     let req = LaunchRequest {
         project: "default".into(),

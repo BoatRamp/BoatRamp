@@ -447,6 +447,37 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Compute reconcile loop. Single-node is always the "leader". Backends are
     // built from the `[compute]` config + capability detection; a no-op when none
     // are registered. Detached for the server's life.
+    // Decide which single workload (if any) may adopt the pre-v0.46 shared legacy `data`
+    // volume on this node, from the `databases` config — so the container backend migrates a
+    // reused deployment's managed-DB data into the per-(project, workload) scoped layout
+    // safely and a non-owner fails closed. `None` when there is no managed DB or ownership is
+    // ambiguous (≥2 co-located managed DBs, none designated via `adopt_legacy_data_volume`).
+    // The node-trusted legacy-`data` claimant (+ a credential probe reused by the F4 migration
+    // below). Computed from the node's OWN config + control-plane records (the deploy store),
+    // NEVER a workload spec — so it recognizes the node-default (turnkey) managed pg as the owner
+    // of the bare `<volumes>/data` cluster even when the `databases` config is EMPTY (the common
+    // ENV-configured turnkey deployment). Needs the `[secrets]` envelope that seals managed-DB
+    // credentials; without it there are no managed DBs, so the claimant is `None`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let (legacy_data_claimant, f4_creds) = match secrets_envelope.clone() {
+        Some(envelope) => {
+            let creds =
+                crate::managed_sql::ManagedSqlCredentials::new(secrets_kv.clone(), envelope);
+            let empty = std::collections::BTreeMap::new();
+            let databases = config
+                .handlers
+                .as_ref()
+                .and_then(|h| h.bindings.sql.as_ref())
+                .map(|sql| &sql.databases)
+                .unwrap_or(&empty);
+            let claimant =
+                crate::managed_sql::legacy_data_volume_claimant(databases, &deploy, &creds).await;
+            (claimant, Some(creds))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let legacy_data_claimant: Option<(String, String)> = None;
     let (compute_backends, compute_node) = crate::compute::build_compute(
         config.compute.as_ref(),
         compute_storage,
@@ -455,6 +486,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         !allow_shared_kernel,
         options.daemon_runtime.clone(),
         worker_exe.as_deref(),
+        legacy_data_claimant.clone(),
     )
     .await;
     // Adopt the IPs of already-running replicas into each backend's fresh-on-boot
@@ -465,6 +497,23 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // every persisted replica's `(workload, replica, endpoint-ip)`; each backend keeps
     // only the IPs in its own subnet (a cheap no-op for docker/cloudflare/VMM).
     crate::compute::adopt_running_replica_ips(&deploy, &compute_backends).await;
+    // F4 — node-side BULK migration of managed-tenant legacy volume dirs into the per-(project,
+    // workload) scoped layout, BEFORE the reconcile loop launches anything. Authorized ENTIRELY
+    // from node-trusted state (the deploy store + node-minted sealed credentials + the legacy-
+    // `data` claimant), never a workload spec. This proactively prevents the launch-time
+    // fail-closed for node-provisioned managed tenants on upgrade — the node-default pg adopts its
+    // `<volumes>/data` cluster, and each per-tenant Single dir moves to its scoped path — while the
+    // launch-time adoption remains the safety backstop for anything not covered here. Idempotent.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    if let Some(creds) = &f4_creds {
+        crate::managed_sql::migrate_managed_tenant_legacy_volumes(
+            &deploy,
+            creds,
+            &legacy_data_claimant,
+            &compute_backends,
+        )
+        .await;
+    }
     // Capture a run_ephemeral-capable compute backend for the project-export/import + `sql exec`
     // managed-SQL seam BEFORE `compute_backends` is consumed by the reconcile loop below (a cheap
     // `Arc` clone). Prefer the Docker-daemon backend, but FALL BACK to the native `container`

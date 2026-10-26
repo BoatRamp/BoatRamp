@@ -365,8 +365,15 @@ async fn provision_and_launch_tenant(
              every tenant mounts the SAME PGDATA"
         ));
     }
-    // The host-side backing dir the backend keys by name: `<data_dir>/compute/volumes/<name>`.
-    let vol_dir = data_dir.join("compute").join("volumes").join(&vol.name);
+    // The host-side backing dir, now keyed by the per-(project, workload) scope:
+    // `<data_dir>/compute/volumes/<scope>/<name>` (this test launches under project
+    // "default", so the scope is the bare workload name).
+    let scope = boatramp_core::compute::compute_volume_scope("default", &workload.name);
+    let vol_dir = data_dir
+        .join("compute")
+        .join("volumes")
+        .join(format!("@{scope}"))
+        .join(&vol.name);
     eprintln!(
         "[{tenant}] workload={:?} volume-name={:?} -> {vol_dir:?}  (not {SHARED_VOLUME_BUG_NAME:?})  OK",
         workload.name, vol.name
@@ -391,7 +398,7 @@ async fn provision_and_launch_tenant(
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize(&spec)
+        .materialize("default", &workload.name, &spec)
         .await
         .map_err(|e| format!("materialize (pull) image: {e}"))?;
     if !matches!(artifact, Artifact::Rootfs { .. }) {

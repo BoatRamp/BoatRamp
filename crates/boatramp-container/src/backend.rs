@@ -21,7 +21,7 @@ use boatramp_core::Storage;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, DataDirOwnership, Endpoint,
     ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RootSource, Scheme, Snapshot, VolumeInfo, compute_instance_id,
+    RootSource, Scheme, Snapshot, VolumeInfo, compute_instance_id, compute_volume_scope,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use futures::StreamExt;
@@ -182,6 +182,23 @@ fn decode_snap(s: &str) -> Option<(String, String, String, u16)> {
 /// else the host bind source escapes `data_dir`). The `mount` is joined onto the
 /// rootfs, so it must be absolute with only normal components (no `..`/`.` — else
 /// the bind target escapes the container rootfs).
+/// The bare volume name every managed database is handed ([`managed_db_spec`]'s
+/// `VolumeRef { name: "data", … }`). Before volumes were keyed per `(project, workload)`,
+/// EVERY default-project / shared managed DB backed this one name at the flat
+/// `<data_dir>/compute/volumes/data` directory — the cross-tenant collision this module
+/// closes. It is the only legacy flat name whose adoption is CONTENDED (many workloads
+/// shared it), so its migration requires a proven single claimant; any other flat name
+/// (a non-default `Single` tenant's globally-unique `<compute>-<ident>`) adopts 1:1.
+const LEGACY_SHARED_VOLUME_NAME: &str = "data";
+
+/// Prefix for a per-`(project, workload)` volume SCOPE directory
+/// (`<volumes>/@<scope>/<name>`). `@` is outside the resource-slug / `sanitize_ident`
+/// alphabet (`[A-Za-z0-9_-]`) that every volume and workload name is drawn from, so a scope
+/// directory can never collide with — and nest a scoped volume inside — a LEGACY FLAT volume
+/// dir (`<volumes>/<name>`, the migration source) that shares the same `volumes/` root. This
+/// keeps the scoped layout and the legacy flat layout in disjoint namespaces.
+const SCOPE_DIR_PREFIX: &str = "@";
+
 fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
     let name_ok = matches!(
         Path::new(name).components().collect::<Vec<_>>().as_slice(),
@@ -202,6 +219,47 @@ fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
         )));
     }
     Ok(())
+}
+
+/// Validate a spec-declared volume (its `name` + `mount`) BEFORE it is used to build any
+/// host path. This is the single choke point for both the migration
+/// ([`ContainerBackend::adopt_legacy_volumes`]) and the launch
+/// ([`ContainerBackend::stage_volumes`]) paths — each MUST call it before constructing a
+/// `volume_dir`/`scoped_volume_dir` from `name`, because the on-disk `vol.name` is otherwise
+/// unconstrained (nothing slug-checks a `ComputeSpec` volume name at ingress). It rejects:
+///  * a traversing / multi-component / absolute `name` or `mount` ([`validate_volume`]) — so a
+///    `".."` name can't escape `<volumes>/`, and
+///  * a `name` starting with the reserved scope-dir prefix `@` ([`SCOPE_DIR_PREFIX`]) — so a
+///    guest/spec can never name a volume `@<victimscope>` whose backing dir would ALIAS another
+///    workload's scope directory (a crafted-name cross-tenant transfer).
+fn validate_spec_volume(name: &str, mount: &str) -> Result<(), BackendError> {
+    validate_volume(name, mount)?;
+    if name.starts_with(SCOPE_DIR_PREFIX) {
+        return Err(BackendError::Launch(format!(
+            "invalid volume name {name:?}: the {SCOPE_DIR_PREFIX:?} prefix is reserved for \
+             per-(project, workload) volume scopes"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a volume **scope** (`<project>@<workload>` / `<workload>`) that could escape the
+/// volumes root. The scope is joined as a directory under `<data_dir>/compute/volumes/`
+/// (the parent of each scoped volume dir), so — like a volume name — it must be a single
+/// normal path component (no `/`, `..`, `.`, or absolute path). Project/workload names are
+/// validated `[a-z0-9-]` upstream, so a well-formed scope always passes; this is a
+/// defense-in-depth guard matching [`validate_volume`]'s name check.
+fn validate_volume_scope(scope: &str) -> Result<(), BackendError> {
+    if matches!(
+        Path::new(scope).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) {
+        Ok(())
+    } else {
+        Err(BackendError::Launch(format!(
+            "invalid volume scope {scope:?}: must be a single path component"
+        )))
+    }
 }
 
 /// The per-node guest-IP lifecycle: an [`IpPool`] plus the
@@ -436,6 +494,19 @@ pub struct ContainerBackend {
     /// backstop never kills legitimate work (the real unreachable-DSN hang is bounded far
     /// tighter by the client's own connect timeout). Set by [`Self::with_ephemeral_timeout`].
     ephemeral_timeout: Duration,
+    /// The ONE `(project, workload)` authorized to **adopt the legacy shared `data`
+    /// volume** — the pre-v0.46 bare `<data_dir>/compute/volumes/data` directory that every
+    /// default-project / shared managed database shared before volumes were keyed per
+    /// `(project, workload)` ([`crate::backend`] volume scope). `None` means no workload may
+    /// adopt it: either there is no legacy data, or its owner is **ambiguous** (≥2 co-located
+    /// managed DBs, none designated) and the node could not prove which one initialized the
+    /// cluster — in which case a managed DB whose own scoped volume is empty but a non-empty
+    /// legacy `data` dir still exists **fails closed** rather than fresh-initializing over an
+    /// unclaimed neighbor's cluster (see [`Self::adopt_legacy_volume_if_claimed`]). Decided
+    /// once at node boot from the `databases` config (sole managed DB ⇒ it; else the operator
+    /// `adopt_legacy_data_volume` designation; else `None`). Set by
+    /// [`Self::with_legacy_data_claimant`].
+    legacy_data_claimant: Option<(String, String)>,
 }
 
 impl ContainerBackend {
@@ -472,7 +543,19 @@ impl ContainerBackend {
             client_image_rootfs: std::collections::BTreeMap::new(),
             require_pinned_client_image: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
+            legacy_data_claimant: None,
         })
+    }
+
+    /// Authorize exactly ONE `(project, workload)` to adopt the legacy shared `data` volume
+    /// (the pre-per-workload bare `<data_dir>/compute/volumes/data` directory). The node
+    /// decides this once at boot from the `databases` config — the sole managed DB, else the
+    /// operator-designated `adopt_legacy_data_volume` binding, else `None` (ambiguous ⇒ no
+    /// adoption, fail closed). See [`legacy_data_claimant`](Self::legacy_data_claimant).
+    #[must_use]
+    pub fn with_legacy_data_claimant(mut self, claimant: Option<(String, String)>) -> Self {
+        self.legacy_data_claimant = claimant;
+        self
     }
 
     /// Require a one-shot client image to be provenance-pinned (preloaded via the air-gap map or
@@ -817,7 +900,20 @@ impl ComputeBackend for ContainerBackend {
         }
     }
 
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+    async fn materialize(
+        &self,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError> {
+        // Key this workload's persistent volumes by the collision-free `(project, workload)`
+        // scope (the SAME identity the container id/cgroup/veth use) so two co-located managed
+        // DBs never share a host directory. Migrate any reused volume from the legacy flat
+        // layout into the scoped layout FIRST — before the derive below reads the scoped dir —
+        // so the rootfs base, the userns map, and the volume all agree on the migrated data.
+        let scope = compute_volume_scope(project, workload);
+        self.adopt_legacy_volumes(project, workload, &scope, spec)
+            .await?;
         // Two rootfs sources produce a directory the worker `pivot_root`s into:
         // a **tar** blob from the shared store (staged + unpacked), or an **OCI
         // image** reference (pulled over the registry HTTP API + its layers
@@ -830,7 +926,7 @@ impl ComputeBackend for ContainerBackend {
         // rootfs's `.b<base>` path, which `launch_inner` re-asserts): the configured base
         // normally, but a per-launch base DERIVED from a REUSED volume's own owner so the rootfs,
         // the userns map, and the volume all agree and the reused data is read as-is (no chown).
-        let mapping = self.resolve_volume_mapping(spec, &probe).await?;
+        let mapping = self.resolve_volume_mapping(&scope, spec, &probe).await?;
         let dir = if mapping.base == self.userns_base {
             probe
         } else {
@@ -1277,7 +1373,12 @@ impl ComputeBackend for ContainerBackend {
     /// ownership-shifting is unavailable on this node (unprivileged — the uids aren't
     /// shifted, so an owner mismatch isn't meaningful), or when a volume's backing
     /// directory can't be scanned (not yet created / vanished — not a fault we can assert).
-    async fn data_dir_ownership(&self, spec: &ComputeSpec) -> Option<DataDirOwnership> {
+    async fn data_dir_ownership(
+        &self,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> Option<DataDirOwnership> {
         if spec.volumes.is_empty() || !can_shift_ownership() {
             return None;
         }
@@ -1290,9 +1391,17 @@ impl ComputeBackend for ContainerBackend {
         // staged rootfs to detect the runtime uid).
         let host_uid = self.userns_base + guest_uid;
         let host_gid = self.userns_base + guest_gid;
+        // Scan the per-(project, workload) SCOPED backing dir — the one the launch actually
+        // mounts — not the legacy flat path.
+        let scope = compute_volume_scope(project, workload);
         let mut clean: Option<DataDirOwnership> = None;
         for vol in &spec.volumes {
-            let dir = self.volume_dir(&vol.name);
+            // Validate the name before building a path from it (consistent with the adopt/stage
+            // choke points) — this read-only diagnostic must not scan outside the scope dir.
+            if validate_spec_volume(&vol.name, &vol.mount).is_err() {
+                continue;
+            }
+            let dir = self.scoped_volume_dir(&scope, &vol.name);
             let name = vol.name.clone();
             // The walk is blocking (a stat per entry); keep it off the reconcile's async
             // runtime. A scan error (dir not yet created / vanished mid-walk) ⇒ skip this
@@ -1326,6 +1435,70 @@ impl ComputeBackend for ContainerBackend {
         }
         clean
     }
+
+    /// Node-authorized BULK migration of managed-tenant legacy volume dirs into the scoped
+    /// layout (F4). `authorized` carries `(project, workload, volume_name)` triples the NODE
+    /// derived from its OWN trusted control-plane state (registered managed workloads gated by a
+    /// node-minted sealed credential, plus the node-trusted legacy-`data` claimant) — NEVER from
+    /// a workload spec. For each triple whose legacy flat dir exists and whose scoped dir does
+    /// not, it performs the SAME atomic, refuse-on-exist rename as the launch-time adoption
+    /// ([`Self::adopt_one_legacy_volume`]): bytes + ownership preserved, read-as-is; never a
+    /// copy/chown/merge/delete. This proactively prevents the launch-time fail-closed for
+    /// node-provisioned managed tenants (whose node-global legacy dirs the launch path cannot
+    /// adopt from an untrusted spec). Each name + scope is validated before a path is built, so a
+    /// malformed/forged triple can neither traverse nor alias a scope dir. Idempotent (an
+    /// already-scoped dir is skipped); a per-triple failure (e.g. refuse-on-exist race) is logged
+    /// and skipped so one bad triple can't block the rest — the launch-time path is the backstop.
+    async fn migrate_legacy_volumes(&self, authorized: &[(String, String, String)]) -> usize {
+        let mut migrated = 0usize;
+        for (project, workload, vol_name) in authorized {
+            // Validate the volume name (traversal + reserved-`@`-prefix) and the derived scope
+            // BEFORE building any path — defense in depth, even though these are node-derived.
+            // The mount is irrelevant to a migration, so a benign absolute placeholder is used.
+            if validate_spec_volume(vol_name, "/").is_err() {
+                continue;
+            }
+            let scope = compute_volume_scope(project, workload);
+            if validate_volume_scope(&scope).is_err() {
+                continue;
+            }
+            let scoped = self.scoped_volume_dir(&scope, vol_name);
+            // Already in the scoped layout (migrated earlier, or launch-time created): nothing to do.
+            if tokio::fs::try_exists(&scoped).await.unwrap_or(false) {
+                continue;
+            }
+            let legacy = self.volume_dir(vol_name);
+            // Nothing to carry over (absent/empty legacy dir): the workload will create its scoped
+            // dir fresh at launch.
+            if !dir_has_entries(&legacy).await {
+                continue;
+            }
+            match self
+                .adopt_one_legacy_volume(&legacy, &scoped, project, workload, vol_name)
+                .await
+            {
+                Ok(()) => migrated += 1,
+                Err(e) => tracing::warn!(
+                    target: "boatramp::repair",
+                    project,
+                    workload,
+                    volume = vol_name.as_str(),
+                    error = %e,
+                    "F4 bulk migration skipped this volume (the launch-time adoption is the \
+                     backstop); likely a concurrent migration or a pre-existing destination"
+                ),
+            }
+        }
+        if migrated > 0 {
+            tracing::info!(
+                target: "boatramp::repair",
+                migrated,
+                "F4: migrated managed-tenant legacy volume dirs into the per-(project,workload) \
+                 scoped layout (atomic rename; data + ownership preserved)"
+            );
+        }
+        migrated
+    }
 }
 
 impl ContainerBackend {
@@ -1341,10 +1514,214 @@ impl ContainerBackend {
     }
 
     /// The host backing directory for persistent volume `name`
-    /// (`<data_dir>/compute/volumes/<name>`) — keyed by volume name (not VM), so
-    /// it persists across launches/replicas.
+    /// (`<data_dir>/compute/volumes/<name>`) — the **legacy, pre-v0.46 flat layout**
+    /// keyed by volume name alone. Retained for the operator volume-reclamation surface
+    /// (`list_volumes`/`remove_volume`, which address a backing dir by its on-disk name)
+    /// and as the MIGRATION SOURCE: a reused volume written under the flat layout is
+    /// adopted into the per-`(project, workload)` scoped layout on first launch (see
+    /// [`Self::scoped_volume_dir`] / [`Self::adopt_legacy_volume_if_claimed`]). This flat
+    /// keying is exactly the cross-tenant collision the scoped layout closes — two
+    /// co-located workloads naming a volume identically (`"data"`) shared one directory —
+    /// so it is NEVER used to stage a launch anymore.
     fn volume_dir(&self, name: &str) -> PathBuf {
         self.volumes_dir().join(name)
+    }
+
+    /// The host backing directory for persistent volume `name` of the workload scoped by
+    /// `scope` (= [`compute_volume_scope`]`(project, workload)`):
+    /// `<data_dir>/compute/volumes/@<scope>/<name>`. Nesting the volume under the
+    /// `(project, workload)` scope — the SAME identity the container id / cgroup / veth / IP
+    /// use ([`compute_instance_id`]) — is what gives two co-located managed databases (each
+    /// handed the bare volume name `"data"`) their own PGDATA on disk, closing the
+    /// cross-tenant collision (fail-closed DoS / fail-open disclosure / two postmasters on
+    /// one cluster → corruption).
+    ///
+    /// The scope SEGMENT is prefixed with `@` ([`SCOPE_DIR_PREFIX`]) — a byte that never
+    /// appears in a resource-slug / `sanitize_ident` volume or workload name
+    /// (`[A-Za-z0-9_-]`) — so a scope DIRECTORY (`@<scope>`) can never coincide with a LEGACY
+    /// FLAT volume dir (`<name>`, the pre-v0.46 migration source) living in the same
+    /// `volumes/` root. Without it, a workload whose scope string equalled some other
+    /// workload's flat volume name would nest INTO that volume's data dir (data relocation /
+    /// corruption on a later adoption). `scope` is a single, filesystem-safe path component
+    /// (validated by [`validate_volume_scope`]), so the nested path has no `..`/`.`/absolute
+    /// escape.
+    fn scoped_volume_dir(&self, scope: &str, name: &str) -> PathBuf {
+        self.volumes_dir()
+            .join(format!("{SCOPE_DIR_PREFIX}{scope}"))
+            .join(name)
+    }
+
+    /// One-time, idempotent **migration** of a workload's persistent volumes from the
+    /// legacy flat layout (`<volumes>/<name>`, keyed by volume name alone) into the
+    /// per-`(project, workload)` scoped layout (`<volumes>/<scope>/<name>`). Run at the
+    /// START of both [`materialize`](ComputeBackend::materialize) and `launch_inner`, before
+    /// the userns-base derive reads the scoped dir, so the rootfs/map/volume all agree on the
+    /// migrated data end-to-end. Safe to call repeatedly: once the scoped dir exists it is a
+    /// no-op.
+    ///
+    /// Each volume's name + mount is validated FIRST ([`validate_spec_volume`]) so no `".."` or
+    /// `@<scope>` name can build a path that escapes `<volumes>/` or aliases another workload's
+    /// scope dir. Then, for each volume whose scoped dir does NOT yet exist but whose legacy
+    /// flat dir holds data:
+    /// * **the contended shared `"data"` volume** (the literal name EVERY managed DB is handed)
+    ///   — adopted ONLY by the one `(project, workload)` the NODE proved is its owner
+    ///   ([`legacy_data_claimant`](Self::legacy_data_claimant) — TRUSTED, derived from the node's
+    ///   own `databases` config, NEVER from this spec). A non-owner (generic or managed) that
+    ///   finds a non-empty legacy `data` dir **fails closed**; an ambiguous owner (`None`) fails
+    ///   every contender closed until an operator designates one. The data is left byte-for-byte
+    ///   in place.
+    /// * **ANY other (non-`"data"`) legacy flat dir** — NEVER auto-adopted from a workload spec.
+    ///   The backend cannot prove, from an UNTRUSTED spec, that this workload owns a node-global
+    ///   legacy dir: every in-spec signal — `vol.name` AND `db_user_for_spec`'s PGDATA-env /
+    ///   `postgres`-entrypoint markers — is attacker-FORGEABLE, so none may decide this tenancy
+    ///   boundary (a crafted DB-shaped spec could otherwise set `vol.name` to a victim tenant's
+    ///   digest-unique legacy dir and rename-steal it). It fails closed on ANY existing legacy
+    ///   flat dir (an empty/absent one just creates the scoped dir fresh). A node-provisioned
+    ///   managed `Single` tenant's legacy dir is migrated by an explicit operator pre-stage (or a
+    ///   node-side bulk migration — tracked follow-up), never by spec-driven adoption.
+    ///
+    /// Adoption is an **atomic, refuse-on-exist rename** — never a copy, chown, merge, or
+    /// delete: the data dir keeps its exact bytes AND its existing owner, so the derive-base
+    /// repair still reads it as-is (no re-chown of a neighbor's data into a new uid range). If
+    /// the destination already exists the rename ABORTS (never overlays two clusters into one).
+    async fn adopt_legacy_volumes(
+        &self,
+        project: &str,
+        workload: &str,
+        scope: &str,
+        spec: &ComputeSpec,
+    ) -> Result<(), BackendError> {
+        // Validate the scope as a single safe path component BEFORE any filesystem op below
+        // builds a `<volumes>/@<scope>/…` path (defense in depth; `scope` is already derived
+        // from slug-validated project/workload names).
+        validate_volume_scope(scope)?;
+        for vol in &spec.volumes {
+            // Validate the volume NAME + mount BEFORE constructing ANY path from it — the
+            // on-disk `vol.name` is otherwise unconstrained, so an unvalidated `".."` would
+            // escape `<volumes>/` and an `@<victimscope>` name would alias another workload's
+            // scope dir (the rename would then STEAL the victim's whole scope). This runs ahead
+            // of the `volume_dir`/`scoped_volume_dir` construction below.
+            validate_spec_volume(&vol.name, &vol.mount)?;
+            let scoped = self.scoped_volume_dir(scope, &vol.name);
+            // Already in the scoped layout (migrated earlier, or fresh-created by a prior
+            // launch): nothing to adopt.
+            if tokio::fs::try_exists(&scoped).await.unwrap_or(false) {
+                continue;
+            }
+            let legacy = self.volume_dir(&vol.name);
+            // No legacy data to carry over ⇒ a fresh volume; `stage_volumes` creates the
+            // scoped dir. A legacy dir that exists but holds nothing is likewise treated as
+            // fresh (we never adopt an empty shell, so a stray empty `data` can't block).
+            if !dir_has_entries(&legacy).await {
+                continue;
+            }
+            if vol.name != LEGACY_SHARED_VOLUME_NAME {
+                // ANY non-`"data"` legacy flat dir is NEVER auto-adopted from this spec. The
+                // backend cannot prove, from an UNTRUSTED spec, that this workload owns a
+                // node-global legacy dir: the only in-spec signals (`vol.name`, and
+                // `db_user_for_spec`'s PGDATA-env / `postgres`-entrypoint markers) are all
+                // attacker-FORGEABLE, so none may decide this tenancy boundary. Otherwise a
+                // crafted DB-shaped spec could set `vol.name` to a victim tenant's digest-unique
+                // legacy dir (a deterministic public function of the victim's project) and rename
+                // (steal) it — cross-tenant disclosure at rest + the owner's data orphaned. Fail
+                // closed. A node-provisioned managed `Single` tenant's legacy dir is migrated by
+                // an explicit operator pre-stage (or a node-side bulk migration — tracked
+                // follow-up), never by spec-driven adoption. (`validate_spec_volume` above already
+                // rejected a traversing / reserved-`@` name, so `scoped`/`legacy` are safe paths.)
+                return Err(BackendError::Launch(format!(
+                    "refusing to launch {project}/{workload}: a non-empty LEGACY volume exists at \
+                     {} but boatramp will not adopt a non-`data` legacy directory from a workload \
+                     spec — it cannot prove, from an untrusted spec, that this workload owns that \
+                     node-global directory (its name could be another tenant's), and guessing \
+                     could hand one tenant's data to another. Your data is left untouched. \
+                     Remedy: if this workload truly owns the directory, pre-stage it by moving {} \
+                     to {} before launch; otherwise remove the stale directory.",
+                    legacy.display(),
+                    legacy.display(),
+                    scoped.display()
+                )));
+            }
+            // The contended shared `"data"` dir (the literal name EVERY managed DB is handed):
+            // adopt ONLY if the NODE proved this `(project, workload)` is its sole owner
+            // (`legacy_data_claimant` — TRUSTED, derived from the node's own `databases` config,
+            // never from this spec). A GENERIC workload running arbitrary tenant code is never the
+            // claimant, so it can never rename the legacy MANAGED cluster (e.g. the control-plane
+            // DB) into its own scope. A non-claimant fails closed; the owner is designated via
+            // `adopt_legacy_data_volume` (or pre-stages manually).
+            let is_claimant = self
+                .legacy_data_claimant
+                .as_ref()
+                .is_some_and(|(p, w)| p == project && w == workload);
+            if !is_claimant {
+                return Err(BackendError::Launch(format!(
+                    "refusing to launch {project}/{workload}: a non-empty LEGACY shared volume \
+                     exists at {} but this workload is not its proven owner. Two or more \
+                     co-located workloads shared that directory before per-workload volume \
+                     isolation, so boatramp will not guess which one initialized the cluster \
+                     (guessing would hand one tenant's data to another). Your data is left \
+                     untouched. Remedy: set `adopt_legacy_data_volume = true` on the ONE \
+                     `databases` binding that owns this cluster and redeploy. For a workload with \
+                     no `databases` binding to designate, pre-stage it manually by moving {} to {} \
+                     before launch; or remove the stale directory if it holds no wanted data.",
+                    legacy.display(),
+                    legacy.display(),
+                    scoped.display()
+                )));
+            }
+            self.adopt_one_legacy_volume(&legacy, &scoped, project, workload, &vol.name)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Adopt a single legacy flat volume dir into its scoped location by an **atomic,
+    /// refuse-on-exist rename**. Creates the scope parent, ABORTS if the destination already
+    /// exists (never merges two clusters), then renames — preserving the data's exact bytes
+    /// and owner (no copy/chown), so the derive-base repair reads it as-is.
+    async fn adopt_one_legacy_volume(
+        &self,
+        legacy: &Path,
+        scoped: &Path,
+        project: &str,
+        workload: &str,
+        name: &str,
+    ) -> Result<(), BackendError> {
+        if let Some(parent) = scoped.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                BackendError::Launch(format!("create volume scope dir {}: {e}", parent.display()))
+            })?;
+        }
+        // Refuse-on-exist: a destination that already exists must never be overlaid/merged
+        // (that would fuse two clusters). The common idempotent case — the scoped dir already
+        // present — is handled by the caller's pre-check; reaching here with it present means a
+        // concurrent relaunch won the race, so fail closed and let the next reconcile tick (which
+        // will find the scoped dir and skip) proceed.
+        if tokio::fs::try_exists(scoped).await.unwrap_or(false) {
+            return Err(BackendError::Launch(format!(
+                "refusing to adopt legacy volume {name:?} for {project}/{workload}: destination \
+                 {} already exists (a concurrent launch migrated it); not overlaying two data \
+                 directories. Retry.",
+                scoped.display()
+            )));
+        }
+        tokio::fs::rename(legacy, scoped).await.map_err(|e| {
+            BackendError::Launch(format!(
+                "adopt legacy volume {name:?} for {project}/{workload}: rename {} -> {}: {e}",
+                legacy.display(),
+                scoped.display()
+            ))
+        })?;
+        tracing::info!(
+            target: "boatramp::repair",
+            project,
+            workload,
+            volume = name,
+            from = %legacy.display(),
+            to = %scoped.display(),
+            "migrated a managed-database volume from the legacy flat layout to the per-(project,\
+             workload) scoped layout (atomic rename; data + ownership preserved, read as-is)"
+        );
+        Ok(())
     }
 
     /// Ensure each of the spec's persistent volumes has a backing directory and
@@ -1354,6 +1731,7 @@ impl ContainerBackend {
     /// persists across restarts because it lives outside the ephemeral rootfs.
     async fn stage_volumes(
         &self,
+        scope: &str,
         spec: &ComputeSpec,
         mapping: &ResolvedMapping,
     ) -> Result<Vec<VolumeMount>, BackendError> {
@@ -1369,10 +1747,18 @@ impl ContainerBackend {
         //    REMAP of host-owned data the mapping can't express. `chown_tree_to` relabels to that
         //    host `(uid, gid)`, SKIPPING entries already correct (never a reinit — only ownership
         //    changes, never content). A remap is only ever reached as host root.
+        //
+        // The backing dir is the per-`(project, workload)` SCOPED dir
+        // (`<volumes>/<scope>/<name>`), never the legacy flat `<volumes>/<name>` — any reused
+        // flat data was already migrated into the scoped layout by `adopt_legacy_volumes`
+        // before this point.
+        validate_volume_scope(scope)?;
         let mut mounts = Vec::with_capacity(spec.volumes.len());
         for (i, vol) in spec.volumes.iter().enumerate() {
-            validate_volume(&vol.name, &vol.mount)?;
-            let dir = self.volume_dir(&vol.name);
+            // Validate name + mount + the reserved `@` prefix before building any path (the
+            // same choke point the migration uses — see [`validate_spec_volume`]).
+            validate_spec_volume(&vol.name, &vol.mount)?;
+            let dir = self.scoped_volume_dir(scope, &vol.name);
             tokio::fs::create_dir_all(&dir).await.map_err(|e| {
                 BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
             })?;
@@ -1445,12 +1831,14 @@ impl ContainerBackend {
     /// ([`Self::materialize`]) and the userns map is written with `D` ([`Self::launch_inner`]),
     /// so the mapping, the rootfs, and the volume all agree.
     ///
-    /// Scoped to this workload's OWN volume dirs (`compute/volumes/<name>`, never a sibling
-    /// tenant's on a shared host volume). The pure decision + its fail-closed guards live in
-    /// [`resolve_mapping_decision`]; this method is the I/O that feeds it (detect the runtime id
-    /// + scan each volume's owner, budget-bounded).
+    /// Scoped to this workload's OWN volume dirs — the per-`(project, workload)`
+    /// `compute/volumes/<scope>/<name>`, never a sibling tenant's (two co-located managed DBs
+    /// no longer share one `compute/volumes/data`). The pure decision + its fail-closed guards
+    /// live in [`resolve_mapping_decision`]; this method is the I/O that feeds it (detect the
+    /// runtime id + scan each volume's owner, budget-bounded).
     async fn resolve_volume_mapping(
         &self,
+        scope: &str,
         spec: &ComputeSpec,
         rootfs_dir: &Path,
     ) -> Result<ResolvedMapping, BackendError> {
@@ -1473,7 +1861,11 @@ impl ContainerBackend {
         };
         let mut volumes = Vec::with_capacity(spec.volumes.len());
         for vol in &spec.volumes {
-            let dir = self.volume_dir(&vol.name);
+            // Validate the name + mount before building a path from it — keep the guard LOCAL to
+            // this owner-scan, not dependent on `adopt_legacy_volumes` having run first (a future
+            // caller that skips adopt must not scan from an unvalidated `..`/`@scope` name).
+            validate_spec_volume(&vol.name, &vol.mount)?;
+            let dir = self.scoped_volume_dir(scope, &vol.name);
             let name = vol.name.clone();
             let consensus = tokio::task::spawn_blocking(move || {
                 crate::data_dir::scan_consistent_owner(
@@ -1508,13 +1900,16 @@ impl ContainerBackend {
             tracing::info!(
                 target: "boatramp::repair",
                 volume = name.as_str(),
+                scope,
+                scoped_path = %self.scoped_volume_dir(scope, name).display(),
                 consensus = ?consensus,
                 runtime_uid = runtime.map(|(u, _)| u),
                 runtime_gid = runtime.map(|(_, g)| g),
                 configured_base = self.userns_base,
                 chosen_base = mapping.base,
                 chown = ?chown,
-                "reused-volume mapping decision: chown=None ⇒ data read AS-IS (no chown/reinit); \
+                "reused-volume mapping decision: scoped_path is the per-(project,workload) backing \
+                 dir (collision-free); chown=None ⇒ data read AS-IS (no chown/reinit); \
                  chosen_base != configured_base ⇒ the data dir's existing owner was mapped onto the \
                  runtime uid; chown=Some ⇒ a fresh/remap volume chowned under the chosen base"
             );
@@ -1565,13 +1960,20 @@ impl ContainerBackend {
         ip: Ipv4Addr,
     ) -> Result<Instance, BackendError> {
         let (uid, gid) = spec_uid_gid(&req.spec);
+        // The per-(project, workload) volume scope (the SAME identity as `id`/cgroup/veth).
+        // Re-run the idempotent legacy-flat→scoped migration here too (a no-op once the scoped
+        // dir exists) so a launch that did not route through this process's `materialize` still
+        // adopts reused data before the derive reads it.
+        let scope = compute_volume_scope(&req.project, &req.workload);
+        self.adopt_legacy_volumes(&req.project, &req.workload, &scope, &req.spec)
+            .await?;
         // The workload's resolved userns mapping, re-resolved from the SAME staged rootfs
         // `materialize` produced (its `.b<base>` path pins the base). Re-assert the two agree:
         // if a concurrent/overlapping relaunch changed the volume's owner between materialize and
         // now, the rootfs base and the freshly-derived base could diverge (rootfs shifted for one
         // base, map/volume for another → a boot failure). Fail closed + retry instead (LOW-1).
         let mapping = self
-            .resolve_volume_mapping(&req.spec, Path::new(rootfs))
+            .resolve_volume_mapping(&scope, &req.spec, Path::new(rootfs))
             .await?;
         if let Some(staged) = parse_rootfs_base(Path::new(rootfs))
             && staged != mapping.base
@@ -1584,7 +1986,7 @@ impl ContainerBackend {
             )));
         }
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
-        plan.volumes = self.stage_volumes(&req.spec, &mapping).await?;
+        plan.volumes = self.stage_volumes(&scope, &req.spec, &mapping).await?;
         // Point the guest at boatramp's internal DNS on the bridge gateway (when the
         // resolver is enabled), scoped to this container's project so a bare peer name
         // resolves within the tenant. Written per-container by the worker (the staged
@@ -2569,6 +2971,18 @@ fn resolve_mapping_decision(
         })
         .collect();
     Ok(ResolvedMapping { base, chowns })
+}
+
+/// Whether `dir` exists and holds at least one entry — the cheap "is there data to
+/// adopt?" probe for the legacy-volume migration. A missing directory, or one that exists
+/// but is empty (a fresh/abandoned shell), is `false`: the migration never adopts an empty
+/// directory, so a stray empty legacy `data` dir can neither be mistaken for a cluster nor
+/// block a fresh managed DB. Reads only the first directory entry (no recursion).
+async fn dir_has_entries(dir: &Path) -> bool {
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut rd) => matches!(rd.next_entry().await, Ok(Some(_))),
+        Err(_) => false, // missing / unreadable ⇒ nothing to adopt
+    }
 }
 
 /// Sum the on-disk size (bytes) of every regular file under `dir`, recursively
@@ -3588,7 +4002,10 @@ mod tests {
         let hash = "d".repeat(64);
         let spec = spec_for(&hash);
 
-        let art = backend.materialize(&spec).await.expect("materialize");
+        let art = backend
+            .materialize("default", "pg", &spec)
+            .await
+            .expect("materialize");
         let dir = match &art {
             Artifact::Rootfs { dir } => PathBuf::from(dir),
             other => panic!("expected Rootfs, got {other:?}"),
@@ -3600,7 +4017,10 @@ mod tests {
         );
 
         // Idempotent: a second materialize re-uses the staged dir.
-        let art2 = backend.materialize(&spec).await.expect("materialize 2");
+        let art2 = backend
+            .materialize("default", "pg", &spec)
+            .await
+            .expect("materialize 2");
         assert_eq!(art, art2);
 
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -3626,7 +4046,10 @@ mod tests {
         let mut spec = spec_for(&"d".repeat(64));
         spec.root = RootSource::Image("pgvector/pgvector:pg16".into());
 
-        let art = backend.materialize(&spec).await.expect("materialize image");
+        let art = backend
+            .materialize("default", "pg", &spec)
+            .await
+            .expect("materialize image");
         let dir = match &art {
             Artifact::Rootfs { dir } => PathBuf::from(dir),
             other => panic!("expected Rootfs, got {other:?}"),
@@ -3653,7 +4076,7 @@ mod tests {
 
         // Idempotent: a second materialize re-uses the pulled rootfs (no re-pull).
         let art2 = backend
-            .materialize(&spec)
+            .materialize("default", "pg", &spec)
             .await
             .expect("materialize image 2");
         assert_eq!(art, art2);
@@ -3694,24 +4117,412 @@ mod tests {
             chowns: vec![None, None],
         };
         let mounts = backend
-            .stage_volumes(&spec, &mapping)
+            .stage_volumes("acme-pg", &spec, &mapping)
             .await
             .expect("stage volumes");
         assert_eq!(mounts.len(), 2);
-        // Each maps the host backing dir → the in-guest mount, and the dir exists.
+        // Each maps the host backing dir → the in-guest mount, and the dir exists. The backing
+        // dir is now nested under the per-(project, workload) SCOPE, closing the cross-tenant
+        // collision where two workloads' same-named volumes shared one flat dir.
         assert_eq!(mounts[0].mount, "/data");
-        assert!(mounts[0].source.ends_with("/compute/volumes/db"));
+        assert!(mounts[0].source.ends_with("/compute/volumes/@acme-pg/db"));
         assert!(PathBuf::from(&mounts[0].source).is_dir());
-        assert!(mounts[1].source.ends_with("/compute/volumes/cache"));
+        assert!(
+            mounts[1]
+                .source
+                .ends_with("/compute/volumes/@acme-pg/cache")
+        );
         assert!(PathBuf::from(&mounts[1].source).is_dir());
 
         // Idempotent: staging again re-uses the existing dirs.
         let again = backend
-            .stage_volumes(&spec, &mapping)
+            .stage_volumes("acme-pg", &spec, &mapping)
             .await
             .expect("stage volumes 2");
         assert_eq!(again, mounts);
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- Legacy-volume migration (the cross-tenant collision fix) -----------------------
+
+    /// Build a volume-management backend over a fresh data dir, with an optional
+    /// legacy-`data` claimant.
+    fn migration_backend(
+        data_dir: &std::path::Path,
+        claimant: Option<(&str, &str)>,
+    ) -> ContainerBackend {
+        ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.to_path_buf(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend")
+        .with_legacy_data_claimant(claimant.map(|(p, w)| (p.to_string(), w.to_string())))
+    }
+
+    /// A single-volume spec whose volume is named `vol`. `managed` makes it a managed-DB spec
+    /// (a `PGDATA` env so [`db_user_for_spec`] detects it), which the contended-`"data"`
+    /// claimant rule keys on; otherwise it is a GENERIC compute spec (a `/bin/hello`
+    /// entrypoint), for which the `"data"` volume adopts 1:1 and never fails closed.
+    fn spec_with_volume_kind(vol: &str, managed: bool) -> ComputeSpec {
+        use boatramp_core::compute::VolumeRef;
+        let mut s = spec_for(&"d".repeat(64));
+        if managed {
+            s.env
+                .insert("PGDATA".into(), "/var/lib/postgresql/data".into());
+        }
+        s.volumes = vec![VolumeRef {
+            mount: "/var/lib/postgresql/data".into(),
+            name: vol.into(),
+            size_mib: 128,
+        }];
+        s
+    }
+
+    /// A single-volume MANAGED-DB spec whose volume is named `vol`.
+    fn spec_with_volume(vol: &str) -> ComputeSpec {
+        spec_with_volume_kind(vol, true)
+    }
+
+    /// Seed a legacy flat volume dir `<volumes>/<name>` with a sentinel file; return the
+    /// sentinel's path so a test can assert it survived the migration byte-for-byte.
+    fn seed_legacy_volume(data_dir: &std::path::Path, name: &str, sentinel: &str) -> PathBuf {
+        let dir = data_dir.join("compute").join("volumes").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("PG_VERSION");
+        std::fs::write(&f, sentinel).unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn migration_db_shaped_spec_cannot_steal_a_non_data_legacy_dir() {
+        // The blocking-HIGH attack: a MANAGED/DB-shaped spec (PGDATA env ⇒ `db_user_for_spec`
+        // Some) must NOT be able to adopt a non-`"data"` node-global legacy dir by setting
+        // `vol.name` to a victim's digest-unique name. `db_user_for_spec` is attacker-forgeable,
+        // so it cannot gate this tenancy boundary — the backend adopts a non-`"data"` legacy dir
+        // from NO spec (managed-looking or not); only the node-trusted `"data"` claimant adopts.
+        // (Mutation: re-add the `else if db_user_for_spec(spec).is_none()` branch and a DB-shaped
+        // spec steals `<volumes>/pg-victim_abc`.)
+        let data_dir = unique_dir("mig-steal");
+        let backend = migration_backend(&data_dir, None);
+        // Victim tenant's EXCLUSIVE, unmigrated legacy Single dir (digest-unique name).
+        seed_legacy_volume(&data_dir, "pg-victim_abc", "VICTIM-PII");
+        // Attacker (a DIFFERENT project) crafts a DB-shaped spec naming the victim's dir.
+        let db_shaped = spec_with_volume("pg-victim_abc"); // managed shape (PGDATA env)
+        let err = backend
+            .adopt_legacy_volumes("attacker", "evil", "attacker@evil", &db_shaped)
+            .await
+            .expect_err("a DB-shaped spec must NOT adopt a non-`data` legacy dir");
+        assert!(
+            format!("{err}").contains("will not adopt a non-`data` legacy directory"),
+            "actionable fail-closed refusal, got: {err}"
+        );
+        // Victim's data is byte-untouched; the attacker got no scoped dir (nothing stolen).
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/pg-victim_abc/PG_VERSION"))
+                .unwrap(),
+            "VICTIM-PII"
+        );
+        assert!(!data_dir.join("compute/volumes/@attacker@evil").exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_adopts_shared_data_only_for_the_proven_claimant() {
+        // The contended `"data"` dir is adopted by the designated claimant...
+        let data_dir = unique_dir("mig-claim");
+        let backend = migration_backend(&data_dir, Some(("default", "pg")));
+        seed_legacy_volume(&data_dir, "data", "PROVISOR-CLUSTER");
+        let spec = spec_with_volume("data");
+
+        backend
+            .adopt_legacy_volumes("default", "pg", "pg", &spec)
+            .await
+            .expect("claimant adopts the shared data volume");
+        let scoped = data_dir.join("compute/volumes/@pg/data/PG_VERSION");
+        assert_eq!(
+            std::fs::read_to_string(&scoped).unwrap(),
+            "PROVISOR-CLUSTER",
+            "the owner's cluster is preserved under its scoped dir"
+        );
+        assert!(
+            !data_dir.join("compute/volumes/data").exists(),
+            "legacy shared dir migrated away"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_refuses_shared_data_for_a_non_claimant_and_preserves_it() {
+        // ...and a NON-owner fails closed, leaving the shared data byte-for-byte in place
+        // (this is the control-plane-colocated case: `control` must not seize `default`'s
+        // cluster). This is the mutation-sensitive invariant — neutering the claimant check
+        // would let `control` adopt a neighbor's data.
+        let data_dir = unique_dir("mig-refuse");
+        let backend = migration_backend(&data_dir, Some(("default", "pg")));
+        seed_legacy_volume(&data_dir, "data", "PROVISOR-CLUSTER");
+        let spec = spec_with_volume("data");
+
+        let err = backend
+            .adopt_legacy_volumes("default", "control", "control", &spec)
+            .await
+            .expect_err("a non-owner must fail closed, not adopt");
+        assert!(
+            format!("{err}").contains("not its proven owner"),
+            "actionable refusal, got: {err}"
+        );
+        // The owner's data is untouched; `control` got no scoped dir.
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/data/PG_VERSION")).unwrap(),
+            "PROVISOR-CLUSTER"
+        );
+        assert!(!data_dir.join("compute/volumes/@control").exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_fails_closed_for_shared_data_when_owner_is_ambiguous() {
+        // No claimant (ambiguous ⇒ `None`): EVERY contender for the shared `data` dir fails
+        // closed, so the data is never fresh-initialized over / orphaned.
+        let data_dir = unique_dir("mig-ambig");
+        let backend = migration_backend(&data_dir, None);
+        seed_legacy_volume(&data_dir, "data", "CLUSTER");
+        let spec = spec_with_volume("data");
+        for wl in ["pg", "control"] {
+            backend
+                .adopt_legacy_volumes("default", wl, wl, &spec)
+                .await
+                .expect_err("ambiguous shared data ⇒ fail closed");
+        }
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/data/PG_VERSION")).unwrap(),
+            "CLUSTER"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_generic_data_volume_fails_closed_and_cannot_steal_a_managed_cluster() {
+        // A GENERIC (non-managed-DB) compute workload that names a volume "data" must NOT be
+        // able to adopt the contended legacy `data` cluster — it runs arbitrary tenant code and
+        // is never the claimant, so adopting a legacy MANAGED cluster (e.g. the control-plane
+        // DB) would be a cross-tenant disclosure at rest + orphan the real owner. The
+        // contended-"data" rule is gated on the NAME ALONE, so this fails closed. (Mutation:
+        // re-add an `is_managed_db &&` guard and this workload would STEAL the cluster.)
+        let data_dir = unique_dir("mig-generic");
+        // Claimant is the MANAGED owner default/pg — NOT the generic workload.
+        let backend = migration_backend(&data_dir, Some(("default", "pg")));
+        seed_legacy_volume(&data_dir, "data", "MANAGED-CLUSTER");
+        let generic = spec_with_volume_kind("data", false);
+
+        let err = backend
+            .adopt_legacy_volumes("acme", "web", "acme@web", &generic)
+            .await
+            .expect_err("a generic non-owner must FAIL CLOSED on a legacy `data` cluster");
+        assert!(
+            format!("{err}").contains("not its proven owner"),
+            "actionable refusal, got: {err}"
+        );
+        // The managed owner's cluster is untouched (not stolen); the generic workload got no
+        // scoped dir.
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/data/PG_VERSION")).unwrap(),
+            "MANAGED-CLUSTER"
+        );
+        assert!(!data_dir.join("compute/volumes/@acme@web").exists());
+
+        // ...and the PROVEN managed claimant can still adopt its own cluster.
+        let managed = spec_with_volume("data");
+        backend
+            .adopt_legacy_volumes("default", "pg", "pg", &managed)
+            .await
+            .expect("the proven claimant adopts the legacy cluster");
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/@pg/data/PG_VERSION")).unwrap(),
+            "MANAGED-CLUSTER"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_generic_workload_cannot_adopt_a_custom_named_legacy_dir() {
+        // F1: a GENERIC workload's claim to a NON-`"data"` flat name is unprovable — names like
+        // `pgdata`/`cache` are tenant-chosen (not globally unique) and the legacy layout was
+        // node-global, so `<volumes>/<name>` may be ANOTHER tenant's data. A generic workload
+        // must NOT auto-adopt an existing legacy flat dir (renaming it on first-declare steals
+        // it — the same crafted-name theft as `"data"`, for non-`"data"` names). (Mutation: let
+        // a generic spec fall through to the 1:1 adopt and tenant B steals tenant A's `pgdata`.)
+        let data_dir = unique_dir("mig-f1");
+        let backend = migration_backend(&data_dir, None);
+        // Tenant A's EXCLUSIVE legacy volume named "pgdata" (never collided pre-fix).
+        seed_legacy_volume(&data_dir, "pgdata", "TENANT-A-DATA");
+        // Tenant B's generic workload declares the same name, co-located, launches first.
+        let generic = spec_with_volume_kind("pgdata", false);
+        let err = backend
+            .adopt_legacy_volumes("beta", "web", "beta@web", &generic)
+            .await
+            .expect_err("a generic workload must NOT steal a custom-named legacy dir");
+        assert!(
+            format!("{err}").contains("will not adopt a non-`data` legacy directory"),
+            "actionable generic refusal, got: {err}"
+        );
+        // Tenant A's data is byte-untouched; B got no scoped dir (nothing stolen/renamed).
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("compute/volumes/pgdata/PG_VERSION")).unwrap(),
+            "TENANT-A-DATA"
+        );
+        assert!(!data_dir.join("compute/volumes/@beta@web").exists());
+
+        // With NO legacy dir, a generic workload proceeds normally (adopt is a no-op; stage
+        // creates the scoped dir fresh) — it only fails closed on an EXISTING legacy dir.
+        let data_dir2 = unique_dir("mig-f1-fresh");
+        let backend2 = migration_backend(&data_dir2, None);
+        let generic2 = spec_with_volume_kind("cache", false);
+        backend2
+            .adopt_legacy_volumes("beta", "web", "beta@web", &generic2)
+            .await
+            .expect("a generic workload with no legacy dir proceeds (fresh)");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&data_dir2);
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_traversing_or_reserved_prefix_volume_names() {
+        // HIGH: the adopt path builds host paths from `vol.name`, so it MUST validate the name
+        // before constructing any path — a `".."` name would escape `<volumes>/`, and an
+        // `@<victimscope>` name would ALIAS another workload's scope dir (the rename would
+        // steal the victim's whole scope). Both must be rejected on the adopt path.
+        let data_dir = unique_dir("mig-badname");
+        let backend = migration_backend(&data_dir, None);
+        // Seed a victim scope dir that an `@`-named volume would try to alias/rename.
+        let victim = data_dir.join("compute/volumes/@victim/data");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("PG_VERSION"), "VICTIM-DATA").unwrap();
+
+        for bad in ["..", "@victim", "a/b"] {
+            let spec = spec_with_volume_kind(bad, false);
+            let err = backend
+                .adopt_legacy_volumes("acme", "web", "acme@web", &spec)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("invalid volume"),
+                "name {bad:?} must be rejected as an invalid volume, got: {err}"
+            );
+        }
+        // The victim's scope was never touched by the `@victim`-named attempt.
+        assert_eq!(
+            std::fs::read_to_string(victim.join("PG_VERSION")).unwrap(),
+            "VICTIM-DATA"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_is_a_noop_when_fresh_or_empty() {
+        let data_dir = unique_dir("mig-fresh");
+        let backend = migration_backend(&data_dir, None);
+        let spec = spec_with_volume("data");
+        // No legacy dir at all ⇒ Ok, nothing created (stage_volumes makes the scoped dir).
+        backend
+            .adopt_legacy_volumes("default", "pg", "pg", &spec)
+            .await
+            .expect("fresh ⇒ no-op");
+        assert!(!data_dir.join("compute/volumes/@pg/data").exists());
+        // An EMPTY legacy `data` dir is treated as fresh (never adopted), so it can neither be
+        // mistaken for a cluster nor block a non-claimant.
+        std::fs::create_dir_all(data_dir.join("compute/volumes/data")).unwrap();
+        backend
+            .adopt_legacy_volumes("default", "control", "control", &spec)
+            .await
+            .expect("empty legacy data ⇒ no-op, no refusal");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_refuses_to_overlay_an_existing_destination() {
+        // Refuse-on-exist: adopting onto a destination that already exists must ABORT, never
+        // merge two clusters into one.
+        let data_dir = unique_dir("mig-exist");
+        let backend = migration_backend(&data_dir, None);
+        let legacy = data_dir.join("compute/volumes/legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("f"), "x").unwrap();
+        let scoped = data_dir.join("compute/volumes/@acme-pg/legacy");
+        std::fs::create_dir_all(&scoped).unwrap();
+        std::fs::write(scoped.join("other"), "y").unwrap();
+
+        let err = backend
+            .adopt_one_legacy_volume(&legacy, &scoped, "acme", "pg", "legacy")
+            .await
+            .expect_err("destination exists ⇒ refuse-on-exist");
+        assert!(format!("{err}").contains("already exists"), "got: {err}");
+        // Both dirs intact — nothing merged.
+        assert!(legacy.join("f").exists() && scoped.join("other").exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn bulk_migrate_legacy_volumes_moves_only_authorized_preserving_data() {
+        // F4: the node-side bulk migration (`migrate_legacy_volumes`) moves each node-authorized
+        // `(project, workload, volume_name)` triple's legacy flat dir to its scoped dir — a true
+        // multi-tenant fixture (distinct digest names + distinct sentinel data + a default `data`
+        // cluster), asserting ZERO cross-tenant mixing, that an UNAUTHORIZED legacy dir is left
+        // untouched, and that it is idempotent + input-validated.
+        let data_dir = unique_dir("mig-bulk");
+        let backend = migration_backend(&data_dir, None);
+        seed_legacy_volume(&data_dir, "pg-acme_a", "ACME");
+        seed_legacy_volume(&data_dir, "pg-beta_b", "BETA");
+        seed_legacy_volume(&data_dir, "data", "NODE-DEFAULT-PG");
+        seed_legacy_volume(&data_dir, "unauth", "SOMEONE-ELSE"); // NOT in the authorized set
+        let authorized = vec![
+            (
+                "acme".to_string(),
+                "pg-acme_a".to_string(),
+                "pg-acme_a".to_string(),
+            ),
+            (
+                "beta".to_string(),
+                "pg-beta_b".to_string(),
+                "pg-beta_b".to_string(),
+            ),
+            // the node-default pg claimant for the legacy `data` cluster: (default, pg) ⇒ scope "pg"
+            ("default".to_string(), "pg".to_string(), "data".to_string()),
+            // a forged/bad name must be skipped, never traverse:
+            ("x".to_string(), "x".to_string(), "..".to_string()),
+        ];
+
+        let n = backend.migrate_legacy_volumes(&authorized).await;
+        assert_eq!(n, 3, "exactly the 3 valid authorized tenants migrated");
+
+        // Each moved to its OWN scoped dir with its OWN sentinel — zero cross-mixing.
+        let read = |p: &str| std::fs::read_to_string(data_dir.join(p)).unwrap();
+        assert_eq!(
+            read("compute/volumes/@acme@pg-acme_a/pg-acme_a/PG_VERSION"),
+            "ACME"
+        );
+        assert_eq!(
+            read("compute/volumes/@beta@pg-beta_b/pg-beta_b/PG_VERSION"),
+            "BETA"
+        );
+        assert_eq!(
+            read("compute/volumes/@pg/data/PG_VERSION"),
+            "NODE-DEFAULT-PG"
+        );
+        // Legacy flat dirs of the migrated tenants are gone; the UNAUTHORIZED one is untouched.
+        assert!(!data_dir.join("compute/volumes/pg-acme_a").exists());
+        assert!(!data_dir.join("compute/volumes/data").exists());
+        assert_eq!(read("compute/volumes/unauth/PG_VERSION"), "SOMEONE-ELSE");
+
+        // Idempotent: a re-run migrates nothing and disturbs nothing.
+        assert_eq!(backend.migrate_legacy_volumes(&authorized).await, 0);
+        assert_eq!(
+            read("compute/volumes/@acme@pg-acme_a/pg-acme_a/PG_VERSION"),
+            "ACME"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

@@ -241,6 +241,41 @@ jobs:
           grep -q 'co-located pgvector from an OCI image (host-root):' pg.log \
             || { echo "::error::host-root mode never reached a serving Postgres (silent skip?)" >&2; exit 1; }
 
+      - name: Co-located managed-DB volume isolation + legacy adoption (hard gate — the cross-tenant volume collision)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The load-bearing proof that two co-located managed databases NO LONGER share one
+          # host PGDATA (the CRITICAL `<data_dir>/compute/volumes/data` collision): launch TWO
+          # managed pgvector workloads that BOTH request the bare "data" volume and assert they
+          # land on DISTINCT per-(project,workload) scoped dirs, both come up healthy, and
+          # NEITHER reads the other's sentinel row (a true two-cluster multi-tenant fixture).
+          # The second test proves the one-time legacy-"data" migration: the proven claimant
+          # adopts the pre-v0.46 flat cluster (data preserved, read as-is) while a non-claimant
+          # gets a fresh dir and an unproven owner fails closed. The third (F4) proves the
+          # ENV-configured turnkey recovery: a NODE-DEFAULT managed pg owning the bare `data`
+          # cluster + a co-located declared `control` (no node-static config, no flag) — the
+          # node-default pg adopts its cluster via the node-side bulk migration, `control` gets a
+          # fresh scoped dir, both healthy, zero cross-read. --test-threads=1 so the launches
+          # don't contend on the single test bridge.
+          timeout -k 30 1200 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-container --test container_live \
+            container_colocated_managed_dbs_get_isolated_volumes \
+            container_legacy_data_volume_adopted_only_by_the_claimant \
+            container_f4_node_default_pg_adopts_data_colocated_control_fresh \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee voliso.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok`; gate on ALL
+          # end-of-test success markers, which print ONLY after the isolation / zero-cross-read,
+          # the claimant-adoption / refuse-on-unproven, and the F4 turnkey assertions all held.
+          grep -qE 'test result: ok' voliso.log \
+            || { echo "::error::co-located managed-DB volume isolation test did not pass" >&2; exit 1; }
+          grep -q 'colocated isolation OK:' voliso.log \
+            || { echo "::error::co-located isolation never reached the success marker (silent skip or cross-tenant volume collision?)" >&2; exit 1; }
+          grep -q 'legacy single-claimant adoption + refuse-on-unproven OK' voliso.log \
+            || { echo "::error::legacy-data adoption never reached the success marker (silent skip?)" >&2; exit 1; }
+          grep -q 'F4 turnkey OK:' voliso.log \
+            || { echo "::error::F4 turnkey node-default-pg migration never reached the success marker (silent skip?)" >&2; exit 1; }
+
       - name: Cross-tenant isolation on a shared Postgres (hard gate — the #1 invariant)
         run: |
           set -o pipefail

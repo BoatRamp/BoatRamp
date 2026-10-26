@@ -563,6 +563,204 @@ pub async fn auto_register_managed_db_workloads(
     }
 }
 
+/// Decide the ONE `(project, workload)` authorized to **adopt the legacy shared `data`
+/// volume** — the pre-v0.46 bare `<data_dir>/compute/volumes/data` directory that every
+/// default-project / shared managed database shared before the backing dir was keyed per
+/// `(project, workload)`. The container backend uses this to safely migrate a reused
+/// deployment's data into the per-workload scoped layout on first launch
+/// (`ContainerBackend::with_legacy_data_claimant`).
+///
+/// Every managed co-located DB's default-tenant / shared install ran under the reserved
+/// `default` project with its workload = the binding's `<compute>`, so the returned project
+/// is always `default` and the workload is a `<compute>` name. The rule is deliberately
+/// **fail-closed on ambiguity** (pitfall: a wrong guess would itself be the cross-tenant
+/// transfer we are preventing):
+/// * operator-designated (`adopt_legacy_data_volume`) — if EXACTLY ONE binding sets it, that
+///   one; ≥2 is a contradictory designation ⇒ `None`;
+/// * else if EXACTLY ONE managed co-located DB is configured, it is the unambiguous owner;
+/// * else (≥2 co-located managed DBs, none designated) ⇒ `None` — no workload may adopt the
+///   shared dir, so each fails closed at launch until an operator designates the owner.
+///
+/// Priority (fail-closed on ambiguity at every step):
+/// 1. **Explicit operator designation** — a node-static `databases` binding with
+///    `adopt_legacy_data_volume = true` (the override for the rare case a DECLARED db owns the
+///    cluster). Exactly one ⇒ it; ≥2 ⇒ `None`.
+/// 2. **Node-default (turnkey) managed pg** — recognized from node-TRUSTED control-plane state
+///    (the deploy store + the sealed-credential store), NOT from config or a spec: the UNIQUE
+///    `default`-project compute workload that is node-minted managed (a sealed
+///    `managed-sql-cred/default/<workload>`) and is NOT a derived/applied db (the `bramp-db-`
+///    prefix). This is the historical owner of the bare `data` cluster and is recognized even
+///    when the node-static `databases` config is EMPTY (the common ENV-configured turnkey
+///    deployment, whose node-default pg + any applied dbs live in the deploy store, not config).
+///    Exactly one such workload ⇒ it; ≥2 ⇒ `None`.
+/// 3. **Sole node-static managed binding** — fallback for a config-present node whose workload
+///    is not yet registered in the deploy store.
+/// 4. Else `None` — no workload adopts the shared dir (each fails closed at launch until an
+///    operator designates the owner).
+///
+/// Returns `Some((default, <workload>))` or `None`. NEVER derived from a workload spec — the
+/// authorization is the node's own config + control-plane records, so a tenant PUT spec (even a
+/// crafted DB-shaped one) can never make itself the claimant (a tenant cannot register a workload
+/// under the reserved `default` project, nor mint a `default`-scoped managed credential).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub async fn legacy_data_volume_claimant(
+    databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+) -> Option<(String, String)> {
+    use boatramp_core::project::DEFAULT_PROJECT;
+    use boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX;
+
+    // (1) Explicit operator designation — the override wins.
+    let designated: Vec<&str> = databases
+        .values()
+        .filter(|db| db.adopt_legacy_data_volume && db.is_managed_credential())
+        .filter_map(|db| db.compute.as_deref().filter(|c| !c.is_empty()))
+        .collect();
+    if designated.len() == 1 {
+        return Some((DEFAULT_PROJECT.to_string(), designated[0].to_string()));
+    }
+    if designated.len() >= 2 {
+        tracing::error!(
+            designated = ?designated,
+            "managed sql: `adopt_legacy_data_volume` is set on MORE THAN ONE databases binding; \
+             the legacy shared `data` volume owner is ambiguous — refusing (fail closed). Set the \
+             flag on exactly ONE binding."
+        );
+        return None;
+    }
+
+    // (2) Node-default (turnkey) managed pg, from node-trusted control-plane state.
+    match deploy.list_compute_workloads(ProjectRef::DEFAULT).await {
+        Ok(workloads) => {
+            let mut node_default: Vec<String> = Vec::new();
+            for wl in &workloads {
+                // A derived/applied db (`bramp-db-<digest>`, e.g. a declared `control` DB) is NEVER
+                // the turnkey default — skip it so it cannot adopt the node-default pg's cluster.
+                if wl.name.starts_with(DERIVED_MANAGED_DB_PREFIX) {
+                    continue;
+                }
+                // Node-minted managed credential = this `default`-project workload is a managed DB
+                // boatramp provisioned (a tenant cannot mint one, nor deploy under `default`).
+                if creds
+                    .is_sealed(DEFAULT_PROJECT, &wl.name)
+                    .await
+                    .unwrap_or(false)
+                {
+                    node_default.push(wl.name.clone());
+                }
+            }
+            if node_default.len() == 1 {
+                return Some((DEFAULT_PROJECT.to_string(), node_default.remove(0)));
+            }
+            if node_default.len() >= 2 {
+                tracing::error!(
+                    workloads = ?node_default,
+                    "managed sql: more than one node-default managed workload under the reserved \
+                     `default` project; the legacy `data` owner is ambiguous — refusing (fail \
+                     closed). Designate the owner with `adopt_legacy_data_volume`."
+                );
+                return None;
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "managed sql: could not enumerate `default`-project compute workloads for the legacy \
+             `data` claimant; falling back to the node-static config"
+        ),
+    }
+
+    // (3) Fallback: exactly one node-static managed binding.
+    let managed: Vec<&str> = databases
+        .values()
+        .filter(|db| db.is_managed_credential())
+        .filter_map(|db| db.compute.as_deref().filter(|c| !c.is_empty()))
+        .collect();
+    if managed.len() == 1 {
+        return Some((DEFAULT_PROJECT.to_string(), managed[0].to_string()));
+    }
+    if managed.len() >= 2 {
+        tracing::warn!(
+            workloads = ?managed,
+            "managed sql: {} co-located managed databases shared the legacy `data` volume and none \
+             is designated via `adopt_legacy_data_volume`; they fail closed at launch (data left \
+             untouched) until the owner is designated.",
+            managed.len()
+        );
+    }
+    None
+}
+
+/// **F4 — node-side bulk migration of managed-tenant legacy volume directories.** Computes the
+/// node-TRUSTED authorized `(project, workload, volume_name)` set (from the node's own config +
+/// control-plane records, NEVER a workload spec) and asks each compute backend to migrate those
+/// legacy flat dirs into the per-`(project, workload)` scoped layout BEFORE the reconcile launches
+/// anything — so a node-provisioned managed tenant never hits the launch-time fail-closed on
+/// upgrade. The authorized set is:
+///  * the legacy `data` cluster for the node-trusted `data_claimant` (the node-default pg, or an
+///    operator designation), and
+///  * every non-`default`-project managed `Single` tenant the node minted a sealed credential for
+///    (its legacy flat dir is named after its own globally-unique `<compute>-<ident>` workload).
+///
+/// The migration itself is the backend's atomic, refuse-on-exist rename (bytes + ownership
+/// preserved); this function only decides WHICH dirs are authorized. Best-effort + idempotent.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub async fn migrate_managed_tenant_legacy_volumes(
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    data_claimant: &Option<(String, String)>,
+    backends: &boatramp_core::compute::BackendRegistry,
+) {
+    let authorized = authorized_legacy_migrations(deploy, creds, data_claimant).await;
+    if authorized.is_empty() {
+        return;
+    }
+    for backend in backends.values() {
+        backend.migrate_legacy_volumes(&authorized).await;
+    }
+}
+
+/// The node-TRUSTED set of `(project, workload, volume_name)` legacy dirs authorized for F4
+/// migration. Split out from [`migrate_managed_tenant_legacy_volumes`] so the enumerate→authorize
+/// decision is host-unit-testable without a compute backend. NEVER reads a workload spec: the
+/// legacy `data` cluster is authorized only for the node-trusted `data_claimant`, and a non-default
+/// managed `Single` tenant only when the node minted its sealed credential (`is_sealed`) — so a
+/// tenant PUT workload (no node-minted credential) is never authorized to move a node-global dir.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub async fn authorized_legacy_migrations(
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    data_claimant: &Option<(String, String)>,
+) -> Vec<(String, String, String)> {
+    use boatramp_core::project::DEFAULT_PROJECT;
+    let mut authorized: Vec<(String, String, String)> = Vec::new();
+    // The legacy bare `data` cluster → the node-trusted claimant (node-default pg / designation).
+    if let Some((project, workload)) = data_claimant {
+        authorized.push((project.clone(), workload.clone(), "data".to_string()));
+    }
+    // Non-`default` managed `Single` tenants: each node-minted (sealed) workload owns the legacy
+    // flat dir named after itself (`managed_volume_name` returns the workload name for a non-default
+    // Single). `default`-project rows are the `data` case (handled above).
+    match deploy.list_compute_workloads_all().await {
+        Ok(rows) => {
+            for (project, wl) in rows {
+                if project == DEFAULT_PROJECT {
+                    continue;
+                }
+                if creds.is_sealed(&project, &wl.name).await.unwrap_or(false) {
+                    authorized.push((project, wl.name.clone(), wl.name));
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "managed sql: F4 could not enumerate compute workloads for the node-side legacy \
+             migration; the launch-time adoption remains the backstop"
+        ),
+    }
+    authorized
+}
+
 /// Register the ONE shared server workload for a `Shared` binding: the bare `<compute>`
 /// under the reserved default project, non-clobbering (an operator-declared workload
 /// wins; a re-run is a no-op). The synthesized spec is the tested `managed_db_spec` with
@@ -2566,6 +2764,161 @@ mod tests {
             password_env: pw_env.map(Into::into),
             ..Default::default()
         }
+    }
+
+    /// A fresh `(DeployStore, ManagedSqlCredentials)` sharing one in-memory KV, for the
+    /// claimant/F4 tests. With no workloads registered, the deploy-store (node-default pg) step
+    /// finds nothing, so the config-driven assertions exercise steps (1) and (3).
+    fn deploy_and_creds() -> (DeployStore, ManagedSqlCredentials) {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
+        (deploy, creds)
+    }
+
+    /// Register a minimal compute workload under `project` (the claimant reads only `.name`).
+    async fn reg_workload(deploy: &DeployStore, project: &str, name: &str) {
+        let wl = boatramp_core::compute::ComputeWorkload {
+            version: boatramp_core::SCHEMA_VERSION,
+            name: name.to_string(),
+            active: "0".repeat(64),
+            replicas: 1,
+            placement: Default::default(),
+        };
+        deploy
+            .set_compute_workload(boatramp_core::project::ProjectRef::new(project), &wl)
+            .await
+            .expect("register workload");
+    }
+
+    #[tokio::test]
+    async fn legacy_data_claimant_is_the_sole_or_designated_managed_db_else_none() {
+        let (deploy, creds) = deploy_and_creds();
+        // No managed DB ⇒ no claimant.
+        assert_eq!(
+            legacy_data_volume_claimant(&BTreeMap::new(), &deploy, &creds).await,
+            None
+        );
+
+        // Exactly ONE managed co-located DB ⇒ it is the unambiguous owner (no flag needed).
+        let mut one = BTreeMap::new();
+        one.insert("app".to_string(), db("postgres", Some("pg"), "", None));
+        assert_eq!(
+            legacy_data_volume_claimant(&one, &deploy, &creds).await,
+            Some(("default".to_string(), "pg".to_string()))
+        );
+
+        // TWO co-located managed DBs, none designated ⇒ AMBIGUOUS ⇒ None (fail closed).
+        let mut two = BTreeMap::new();
+        two.insert("app".to_string(), db("postgres", Some("pg"), "", None));
+        two.insert(
+            "control".to_string(),
+            db("postgres", Some("control"), "", None),
+        );
+        assert_eq!(
+            legacy_data_volume_claimant(&two, &deploy, &creds).await,
+            None
+        );
+
+        // ...resolved by designating the owner on exactly ONE binding.
+        let mut designated = two.clone();
+        designated.get_mut("app").unwrap().adopt_legacy_data_volume = true;
+        assert_eq!(
+            legacy_data_volume_claimant(&designated, &deploy, &creds).await,
+            Some(("default".to_string(), "pg".to_string()))
+        );
+
+        // Two designations contradict each other ⇒ still ambiguous ⇒ None.
+        let mut both = two.clone();
+        both.get_mut("app").unwrap().adopt_legacy_data_volume = true;
+        both.get_mut("control").unwrap().adopt_legacy_data_volume = true;
+        assert_eq!(
+            legacy_data_volume_claimant(&both, &deploy, &creds).await,
+            None
+        );
+
+        // BYO (password_env / url_env) bindings aren't managed ⇒ don't count.
+        let mut mixed = BTreeMap::new();
+        mixed.insert("app".to_string(), db("postgres", Some("pg"), "", None));
+        mixed.insert(
+            "byo".to_string(),
+            db("postgres", Some("pg2"), "", Some("PW")),
+        );
+        mixed.insert("ext".to_string(), db("mysql", None, "URL", None));
+        assert_eq!(
+            legacy_data_volume_claimant(&mixed, &deploy, &creds).await,
+            Some(("default".to_string(), "pg".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_data_claimant_recognizes_the_node_default_pg_with_empty_config() {
+        // The mainline turnkey recovery: EMPTY node-static `databases` config, but the deploy
+        // store holds the node-default pg (workload "pg") that owns `<volumes>/data`, alongside an
+        // APPLIED `control` db (workload `bramp-db-…`, no data) that also collided. The claimant
+        // must recognize "pg" as the owner WITHOUT any config/flag — from the deploy store + the
+        // node-minted sealed credential, excluding the `bramp-db-` applied db.
+        let (deploy, creds) = deploy_and_creds();
+        reg_workload(&deploy, "default", "pg").await;
+        reg_workload(&deploy, "default", "bramp-db-ctrl").await;
+        // Seal node-minted managed credentials for BOTH (the applied `control` has one too).
+        creds.password("default", "pg").await.unwrap();
+        creds.password("default", "bramp-db-ctrl").await.unwrap();
+        // A co-located GENERIC (unsealed) workload under default must NOT be considered.
+        reg_workload(&deploy, "default", "sidecar").await;
+
+        assert_eq!(
+            legacy_data_volume_claimant(&BTreeMap::new(), &deploy, &creds).await,
+            Some(("default".to_string(), "pg".to_string())),
+            "node-default pg recognized as the legacy `data` owner with no config/flag; the \
+             bramp-db applied db and the unsealed sidecar are excluded"
+        );
+
+        // Mutation sense: a SECOND node-minted non-`bramp-db` default workload makes it ambiguous
+        // (the node can no longer prove which owns the shared cluster) ⇒ fail closed.
+        reg_workload(&deploy, "default", "pg2").await;
+        creds.password("default", "pg2").await.unwrap();
+        assert_eq!(
+            legacy_data_volume_claimant(&BTreeMap::new(), &deploy, &creds).await,
+            None,
+            "two node-default-shaped workloads ⇒ ambiguous ⇒ fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_legacy_migrations_covers_claimant_and_sealed_non_default_single() {
+        // F4's node-trusted authorized set: the `data` claimant + every non-default managed Single
+        // tenant (node-minted sealed credential). A non-default UNSEALED (generic/PUT) workload and
+        // the `default` project rows are excluded.
+        let (deploy, creds) = deploy_and_creds();
+        reg_workload(&deploy, "acme", "pg-acme_a").await;
+        creds.password("acme", "pg-acme_a").await.unwrap(); // node-minted Single ⇒ authorized
+        reg_workload(&deploy, "beta", "pg-beta_b").await;
+        creds.password("beta", "pg-beta_b").await.unwrap(); // node-minted Single ⇒ authorized
+        reg_workload(&deploy, "evil", "stolen").await; // UNSEALED (PUT) ⇒ NOT authorized
+        reg_workload(&deploy, "default", "pg").await; // default row ⇒ excluded (the `data` case)
+
+        let claimant = Some(("default".to_string(), "pg".to_string()));
+        let mut auth = authorized_legacy_migrations(&deploy, &creds, &claimant).await;
+        auth.sort();
+        assert_eq!(
+            auth,
+            vec![
+                (
+                    "acme".to_string(),
+                    "pg-acme_a".to_string(),
+                    "pg-acme_a".to_string()
+                ),
+                (
+                    "beta".to_string(),
+                    "pg-beta_b".to_string(),
+                    "pg-beta_b".to_string()
+                ),
+                ("default".to_string(), "pg".to_string(), "data".to_string()),
+            ],
+            "authorized = claimant's `data` + each sealed non-default Single; the unsealed PUT \
+             workload is excluded"
+        );
     }
 
     #[tokio::test]

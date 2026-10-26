@@ -158,7 +158,12 @@ impl ComputeBackend for VmmBackend {
         }
     }
 
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+    async fn materialize(
+        &self,
+        _project: &str,
+        _workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError> {
         // The microVM boots an `ext4` rootfs; an OCI image reference must be built into
         // one first (`compute build`), so it is not runnable here directly.
         let rootfs_hash = match &spec.root {

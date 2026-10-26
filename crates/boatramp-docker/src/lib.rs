@@ -433,7 +433,12 @@ impl ComputeBackend for DockerBackend {
         }
     }
 
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+    async fn materialize(
+        &self,
+        _project: &str,
+        _workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError> {
         // The docker backend pulls an OCI **image reference** (registry/repo:tag or a
         // digest); an ext4 rootfs is not runnable here.
         let reference = match &spec.root {

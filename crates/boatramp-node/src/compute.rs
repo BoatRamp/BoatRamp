@@ -154,6 +154,7 @@ fn sysctl_string(name: &str) -> Option<String> {
 /// native `container` backend; Linux + `/dev/kvm` ⇒ the in-process
 /// `vmm-embedded` microVM backend (strongest isolation). Absent config ⇒ an empty
 /// registry + a node advertising nothing, so the reconcile loop stays a no-op.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_compute(
     cfg: Option<&crate::config::ComputeConfig>,
     storage: std::sync::Arc<dyn boatramp_core::Storage>,
@@ -166,11 +167,22 @@ pub async fn build_compute(
     // built `boatramp` binary so the workers find the `__sandbox`/`__vmm-run`/
     // `__vz-run` subcommands. See [`crate::node::NodeInput::worker_exe`].
     worker_exe: Option<&std::path::Path>,
+    // The ONE `(project, workload)` authorized to adopt the pre-v0.46 shared legacy `data`
+    // volume on this node (decided from the `databases` config — the sole managed DB, or the
+    // operator-designated binding; `None` when there is none or ownership is ambiguous). Wired
+    // into the native container backend so a reused deployment's data is migrated into the
+    // per-workload scoped layout safely, and a contender fails closed rather than fresh-init
+    // over an unclaimed neighbor's cluster. See [`crate::managed_sql::legacy_data_volume_claimant`].
+    legacy_data_claimant: Option<(String, String)>,
 ) -> (
     boatramp_core::compute::BackendRegistry,
     boatramp_core::compute::Node,
 ) {
     use boatramp_core::compute::{BackendKind, BackendRegistry, Node};
+    // The native container backend (Linux-only, below) is the sole consumer of the legacy-data
+    // claimant; reference it on non-Linux so the parameter isn't flagged unused there.
+    #[cfg(not(target_os = "linux"))]
+    let _ = &legacy_data_claimant;
     let mut backends: BackendRegistry = std::collections::BTreeMap::new();
     let empty_node = |id| Node {
         id,
@@ -283,6 +295,11 @@ pub async fn build_compute(
                     // an `@sha256:`-pinned ref, so a registry/MITM cannot substitute an image that
                     // would run with the managed-DB credential + egress (M1).
                     let c = c.with_require_pinned_client_image(strict);
+                    // Authorize the ONE workload (if any) that may adopt the pre-v0.46 shared
+                    // legacy `data` volume, so a reused deployment's managed-DB data is migrated
+                    // into the per-(project, workload) scoped layout safely and a non-owner fails
+                    // closed instead of fresh-initializing over an unclaimed neighbor's cluster.
+                    let c = c.with_legacy_data_claimant(legacy_data_claimant.clone());
                     // Reclaim one-shot cgroups orphaned by a hard crash mid-export/import (L2).
                     c.sweep_orphaned_ephemeral_cgroups();
                     backends.insert("container".to_string(), std::sync::Arc::new(c));
@@ -955,7 +972,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }
         async fn launch(&self, _: &LaunchRequest) -> Result<Instance, BackendError> {
@@ -1115,7 +1137,12 @@ mod tests {
                 max_mem_mib: None,
             }
         }
-        async fn materialize(&self, _: &ComputeSpec) -> Result<Artifact, BackendError> {
+        async fn materialize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }
         async fn reserve_in_use(&self, replicas: &[(String, String, u32, std::net::Ipv4Addr)]) {

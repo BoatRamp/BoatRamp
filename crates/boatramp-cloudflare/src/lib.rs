@@ -207,7 +207,12 @@ impl ComputeBackend for CloudflareBackend {
         }
     }
 
-    async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+    async fn materialize(
+        &self,
+        _project: &str,
+        _workload: &str,
+        spec: &ComputeSpec,
+    ) -> Result<Artifact, BackendError> {
         // The CF backend pulls an OCI image reference; nothing to stage locally. An
         // ext4 rootfs is not runnable here.
         let reference = match &spec.root {
@@ -367,7 +372,10 @@ mod tests {
     #[tokio::test]
     async fn materialize_records_image_and_rejects_empty() {
         let b = CloudflareBackend::new("example.com");
-        let art = b.materialize(&spec(256, "registry/app:1")).await.unwrap();
+        let art = b
+            .materialize("default", "edge", &spec(256, "registry/app:1"))
+            .await
+            .unwrap();
         assert_eq!(
             art,
             Artifact::Image {
@@ -375,7 +383,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            b.materialize(&spec(256, "")).await,
+            b.materialize("default", "edge", &spec(256, "")).await,
             Err(BackendError::Materialize(_))
         ));
     }
