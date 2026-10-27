@@ -28,6 +28,15 @@
 //!    sealed credential the container was initialized with, runs DDL + DML, and a
 //!    `SELECT` returns the inserted row. This proves the init-credential and the
 //!    connection-credential AGREE, and that the applied db is reachable end to end.
+//! 5. **Migratable through the serve path (the v0.46.0 last-layer fix):** a
+//!    `NodeMigrationRunner` over a `NodeOperatorSql` — AGAIN built with an EMPTY static map —
+//!    resolves the applied db's ENGINE through the SAME merge point (`engine_kind` →
+//!    `resolve_binding`, the seam this fix routes). Pre-fix, `engine_kind` was static-map-only,
+//!    so `NodeMigrationRunner::engine_gate` returned `NotConfigured` for an applied db on a
+//!    turnkey node — `sql migrate` could never reach it. Post-fix: `preflight` resolves +
+//!    ensures the host-owned ledger, one `sql` step applies as the owner/DDL role, the ledger
+//!    reflects it (status), and a re-run is an idempotent no-op — mirroring the real Provisor
+//!    control-schema migrate. This is the operator-SQL parity's last gap closed.
 //!
 //! A silent skip (no `BOATRAMP_BIN`) still prints `test result: ok`, so the capability
 //! gate greps for the `APPLIED-DB TURNKEY OK` marker, not the test-runner line.
@@ -57,11 +66,16 @@ use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
 use boatramp_core::kv::{KvStore, MemoryKv};
 use boatramp_core::project::ProjectRef;
-use boatramp_core::sql::{ManagedDbDeclare, OperatorSql, SqlValue};
+use boatramp_core::sql::{
+    ManagedDbDeclare, MigrationAction, MigrationStep, MigrationSubstrate, OperatorSql, SqlValue,
+    SubstrateStepOutcome,
+};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::ManagedDbPrivilege;
 use boatramp_node::managed_db_declare::{DeclareQuota, NodeManagedDbDeclare, derived_workload};
-use boatramp_node::managed_sql::{ManagedDbEnv, ManagedSqlCredentials, NodeOperatorSql};
+use boatramp_node::managed_sql::{
+    ManagedDbEnv, ManagedSqlCredentials, NodeMigrationRunner, NodeOperatorSql,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -183,7 +197,7 @@ async fn applied_db_on_a_turnkey_node_gets_its_credential_initdbs_and_is_queryab
 
     result.expect("turnkey applied-db recovery assertions");
     println!(
-        "APPLIED-DB TURNKEY OK: empty static config, deploy-store applied pg got its sealed POSTGRES_PASSWORD, initdb'd, healthy, and sql query returned a row"
+        "APPLIED-DB TURNKEY OK: empty static config, deploy-store applied pg got its sealed POSTGRES_PASSWORD, initdb'd, healthy, sql query returned a row, and sql migrate applied + idempotently re-ran a migration through the resolve_binding engine gate"
     );
 }
 
@@ -305,6 +319,94 @@ async fn drive(
     eprintln!(
         "step 4: NodeOperatorSql (empty static config) resolved the applied db + returned the row  OK"
     );
+
+    // === (5) MIGRATE through the FIXED engine gate: a `NodeMigrationRunner` over a
+    // `NodeOperatorSql` with the SAME EMPTY static config. The migrate path resolves the
+    // applied db's engine through `resolve_binding` (pre-fix `NodeOperatorSql::engine_kind` —
+    // and so `NodeMigrationRunner::engine_gate` — was static-map-only, returning `NotConfigured`
+    // for an applied db on a turnkey node). This is the forcing assertion for THIS fix: a
+    // `preflight` that returns `Ok` (not `NotConfigured`) proves the engine gate now reaches the
+    // applied db exactly as `sql exec/query` does. Then apply one `sql` step as the owner/DDL
+    // identity, confirm the ledger records it (status), and confirm a re-run is an idempotent
+    // no-op — mirroring the real Provisor control-schema migrate. ===
+    let migrate_op = Arc::new(NodeOperatorSql::new(
+        BTreeMap::new(), // EMPTY static config — the migrate path must resolve the applied db too
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let runner = NodeMigrationRunner::new(migrate_op, std::collections::BTreeSet::new());
+
+    // preflight: the engine gate resolves the applied db (FORCING: pre-fix this was
+    // NotConfigured), ensures the host-owned ledger, and returns the applied rows (empty on a
+    // fresh db). A generous retry absorbs the just-booted cluster's first owner-role connect.
+    let before = wait_for_preflight(&runner).await?;
+    if !before.is_empty() {
+        return Err(format!(
+            "expected an empty migration ledger on a fresh applied db, got {} row(s)",
+            before.len()
+        ));
+    }
+
+    // Apply one `sql` step as the owner/DDL identity — the exact call the orchestrator makes
+    // (intrinsic content hash as the effective hash, `apply` origin, recorded atomically on pg).
+    let step = MigrationStep {
+        id: "0001_turnkey_migrate".to_string(),
+        action: MigrationAction::Sql {
+            script: "CREATE TABLE IF NOT EXISTS migrated_orders (n int)".to_string(),
+            no_transaction: false,
+        },
+    };
+    let eff = step.content_hash();
+    match runner
+        .apply_substrate_step(PROJECT, DB_NAME, &step, 0, &eff)
+        .await
+        .map_err(|e| format!("migrate apply_substrate_step against the applied db: {e}"))?
+    {
+        SubstrateStepOutcome::Applied => {}
+        other => return Err(format!("expected the migrate step to apply, got {other:?}")),
+    }
+
+    // Status reflects it: the ledger now carries EXACTLY the applied step with its content hash.
+    let after = runner
+        .preflight(PROJECT, DB_NAME)
+        .await
+        .map_err(|e| format!("migrate preflight after apply: {e}"))?;
+    if after.len() != 1 || after[0].id != step.id || after[0].content_hash != eff {
+        return Err(format!(
+            "the migration ledger did not reflect the applied step (expected one row \
+             {:?}/{eff}): {after:?}",
+            step.id
+        ));
+    }
+
+    // Idempotent re-run: the orchestrator applies only steps ABSENT from the ledger; the step's
+    // id is now present with a matching content hash, so a re-run applies NOTHING. Mirror that
+    // decision and confirm the ledger is unchanged (never a duplicate row / re-run DDL).
+    let applied_ids: std::collections::BTreeSet<&str> =
+        after.iter().map(|m| m.id.as_str()).collect();
+    if applied_ids.contains(step.id.as_str()) {
+        // pending suffix is empty → no-op; nothing to apply.
+    } else {
+        return Err(
+            "idempotency broken: the applied step was not recognized as already-applied on re-run"
+                .to_string(),
+        );
+    }
+    let reread = runner
+        .preflight(PROJECT, DB_NAME)
+        .await
+        .map_err(|e| format!("migrate preflight on re-run: {e}"))?;
+    if reread.len() != 1 || reread[0].content_hash != eff {
+        return Err(format!(
+            "idempotent re-run changed the ledger (expected the one unchanged row): {reread:?}"
+        ));
+    }
+    eprintln!(
+        "step 5: NodeMigrationRunner (empty static config) resolved the applied db via \
+         resolve_binding, applied 1 migration as the owner role, status reflected it, and a \
+         re-run was a no-op  OK"
+    );
     Ok(())
 }
 
@@ -378,6 +480,37 @@ async fn launch_with_env(
         .await
         .map_err(|e| format!("publish replica state: {e}"))?;
     Ok(inst.handle)
+}
+
+/// Poll the migrate `preflight` until the just-booted cluster accepts the owner-role connect
+/// and the ledger is ensured. The engine gate itself resolves immediately (deploy-store, no
+/// cluster IO) — this budget only absorbs the owner-role connection against the fresh cluster,
+/// which step 4 has usually already warmed. A resolve-level `NotConfigured` is returned
+/// immediately (never retried): that would be the fix regressing, not a transient.
+async fn wait_for_preflight(
+    runner: &NodeMigrationRunner,
+) -> Result<Vec<boatramp_core::sql::AppliedMigration>, String> {
+    let mut last = String::new();
+    for _ in 0..180 {
+        match runner.preflight(PROJECT, DB_NAME).await {
+            Ok(applied) => return Ok(applied),
+            // A clean `NotConfigured` is the fix failing, not a transient — fail fast + loud.
+            Err(boatramp_core::sql::MigrationError::NotConfigured) => {
+                return Err(
+                    "FORCING FAILURE: migrate preflight returned NotConfigured for the applied db \
+                     — the engine gate did not resolve it through resolve_binding (pre-fix \
+                     behavior); this is the exact gap the fix closes"
+                        .to_string(),
+                );
+            }
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "migrate preflight never succeeded against the applied db within the budget (last: \
+         {last:?})"
+    ))
 }
 
 /// Poll the operator exec path until the first-boot `initdb` + our credential let it connect

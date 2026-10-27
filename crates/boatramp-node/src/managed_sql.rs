@@ -1129,12 +1129,25 @@ impl NodeOperatorSql {
         self.connect_for(project, db, true).await
     }
 
-    /// The SQL engine of managed database `db`, if configured (for the migration runner's
-    /// engine gate).
-    pub(crate) fn engine_kind(&self, db: &str) -> Option<ExternalSqlKind> {
-        self.databases
-            .get(db)
-            .and_then(|cfg| ExternalSqlKind::parse(&cfg.kind))
+    /// The SQL engine of managed database `db` in `project`, if resolvable (for the migration
+    /// runner's engine gate). Resolves through the SAME merge point `connect_for`/`ping` use
+    /// (node-static config + the per-project deploy-store declaration, daemon-config-wins), so an
+    /// APPLIED managed db declared via `boatramp apply` on a turnkey node — EMPTY node-static
+    /// `[databases]` — resolves its engine identically to `sql exec/query` (parity with the migrate
+    /// path's connection, which already goes through `resolve_binding` via `owner_backend_for`).
+    /// A node-static binding resolves exactly as before. Fails closed: a daemon/manifest same-name
+    /// conflict is surfaced as an error (never a wrong-db migrate), an unknown name is `None`, and a
+    /// non-pg/mysql kind (e.g. libsql) is `None` (the sqlx migration runner does not own it).
+    pub(crate) async fn engine_kind(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Option<ExternalSqlKind>, SqlError> {
+        let resolved =
+            crate::managed_db_declare::resolve_binding(&self.databases, &self.deploy, project, db)
+                .await
+                .map_err(|e| SqlError::other(e.to_string()))?;
+        Ok(resolved.and_then(|cfg| ExternalSqlKind::parse(&cfg.kind)))
     }
 
     /// Connect as the **MySQL DDL identity** — the owner-role analog for a backend with no
@@ -1159,13 +1172,24 @@ impl NodeOperatorSql {
     /// influences. The credential stays on the node (as with every other `sql` connection).
     async fn mysql_ddl_backend_for(
         &self,
+        project: &str,
         db: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         use boatramp_storage::sql_sqlx::{ExternalSqlOptions, connect};
-        let cfg = self
-            .databases
-            .get(db)
-            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        // Resolve through the SAME merge point `connect_for` uses (node-static config +
+        // per-project deploy-store declaration, daemon-config-wins) — so a node-static BYO MySQL
+        // binding resolves byte-identically (the distinctness checks below operate on the exact
+        // same config), and an APPLIED managed MySQL db on a turnkey node resolves to its
+        // compute-backed config here too, where the HIGH-2 guard below refuses it fail-closed with
+        // the clear "managed MySQL migration not supported" message rather than an opaque "no
+        // database named". Fail-closed: a daemon/manifest conflict is an error, an unknown name is
+        // "no database named".
+        let resolved =
+            crate::managed_db_declare::resolve_binding(&self.databases, &self.deploy, project, db)
+                .await
+                .map_err(|e| SqlError::other(e.to_string()))?
+                .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let cfg = &resolved;
 
         // [Security review HIGH-2] A **compute-backed managed** MySQL binding (`compute` set, no
         // runtime `url_env`) gets NO distinctness enforcement in the block below (there is no
@@ -1914,8 +1938,15 @@ impl NodeMigrationRunner {
     /// migration substrate yet (a later parity phase) — but it is not an [`ExternalSqlKind`], so it
     /// never reaches here; a database of an unknown/unconfigured engine returns `NotConfigured`. Fail
     /// closed + clear. Returns the resolved engine so callers thread it into the dialect-aware ledger.
-    fn engine_gate(&self, db: &str) -> Result<ExternalSqlKind, MigrationError> {
-        match self.op.engine_kind(db) {
+    async fn engine_gate(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<ExternalSqlKind, MigrationError> {
+        // `?` maps a resolve error (e.g. a daemon/manifest same-name conflict) to
+        // `MigrationError::Sql` — a hard, fail-closed refusal, never `NotConfigured` / a wrong-db
+        // migrate. An unresolved name (or a non-pg/mysql kind) is `None` → `NotConfigured`.
+        match self.op.engine_kind(project, db).await? {
             Some(kind @ (ExternalSqlKind::Postgres | ExternalSqlKind::Mysql)) => Ok(kind),
             None => Err(MigrationError::NotConfigured),
         }
@@ -1938,10 +1969,10 @@ impl NodeMigrationRunner {
         project: &str,
         db: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, MigrationError> {
-        let kind = self.engine_gate(db)?;
+        let kind = self.engine_gate(project, db).await?;
         let result = match kind {
             ExternalSqlKind::Postgres => self.op.owner_backend_for(project, db).await,
-            ExternalSqlKind::Mysql => self.op.mysql_ddl_backend_for(db).await,
+            ExternalSqlKind::Mysql => self.op.mysql_ddl_backend_for(project, db).await,
         };
         result.map_err(|e| match e {
             SqlError::Unavailable(m) => MigrationError::Unavailable(m),
@@ -1958,7 +1989,7 @@ impl MigrationSubstrate for NodeMigrationRunner {
         project: &str,
         db: &str,
     ) -> Result<Vec<AppliedMigration>, MigrationError> {
-        let kind = self.engine_gate(db)?;
+        let kind = self.engine_gate(project, db).await?;
         let owner = self.connect_ddl(project, db).await?;
         self.ensure_ledger(kind, &owner).await?;
         Ok(self.read_applied(kind, &owner).await?)
@@ -1981,7 +2012,7 @@ impl MigrationSubstrate for NodeMigrationRunner {
                 "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
             ));
         }
-        let kind = self.engine_gate(db)?;
+        let kind = self.engine_gate(project, db).await?;
         let owner = self.connect_ddl(project, db).await?;
         let ledger_insert =
             Self::ledger_insert(kind, step, ordinal, effective_hash, LedgerOrigin::Apply);
@@ -2112,7 +2143,7 @@ impl MigrationSubstrate for NodeMigrationRunner {
                 step.id
             )));
         }
-        let kind = self.engine_gate(db)?;
+        let kind = self.engine_gate(project, db).await?;
         let owner = self.connect_ddl(project, db).await?;
         self.ensure_ledger(kind, &owner).await?;
         owner
@@ -2132,7 +2163,7 @@ impl MigrationSubstrate for NodeMigrationRunner {
         project: &str,
         db: &str,
     ) -> Result<Arc<dyn MigrateDdl>, MigrationError> {
-        let kind = self.engine_gate(db)?;
+        let kind = self.engine_gate(project, db).await?;
         let owner = self.connect_ddl(project, db).await?;
         Ok(Arc::new(OwnerDdl { owner, kind }))
     }
@@ -3826,14 +3857,16 @@ mod tests {
         NodeMigrationRunner::new(op, std::collections::BTreeSet::new())
     }
 
-    /// The engine gate admits BOTH Postgres and MySQL now (parity), and returns the resolved engine;
-    /// an unconfigured database is `NotConfigured`.
+    /// The engine gate admits BOTH Postgres and MySQL now (parity) over a NODE-STATIC binding
+    /// (the no-regress case: static resolution is byte-identical), and returns the resolved engine;
+    /// an unconfigured database is `NotConfigured`. The gate now resolves through `resolve_binding`
+    /// (so it also reaches an APPLIED deploy-store db — covered live), hence `async`.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[test]
-    fn engine_gate_admits_postgres_and_mysql() {
+    #[tokio::test]
+    async fn engine_gate_admits_postgres_and_mysql() {
         let pg = runner_over(op_for("postgres", None, boatramp_core::env::MapEnv::new()));
         assert!(matches!(
-            pg.engine_gate("main"),
+            pg.engine_gate("default", "main").await,
             Ok(ExternalSqlKind::Postgres)
         ));
         let my = runner_over(op_for(
@@ -3841,10 +3874,13 @@ mod tests {
             Some("X"),
             boatramp_core::env::MapEnv::new(),
         ));
-        assert!(matches!(my.engine_gate("main"), Ok(ExternalSqlKind::Mysql)));
+        assert!(matches!(
+            my.engine_gate("default", "main").await,
+            Ok(ExternalSqlKind::Mysql)
+        ));
         // An unknown database name is NotConfigured, not a panic.
         assert!(matches!(
-            pg.engine_gate("absent"),
+            pg.engine_gate("default", "absent").await,
             Err(MigrationError::NotConfigured)
         ));
     }
