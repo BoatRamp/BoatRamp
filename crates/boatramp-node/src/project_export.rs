@@ -7412,6 +7412,7 @@ async fn read_libsql_capture_sidecar(dir: &Path) -> Option<LibsqlCaptureSidecar>
 /// the result still lives under `base_dir` (defeats a symlink planted in the bundle dir). Returns the
 /// confined absolute path or a loud [`Perr`] — never a path that escapes the bundle dir. (Security
 /// review Stage 4, Finding 1: an unconfined join enabled `/dev/zero` DoS + out-of-tree file reads.)
+#[cfg(any(feature = "sql-delta-libsql", test))]
 fn confine_bundle_snapshot(base_dir: &Path, snapshot_file: &str) -> Result<PathBuf, Perr> {
     use std::path::Component;
     let rel = Path::new(snapshot_file);
@@ -7614,12 +7615,12 @@ impl NodeProjectExport {
         #[cfg(not(feature = "sql-delta-libsql"))]
         {
             let _ = (project, opts, report);
-            return Err(Perr::Unavailable(
+            Err(Perr::Unavailable(
                 "bundle carries libsql changeset true-delta members but this build lacks the libsql \
                  changeset engine (feature `sql-delta-libsql`) — refusing to restore (never a silent \
                  stale-base full-dump)"
                     .into(),
-            ));
+            ))
         }
         #[cfg(feature = "sql-delta-libsql")]
         {
