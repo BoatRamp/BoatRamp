@@ -307,10 +307,18 @@ impl MysqlConnection {
 /// schema. No `--connect-timeout`: `mysqldump` does not register it (unknown variable);
 /// the overall ephemeral-run timeout bounds a stuck dump instead.
 pub fn mysqldump_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
+    // `--set-gtid-purged=OFF` is MANDATORY: a `gtid_mode=ON` server (which `delta_capture`
+    // requires, and which the mysql true-delta CI gate launches with) otherwise makes `mysqldump`
+    // emit an ACTIVE `SET @@GLOBAL.GTID_PURGED=…`, which fails to replay into a fresh db on the same
+    // server (`ERROR 3546: the added gtid set must not overlap with GTID_EXECUTED`) and, more
+    // fundamentally, a logical EXPORT bundle must not carry a server-global replication coordinate.
+    // `OFF` keeps the stream portable and is a no-op on a non-gtid server (mirrors the shadow /
+    // capture-base invocations, which already set it for the same reason).
     let mut argv = vec![
         "mysqldump".to_string(),
         "--single-transaction".to_string(),
         "--no-tablespaces".to_string(),
+        "--set-gtid-purged=OFF".to_string(),
     ];
     argv.extend(conn.conn_args());
     if data_only {
@@ -885,6 +893,15 @@ mod tests {
         assert!(!dump_full.argv.iter().any(|a| a == "--no-create-info"));
         assert!(dump_full.argv.iter().any(|a| a == "--databases"));
         assert!(!dump_do.argv.iter().any(|a| a == "--databases"));
+        // BOTH variants must suppress GTID_PURGED: a gtid_mode=ON server would otherwise emit an
+        // active `SET @@GLOBAL.GTID_PURGED` that fails to restore (overlap) + taints a portable bundle.
+        for d in [&dump_do, &dump_full] {
+            assert!(
+                d.argv.iter().any(|a| a == "--set-gtid-purged=OFF"),
+                "mysqldump must carry --set-gtid-purged=OFF (gtid-safety): {:?}",
+                d.argv
+            );
+        }
         // mysqldump does NOT register --connect-timeout (it fails with "unknown variable");
         // it must never appear on a dump invocation, but the mysql restore client DOES
         // accept it.

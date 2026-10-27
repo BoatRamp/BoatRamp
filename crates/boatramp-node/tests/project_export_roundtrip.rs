@@ -4882,3 +4882,1109 @@ async fn project_export_libsql_true_delta_and_crafted_escape_gate() {
 
     println!("PROJECT EXPORT LIBSQL TRUE-DELTA OK");
 }
+
+// ===========================================================================================
+// SQL true-delta MULTI-DELTA CHAIN gates (PLAN-sql-true-delta Stage 5). Each builds on the
+// per-engine single-delta gate above by adding a THIRD link — a real base → d1 → d2 chain — and
+// proving the chain RESTORES CORRECTLY to the final state after BOTH mutation rounds, honouring each
+// engine's documented MODE limit, and carrying the crafted-escape assertion THROUGH the chain. Not a
+// duplicate of the single-delta gates: those import a 2-link (base → d1) chain; these import the
+// 3rd link and exercise the chain-walk + the full-dump-fallback-in-a-chain restore for the first
+// time. Markers: `PROJECT EXPORT {PG,MYSQL,LIBSQL} TRUE-DELTA CHAIN OK`.
+// ===========================================================================================
+
+/// LIVE gate (Docker + a `wal_level=logical` Postgres): the pg logical-WAL true-delta MULTI-DELTA
+/// CHAIN round-trip. Builds base → d1 → d2 and proves the chain restores to the final state after
+/// BOTH mutation rounds, honouring pg's mode limit: a single advancing slot can true-delta only the
+/// FIRST delta, so d1 is a genuine `PgWalReplay` member while d2 (incremental onto a delta parent,
+/// whose dir records no slot) FULL-DUMPS as the fallback — and the chain restore (newest full dump
+/// supersedes earlier WAL) yields d2's final state regardless of which links were true-delta vs
+/// fallback. Also carries the crafted-escape assertion through the chain-import path: a tampered
+/// WAL-delta member in a chain is refused fail-closed, the victim table + a SECOND tenant's db
+/// untouched. Marker: `PROJECT EXPORT PG TRUE-DELTA CHAIN OK`.
+#[tokio::test]
+async fn project_export_pg_true_delta_chain_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live pg true-delta CHAIN not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live pg true-delta CHAIN not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let s = now_suffix();
+    let live_db = format!("brexp_tdc_live_{s}");
+    let tenant_b_db = format!("brexp_tdc_tenantb_{s}");
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // PRECONDITION: logical decoding. SELF-SKIP (not assert) when a bring-your-own test pg lacks it,
+    // so a pg launched without `-c wal_level=logical` (e.g. capability.yml's) runs the file's other
+    // tests cleanly; the preflight-matrix CHAIN gate launches pg WITH it and gates on the marker, so
+    // a skip there FAILS the job (the marker never prints).
+    let (_c, wal_level) = psql(backend.as_ref(), &image, &maint, "SHOW wal_level").await;
+    if wal_level.trim() != "logical" {
+        eprintln!(
+            "SKIP: the test Postgres is not wal_level=logical (pg WAL true-delta CHAIN gate needs \
+             `-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10`)"
+        );
+        return;
+    }
+
+    // --- a source live DB (base rows + a victim table) + a SECOND tenant's DB (sentinel) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db}"),
+        format!("DROP DATABASE IF EXISTS {tenant_b_db}"),
+        format!("CREATE DATABASE {tenant_b_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+    let live = conn(&user, &password, &host, port, &live_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "CREATE TABLE t(id int primary key, v text); \
+         CREATE TABLE victim(id int primary key); INSERT INTO victim VALUES (1); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed base rows: {o}");
+    let tenant_b = conn(&user, &password, &host, port, &tenant_b_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &tenant_b,
+        "CREATE TABLE b(id int primary key, v text); INSERT INTO b VALUES (7,'TENANT_B_SENTINEL');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed tenant B: {o}");
+
+    // --- the driver: a MANAGED Single/default pg binding with delta_capture (identical to the
+    //     single-delta gate's) ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            compute: Some("pg".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            delta_capture: true,
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/pg", sealed).await.unwrap();
+    }
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "pg".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        .with_resumable_base(Some(resumable.clone()));
+
+    let full = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    let incr = |base: &str| ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: base.to_string(),
+        }),
+    };
+
+    // --- BASE export: creates the pgoutput capture slot + the full dump ---
+    drv.export_resumable("default", &full, "cbase")
+        .await
+        .expect("base resumable export");
+
+    // --- round-1 mutation → d1 (incremental vs cbase): the FIRST delta true-WAL-captures ---
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "INSERT INTO t VALUES (4,'delta'); UPDATE t SET v='beta2' WHERE id=2; DELETE FROM t WHERE id=3;",
+    )
+    .await;
+    assert_eq!(c, 0, "round-1 mutate: {o}");
+    drv.export_resumable("default", &incr("cbase"), "d1")
+        .await
+        .expect("delta d1 export");
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::PgWalReplay,
+        "the FIRST chain delta must WAL-capture (true-delta), not full-dump"
+    );
+    let pgwal_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.path == "sql/app.pgwal" && m.kind == MemberKind::PgWalDelta)
+        .expect("d1 must carry a sql/app.pgwal true-delta member");
+    assert!(
+        !d1_manifest.members.iter().any(|m| m.path == "sql/app.pgc"),
+        "d1's full pg dump must be SUPERSEDED by the WAL delta member"
+    );
+
+    // --- round-2 mutation → d2 (incremental vs d1): a LATER link, so pg FULL-DUMPS as the fallback
+    //     (the documented mode limit — d1's dir records no slot; only a BASE export creates one). The
+    //     chain still restores correctly below. ---
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "INSERT INTO t VALUES (5,'epsilon'); UPDATE t SET v='delta2' WHERE id=4; DELETE FROM t WHERE id=1;",
+    )
+    .await;
+    assert_eq!(c, 0, "round-2 mutate: {o}");
+    drv.export_resumable("default", &incr("d1"), "d2")
+        .await
+        .expect("delta d2 export");
+    let d2_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d2").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d2_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::FullDumpFallback,
+        "a LATER pg chain link must FULL-DUMP (a single advancing slot cannot re-emit the interval)"
+    );
+    assert!(
+        d2_manifest
+            .members
+            .iter()
+            .any(|m| m.path == "sql/app.pgc" && m.kind == MemberKind::PgDump),
+        "d2 must carry a full pg dump member (the fallback)"
+    );
+    assert!(
+        !d2_manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::PgWalDelta),
+        "d2 (a later link) must NOT carry a WAL delta member"
+    );
+
+    // --- CRAFTED-ESCAPE THROUGH THE CHAIN: tamper the d1 WAL-delta member (the replayed true-delta
+    //     link) + fix its meta so it passes integrity and reaches the replay; import the base→evil
+    //     chain. import_delta_chain → restore_pg_true_delta_in_chain must refuse it fail-closed (the
+    //     injected statement hits a non-existent relation → ON_ERROR_STOP → shadow dropped → no
+    //     swap), the victim table + tenant B untouched. ---
+    let d1_dir = resumable.join("d1");
+    let evil_dir = resumable.join("evil");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    for ent in std::fs::read_dir(&d1_dir).unwrap() {
+        let ent = ent.unwrap();
+        if ent.file_type().unwrap().is_file() {
+            std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
+        }
+    }
+    let crafted = crafted_injection_pgwal();
+    std::fs::write(evil_dir.join(format!("m{pgwal_idx:05}")), &crafted).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let meta = project_bundle::MemberMeta {
+            size: crafted.len() as u64,
+            sha256: hex::encode(Sha256::digest(&crafted)),
+        };
+        std::fs::write(
+            evil_dir.join(format!("m{pgwal_idx:05}.meta")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+    let evil_res = drv
+        .import_resumable(
+            "default",
+            "evil",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        evil_res.is_err(),
+        "a tampered WAL-delta member in the chain MUST be refused fail-closed; got: {evil_res:?}"
+    );
+    let (_c, victim) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM victim",
+    )
+    .await;
+    assert_eq!(
+        victim.trim(),
+        "1",
+        "the crafted chain import must not touch the victim table (shadow dropped, no swap)"
+    );
+
+    // --- plant a pre-import sentinel so the clean chain import PROVES a real restore (not a no-op) ---
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+
+    // --- IMPORT THE 3-LINK CHAIN (import d2 → resolves base → d1 → d2). The chain restore takes d2's
+    //     newest full dump (superseding d1's WAL) → the FINAL state after BOTH mutation rounds. ---
+    let report = drv
+        .import_resumable(
+            "default",
+            "d2",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("3-link delta chain import (base → d1 → d2)");
+    assert!(report.pg_databases >= 1, "the pg db must be restored");
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "2:beta2\n4:delta2\n5:epsilon",
+        "the restored db must equal the MUTATED source after the WHOLE chain (both rounds) — not the \
+         base, not d1's state, not the pre-import sentinel"
+    );
+    let (_c, b_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &tenant_b,
+        "SELECT id || ':' || v FROM b ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        b_rows, "7:TENANT_B_SENTINEL",
+        "the second tenant's db must be UNTOUCHED by the chain restore"
+    );
+
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {tenant_b_db}"),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+    println!("PROJECT EXPORT PG TRUE-DELTA CHAIN OK");
+}
+
+/// LIVE gate (Docker + a `gtid_mode=ON --log-bin --binlog-format=ROW` MySQL): the mysql binlog
+/// true-delta MULTI-DELTA CHAIN round-trip. Builds base → d1 → d2 and proves the chain restores to
+/// the final state after BOTH mutation rounds, honouring mysql's mode limit: a one-shot base GTID
+/// coordinate lets only the FIRST delta true-binlog-capture, so d1 is a genuine `MysqlBinlogReplay`
+/// member while d2 (incremental onto a delta parent, which records no coordinate) FULL-DUMPS as the
+/// fallback — and the chain restore (newest full dump supersedes earlier binlog) yields d2's final
+/// state. Also carries the crafted-escape assertion through the chain-import path: a well-formed but
+/// malicious binlog-delta member in a chain is denied by the shadow-scoped apply grants and refused
+/// fail-closed, the victim table + a SECOND tenant's db untouched. Marker:
+/// `PROJECT EXPORT MYSQL TRUE-DELTA CHAIN OK`.
+#[tokio::test]
+async fn project_export_mysql_true_delta_chain_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (live mysql true-delta CHAIN not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live mysql true-delta CHAIN not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    let s = now_suffix();
+    let live_db = format!("brexp_mytdc_live_{s}");
+    let tenant_b_db = format!("brexp_mytdc_tenantb_{s}");
+    let mkconn = |db: &str| MysqlConnection {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        password: password.clone(),
+        database: db.to_string(),
+        connect_timeout_secs: 10,
+    };
+    let admin = mkconn("");
+
+    // PRECONDITION: GTID + row binlog. SELF-SKIP (like the single-delta mysql gate) when the server
+    // lacks them — the preflight-matrix CHAIN gate launches mysql WITH the binlog argv and gates on
+    // the marker, so a skip there FAILS the job (the marker never prints).
+    let (_c, gtid_mode) =
+        mysql_run(backend.as_ref(), image, &admin, None, "SELECT @@gtid_mode;").await;
+    if gtid_mode.trim() != "ON" {
+        eprintln!(
+            "SKIP: the test MySQL is not gtid_mode=ON (binlog true-delta CHAIN gate needs \
+             `--log-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON`)"
+        );
+        return;
+    }
+
+    // --- a source live DB (base rows + a victim table) + a SECOND tenant's DB (sentinel) ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!(
+            "DROP DATABASE IF EXISTS {live_db}; CREATE DATABASE {live_db}; \
+             DROP DATABASE IF EXISTS {tenant_b_db}; CREATE DATABASE {tenant_b_db};"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "setup dbs: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         CREATE TABLE victim(id INT PRIMARY KEY); INSERT INTO victim VALUES (1); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed base rows: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "CREATE TABLE b(id INT PRIMARY KEY, v TEXT); INSERT INTO b VALUES (7,'TENANT_B_SENTINEL');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed tenant B: {o}");
+
+    // --- the driver: a MANAGED Single/default mysql binding with delta_capture ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "mysql".to_string(),
+            compute: Some("mysql".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            delta_capture: true,
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/mysql", sealed)
+            .await
+            .unwrap();
+    }
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "mysql".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        .with_resumable_base(Some(resumable.clone()));
+
+    let full = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    let incr = |base: &str| ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: base.to_string(),
+        }),
+    };
+
+    // --- BASE export: records the snapshot GTID + start binlog in mysql_capture.json ---
+    drv.export_resumable("default", &full, "cbase")
+        .await
+        .expect("base resumable export");
+
+    // --- round-1 mutation → d1 (incremental vs cbase): the FIRST delta true-binlog-captures ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "INSERT INTO t VALUES (4,'delta'); UPDATE t SET v='beta2' WHERE id=2; DELETE FROM t WHERE id=3;",
+    )
+    .await;
+    assert_eq!(c, 0, "round-1 mutate: {o}");
+    drv.export_resumable("default", &incr("cbase"), "d1")
+        .await
+        .expect("delta d1 export");
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::MysqlBinlogReplay,
+        "the FIRST chain delta must binlog-capture (true-delta), not full-dump"
+    );
+    let bin_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.path == "sql/app.mysqlbinlog" && m.kind == MemberKind::MysqlBinlogDelta)
+        .expect("d1 must carry a sql/app.mysqlbinlog true-delta member");
+    assert!(
+        !d1_manifest.members.iter().any(|m| m.path == "sql/app.sql"),
+        "d1's full mysql dump must be SUPERSEDED by the binlog delta member"
+    );
+
+    // --- round-2 mutation → d2 (incremental vs d1): a LATER link, so mysql FULL-DUMPS as the
+    //     fallback (d1's dir records no GTID coordinate). The chain still restores correctly. ---
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "INSERT INTO t VALUES (5,'epsilon'); UPDATE t SET v='delta2' WHERE id=4; DELETE FROM t WHERE id=1;",
+    )
+    .await;
+    assert_eq!(c, 0, "round-2 mutate: {o}");
+    drv.export_resumable("default", &incr("d1"), "d2")
+        .await
+        .expect("delta d2 export");
+    let d2_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d2").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d2_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::FullDumpFallback,
+        "a LATER mysql chain link must FULL-DUMP (a one-shot base GTID cannot re-emit the interval)"
+    );
+    assert!(
+        d2_manifest
+            .members
+            .iter()
+            .any(|m| m.path == "sql/app.sql" && m.kind == MemberKind::MysqlDump),
+        "d2 must carry a full mysql dump member (the fallback)"
+    );
+    assert!(
+        !d2_manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::MysqlBinlogDelta),
+        "d2 (a later link) must NOT carry a binlog delta member"
+    );
+
+    // --- CRAFTED-ESCAPE THROUGH THE CHAIN: a well-formed-but-malicious binlog member (valid SQL
+    //     targeting the VICTIM / foreign-tenant db) in place of d1's binlog member. The apply user
+    //     (ALL on the shadow ONLY) is DENIED → `mysql` errors → the base→evil chain import is refused
+    //     fail-closed, the victim + tenant B untouched (shadow dropped, no swap). ---
+    let d1_dir = resumable.join("d1");
+    let evil_dir = resumable.join("evil");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    for ent in std::fs::read_dir(&d1_dir).unwrap() {
+        let ent = ent.unwrap();
+        if ent.file_type().unwrap().is_file() {
+            std::fs::copy(ent.path(), evil_dir.join(ent.file_name())).unwrap();
+        }
+    }
+    let evil_sql = format!(
+        "INSERT INTO `{tenant_b_db}`.b VALUES (999,'ESCAPE_ATTEMPT');\n\
+         DROP TABLE `{live_db}`.victim;\n"
+    );
+    std::fs::write(evil_dir.join(format!("m{bin_idx:05}")), evil_sql.as_bytes()).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let meta = project_bundle::MemberMeta {
+            size: evil_sql.len() as u64,
+            sha256: hex::encode(Sha256::digest(evil_sql.as_bytes())),
+        };
+        std::fs::write(
+            evil_dir.join(format!("m{bin_idx:05}.meta")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+    let evil_res = drv
+        .import_resumable(
+            "default",
+            "evil",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        evil_res.is_err(),
+        "a well-formed malicious binlog member in the chain MUST be refused by the shadow-scoped \
+         apply grants; got: {evil_res:?}"
+    );
+    let (_c, victim) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT COUNT(*) FROM victim;",
+    )
+    .await;
+    assert_eq!(
+        victim.trim(),
+        "1",
+        "the crafted chain import must not touch the victim table (shadow dropped, no swap)"
+    );
+    let (_c, b_after_evil) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "SELECT CONCAT(id, ':', v) FROM b ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        b_after_evil, "7:TENANT_B_SENTINEL",
+        "tenant B must be untouched after the refused crafted chain import"
+    );
+
+    // --- plant a pre-import sentinel, then IMPORT THE 3-LINK CHAIN (import d2 → base → d1 → d2). The
+    //     chain restore takes d2's newest full dump (superseding d1's binlog) → the FINAL state. ---
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "DELETE FROM t; INSERT INTO t VALUES (99,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+    let report = drv
+        .import_resumable(
+            "default",
+            "d2",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("3-link delta chain import (base → d1 → d2)");
+    assert!(report.pg_databases >= 1, "the mysql db must be restored");
+    let (_c, rows) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&live_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        rows, "2:beta2\n4:delta2\n5:epsilon",
+        "the restored db must equal the MUTATED source after the WHOLE chain (both rounds) — not the \
+         base, not d1's state, not the pre-import sentinel"
+    );
+    let (_c, b_rows) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&tenant_b_db),
+        "SELECT CONCAT(id, ':', v) FROM b ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        b_rows, "7:TENANT_B_SENTINEL",
+        "the second tenant's db must be UNTOUCHED by the chain restore"
+    );
+
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS {live_db}; DROP DATABASE IF EXISTS {tenant_b_db};"),
+    )
+    .await;
+    println!("PROJECT EXPORT MYSQL TRUE-DELTA CHAIN OK");
+}
+
+/// The libsql changeset true-delta MULTI-DELTA CHAIN gate (in-process; feature `sql-delta-libsql`).
+/// Unlike pg/mysql, libsql re-diffs a fixed base snapshot, so an INCREMENTAL chain is true-delta
+/// across EVERY link: base → d1 (changeset vs base) → d2 (changeset vs d1). Proves (1) the 3-link
+/// chain restores EXACTLY to the final state after BOTH mutation rounds (base snapshot + d1 changeset
+/// + d2 changeset, applied in order), both links genuine `LibsqlChangeset` members; and (2) a
+/// crafted changeset tampered into the MIDDLE link (d1) — carrying a write to a table OUTSIDE the
+/// base schema — is REFUSED when the whole chain is imported, the target left byte-unchanged (no
+/// swap) and a SECOND site untouched. Marker: `PROJECT EXPORT LIBSQL TRUE-DELTA CHAIN OK`.
+#[cfg(feature = "sql-delta-libsql")]
+#[tokio::test]
+async fn project_export_libsql_true_delta_chain_and_crafted_escape_gate() {
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::sql_libsql::LibsqlSqlBackends;
+    use std::collections::BTreeMap;
+
+    let project = "acme";
+    let blog = "blog"; // the true-delta site
+    let shop = "shop"; // a SECOND site that must stay untouched
+
+    let td = tempfile::tempdir().unwrap();
+    let libsql_dir = td.path().join("handlers-sql");
+    let backends = Arc::new(LibsqlSqlBackends::local(&libsql_dir));
+
+    async fn seed(
+        backends: &Arc<LibsqlSqlBackends>,
+        project: &str,
+        site: &str,
+        rows: &[(i64, &str)],
+    ) {
+        let db: Arc<dyn SqlBackend> = backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let _ = tx.execute("DROP TABLE IF EXISTS t", &[]).await;
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        for (id, v) in rows {
+            tx.execute(
+                "INSERT INTO t VALUES (?1,?2)",
+                &[SqlValue::Integer(*id), SqlValue::Text((*v).into())],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    async fn read_t(backends: &Arc<LibsqlSqlBackends>, project: &str, site: &str) -> Vec<String> {
+        let db: Arc<dyn SqlBackend> = backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin_read_only().await.unwrap();
+        let rows = tx
+            .query("SELECT id || ':' || v FROM t ORDER BY id", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        rows.rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                SqlValue::Text(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    seed(
+        &backends,
+        project,
+        blog,
+        &[(1, "orig"), (2, "beta"), (3, "gamma")],
+    )
+    .await;
+    seed(&backends, project, shop, &[(1, "SHOPSENTINEL")]).await;
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    kv.put("project/acme/current/blog", b"dep1".to_vec())
+        .await
+        .unwrap();
+    kv.put("project/acme/current/shop", b"dep1".to_vec())
+        .await
+        .unwrap();
+    kv.put("project/acme/config/tenancy", b"{}".to_vec())
+        .await
+        .unwrap();
+
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(blobs.clone(), kv.clone()),
+        kv.clone(),
+        blobs.clone(),
+        work,
+    )
+    .with_libsql(backends.clone())
+    .with_resumable_base(Some(resumable.clone()));
+
+    // --- BASE export ---
+    let full = ExportOptions::default();
+    drv.export_resumable(project, &full, "cbase")
+        .await
+        .expect("base export");
+
+    let incr = |base: &str| ExportOptions {
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: base.to_string(),
+        }),
+        ..Default::default()
+    };
+
+    // --- round-1 mutation → d1 (incremental vs cbase): a changeset ---
+    {
+        let db: Arc<dyn SqlBackend> = backends.database(project, blog, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("INSERT INTO t VALUES (4,'delta')", &[])
+            .await
+            .unwrap();
+        tx.execute("UPDATE t SET v='beta2' WHERE id=2", &[])
+            .await
+            .unwrap();
+        tx.execute("DELETE FROM t WHERE id=3", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    drv.export_resumable(project, &incr("cbase"), "d1")
+        .await
+        .expect("d1 export");
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::LibsqlChangeset,
+        "d1 must changeset-capture (not full-dump)"
+    );
+    let blog_cs_path = format!("libsql/{project}/{blog}/default.changeset");
+    let d1_cs_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.kind == MemberKind::LibsqlChangeset && m.path == blog_cs_path)
+        .expect("d1 must carry a blog changeset member");
+
+    // --- round-2 mutation → d2 (incremental vs d1): ANOTHER changeset (libsql true-deltas across
+    //     links — the re-diffable fixed base snapshot each delta records). ---
+    {
+        let db: Arc<dyn SqlBackend> = backends.database(project, blog, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("INSERT INTO t VALUES (5,'epsilon')", &[])
+            .await
+            .unwrap();
+        tx.execute("UPDATE t SET v='delta2' WHERE id=4", &[])
+            .await
+            .unwrap();
+        tx.execute("DELETE FROM t WHERE id=1", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    drv.export_resumable(project, &incr("d1"), "d2")
+        .await
+        .expect("d2 export");
+    let d2_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d2").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d2_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::LibsqlChangeset,
+        "d2 must ALSO changeset-capture (libsql true-deltas across chain links)"
+    );
+    assert!(
+        d2_manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::LibsqlChangeset && m.path == blog_cs_path),
+        "d2 must carry a blog changeset member (not a full dump)"
+    );
+
+    let final_expect = vec![
+        "2:beta2".to_string(),
+        "4:delta2".to_string(),
+        "5:epsilon".to_string(),
+    ];
+
+    // --- PART 1: clean 3-link round-trip. Plant a PRE-IMPORT sentinel in blog, import d2 (the chain
+    //     base → d1 → d2), assert blog == the final state (base snapshot + d1 changeset + d2
+    //     changeset, applied in order) and shop untouched. ---
+    seed(&backends, project, blog, &[(99, "PRE_IMPORT")]).await;
+    let report = drv
+        .import_resumable(
+            project,
+            "d2",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("3-link delta chain import (base snapshot + 2 changesets)");
+    assert!(
+        report.libsql_databases >= 1,
+        "a libsql db was restored by the changeset-chain pass"
+    );
+    assert_eq!(
+        read_t(&backends, project, blog).await,
+        final_expect,
+        "blog must equal the final state after BOTH changeset links — not the base, not d1's state, \
+         not the pre-import sentinel"
+    );
+    assert_eq!(
+        read_t(&backends, project, shop).await,
+        vec!["1:SHOPSENTINEL".to_string()],
+        "the SECOND site (shop) must be UNTOUCHED"
+    );
+
+    // --- PART 2: CRAFTED MIDDLE-of-chain. Tamper d1's (the MIDDLE link's) changeset to carry a write
+    //     to a FOREIGN table `evil`; import the whole chain (d2 → base → d1 → d2). The restore applies
+    //     the base snapshot then d1's crafted changeset FIRST — whose foreign-table write is refused by
+    //     the base-table confinement → the import aborts, blog byte-unchanged (no swap), shop
+    //     untouched. The crafted changeset's t-portion applies cleanly against the base schema, so the
+    //     FOREIGN-table write (a table absent from the base shadow) is what the confinement refuses. ---
+    let evil = tempfile::tempdir().unwrap();
+    let evil_backends = Arc::new(LibsqlSqlBackends::local(evil.path().join("db")));
+    {
+        let db: Arc<dyn SqlBackend> = evil_backends.database("x", "base", "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "INSERT INTO t VALUES (1,'orig'),(2,'beta'),(3,'gamma')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE evil(id INTEGER PRIMARY KEY, secret TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let db2: Arc<dyn SqlBackend> = evil_backends.database("x", "cur", "").await.unwrap();
+        let mut tx = db2.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "INSERT INTO t VALUES (1,'HACKED'),(2,'beta'),(3,'gamma')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE evil(id INTEGER PRIMARY KEY, secret TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute("INSERT INTO evil VALUES (1,'ESCAPED')", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let evil_base_snap = evil.path().join("eb.db");
+    let evil_cur_snap = evil.path().join("ec.db");
+    evil_backends
+        .snapshot_into(&ProjectRef::new("x").qualified("base"), "", &evil_base_snap)
+        .await
+        .unwrap();
+    evil_backends
+        .snapshot_into(&ProjectRef::new("x").qualified("cur"), "", &evil_cur_snap)
+        .await
+        .unwrap();
+    let crafted_raw = match tokio::task::spawn_blocking(move || {
+        boatramp_storage::sql_libsql_changeset::capture_changeset(&evil_base_snap, &evil_cur_snap)
+    })
+    .await
+    .unwrap()
+    .expect("craft a changeset")
+    {
+        boatramp_storage::sql_libsql_changeset::ChangesetCapture::Changeset(c) => c,
+        other => panic!("crafted capture unexpectedly fell back: {other:?}"),
+    };
+    let crafted_member = boatramp_core::project_delta::encode_libsql_changeset(&crafted_raw);
+
+    // Overwrite d1's blog changeset member + regenerate its {size,sha256} meta (so it passes the
+    // integrity check and reaches the replay). d1's MANIFEST is untouched, so the chain coherence +
+    // the d2→d1→base walk are intact — the ONLY tampered thing is the middle changeset's bytes.
+    let obj = resumable.join("d1").join(format!("m{d1_cs_idx:05}"));
+    std::fs::write(&obj, &crafted_member).unwrap();
+    let sha = boatramp_core::deploy::sha256_hex(&crafted_member);
+    std::fs::write(
+        resumable.join("d1").join(format!("m{d1_cs_idx:05}.meta")),
+        format!("{{\"size\":{},\"sha256\":\"{sha}\"}}", crafted_member.len()).as_bytes(),
+    )
+    .unwrap();
+
+    // Plant a distinct sentinel so the refusal is PROVABLY a no-swap (blog stays the sentinel).
+    seed(&backends, project, blog, &[(77, "CRAFTED_SENTINEL")]).await;
+    let res = drv
+        .import_resumable(
+            project,
+            "d2",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "a crafted MIDDLE-of-chain changeset writing a table OUTSIDE the base schema MUST be refused"
+    );
+    assert_eq!(
+        read_t(&backends, project, blog).await,
+        vec!["77:CRAFTED_SENTINEL".to_string()],
+        "the refused crafted chain import left blog UNCHANGED (no partial/leaked write, no swap)"
+    );
+    assert_eq!(
+        read_t(&backends, project, shop).await,
+        vec!["1:SHOPSENTINEL".to_string()],
+        "the second site must be UNTOUCHED by the refused crafted chain import"
+    );
+
+    println!("PROJECT EXPORT LIBSQL TRUE-DELTA CHAIN OK");
+}

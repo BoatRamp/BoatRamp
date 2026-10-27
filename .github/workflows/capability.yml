@@ -481,6 +481,14 @@ jobs:
           # refusal both pass, so a silent feature-gate-away or a regression fails the job.
           grep -q 'PROJECT EXPORT LIBSQL TRUE-DELTA OK' project-export.log \
             || { echo "::error::libsql changeset true-delta gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # libsql changeset true-delta MULTI-DELTA CHAIN (PLAN-sql-true-delta Stage 5): in-process,
+          # so the `--features sql-delta-libsql` build ALWAYS runs it — its marker prints ONLY after
+          # the base->d1->d2 3-link incremental round-trip (true-delta across EVERY link) AND the
+          # crafted MIDDLE-of-chain changeset refusal both pass, so a silent feature-gate-away or a
+          # chain-restore regression fails the job. (The pg/mysql CHAIN gates self-skip here — no
+          # wal_level=logical / binlog on this job's DBs — and gate in preflight-matrix.yml instead.)
+          grep -q 'PROJECT EXPORT LIBSQL TRUE-DELTA CHAIN OK' project-export.log \
+            || { echo "::error::libsql changeset true-delta CHAIN gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
           # MySQL round-trip: self-skips without a reachable MySQL/docker (the silent-skip
           # trap), so gate on its marker which prints ONLY after the real mysqldump ->
           # bundle(SHA-256) -> drop -> mysql-restore -> ROW-equality round-trip.

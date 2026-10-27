@@ -62,6 +62,8 @@ additive — an absent `databases:` still parses (no version bump, no migration)
 | `read_only` | Provision a read-only binding. |
 | `rls_session` / `tenant_guc` / `session_guc` / `tenant_all_marker` | Row-level-security / session knobs for tenant isolation. |
 | `pool_max` / `connect_timeout_secs` / `startup_grace_secs` | Connection knobs — each **capped** to an operator ceiling. |
+| `delta_capture` | Opt a **dedicated** Postgres/MySQL database into true **row-delta export** (logical WAL / binlog). Default `false`. Flips a start-only server setting, so it takes effect only after a restart (below). See [Incremental & true-delta export](./delta-export.md). |
+| `restart_policy` | How a restart-requiring config change (e.g. flipping `delta_capture`) is applied: `manual` (default — stage it, mark the DB **pending restart**) or `auto` (apply + restart on the next `apply`). |
 
 See the [`databases:` schema](../reference/project-cfg.md#managed-databases-databases) for the full
 field reference.
@@ -186,6 +188,39 @@ These are `Project·Admin`.
 
 To declare, change, or tear down a database itself, edit the manifest and `apply` (or
 use the imperative teardown verb) — not this command.
+
+### Restart a managed database (and apply a pending config change)
+
+Some config changes only take effect when the database **starts** — most notably flipping
+`delta_capture` (it enables `wal_level = logical` / binary logging in the launch argv). Such a
+change is **staged as pending** until the database is restarted; the `restart_policy` field
+(`manual` default, or `auto`) chooses whether a restart happens automatically on `apply`.
+
+Restart a dedicated, project-scoped managed database explicitly — stopping its replica so the
+reconcile loop relaunches it fresh **on the same data volume**, adopting any staged config:
+
+```console
+$ boatramp db restart --db app
+restarted database `app` (workload `bramp-db-app`)
+  pending config change applied
+  replicas stopped: 1 (the reconcile loop will relaunch)
+```
+
+`--db` defaults to `default`. A **pending restart** is surfaced by `db status` / `db get`, so a
+staged change is never silently un-applied:
+
+```console
+$ boatramp db status app
+database `app`
+  readiness:       provisioned
+  declared:        yes
+  pending restart: yes — a staged config change has not been applied; run `boatramp db restart --db app`
+```
+
+Restart is for a **dedicated (`tenant: single`), project-scoped** managed database — a
+shared-tenant server (it hosts other tenants) or a site-scoped binding (no single workload) is
+out of scope and refused with a clear message, and a bring-your-own-URL database is not
+boatramp's to restart. The restart API is `POST /api/databases/{name}/restart`, `Project·Admin`.
 
 ## How the declaration merges with node config
 

@@ -23,6 +23,16 @@ $ boatramp project export acme --out acme.brproj --server https://cp.acme.com
 
 Server seam: `POST /api/project-export` (streams the bundle out).
 
+### Ship only what changed (incremental & true-delta)
+
+To keep a staging/DR copy **in step** with production without re-shipping the whole project each
+time, take a **delta** export — it carries only the control-plane KV upserts/tombstones, the
+new/changed blobs, and (for an opted-in managed SQL database) the **row-level changes** since a
+base. A delta is written as a node-local **resumable** directory and chains onto a base with
+`--resumable <dir> --mode incremental --base <dir>`. See
+[Incremental & true-delta export](./delta-export.md) for the full flow, the three SQL engines
+and their modes, the `delta_capture` opt-in + restart, and the security/scope limits.
+
 ## Import a bundle
 
 Import is a **dry-run plan by default** — it mutates nothing until you pass `--apply`.

@@ -199,7 +199,9 @@ resolves to. Takes the common `--server` flag.
 | `repair [--apply]` | Repair a managed tenant's provisioning drift (the owner-model retrofit that unblocks `migrate`). Defaults to a dry-run; `--apply` converges. Fixes provisioning only — never touches schema or data. `Project·Admin`. |
 | `tenant-secrets {set,rotate,ls,rm}` | Manage the project's **per-tenant** sealed secrets — each tenant's own third-party credential, sealed server-side under `(tenant, name)`, each verb taking `--tenant <t>`. Distinct from the per-project `boatramp secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`. |
 | `export <name> --out <file>` | Stream the project (managed-DB dumps + control-plane KV slice + blobs) to a portable `BRPROJ` bundle, from a **running node** (`System·Admin`). See [Export, import & clone a project](../how-to/clone-project.md). |
+| `export <name> --resumable <DIR> [--mode <differential\|incremental> --base <DIR>]` | Write a **resumable** member-object directory under the node's `[serve] resumable_export_dir` base (a re-run skips members already present + SHA-verified) instead of streaming a file. `--mode`/`--base` take a **delta** against a prior resumable `--base` dir — `incremental` (vs the parent, forming a chain) or `differential` (vs a fixed base); omit for a full resumable export. `--out` and `--resumable` are mutually exclusive. See [Incremental & true-delta export](../how-to/delta-export.md). |
 | `import <name> --in <file>` | Import a `BRPROJ` bundle into a project on a **running node** (`System·Admin`); a dry-run plan by default, `--apply` executes. See [Export, import & clone a project](../how-to/clone-project.md). |
+| `import <name> --resumable <DIR> [--apply]` | Import a **resumable**/delta member-object directory of this name on the node (the output of a resumable export). A delta's whole chain (base → … → this link) is resolved and applied in order. `--in` and `--resumable` are mutually exclusive; dry-run by default. |
 
 ## `boatramp apply`
 
@@ -966,6 +968,7 @@ database and gate at `Project·Admin`. Takes the common `--server` flag.
 | `ensure database <name>` | Idempotently (re-)provision an already-declared database — e.g. force the default-project database setup to run now rather than waiting for the first binding. `Project·Admin`. |
 | `ensure user <name> <user>` | Idempotently provision a login role `<user>` on the managed database `<name>`. By default the host mints + seals the password; `--password-secret <secret>` binds a **bring-your-own** password from a sealed secret instead. On a shared cluster the role name is per-tenant-qualified so it can't collide across tenants. `Project·Admin`. |
 | `drop user <name> <user>` | Drop the login role `<user>` on `<name>` (idempotent — absent is still success). `Project·Admin`. |
+| `restart [--db <name>]` | Restart a **dedicated, project-scoped** managed database — stop its replica so the reconcile loop relaunches it fresh (same data volume), applying any **pending** restart-requiring config change (e.g. a flipped `delta_capture`) in the process. `--db` defaults to `default`. A shared-tenant/site-scoped/BYO binding is refused. Prints the workload, whether a pending change was applied, and replicas stopped. `Project·Admin`. |
 
 The global `--output-format json` emits the raw record instead of the human table.
 To declare or change a database, edit the manifest's `databases:` block — see

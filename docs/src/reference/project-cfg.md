@@ -217,6 +217,8 @@ or credential (teardown stays an explicit imperative verb — a data-loss guard)
 | `pool_max` | u32? | — | Max pooled connections. **Capped** to an operator ceiling (64) at lowering. |
 | `connect_timeout_secs` | u64? | — | Connection/acquire timeout. **Capped** (60s). |
 | `startup_grace_secs` | u32? | — | Startup grace for the managed server's first `initdb`. **Capped** (600s). |
+| `delta_capture` | bool | `false` | Opt a **dedicated** Postgres/MySQL database into true **row-delta export** (logical WAL / binlog). Flips a **start-only** server setting (`wal_level=logical` / `--log-bin`), so it takes effect only after a restart — staged pending per `restart_policy`; a delta export before the restart is refused loudly. See [Incremental & true-delta export](../how-to/delta-export.md). |
+| `restart_policy` | enum | `manual` | How a restart-requiring config change (e.g. flipping `delta_capture`) is applied: `manual` (stage it, mark the DB **pending restart** for an explicit `boatramp db restart`) or `auto` (apply + restart the DB on the next `apply`). |
 
 **Excluded — the security contract.** These are **not** fields; a manifest that
 names one **fails to parse** (`deny_unknown_fields`), because the credential is
