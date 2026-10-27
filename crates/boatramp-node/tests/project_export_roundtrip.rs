@@ -3652,6 +3652,289 @@ async fn project_export_pg_true_delta_roundtrip_live() {
     println!("PROJECT EXPORT PG TRUE-DELTA OK");
 }
 
+/// LIVE gate (Docker + a `wal_level=logical` Postgres): the pg true-delta OVERLAP-WINDOW proof
+/// (PLAN-sql-true-delta Stage-2 MEDIUM). A continuous stream of single-row INSERT statements commits
+/// THROUGHOUT the BASE export — so writes land in the slot-create→dump window that the old,
+/// un-pinned base dump left open. With the snapshot-pin (`CREATE_REPLICATION_SLOT … (SNAPSHOT
+/// 'export')` held across `pg_dump --snapshot`), the base dump and the slot share ONE consistent
+/// point, so each concurrent row lands in the dump XOR the WAL — never both — and the delta chain
+/// imports CLEANLY with source == target. Under the OLD code a window row lands in BOTH, so the
+/// WAL-replay INSERT is a duplicate-key `ON_ERROR_STOP` abort (import fails) or a row mismatch — so
+/// this test FAILS on a regression and PASSES only when the window is closed. Marker:
+/// `PROJECT EXPORT PG OVERLAP-WINDOW OK`.
+#[tokio::test]
+async fn project_export_pg_true_delta_overlap_window_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (pg overlap-window proof not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (pg overlap-window proof not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let s = now_suffix();
+    let live_db = format!("brexp_ow_live_{s}");
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // Self-skip (not assert) when logical decoding is off: the HARD marker gate is in
+    // preflight-matrix (which launches pgvector with `-c wal_level=logical`), so a looser job on a
+    // stock `replica` pgvector skips cleanly rather than failing — the marker simply never prints.
+    let (_c, wal_level) = psql(backend.as_ref(), &image, &maint, "SHOW wal_level").await;
+    if wal_level.trim() != "logical" {
+        eprintln!(
+            "SKIP: test Postgres is wal_level={} (overlap-window proof needs wal_level=logical)",
+            wal_level.trim()
+        );
+        return;
+    }
+
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+    let live = conn(&user, &password, &host, port, &live_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "CREATE TABLE t(id int primary key, v text); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed base rows: {o}");
+
+    // --- driver: a MANAGED Single/default pg binding with delta_capture at the test DSN ---
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            compute: Some("pg".to_string()),
+            database: Some(live_db.clone()),
+            user: Some(user.clone()),
+            delta_capture: true,
+            ..Default::default()
+        },
+    )]);
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    {
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/pg", sealed).await.unwrap();
+    }
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    deploy
+        .set_replica_state(
+            boatramp_core::project::ProjectRef::new("default"),
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: "default".to_string(),
+                    workload: "pg".to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: boatramp_core::compute::Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        DeployStore::new(blobs.clone(), kv.clone()),
+    ));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(databases, deploy, kv.clone(), blobs.clone(), work)
+        .with_managed_pg(backend.clone(), envelope, op, false)
+        .with_resumable_base(Some(resumable.clone()));
+
+    // --- a CONCURRENT writer: single-row INSERT statements, each its own autocommit txn, spread by
+    // pg_sleep so a stream of commits spans the WHOLE base export (and so the slot-create→dump
+    // window). Feeds ONE psql a multi-statement script (container launch per INSERT would be far
+    // too coarse to overlap the window). Ids 1000.. so they never collide with the base rows. ---
+    const WRITER_ROWS: usize = 150;
+    let writer_script = {
+        let mut s = String::new();
+        for k in 0..WRITER_ROWS {
+            let id = 1000 + k;
+            s.push_str(&format!(
+                "INSERT INTO t VALUES ({id},'w{k}'); SELECT pg_sleep(0.025);\n"
+            ));
+        }
+        s
+    };
+    let wbackend = backend.clone();
+    let wimage = image.clone();
+    let wlive = live.clone();
+    let writer = tokio::spawn(async move {
+        // ON_ERROR_STOP would abort on any failure (e.g. a dup key), so a non-zero exit here is a
+        // real problem; assert it succeeded after the join.
+        psql(wbackend.as_ref(), &wimage, &wlive, &writer_script).await
+    });
+    // Let the writer begin committing before the base export's capture orchestration runs.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // --- BASE export: SNAPSHOT-PINNED capture slot + base dump, while the writer commits ---
+    let full = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    drv.export_resumable("default", &full, "base")
+        .await
+        .expect("base resumable export (snapshot-pinned, under concurrent writes)");
+
+    // The base export created exactly one pgoutput slot on this db (the snapshot-pin path).
+    let (_c, slots) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM pg_replication_slots WHERE database = current_database() \
+         AND slot_name LIKE 'brexp_slot_%'",
+    )
+    .await;
+    assert_eq!(
+        slots.trim(),
+        "1",
+        "the base export must create exactly one snapshot-pinned capture slot"
+    );
+
+    // Drain the writer fully, so every concurrent row is committed before we snapshot the
+    // source + take the delta. A clean writer exit (ON_ERROR_STOP) means no INSERT failed.
+    let (wcode, wout) = writer.await.expect("writer task join");
+    assert_eq!(wcode, 0, "the concurrent writer must succeed: {wout}");
+
+    // The source's authoritative post-write state — a compact, order-independent checksum.
+    let checksum_sql = "SELECT count(*)||'|'||coalesce(sum(id),0)||'|'||\
+                        coalesce(md5(string_agg(id||':'||v, ',' ORDER BY id)),'') FROM t";
+    let (_c, source_sum) = psql(backend.as_ref(), &image, &live, checksum_sql).await;
+    // Sanity: the base rows + every writer row are present in the source.
+    assert!(
+        source_sum
+            .trim()
+            .starts_with(&format!("{}|", 3 + WRITER_ROWS)),
+        "source must hold the 3 base rows + {WRITER_ROWS} writer rows: {source_sum}"
+    );
+
+    // --- INCREMENTAL delta export: drains the WAL (every post-snapshot write) into a PgWalDelta ---
+    let delta_opts = ExportOptions {
+        data_only: false,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base".to_string(),
+        }),
+    };
+    drv.export_resumable("default", &delta_opts, "d1")
+        .await
+        .expect("incremental delta export");
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::PgWalReplay,
+        "the delta must be a TRUE WAL delta (snapshot-pin must not have forced a full-dump fallback)"
+    );
+
+    // --- plant a pre-import sentinel so a no-op import can't masquerade as success ---
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "DELETE FROM t; INSERT INTO t VALUES (-1,'SENTINEL_PRE_IMPORT');",
+    )
+    .await;
+    assert_eq!(c, 0, "plant the pre-import sentinel");
+
+    // --- IMPORT the chain: base dump restore + WAL replay + atomic swap ---
+    let report = drv
+        .import_resumable(
+            "default",
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delta chain import under concurrent-write overlap (window must be closed)");
+    assert!(report.pg_databases >= 1, "the pg db must be restored");
+
+    // --- THE PROOF: restored == source. Had any concurrent row landed in BOTH the base dump and
+    // the WAL (the un-pinned overlap bug), the WAL-replay INSERT would have been a duplicate-key
+    // abort (import error, caught above) or left a row mismatch here. Equality ⇒ window closed. ---
+    let (_c, target_sum) = psql(backend.as_ref(), &image, &live, checksum_sql).await;
+    assert_eq!(
+        target_sum.trim(),
+        source_sum.trim(),
+        "the restored db must EXACTLY equal the concurrently-written source (base dump ⊎ WAL replay, \
+         each row exactly once) — the overlap window is closed"
+    );
+
+    for sql in [format!("DROP DATABASE IF EXISTS {live_db}")] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+    println!("PROJECT EXPORT PG OVERLAP-WINDOW OK");
+}
+
 /// LIVE gate (Docker + a `gtid_mode=ON --log-bin --binlog-format=ROW` MySQL): the mysql binlog
 /// true-delta round-trip. Seeds a base, creates a BASE resumable export (which records the snapshot
 /// GTID + start binlog in `mysql_capture.json`), mutates rows (insert/update/delete), takes an

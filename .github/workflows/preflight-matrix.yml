@@ -293,13 +293,13 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 14 live/always-on tests + the 1 pure-unit URL-parser + the 1
+          # HARD gate: the file's 15 live/always-on tests + the 1 pure-unit URL-parser + the 1
           # pure-unit WAL-render-inertness test must ALL actually run (both live DBs reachable,
           # docker usable for the ephemeral client containers) — a self-skip (unset env /
           # unreachable docker) still prints `test result: ok`, so require the exact passed-count
           # AND every one of the file's success markers below.
-          grep -qE 'test result: ok\. 16 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 16 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 17 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 17 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -318,6 +318,8 @@ jobs:
             || { echo "::error::live full-driver pg round-trip (NodeProjectExport::export/import, not the reconstructed primitives) never reached its marker (silent skip or a regression?)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT PG TRUE-DELTA OK' project-export-live.log \
             || { echo "::error::live pg logical-WAL TRUE-DELTA round-trip never reached its marker (silent skip, a WAL-capture/replay regression, or the test pg lacks wal_level=logical)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT PG OVERLAP-WINDOW OK' project-export-live.log \
+            || { echo "::error::live pg true-delta OVERLAP-WINDOW proof never reached its marker (silent skip, or the base↔WAL overlap window reopened — concurrent writes must import cleanly via the snapshot-pin)" >&2; exit 1; }
 
           # --- live mysql (needs BOATRAMP_TEST_MYSQL_URL + docker) ---
           grep -q 'PROJECT EXPORT MYSQL ROUNDTRIP OK' project-export-live.log \

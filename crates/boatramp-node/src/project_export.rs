@@ -82,7 +82,7 @@ use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
     mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
     mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
-    pg_restore_invocation, pg_restore_shadow_invocation, psql_invocation,
+    pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major, psql_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -985,6 +985,30 @@ impl NodeProjectExport {
         let merged = merge_stderr_argv(argv);
         let code = self
             .run_sql_client(image, &merged, env, stdin_path, &out)
+            .await?;
+        let s = tokio::fs::read_to_string(&out).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(&out).await;
+        Ok((code, s.trim().to_string()))
+    }
+
+    /// Like [`run_sql_capture`](Self::run_sql_capture) but WITHOUT the [`merge_stderr_argv`] wrap, so
+    /// the captured stdout is PURE command output and the client's stderr can never co-mingle into
+    /// it. The one caller whose stdout is a DATA payload — the pg WAL drain, whose stdout is the
+    /// hex-encoded `pgoutput` stream (PLAN-sql-true-delta LOW A1) — MUST use this, not the merging
+    /// variant (`merge_stderr_argv` is documented must-NOT-wrap-data). On a non-zero exit
+    /// `run_ephemeral` drops the container's stderr, so the diagnostic is just the exit code (the
+    /// caller fails closed / falls back) — an accepted trade for never corrupting the data stream.
+    async fn run_sql_capture_nomerge(
+        &self,
+        image: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        stdin_path: Option<&Path>,
+        stage_dir: &Path,
+    ) -> Result<(i32, String), Perr> {
+        let out = stage_dir.join(format!("cap-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(image, argv, env, stdin_path, &out)
             .await?;
         let s = tokio::fs::read_to_string(&out).await.unwrap_or_default();
         let _ = tokio::fs::remove_file(&out).await;
@@ -3524,10 +3548,13 @@ impl NodeProjectExport {
         };
 
         // SQL true-delta capture (PLAN-sql-true-delta Stage 2): a BASE (full) resumable export of a
-        // `delta_capture` managed pg db creates the pgoutput slot + publication + ephemeral role
-        // NOW — BEFORE the base dump is produced, so the slot's `restart_lsn` precedes the dump and
-        // a later incremental delta's WAL-since-base is complete. A delta export (`opts.delta`) does
-        // not create slots; it drains the PARENT's slot at plan time (see `plan_delta_export`).
+        // `delta_capture` managed pg db mints the capture's ephemeral REPLICATION role + the
+        // `FOR ALL TABLES` publication NOW (before the slot's consistent point). The pgoutput SLOT
+        // itself is created LATER, SNAPSHOT-PINNED, by `produce_pg_capture_base` in the member loop,
+        // over a held `replication=database` session across `pg_dump --snapshot` — so the base dump
+        // and the slot share one consistent point and the base↔WAL overlap window is CLOSED. A delta
+        // export (`opts.delta`) does not create slots; it drains the PARENT's slot (see
+        // `plan_delta_export`).
         if opts.delta.is_none() {
             self.pg_capture_base_slots(project, dir, &stage_dir).await;
         }
@@ -3554,10 +3581,25 @@ impl NodeProjectExport {
                 && db_from_mysql_member(&spec.path)
                     .and_then(|d| self.databases.get(d))
                     .is_some_and(Self::mysql_capture_eligible);
+            // SQL true-delta (pg WAL, PLAN-sql-true-delta Stage 2): a BASE export of a
+            // capture-eligible managed pg db dumps it SNAPSHOT-PINNED to its just-created capture
+            // slot (close the base↔WAL overlap window) — produced specially regardless of the spec's
+            // framing (every resumable member is one `m{idx}` object). A delta export keeps the
+            // normal production (it drains the parent's slot at plan time).
+            let capture_base_pg = opts.delta.is_none()
+                && spec.kind == MemberKind::PgDump
+                && db_from_pg_member(&spec.path)
+                    .and_then(|d| self.databases.get(d))
+                    .is_some_and(Self::pg_capture_eligible);
             let digest = if capture_base_mysql {
                 let db = db_from_mysql_member(&spec.path).expect("mysql member path");
                 let cfg = self.databases.get(db).expect("capture-eligible db").clone();
                 self.produce_mysql_capture_base(project, dir, idx, db, &cfg, &stage_dir)
+                    .await?
+            } else if capture_base_pg {
+                let db = db_from_pg_member(&spec.path).expect("pg member path");
+                let cfg = self.databases.get(db).expect("capture-eligible db").clone();
+                self.produce_pg_capture_base(project, dir, idx, db, &cfg, &stage_dir)
                     .await?
             } else {
                 let job = jobs.get(&spec.path);
@@ -5260,14 +5302,19 @@ impl NodeProjectExport {
 // pg logical-WAL true-delta: CAPTURE (export) + REPLAY (restore) — PLAN-sql-true-delta Stage 2.
 //
 // CAPTURE. A managed, dedicated/Single pg db with `delta_capture` sources a row-level delta from
-// the server's logical WAL. A BASE (full) resumable export of such a db creates a `pgoutput`
-// logical replication SLOT + a `FOR ALL TABLES` publication + an ephemeral `REPLICATION
-// NOSUPERUSER …` role, recording their names + the slot's consistent-point LSN + the schema
-// fingerprint in a `pg_capture.json` sidecar beside the resumable member objects. An INCREMENTAL
-// delta export then DRAINS the parent's slot (`pg_logical_slot_get_binary_changes` — GET, not peek,
-// so it advances the slot + releases the pinned WAL), length-frames each drained message
-// (`pgoutput::frame_message`) into the `PgWalDelta` member, and DROPS the slot+publication+role
-// (bounded retention, §4). A schema change since the base, a lost/missing slot, or `--mode
+// the server's logical WAL. A BASE (full) resumable export of such a db mints a `FOR ALL TABLES`
+// publication + an ephemeral `REPLICATION NOSUPERUSER …` role, then — SNAPSHOT-PINNED — creates a
+// `pgoutput` logical replication SLOT over a held `replication=database` session across the base
+// `pg_dump --snapshot=<exported snapshot>` (`produce_pg_capture_base`), so the base dump and the
+// slot share ONE consistent point and the base↔WAL overlap window is CLOSED (a write committing in
+// the old slot-create→dump gap now lands in the WAL ONLY, never also in the dump). Their names + the
+// slot's consistent-point LSN + the schema fingerprint are recorded in a `pg_capture.json` sidecar
+// beside the resumable member objects. An INCREMENTAL delta export then DRAINS the parent's slot
+// (`pg_logical_slot_get_binary_changes` — GET, not peek, so it advances the slot + releases the
+// pinned WAL; the drain's hex DATA runs through a NON-merging capture so stderr never co-mingles),
+// length-frames each drained message (`pgoutput::frame_message`) into the `PgWalDelta` member, and
+// DROPS the slot+publication+role (bounded retention, §4 — also on any drain error). A schema change
+// since the base, a lost/missing slot, or `--mode
 // differential` all fall back to a full dump for that db.
 //
 // REPLAY. `restore_pg_true_delta_in_chain` restores the chain's newest FULL dump into the inc2
@@ -5285,6 +5332,29 @@ impl NodeProjectExport {
 /// The capture-sidecar filename written beside a resumable export dir's member objects.
 const PG_CAPTURE_SIDECAR: &str = "pg_capture.json";
 
+/// Stale-resumable-base TTL (§4): how long an abandoned-but-resumable BASE export's capture slot is
+/// shielded from the startup orphan sweep. A legitimate base→delta chain drains + drops its slot
+/// within one base→delta interval; past this age the base is treated as abandoned and the sweep
+/// reclaims the slot's WAL pin (the delta that never came falls back to a full dump). Generous (7
+/// days) so a deliberate multi-day base→delta workflow still true-deltas; the `max_slot_wal_keep_size`
+/// ceiling bounds the disk regardless. Pre-TTL sidecars (no `created_at`) fall back to the file mtime.
+const STALE_RESUMABLE_CAPTURE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The `CREATE_REPLICATION_SLOT` **replication-protocol** command that creates `slot` as a pgoutput
+/// logical slot AND exports a consistent snapshot (the point the slot's WAL decoding starts from),
+/// to be run over a `replication=database` session that stays OPEN across the paired
+/// `pg_dump --snapshot`. PG15+ takes the generic option list `(SNAPSHOT 'export')`; PG9.4–14 takes
+/// the positional `EXPORT_SNAPSHOT` keyword. `slot` is a driver-derived identifier (never bundle
+/// data / a credential), double-quoted for the replication grammar.
+fn create_replication_slot_export_sql(slot: &str, server_version_num: &str) -> String {
+    let slot_q = format!("\"{}\"", slot.replace('"', "\"\""));
+    let opts = match pg_server_major(server_version_num) {
+        Some(m) if m >= 15 => "(SNAPSHOT 'export')",
+        _ => "EXPORT_SNAPSHOT",
+    };
+    format!("CREATE_REPLICATION_SLOT {slot_q} LOGICAL pgoutput {opts};")
+}
+
 /// One managed-pg db's capture artifacts, recorded in the resumable dir's `pg_capture.json` so a
 /// later INCREMENTAL delta (which references this dir as its parent) can drain the slot. Carries
 /// only NON-secret names + the base LSN + the base schema fingerprint — never the ephemeral role's
@@ -5298,12 +5368,23 @@ struct PgCaptureEntry {
     publication: String,
     /// The ephemeral `REPLICATION NOSUPERUSER …` capture role (`brexp_capture_<suffix>`).
     role: String,
-    /// The slot's consistent-point LSN at creation (the point a delta replays FROM).
+    /// The slot's consistent-point LSN — the point a delta replays FROM. EMPTY until the
+    /// SNAPSHOT-PINNED base producer ([`NodeProjectExport::produce_pg_capture_base`]) has created
+    /// the slot and read back its `confirmed_flush_lsn`: `pg_begin_capture` only mints the role +
+    /// publication, so a sidecar entry with an empty `base_lsn` is a slot that was never
+    /// successfully pinned (its delta falls back to a full dump).
     base_lsn: String,
     /// The source schema-ledger fingerprint at capture time. A delta whose current fingerprint
     /// differs MUST fall back to a full dump (logical decoding carries no DDL).
     #[serde(default)]
     schema_fingerprint: Option<String>,
+    /// Unix seconds when this capture was begun (the base's slot minted). Used by the startup
+    /// orphan sweep's stale-resumable-base TTL (§4): an abandoned-but-resumable base older than
+    /// [`STALE_RESUMABLE_CAPTURE_TTL_SECS`] no longer shields its slot from reclamation, so a
+    /// forgotten base's WAL pin is freed instead of being held forever. `0` (a pre-TTL sidecar,
+    /// absent in the JSON) ⇒ fall back to the sidecar file's mtime for the age.
+    #[serde(default)]
+    created_at: u64,
 }
 
 /// A resumable dir's capture sidecar: per-db capture artifacts keyed by the node's DB binding name.
@@ -5316,6 +5397,38 @@ struct PgCaptureSidecar {
 async fn read_pg_capture_sidecar(dir: &Path) -> Option<PgCaptureSidecar> {
     let bytes = tokio::fs::read(dir.join(PG_CAPTURE_SIDECAR)).await.ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// The age (seconds) of a resumable dir's capture sidecar FILE, from its mtime — the fallback age
+/// for the stale-resumable-base TTL (§4 LOW 4b) when a pre-TTL entry carries no `created_at`. A
+/// file we cannot stat / whose mtime is in the future returns `0` (treated as fresh, so the sweep
+/// never reclaims a base it cannot age — fail-safe toward retention).
+async fn pg_capture_sidecar_age_secs(dir: &Path, now: u64) -> u64 {
+    let Ok(meta) = tokio::fs::metadata(dir.join(PG_CAPTURE_SIDECAR)).await else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    let mtime_secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(mtime_secs)
+}
+
+/// Whether a capture sidecar entry still SHIELDS its slot from the startup orphan sweep (§4 LOW 4b):
+/// `true` while the base is within the TTL, `false` once it is stale (abandoned-but-resumable) so the
+/// sweep may reclaim the slot's WAL pin. The entry's age is its own `created_at` when recorded
+/// (`> 0`), else the `file_age_secs` fallback (the sidecar file's mtime, for a pre-TTL entry). Pure
+/// so the §4 TTL decision is unit-mutation-gated (flip the comparison and this flags it).
+fn capture_entry_shielded(created_at: u64, file_age_secs: u64, now: u64, ttl: u64) -> bool {
+    let age = if created_at > 0 {
+        now.saturating_sub(created_at)
+    } else {
+        file_age_secs
+    };
+    age <= ttl
 }
 
 /// Build a capture-role connection by swapping the identity of a superuser connection (same
@@ -5361,11 +5474,19 @@ impl NodeProjectExport {
             .await
     }
 
-    /// Create one managed pg db's capture artifacts at the CURRENT consistent point: an ephemeral
-    /// `REPLICATION NOSUPERUSER …` role + a `FOR ALL TABLES` publication (both by the SUPERUSER),
-    /// then a `pgoutput` logical slot CREATED BY the capture role (least-privilege: the bootstrap
-    /// superuser never creates or reads the WAL stream). Returns the recorded [`PgCaptureEntry`]
-    /// (names + base LSN + schema fingerprint). Rolls back a partial create on failure.
+    /// Create one managed pg db's NON-slot capture artifacts at BASE time: an ephemeral
+    /// `REPLICATION NOSUPERUSER …` role + a `FOR ALL TABLES` publication (both by the SUPERUSER).
+    /// The pgoutput logical SLOT is deliberately NOT created here — it is created SNAPSHOT-PINNED by
+    /// [`produce_pg_capture_base`] over a held `replication=database` session, so the base dump
+    /// (`pg_dump --snapshot=<name>`) and the slot share ONE consistent point and the base↔WAL
+    /// overlap window is closed (PLAN-sql-true-delta Stage-2 MEDIUM). Returns a [`PgCaptureEntry`]
+    /// whose `base_lsn` is EMPTY (pending — the producer fills it from the slot's
+    /// `confirmed_flush_lsn`). Rolls back the role on a publication failure.
+    ///
+    /// The role is created with a throwaway random password: it is never persisted, and the
+    /// snapshot-pinned producer / the drain each RESET it (superuser `ALTER ROLE … PASSWORD`) to a
+    /// fresh value just before use — so no capture-role credential ever lands on disk or outlives
+    /// the one operation that needs it.
     async fn pg_begin_capture(
         &self,
         project: &str,
@@ -5382,11 +5503,12 @@ impl NodeProjectExport {
         let role_q = quote_ident(ExternalSqlKind::Postgres, &role);
         let pub_q = quote_ident(ExternalSqlKind::Postgres, &publication);
 
-        // SUPERUSER: the ephemeral least-privilege REPLICATION role (so the WAL drain is NOT run as
-        // the bootstrap superuser — defence in depth), then the publication. The publication MUST
-        // exist from BASE time (before any change the delta will carry): pgoutput decodes the WAL
-        // against the HISTORICAL catalog snapshot at each change's LSN, so a publication created
-        // later is "not visible" at those LSNs and the drain errors. `FOR ALL TABLES` is
+        // SUPERUSER: the ephemeral least-privilege REPLICATION role (so the WAL drain + the
+        // snapshot-export session are NOT run as the bootstrap superuser — defence in depth), then
+        // the publication. The publication MUST exist before the slot's consistent point (the slot
+        // is created just after, by the snapshot-pinned producer): pgoutput decodes the WAL against
+        // the HISTORICAL catalog snapshot at each change's LSN, so a publication created AFTER a
+        // change's LSN is "not visible" there and the drain errors. `FOR ALL TABLES` is
         // superuser-only; a dedicated/Single db is wholly one tenant's, so it is correct here. The
         // base full dump of a delta_capture db is taken with `pg_dump --no-publications` (see
         // `StageJob::Pg.no_publications`) so this capture publication never lands in the dump and
@@ -5426,46 +5548,269 @@ impl NodeProjectExport {
             )));
         }
 
-        // CAPTURE ROLE: create + own the pgoutput slot (a REPLICATION role may create a logical
-        // slot). The function returns (slot_name, lsn); read the consistent-point LSN as the base.
-        let role_conn = capture_role_conn(&su, &role, &role_pw);
-        let create_slot = format!(
-            "SELECT lsn::text FROM pg_create_logical_replication_slot({}, 'pgoutput')",
-            pg_lit(&slot)
-        );
-        let (code, out) = self
-            .pg_capture_sql(&role_conn, &image, &create_slot, stage_dir)
-            .await?;
-        let base_lsn = out.trim().lines().next().unwrap_or("").trim().to_string();
-        if code != 0 || base_lsn.is_empty() {
-            let _ = self
-                .pg_capture_sql(
-                    &su,
-                    &image,
-                    &format!("DROP PUBLICATION IF EXISTS {pub_q}"),
-                    stage_dir,
-                )
-                .await;
-            let _ = self
-                .pg_capture_sql(
-                    &su,
-                    &image,
-                    &format!("DROP ROLE IF EXISTS {role_q}"),
-                    stage_dir,
-                )
-                .await;
-            return Err(Perr::Other(format!(
-                "pg capture: create logical slot for {db:?} exited {code}: {out}"
-            )));
-        }
         let schema_fingerprint = self.schema_fingerprint(project, db).await;
         Ok(PgCaptureEntry {
             slot,
             publication,
             role,
-            base_lsn,
+            base_lsn: String::new(), // PENDING — produce_pg_capture_base pins + fills it
             schema_fingerprint,
+            created_at: now_secs(),
         })
+    }
+
+    /// Produce ONE capture-eligible managed-pg db's BASE member object, SNAPSHOT-PINNED to its
+    /// capture slot (PLAN-sql-true-delta Stage-2 MEDIUM — close the base↔WAL overlap window). The
+    /// slot (`entry.slot`, minted role + publication already created by `pg_begin_capture`) is
+    /// created here, inside ONE ephemeral client container, over a `replication=database` session
+    /// that is HELD OPEN across the base `pg_dump --snapshot=<exported snapshot>`: the slot's
+    /// consistent point and the dump's snapshot are then the SAME, so a write committing in the old
+    /// slot-create→dump window lands in the WAL ONLY (never ALSO in the dump), and its replay is a
+    /// clean INSERT — not a duplicate-key `ON_ERROR_STOP` abort. On success the sidecar entry's
+    /// `base_lsn` is filled from the slot's `confirmed_flush_lsn` (== the consistent point for a
+    /// freshly-created, un-consumed slot).
+    ///
+    /// Robust + best-effort: if the snapshot-pin cannot be established (replication disabled, an old
+    /// slot can't be dropped, the session/dump errors) it DROPS any partial slot, REMOVES the db's
+    /// sidecar entry (so its future delta falls back to a full dump), and produces a plain
+    /// (un-pinned) base dump — the BASE export still succeeds. Idempotent on resume: a pre-existing
+    /// slot of this name is dropped and re-pinned so the dump and slot always share one point.
+    async fn produce_pg_capture_base(
+        &self,
+        project: &str,
+        dir: &Path,
+        idx: usize,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        stage_dir: &Path,
+    ) -> Result<project_bundle::MemberMeta, Perr> {
+        let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
+        // The capture artifacts `pg_begin_capture` recorded (role + publication + slot NAME). Absent
+        // ⇒ capture never began for this db; fall straight back to a plain base dump.
+        let entry = read_pg_capture_sidecar(dir)
+            .await
+            .and_then(|s| s.dbs.get(db).cloned());
+        let staged = stage_dir.join(format!("pgcap-base-{idx}"));
+
+        if let Some(entry) = entry {
+            match self
+                .pg_snapshot_pinned_dump(
+                    &conn,
+                    &image,
+                    &server_version_num,
+                    &entry,
+                    &staged,
+                    stage_dir,
+                )
+                .await
+            {
+                Ok(base_lsn) => {
+                    // Record the consistent point so the manifest cursor is the slot's own LSN.
+                    self.pg_sidecar_set_base_lsn(dir, db, &base_lsn).await;
+                    let meta = write_member_from_file(dir, idx, &staged).await?;
+                    let _ = tokio::fs::remove_file(&staged).await;
+                    return Ok(meta);
+                }
+                Err(e) => {
+                    tracing::warn!(db = %db, error = %e, "pg delta capture: could not snapshot-pin the base; this db's delta will fall back to a full dump");
+                    // Reclaim the (possibly half-created) slot + forget the entry so neither the
+                    // orphan sweep nor the ceiling has to, and the future delta cleanly full-dumps.
+                    self.pg_drop_capture(project, db, cfg, &entry, stage_dir)
+                        .await;
+                    self.pg_sidecar_remove_db(dir, db).await;
+                }
+            }
+        }
+
+        // FALLBACK: a plain (un-pinned) base dump — robustness over true-delta (best-effort).
+        let _ = tokio::fs::remove_file(&staged).await;
+        let exclude_extensions = self.trusted_extensions.clone();
+        let inv = pg_dump_invocation(
+            &conn,
+            false,
+            &server_version_num,
+            &exclude_extensions,
+            cfg.delta_capture,
+        );
+        let code = self
+            .run_sql_client(&image, &inv.argv, &inv.env, None, &staged)
+            .await?;
+        if code != 0 {
+            let _ = tokio::fs::remove_file(&staged).await;
+            return Err(Perr::Other(format!(
+                "pg capture base fallback dump for {db:?} exited {code}"
+            )));
+        }
+        let meta = write_member_from_file(dir, idx, &staged).await?;
+        let _ = tokio::fs::remove_file(&staged).await;
+        Ok(meta)
+    }
+
+    /// Create `entry.slot` with an EXPORTED SNAPSHOT over a held `replication=database` session and
+    /// run `pg_dump --snapshot=<name>` pinned to it, inside ONE ephemeral container, streaming the
+    /// `-Fc` archive to `staged`. Returns the slot's consistent-point LSN
+    /// (`confirmed_flush_lsn`). The session is the capture role (non-superuser `REPLICATION`); its
+    /// password is RESET fresh by the superuser just before use (never persisted). A pre-existing
+    /// slot of the name is dropped first (idempotent re-pin on resume).
+    async fn pg_snapshot_pinned_dump(
+        &self,
+        conn: &PgConnection,
+        image: &str,
+        server_version_num: &str,
+        entry: &PgCaptureEntry,
+        staged: &Path,
+        stage_dir: &Path,
+    ) -> Result<String, Perr> {
+        let role_q = quote_ident(ExternalSqlKind::Postgres, &entry.role);
+        let slot_lit = pg_lit(&entry.slot);
+        // SUPERUSER: drop any stale slot of this name (prior incomplete run), so the dump + slot
+        // always share one fresh consistent point; never drop one that isn't ours by name.
+        let (code, out) = self
+            .pg_capture_sql(
+                conn,
+                image,
+                &format!(
+                    "SELECT pg_drop_replication_slot({slot_lit}) WHERE EXISTS (SELECT 1 FROM \
+                     pg_replication_slots WHERE slot_name = {slot_lit})"
+                ),
+                stage_dir,
+            )
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: drop stale slot {:?} before re-pin exited {code}: {out}",
+                entry.slot
+            )));
+        }
+        // SUPERUSER: reset the capture role's password to a fresh, never-persisted value so the
+        // held replication session authenticates (mirrors the drain's reset-on-use pattern).
+        let role_pw = random_token();
+        let (code, out) = self
+            .pg_capture_sql(
+                conn,
+                image,
+                &format!("ALTER ROLE {role_q} PASSWORD {}", pg_lit(&role_pw)),
+                stage_dir,
+            )
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: reset capture-role password exited {code}: {out}"
+            )));
+        }
+
+        // The pg_dump flags (NON-pinned) the base would normally use: --no-owner/--no-privileges,
+        // the extension-comment handling, --no-publications (the capture publication must not land
+        // in the dump), -Fc. We append `--snapshot=<exported snapshot>` in the orchestration.
+        let exclude_extensions = self.trusted_extensions.clone();
+        let dump = pg_dump_invocation(conn, false, server_version_num, &exclude_extensions, true);
+        // argv[0] is "pg_dump"; the rest are flags (no credential, no bundle data) — sh-quote them.
+        let dump_flags = sh_join(&dump.argv[1..]);
+        let slot_cmd = create_replication_slot_export_sql(&entry.slot, server_version_num);
+
+        // ONE container runs BOTH the held snapshot-export session (as the capture role) and the
+        // pinned pg_dump (as the tenant conn). The replication session's stdin is a FIFO kept open
+        // by fd 9 so psql never hits EOF (which would close the connection + drop the exported
+        // snapshot); after the dump we close fd 9 to release it. The capture-role password rides in
+        // $BREXP_CAP_PW (env, never argv); the slot name + flags are driver-derived identifiers.
+        let script = format!(
+            r#"set -u
+COORD=$(mktemp) || exit 91
+ERRF=$(mktemp) || exit 91
+FIFO=$(mktemp -u) || exit 91
+mkfifo "$FIFO" || exit 91
+# The held replication session's query result → $COORD; its own stdout → /dev/null so NOTHING but
+# the foreground pg_dump's `-Fc` archive ever reaches the container stdout (the member sink).
+PGPASSWORD="$BREXP_CAP_PW" psql "host=$PGHOST port=$PGPORT user=$BREXP_CAP_ROLE dbname=$PGDATABASE replication=database" -At -F'|' -o "$COORD" <"$FIFO" >/dev/null 2>"$ERRF" &
+REPL=$!
+exec 9>"$FIFO"
+printf '%s\n' {slot_cmd_q} >&9
+SNAP=""
+i=0
+while [ $i -lt 600 ]; do
+  SNAP=$(awk -F'|' 'NR==1{{print $3; exit}}' "$COORD" 2>/dev/null)
+  [ -n "$SNAP" ] && break
+  i=$((i+1)); sleep 0.1
+done
+if [ -z "$SNAP" ]; then
+  echo "brexp: snapshot export failed: $(cat "$ERRF" 2>/dev/null)" >&2
+  exec 9>&-; wait "$REPL" 2>/dev/null; exit 92
+fi
+pg_dump {dump_flags} --snapshot="$SNAP"
+RC=$?
+exec 9>&-
+wait "$REPL" 2>/dev/null
+exit $RC
+"#,
+            slot_cmd_q = sh_join(&[slot_cmd]),
+            dump_flags = dump_flags,
+        );
+        let mut env = conn.env();
+        env.push(("BREXP_CAP_ROLE".to_string(), entry.role.clone()));
+        env.push(("BREXP_CAP_PW".to_string(), role_pw));
+        let argv = vec!["sh".to_string(), "-c".to_string(), script];
+        let code = self
+            .run_sql_client(image, &argv, &env, None, staged)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg capture: snapshot-pinned base dump for slot {:?} exited {code} (snapshot export \
+                 or pg_dump failed)",
+                entry.slot
+            )));
+        }
+        // The slot now exists at its consistent point; read it back as the recorded base cursor.
+        // `confirmed_flush_lsn` of a freshly-created, never-consumed logical slot IS the exported
+        // snapshot's consistent point (verified live). Empty ⇒ the slot vanished ⇒ treat as failure.
+        let (code, lsn) = self
+            .pg_capture_sql(
+                conn,
+                image,
+                &format!(
+                    "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = {slot_lit}"
+                ),
+                stage_dir,
+            )
+            .await?;
+        let lsn = lsn.trim().lines().next().unwrap_or("").trim().to_string();
+        if code != 0 || lsn.is_empty() {
+            return Err(Perr::Other(format!(
+                "pg capture: snapshot-pinned slot {:?} has no confirmed_flush_lsn after creation \
+                 (exit {code})",
+                entry.slot
+            )));
+        }
+        Ok(lsn)
+    }
+
+    /// Set `db`'s `base_lsn` in a resumable dir's capture sidecar (the snapshot-pin producer records
+    /// the slot's consistent point once the slot is created). No-op if the sidecar/entry is gone.
+    async fn pg_sidecar_set_base_lsn(&self, dir: &Path, db: &str, base_lsn: &str) {
+        let Some(mut sidecar) = read_pg_capture_sidecar(dir).await else {
+            return;
+        };
+        if let Some(e) = sidecar.dbs.get_mut(db) {
+            e.base_lsn = base_lsn.to_string();
+            if let Ok(bytes) = serde_json::to_vec_pretty(&sidecar) {
+                let _ = write_atomic(&dir.join(PG_CAPTURE_SIDECAR), &bytes).await;
+            }
+        }
+    }
+
+    /// Remove `db`'s entry from a resumable dir's capture sidecar (the snapshot-pin fell back to a
+    /// plain dump, so there is no slot to drain — the future delta full-dumps). Deletes the sidecar
+    /// file entirely if it becomes empty.
+    async fn pg_sidecar_remove_db(&self, dir: &Path, db: &str) {
+        let Some(mut sidecar) = read_pg_capture_sidecar(dir).await else {
+            return;
+        };
+        if sidecar.dbs.remove(db).is_some() {
+            if sidecar.dbs.is_empty() {
+                let _ = tokio::fs::remove_file(dir.join(PG_CAPTURE_SIDECAR)).await;
+            } else if let Ok(bytes) = serde_json::to_vec_pretty(&sidecar) {
+                let _ = write_atomic(&dir.join(PG_CAPTURE_SIDECAR), &bytes).await;
+            }
+        }
     }
 
     /// Drain one managed pg db's capture slot into a framed `pgoutput` byte stream (the `PgWalDelta`
@@ -5505,7 +5850,9 @@ impl NodeProjectExport {
             return Ok(None);
         }
 
-        // Reset the capture role's password (superuser), so no credential is persisted on disk.
+        // Reset the capture role's password (superuser), so no credential is persisted on disk. A
+        // failure here leaves the slot pinning WAL, so DROP it before returning (§4 LOW 4a:
+        // drop-slot-on-drain-error — reclaim the WAL pin promptly; the delta then full-dumps).
         let role_pw = random_token();
         let (code, out) = self
             .pg_capture_sql(
@@ -5516,6 +5863,8 @@ impl NodeProjectExport {
             )
             .await?;
         if code != 0 {
+            self.pg_drop_capture(project, db, cfg, entry, stage_dir)
+                .await;
             return Err(Perr::Other(format!(
                 "pg capture: reset capture-role password for {db:?} exited {code}: {out}"
             )));
@@ -5523,19 +5872,27 @@ impl NodeProjectExport {
 
         // Drain AS the capture role: GET (not peek) advances the slot + releases its pinned WAL.
         // Each row is one raw pgoutput message; hex-encode it over psql's text output (so a binary
-        // stream survives the client cleanly), decode, and length-frame for the delta member.
+        // stream survives the client cleanly), decode, and length-frame for the delta member. The
+        // drain's stdout IS a DATA payload (the hex stream), so it runs through the NON-merging
+        // capture (§4 LOW A1) — `merge_stderr_argv` must never wrap a data payload, lest a stderr
+        // line co-mingle into the hex. On a non-zero exit stderr is dropped (fail-closed).
         let role_conn = capture_role_conn(&su, &entry.role, &role_pw);
         let drain = format!(
             "SELECT encode(data, 'hex') FROM pg_logical_slot_get_binary_changes({slot_lit}, NULL, \
              NULL, 'proto_version', '1', 'publication_names', {})",
             pg_lit(&entry.publication)
         );
+        let drain_inv = psql_invocation(&role_conn, &drain);
         let (code, out) = self
-            .pg_capture_sql(&role_conn, &image, &drain, stage_dir)
+            .run_sql_capture_nomerge(&image, &drain_inv.argv, &drain_inv.env, None, stage_dir)
             .await?;
         if code != 0 {
+            // §4 LOW 4a: a drain error on a non-`lost`/non-`missing` path reclaims the slot now
+            // (the WAL ceiling would eventually, but promptly is better) — the delta full-dumps.
+            self.pg_drop_capture(project, db, cfg, entry, stage_dir)
+                .await;
             return Err(Perr::Other(format!(
-                "pg capture: drain slot {:?} for {db:?} exited {code}: {out}",
+                "pg capture: drain slot {:?} for {db:?} exited {code}",
                 entry.slot
             )));
         }
@@ -5545,11 +5902,18 @@ impl NodeProjectExport {
             if h.is_empty() {
                 continue;
             }
-            let raw = hex::decode(h).map_err(|e| {
-                Perr::Other(format!(
-                    "pg capture: a drained row is not valid hex for {db:?}: {e}"
-                ))
-            })?;
+            let raw = match hex::decode(h) {
+                Ok(r) => r,
+                Err(e) => {
+                    // A non-hex drained row (never expected on a clean drain) ⇒ reclaim the slot
+                    // (§4 LOW 4a) and fail closed; the delta falls back to a full dump.
+                    self.pg_drop_capture(project, db, cfg, entry, stage_dir)
+                        .await;
+                    return Err(Perr::Other(format!(
+                        "pg capture: a drained row is not valid hex for {db:?}: {e}"
+                    )));
+                }
+            };
             framed.extend_from_slice(&boatramp_core::pgoutput::frame_message(&raw));
         }
 
@@ -5626,6 +5990,13 @@ impl NodeProjectExport {
             return None;
         }
         let entry = sidecar.dbs.get(db)?;
+        // PENDING/INCOMPLETE capture: an empty `base_lsn` is a sidecar entry whose slot was never
+        // successfully snapshot-pinned (the base producer fell back / crashed before filling it), so
+        // there is no reliable slot to drain ⇒ full-dump.
+        if entry.base_lsn.is_empty() {
+            tracing::info!(db = %db, "pg delta: base capture never completed (no pinned slot) — falling back to a full dump");
+            return None;
+        }
         // SCHEMA-FINGERPRINT FALLBACK: a DDL change between base and delta cannot be WAL-replayed.
         // Treat None==None as "unchanged"; any difference (incl. one side absent) forces a dump.
         let current_fp = self.schema_fingerprint(project, db).await;
@@ -5651,15 +6022,20 @@ impl NodeProjectExport {
         }
     }
 
-    /// Collect every capture artifact name (slot / role / publication) a PENDING base still
-    /// references, by scanning the resumable base for `pg_capture.json` sidecars. The orphan sweep
-    /// drops only `brexp_*` artifacts NOT in this set, so a legitimately-pending base→delta chain's
-    /// slot is never reclaimed from under it. Bounded walk; no resumable base ⇒ empty set.
+    /// Collect every capture artifact name (slot / role / publication) a PENDING, NOT-YET-STALE base
+    /// still references, by scanning the resumable base for `pg_capture.json` sidecars. The orphan
+    /// sweep drops only `brexp_*` artifacts NOT in this set, so a legitimately-pending base→delta
+    /// chain's slot is never reclaimed from under it — EXCEPT once the base is older than
+    /// [`STALE_RESUMABLE_CAPTURE_TTL_SECS`] (§4 LOW 4b): a stale entry stops shielding its slot, so an
+    /// abandoned-but-resumable base's WAL pin is reclaimed rather than held forever. An entry's age is
+    /// its recorded `created_at` (falling back to the sidecar file's mtime for a pre-TTL sidecar).
+    /// Bounded walk; no resumable base ⇒ empty set.
     async fn collect_pending_capture_names(&self) -> std::collections::HashSet<String> {
         let mut wanted = std::collections::HashSet::new();
         let Some(base) = self.resumable_base.as_ref() else {
             return wanted;
         };
+        let now = now_secs();
         let mut stack = vec![base.clone()];
         let mut budget = 4096usize; // bound the walk against a pathological tree
         while let Some(dir) = stack.pop() {
@@ -5668,7 +6044,18 @@ impl NodeProjectExport {
             }
             budget -= 1;
             if let Some(sidecar) = read_pg_capture_sidecar(&dir).await {
+                // A pre-TTL sidecar (every entry `created_at == 0`) has no per-entry age — fall back
+                // to the sidecar FILE's mtime as the base's age, computed once per dir.
+                let file_age_secs = pg_capture_sidecar_age_secs(&dir, now).await;
                 for e in sidecar.dbs.values() {
+                    if !capture_entry_shielded(
+                        e.created_at,
+                        file_age_secs,
+                        now,
+                        STALE_RESUMABLE_CAPTURE_TTL_SECS,
+                    ) {
+                        continue; // stale/abandoned base — stop shielding its slot (§4 LOW 4b)
+                    }
                     wanted.insert(e.slot.clone());
                     wanted.insert(e.role.clone());
                     wanted.insert(e.publication.clone());
@@ -5685,15 +6072,18 @@ impl NodeProjectExport {
         wanted
     }
 
-    /// Create fresh capture artifacts for every capture-eligible pg db covered by a BASE (full)
-    /// resumable export, writing them to the dir's `pg_capture.json` sidecar so a later incremental
-    /// delta can drain the slot. The slot's `restart_lsn` must precede the base dump, so this runs
-    /// BEFORE member production. Idempotent on resume (skips if a sidecar already exists). Failure to
-    /// capture one db is NON-fatal: that db simply has no sidecar entry and its future delta
-    /// full-dumps (true-delta is best-effort; the export itself must not fail for it).
+    /// Mint the NON-slot capture artifacts (ephemeral REPLICATION role + `FOR ALL TABLES`
+    /// publication) for every capture-eligible pg db covered by a BASE (full) resumable export,
+    /// writing a PENDING `pg_capture.json` entry (empty `base_lsn`) per db so the later
+    /// snapshot-pinned producer can create the slot + fill the LSN, and so a later incremental delta
+    /// can drain it. The publication must exist before the slot's consistent point, so this runs
+    /// BEFORE member production (the slot is created SNAPSHOT-PINNED during the base dump, see
+    /// [`produce_pg_capture_base`]). Idempotent on resume (skips if a sidecar already exists). Failure
+    /// to begin capture for one db is NON-fatal: that db simply has no sidecar entry and its future
+    /// delta full-dumps (true-delta is best-effort; the export itself must not fail for it).
     async fn pg_capture_base_slots(&self, project: &str, dir: &Path, stage_dir: &Path) {
         if read_pg_capture_sidecar(dir).await.is_some() {
-            return; // resume: slots already created on the first run.
+            return; // resume: role+publication already minted (+ any slot the producer pinned).
         }
         let mut sidecar = PgCaptureSidecar::default();
         for (db, cfg) in &self.databases {
@@ -6931,6 +7321,48 @@ async fn write_member_from_producer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_replication_slot_export_sql_is_version_aware_and_quoted() {
+        // PG15+ takes the generic option list `(SNAPSHOT 'export')`…
+        let pg16 = create_replication_slot_export_sql("brexp_slot_x", "160004");
+        assert_eq!(
+            pg16,
+            "CREATE_REPLICATION_SLOT \"brexp_slot_x\" LOGICAL pgoutput (SNAPSHOT 'export');"
+        );
+        let pg17 = create_replication_slot_export_sql("brexp_slot_x", "170000");
+        assert!(pg17.contains("(SNAPSHOT 'export')"));
+        // …PG9.4–14 take the positional EXPORT_SNAPSHOT keyword.
+        let pg14 = create_replication_slot_export_sql("brexp_slot_x", "140010");
+        assert!(
+            pg14.ends_with("LOGICAL pgoutput EXPORT_SNAPSHOT;"),
+            "pre-15 must use the positional keyword: {pg14}"
+        );
+        // An unparseable banner is conservative (treat as old → positional keyword).
+        let bad = create_replication_slot_export_sql("brexp_slot_x", "garbage");
+        assert!(bad.ends_with("EXPORT_SNAPSHOT;"));
+        // The slot name is double-quoted for the replication grammar, embedded `"` doubled.
+        let weird = create_replication_slot_export_sql("s\"lot", "160004");
+        assert!(
+            weird.contains("\"s\"\"lot\""),
+            "slot name must be quoted: {weird}"
+        );
+    }
+
+    #[test]
+    fn capture_entry_shielded_applies_the_stale_resumable_ttl() {
+        let ttl = STALE_RESUMABLE_CAPTURE_TTL_SECS;
+        let now = 1_000_000u64;
+        // A FRESH base (created just now) is shielded; one older than the TTL is NOT (§4 LOW 4b).
+        assert!(capture_entry_shielded(now - 10, 0, now, ttl));
+        assert!(capture_entry_shielded(now - ttl, 0, now, ttl)); // exactly at the TTL still shielded
+        assert!(!capture_entry_shielded(now - ttl - 1, 0, now, ttl)); // past the TTL → reclaimable
+        // A pre-TTL entry (created_at == 0) falls back to the sidecar FILE age.
+        assert!(capture_entry_shielded(0, ttl - 1, now, ttl)); // recent file → shielded
+        assert!(!capture_entry_shielded(0, ttl + 1, now, ttl)); // old file → stale
+        // A future/garbled created_at never under-ages into staleness (saturating_sub → 0 → shielded).
+        assert!(capture_entry_shielded(now + 5, 0, now, ttl));
+    }
 
     /// Drive the streaming export into an in-memory buffer (the v2 bundle bytes) — the
     /// in-process stand-in for the HTTP response the handler wires the sink to.
