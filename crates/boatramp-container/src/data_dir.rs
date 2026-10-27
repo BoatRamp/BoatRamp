@@ -11,11 +11,27 @@
 //!
 //! [`scan_data_dir_ownership`] is the **read-only** counterpart of that launch-time
 //! `chown_tree_to`: it walks the same tree and reports a fault WITHOUT changing anything.
-//! It lives in this cross-platform module (not the `target_os = "linux"`-gated backend) so
-//! the detection logic is unit-tested on every host; the backend's `ComputeBackend`
+//! It lives in this module (compiled on every host, not the `target_os = "linux"`-gated
+//! backend) so the detection logic is unit-tested on every unix host; the backend's `ComputeBackend`
 //! implementation wires it to a workload's volumes and the expected guest owner.
 
 use std::path::Path;
+
+/// The owner `(uid, gid)` of a filesystem entry. On unix this is the real posix owner; on a
+/// non-unix host (Windows is a release build target) posix ownership does not exist, so this
+/// returns `(0, 0)`. The data-dir-ownership scans below only ever run from the
+/// `target_os = "linux"` container backend, so the non-unix value is never actually observed —
+/// the `#[cfg(not(unix))]` arm exists only so this detection module (deliberately kept out of
+/// the linux-gated backend, to stay unit-tested on every unix host) still COMPILES on Windows.
+#[cfg(unix)]
+fn entry_owner(meta: &std::fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.uid(), meta.gid())
+}
+#[cfg(not(unix))]
+fn entry_owner(_meta: &std::fs::Metadata) -> (u32, u32) {
+    (0, 0)
+}
 
 /// How many foreign-owned entries [`scan_data_dir_ownership`] counts before stopping early
 /// — enough to warn and sample without walking a large tree once the fault is established.
@@ -59,11 +75,11 @@ pub(crate) fn scan_data_dir_ownership(
     gid: u32,
     budget: u64,
 ) -> std::io::Result<OwnershipScan> {
-    use std::os::unix::fs::MetadataExt;
     let mut scan = OwnershipScan::default();
     let consider = |path: &Path, meta: &std::fs::Metadata, scan: &mut OwnershipScan| {
         scan.scanned += 1;
-        if meta.uid() != uid || meta.gid() != gid {
+        let (euid, egid) = entry_owner(meta);
+        if euid != uid || egid != gid {
             scan.foreign += 1;
             if scan.sample.is_none() {
                 let rel = path.strip_prefix(dir).unwrap_or(path);
@@ -72,7 +88,7 @@ pub(crate) fn scan_data_dir_ownership(
                 } else {
                     rel
                 };
-                scan.sample = Some((shown.display().to_string(), meta.uid(), meta.gid()));
+                scan.sample = Some((shown.display().to_string(), euid, egid));
             }
         }
     };
@@ -143,13 +159,12 @@ pub(crate) enum OwnerConsensus {
 /// directory, or one with only its (existing) root and no contents, is [`OwnerConsensus::Empty`]
 /// — a fresh volume the caller does not derive from.
 pub(crate) fn scan_consistent_owner(dir: &Path, budget: u64) -> std::io::Result<OwnerConsensus> {
-    use std::os::unix::fs::MetadataExt;
     let root_meta = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OwnerConsensus::Empty),
         Err(e) => return Err(e),
     };
-    let (first_uid, first_gid) = (root_meta.uid(), root_meta.gid());
+    let (first_uid, first_gid) = entry_owner(&root_meta);
     let mut entries: u64 = 1; // the root itself
     let mut children: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -159,14 +174,15 @@ pub(crate) fn scan_consistent_owner(dir: &Path, budget: u64) -> std::io::Result<
             let meta = std::fs::symlink_metadata(&path)?;
             entries += 1;
             children += 1;
-            if meta.uid() != first_uid || meta.gid() != first_gid {
+            let (euid, egid) = entry_owner(&meta);
+            if euid != first_uid || egid != first_gid {
                 let rel = path.strip_prefix(dir).unwrap_or(&path);
                 return Ok(OwnerConsensus::Mixed {
                     first_uid,
                     first_gid,
                     conflict_path: rel.display().to_string(),
-                    conflict_uid: meta.uid(),
-                    conflict_gid: meta.gid(),
+                    conflict_uid: euid,
+                    conflict_gid: egid,
                 });
             }
             if meta.file_type().is_dir() {
@@ -189,7 +205,7 @@ pub(crate) fn scan_consistent_owner(dir: &Path, budget: u64) -> std::io::Result<
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
