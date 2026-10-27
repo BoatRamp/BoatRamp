@@ -202,9 +202,12 @@ impl ManagedSqlCredentials {
 }
 
 /// One managed database's non-secret connection parts, keyed in [`ManagedDbEnv`]
-/// by the compute **workload** that backs it.
+/// by the compute **workload** that backs it. `Clone` so the deploy-store resolve path
+/// (an APPLIED managed db, synthesized on the fly) can return an owned spec alongside the
+/// borrowed node-static one.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+#[derive(Clone)]
 struct ManagedDbSpec {
     kind: ExternalSqlKind,
     database: String,
@@ -343,9 +346,29 @@ impl ManagedDbEnv {
         )
     }
 
-    /// Resolve the launched `workload` to the [`ManagedDbSpec`] whose server-init env
-    /// it needs. An exact match wins (the base workload — the shared server, or a
-    /// single-tenant install). Otherwise a **`Single` per-tenant** workload
+    /// Resolve the launched `(project, workload)` to the [`ManagedDbSpec`] whose
+    /// server-init env it needs, consulting BOTH the node-static config and — for an
+    /// APPLIED (deploy-store) managed db — the per-project declaration store.
+    ///
+    /// The node-static path ([`resolve_static`](Self::resolve_static)) wins first (no IO);
+    /// only a workload absent from the static config falls through to the deploy store
+    /// ([`resolve_applied`](Self::resolve_applied)). This is what lets a turnkey,
+    /// ENV-configured node (EMPTY node-static `[databases]`) still inject the sealed
+    /// credential into a managed db declared via `boatramp apply`'s `databases:` block
+    /// (stored at `project/<proj>/database/<name>`, launched as the derived
+    /// `bramp-db-<digest>` workload) — the node-default `pg` and any other node-static
+    /// binding are still served by the static path. Returns an OWNED spec (the applied arm
+    /// synthesizes one; the static arm clones its borrow).
+    async fn resolve_spec(&self, project: &str, workload: &str) -> Option<ManagedDbSpec> {
+        if let Some(spec) = self.resolve_static(workload) {
+            return Some(spec.clone());
+        }
+        self.resolve_applied(project, workload).await
+    }
+
+    /// The node-static resolution: resolve `workload` against the config-derived
+    /// [`self.dbs`](Self::dbs) only. An exact match wins (the base workload — the shared
+    /// server, or a single-tenant install). Otherwise a **`Single` per-tenant** workload
     /// `<base>-<tenant_ident>` maps back to its `Single` base spec, so a dedicated
     /// per-tenant container is initialized from the same binding — with its OWN
     /// per-tenant credential, keyed by its OWN `(project, workload)` (the reconcile
@@ -353,7 +376,7 @@ impl ManagedDbEnv {
     /// keys per tenant). A `Shared` base never matches a `-suffixed` name (it spawns
     /// no per-tenant workload), so a stray derived name can never smuggle a Shared
     /// server's credential.
-    fn resolve_spec(&self, workload: &str) -> Option<&ManagedDbSpec> {
+    fn resolve_static(&self, workload: &str) -> Option<&ManagedDbSpec> {
         if let Some(spec) = self.dbs.get(workload) {
             return Some(spec);
         }
@@ -376,13 +399,85 @@ impl ManagedDbEnv {
             .max_by_key(|(base, _)| base.len())
             .map(|(_, spec)| spec)
     }
+
+    /// The APPLIED (deploy-store) resolution: synthesize the [`ManagedDbSpec`] for a
+    /// managed db DECLARED via `boatramp apply` (a `project/<proj>/database/<name>`
+    /// record), when `workload` is the server workload that declaration lowers to.
+    ///
+    /// Every applied managed-db server workload is a DERIVED name
+    /// (`bramp-db-<digest>`, [`derived_workload`](crate::managed_db_declare::derived_workload)) —
+    /// a `Single` per-tenant container carries a `-<ident>` suffix on top. So only a
+    /// `bramp-db-`-prefixed workload can be an applied db; anything else skips the store
+    /// read entirely (the node-static hot path pays no IO). The lookup lists the
+    /// `project`'s declarations and matches the one whose derived server workload equals
+    /// `workload` (exact for `Shared`/default-`Single`, or the `<derived>-<ident>` prefix
+    /// for a non-default `Single` — mirroring [`resolve_static`](Self::resolve_static)),
+    /// then lowers it through the SAME [`lower`](crate::managed_db_declare::lower) the
+    /// provisioner uses, so the synthesized spec's kind/database/user never drift from
+    /// what was provisioned. The sealed credential is keyed by the EXACT launched
+    /// `(project, workload)` the caller then mints/unseals — unchanged — so the init
+    /// password and the handler's connection password still agree by construction.
+    ///
+    /// `project` is the project the workload is REGISTERED under (what the reconcile
+    /// passes): for `Single` that is the declaration's own project (bare `default`, or the
+    /// tenant project for a non-default install); a `Shared` server registered under the
+    /// reserved `default` project only resolves here when its declaration is ALSO under
+    /// `default` (a `Shared` db declared in a non-default project registers its server
+    /// under `default` while its record lives under that other project — it is not
+    /// resolvable from the server's project alone, and so FAILS CLOSED: the empty env
+    /// makes the image refuse to init, surfacing the misconfiguration rather than
+    /// launching with a blank/default password).
+    async fn resolve_applied(&self, project: &str, workload: &str) -> Option<ManagedDbSpec> {
+        use boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX;
+        // Only a derived server workload can be an applied managed db — skip the store
+        // read for every node-static / non-managed workload launch.
+        if !workload.starts_with(DERIVED_MANAGED_DB_PREFIX) {
+            return None;
+        }
+        let declarations = self
+            .deploy
+            .list_project_databases(ProjectRef::new(project))
+            .await
+            .ok()?;
+        for apply_db in &declarations {
+            let derived = crate::managed_db_declare::derived_workload(project, &apply_db.name);
+            let lowered = crate::managed_db_declare::lower(project, apply_db);
+            // Exact (Shared / default Single) or a non-default `Single` per-tenant
+            // `<derived>-<ident>` (gate the prefix match on `Single`, like `resolve_static`
+            // — a `Shared` server never spawns a `-suffixed` per-tenant workload).
+            let is_match = workload == derived
+                || (matches!(lowered.tenant, crate::config::TenantIsolation::Single)
+                    && workload
+                        .strip_prefix(derived.as_str())
+                        .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1));
+            if !is_match {
+                continue;
+            }
+            let (Some(kind), Some(database), Some(user)) = (
+                ExternalSqlKind::parse(&lowered.kind),
+                lowered.database.clone(),
+                lowered.user.clone(),
+            ) else {
+                // A declaration we can't lower to a complete spec — fail closed (empty env),
+                // never a partial/blank credential launch.
+                return None;
+            };
+            return Some(ManagedDbSpec {
+                kind,
+                database,
+                user,
+                tenant: lowered.tenant,
+            });
+        }
+        None
+    }
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[async_trait]
 impl ManagedDbEnvResolver for ManagedDbEnv {
     async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)> {
-        let Some(db) = self.resolve_spec(workload) else {
+        let Some(db) = self.resolve_spec(project, workload).await else {
             return Vec::new();
         };
         // The credential key is the launched `(project, workload)` itself — the bare
@@ -406,8 +501,12 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         }
     }
 
-    fn managed_db_privilege(&self, _project: &str, workload: &str) -> Option<PrivilegeDirective> {
-        let db = self.resolve_spec(workload)?;
+    async fn managed_db_privilege(
+        &self,
+        project: &str,
+        workload: &str,
+    ) -> Option<PrivilegeDirective> {
+        let db = self.resolve_spec(project, workload).await?;
         Some(match self.privilege {
             ManagedDbPrivilege::Rootless => {
                 let (uid, gid) = managed_db_default_ids(db.kind);
@@ -424,7 +523,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         _endpoint: &boatramp_core::compute::Endpoint,
     ) -> Option<bool> {
         // Not a managed database → let the reconcile use the generic `healthy` signal.
-        let db = self.resolve_spec(workload)?;
+        let db = self.resolve_spec(project, workload).await?;
         // Resolve the init superuser's sealed password (same key the server-init env used,
         // so this connects as exactly the user the image initialized). A credential we
         // can't yet resolve means "not ready" (don't claim service-ready blindly).
@@ -447,7 +546,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         _endpoint: &boatramp_core::compute::Endpoint,
     ) -> Result<(), String> {
         // Not a managed database → nothing to provision.
-        let Some(db) = self.resolve_spec(workload) else {
+        let Some(db) = self.resolve_spec(project, workload).await else {
             return Ok(());
         };
         match db.tenant {
@@ -1166,10 +1265,19 @@ impl NodeOperatorSql {
         // to fail closed on any db name that is not a safe URL path segment.
         boatramp_core::project::validate_resource_name("database", db)
             .map_err(|err| SqlError::other(err.to_string()))?;
-        let cfg = self
-            .databases
-            .get(db)
-            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        // Resolve the live binding through the SAME merge point the declare capability uses
+        // (node-static config + the per-project deploy-store declaration, daemon-config-wins).
+        // A node-static binding resolves exactly as before; an APPLIED (deploy-store) managed db
+        // declared via `boatramp apply` on a turnkey node — with EMPTY node-static `[databases]` —
+        // now also resolves here, so `sql exec/query` reaches it (parity with the server-init
+        // credential path). Fails closed: a daemon/manifest same-name conflict is an error, and an
+        // unknown name is "no database named".
+        let resolved =
+            crate::managed_db_declare::resolve_binding(&self.databases, &self.deploy, project, db)
+                .await
+                .map_err(|e| SqlError::other(e.to_string()))?
+                .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let cfg = &resolved;
         let kind = ExternalSqlKind::parse(&cfg.kind).ok_or_else(|| {
             SqlError::other(format!("database {db:?}: unknown engine {:?}", cfg.kind))
         })?;
@@ -1402,10 +1510,19 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
     ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, SqlError> {
         use boatramp_core::sql::SqlPingReplica;
         use std::time::Duration;
-        let cfg = self
-            .databases
-            .get(db)
-            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        // Defense-in-depth, matching `connect_for`: re-run the canonical `database`
+        // validator so a name that is not a safe URL path segment fails closed here too
+        // (not only at the HTTP ingress) and can never reshape the deploy-store key.
+        boatramp_core::project::validate_resource_name("database", db)
+            .map_err(|err| SqlError::other(err.to_string()))?;
+        // Same merge point as `connect_for` — a node-static binding or an APPLIED
+        // (deploy-store) managed db, daemon-config-wins / fail-closed.
+        let resolved =
+            crate::managed_db_declare::resolve_binding(&self.databases, &self.deploy, project, db)
+                .await
+                .map_err(|e| SqlError::other(e.to_string()))?
+                .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let cfg = &resolved;
         // A bring-your-own-URL binding isn't compute-backed, so there is no replica
         // fleet to probe — ping is for managed co-located databases.
         if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
@@ -2950,10 +3067,10 @@ mod tests {
         // The managed workload gets a rootless privilege directive by default; the
         // non-managed ones get none.
         assert_eq!(
-            env.managed_db_privilege("default", "pg"),
+            env.managed_db_privilege("default", "pg").await,
             Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
         );
-        assert_eq!(env.managed_db_privilege("default", "nope"), None);
+        assert_eq!(env.managed_db_privilege("default", "nope").await, None);
 
         // The managed workload gets its server-init env, sealed-password-derived.
         let pg = env.managed_db_env("default", "pg").await;
@@ -2972,6 +3089,154 @@ mod tests {
         // The BYO-credential + BYO-URL workloads are NOT managed here.
         assert!(env.managed_db_env("default", "pg2").await.is_empty());
         assert!(env.managed_db_env("default", "nope").await.is_empty());
+    }
+
+    /// Build a minimal `Single`/`Project` managed-pg [`ApplyDatabase`] (what `boatramp
+    /// apply`'s `databases:` block lowers to) for the applied-db resolve tests.
+    fn applied_pg(name: &str) -> boatramp_core::compute::ApplyDatabase {
+        use boatramp_core::compute::{
+            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
+            ApplyDatabaseTenant,
+        };
+        ApplyDatabase {
+            name: name.to_string(),
+            kind: ApplyDatabaseKind::Postgres,
+            version: None,
+            extensions: vec![],
+            size: ApplyDatabaseSize::Small,
+            tenant: ApplyDatabaseTenant::Single,
+            tenant_scope: ApplyDatabaseScope::Project,
+            read_only: false,
+            rls_session: false,
+            tenant_guc: None,
+            session_guc: None,
+            tenant_all_marker: None,
+            pool_max: None,
+            connect_timeout_secs: None,
+            startup_grace_secs: None,
+            readiness_gate: Default::default(),
+            delta_capture: false,
+            restart_policy: Default::default(),
+        }
+    }
+
+    /// THE TURNKEY RECOVERY GATE — `APPLIED-DB SERVER-INIT ENV RESOLVED`.
+    ///
+    /// A turnkey, ENV-configured node with EMPTY node-static `[databases]` must still
+    /// inject the sealed server-init credential into a managed db DECLARED via `boatramp
+    /// apply` (stored at `project/<proj>/database/<name>`, launched as the derived
+    /// `bramp-db-<digest>` workload). Each assertion observes a CONCRETE outcome (the
+    /// env vars, the password length, the exact sealed key), so a mutation that neuters
+    /// the deploy-store fallback flips a real assertion.
+    #[tokio::test]
+    async fn managed_db_env_resolves_an_applied_db_from_the_deploy_store() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let creds = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
+
+        // (1) A `Single`/`Project` managed pg declared under the reserved `default`
+        // project (the dominant turnkey case). Its server workload is the BARE derived
+        // name (default tenant, no `-<ident>` suffix).
+        let name = "orders";
+        deploy
+            .set_project_database(ProjectRef::new("default"), &applied_pg(name))
+            .await
+            .unwrap();
+
+        // EMPTY node-static config — the whole point: the resolver must still be built
+        // (the node.rs gate fix) and resolve from the deploy store.
+        let env = ManagedDbEnv::from_config(
+            &BTreeMap::new(),
+            creds,
+            ManagedDbPrivilege::default(),
+            deploy.clone(),
+        );
+        assert!(
+            env.is_empty(),
+            "GATE: no node-static managed dbs configured"
+        );
+
+        // The launched workload is the derived `bramp-db-<digest>` of (default, orders).
+        let workload = crate::managed_db_declare::derived_workload("default", name);
+        assert!(
+            workload.starts_with("bramp-db-"),
+            "derived server workload keeps the reserved prefix"
+        );
+
+        // GATE: the applied db resolves — it gets its POSTGRES_* server-init env, with the
+        // declaration's `name` as BOTH database and user (the managed lowering).
+        let e = env.managed_db_env("default", &workload).await;
+        assert!(
+            e.contains(&("POSTGRES_USER".into(), name.into())),
+            "GATE: applied db server-init env must carry POSTGRES_USER: {e:?}"
+        );
+        assert!(
+            e.contains(&("POSTGRES_DB".into(), name.into())),
+            "GATE: applied db server-init env must carry POSTGRES_DB: {e:?}"
+        );
+        let pw = e
+            .iter()
+            .find(|(k, _)| k == "POSTGRES_PASSWORD")
+            .map(|(_, v)| v.clone())
+            .expect("GATE: applied db server-init env must carry POSTGRES_PASSWORD");
+        assert_eq!(
+            pw.len(),
+            64,
+            "GATE: managed 32-byte hex password minted + sealed"
+        );
+
+        // Idempotent — the same sealed credential each call.
+        assert_eq!(env.managed_db_env("default", &workload).await, e);
+
+        // The privilege directive is returned too, so the stock image can init rootless.
+        assert_eq!(
+            env.managed_db_privilege("default", &workload).await,
+            Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 }),
+            "GATE: an applied db still gets the rootless privilege directive"
+        );
+
+        // GATE: init password / connection password AGREE — the handler's connection path
+        // (operator SQL) unseals EXACTLY the same `(project, workload)` key the init env
+        // used. (`creds` moved into `env`; re-key over the shared kv with the same scheme.)
+        let conn = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
+        assert_eq!(
+            conn.password("default", &workload).await.unwrap(),
+            pw,
+            "GATE: the init and handler-connection passwords are the SAME sealed credential"
+        );
+
+        // (2) A `Single`/`Project` applied db under a NON-default project launches a
+        // per-tenant `<derived>-<ident>` workload — the prefix arm must resolve it too.
+        deploy
+            .set_project_database(ProjectRef::new("acme"), &applied_pg(name))
+            .await
+            .unwrap();
+        let derived_acme = crate::managed_db_declare::derived_workload("acme", name);
+        let ident = boatramp_storage::tenant_provision::sanitize_ident("acme");
+        let per_tenant = format!("{derived_acme}-{ident}");
+        let e2 = env.managed_db_env("acme", &per_tenant).await;
+        assert!(
+            e2.contains(&("POSTGRES_DB".into(), name.into())),
+            "GATE: a non-default Single applied db's per-tenant workload resolves: {e2:?}"
+        );
+
+        // MUTATION SENSE — fail closed: a `bramp-db-`-shaped workload with NO matching
+        // declaration resolves to NOTHING (empty env ⇒ image refuses to init), and a
+        // non-prefixed unknown workload never even reads the store.
+        assert!(
+            env.managed_db_env("default", "bramp-db-0000000000000000000000000")
+                .await
+                .is_empty(),
+            "GATE: an unmatched derived workload fails closed (no blank credential)"
+        );
+        assert!(env.managed_db_env("default", "random").await.is_empty());
+        assert!(
+            env.managed_db_privilege("default", "bramp-db-0000000000000000000000000")
+                .await
+                .is_none()
+        );
+
+        println!("APPLIED-DB SERVER-INIT ENV RESOLVED");
     }
 
     /// L3: when one `Single` compute base (`pg`) is a `-`-prefix of another
@@ -3024,7 +3289,7 @@ mod tests {
 
         // The privilege lookup uses the same resolver, so it is unambiguous too.
         assert_eq!(
-            env.managed_db_privilege("acme", "pg-metrics-acme"),
+            env.managed_db_privilege("acme", "pg-metrics-acme").await,
             Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
         );
     }

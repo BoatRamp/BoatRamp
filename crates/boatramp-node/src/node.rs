@@ -638,35 +638,47 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // moves the original.
     #[cfg(feature = "project-export")]
     let export_envelope = secrets_envelope.clone();
+    // Build the managed-DB server-init credential injector whenever a secrets envelope is
+    // present — NOT only when the node-static `[databases]` map is non-empty. A turnkey,
+    // ENV-configured node with EMPTY node-static `[databases]` still has APPLIED managed dbs
+    // (declared via `boatramp apply`, stored in the deploy store, launched as a derived
+    // `bramp-db-<digest>` workload); the resolver resolves those from the deploy store at launch
+    // (`ManagedDbEnv::resolve_spec`), so without this the fresh applied db would launch with no
+    // `POSTGRES_*`/`MYSQL_*` env and the stock image would refuse to `initdb`. The resolver is a
+    // no-op for every non-managed workload, so building it unconditionally (given an envelope) is
+    // safe. (Same relaxation the declarative capability already applies — a node with no
+    // node-static databases can still serve a project declaration.) No envelope ⇒ `None`: a
+    // managed DB requires one to seal its credential, so there is nothing to inject.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
-        config
-            .handlers
-            .as_ref()
-            .and_then(|h| h.bindings.sql.as_ref()),
-        secrets_envelope,
-    ) {
-        (Some(sql), Some(envelope)) if !sql.databases.is_empty() => {
-            // Crown-jewel (C2): sealed managed-DB credentials go through the frontier-syncing
-            // `secrets_kv`, so a freshly-minted DB credential is past the durable frontier before
-            // the workload sees it — never droppable by the self-heal-on-open trailing-tail quarantine.
-            let creds =
-                crate::managed_sql::ManagedSqlCredentials::new(secrets_kv.clone(), envelope);
-            let privilege = config
-                .compute
-                .as_ref()
-                .map(|c| c.managed_db_privilege)
-                .unwrap_or_default();
-            let env = crate::managed_sql::ManagedDbEnv::from_config(
-                &sql.databases,
-                creds,
-                privilege,
-                deploy.clone(),
-            );
-            (!env.is_empty()).then(|| Arc::new(env) as Arc<_>)
-        }
-        _ => None,
-    };
+    let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> =
+        match secrets_envelope {
+            Some(envelope) => {
+                let static_dbs = config
+                    .handlers
+                    .as_ref()
+                    .and_then(|h| h.bindings.sql.as_ref())
+                    .map(|sql| sql.databases.clone())
+                    .unwrap_or_default();
+                // Crown-jewel (C2): sealed managed-DB credentials go through the frontier-syncing
+                // `secrets_kv`, so a freshly-minted DB credential is past the durable frontier before
+                // the workload sees it — never droppable by the self-heal-on-open trailing-tail quarantine.
+                let creds =
+                    crate::managed_sql::ManagedSqlCredentials::new(secrets_kv.clone(), envelope);
+                let privilege = config
+                    .compute
+                    .as_ref()
+                    .map(|c| c.managed_db_privilege)
+                    .unwrap_or_default();
+                let env = crate::managed_sql::ManagedDbEnv::from_config(
+                    &static_dbs,
+                    creds,
+                    privilege,
+                    deploy.clone(),
+                );
+                Some(Arc::new(env) as Arc<_>)
+            }
+            None => None,
+        };
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = None;
 
@@ -704,59 +716,75 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // stays sqlx-only — a libsql file has no operator-SQL/credential seam.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>;
-    // Late-init: the match arms assign it (and, under sqlx, `operator_sql` in the same block), and the
-    // arms differ by feature-cfg — so a direct `let … = match {…}` would need cfg'd arm bodies. The
-    // late-init keeps that readable; the value is always assigned before use.
+    // Late-init: the `if want_sql_substrate` branches below assign it (and, under sqlx,
+    // `operator_sql` in the same block), and the bodies differ by feature-cfg — so a direct
+    // `let … = if {…}` would need cfg'd branch bodies. The late-init keeps that readable; the
+    // value is always assigned before use.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
     #[allow(clippy::needless_late_init)]
     let migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>;
+    // Build the operator-SQL / migration substrate when the node has a node-static `databases`
+    // map OR — under a sqlx engine — a secrets envelope. The envelope case is the turnkey,
+    // ENV-configured node with EMPTY node-static `[databases]`: it can still have APPLIED managed
+    // dbs (declared via `boatramp apply`, in the deploy store) that `sql exec/query` must reach,
+    // and `NodeOperatorSql` resolves those through the SAME merge point the declare capability
+    // uses. (A `migrate`-only node has no managed-credential seam, so it still builds the libsql
+    // substrate only when a `libsql` binding is actually declared in the static config.)
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
-    match config
+    let sql_static_dbs = config
         .handlers
         .as_ref()
         .and_then(|h| h.bindings.sql.as_ref())
-        .filter(|sql| !sql.databases.is_empty())
-    {
-        Some(sql) => {
-            // The sqlx (Postgres/MySQL) arm — the shared NodeOperatorSql backs both the operator-SQL
-            // cap and the sqlx migration runner. Only built when a sqlx engine is compiled in.
+        .map(|sql| sql.databases.clone())
+        .unwrap_or_default();
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let want_sql_substrate = !sql_static_dbs.is_empty() || operator_envelope.is_some();
+    #[cfg(all(
+        not(any(feature = "sql-postgres", feature = "sql-mysql")),
+        feature = "migrate"
+    ))]
+    let want_sql_substrate = !sql_static_dbs.is_empty();
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
+    if want_sql_substrate {
+        // The sqlx (Postgres/MySQL) arm — the shared NodeOperatorSql backs both the operator-SQL
+        // cap and the sqlx migration runner. Only built when a sqlx engine is compiled in.
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        let node_op = Arc::new(crate::managed_sql::NodeOperatorSql::new(
+            sql_static_dbs.clone(),
+            kv.clone(),
+            operator_envelope,
+            deploy.clone(),
+        ));
+        // The operator's trusted-extension allowlist — the only extensions a migration may
+        // enable (empty ⇒ none). See ExternalSqlConfig::migrate_trusted_extensions.
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        let trusted: std::collections::BTreeSet<String> = config
+            .handlers
+            .as_ref()
+            .and_then(|h| h.bindings.sql.as_ref())
+            .and_then(|sql| sql.migrate_trusted_extensions.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        migration_substrate = Some(Arc::new(crate::managed_sql::DispatchMigrationRunner::new(
             #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-            let node_op = Arc::new(crate::managed_sql::NodeOperatorSql::new(
-                sql.databases.clone(),
-                kv.clone(),
-                operator_envelope,
-                deploy.clone(),
-            ));
-            // The operator's trusted-extension allowlist — the only extensions a migration may
-            // enable (empty ⇒ none). See ExternalSqlConfig::migrate_trusted_extensions.
+            node_op.clone(),
             #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-            let trusted: std::collections::BTreeSet<String> = sql
-                .migrate_trusted_extensions
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            migration_substrate = Some(Arc::new(crate::managed_sql::DispatchMigrationRunner::new(
-                #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-                node_op.clone(),
-                #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-                trusted,
-                #[cfg(feature = "migrate")]
-                sql.databases.clone(),
-            ))
-                as Arc<dyn boatramp_core::sql::MigrationSubstrate>);
-            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-            {
-                operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
-            }
+            trusted,
+            #[cfg(feature = "migrate")]
+            sql_static_dbs.clone(),
+        ))
+            as Arc<dyn boatramp_core::sql::MigrationSubstrate>);
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
         }
-        None => {
-            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-            {
-                operator_sql = None;
-            }
-            migration_substrate = None;
+    } else {
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            operator_sql = None;
         }
+        migration_substrate = None;
     }
     // When only `migrate` (no sqlx) is compiled, the operator-SQL cap does not exist.
     #[cfg(all(

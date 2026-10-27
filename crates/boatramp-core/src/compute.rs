@@ -1351,10 +1351,16 @@ pub trait ManagedDbEnvResolver: Send + Sync {
 
     /// The privilege strategy that lets `workload`'s stock DB image initialize on a
     /// shared-kernel backend, or `None` if `workload` is not a managed database.
-    /// Sync + defaulted so a non-DB resolver needs no change. The reconcile applies it
-    /// to the **launch** spec only (never the stored one), and only when the operator
-    /// has not already set `user`/`cap_add`.
-    fn managed_db_privilege(&self, _project: &str, _workload: &str) -> Option<PrivilegeDirective> {
+    /// Defaulted so a non-DB resolver needs no change. The reconcile applies it to the
+    /// **launch** spec only (never the stored one), and only when the operator has not
+    /// already set `user`/`cap_add`. Async because resolving whether `workload` is a
+    /// managed database may require a control-plane lookup (an APPLIED, deploy-store
+    /// managed db on an env-configured node, which carries no node-static config entry).
+    async fn managed_db_privilege(
+        &self,
+        _project: &str,
+        _workload: &str,
+    ) -> Option<PrivilegeDirective> {
         None
     }
 
@@ -1910,8 +1916,10 @@ pub async fn reconcile_once(
                     // cap allowlist) so its stock image can init on a shared-kernel
                     // backend; applied to the launch spec only, and only where the
                     // operator has not set `user`/`cap_add` already.
-                    let privilege =
-                        managed_db.and_then(|m| m.managed_db_privilege(&project_name, &wl));
+                    let privilege = match managed_db {
+                        Some(m) => m.managed_db_privilege(&project_name, &wl).await,
+                        None => None,
+                    };
                     match launch_one(
                         b.as_ref(),
                         &project_name,
