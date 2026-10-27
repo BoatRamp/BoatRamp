@@ -2960,10 +2960,24 @@ fn resolve_mapping_decision(
         .into_iter()
         .map(|k| match k {
             Kind::ReadAsIs => None,
-            Kind::Fresh => Some((
-                base.saturating_add(guest_uid),
-                base.saturating_add(guest_gid),
-            )),
+            // Pre-own a FRESH dir AS the workload's RUNTIME uid under the workload base, NOT the
+            // entrypoint/spec `guest_uid`. A managed DB's stock entrypoint drops to its image
+            // runtime uid (e.g. postgres:999) and, on a cap-dropped node (no CAP_CHOWN), cannot
+            // re-own PGDATA itself — a dir left at `base + guest_uid` (= base+0 for a root
+            // entrypoint) is container-root-owned and the entrypoint's `chown` EPERMs before
+            // initdb. Owning the fresh dir at `base + runtime` mirrors exactly the ownership a
+            // REUSED dir is read at (chown=None on an `owner == base + runtime` dir), so initdb
+            // needs no chown. `runtime` is the detected managed-DB uid, or the spec guest uid for
+            // a non-DB workload (set in `resolve_volume_mapping`), so `base + runtime` equals the
+            // old `base + guest` for non-DB — unchanged there. Fall back to guest only when a
+            // managed image's uid is unreadable.
+            Kind::Fresh => Some(match runtime {
+                Some((u, g)) => (base.saturating_add(u), base.saturating_add(g)),
+                None => (
+                    base.saturating_add(guest_uid),
+                    base.saturating_add(guest_gid),
+                ),
+            }),
             // Remap an unmappable reused dir to the runtime user UNDER the workload base, so it
             // is readable as-is afterwards (relabel only — never a reinit). `runtime` is `Some`
             // here (an unmappable Uniform already required it above).
@@ -3901,6 +3915,28 @@ mod tests {
                 chowns: vec![Some((UB + 999, UB + 999))]
             }
         );
+    }
+
+    #[test]
+    fn mapping_decision_fresh_managed_db_chowns_to_runtime_uid_not_entrypoint() {
+        // A managed DB with a ROOT entrypoint: spec/guest uid 0, but the DB runs as the DETECTED
+        // image runtime uid (postgres 999). A FRESH dir must be pre-owned as `base + RUNTIME`
+        // (base+999), NOT `base + guest` (base+0 = container root) — else a cap-dropped entrypoint
+        // (no CAP_CHOWN) can't re-own PGDATA to postgres and initdb EPERMs. This reproduces the
+        // Provisor `control`/bramp-db crash-loop: Empty consensus, guest 0, runtime 999.
+        let v = [vol("data", OwnerConsensus::Empty)];
+        let m = resolve_mapping_decision(&v, 0, 0, Some((999, 999)), false, UB, true)
+            .expect("fresh managed-DB dir maps");
+        assert_eq!(
+            m,
+            ResolvedMapping {
+                base: UB,
+                chowns: vec![Some((UB + 999, UB + 999))]
+            },
+            "fresh managed-DB dir pre-owned as base+runtime (postgres 999), not base+guest (root 0)"
+        );
+        // The OLD code chowned to base+guest = UB+0 = UB (container root), which a cap-dropped
+        // entrypoint could not re-own → the crash-loop. Mutation: revert to guest_uid here.
     }
 
     #[test]
