@@ -83,6 +83,11 @@ fs = ["boatramp-storage/fs", "boatramp-node/fs", "fallback"]
 # `project export|import` client verbs are always built (thin HTTP clients); this
 # gates the SERVE-side capability that answers `/api/project-{export,import}`.
 project-export = ["sql-postgres", "fs", "boatramp-node/project-export"]
+# The libsql/SQLite changeset true-delta engine for env-clone (SQL true-delta program, Stage 4):
+# turns on `boatramp-node/sql-delta-libsql` (which pulls the storage crate's session/changeset
+# engine). Implies `project-export`. OFF by default until proven; `--all-features` (the shipped
+# binary) + the CI project-export gate opt it in.
+sql-delta-libsql = ["project-export", "boatramp-node/sql-delta-libsql"]
 # The `boatramp forward` overlay client-edge (IU-10): binds a local listener and
 # forwards connections into the cluster over the relay-blind overlay fabric.
 # `dep:async-trait` is for the `LiveExposers` impl bridging the shared reverse-ingress registry into

@@ -71,6 +71,13 @@ sql = ["dep:libsql", "dep:reqwest", "dep:sqlparser", "tokio/sync"]
 # chrono/uuid/bigdecimal/json features are set on the workspace `sqlx` dep).
 sql-postgres = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/postgres"]
 sql-mysql = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/mysql"]
+# The libsql/SQLite CHANGESET true-delta engine (`sql_libsql_changeset`; SQL true-delta program,
+# Stage 4). Pulls `libsql-ffi` with the SQLite `session`/`preupdate_hook` extensions ON so the
+# offline file-based capture (session diff of a base snapshot vs the current DB) + the confined
+# replay (`sqlite3changeset_apply` with a base-table filter + abort-on-conflict) are available.
+# Needs the libsql backend (`sql`) for the snapshot/shadow primitives it reuses. OFF by default
+# until proven; the managed/CI build opts it in.
+sql-delta-libsql = ["sql", "dep:libsql-ffi", "dep:sha2", "dep:hex"]
 # A bounded local read-through cache over any `Storage`:
 # clustered/CF nodes front the shared object store with a hot-blob cache.
 cache = ["dep:lru", "dep:bytes"]
@@ -184,6 +191,9 @@ azure_storage_queue = { workspace = true, optional = true }
 # shared-key auth, so `azure_shared_key` hand-rolls Azure's HMAC-SHA256 string-to-sign.
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Streaming SHA-256 of the libsql delta base snapshot (bounded memory, no whole-file read) +
+# its hex compare against the recorded cursor — behind `sql-delta-libsql`.
+hex = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -195,6 +205,11 @@ serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true, optional = true }
 object_store = { version = "0.14", features = ["aws"], optional = true }
 libsql = { workspace = true, optional = true }
+# Raw SQLite FFI with the `session`/`preupdate_hook` extensions ON — the libsql changeset
+# true-delta engine (`sql_libsql_changeset`, behind `sql-delta-libsql`). The SAME `libsql-ffi`
+# the `libsql` crate already pulls transitively (features unify to ONE SQLite build), so no
+# second amalgamation and no symbol collision.
+libsql-ffi = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 # Only to name `log::LevelFilter::Off` when disabling sqlx statement logging on the

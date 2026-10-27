@@ -297,6 +297,18 @@ libsql = { version = "0.9", default-features = false, features = [
   "tls",
 ] }
 
+# The RAW SQLite FFI the `libsql` crate is built on (same `libsql-ffi` it pulls
+# transitively — one SQLite in the graph, no second amalgamation / no symbol
+# collision). Pulled DIRECTLY only behind `boatramp-storage/sql-delta-libsql` to
+# turn ON the SQLite `session`/`preupdate_hook` extensions (compiled from the
+# crate's PRE-GENERATED bindings — no libclang at build time, so musl-safe) for the
+# libsql changeset true-delta engine (SQL true-delta program, Stage 4). Off by
+# default; the managed/CI build opts it in.
+libsql-ffi = { version = "0.9", default-features = false, features = [
+  "session",
+  "preupdate_hook",
+] }
+
 # External bring-your-own SQL databases for the handler `sql` binding: an
 # operator-configured Postgres/MySQL a function/handler opens by name (isolation
 # is the operator's — it's their DB — so these bypass the per-site libsql

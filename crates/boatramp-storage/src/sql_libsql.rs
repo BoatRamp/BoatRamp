@@ -1238,6 +1238,167 @@ impl LibsqlSqlBackends {
         Ok(())
     }
 
+    /// **Snapshot a local libsql DB as a DELTA BASE** (SQL true-delta program, Stage 4): a
+    /// VACUUM-INTO + integrity-checked copy at `dest` (via [`Self::snapshot_into`]) whose SHA-256 is
+    /// returned as the base CURSOR. A later incremental/differential delta diffs the live DB against
+    /// this exact file, and the restore applies the changeset onto it — so the sha both NAMES the
+    /// base and lets capture + restore prove they are working from the same bytes. Local single-node
+    /// only (inherited from `snapshot_into`).
+    #[cfg(feature = "sql-delta-libsql")]
+    pub async fn snapshot_delta_base(
+        &self,
+        site: &str,
+        name: &str,
+        dest: &Path,
+    ) -> Result<String, SqlError> {
+        self.snapshot_into(site, name, dest).await?;
+        // Stream the sha (bounded memory — a site DB can be large; never read it whole).
+        let d = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || stream_sha256_hex(&d))
+            .await
+            .map_err(|e| SqlError::other(format!("libsql base hash task failed: {e}")))?
+            .map_err(SqlError::other)
+    }
+
+    /// **Capture a libsql CHANGESET delta** (Stage 4) of the live `(site, name)` DB against the
+    /// stored `base_snapshot` (whose SHA-256 must equal `base_sha256`). Snapshots the current DB into
+    /// `scratch_dir` (online-consistent VACUUM INTO), then diffs base→current with the SQLite session
+    /// engine off the async runtime (`spawn_blocking` — the FFI is sync). A missing base snapshot or
+    /// a sha mismatch yields a [`ChangesetCapture::Fallback`] (NOT an error — the caller full-dumps
+    /// the DB instead), as does any schema/PK/diff condition the engine reports.
+    #[cfg(feature = "sql-delta-libsql")]
+    pub async fn capture_delta_changeset(
+        &self,
+        site: &str,
+        name: &str,
+        base_snapshot: &Path,
+        base_sha256: &str,
+        scratch_dir: &Path,
+    ) -> Result<crate::sql_libsql_changeset::ChangesetCapture, SqlError> {
+        use crate::sql_libsql_changeset::ChangesetCapture;
+        // The base snapshot must exist AND hash to the recorded cursor; otherwise we cannot trust it
+        // as the diff base → fall back to a full dump (the delta is still a complete bundle). Hash it
+        // by STREAMING (bounded memory — the base is a whole site DB, never loaded whole), off the
+        // async runtime. A missing file or a mismatch is a FALLBACK, never a hard error here.
+        let base_for_hash = base_snapshot.to_path_buf();
+        let hash_res = tokio::task::spawn_blocking(move || stream_sha256_hex(&base_for_hash))
+            .await
+            .map_err(|e| SqlError::other(format!("libsql base hash task failed: {e}")))?;
+        match hash_res {
+            Ok(h) if h == base_sha256 => {}
+            Ok(_) => {
+                return Ok(ChangesetCapture::Fallback(
+                    "libsql base snapshot sha mismatch (base changed/corrupt) — full-dump fallback"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Ok(ChangesetCapture::Fallback(
+                    "libsql base snapshot missing/unreadable — full-dump fallback".into(),
+                ));
+            }
+        }
+        tokio::fs::create_dir_all(scratch_dir)
+            .await
+            .map_err(SqlError::other)?;
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let current = scratch_dir.join(format!("delta-current-{uniq}-{}.db", std::process::id()));
+        // Clear any stale stub so VACUUM INTO is the sole writer.
+        remove_db_files(&current);
+        self.snapshot_into(site, name, &current).await?;
+        let base = base_snapshot.to_path_buf();
+        let cur = current.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::sql_libsql_changeset::capture_changeset(&base, &cur)
+        })
+        .await
+        .map_err(|e| SqlError::other(format!("libsql changeset capture task failed: {e}")))?;
+        remove_db_files(&current);
+        outcome
+    }
+
+    /// **Restore a libsql delta CHAIN into the atomic shadow** (Stage 4): copy the verified base
+    /// snapshot into a FRESH `*.shadow_*` beside live, apply each `changeset` onto it (confined to
+    /// the base's own tables, abort-on-conflict — [`crate::sql_libsql_changeset::apply_changeset_confined`]),
+    /// `integrity_check`, then atomically rename the shadow over live. On ANY failure the shadow is
+    /// removed and live is NEVER renamed-over (all-or-nothing, like the `.dump` shadow restore).
+    /// `base_snapshot`'s SHA-256 MUST equal `base_sha256` (a corrupt/mismatched base is a hard error
+    /// here, not a fallback — restore cannot choose a different base). Overwriting a non-empty live is
+    /// gated on `overwrite`. Local single-node only.
+    #[cfg(feature = "sql-delta-libsql")]
+    pub async fn restore_delta_changeset_chain(
+        &self,
+        site: &str,
+        name: &str,
+        base_snapshot: &Path,
+        base_sha256: &str,
+        changesets: Vec<Vec<u8>>,
+        overwrite: bool,
+    ) -> Result<(), SqlError> {
+        let Mode::Local { dir } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql changeset restore is supported for local single-node databases only",
+            ));
+        };
+        validate_site_ident(site)?;
+        let canon = canonical_name(name);
+        let live = Self::resolve_local_path(dir, site, canon);
+        if let Ok(meta) = std::fs::metadata(&live)
+            && meta.len() > 0
+            && !overwrite
+        {
+            return Err(SqlError::other(format!(
+                "destination database already exists (refusing to overwrite): {}",
+                live.display()
+            )));
+        }
+        if let Some(parent) = live.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        let shadow = shadow_path_for(&live);
+        remove_db_files(&shadow);
+        // Stage the base into the shadow, VERIFY the COPY's sha against the recorded cursor, then
+        // apply the changesets + integrity-check — all off the runtime (the FFI apply is sync). The
+        // base is COPIED first (bounded memory — `std::fs::copy` streams; never a whole-file read)
+        // and the sha is taken over the SHADOW we actually apply onto, so a mismatched/corrupt base
+        // is a hard error AND there is no read-then-copy TOCTOU (the verified bytes are the applied
+        // bytes). Any error removes the shadow and leaves live untouched.
+        let shadow_cl = shadow.clone();
+        let base_cl = base_snapshot.to_path_buf();
+        let expected_sha = base_sha256.to_string();
+        let staged: Result<(), SqlError> = tokio::task::spawn_blocking(move || {
+            std::fs::copy(&base_cl, &shadow_cl).map_err(|e| {
+                SqlError::other(format!(
+                    "libsql changeset restore: copying base snapshot {}: {e}",
+                    base_cl.display()
+                ))
+            })?;
+            let got = stream_sha256_hex(&shadow_cl).map_err(SqlError::other)?;
+            if got != expected_sha {
+                return Err(SqlError::other(
+                    "libsql changeset restore: base snapshot sha mismatch — the chain's base does \
+                     not match the changeset's recorded base cursor (refusing a mismatched replay)",
+                ));
+            }
+            for cs in &changesets {
+                crate::sql_libsql_changeset::apply_changeset_confined(&shadow_cl, cs)?;
+            }
+            crate::sql_libsql_changeset::verify_integrity(&shadow_cl)
+        })
+        .await
+        .map_err(|e| SqlError::other(format!("libsql changeset restore task failed: {e}")))?;
+        if let Err(e) = staged {
+            remove_db_files(&shadow);
+            return Err(e);
+        }
+        // Verified — atomically swap the shadow in for live, then evict the cached handle.
+        self.finalize_shadow_swap(&shadow, &live, (site.to_string(), canon.to_string()))
+            .await
+    }
+
     /// Sweep stale `*.shadow_*` libsql files left by a crash mid-shadow-restore (the RAII guard
     /// only fires in-process). Recursively removes any `*.shadow_*` file (and its sidecars) under
     /// the local data dir. A no-op for a remote backend. Call once at node startup.
@@ -1682,6 +1843,26 @@ fn shadow_apply_authorizer() -> AuthHook {
         }
         Authorization::Allow
     })
+}
+
+/// Streaming SHA-256 (lowercase hex) of a file — reads in bounded 64 KiB chunks so a large (or an
+/// attacker-sized) base snapshot is never loaded whole into memory (the libsql delta base-snapshot
+/// read, which is NOT a size-capped bundle member). The libsql changeset engine's hash primitive.
+#[cfg(feature = "sql-delta-libsql")]
+fn stream_sha256_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// A `<live>.shadow_<nanos>_<pid>` path in the SAME directory as `live`, so a later `std::fs::rename`

@@ -135,6 +135,12 @@ sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 # for the shadow restore + the binlog true-delta engine) and a local blob backend (fs)
 # for the blob staging store.
 project-export = ["sql-postgres", "sql-mysql", "fs", "dep:tokio-util"]
+# The libsql/SQLite CHANGESET true-delta engine for the export driver (SQL true-delta program,
+# Stage 4): wires the capture (session diff of a base snapshot vs the current DB) + the confined
+# replay (`sqlite3changeset_apply`) into `plan_delta_export`/`import_delta_chain`, via the storage
+# crate's `sql-delta-libsql` engine (which turns ON the SQLite session/preupdate_hook extensions).
+# Implies `project-export`. OFF by default until proven; the managed/CI build opts it in.
+sql-delta-libsql = ["project-export", "boatramp-storage/sql-delta-libsql"]
 # The per-project SMTP email gateway (`boatramp:handlers/email`): wires the profile
 # store + delivery spool into the handler runtime. Enables the server's `email`
 # feature (which pulls `boatramp-handlers/email` + lettre); implies handlers.

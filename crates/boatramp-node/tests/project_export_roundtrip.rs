@@ -4540,3 +4540,345 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
 
     println!("PROJECT EXPORT MYSQL TRUE-DELTA OK");
 }
+
+// ===========================================================================================
+// libsql CHANGESET true-delta (SQL true-delta program, Stage 4) — the IN-PROCESS ≥2-tenant gate.
+// No Docker, no external server: embedded libsql, two SITES (separate DB FILES) in one project.
+// Feature-gated on `sql-delta-libsql` (the engine); CI opts the feature in so this RUNS (not an
+// ignore-gated stub). Marker: `PROJECT EXPORT LIBSQL TRUE-DELTA OK`.
+// ===========================================================================================
+
+/// **The libsql changeset true-delta gate.** Proves, entirely in-process:
+///  (1) a REAL round-trip — base export → mutate (insert/update/delete) → DIFFERENTIAL delta export
+///      (a `LibsqlChangeset` member, NOT a full dump) → import the chain → the restored site EXACTLY
+///      equals the MUTATED source (a result ONLY base-snapshot + changeset-replay can produce — the
+///      base snapshot alone is the pre-mutation state, and the pre-import sentinel proves the swap);
+///  (2) a ≥2-tenant CRAFTED-ESCAPE — a changeset member tampered to carry a write to a table OUTSIDE
+///      the restored base's schema is REFUSED, the target is left byte-unchanged (atomic — the
+///      legit-looking change bundled with it is rolled back too), and the SECOND site is untouched.
+///
+/// Mutation-sensitive: without the apply confinement (the base-table filter's foreign-table refusal /
+/// abort-on-conflict), the crafted member's legit-looking row change would leak into the target —
+/// turning assertion (2) RED. And a full-dump fallback instead of a true changeset would make the
+/// strategy/member assertions in (1) RED.
+#[cfg(feature = "sql-delta-libsql")]
+#[tokio::test]
+async fn project_export_libsql_true_delta_and_crafted_escape_gate() {
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest, SqlDeltaKind};
+    use boatramp_core::project_export::{ExportOptions, ImportOptions, ProjectExport};
+    use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::sql_libsql::LibsqlSqlBackends;
+    use std::collections::BTreeMap;
+
+    let project = "acme";
+    let blog = "blog"; // tenant A — gets the true-delta
+    let shop = "shop"; // tenant B — a SECOND site that must stay untouched
+
+    let td = tempfile::tempdir().unwrap();
+    let libsql_dir = td.path().join("handlers-sql");
+    let backends = Arc::new(LibsqlSqlBackends::local(&libsql_dir));
+
+    // Seed a site's `t` table from scratch.
+    async fn seed(
+        backends: &Arc<LibsqlSqlBackends>,
+        project: &str,
+        site: &str,
+        rows: &[(i64, &str)],
+    ) {
+        let db: Arc<dyn SqlBackend> = backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let _ = tx.execute("DROP TABLE IF EXISTS t", &[]).await;
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        for (id, v) in rows {
+            tx.execute(
+                "INSERT INTO t VALUES (?1,?2)",
+                &[SqlValue::Integer(*id), SqlValue::Text((*v).into())],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    async fn read_t(backends: &Arc<LibsqlSqlBackends>, project: &str, site: &str) -> Vec<String> {
+        let db: Arc<dyn SqlBackend> = backends.database(project, site, "").await.unwrap();
+        let mut tx = db.begin_read_only().await.unwrap();
+        let rows = tx
+            .query("SELECT id || ':' || v FROM t ORDER BY id", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        rows.rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                SqlValue::Text(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    seed(
+        &backends,
+        project,
+        blog,
+        &[(1, "orig"), (2, "beta"), (3, "gamma")],
+    )
+    .await;
+    seed(&backends, project, shop, &[(1, "SHOPSENTINEL")]).await;
+
+    // Deploy pointers so `DeployStore::list_sites` enumerates BOTH sites.
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    kv.put("project/acme/current/blog", b"dep1".to_vec())
+        .await
+        .unwrap();
+    kv.put("project/acme/current/shop", b"dep1".to_vec())
+        .await
+        .unwrap();
+    // An OWNED control-plane key so the scoped KV slice is non-trivial.
+    kv.put("project/acme/config/tenancy", b"{}".to_vec())
+        .await
+        .unwrap();
+
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let resumable = td.path().join("resumable");
+    let drv = NodeProjectExport::new(
+        BTreeMap::new(),
+        DeployStore::new(blobs.clone(), kv.clone()),
+        kv.clone(),
+        blobs.clone(),
+        work,
+    )
+    .with_libsql(backends.clone())
+    .with_resumable_base(Some(resumable.clone()));
+
+    // --- BASE export (records a libsql_capture.json snapshot per site) ---
+    let full = ExportOptions::default();
+    drv.export_resumable(project, &full, "base")
+        .await
+        .expect("base export");
+    assert!(
+        resumable.join("base").join("libsql_capture.json").exists(),
+        "the base export must record a libsql_capture.json sidecar"
+    );
+
+    // --- mutate blog: INSERT 4, UPDATE 2→beta2, DELETE 3 (shop untouched) ---
+    {
+        let db: Arc<dyn SqlBackend> = backends.database(project, blog, "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("INSERT INTO t VALUES (4,'delta')", &[])
+            .await
+            .unwrap();
+        tx.execute("UPDATE t SET v='beta2' WHERE id=2", &[])
+            .await
+            .unwrap();
+        tx.execute("DELETE FROM t WHERE id=3", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    let mutated_expect = vec![
+        "1:orig".to_string(),
+        "2:beta2".to_string(),
+        "4:delta".to_string(),
+    ];
+
+    // --- DIFFERENTIAL delta export against the fixed base ---
+    let delta_opts = ExportOptions {
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Differential,
+            base_reference: "base".to_string(),
+        }),
+        ..Default::default()
+    };
+    drv.export_resumable(project, &delta_opts, "d1")
+        .await
+        .expect("delta export");
+
+    // PROVE it is a TRUE changeset delta, not a full-dump fallback.
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert_eq!(
+        d1_manifest.delta.as_ref().unwrap().sql_strategy,
+        SqlDeltaKind::LibsqlChangeset,
+        "the delta must have changeset-captured libsql (not fallen back to a full dump)"
+    );
+    let blog_cs_path = format!("libsql/{project}/{blog}/default.changeset");
+    let blog_cs_idx = d1_manifest
+        .members
+        .iter()
+        .position(|m| m.kind == MemberKind::LibsqlChangeset && m.path == blog_cs_path)
+        .expect("d1 must carry a blog libsql changeset member");
+    assert!(
+        !d1_manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::Libsql && m.path.contains(&format!("/{blog}/"))),
+        "the full blog libsql dump must be SUPERSEDED by the changeset member"
+    );
+    assert!(
+        matches!(
+            d1_manifest.members[blog_cs_idx].sql_cursor,
+            Some(boatramp_core::project_delta::SqlMemberCursor::LibsqlChangesetBase { .. })
+        ),
+        "the changeset member must carry a LibsqlChangesetBase cursor"
+    );
+
+    // --- PART 1: REAL round-trip. Plant a PRE-IMPORT sentinel in blog, import the chain, assert
+    //     blog == MUTATED source (base snapshot + changeset replay), shop == untouched sentinel. ---
+    seed(&backends, project, blog, &[(99, "PRE_IMPORT")]).await;
+    let report = drv
+        .import_resumable(
+            project,
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delta chain import (base snapshot + changeset replay + atomic swap)");
+    assert!(
+        report.libsql_databases >= 1,
+        "a libsql db was restored by the changeset pass"
+    );
+    assert_eq!(
+        read_t(&backends, project, blog).await,
+        mutated_expect,
+        "the restored blog db must equal the MUTATED source — base snapshot + changeset replay \
+         (not the base state, not the pre-import sentinel)"
+    );
+    assert_eq!(
+        read_t(&backends, project, shop).await,
+        vec!["1:SHOPSENTINEL".to_string()],
+        "the SECOND site (shop) must be UNTOUCHED (its changeset is empty)"
+    );
+
+    // --- PART 2: CRAFTED-ESCAPE. Tamper d1's blog changeset member to carry a write to a FOREIGN
+    //     table `evil` (plus a legit-looking t:1 update). Import → REFUSED, blog byte-unchanged
+    //     (atomic), shop untouched. ---
+    let evil = tempfile::tempdir().unwrap();
+    let evil_backends = Arc::new(LibsqlSqlBackends::local(evil.path().join("db")));
+    {
+        let db: Arc<dyn SqlBackend> = evil_backends.database("x", "base", "").await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "INSERT INTO t VALUES (1,'orig'),(2,'beta'),(3,'gamma')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE evil(id INTEGER PRIMARY KEY, secret TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let db2: Arc<dyn SqlBackend> = evil_backends.database("x", "cur", "").await.unwrap();
+        let mut tx = db2.begin().await.unwrap();
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "INSERT INTO t VALUES (1,'HACKED'),(2,'beta'),(3,'gamma')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE evil(id INTEGER PRIMARY KEY, secret TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute("INSERT INTO evil VALUES (1,'ESCAPED')", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let evil_base_snap = evil.path().join("eb.db");
+    let evil_cur_snap = evil.path().join("ec.db");
+    evil_backends
+        .snapshot_into(&ProjectRef::new("x").qualified("base"), "", &evil_base_snap)
+        .await
+        .unwrap();
+    evil_backends
+        .snapshot_into(&ProjectRef::new("x").qualified("cur"), "", &evil_cur_snap)
+        .await
+        .unwrap();
+    let crafted_raw = match tokio::task::spawn_blocking(move || {
+        boatramp_storage::sql_libsql_changeset::capture_changeset(&evil_base_snap, &evil_cur_snap)
+    })
+    .await
+    .unwrap()
+    .expect("craft a changeset")
+    {
+        boatramp_storage::sql_libsql_changeset::ChangesetCapture::Changeset(c) => c,
+        other => panic!("crafted capture unexpectedly fell back: {other:?}"),
+    };
+    let crafted_member = boatramp_core::project_delta::encode_libsql_changeset(&crafted_raw);
+
+    // Overwrite d1's blog changeset member object `m{idx:05}` + regenerate its `{size,sha256}` meta.
+    let obj = resumable.join("d1").join(format!("m{blog_cs_idx:05}"));
+    std::fs::write(&obj, &crafted_member).unwrap();
+    let sha = boatramp_core::deploy::sha256_hex(&crafted_member);
+    std::fs::write(
+        resumable.join("d1").join(format!("m{blog_cs_idx:05}.meta")),
+        format!("{{\"size\":{},\"sha256\":\"{sha}\"}}", crafted_member.len()).as_bytes(),
+    )
+    .unwrap();
+
+    // Reset blog live to the BASE content so the crafted t-change would apply cleanly — isolating
+    // the FOREIGN-table refusal as the sole reason the import is rejected.
+    seed(
+        &backends,
+        project,
+        blog,
+        &[(1, "orig"), (2, "beta"), (3, "gamma")],
+    )
+    .await;
+    let res = drv
+        .import_resumable(
+            project,
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "a crafted changeset writing a table OUTSIDE the base schema MUST be refused"
+    );
+    assert_eq!(
+        read_t(&backends, project, blog).await,
+        vec![
+            "1:orig".to_string(),
+            "2:beta".to_string(),
+            "3:gamma".to_string()
+        ],
+        "the refused crafted import left blog UNCHANGED (no partial/leaked write)"
+    );
+    assert_eq!(
+        read_t(&backends, project, shop).await,
+        vec!["1:SHOPSENTINEL".to_string()],
+        "the second site must be UNTOUCHED by the refused crafted import"
+    );
+
+    println!("PROJECT EXPORT LIBSQL TRUE-DELTA OK");
+}

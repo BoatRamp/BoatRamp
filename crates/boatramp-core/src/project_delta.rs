@@ -475,6 +475,54 @@ impl SqlDeltaStrategy for FullDumpFallback {
 }
 
 // ===========================================================================================
+// libsql changeset-delta wire framing (SQL true-delta program, Stage 4) — the SQLite
+// session/changeset blob, lightly framed with a magic + version so a reader can tell a boatramp
+// libsql true-delta member from a foreign blob and reject an unknown framing version. The
+// changeset's own internal structure is validated by `sqlite3changeset_apply` on replay; this
+// frame is the cheap integrity/version envelope (the member also carries a bundle-layer SHA-256).
+// The raw changeset bytes are produced + consumed by the libsql FFI session engine in
+// `boatramp-storage` (behind its `sql-delta-libsql` feature); this core holds only the pure
+// framing so it stays unit-testable with no libsql/FFI dependency.
+// ===========================================================================================
+
+/// The libsql changeset-delta member magic.
+const LIBSQL_CS_MAGIC: &[u8; 8] = b"BRLSQLCS";
+/// The libsql changeset-delta member framing version.
+const LIBSQL_CS_VERSION: u32 = 1;
+
+/// Encode a raw SQLite changeset blob into the `*.changeset` member bytes:
+/// ```text
+/// MAGIC "BRLSQLCS" (8) | version u32 LE | changeset_len u64 LE | <raw changeset bytes>
+/// ```
+/// An EMPTY changeset (no row changes since the base) is a valid member (`changeset_len == 0`) —
+/// its replay is a no-op, kept so the delta bundle is still a complete point-in-time.
+#[must_use]
+pub fn encode_libsql_changeset(changeset: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + changeset.len());
+    out.extend_from_slice(LIBSQL_CS_MAGIC);
+    out.extend_from_slice(&LIBSQL_CS_VERSION.to_le_bytes());
+    out.extend_from_slice(&(changeset.len() as u64).to_le_bytes());
+    out.extend_from_slice(changeset);
+    out
+}
+
+/// Decode a `*.changeset` member produced by [`encode_libsql_changeset`], returning the raw
+/// changeset bytes. Any corruption / foreign magic / unknown version / truncation is a loud
+/// [`DeltaError`] (never a silent partial — a malformed true-delta member must fail the import).
+pub fn decode_libsql_changeset(bytes: &[u8]) -> Result<Vec<u8>, DeltaError> {
+    let mut r = FrameReader { buf: bytes, pos: 0 };
+    if r.take(8)? != LIBSQL_CS_MAGIC.as_slice() {
+        return Err(DeltaError::BadMagic);
+    }
+    let version = r.u32()?;
+    if version != LIBSQL_CS_VERSION {
+        return Err(DeltaError::UnsupportedVersion(version));
+    }
+    let len = r.u64()? as usize;
+    Ok(r.take(len)?.to_vec())
+}
+
+// ===========================================================================================
 // Shared framing reader + errors
 // ===========================================================================================
 
@@ -790,6 +838,43 @@ mod tests {
             r#"{"engine":"libsql_changeset_base","base_sha256":"deadbeef"}"#
         );
         assert_eq!(ls.kind(), SqlDeltaKind::LibsqlChangeset);
+    }
+
+    /// The libsql changeset-delta member round-trips through its wire framing (an opaque changeset
+    /// blob), an EMPTY changeset round-trips to empty, and a corrupt/foreign/short frame fails loud.
+    #[test]
+    fn libsql_changeset_wire_round_trip_and_loud_reject() {
+        // An opaque binary "changeset" (the real one comes from the SQLite session engine; the
+        // framing is engine-agnostic, so arbitrary bytes exercise it).
+        let cs = b"\x00\x01\x02 a fake changeset with \x00 NULs and a ; and '".to_vec();
+        let bytes = encode_libsql_changeset(&cs);
+        assert_eq!(decode_libsql_changeset(&bytes).expect("round-trip"), cs);
+
+        // Empty changeset (no row changes) round-trips to empty.
+        let empty = encode_libsql_changeset(&[]);
+        assert!(
+            decode_libsql_changeset(&empty)
+                .expect("empty round-trip")
+                .is_empty()
+        );
+
+        // Foreign magic → loud BadMagic.
+        assert!(matches!(
+            decode_libsql_changeset(b"NOTACSET...."),
+            Err(DeltaError::BadMagic)
+        ));
+        // Truncation (drop the last 3 bytes of the body) → loud Truncated.
+        assert!(matches!(
+            decode_libsql_changeset(&bytes[..bytes.len() - 3]),
+            Err(DeltaError::Truncated(_))
+        ));
+        // An unknown framing version → loud UnsupportedVersion (forward-compat gate).
+        let mut bad_ver = encode_libsql_changeset(&cs);
+        bad_ver[8..12].copy_from_slice(&999u32.to_le_bytes());
+        assert!(matches!(
+            decode_libsql_changeset(&bad_ver),
+            Err(DeltaError::UnsupportedVersion(999))
+        ));
     }
 
     /// The SQL-delta scaffold: the fallback is NOT a true delta; the scaffolded strategies would be.

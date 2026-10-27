@@ -253,6 +253,22 @@ fn site_from_libsql_member(path: &str) -> Option<&str> {
     Some(body.rsplit_once('/').map(|(_, s)| s).unwrap_or(body))
 }
 
+/// The bundle member path for a site's libsql **changeset** true-delta (SQL true-delta program,
+/// Stage 4). Sibling of [`libsql_member_path`] with a `.changeset` leaf so a reader tells a true
+/// row-delta member from a full `.sqlite` dump.
+fn libsql_changeset_member_path(project: &str, site: &str) -> String {
+    format!("libsql/{project}/{site}/default.changeset")
+}
+
+/// Recover the SITE from a `libsql/<project>/<site>/default.changeset` true-delta member path (the
+/// source project segment is discarded — the import re-qualifies with the TARGET project).
+fn site_from_libsql_changeset_member(path: &str) -> Option<&str> {
+    let body = path
+        .strip_prefix("libsql/")?
+        .strip_suffix("/default.changeset")?;
+    Some(body.rsplit_once('/').map(|(_, s)| s).unwrap_or(body))
+}
+
 /// Defense-in-depth project-slug validation at the DRIVER entry (the admin handler
 /// already rejects an invalid slug, but a direct driver caller must be guarded too — the
 /// `project` string flows into temp paths, libsql `local_path`, the blob prefix, and
@@ -1330,6 +1346,12 @@ enum StageJob {
     /// `delta_capture`). Replayed onto the restored base inside the atomic shadow (see
     /// `restore_mysql_true_delta_in_chain`).
     MysqlBinlogDelta { bytes: Vec<u8> },
+    /// A libsql/SQLite **changeset** delta member (`libsql/<project>/<site>/default.changeset`) — the
+    /// framed SQLite changeset (session diff of the base snapshot vs the current DB), already
+    /// produced at plan time (a DELTA export of a capture-eligible libsql site). Replayed onto the
+    /// restored base snapshot inside the atomic shadow (see `restore_libsql_true_delta_in_chain`).
+    /// SQL true-delta program, Stage 4.
+    LibsqlChangeset { bytes: Vec<u8> },
 }
 
 /// The export stager's request: "produce the member at `path`". `chunked` selects a
@@ -2992,10 +3014,12 @@ impl NodeProjectExport {
             StageJob::KvDelta { bytes }
             | StageJob::BlobTombstone { bytes }
             | StageJob::PgWalDelta { bytes }
-            | StageJob::MysqlBinlogDelta { bytes } => {
+            | StageJob::MysqlBinlogDelta { bytes }
+            | StageJob::LibsqlChangeset { bytes } => {
                 // A delta member whose bytes were computed + encoded at plan time (the KV
                 // upserts+tombstones / the blob tombstone key list / the drained + framed
-                // pgoutput WAL change stream / the framed raw mysql binlog). Just persist them.
+                // pgoutput WAL change stream / the framed raw mysql binlog / the framed libsql
+                // changeset). Just persist them.
                 tokio::fs::write(&tmp, bytes).await.map_err(other)?;
             }
         }
@@ -3633,6 +3657,16 @@ impl NodeProjectExport {
         if opts.delta.is_none() {
             self.mysql_capture_base_gtids(project, dir, &specs).await;
         }
+
+        // SQL true-delta capture (libsql changeset, SQL true-delta program, Stage 4): snapshot every
+        // local libsql site's DB into `libsql_capture/` + record its sha in `libsql_capture.json`.
+        // Run on BOTH base AND delta exports (unlike pg/mysql) so a FIXED base snapshot is always
+        // available to diff against (differential, vs the root) AND each delta leaves a fresh snapshot
+        // for the next link (incremental). Best-effort: a site that fails to snapshot simply
+        // full-dumps at the next delta. Feature-gated — off builds never capture (today's behaviour).
+        #[cfg(feature = "sql-delta-libsql")]
+        self.libsql_capture_base_snapshots(project, dir).await;
+
         let _ = tokio::fs::remove_dir_all(&session).await;
         Ok(())
     }
@@ -3778,14 +3812,25 @@ impl NodeProjectExport {
         } else {
             None
         };
+        // The libsql analogue (SQL true-delta program, Stage 4). Unlike pg/mysql (a single advancing
+        // slot / a one-shot binlog coordinate ⇒ incremental-only), the libsql base is a FIXED FILE
+        // snapshot every delta can re-diff, so BOTH modes are eligible: differential diffs each delta
+        // vs the root base's stored snapshot; incremental diffs vs the parent's (each export stores a
+        // fresh snapshot). Read the capture sidecar from `base_dir` (the fixed base in differential,
+        // the parent in incremental) in either mode.
+        let parent_libsql_capture = read_libsql_capture_sidecar(&base_dir).await;
         let cap_dir = self
             .work_dir
             .join(format!("delta-capture-{project}-{created_at}"));
-        if parent_capture.is_some() || parent_mysql_capture.is_some() {
+        if parent_capture.is_some()
+            || parent_mysql_capture.is_some()
+            || parent_libsql_capture.is_some()
+        {
             tokio::fs::create_dir_all(&cap_dir).await.map_err(other)?;
         }
         let mut any_pg_true_delta = false;
         let mut any_mysql_true_delta = false;
+        let mut any_libsql_true_delta = false;
 
         // --- build the ordered delta member set from the full plan ---
         let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
@@ -3904,12 +3949,46 @@ impl NodeProjectExport {
                     }
                 }
                 MemberKind::Libsql => {
-                    // SQL full-dump fallback (decision 3): keep the full member verbatim. The
-                    // libsql changeset true-delta is a separate later engine.
-                    let job = full_jobs.remove(&spec.path).ok_or_else(|| {
-                        Perr::Other(format!("delta export: no stage job for {}", spec.path))
-                    })?;
-                    ordered.push((spec.clone(), job));
+                    // libsql changeset true-delta (SQL true-delta program, Stage 4): if this site's
+                    // base recorded a snapshot in the parent's `libsql_capture.json`, and the schema
+                    // is unchanged + every table has a PK, DIFF the current DB against that base
+                    // snapshot into a `LibsqlChangeset` member IN PLACE OF the full dump. Any miss
+                    // (engine not built, no base snapshot, schema drift, diff failure) FALLS BACK to
+                    // the full dump — the all-families-consistent invariant + best-effort true-delta.
+                    let site = site_from_libsql_member(&spec.path);
+                    let cs_member = match (site, parent_libsql_capture.as_ref()) {
+                        (Some(site), Some(sidecar)) => match sidecar.sites.get(site) {
+                            Some(entry) => {
+                                self.try_libsql_changeset_delta(
+                                    project, site, entry, &base_dir, &cap_dir,
+                                )
+                                .await
+                            }
+                            None => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((bytes, cursor)) = cs_member {
+                        any_libsql_true_delta = true;
+                        let site = site.expect("cs_member implies a parsed site");
+                        ordered.push((
+                            MemberSpec::sidecar(
+                                libsql_changeset_member_path(project, site),
+                                MemberKind::LibsqlChangeset,
+                                None,
+                            )
+                            .with_sql_cursor(cursor),
+                            StageJob::LibsqlChangeset { bytes },
+                        ));
+                        // The full libsql dump for this site is now superseded — drop it.
+                        let _ = full_jobs.remove(&spec.path);
+                    } else {
+                        // SQL full-dump fallback (decision 3): keep the full member verbatim.
+                        let job = full_jobs.remove(&spec.path).ok_or_else(|| {
+                            Perr::Other(format!("delta export: no stage job for {}", spec.path))
+                        })?;
+                        ordered.push((spec.clone(), job));
+                    }
                 }
                 MemberKind::KvDelta
                 | MemberKind::BlobTombstone
@@ -3959,6 +4038,8 @@ impl NodeProjectExport {
                 pd::SqlDeltaKind::PgWalReplay
             } else if any_mysql_true_delta {
                 pd::SqlDeltaKind::MysqlBinlogReplay
+            } else if any_libsql_true_delta {
+                pd::SqlDeltaKind::LibsqlChangeset
             } else {
                 pd::SqlDeltaKind::FullDumpFallback
             },
@@ -4204,6 +4285,20 @@ impl NodeProjectExport {
         let mut report = ImportReport::default();
         let mut saw_identity = false;
         let last = chain.len() - 1;
+        // Sites whose libsql family is restored by the atomic changeset pass
+        // (`restore_libsql_true_delta_in_chain`) AFTER this loop: any site carrying a
+        // `LibsqlChangeset` member anywhere in the chain. Their base full `Libsql` member is replayed
+        // by that pass too (base snapshot + changesets), so the main loop must SKIP it — exactly as a
+        // managed pg/mysql full dump is skipped. A libsql site with NO changeset (pure full-dump
+        // fallback) is not here, so it still restores via `restore_member` (newest link). Computed
+        // even when the engine feature is off: a bundle built elsewhere may carry changeset members,
+        // and the pass below then refuses loudly rather than silently full-dumping the stale base.
+        let libsql_changeset_sites: std::collections::BTreeSet<String> = chain
+            .iter()
+            .flat_map(|(_, m)| m.members.iter())
+            .filter(|s| s.kind == MemberKind::LibsqlChangeset)
+            .filter_map(|s| site_from_libsql_changeset_member(&s.path).map(str::to_string))
+            .collect();
         for (pos, (dir, m)) in chain.iter().enumerate() {
             let is_newest = pos == last;
             for (idx, spec) in m.members.iter().enumerate() {
@@ -4243,7 +4338,17 @@ impl NodeProjectExport {
                             && is_newest
                     }
                     MemberKind::MysqlBinlogDelta => false,
-                    MemberKind::Libsql => is_newest,
+                    // A libsql full dump whose site has a changeset in the chain is restored by the
+                    // atomic changeset pass (base snapshot + changesets); skip it here. A site with
+                    // no changeset still restores its newest full dump via `restore_member`.
+                    MemberKind::Libsql => {
+                        is_newest
+                            && !site_from_libsql_member(&spec.path)
+                                .map(|s| libsql_changeset_sites.contains(s))
+                                .unwrap_or(false)
+                    }
+                    // A libsql changeset is replayed only by the atomic changeset pass below.
+                    MemberKind::LibsqlChangeset => false,
                     MemberKind::Identity => false,
                     _ => true,
                 };
@@ -4283,6 +4388,23 @@ impl NodeProjectExport {
         // it as the ephemeral apply user, then swap. Independent of the KV/blob overlay above.
         if let Err(e) = self
             .restore_mysql_true_delta_in_chain(project, &chain, opts, &mut report, &session)
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&session).await;
+            return Err(e);
+        }
+        // libsql changeset true-delta (SQL true-delta program, Stage 4): for each site with a
+        // changeset in the chain, copy the base snapshot into a fresh atomic shadow, apply each
+        // changeset onto it (confined to the base's own tables, abort-on-conflict), integrity-check,
+        // then atomically swap. Independent of the KV/blob overlay above.
+        if let Err(e) = self
+            .restore_libsql_true_delta_in_chain(
+                project,
+                &chain,
+                &libsql_changeset_sites,
+                opts,
+                &mut report,
+            )
             .await
         {
             let _ = tokio::fs::remove_dir_all(&session).await;
@@ -7165,6 +7287,350 @@ impl NodeProjectExport {
     }
 }
 
+// ===========================================================================================
+// libsql CHANGESET true-delta: CAPTURE (export) + REPLAY (restore) — SQL true-delta program, Stage 4.
+// (Textually separate from the pg/mysql engines above to minimize merge conflict; it reuses only the
+// resumable member-object layout + the libsql backend's atomic shadow primitives.)
+//
+// CAPTURE. libsql has no server change stream, so the base is a FIXED FILE: every resumable export
+// (base AND delta) snapshots each local libsql site's DB (`snapshot_delta_base` = VACUUM INTO +
+// integrity-check) into `libsql_capture/<n>.db` and records its SHA-256 in a `libsql_capture.json`
+// sidecar (keyed by SITE) — the libsql analogue of `pg_capture.json`/`mysql_capture.json`. A later
+// DELTA export whose base recorded a snapshot diffs the live DB against it with the SQLite session
+// engine (`capture_delta_changeset`), shipping the resulting changeset as a `LibsqlChangeset` member
+// IN PLACE OF the full dump. A schema change since the base, a PK-less table, a missing/mismatched
+// base snapshot, or any diff failure FALLS BACK to a full dump for that site (best-effort true-delta;
+// the delta bundle is always a complete point-in-time). BOTH differential (vs the fixed root base)
+// and incremental (vs the parent) modes are supported — the base snapshot is a re-diffable file,
+// unlike pg's single advancing slot / mysql's one-shot binlog coordinate (incremental-only).
+//
+// REPLAY. `restore_libsql_true_delta_in_chain` resolves, per site, the newest FULL base `Libsql`
+// member (its snapshot + sha from that link's `libsql_capture.json`) + the subsequent `LibsqlChangeset`
+// members, and hands them to `restore_delta_changeset_chain`: copy the sha-verified base snapshot
+// into a fresh `*.shadow_*`, apply each changeset CONFINED to the base's own tables (abort on any
+// conflict / refuse any foreign table), integrity-check, then atomically rename the shadow over live.
+// A decode/apply failure drops the shadow (live untouched) and fails the import loud. In-process,
+// no Docker — the engine is embedded libsql.
+//
+// SCOPE: local single-node libsql (the managed default). Feature-gated (`sql-delta-libsql`); an
+// off build never captures and REFUSES to restore a changeset member (never a silent full-dump).
+// ===========================================================================================
+
+/// The libsql-capture sidecar filename written beside a resumable export dir's member objects.
+const LIBSQL_CAPTURE_SIDECAR: &str = "libsql_capture.json";
+
+/// One libsql site's base-snapshot record in `libsql_capture.json`: the snapshot file (RELATIVE to
+/// the resumable dir) a later delta diffs against + the restore applies changesets onto, and its
+/// SHA-256 (the base cursor — it NAMES the base and lets capture + restore prove same bytes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LibsqlCaptureEntry {
+    /// The base snapshot path, RELATIVE to the resumable dir (e.g. `libsql_capture/0.db`).
+    snapshot_file: String,
+    /// The base snapshot's SHA-256 (lowercase hex) — the `LibsqlChangesetBase` cursor value.
+    base_sha256: String,
+}
+
+/// A resumable dir's libsql-capture sidecar: per-site base snapshots keyed by SITE name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct LibsqlCaptureSidecar {
+    sites: BTreeMap<String, LibsqlCaptureEntry>,
+}
+
+/// Read the libsql-capture sidecar from a resumable dir (absent/corrupt ⇒ `None`).
+async fn read_libsql_capture_sidecar(dir: &Path) -> Option<LibsqlCaptureSidecar> {
+    let bytes = tokio::fs::read(dir.join(LIBSQL_CAPTURE_SIDECAR))
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// CONFINE a base-snapshot path from the (untrusted) `libsql_capture.json` sidecar under `base_dir`
+/// before it is read/copied — the `snapshot_file` string travels with the bundle across the import
+/// trust boundary, so it is treated exactly like `resolve_resumable_dir` treats an operator-named
+/// dir: reject an empty / absolute / `..`-or-`.`-bearing relative path, then canonicalize and assert
+/// the result still lives under `base_dir` (defeats a symlink planted in the bundle dir). Returns the
+/// confined absolute path or a loud [`Perr`] — never a path that escapes the bundle dir. (Security
+/// review Stage 4, Finding 1: an unconfined join enabled `/dev/zero` DoS + out-of-tree file reads.)
+fn confine_bundle_snapshot(base_dir: &Path, snapshot_file: &str) -> Result<PathBuf, Perr> {
+    use std::path::Component;
+    let rel = Path::new(snapshot_file);
+    if rel.as_os_str().is_empty()
+        || rel.is_absolute()
+        || rel.components().any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(Perr::Other(format!(
+            "libsql delta: refusing out-of-tree base snapshot path {snapshot_file:?}"
+        )));
+    }
+    let joined = base_dir.join(rel);
+    // Resolve symlinks + `.`; the canonical path MUST stay under the canonical base dir.
+    let canon_base = std::fs::canonicalize(base_dir).map_err(|e| {
+        Perr::Other(format!(
+            "libsql delta: canonicalize base dir {}: {e}",
+            base_dir.display()
+        ))
+    })?;
+    let canon = std::fs::canonicalize(&joined).map_err(|e| {
+        Perr::Other(format!(
+            "libsql delta: base snapshot {snapshot_file:?} not found/canonicalize: {e}"
+        ))
+    })?;
+    if !canon.starts_with(&canon_base) {
+        return Err(Perr::Other(format!(
+            "libsql delta: base snapshot path {snapshot_file:?} escapes the bundle dir (symlink?)"
+        )));
+    }
+    Ok(canon)
+}
+
+impl NodeProjectExport {
+    /// Snapshot every local libsql site's DB as a delta BASE into `dir/libsql_capture/` and record
+    /// each one's sha in `libsql_capture.json`. Best-effort: a site that fails to snapshot is simply
+    /// omitted (it full-dumps at the next delta). Enumerates sites AUTHORITATIVELY from the deploy
+    /// store (never a filesystem walk), exactly like `plan_export`.
+    #[cfg(feature = "sql-delta-libsql")]
+    async fn libsql_capture_base_snapshots(&self, project: &str, dir: &Path) {
+        let Some(libsql) = &self.libsql else {
+            return;
+        };
+        let sites = match self.deploy.list_sites(ProjectRef::new(project)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%project, error = %e, "libsql delta capture: list_sites failed; skipping base snapshots");
+                return;
+            }
+        };
+        let mut sidecar = LibsqlCaptureSidecar::default();
+        for (i, site) in sites.into_iter().enumerate() {
+            let qsite = ProjectRef::new(project).qualified(&site);
+            if !libsql.local_database_exists(&qsite, "") {
+                continue; // a site that never wrote SQL — nothing to snapshot
+            }
+            // Opaque per-site filename (the sidecar records the site→file mapping, so the name needs
+            // no site-derived escaping).
+            let rel = format!("libsql_capture/{i}.db");
+            let dest = dir.join(&rel);
+            match libsql.snapshot_delta_base(&qsite, "", &dest).await {
+                Ok(sha) => {
+                    sidecar.sites.insert(
+                        site,
+                        LibsqlCaptureEntry {
+                            snapshot_file: rel,
+                            base_sha256: sha,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(%project, %site, error = %e, "libsql delta capture: base snapshot failed; this site will full-dump at the next delta");
+                }
+            }
+        }
+        if !sidecar.sites.is_empty()
+            && let Ok(bytes) = serde_json::to_vec_pretty(&sidecar)
+        {
+            let _ = write_atomic(&dir.join(LIBSQL_CAPTURE_SIDECAR), &bytes).await;
+        }
+    }
+
+    /// Try to produce a libsql CHANGESET delta for `site` against the parent base snapshot named by
+    /// `entry`. Returns `Some((framed_changeset_bytes, cursor))` on success, or `None` for ANY
+    /// fallback (engine not built, no libsql backend, missing/mismatched base, schema drift, PK-less
+    /// table, or a diff failure) — the caller then keeps the full dump.
+    async fn try_libsql_changeset_delta(
+        &self,
+        project: &str,
+        site: &str,
+        entry: &LibsqlCaptureEntry,
+        base_dir: &Path,
+        cap_dir: &Path,
+    ) -> Option<(Vec<u8>, boatramp_core::project_delta::SqlMemberCursor)> {
+        // Silence unused-param warnings in an off build (no engine to call).
+        let _ = (project, site, entry, base_dir, cap_dir);
+        #[cfg(feature = "sql-delta-libsql")]
+        {
+            use boatramp_storage::sql_libsql_changeset::ChangesetCapture;
+            let libsql = self.libsql.as_ref()?;
+            let qsite = ProjectRef::new(project).qualified(site);
+            if !libsql.local_database_exists(&qsite, "") {
+                return None; // site has no live DB now → keep the full-dump member path
+            }
+            // Confine the sidecar-named base snapshot under base_dir before use (a bad/escaping path
+            // → full-dump fallback, never a traversal). Trusted side here (our own export output),
+            // but held to the same confinement as the restore side — defense in depth.
+            let base_snapshot = match confine_bundle_snapshot(base_dir, &entry.snapshot_file) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(%project, %site, error = %e, "libsql delta: base snapshot path rejected; full-dump fallback");
+                    return None;
+                }
+            };
+            match libsql
+                .capture_delta_changeset(&qsite, "", &base_snapshot, &entry.base_sha256, cap_dir)
+                .await
+            {
+                Ok(ChangesetCapture::Changeset(cs)) => {
+                    let framed = boatramp_core::project_delta::encode_libsql_changeset(&cs);
+                    let cursor =
+                        boatramp_core::project_delta::SqlMemberCursor::LibsqlChangesetBase {
+                            base_sha256: entry.base_sha256.clone(),
+                        };
+                    Some((framed, cursor))
+                }
+                Ok(ChangesetCapture::Fallback(reason)) => {
+                    tracing::info!(%project, %site, %reason, "libsql delta: full-dump fallback");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(%project, %site, error = %e, "libsql delta: changeset capture failed; full-dump fallback");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "sql-delta-libsql"))]
+        {
+            None
+        }
+    }
+
+    /// Replay every libsql changeset chain into the atomic shadow. For each site in
+    /// `changeset_sites`: resolve the newest FULL base `Libsql` member (a newer full dump supersedes
+    /// earlier changesets, like pg/mysql) + its stored base snapshot + the subsequent
+    /// `LibsqlChangeset` members in chain order, then `restore_delta_changeset_chain`. A site with no
+    /// changeset is restored by the main loop's `restore_member` and never reaches here.
+    async fn restore_libsql_true_delta_in_chain(
+        &self,
+        project: &str,
+        chain: &[(PathBuf, project_bundle::StreamManifest)],
+        changeset_sites: &std::collections::BTreeSet<String>,
+        opts: &ImportOptions,
+        report: &mut ImportReport,
+    ) -> Result<(), Perr> {
+        if changeset_sites.is_empty() {
+            return Ok(());
+        }
+        // Per site: the newest FULL base libsql member (dir) + the changeset members AFTER it.
+        struct SitePlan {
+            base_dir: Option<PathBuf>,
+            changesets: Vec<(PathBuf, usize)>,
+        }
+        let mut per_site: BTreeMap<String, SitePlan> = BTreeMap::new();
+        for (dir, m) in chain {
+            for (idx, spec) in m.members.iter().enumerate() {
+                match spec.kind {
+                    MemberKind::Libsql => {
+                        if let Some(site) = site_from_libsql_member(&spec.path)
+                            .filter(|s| changeset_sites.contains(*s))
+                        {
+                            let e = per_site.entry(site.to_string()).or_insert(SitePlan {
+                                base_dir: None,
+                                changesets: Vec::new(),
+                            });
+                            e.base_dir = Some(dir.clone());
+                            e.changesets.clear();
+                        }
+                    }
+                    MemberKind::LibsqlChangeset => {
+                        if let Some(site) = site_from_libsql_changeset_member(&spec.path) {
+                            per_site
+                                .entry(site.to_string())
+                                .or_insert(SitePlan {
+                                    base_dir: None,
+                                    changesets: Vec::new(),
+                                })
+                                .changesets
+                                .push((dir.clone(), idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        per_site.retain(|_, p| !p.changesets.is_empty());
+        if per_site.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "sql-delta-libsql"))]
+        {
+            let _ = (project, opts, report);
+            return Err(Perr::Unavailable(
+                "bundle carries libsql changeset true-delta members but this build lacks the libsql \
+                 changeset engine (feature `sql-delta-libsql`) — refusing to restore (never a silent \
+                 stale-base full-dump)"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "sql-delta-libsql")]
+        {
+            let Some(libsql) = self.libsql.clone() else {
+                return Err(Perr::Unavailable(
+                    "bundle carries libsql changeset members but this node has no local libsql \
+                     backend to restore them into"
+                        .into(),
+                ));
+            };
+            if !opts.apply {
+                report.libsql_databases += per_site.len();
+                return Ok(());
+            }
+            for (site, plan) in per_site {
+                let Some(base_dir) = plan.base_dir else {
+                    return Err(Perr::Other(format!(
+                        "libsql true-delta restore: site {site:?} has changeset member(s) but no full \
+                         base libsql member in the chain — cannot replay onto nothing"
+                    )));
+                };
+                // The base snapshot + sha come from the base link's libsql_capture.json sidecar.
+                let sidecar = read_libsql_capture_sidecar(&base_dir).await.ok_or_else(|| {
+                    Perr::Other(format!(
+                        "libsql true-delta restore: base dir {} has no {LIBSQL_CAPTURE_SIDECAR} — \
+                         cannot resolve the base snapshot for site {site:?}",
+                        base_dir.display()
+                    ))
+                })?;
+                let entry = sidecar.sites.get(&site).ok_or_else(|| {
+                    Perr::Other(format!(
+                        "libsql true-delta restore: no base snapshot recorded for site {site:?} in \
+                         {LIBSQL_CAPTURE_SIDECAR}"
+                    ))
+                })?;
+                // CONFINE the sidecar-named base snapshot under base_dir before reading/copying it
+                // (the sidecar is untrusted bundle data) — a bad/escaping path is a hard error, never
+                // a traversal / out-of-tree read (Stage 4 security review, Finding 1).
+                let base_snapshot = confine_bundle_snapshot(&base_dir, &entry.snapshot_file)?;
+                // Decode each changeset member (chain order) into its raw changeset blob.
+                let mut changesets: Vec<Vec<u8>> = Vec::with_capacity(plan.changesets.len());
+                for (dir, idx) in &plan.changesets {
+                    let obj = dir.join(member_object_name(*idx));
+                    let bytes = tokio::fs::read(&obj).await.map_err(other)?;
+                    let cs = boatramp_core::project_delta::decode_libsql_changeset(&bytes)
+                        .map_err(|e| {
+                            Perr::Other(format!(
+                                "libsql true-delta restore: decode changeset member {}: {e}",
+                                obj.display()
+                            ))
+                        })?;
+                    changesets.push(cs);
+                }
+                let qsite = ProjectRef::new(project).qualified(&site);
+                libsql
+                    .restore_delta_changeset_chain(
+                        &qsite,
+                        "",
+                        &base_snapshot,
+                        &entry.base_sha256,
+                        changesets,
+                        opts.overwrite,
+                    )
+                    .await
+                    .map_err(other)?;
+                report.libsql_databases += 1;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Read up to `max` bytes from the start of `path` as a UTF-8 (lossy) string — for parsing a dump's
 /// header (the COMMENTED GTID/binlog coordinate) without loading a large member whole.
 async fn read_file_prefix(path: &Path, max: usize) -> Result<String, Perr> {
@@ -8273,6 +8739,52 @@ mod tests {
         );
         assert_eq!(site_from_libsql_member("sql/app.pgc"), None);
         assert_eq!(site_from_libsql_member("libsql/bad"), None);
+        // The changeset sibling path round-trips too.
+        assert_eq!(
+            libsql_changeset_member_path("acme", "blog"),
+            "libsql/acme/blog/default.changeset"
+        );
+        assert_eq!(
+            site_from_libsql_changeset_member("libsql/acme/blog/default.changeset"),
+            Some("blog")
+        );
+        assert_eq!(
+            site_from_libsql_changeset_member("libsql/acme/blog/default.sqlite"),
+            None
+        );
+    }
+
+    /// Stage-4 security review Finding 1: the (untrusted) `libsql_capture.json` `snapshot_file` is
+    /// CONFINED under the bundle dir before any read/copy — an absolute path, a `..` traversal, a
+    /// `.`-bearing path, or an empty string is REFUSED; a plain relative name that exists resolves to
+    /// an in-tree absolute path. (A symlink that escapes is rejected by the canonicalize+starts_with
+    /// guard — not exercised here as it needs a filesystem fixture; the component/absolute checks are
+    /// the load-bearing lexical guard.)
+    #[test]
+    fn confine_bundle_snapshot_refuses_out_of_tree_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let cap = base.path().join("libsql_capture");
+        std::fs::create_dir_all(&cap).unwrap();
+        std::fs::write(cap.join("0.db"), b"x").unwrap();
+
+        // A legit in-tree relative path resolves under base.
+        let ok = confine_bundle_snapshot(base.path(), "libsql_capture/0.db").expect("in-tree ok");
+        assert!(ok.starts_with(std::fs::canonicalize(base.path()).unwrap()));
+
+        // Every out-of-tree shape is refused BEFORE any read.
+        for bad in [
+            "/dev/zero",
+            "/etc/passwd",
+            "../../../etc/passwd",
+            "libsql_capture/../../escape",
+            "./libsql_capture/0.db", // a leading `.` is a non-Normal component → refused
+            "",
+        ] {
+            assert!(
+                confine_bundle_snapshot(base.path(), bad).is_err(),
+                "an out-of-tree snapshot path must be refused: {bad:?}"
+            );
+        }
     }
 
     #[test]

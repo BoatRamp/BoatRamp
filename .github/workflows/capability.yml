@@ -458,7 +458,7 @@ jobs:
           echo "mysql bridge IP: $MYIP"
           BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
           BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
-            timeout -k 30 900 cargo test -p boatramp-node --features project-export \
+            timeout -k 30 900 cargo test -p boatramp-node --features project-export,sql-delta-libsql \
             --test project_export_roundtrip \
             -- --test-threads=1 --nocapture 2>&1 | tee project-export.log
           docker rm -f brexport-pg >/dev/null 2>&1 || true
@@ -475,6 +475,12 @@ jobs:
           # same invocation — its marker proves it was not silently feature-gated away.
           grep -q 'PROJECT EXPORT LIBSQL ROUNDTRIP OK' project-export.log \
             || { echo "::error::libsql project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # libsql CHANGESET true-delta (SQL true-delta program, Stage 4): in-process (no server),
+          # so the `--features sql-delta-libsql` build ALWAYS runs it — its marker prints ONLY after
+          # the base->mutate->changeset-delta->import round-trip AND the ≥2-tenant crafted-escape
+          # refusal both pass, so a silent feature-gate-away or a regression fails the job.
+          grep -q 'PROJECT EXPORT LIBSQL TRUE-DELTA OK' project-export.log \
+            || { echo "::error::libsql changeset true-delta gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
           # MySQL round-trip: self-skips without a reachable MySQL/docker (the silent-skip
           # trap), so gate on its marker which prints ONLY after the real mysqldump ->
           # bundle(SHA-256) -> drop -> mysql-restore -> ROW-equality round-trip.

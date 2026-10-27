@@ -67,6 +67,11 @@ pub mod kv_cloudflare;
 
 #[cfg(feature = "sql")]
 pub mod sql_libsql;
+// The libsql/SQLite CHANGESET true-delta engine (SQL true-delta program, Stage 4): offline
+// file-based capture (session diff) + confined replay (`sqlite3changeset_apply`). Behind
+// `sql-delta-libsql` (which pulls `libsql-ffi` with the `session`/`preupdate_hook` extensions).
+#[cfg(feature = "sql-delta-libsql")]
+pub mod sql_libsql_changeset;
 // The SQL-backed control-plane KV ([`KvStore`](boatramp_core::kv::KvStore)) — SQLite/libsql-local
 // single-writer (`sql`), the Postgres multi-writer primary (`sql-postgres`), and the MySQL/MariaDB
 // multi-writer primary (`sql-mysql`). Available under ANY engine feature; each backing's code is
