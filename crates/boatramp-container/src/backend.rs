@@ -1809,6 +1809,46 @@ impl ContainerBackend {
         parse_passwd_ids(&passwd, user)
     }
 
+    /// The `(uid, gid)` this workload's **init process** — the stock entrypoint the worker
+    /// `execve`s — is launched as (the uid its `docker-entrypoint.sh` sees as `id -u`).
+    ///
+    /// For a managed database whose spec leaves `user` unset, that is the DB's DETECTED image
+    /// RUNTIME uid ([`Self::db_runtime_ids`], e.g. postgres `999`) rather than the spec's
+    /// namespace-root default (`0`). Launched as that uid, the stock postgres/mysql entrypoint
+    /// takes its NON-root branch (`[ "$(id -u)" = '0' ]` is false): it SKIPS the root-only
+    /// `chmod 700 $PGDATA` + `find … -exec chown` + `gosu`/`su-exec` privilege drop — the steps
+    /// that need `CAP_CHOWN`/`CAP_FOWNER`/`CAP_DAC_OVERRIDE`/`CAP_SETUID`, which a cap-dropped
+    /// multi-tenant node does not grant — and runs `initdb` + the server directly as that uid, on
+    /// the volume already pre-owned `base + runtime` ([`resolve_mapping_decision`]). So a FRESH
+    /// init works under the dropped-`ALL` posture (initdb as `999` on a `999`-owned dir, no
+    /// capability needed) and a REUSED cluster still comes up (existing cluster detected →
+    /// skip-init → exec as `999`); the path needs no capabilities, so it is identical on
+    /// cap-dropped and non-cap-dropped nodes (posture-independent).
+    ///
+    /// An operator-set `user` always wins (mirrors
+    /// [`PrivilegeDirective::apply`](boatramp_core::compute::PrivilegeDirective::apply) — the
+    /// reconcile never clobbers an explicit `user`/`cap_add`). A non-DB workload, or a managed
+    /// image whose runtime uid can't be read from `/etc/passwd`, keeps the spec's own
+    /// `(uid, gid)`, so every non-managed launch is byte-for-byte unchanged.
+    ///
+    /// `rootfs_dir` is the SAME staged rootfs [`Self::resolve_volume_mapping`] reads the runtime
+    /// uid + derives the volume mapping from, so the launch uid always equals the uid the data
+    /// dir is owned as — the entrypoint owns its data dir with no chown.
+    async fn init_process_ids(&self, spec: &ComputeSpec, rootfs_dir: &Path) -> (u32, u32) {
+        let spec_ids = spec_uid_gid(spec);
+        // An operator-set `user` is authoritative (and the fast path for any workload that
+        // already pins its uid): never override it with the detected image uid.
+        if spec.user.is_some() {
+            return spec_ids;
+        }
+        // `db_runtime_ids` is `Some` only for a managed DB (gated on `db_user_for_spec`); `None`
+        // (a non-DB workload, or a managed image whose `/etc/passwd` can't be read) keeps the
+        // spec's own ids, leaving the launch unchanged.
+        self.db_runtime_ids(rootfs_dir, spec)
+            .await
+            .unwrap_or(spec_ids)
+    }
+
     /// Resolve the user-namespace mapping to launch this workload's container with, chosen so a
     /// REUSED persistent volume's data dir is read **as-is** without rewriting its ownership.
     ///
@@ -1959,7 +1999,12 @@ impl ContainerBackend {
         rootfs: &str,
         ip: Ipv4Addr,
     ) -> Result<Instance, BackendError> {
-        let (uid, gid) = spec_uid_gid(&req.spec);
+        // Launch the init process (the stock entrypoint) as the uid it should RUN as. For a
+        // managed DB with no operator-set `user` that is the image's DETECTED runtime uid (e.g.
+        // postgres 999) — so the entrypoint takes its non-root path and inits/serves directly
+        // without the capabilities a cap-dropped node withholds (see `init_process_ids`). A non-DB
+        // workload keeps the spec's namespace-root default, so its launch is unchanged.
+        let (uid, gid) = self.init_process_ids(&req.spec, Path::new(rootfs)).await;
         // The per-(project, workload) volume scope (the SAME identity as `id`/cgroup/veth).
         // Re-run the idempotent legacy-flat→scoped migration here too (a no-op once the scoped
         // dir exists) so a launch that did not route through this process's `materialize` still
@@ -4178,6 +4223,82 @@ mod tests {
         assert_eq!(again, mounts);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A rootfs dir with an `/etc/passwd` giving `postgres` the `999:999` the stock
+    /// postgres/mysql images run as. Returns the dir (the caller removes it).
+    fn rootfs_with_passwd(label: &str) -> PathBuf {
+        let dir = unique_dir(label);
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::write(
+            dir.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\n\
+             postgres:x:999:999::/var/lib/postgresql:/bin/bash\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn init_process_ids_launches_a_managed_db_as_its_detected_runtime_uid() {
+        let data_dir = unique_dir("launchids");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+        let rootfs = rootfs_with_passwd("launchids-rootfs");
+
+        // A managed DB (PGDATA env ⇒ `db_user_for_spec` = postgres), no operator `user`: launched
+        // AS the DETECTED image runtime uid (999), NOT the namespace-root default (0). Running as
+        // 999 makes the stock entrypoint take its non-root path (skips the cap-needing
+        // chown/chmod/gosu), so a FRESH init works on a cap-dropped node. 999 is also exactly the
+        // uid the data dir is pre-owned as (`base + runtime`), so the entrypoint owns its data.
+        let db = spec_with_volume_kind("data", true);
+        assert_eq!(db.user, None, "a managed-DB spec leaves user unset");
+        assert_eq!(
+            backend.init_process_ids(&db, &rootfs).await,
+            (999, 999),
+            "a managed DB launches as its detected runtime uid, not container-root"
+        );
+
+        // A non-DB workload keeps the spec's namespace-root default (0,0) — byte-for-byte
+        // unchanged (`db_runtime_ids` is `None`, so the detection never fires).
+        let generic = spec_with_volume_kind("data", false);
+        assert_eq!(
+            backend.init_process_ids(&generic, &rootfs).await,
+            (GUEST_UID, GUEST_GID),
+            "a non-DB workload's launch uid is unchanged"
+        );
+
+        // An operator-set `user` always wins, even for a managed DB (mirrors
+        // `PrivilegeDirective::apply`'s operator-wins rule).
+        let mut pinned = spec_with_volume_kind("data", true);
+        pinned.user = Some("1234:1234".into());
+        assert_eq!(
+            backend.init_process_ids(&pinned, &rootfs).await,
+            (1234, 1234),
+            "an explicit operator user is honored over the detected image uid"
+        );
+
+        // A managed DB whose image `/etc/passwd` can't be read falls back to the spec's own ids
+        // (never a panic, never a blind guess).
+        let no_passwd = unique_dir("launchids-nopw");
+        std::fs::create_dir_all(&no_passwd).unwrap();
+        assert_eq!(
+            backend
+                .init_process_ids(&spec_with_volume_kind("data", true), &no_passwd)
+                .await,
+            (GUEST_UID, GUEST_GID),
+            "an unreadable image /etc/passwd falls back to the spec uid"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&rootfs);
+        let _ = std::fs::remove_dir_all(&no_passwd);
     }
 
     // --- Legacy-volume migration (the cross-tenant collision fix) -----------------------
