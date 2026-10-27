@@ -1357,6 +1357,39 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Restart a managed database (`POST /api/{seg}/databases/{name}/restart`).
+    /// `Project·Admin`. Stops the workload's currently-running replica(s) so the
+    /// reconcile loop relaunches a fresh one, applying any restart-requiring config
+    /// change staged on the declaration in the process (e.g. a flipped
+    /// `delta_capture`). Returns `(workload, config_applied, replicas_restarted)`.
+    pub async fn restart_database(&self, name: &str) -> Result<(String, bool, usize)> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let v: serde_json::Value = client
+            .post(format!("{server}/api/{seg}/{name}/restart"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok((
+            v.get("workload")
+                .and_then(|w| w.as_str())
+                .unwrap_or(name)
+                .to_string(),
+            v.get("config_applied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            v.get("replicas_restarted")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize,
+        ))
+    }
+
     /// Ensure a login role on a declared managed database
     /// (`POST /api/{seg}/databases/{database}/users/{user}/ensure`). `Project·Admin`.
     /// Returns `(created, password)`: `password` is `Some` ONLY on the call that minted

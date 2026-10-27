@@ -83,6 +83,18 @@ enum DbCommand {
         #[command(subcommand)]
         what: DropWhat,
     },
+    /// Restart a managed database (`Project·Admin`): stop it so the reconcile loop
+    /// relaunches it, applying any restart-requiring config change staged on the
+    /// declaration in the process (e.g. a flipped `delta_capture`, which needs
+    /// `wal_level=logical`/`--log-bin` in the launch argv to take effect). The
+    /// explicit restart path a `restart_policy: manual` config change needs (see
+    /// `db status`'s "pending restart" signal), and a general lever to bounce a
+    /// database that needs no config change at all.
+    Restart {
+        /// The database binding name (defaults to the project's `default` database).
+        #[arg(long = "db", default_value = "default")]
+        db: String,
+    },
 }
 
 /// What `db drop` removes. Idempotent: dropping an absent resource is a clean no-op.
@@ -152,9 +164,13 @@ fn validate_name(name: &str) -> Result<()> {
 pub enum DbOutput {
     /// `db ls` — the project's declared managed databases.
     Ls { databases: Vec<ApplyDatabase> },
-    /// `db get <name>` — one declaration.
+    /// `db get <name>` — one declaration, plus whether a restart-requiring config
+    /// change is pending (PLAN-sql-true-delta Stage 1b).
     // Boxed to keep this larger payload from dwarfing the other variants.
-    Get { database: Box<ApplyDatabase> },
+    Get {
+        database: Box<ApplyDatabase>,
+        pending_restart: bool,
+    },
     /// `db status <name>` — the read-only status view (declaration + derived workload).
     Status {
         name: String,
@@ -189,6 +205,16 @@ pub enum DbOutput {
         role_name: String,
         existed: bool,
     },
+    /// `db restart [--db <name>]` — the database was restarted; `config_applied` is
+    /// whether a pending config change (e.g. a flipped `delta_capture`) was adopted in
+    /// the process, `replicas_restarted` how many running replicas were stopped for
+    /// the reconcile loop to relaunch.
+    Restart {
+        name: String,
+        workload: String,
+        config_applied: bool,
+        replicas_restarted: usize,
+    },
 }
 
 impl crate::output::Rendered for DbOutput {
@@ -204,9 +230,21 @@ impl crate::output::Rendered for DbOutput {
                 }
                 Ok(())
             }
-            Self::Get { database } => {
+            Self::Get {
+                database,
+                pending_restart,
+            } => {
                 write_header(w)?;
-                write_row(w, database)
+                write_row(w, database)?;
+                if *pending_restart {
+                    writeln!(
+                        w,
+                        "  pending restart: a config change (e.g. delta_capture) is staged but \
+                         not yet applied — run `boatramp db restart --db {}`",
+                        database.name
+                    )?;
+                }
+                Ok(())
             }
             Self::Status { name, view } => {
                 let workload = view.get("workload").and_then(|v| v.as_str()).unwrap_or("?");
@@ -227,6 +265,20 @@ impl crate::output::Rendered for DbOutput {
                     write!(w, " ({reason})")?;
                 }
                 writeln!(w)?;
+                // Pending-restart signal (PLAN-sql-true-delta Stage 1b): a config change (e.g.
+                // a flipped `delta_capture`) is staged but not yet applied. Shown only when
+                // true — the common case (no pending change) stays terse.
+                if view
+                    .get("pending_restart")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    writeln!(
+                        w,
+                        "  pending restart: yes — a staged config change has not been applied; \
+                         run `boatramp db restart --db {name}`"
+                    )?;
+                }
                 // The data-dir-ownership health signal: a filesystem fault (foreign-owned
                 // files the managed database can't read) behind an otherwise-opaque
                 // `starting` stall — the signal `/api/repair` can't give. Shown only when a
@@ -373,6 +425,21 @@ impl crate::output::Rendered for DbOutput {
                 }
                 Ok(())
             }
+            Self::Restart {
+                name,
+                workload,
+                config_applied,
+                replicas_restarted,
+            } => {
+                writeln!(w, "restarted database `{name}` (workload `{workload}`)")?;
+                if *config_applied {
+                    writeln!(w, "  pending config change applied")?;
+                }
+                writeln!(
+                    w,
+                    "  replicas stopped: {replicas_restarted} (the reconcile loop will relaunch)"
+                )
+            }
         }
     }
 }
@@ -418,6 +485,10 @@ pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
                 drop_user(&cp, &database, &name).await
             }
         },
+        DbCommand::Restart { db } => {
+            validate_name(&db)?;
+            restart(&cp, &db).await
+        }
     }
 }
 
@@ -459,20 +530,47 @@ async fn ls(cp: &ControlPlane) -> Result<DbOutput> {
     Ok(DbOutput::Ls { databases })
 }
 
-/// `db get <name>` — show one declaration.
+/// `db get <name>` — show one declaration, plus whether a restart-requiring config
+/// change is pending. `get` itself returns only the plain declaration (it must stay a
+/// clean `ApplyDatabase` on the wire), so this makes one additional, best-effort
+/// `status` round trip to decorate it — a failure there (e.g. an older server) just
+/// omits the pending signal rather than failing the whole command.
 async fn get(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
     let db = cp.get_database(name).await?;
+    let pending_restart = cp
+        .database_status(name)
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("pending_restart")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
     Ok(DbOutput::Get {
         database: Box::new(db),
+        pending_restart,
     })
 }
 
-/// `db status <name>` — the read-only status view (declaration + derived workload).
+/// `db status <name>` — the read-only status view (declaration + derived workload +
+/// the "pending restart" signal).
 async fn status(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
     let view = cp.database_status(name).await?;
     Ok(DbOutput::Status {
         name: name.to_string(),
         view,
+    })
+}
+
+/// `db restart [--db <name>]` — restart a managed database, applying any pending
+/// restart-requiring config change (e.g. a flipped `delta_capture`) in the process.
+async fn restart(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
+    let (workload, config_applied, replicas_restarted) = cp.restart_database(name).await?;
+    Ok(DbOutput::Restart {
+        name: name.to_string(),
+        workload,
+        config_applied,
+        replicas_restarted,
     })
 }
 
@@ -692,5 +790,83 @@ mod tests {
         });
         assert!(out.contains("readiness:       provision_failed"), "{out}");
         assert!(out.contains("(data dir perms)"), "{out}");
+    }
+
+    fn sample_db(name: &str) -> ApplyDatabase {
+        serde_json::from_value(serde_json::json!({ "name": name, "kind": "postgres" }))
+            .expect("minimal ApplyDatabase")
+    }
+
+    /// `db status` surfaces a pending-restart signal (PLAN-sql-true-delta Stage 1b) only
+    /// when the server flags it true — the common case (no pending change) stays terse.
+    #[test]
+    fn status_surfaces_pending_restart_only_when_true() {
+        let pending = serde_json::json!({
+            "workload": "bramp-db-acme-app",
+            "declared": true,
+            "readiness": {"state": "provisioned"},
+            "pending_restart": true,
+        });
+        let out = render(&DbOutput::Status {
+            name: "app".into(),
+            view: pending,
+        });
+        assert!(out.contains("pending restart: yes"), "{out}");
+        assert!(out.contains("db restart --db app"), "{out}");
+
+        let clear = serde_json::json!({
+            "workload": "bramp-db-acme-app",
+            "declared": true,
+            "readiness": {"state": "provisioned"},
+            "pending_restart": false,
+        });
+        let out = render(&DbOutput::Status {
+            name: "app".into(),
+            view: clear,
+        });
+        assert!(!out.contains("pending restart"), "{out}");
+    }
+
+    /// `db get` decorates the plain declaration with the pending-restart signal when the
+    /// server reports one — and stays terse when it does not.
+    #[test]
+    fn get_surfaces_pending_restart_only_when_true() {
+        let out = render(&DbOutput::Get {
+            database: Box::new(sample_db("app")),
+            pending_restart: true,
+        });
+        assert!(out.contains("pending restart:"), "{out}");
+        assert!(out.contains("db restart --db app"), "{out}");
+
+        let out = render(&DbOutput::Get {
+            database: Box::new(sample_db("app")),
+            pending_restart: false,
+        });
+        assert!(!out.contains("pending restart"), "{out}");
+    }
+
+    /// `db restart` reports the workload + whether a pending config change was adopted.
+    #[test]
+    fn restart_reports_config_applied_and_replica_count() {
+        let out = render(&DbOutput::Restart {
+            name: "app".into(),
+            workload: "bramp-db-acme-app-abc123".into(),
+            config_applied: true,
+            replicas_restarted: 1,
+        });
+        assert!(out.contains("restarted database `app`"), "{out}");
+        assert!(out.contains("bramp-db-acme-app-abc123"), "{out}");
+        assert!(out.contains("pending config change applied"), "{out}");
+        assert!(out.contains("replicas stopped: 1"), "{out}");
+
+        // No pending change: no "applied" line, but still reports the bounce.
+        let out = render(&DbOutput::Restart {
+            name: "app".into(),
+            workload: "bramp-db-acme-app-abc123".into(),
+            config_applied: false,
+            replicas_restarted: 0,
+        });
+        assert!(!out.contains("pending config change applied"), "{out}");
+        assert!(out.contains("replicas stopped: 0"), "{out}");
     }
 }

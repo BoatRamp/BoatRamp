@@ -2196,6 +2196,55 @@ pub trait ManagedDbDeclare: Send + Sync {
         database: &str,
         user: &str,
     ) -> Result<DropUserOutcome, DeclareError>;
+
+    /// Restart managed database `name` in `project`: stop its workload's currently
+    /// running replica(s) so the reconcile loop relaunches a fresh one, **applying any
+    /// restart-requiring config change staged on the declaration in the process** (e.g. a
+    /// flipped `delta_capture`, which flips `wal_level=logical`/`--log-bin` in the launch
+    /// argv — a start-only server setting) — the `POST /api/databases/{name}/restart`
+    /// verb / `boatramp db restart`. This is the explicit restart path a `restart_policy:
+    /// manual` config change needs (see [`restart_pending`](Self::restart_pending)), and
+    /// a general ops lever to bounce a managed database that needs no config change at
+    /// all (`config_applied` is then `false`).
+    ///
+    /// `NotDeclared` if `name` is not a managed declaration in `project`;
+    /// `NotProvisioned` if it has never been provisioned (nothing to restart — run
+    /// `db ensure` first). **Scope limit (documented):** today this covers only a
+    /// dedicated, project-scoped managed database (`tenant: single`, `tenant_scope:
+    /// project`) — the same tenancy `delta_capture`'s true-delta export requires. A
+    /// `Shared` server hosts other tenants (restarting it has a wider blast radius than
+    /// this per-project primitive should own) and a `Site`-scoped binding has no single
+    /// workload (its per-site containers are created lazily); both are refused with a
+    /// clear, actionable `Other` error rather than guessing a target.
+    async fn restart(&self, project: &str, name: &str) -> Result<RestartOutcome, DeclareError>;
+
+    /// Whether `name` has a restart-requiring config change staged but not yet applied —
+    /// the "pending restart" signal `db get`/`db status` surface. `true` only when the
+    /// database is already provisioned AND its current declaration would re-mint a
+    /// different content-addressed [`ComputeSpec`](crate::compute::ComputeSpec) than the
+    /// one actually active (e.g. `delta_capture` was flipped under `restart_policy:
+    /// manual` and has not been adopted by [`restart`](Self::restart) yet). `false` — never
+    /// an error — for a database that is not declared, not yet provisioned, or whose
+    /// tenancy is out of scope for the restart primitive (see `restart`'s docs): there is
+    /// nothing meaningful to report pending in those cases.
+    async fn restart_pending(&self, project: &str, name: &str) -> Result<bool, DeclareError>;
+}
+
+/// The outcome of [`ManagedDbDeclare::restart`]: which server workload was restarted,
+/// whether a pending config change was adopted in the process, and how many running
+/// replicas were stopped for the reconcile loop to relanch.
+#[derive(Debug, Clone)]
+pub struct RestartOutcome {
+    /// The derived server compute-workload name that was restarted.
+    pub workload: String,
+    /// Whether the current declaration's config differed from what was actually active —
+    /// i.e. whether this restart adopted a pending change (e.g. a flipped
+    /// `delta_capture`) rather than just bouncing an unchanged server.
+    pub config_applied: bool,
+    /// How many currently-observed replicas were stopped (for the reconcile loop to
+    /// relaunch against the now-active spec). `0` is valid — e.g. between reconcile
+    /// ticks, or a database that was registered but never launched.
+    pub replicas_restarted: usize,
 }
 
 /// The outcome of [`ManagedDbDeclare::drop_user`]. `existed` reflects whether a sealed
@@ -2259,6 +2308,15 @@ pub enum DeclareError {
     /// The `ensure` verb was called for a database that has not been declared. `404`.
     #[error("managed database {0:?} has not been declared in this project")]
     NotDeclared(String),
+    /// The `restart` verb was called for a database that is declared but has never been
+    /// provisioned (no compute workload registered yet) — there is nothing running to
+    /// restart. `409`: distinct from `NotDeclared` (the declaration exists); the fix is
+    /// `db ensure` first.
+    #[error(
+        "managed database {0:?} is declared but has not been provisioned yet; run \
+         `db ensure` before `db restart`"
+    )]
+    NotProvisioned(String),
     /// Declaring this database would exceed an operator-configured per-project ceiling
     /// (#501 Stage B MEDIUM-1 — the disk-exhaustion / errno-28 guard): either the maximum
     /// NUMBER of declared databases per project, or the maximum AGGREGATE provisioned

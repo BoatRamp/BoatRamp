@@ -347,6 +347,18 @@ fn scalar_text(rows: &boatramp_core::sql::SqlRows) -> Option<String> {
     }
 }
 
+/// The clear, actionable error for a delta export against a `delta_capture`-enabled db
+/// whose server has not actually adopted it yet (PLAN-sql-true-delta Stage 1b).
+fn delta_capture_not_restarted_message(db: &str) -> String {
+    format!(
+        "database {db:?}: delta export refused — `delta_capture` is enabled but the server has \
+         not been restarted to adopt it yet (true-delta needs wal_level=logical / binary \
+         logging, which only take effect at server start); ensure `delta_capture: true` is set \
+         and run `boatramp db restart --db {db}` (or apply with `restart_policy: auto`) before \
+         a delta export of this database"
+    )
+}
+
 /// A stable fingerprint of a schema-ledger query result — a canonical serialization of
 /// every row, hashed. Identical input rows (same migrations applied, same content
 /// hashes) yield an identical fingerprint on both export (source) and import (target),
@@ -776,6 +788,38 @@ impl NodeProjectExport {
                     .into(),
             )
         })
+    }
+
+    /// Refuse LOUD if `db`'s `delta_capture` opt-in has not actually taken effect on the
+    /// LIVE server yet (`wal_level` still not `logical`) — the operator enabled it but has
+    /// not restarted the database (PLAN-sql-true-delta Stage 1b's restart primitive). A
+    /// connectivity failure checking it is deliberately NOT treated as this condition (it
+    /// is left to surface on its own, later in the plan) — this only short-circuits on an
+    /// ANSWERED, non-`logical` `wal_level`, so it never masks an unrelated transient error
+    /// behind a misleading "not restarted" message.
+    async fn assert_pg_delta_capture_live(&self, project: &str, db: &str) -> Result<(), Perr> {
+        let op = self.require_op()?;
+        if let Ok(rows) = op.query(project, db, "SHOW wal_level").await
+            && let Some(level) = scalar_text(&rows)
+            && !level.trim().eq_ignore_ascii_case("logical")
+        {
+            return Err(Perr::Other(delta_capture_not_restarted_message(db)));
+        }
+        Ok(())
+    }
+
+    /// The mysql analogue of [`assert_pg_delta_capture_live`](Self::assert_pg_delta_capture_live):
+    /// refuse LOUD if `db`'s `delta_capture` opt-in has not taken effect yet (binary logging
+    /// still off, `@@GLOBAL.log_bin` != `1`) because the server has not been restarted.
+    async fn assert_mysql_delta_capture_live(&self, project: &str, db: &str) -> Result<(), Perr> {
+        let op = self.require_op()?;
+        if let Ok(rows) = op.query(project, db, "SELECT @@GLOBAL.log_bin").await
+            && let Some(v) = scalar_text(&rows)
+            && v.trim() != "1"
+        {
+            return Err(Perr::Other(delta_capture_not_restarted_message(db)));
+        }
+        Ok(())
     }
 
     /// Resolve a SQL database (managed compute-backed OR external bring-your-own-URL) to
@@ -3748,6 +3792,23 @@ impl NodeProjectExport {
                 "delta export refused: the base chain's root is for project {:?}, not {project:?}",
                 chain[0].1.source.project
             )));
+        }
+
+        // Delta-capture readiness (PLAN-sql-true-delta Stage 1b): `delta_capture` flips a
+        // START-ONLY server setting (`wal_level=logical` / `--log-bin`), so an operator who
+        // enabled it but has not yet RESTARTED the database (`boatramp db restart`) would
+        // otherwise silently get a full-dump delta member for it with no indication why — the
+        // capture machinery's own fallback is deliberately non-fatal (true-delta is
+        // best-effort). An explicit `delta_capture` opt-in is a stated expectation of a true
+        // delta, so refuse LOUD here, up front, rather than let it fall through to that silent
+        // fallback. Every capture-eligible db covered by this export is checked; a connectivity
+        // failure checking it is NOT this condition (it is left to surface on its own, later).
+        for (db, cfg) in &self.databases {
+            if Self::pg_capture_eligible(cfg) {
+                self.assert_pg_delta_capture_live(project, db).await?;
+            } else if Self::mysql_capture_eligible(cfg) {
+                self.assert_mysql_delta_capture_live(project, db).await?;
+            }
         }
 
         // Frontier = replay the chain (metadata only): the effective KV + blob state at the base.

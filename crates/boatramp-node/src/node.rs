@@ -857,6 +857,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 kv.clone(),
                 envelope,
                 quota,
+                compute_backends.clone(),
             )) as Arc<_>
         });
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]

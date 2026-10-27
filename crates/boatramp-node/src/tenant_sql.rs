@@ -80,13 +80,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_spec,
+    BackendRegistry, ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_spec,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
-use boatramp_core::sql::{SqlBackend, SqlError};
+use boatramp_core::sql::{DeclareError, RestartOutcome, SqlBackend, SqlError};
 use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::sql_compute::{
     ComputeEndpointResolver, ComputeResolvedSqlBackend, SESSION_KEY_PROJECT, SESSION_KEY_SITE,
@@ -294,6 +294,223 @@ fn managed_volume_name(workload: &str, is_default: bool) -> String {
     } else {
         workload.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// The managed-DB restart primitive (PLAN-sql-true-delta Stage 1b): a general "config
+// change that only takes effect at start" lever. `delta_capture` is its first consumer
+// (flipping `wal_level=logical` / `--log-bin` in the launch argv), but the mechanism is
+// generic: re-mint the content-addressed `ComputeSpec` from the CURRENT declaration,
+// roll the workload's `active` pointer if it changed, then stop every currently-observed
+// replica so the reconcile loop relaunches it fresh against the new spec, reattaching
+// the SAME data volume (the workload/volume name never changes — only the spec id does).
+//
+// Scope limit (documented, not a bug): only a `Single`/`Project`-scoped binding — the
+// same tenancy `delta_capture`'s true-delta export requires — is supported. A `Shared`
+// server hosts other tenants (restarting it has a wider blast radius than this
+// per-project primitive should own); a `Site`-scoped binding has no single workload (its
+// per-site containers are created lazily, one per site, by the `sql` resolver on first
+// use) — both are refused with a clear, actionable error rather than guessing a target.
+// ---------------------------------------------------------------------------
+
+/// Resolve the managed-DB restart primitive's target `(workload, is_default, engine
+/// kind)` for `binding` under `project`, or `None` when its tenancy is out of scope (see
+/// the module-level note above). Pure + synchronous: mirrors EXACTLY the derivation
+/// `provision_single` uses (via [`tenant_key`] + [`tenant_names`]), so a restart's target
+/// never drifts from what a fresh provision would register.
+fn restart_target(
+    binding: &ExternalDatabaseConfig,
+    project: &str,
+) -> Option<(String, bool, ExternalSqlKind)> {
+    if binding.tenant_scope != TenantScope::Project || binding.tenant != TenantIsolation::Single {
+        return None;
+    }
+    let kind = ExternalSqlKind::parse(&binding.kind)?;
+    let compute = binding.compute.as_deref().filter(|c| !c.is_empty())?;
+    let (tenant_ident_raw, is_default) = tenant_key(binding.tenant_scope, project, "");
+    let names = tenant_names(
+        binding.tenant,
+        compute,
+        binding.database.as_deref().unwrap_or_default(),
+        &tenant_ident_raw,
+        is_default,
+    );
+    Some((names.workload, is_default, kind))
+}
+
+/// Whether `binding`'s tenancy is in scope for the restart primitive at all (`Single` +
+/// `Project`-scoped) — the cheap pre-check `declare`'s `restart_policy: auto` hook uses
+/// to decide whether to even attempt [`restart_pending`]/[`restart_managed_db`], so it
+/// can log a clear one-time notice instead of treating "out of scope" the same as
+/// "nothing changed".
+pub(crate) fn restart_supported(binding: &ExternalDatabaseConfig, project: &str) -> bool {
+    restart_target(binding, project).is_some()
+}
+
+/// The clear, actionable refusal for a restart request whose binding's tenancy
+/// [`restart_target`] does not support (see the module-level scope-limit note above).
+fn restart_scope_message(binding: &ExternalDatabaseConfig, name: &str) -> String {
+    if binding.tenant_scope != TenantScope::Project {
+        format!(
+            "database {name:?}: restart is only supported for a project-scoped managed \
+             database today; a site-scoped binding has no single workload to restart (its \
+             per-site containers are created lazily)"
+        )
+    } else if binding.tenant != TenantIsolation::Single {
+        format!(
+            "database {name:?}: restart is only supported for a dedicated (tenant: single) \
+             managed database today; a shared server hosts other tenants, so restarting it is \
+             out of scope for this per-project primitive"
+        )
+    } else {
+        format!("database {name:?}: not compute-backed or an unknown engine; nothing to restart")
+    }
+}
+
+/// Re-mint the managed-DB [`ComputeSpec`](boatramp_core::compute::ComputeSpec) from
+/// `binding`'s CURRENT fields — the EXACT construction `provision_single` /
+/// `auto_register_managed_db_workloads` use (image, volume size, the `delta_capture`
+/// launch argv, the startup-grace override, and — for a non-default tenant — the
+/// isolated per-workload volume name) — so the restart primitive's remint can never
+/// drift from what a fresh provision would produce.
+fn remint_managed_db_spec(
+    binding: &ExternalDatabaseConfig,
+    kind: ExternalSqlKind,
+    workload: &str,
+    is_default: bool,
+) -> boatramp_core::compute::ComputeSpec {
+    let mut spec = managed_db_spec(
+        engine_of(kind),
+        binding.image.as_deref(),
+        binding.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
+        binding.delta_capture,
+    );
+    if let Some(grace) = binding.startup_grace_secs {
+        spec.startup_grace_secs = grace;
+    }
+    if let Some(vol) = spec.volumes.first_mut() {
+        vol.name = managed_volume_name(workload, is_default);
+    }
+    spec
+}
+
+/// Whether `binding` (declared as `name` in `project`) has a restart-requiring config
+/// change staged but not yet applied — backs [`ManagedDbDeclare::restart_pending`](
+/// boatramp_core::sql::ManagedDbDeclare::restart_pending). `Ok(false)` (never an error)
+/// when the tenancy is out of scope for the restart primitive, or the database has not
+/// been provisioned yet (nothing to be "behind" relative to).
+pub(crate) async fn restart_pending(
+    deploy: &DeployStore,
+    binding: &ExternalDatabaseConfig,
+    project: &str,
+) -> Result<bool, DeclareError> {
+    let Some((workload, is_default, kind)) = restart_target(binding, project) else {
+        return Ok(false);
+    };
+    let proj = ProjectRef::new(project);
+    let Some(wl) = deploy
+        .get_compute_workload(proj, &workload)
+        .await
+        .map_err(|e| DeclareError::Other(e.to_string()))?
+    else {
+        return Ok(false); // not yet provisioned — nothing pending.
+    };
+    let fresh = remint_managed_db_spec(binding, kind, &workload, is_default);
+    Ok(fresh.id() != wl.active)
+}
+
+/// Restart managed database `name` (`binding`, already resolved + validated as the
+/// managed-credential path) in `project` — backs
+/// [`ManagedDbDeclare::restart`](boatramp_core::sql::ManagedDbDeclare::restart). Re-mints
+/// the spec from the current binding, rolls the workload's `active` pointer if it
+/// changed, then stops every currently-observed replica so the reconcile loop relaunches
+/// it fresh (reattaching the same data volume). `backends` resolves each observed
+/// replica's backend to call `stop` on; a replica whose backend is no longer registered
+/// is just forgotten (its state is dropped so the reconcile treats it as missing).
+pub(crate) async fn restart_managed_db(
+    deploy: &DeployStore,
+    backends: &BackendRegistry,
+    binding: &ExternalDatabaseConfig,
+    project: &str,
+    name: &str,
+) -> Result<RestartOutcome, DeclareError> {
+    let Some((workload, is_default, kind)) = restart_target(binding, project) else {
+        return Err(DeclareError::Other(restart_scope_message(binding, name)));
+    };
+    let proj = ProjectRef::new(project);
+    let Some(wl) = deploy
+        .get_compute_workload(proj, &workload)
+        .await
+        .map_err(|e| DeclareError::Other(e.to_string()))?
+    else {
+        return Err(DeclareError::NotProvisioned(name.to_string()));
+    };
+
+    let fresh = remint_managed_db_spec(binding, kind, &workload, is_default);
+    let new_id = deploy
+        .put_compute_spec(&fresh)
+        .await
+        .map_err(|e| DeclareError::Other(e.to_string()))?;
+    let config_applied = new_id != wl.active;
+    if config_applied {
+        let rolled = ComputeWorkload {
+            active: new_id,
+            ..wl
+        };
+        deploy
+            .set_compute_workload(proj, &rolled)
+            .await
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+    }
+
+    let states = deploy
+        .list_replica_states(proj, &workload)
+        .await
+        .map_err(|e| DeclareError::Other(e.to_string()))?;
+    // Mirrors `NodeComputeControl::restart`'s fail-closed semantics (Security review
+    // LOW-2): a replica whose backend is not registered ON THIS NODE is left ALONE —
+    // its state is NOT deleted — rather than silently forgotten. Deleting it anyway
+    // (the prior behavior) could make the reconcile loop launch a FRESH replica while
+    // the old one keeps running unstopped elsewhere, risking two servers on the same
+    // data volume. The config change is still staged (the spec was already rolled
+    // above); only the live bounce of this particular replica is refused.
+    let mut replicas_restarted = 0usize;
+    for state in &states {
+        let Some(backend) = backends.get(&state.backend) else {
+            return Err(DeclareError::Other(format!(
+                "restart {workload}/{}: backend {:?} is not registered on this node; refusing \
+                 to forget this replica (it may still be running) — the config change is \
+                 staged and will apply on its next successful restart",
+                state.handle.replica, state.backend
+            )));
+        };
+        match backend.stop(&state.handle).await {
+            Ok(()) => {}
+            Err(boatramp_core::compute::BackendError::Unsupported) => {
+                return Err(DeclareError::Other(format!(
+                    "restart {workload}/{}: backend {:?} does not support stop",
+                    state.handle.replica, state.backend
+                )));
+            }
+            Err(e) => {
+                return Err(DeclareError::Other(format!(
+                    "restart {workload}/{}: stop: {e}",
+                    state.handle.replica
+                )));
+            }
+        }
+        deploy
+            .delete_replica_state(proj, &workload, state.handle.replica)
+            .await
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        replicas_restarted += 1;
+    }
+
+    Ok(RestartOutcome {
+        workload,
+        config_applied,
+        replicas_restarted,
+    })
 }
 
 /// The **compute-backed managed** bindings of a `databases` config — the ones this

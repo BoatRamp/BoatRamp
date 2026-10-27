@@ -514,6 +514,14 @@ pub fn router_with_fast(
         )
         .route("/api/databases/{name}/status", get(database_status))
         .route("/api/databases/{name}/ensure", post(ensure_database))
+        // Restart a managed database: stop its workload's running replica(s) so the
+        // reconcile loop relaunches it, applying any restart-requiring config change
+        // staged on the declaration in the process (PLAN-sql-true-delta Stage 1b —
+        // e.g. a flipped `delta_capture`). Same `/api/databases/*` prefix ⇒ the SAME
+        // `Project·Admin` gate as declare/ensure (`Right::required`'s `databases`
+        // family rule covers this deeper path too; the project-scoped
+        // `/api/projects/{proj}/databases/{name}/restart` form rewrites here).
+        .route("/api/databases/{name}/restart", post(restart_database))
         // Ensure a login role on a declared managed database (Project·Admin — the
         // `(&"databases", _)` family rule gates this deeper path too; the project-scoped
         // `/api/projects/{proj}/databases/{db}/users/{user}/ensure` form rewrites here).

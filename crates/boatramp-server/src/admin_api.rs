@@ -1847,14 +1847,16 @@ pub(super) async fn repair_dry_run(
 
 /// Map a [`DeclareError`](boatramp_core::sql::DeclareError) to an HTTP response. The
 /// structured reason rides in the body; the status distinguishes the security refusals
-/// (`409` daemon-conflict / identity-change) from a per-project quota refusal (`422`), a
-/// missing declaration (`404`), an unavailable capability (`501`), and a generic bad
-/// request (`400`).
+/// (`409` daemon-conflict / identity-change / not-yet-provisioned) from a per-project
+/// quota refusal (`422`), a missing declaration (`404`), an unavailable capability
+/// (`501`), and a generic bad request (`400`).
 fn declare_error_response(err: boatramp_core::sql::DeclareError) -> Response {
     use boatramp_core::sql::DeclareError as E;
     let status = match &err {
         E::NotConfigured => StatusCode::NOT_IMPLEMENTED,
-        E::DaemonConflict(_) | E::IdentityChange { .. } => StatusCode::CONFLICT,
+        E::DaemonConflict(_) | E::IdentityChange { .. } | E::NotProvisioned(_) => {
+            StatusCode::CONFLICT
+        }
         E::QuotaExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         E::NotDeclared(_) => StatusCode::NOT_FOUND,
         E::Other(_) => StatusCode::BAD_REQUEST,
@@ -1945,6 +1947,40 @@ pub(super) async fn ensure_database(
     };
     match declare.ensure(project.as_ref().as_str(), &name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => declare_error_response(e),
+    }
+}
+
+/// `POST /api/projects/{proj}/databases/{name}/restart` — restart a managed database:
+/// stop its workload's currently-running replica(s) so the reconcile loop relaunches it,
+/// applying any restart-requiring config change staged on the declaration in the
+/// process (e.g. a flipped `delta_capture`). `Project·Admin` (the same owner-grade gate
+/// as declare/ensure — it drives the same privileged provisioning plane). Backs
+/// `boatramp db restart`.
+pub(super) async fn restart_database(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    match declare.restart(project.as_ref().as_str(), &name).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "workload": outcome.workload,
+                "config_applied": outcome.config_applied,
+                "replicas_restarted": outcome.replicas_restarted,
+            })),
+        )
+            .into_response(),
         Err(e) => declare_error_response(e),
     }
 }
@@ -2080,11 +2116,14 @@ pub(super) async fn get_database(
 
 /// `GET /api/projects/{proj}/databases/{name}/status` — a read-only status view of a
 /// declared managed database: the stored declaration plus whether it is registered as a
-/// compute workload yet (a coarse "provisioned" signal for `boatramp db status`).
-/// `Project·Read`. Never returns a secret.
+/// compute workload yet (a coarse "provisioned" signal for `boatramp db status`), and
+/// whether a restart-requiring config change is staged but not yet applied
+/// (`pending_restart`, PLAN-sql-true-delta Stage 1b — e.g. a flipped `delta_capture`
+/// under `restart_policy: manual`). `Project·Read`. Never returns a secret.
 pub(super) async fn database_status(
     State(deploy): State<DeployStore>,
     Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(bad) = reject_invalid_db(&name) {
@@ -2120,11 +2159,23 @@ pub(super) async fn database_status(
         .await
         .unwrap_or_default();
     let readiness = summarize_readiness(&states);
+    // `pending_restart`: whether the current declaration would re-mint a different
+    // content-addressed spec than what is actually active (PLAN-sql-true-delta Stage
+    // 1b) — `false` (never an error) if no restart capability is wired, the database
+    // isn't provisioned yet, or its tenancy is out of the restart primitive's scope.
+    let pending_restart = match &declare {
+        Some(cap) => cap
+            .restart_pending(project.as_ref().as_str(), &name)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
     let mut body = serde_json::json!({
         "database": db,
         "workload": workload,
         "declared": true,
         "readiness": readiness,
+        "pending_restart": pending_restart,
     });
     // Surface the data-dir-ownership health signal when a replica recorded one: a
     // filesystem-level fault (foreign-owned files the rootless DB can't read) that leaves a

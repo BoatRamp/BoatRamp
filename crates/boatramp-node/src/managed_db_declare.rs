@@ -206,6 +206,10 @@ pub struct NodeManagedDbDeclare {
     /// Production is [`SystemEnv`](boatramp_core::env::SystemEnv); a test injects a `MapEnv`
     /// via [`with_env_source`](Self::with_env_source).
     env_source: Arc<dyn boatramp_core::env::EnvSource>,
+    /// The node's compute backends (PLAN-sql-true-delta Stage 1b) — needed to actually
+    /// `stop` a replica for `restart`. A clone of the SAME registry the reconcile loop
+    /// runs over (cheap: `BackendRegistry` is a map of `Arc`s).
+    backends: boatramp_core::compute::BackendRegistry,
 }
 
 /// The operator-configurable per-project ceilings a `declare` is enforced fail-closed
@@ -244,14 +248,17 @@ impl DeclareQuota {
 
 impl NodeManagedDbDeclare {
     /// Build over the node-static `databases` map, the deploy store, KV, the secrets
-    /// envelope (required — a managed DB seals its credential), and the per-project
-    /// declaration ceilings ([`DeclareQuota`], #501 Stage B MEDIUM-1).
+    /// envelope (required — a managed DB seals its credential), the per-project
+    /// declaration ceilings ([`DeclareQuota`], #501 Stage B MEDIUM-1), and the node's
+    /// compute backends (PLAN-sql-true-delta Stage 1b — `restart` needs to `stop` a
+    /// replica).
     pub fn new(
         static_dbs: BTreeMap<String, ExternalDatabaseConfig>,
         deploy: DeployStore,
         kv: Arc<dyn KvStore>,
         envelope: Arc<dyn KeyEnvelope>,
         quota: DeclareQuota,
+        backends: boatramp_core::compute::BackendRegistry,
     ) -> Self {
         Self {
             static_dbs,
@@ -260,6 +267,7 @@ impl NodeManagedDbDeclare {
             envelope,
             quota,
             env_source: Arc::new(boatramp_core::env::SystemEnv),
+            backends,
         }
     }
 
@@ -491,18 +499,24 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
 
         // Destructive-change refusal: on re-apply of an existing declared DB, refuse any
         // change to an IDENTITY field (kind/tenant/tenant_scope) — silent data-loss/orphan.
-        if let Some(prior) = self
+        // `prior` is also the "was this an existing DB, not a first-time declare" signal
+        // the restart-policy hook below needs — a fresh declare's eager provision below
+        // already creates the workload with today's config, so there is nothing to
+        // auto-restart onto.
+        let prior = self
             .deploy
             .get_project_database(ProjectRef::new(project), name)
             .await
-            .map_err(|e| DeclareError::Other(e.to_string()))?
-            && let Some(field) = db.identity_change(&prior)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        if let Some(p) = &prior
+            && let Some(field) = db.identity_change(p)
         {
             return Err(DeclareError::IdentityChange {
                 db: name.to_string(),
                 field,
             });
         }
+        let is_reapply = prior.is_some();
 
         // Per-project ceiling (#501 Stage B MEDIUM-1 — the disk-exhaustion / errno-28
         // guard): fail-closed BEFORE any store write or eager volume provision if this
@@ -538,8 +552,47 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
             .await
             .map_err(|e| DeclareError::Other(e.to_string()))?;
 
-        // Eager provision so the DB exists when `apply` returns.
-        self.provision(&binding, project).await
+        // Eager provision so the DB exists when `apply` returns. For a FIRST-TIME declare
+        // this already creates the workload with today's config (nothing further to
+        // adopt); a re-apply of an EXISTING declaration is non-clobbering (see the
+        // registration paths' doc comments) and so does NOT re-mint/relaunch on its own —
+        // that is exactly the restart primitive's job, below.
+        self.provision(&binding, project).await?;
+
+        // `restart_policy: auto` (PLAN-sql-true-delta Stage 1b): a re-apply that changed a
+        // restart-requiring field (e.g. flipping `delta_capture`) applies it + restarts
+        // the database RIGHT NOW. `restart_pending` is the single source of truth for
+        // "did anything that needs a restart actually change" — it is `false` (no-op)
+        // for an unchanged re-apply, a not-yet-provisioned database, or a tenancy out of
+        // the restart primitive's scope (Shared / Site-scoped — logged, not an error: the
+        // config WAS persisted even though it can't be auto-applied yet).
+        if is_reapply && db.restart_policy.is_auto() {
+            if !crate::tenant_sql::restart_supported(&binding, project) {
+                tracing::warn!(
+                    database = %name,
+                    "managed db: restart_policy=auto is honored only for a dedicated, \
+                     project-scoped managed database today; the config change was persisted but \
+                     not auto-applied — restart it explicitly (e.g. via `boatramp compute \
+                     restart`) if it needs to take effect now"
+                );
+            } else {
+                match crate::tenant_sql::restart_pending(&self.deploy, &binding, project).await {
+                    Ok(true) => {
+                        crate::tenant_sql::restart_managed_db(
+                            &self.deploy,
+                            &self.backends,
+                            &binding,
+                            project,
+                            name,
+                        )
+                        .await?;
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn ensure(&self, project: &str, name: &str) -> Result<(), DeclareError> {
@@ -688,6 +741,52 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
             .map_err(DeclareError::Other)?;
 
         Ok(DropUserOutcome { existed, role_name })
+    }
+
+    async fn restart(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<boatramp_core::sql::RestartOutcome, DeclareError> {
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", name)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        // A daemon-static binding is refused EXPLICITLY (never just "is_managed_credential",
+        // which a static binding with no `password_env` ALSO satisfies — Security review
+        // LOW-1): `restart` re-mints + ROLLS the active spec unconditionally, unlike
+        // `ensure`'s non-clobbering provision (which is a safe no-op on an
+        // already-registered operator workload). Rolling an operator-declared workload's
+        // spec out from under it would silently discard its own image/env — the restart
+        // primitive only ever owns a PROJECT declaration.
+        if self.static_dbs.contains_key(name) {
+            return Err(DeclareError::NotDeclared(name.to_string()));
+        }
+        let binding = match resolve_binding(&self.static_dbs, &self.deploy, project, name).await? {
+            Some(b) if b.is_managed_credential() => b,
+            _ => return Err(DeclareError::NotDeclared(name.to_string())),
+        };
+        crate::tenant_sql::restart_managed_db(&self.deploy, &self.backends, &binding, project, name)
+            .await
+    }
+
+    async fn restart_pending(&self, project: &str, name: &str) -> Result<bool, DeclareError> {
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", name)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        // Same explicit daemon-static refusal as `restart` (Security review LOW-1) — see
+        // its comment. A static binding is never "pending" under this primitive.
+        if self.static_dbs.contains_key(name) {
+            return Ok(false);
+        }
+        let Some(binding) = resolve_binding(&self.static_dbs, &self.deploy, project, name)
+            .await?
+            .filter(ExternalDatabaseConfig::is_managed_credential)
+        else {
+            return Ok(false); // not declared — nothing to report.
+        };
+        crate::tenant_sql::restart_pending(&self.deploy, &binding, project).await
     }
 }
 
@@ -936,6 +1035,7 @@ mod tests {
             kv.clone(),
             std::sync::Arc::new(XorEnvelope),
             quota,
+            std::collections::BTreeMap::new(), // no backends — these tests never launch a replica.
         );
         (cap, deploy, kv)
     }
@@ -1179,5 +1279,174 @@ mod tests {
         let z = DeclareQuota::from_config(Some(0), Some(0));
         assert_eq!(z.max_databases, 0);
         assert_eq!(z.max_volume_mib, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The restart primitive (PLAN-sql-true-delta Stage 1b): `delta_capture` is the
+    // first consumer of a general "managed-DB config change that only takes effect at
+    // start" lever. These run entirely in-engine (NullStorage + MemoryKv, no backend,
+    // no live DB) because a `Single`/`Project` binding's provisioning never opens a
+    // real connection — see `single_project`'s doc comment.
+    // -----------------------------------------------------------------------
+
+    /// GATE: `restart_policy: manual` (the default) STAGES a restart-requiring config
+    /// change as pending rather than silently needing a manual relaunch; the explicit
+    /// `restart` adopts it and clears the pending signal; `restart_policy: auto` applies
+    /// a change on `declare` itself, with NO spurious bounce when nothing changed.
+    #[tokio::test]
+    async fn restart_primitive_stages_manual_applies_auto_and_restart_adopts() {
+        let (cap, _deploy, _kv) = declare_cap(BTreeMap::new());
+
+        // First-time declare: `provision` creates the workload fresh with today's
+        // config, so there is nothing pending yet.
+        cap.declare("acme", "app", &single_project("app"))
+            .await
+            .unwrap();
+        assert!(
+            !cap.restart_pending("acme", "app").await.unwrap(),
+            "a freshly declared db has nothing pending"
+        );
+
+        // Flip `delta_capture` under the MANUAL (default) policy: persisted, but NOT
+        // auto-applied.
+        let mut flipped = single_project("app");
+        flipped.delta_capture = true;
+        cap.declare("acme", "app", &flipped).await.unwrap();
+        assert!(
+            cap.restart_pending("acme", "app").await.unwrap(),
+            "GATE: manual policy must STAGE the change as pending, not silently apply it"
+        );
+
+        // The explicit restart adopts it (`config_applied`) and the pending signal
+        // clears.
+        let outcome = cap.restart("acme", "app").await.unwrap();
+        // A non-default Single tenant's ACTUAL workload is the derived compute name
+        // further qualified with its tenant identity (`tenant_names`'s `"<compute>-
+        // <ident>"`) — check the prefix rather than hardcoding the full derivation.
+        assert!(
+            outcome
+                .workload
+                .starts_with(&derived_workload("acme", "app")),
+            "unexpected workload name {:?}",
+            outcome.workload
+        );
+        assert!(
+            outcome.config_applied,
+            "GATE: restart must adopt the staged change"
+        );
+        assert_eq!(
+            outcome.replicas_restarted, 0,
+            "no replica was ever launched in this in-engine test"
+        );
+        assert!(!cap.restart_pending("acme", "app").await.unwrap());
+
+        // Re-declaring the SAME (now-unchanged) config under AUTO is a no-op — nothing
+        // pending, so nothing to adopt (no spurious bounce on an idempotent re-apply).
+        let mut auto_unchanged = flipped.clone();
+        auto_unchanged.restart_policy = boatramp_core::compute::DbRestartPolicy::Auto;
+        cap.declare("acme", "app", &auto_unchanged).await.unwrap();
+        assert!(!cap.restart_pending("acme", "app").await.unwrap());
+
+        // Flipping `delta_capture` back OFF under AUTO applies it IMMEDIATELY on
+        // `declare` — `restart_pending` never even observes it as pending.
+        let mut off_auto = auto_unchanged;
+        off_auto.delta_capture = false;
+        cap.declare("acme", "app", &off_auto).await.unwrap();
+        assert!(
+            !cap.restart_pending("acme", "app").await.unwrap(),
+            "GATE: restart_policy: auto must apply a pending change on declare, not leave it \
+             staged"
+        );
+    }
+
+    /// GATE: the restart primitive's documented scope limit (`Single` + `Project` only)
+    /// refuses a `Shared` or `Site`-scoped binding with a CLEAR, actionable reason —
+    /// never a silent no-op and never a guess at a target with a wider blast radius.
+    /// `restart_pending` never errors for an out-of-scope tenancy — it just reports
+    /// `false` (nothing meaningful to report). A declared-but-never-provisioned binding
+    /// gets its own distinct `NotProvisioned`, not the scope-limit message.
+    #[tokio::test]
+    async fn restart_refuses_out_of_scope_and_unprovisioned_with_clear_errors() {
+        let (cap, deploy, _kv) = declare_cap(BTreeMap::new());
+
+        // Seed the declarations directly (bypassing `declare`'s eager provision, which
+        // for a non-default Shared binding would try to open a real connection) so this
+        // stays in-engine — `restart` only needs to read the stored declaration.
+        deploy
+            .set_project_database(ProjectRef::new("acme"), &declared("shared"))
+            .await
+            .unwrap();
+        let err = cap.restart("acme", "shared").await.unwrap_err();
+        assert!(
+            matches!(&err, DeclareError::Other(msg) if msg.contains("shared server hosts other tenants")),
+            "GATE: a Shared binding's restart must refuse with the documented scope-limit \
+             reason, got {err:?}"
+        );
+        assert!(!cap.restart_pending("acme", "shared").await.unwrap());
+
+        let mut site_scoped = single_project("per-site");
+        site_scoped.tenant_scope = boatramp_core::compute::ApplyDatabaseScope::Site;
+        deploy
+            .set_project_database(ProjectRef::new("acme"), &site_scoped)
+            .await
+            .unwrap();
+        let err = cap.restart("acme", "per-site").await.unwrap_err();
+        assert!(
+            matches!(&err, DeclareError::Other(msg) if msg.contains("site-scoped binding has no single workload")),
+            "GATE: a Site-scoped binding's restart must refuse with the documented scope-limit \
+             reason, got {err:?}"
+        );
+        assert!(!cap.restart_pending("acme", "per-site").await.unwrap());
+
+        // In scope (Single/Project) but never provisioned: a distinct, actionable error.
+        deploy
+            .set_project_database(ProjectRef::new("acme"), &single_project("unprovisioned"))
+            .await
+            .unwrap();
+        let err = cap.restart("acme", "unprovisioned").await.unwrap_err();
+        assert!(
+            matches!(err, DeclareError::NotProvisioned(ref n) if n == "unprovisioned"),
+            "GATE: restart on a declared-but-unprovisioned db must say so, got {err:?}"
+        );
+        assert!(!cap.restart_pending("acme", "unprovisioned").await.unwrap());
+
+        // A database that was never declared at all: NotDeclared, not a panic.
+        let err = cap.restart("acme", "ghost").await.unwrap_err();
+        assert!(matches!(err, DeclareError::NotDeclared(ref n) if n == "ghost"));
+        assert!(!cap.restart_pending("acme", "ghost").await.unwrap());
+    }
+
+    /// GATE (Security review LOW-1): `restart` must refuse a node-OPERATOR's static
+    /// `[handlers].bindings.sql.databases` binding — even though it satisfies
+    /// `is_managed_credential()` (a static binding with no `password_env` ALSO passes
+    /// that check) — because, unlike `ensure`'s non-clobbering provision, `restart`
+    /// unconditionally RE-MINTS and ROLLS the workload's active spec. Doing that to an
+    /// operator-declared workload would silently discard its own image/env. `restart`
+    /// must return `NotDeclared` (the restart primitive only ever owns a PROJECT
+    /// declaration), and `restart_pending` must report `false`, not actually inspect it.
+    #[tokio::test]
+    async fn restart_refuses_a_daemon_static_binding() {
+        let mut static_dbs = BTreeMap::new();
+        // No `password_env` ⇒ `is_managed_credential()` is true for this static binding
+        // too — the exact condition the fix must not rely on.
+        static_dbs.insert(
+            "byo".to_string(),
+            ExternalDatabaseConfig {
+                kind: "postgres".into(),
+                compute: Some("pg".into()),
+                ..Default::default()
+            },
+        );
+        let (cap, _deploy, _kv) = declare_cap(static_dbs);
+
+        let err = cap.restart("acme", "byo").await.unwrap_err();
+        assert!(
+            matches!(err, DeclareError::NotDeclared(ref n) if n == "byo"),
+            "GATE: restart on a daemon-static binding must refuse as NotDeclared, got {err:?}"
+        );
+        assert!(
+            !cap.restart_pending("acme", "byo").await.unwrap(),
+            "GATE: restart_pending must never report a daemon-static binding as pending"
+        );
     }
 }
