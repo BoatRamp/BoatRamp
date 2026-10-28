@@ -123,6 +123,12 @@ const DEFAULT_IMPORT_MEMBER_CAP: u64 = 256 * 1024 * 1024 * 1024; // 256 GiB
 /// once the TOTAL bytes streamed from the source exceed this, so a bundle can't stream forever.
 const DEFAULT_IMPORT_TOTAL_CAP: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 
+/// Defense-in-depth cap on the number of blob refs a clone MANIFEST may carry before the target's
+/// per-ref HEAD fan-out ([`NodeProjectExport::diff_clone_blobs`]) — so a hostile/huge source
+/// manifest can neither OOM the diff nor drive an unbounded HEAD storm against the target's bucket.
+/// Consistent with (and below) what the 64 MiB manifest-body cap admits (~2M refs).
+const MAX_CLONE_MANIFEST_BLOBS: usize = 2_000_000;
+
 /// Max size of a MySQL binlog TRUE-delta member (SQL true-delta). Unlike every other member, this
 /// one is read WHOLE INTO MEMORY on both sides (drained into a buffer at export, read into a Vec at
 /// restore to pipe into `mysql`), so it carries its own fail-closed RAM bound (LOW-4). A capture
@@ -313,6 +319,26 @@ fn target_blob_key(member_path: &str, source: &str, target: &str) -> Result<Stri
              refusing to import a wrong-scope blob (cross-tenant isolation)"
         ))
     })?;
+    // Defense-in-depth: the re-keyed REMAINDER must be a clean relative path — no empty segment,
+    // no `.`/`..`, no absolute/root component — so a crafted member (`…/../../hblob/victim/…` or an
+    // absolute key) can never traverse OUT of `hblob/{target}/` into another tenant's scope or the
+    // bucket root. The storage layer also screens keys, but this tenancy-critical seam self-defends
+    // rather than relying on it (a leak here shipped a CRITICAL once).
+    use std::path::{Component, Path};
+    if rest.is_empty() {
+        return Err(Perr::Other(format!(
+            "blob member {src_key:?} has an empty key under the source scope; refusing"
+        )));
+    }
+    if !Path::new(rest)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(Perr::Other(format!(
+            "blob member {src_key:?} has an unsafe path component (absolute or `.`/`..`); \
+             refusing to re-key a traversing blob (cross-tenant isolation)"
+        )));
+    }
     Ok(format!("hblob/{target}/{rest}"))
 }
 
@@ -2780,6 +2806,17 @@ impl NodeProjectExport {
     ) -> Result<CloneSkip, Perr> {
         check_project_slug(project)?;
         check_project_slug(source_project)?;
+        // DoS/OOM guard: a hostile source manifest could list an absurd number of blob refs, each
+        // driving a HEAD against the target's own bucket. Cap the COUNT before the fan-out. The
+        // 64 MiB manifest-body cap in the server already bounds this transitively (~2M refs max);
+        // this is the explicit belt-and-suspenders bound at the driver seam.
+        if blobs.len() > MAX_CLONE_MANIFEST_BLOBS {
+            return Err(Perr::Other(format!(
+                "clone manifest lists {} blob refs, exceeding the maximum of {MAX_CLONE_MANIFEST_BLOBS}; \
+                 refusing the diff",
+                blobs.len()
+            )));
+        }
         let mut skip = CloneSkip::default();
         for b in blobs {
             // Re-key to the target's own scope; fail-closed on a foreign/malformed path.
@@ -9180,6 +9217,172 @@ mod tests {
         );
     }
 
+    /// GATE (project-clone, Security review Part B #5): the CROSS-NAME variant of the tenancy gate —
+    /// cloning `preview-a` → `preview-b` exercises the `target_blob_key` + KV re-key END-TO-END
+    /// through the live stream (the same-name `acme→acme` case is an identity no-op on the re-key).
+    /// A foreign tenant (`other`) shares the source bucket/KV. Asserts the target holds preview-b's
+    /// data under the RE-KEYED `hblob/preview-b/` + `project/preview-b/` scopes, byte-identical, with
+    /// ZERO `preview-a` or `other` bytes, and the source is byte-unchanged.
+    #[tokio::test]
+    async fn clone_cross_name_rekeys_end_to_end_zero_foreign_bytes() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |tag: &str| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("{tag}-blobs"))));
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            let work = tmp.path().join(format!("{tag}-work"));
+            std::fs::create_dir_all(&work).unwrap();
+            let drv =
+                NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work)
+                    .with_chunk_size(16);
+            (drv, kv, blobs)
+        };
+        let put = |blobs: Arc<dyn Storage>, key: &'static str, bytes: Vec<u8>| async move {
+            let body: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            blobs
+                .put(key, body, boatramp_core::PutMeta { content_type: None })
+                .await
+                .unwrap();
+        };
+        let read_blob = |blobs: Arc<dyn Storage>, key: String| async move {
+            let got = blobs.get(&key).await.ok()?;
+            let mut body = got.body;
+            let mut buf = Vec::new();
+            while let Some(c) = body.next().await {
+                buf.extend_from_slice(c.unwrap().as_ref());
+            }
+            Some(buf)
+        };
+
+        // SOURCE: preview-a (the clone subject) + `other` (a foreign tenant) share one bucket + KV.
+        let (src, src_kv, src_blobs) = mk("src");
+        let a_bytes: Vec<u8> = (0u32..3000).map(|i| (i % 251) as u8).collect();
+        put(
+            src_blobs.clone(),
+            "hblob/preview-a/web/assets/a.bin",
+            a_bytes.clone(),
+        )
+        .await;
+        put(
+            src_blobs.clone(),
+            "hblob/other/web/assets/o.bin",
+            b"foreign".to_vec(),
+        )
+        .await;
+        src_kv
+            .put("project/preview-a/config/tenancy", b"{\"a\":1}".to_vec())
+            .await
+            .unwrap();
+        src_kv
+            .put("project/other/config/tenancy", b"{\"other\":1}".to_vec())
+            .await
+            .unwrap();
+
+        let opts = ExportOptions::default();
+        let (tgt, tgt_kv, tgt_blobs) = mk("tgt");
+
+        // Clone preview-a → preview-b through the live stream (source_project != target).
+        let manifest = src
+            .clone_manifest("preview-a", &opts)
+            .await
+            .expect("manifest");
+        assert_eq!(
+            manifest.blobs.len(),
+            1,
+            "manifest lists ONLY preview-a's blob"
+        );
+        assert!(
+            manifest.blobs[0]
+                .member_path
+                .starts_with("blobs/hblob/preview-a/"),
+            "no foreign object in preview-a's manifest"
+        );
+        let skip = tgt
+            .clone_blobs_present("preview-b", &manifest.source_project, &manifest.blobs)
+            .await
+            .expect("diff");
+        assert!(
+            skip.skip_member_paths.is_empty(),
+            "fresh target skips nothing"
+        );
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        src.export_clone("preview-a", &opts, &skip, &mut sink)
+            .await
+            .expect("filtered export");
+        let mut rd = futures::io::Cursor::new(sink.into_inner());
+        tgt.import(
+            "preview-b",
+            &mut rd,
+            ImportOptions {
+                apply: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cross-name clone import");
+
+        // The blob landed under the RE-KEYED target scope (preview-a → preview-b), byte-identical.
+        assert_eq!(
+            read_blob(tgt_blobs.clone(), "hblob/preview-b/web/assets/a.bin".into()).await,
+            Some(a_bytes.clone()),
+            "the blob re-keyed to the preview-b scope, byte-identical"
+        );
+        // The owned KV re-keyed too (project/preview-a/… → project/preview-b/…).
+        assert_eq!(
+            tgt_kv
+                .get("project/preview-b/config/tenancy")
+                .await
+                .unwrap(),
+            Some(b"{\"a\":1}".to_vec()),
+            "the owned control-plane KV re-keyed to preview-b"
+        );
+        // ZERO source-scope or foreign bytes in the target (the load-bearing re-key isolation gate).
+        let tgt_keys = tgt_blobs.list("hblob/").await.unwrap();
+        assert!(
+            tgt_keys
+                .iter()
+                .all(|m| m.key.starts_with("hblob/preview-b/")),
+            "the target bucket holds ONLY preview-b objects: {:?}",
+            tgt_keys.iter().map(|m| &m.key).collect::<Vec<_>>()
+        );
+        assert!(
+            tgt_kv
+                .list_prefix("project/preview-a/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "NO un-re-keyed source-scope KV survives on the target"
+        );
+        assert!(
+            tgt_kv
+                .list_prefix("project/other/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "NO foreign-tenant KV on the target"
+        );
+        // The SOURCE is byte-unchanged (a clone reads the source).
+        assert_eq!(
+            read_blob(src_blobs.clone(), "hblob/preview-a/web/assets/a.bin".into()).await,
+            Some(a_bytes),
+            "source preview-a blob intact"
+        );
+        assert_eq!(
+            read_blob(src_blobs.clone(), "hblob/other/web/assets/o.bin".into()).await,
+            Some(b"foreign".to_vec()),
+            "source foreign tenant intact + untouched"
+        );
+    }
+
     #[test]
     fn blob_rekey_lands_in_target_scope_and_fails_closed() {
         // Same project → the member's own scope (no rename).
@@ -9203,6 +9406,75 @@ mod tests {
         assert!(target_blob_key("blobs/hblob/acmecorp/x", "acme", "beta").is_err());
         assert!(target_blob_key("hblob/acme/x", "acme", "beta").is_err());
         assert!(target_blob_key("blobs/not-hblob/x", "acme", "beta").is_err());
+
+        // Defense-in-depth (Security review Part B #4): the re-keyed REMAINDER must be a clean
+        // relative path — a `..`/`.`/absolute/empty component is REFUSED, so a crafted member can
+        // never traverse OUT of `hblob/{target}/` into another tenant's scope or the bucket root,
+        // even though the key IS under the declared source prefix. Mutation witness: drop the
+        // component check in `target_blob_key` and these go from Err → Ok (a traversal escape).
+        assert!(
+            target_blob_key("blobs/hblob/acme/../globex/obj", "acme", "beta").is_err(),
+            "a `..` that climbs out of the acme scope toward globex must be refused"
+        );
+        assert!(
+            target_blob_key("blobs/hblob/acme/a/../../etc/x", "acme", "beta").is_err(),
+            "a `..` chain escaping the target scope must be refused"
+        );
+        assert!(
+            target_blob_key("blobs/hblob/acme/./obj", "acme", "beta").is_err(),
+            "a `.` component in the remainder must be refused"
+        );
+        assert!(
+            target_blob_key("blobs/hblob/acme/", "acme", "beta").is_err(),
+            "an empty remainder (no object key) must be refused"
+        );
+    }
+
+    /// Security review Part B #2 (OOM/DoS guard): `diff_clone_blobs` REFUSES a manifest whose blob
+    /// count exceeds the cap BEFORE the per-ref HEAD fan-out, so a hostile source cannot OOM the
+    /// diff or storm the target's bucket with HEADs. A count at/under the cap is accepted.
+    #[tokio::test]
+    async fn diff_clone_blobs_caps_the_manifest_blob_count() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let drv = NodeProjectExport::new(
+            BTreeMap::new(),
+            DeployStore::new(blobs.clone(), kv.clone()),
+            kv,
+            blobs,
+            tmp.path().join("work"),
+        );
+        // One ref over the cap → refused before any HEAD (the refs point nowhere; a non-capped run
+        // would instead HEAD each, but the cap check fires first).
+        let over: Vec<CloneBlobRef> = (0..MAX_CLONE_MANIFEST_BLOBS + 1)
+            .map(|i| CloneBlobRef {
+                member_path: format!("blobs/hblob/acme/web/c/obj-{i}"),
+                size: Some(1),
+                etag: None,
+            })
+            .collect();
+        let err = drv
+            .diff_clone_blobs("acme", "acme", &over)
+            .await
+            .expect_err("a manifest over the blob-count cap must be refused");
+        assert!(
+            format!("{err}").contains("exceeding the maximum"),
+            "the refusal names the cap: {err}"
+        );
+        // An empty manifest (well under the cap) is fine and skips nothing.
+        let skip = drv
+            .diff_clone_blobs("acme", "acme", &[])
+            .await
+            .expect("an under-cap manifest diffs cleanly");
+        assert!(skip.skip_member_paths.is_empty());
     }
 
     #[test]

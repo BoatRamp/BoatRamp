@@ -3242,6 +3242,12 @@ pub(super) async fn project_import(
 /// `Authorization: Bearer` to the source's clone endpoints.
 const SOURCE_TOKEN_HEADER: &str = "x-boatramp-source-token";
 
+/// The hard cap on the clone MANIFEST body the target will read from a source (`diff` OOM guard):
+/// a manifest is a blob LIST, so it is modest even for a large project, but the source is
+/// attacker-influenceable — bound it like `clone_stream` bounds its skip body. Transitively bounds
+/// `manifest.blobs.len()`; the driver also caps the count explicitly before the HEAD fan-out.
+const CLONE_MANIFEST_CAP: usize = 64 * 1024 * 1024;
+
 /// Query for the SOURCE clone surfaces (`/api/clone/manifest`, `/api/clone/stream`): whether the
 /// clone stream is `--data-only` (no control-plane KV / identity). Default `false` ⇒ a FULL clone
 /// (carries the project's control-plane KV slice); the target mints a FRESH identity on restore.
@@ -3432,71 +3438,106 @@ pub(super) async fn clone_from(
                 .into_response();
         }
     };
-    // Validate the source base URL (scheme http/https, parseable). Increment 1 is operator-driven
-    // (the operator holds Project Admin on both nodes); a stricter host allowlist and the
-    // source-minted scoped pull-grant over the overlay fabric are deferred hardening (PLAN §9.3).
+    // SSRF guard [HIGH]: `source_url` is attacker-influenceable (a tenant-level Project·Admin picks
+    // it), so the target must not be tricked into fetching internal services / cloud metadata
+    // (169.254.169.254) / another tenant. RESOLVE + PIN the address and REFUSE any non-global target
+    // (loopback / private / link-local / ULA — via `is_global_ip`), require HTTPS (so the forwarded
+    // bearer never rides cleartext), and NEVER follow a redirect off the pinned host. Reuses the
+    // shared SSRF decision + pinned-client policy (`graphql_data::token`). The manifest + stream
+    // share the SAME host, so one pin covers both requests (no rebind window between them).
     let source_base = req.source_url.trim_end_matches('/').to_string();
-    match source_base.parse::<axum::http::Uri>() {
-        Ok(u) if matches!(u.scheme_str(), Some("http") | Some("https")) => {}
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "clone source_url must be an absolute http(s) URL\n",
-            )
-                .into_response();
-        }
-    }
+    let manifest_url = format!("{source_base}/api/projects/{source_project}/clone/manifest");
+    let stream_url = format!("{source_base}/api/projects/{source_project}/clone/stream");
+    let Some((host, addr)) = crate::ssrf::resolve_pin(&manifest_url, false, false).await else {
+        tracing::warn!(
+            source_url = %source_base,
+            target = %target,
+            "clone refused: source_url is not an allowed https target resolving to a public address (SSRF guard)"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "clone source_url must be an absolute https URL resolving to a public address\n",
+        )
+            .into_response();
+    };
+    let Some(client) = crate::ssrf::pinned_client(&host, addr, true) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clone: could not build the SSRF-pinned HTTP client\n",
+        )
+            .into_response();
+    };
+    let data_only = if req.data_only { "true" } else { "false" };
 
-    let client = match reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
+    // 1. Fetch the SOURCE manifest (cheap LIST), BOUNDED to `CLONE_MANIFEST_CAP` (OOM guard) with a
+    //    short per-request total timeout. A 3xx is a failure (the no-redirect client already refuses
+    //    to follow off the pinned host). The source's error body is NEVER reflected to the caller
+    //    (that would amplify a semi-blind SSRF) — it is logged server-side and a generic error returned.
+    let manifest_resp = match client
+        .get(&manifest_url)
+        .query(&[("data_only", data_only)])
+        .bearer_auth(&source_token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
     {
-        Ok(c) => c,
+        Ok(r) => r,
         Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest fetch failed");
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("clone: cannot build HTTP client: {e}\n"),
+                StatusCode::BAD_GATEWAY,
+                "clone: could not fetch the source manifest\n",
             )
                 .into_response();
         }
     };
-    let data_only = if req.data_only { "true" } else { "false" };
-
-    // 1. Fetch the SOURCE manifest (cheap LIST).
-    let manifest_url = format!("{source_base}/api/projects/{source_project}/clone/manifest");
-    let manifest: boatramp_core::project_export::CloneManifest = match client
-        .get(&manifest_url)
-        .query(&[("data_only", data_only)])
-        .bearer_auth(&source_token)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("clone: source manifest was not valid JSON: {e}\n"),
-                )
-                    .into_response();
+    if !manifest_resp.status().is_success() {
+        tracing::warn!(status = %manifest_resp.status(), source_url = %source_base, "clone: source refused the manifest");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "clone: the source refused the manifest request\n",
+        )
+            .into_response();
+    }
+    let manifest_bytes = {
+        use futures::StreamExt;
+        let mut stream = manifest_resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if buf.len().saturating_add(chunk.len()) > CLONE_MANIFEST_CAP {
+                        tracing::warn!(source_url = %source_base, cap = CLONE_MANIFEST_CAP, "clone: source manifest exceeds the size cap");
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            "clone: the source manifest is too large\n",
+                        )
+                            .into_response();
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, source_url = %source_base, "clone: error reading the source manifest");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "clone: error reading the source manifest\n",
+                    )
+                        .into_response();
+                }
+                None => break,
             }
-        },
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "clone: source refused the manifest ({status}): {}\n",
-                    body.trim_end()
-                ),
-            )
-                .into_response();
         }
+        buf
+    };
+    let manifest: boatramp_core::project_export::CloneManifest = match serde_json::from_slice(
+        &manifest_bytes,
+    ) {
+        Ok(m) => m,
         Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest was not valid JSON");
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("clone: cannot reach the source manifest: {e}\n"),
+                "clone: the source manifest was not valid\n",
             )
                 .into_response();
         }
@@ -3504,18 +3545,17 @@ pub(super) async fn clone_from(
     // Defense: the manifest MUST describe the project the operator asked to clone (never trust a
     // source that answers for a different project).
     if manifest.source_project != source_project {
+        tracing::warn!(got = %manifest.source_project, expected = %source_project, "clone: source manifest names a different project");
         return (
             StatusCode::BAD_GATEWAY,
-            format!(
-                "clone: source manifest is for project {:?}, expected {source_project:?}\n",
-                manifest.source_project
-            ),
+            "clone: the source manifest names a different project\n",
         )
             .into_response();
     }
 
     // 2. Diff the source's blobs against THIS node's own store (re-keyed to the target scope,
-    //    fail-closed on any foreign path) → the per-SHA skip set.
+    //    fail-closed on any foreign path; the driver also caps the blob COUNT before the HEAD
+    //    fan-out) → the per-SHA skip set.
     let skip = match cap
         .clone_blobs_present(&target, &source_project, &manifest.blobs)
         .await
@@ -3524,9 +3564,10 @@ pub(super) async fn clone_from(
         Err(e) => return resumable_error_response(e),
     };
 
-    // 3. Pull ONLY the missing members over the live stream.
-    let stream_url = format!("{source_base}/api/projects/{source_project}/clone/stream");
-    let resp = match client
+    // 3. Pull ONLY the missing members over the live stream. No total timeout (a legitimate large
+    //    clone is long) — the pinned client's idle `read_timeout` bounds a stalled peer and the
+    //    import driver caps the total bytes. 3xx ⇒ failure; the source body is NEVER reflected.
+    let stream_resp = match client
         .post(&stream_url)
         .query(&[("data_only", data_only)])
         .bearer_auth(&source_token)
@@ -3534,27 +3575,25 @@ pub(super) async fn clone_from(
         .send()
         .await
     {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "clone: source refused the stream ({status}): {}\n",
-                    body.trim_end()
-                ),
-            )
-                .into_response();
-        }
+        Ok(r) => r,
         Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source stream open failed");
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("clone: cannot open the source stream: {e}\n"),
+                "clone: could not open the source stream\n",
             )
                 .into_response();
         }
     };
+    if !stream_resp.status().is_success() {
+        tracing::warn!(status = %stream_resp.status(), source_url = %source_base, "clone: source refused the stream");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "clone: the source refused the stream request\n",
+        )
+            .into_response();
+    }
+    let resp = stream_resp;
 
     // 4. Restore through the EXISTING inc2 import reader — the target enforces its own scope on
     //    every member (never the source-declared scope). Clone is always a FRESH identity

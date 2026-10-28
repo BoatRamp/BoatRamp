@@ -151,6 +151,9 @@ mod graphql_apq;
 mod graphql_cache;
 #[cfg(feature = "handlers")]
 mod graphql_data;
+/// The shared, always-compiled SSRF guard (resolve+pin+`is_global_ip`, pinned no-redirect client),
+/// used by the OIDC/JWKS fetch (`graphql_data::token`) and the project-clone pull (`admin_api`).
+mod ssrf;
 /// The node-wide JWKS freshness policy (two-tier: own vs foreign) + the startup pre-warm entry, so the
 /// node (`boatramp-node::handlers`) installs the `[handlers]` JWKS knobs into the token-verification
 /// cache once at startup. See [`graphql_data::token`]. The token module is `oidc`-gated, so the export
