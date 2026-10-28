@@ -469,6 +469,13 @@ pub fn router_with_fast(
         // `/api/<family>/*` project matcher) + re-checked defense-in-depth at the handler.
         .route("/api/project-export", post(project_export))
         .route("/api/project-import", post(project_import))
+        // Streaming project CLONE (PLAN-project-clone, increment 1): the SOURCE manifest + filtered
+        // member stream, and the TARGET orchestrator. Reached as `/api/projects/<proj>/clone/…`
+        // (project-scoped, rewritten here by `project_scope`), so authz gates the family at
+        // `Project·Admin` — self-serve for a Project Admin, NO node-global `System·Admin`.
+        .route("/api/clone/manifest", get(clone_manifest))
+        .route("/api/clone/stream", post(clone_stream))
+        .route("/api/clone/from", post(clone_from))
         // Operator SQL to a managed co-located database: run a migration script or a
         // single query via the sealed managed credential (resolved server-side).
         // Admin-scoped (deny-safe `Right::required` default for `/api/sql/*`).

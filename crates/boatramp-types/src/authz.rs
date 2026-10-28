@@ -508,6 +508,23 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Write },
                 ),
+                // Streaming project CLONE (PLAN-project-clone, increment 1):
+                // `/api/projects/<proj>/clone/{manifest,stream,from}`. A clone MOVES a whole
+                // project's data (blobs + managed DBs + the control-plane KV slice) between nodes —
+                // the export-/import-grade act — so BOTH the SOURCE surfaces (`manifest` read +
+                // `stream` export) AND the TARGET orchestrator (`from`) gate at **`Project·Admin`**,
+                // the owner tier, NEVER the deploy-grade publisher the general project catch-all
+                // below would grant (even `manifest`'s GET is Admin: it enumerates every blob ref,
+                // an export-grade disclosure). This is the accepted-decision authz (PLAN §5): clone
+                // is self-serve for a Project Admin and carries NO node-global `System·Admin`
+                // anywhere — two Project-Admin authorizations (export on the source, import on the
+                // target). Gated explicitly here, ABOVE the `Some(_)` catch-all, so a
+                // `project_publisher`/deployer can never drive a clone (the `/api/repair` escalation
+                // lesson). Mutation witness: drop this arm and `clone/stream` falls to
+                // `Project·Deploy`, which a publisher token satisfies.
+                Some((&"clone", _)) => {
+                    Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
+                }
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -2789,6 +2806,66 @@ mod tests {
         assert!(
             !acme_admin.allows(&globex_apply),
             "an acme grant must not reach globex's repair surface",
+        );
+    }
+
+    /// PLAN-project-clone §5 (accepted-decision authz): the streaming-clone surfaces move a whole
+    /// project's data between nodes, so BOTH the SOURCE (`clone/manifest` read, `clone/stream`
+    /// export) AND the TARGET orchestrator (`clone/from`) gate at **`Project·Admin`** — never the
+    /// deploy-grade publisher the general project catch-all would grant, and NEVER node-global
+    /// `System·Admin`. A `project_publisher` is refused; a `project_admin` is allowed; a grant on
+    /// one tenant never reaches another's clone surface. Mutation witness: the `Some((&"clone", _))`
+    /// arm — drop it and `clone/stream`/`clone/from` fall to `Project·Deploy`, which the publisher
+    /// assertions below would then (wrongly) allow.
+    #[test]
+    fn clone_surface_is_project_admin_not_publisher_and_never_system_admin() {
+        let policy = AuthzPolicy::default_policy();
+        let acme_admin_right = Right::new(Resource::Project, Some("acme".into()), Action::Admin);
+
+        // Every clone verb (GET manifest, POST stream, POST from) maps to Project·Admin on acme —
+        // even the GET manifest, which enumerates every blob ref (an export-grade disclosure).
+        for (method, path) in [
+            ("GET", "/api/projects/acme/clone/manifest"),
+            ("POST", "/api/projects/acme/clone/stream"),
+            ("POST", "/api/projects/acme/clone/from"),
+        ] {
+            assert_eq!(
+                Right::required(method, path),
+                Some(acme_admin_right.clone()),
+                "{method} {path} must require Project·Admin on acme (never Deploy, never System)",
+            );
+            // It is a PROJECT right, not the node-global System·Admin.
+            let req = Right::required(method, path).unwrap();
+            assert_eq!(req.resource, Resource::Project, "clone is a Project right");
+            assert_ne!(
+                req,
+                Right::new(Resource::System, None, Action::Admin),
+                "clone must NOT be gated node-global System·Admin",
+            );
+        }
+
+        let acme_pub = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        for (method, path) in [
+            ("GET", "/api/projects/acme/clone/manifest"),
+            ("POST", "/api/projects/acme/clone/stream"),
+            ("POST", "/api/projects/acme/clone/from"),
+        ] {
+            let req = Right::required(method, path).unwrap();
+            assert!(
+                !acme_pub.allows(&req),
+                "a project_publisher on acme must NOT drive a clone ({method} {path})",
+            );
+            assert!(
+                acme_admin.allows(&req),
+                "a project_admin on acme must drive a clone ({method} {path})",
+            );
+        }
+        // Cross-tenant: an acme admin grant never reaches globex's clone surface.
+        let globex_stream = Right::required("POST", "/api/projects/globex/clone/stream").unwrap();
+        assert!(
+            !acme_admin.allows(&globex_stream),
+            "an acme grant must not reach globex's clone surface",
         );
     }
 

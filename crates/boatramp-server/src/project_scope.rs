@@ -96,6 +96,14 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // `Project·Admin` (#501 Stage B authz, which anticipated this project-qualified path) — this entry was
     // the only missing piece; without it the project-scoped apply 404s (imperative/declarative parity).
     "databases",
+    // Streaming project CLONE (PLAN-project-clone, increment 1):
+    // `/api/projects/<proj>/clone/{manifest,stream,from}`. The SOURCE surfaces (manifest + stream)
+    // and the TARGET orchestrator (`from`) all rewrite onto the global `/api/clone/…` handlers,
+    // tagged with the tenant. Authz still sees the original project-qualified path and gates the
+    // family at `Project·Admin` (see `authz::Right::required`), so clone is self-serve for a
+    // Project Admin and NEVER requires node-global `System·Admin`. Without this entry the route
+    // would 404.
+    "clone",
 ];
 
 /// The tenant project a request targets, injected as a request extension by
@@ -367,6 +375,18 @@ mod tests {
         let s = scope_of("/api/projects/acme/databases/appdb/ensure");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/databases/appdb/ensure"));
+
+        // Streaming clone (PLAN-project-clone): the SOURCE surfaces + the TARGET orchestrator all
+        // rewrite onto the global `/api/clone/…` handlers, tagged with the tenant. `Right::required`
+        // gates the family at Project·Admin. Mutation witness: drop `"clone"` from
+        // PROJECT_SCOPED_FAMILIES and these rewrites are `None` → the routes 404.
+        let s = scope_of("/api/projects/acme/clone/manifest");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/clone/manifest"));
+        let s = scope_of("/api/projects/acme/clone/stream");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/clone/stream"));
+        let s = scope_of("/api/projects/acme/clone/from");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/clone/from"));
     }
 
     /// A6 (v0.7.0): a present-but-non-conforming `<proj>` segment marks the scope
