@@ -110,25 +110,42 @@ fn process_alive(pid: u32) -> bool {
     matches!(kill(Pid::from_raw(pid), None), Ok(()) | Err(Errno::EPERM))
 }
 
-/// Best-effort liveness check (Windows, R4): conservatively assume the recorded owner is STILL
-/// ALIVE. There is no safe, dependency-free way under `#![forbid(unsafe_code)]` to check whether an
-/// arbitrary PID is running on Windows — `OpenProcess`/`GetExitCodeProcess` are raw winapi (unsafe),
-/// and pulling a heavy process-enumeration crate just for a liveness probe is not worth it for Stage
-/// A. Returning `true` fails SAFE for the thing that actually matters: [`cleanup_stale`] then never
-/// reverts a previous run's NRPT rule / host state out from under a possibly-live owner — the
-/// opposite error (a wrong revert of a running tunnel's split-DNS) is the one that actually breaks
-/// name resolution for a live process.
+/// Liveness check (Windows, R4): is the process that wrote the marker still running?
 ///
-/// **Consequence, stated plainly for the reviewer**: because this always reports "alive",
-/// [`cleanup_stale`] on Windows always takes its `owner_still_running` early-return and reverts
-/// NOTHING — at a fresh run's startup check AND via `boatramp tunnel --cleanup`, which share this
-/// one path. So Stage A has NO automatic crash-recovery of a leftover NRPT rule on Windows: a
-/// genuinely crashed run's rule is removed by hand (`Remove-DnsClientNrptRule`, see
-/// [`super::resolver`]). A real PID-liveness probe — which would let a dead owner be detected and so
-/// re-enable `--cleanup`'s auto-revert here — is deferred to the live wintun smoke-test stage.
+/// Probes via the built-in `tasklist.exe /FI "PID eq <pid>" /NH /FO CSV` — no raw winapi, no extra
+/// crate, so it stays within `#![forbid(unsafe_code)]` (unlike `OpenProcess`/`GetExitCodeProcess`).
+/// `tasklist.exe` is resolved by its ABSOLUTE System32 path, never a bare name, for the same
+/// application-directory-hijack reason as [`super::resolver`]'s PowerShell launch (Security review
+/// MEDIUM-1): this probe runs in the same elevated context as the revert it gates. The `PID eq <pid>`
+/// filter value is a plain `u32` rendered as decimal digits — no metacharacters — and is passed as a
+/// discrete argv entry regardless.
+///
+/// The `/FI` filter makes tasklist emit a row ONLY for that exact PID (PIDs are unique), so the match
+/// is tasklist's own, not a parse of ours: with `/NH` a live PID yields a single `/FO CSV` data row
+/// that begins with a quoted image name (`"name",…`), while a dead PID prints
+/// `INFO: No tasks are running which match…`, which does not. So the process is ALIVE iff any output
+/// line is a quoted CSV data row.
+///
+/// Failure of the probe itself (tasklist missing, spawn error, non-zero exit) FAILS SAFE to `true`:
+/// the costly error is reverting a *live* owner's split-DNS out from under it, so when we cannot tell,
+/// we assume alive and [`cleanup_stale`] leaves the host state untouched. With a working probe a
+/// genuinely crashed run is now detected, so `--cleanup` and the startup check auto-revert a leftover
+/// NRPT rule on Windows exactly as they do on unix (closes the Stage-A crash-recovery gap; Security
+/// review MEDIUM-2).
 #[cfg(windows)]
-fn process_alive(_pid: u32) -> bool {
-    true
+fn process_alive(pid: u32) -> bool {
+    use std::path::Path;
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let tasklist = Path::new(&system_root).join(r"System32\tasklist.exe");
+    match std::process::Command::new(tasklist)
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.trim_start().starts_with('"')),
+        _ => true,
+    }
 }
 
 /// What [`cleanup_stale`] actually did — surfaced so [`super::frontend::TunFrontend::bind`] and

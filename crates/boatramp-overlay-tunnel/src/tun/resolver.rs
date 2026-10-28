@@ -433,6 +433,24 @@ fn nrpt_namespace(zone_suffix: &str) -> io::Result<String> {
     Ok(format!(".{name}"))
 }
 
+/// Resolve `powershell.exe` by its ABSOLUTE System32 path instead of letting `Command::new` search
+/// for a bare name.
+///
+/// **Security-critical (Security review MEDIUM-1).** On Windows, Rust's `Command` process search
+/// probes the running binary's own *application directory* BEFORE `System32`. The tunnel runs
+/// elevated (it installs NRPT rules), so a `powershell.exe` planted next to `boatramp.exe` — an
+/// unzipped portable build in `Downloads`, a shared `target\` dir, any user-writable install
+/// location, which is the normal case for an R4 binary — would run AS ADMINISTRATOR in place of the
+/// real shell: a trivial local-privilege-escalation / elevated-RCE vector. Building the canonical
+/// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` path (`SystemRoot` is an
+/// OS-controlled, protected variable) removes the search entirely. The teardown liveness probe
+/// resolves `tasklist.exe` the same way, for the same reason.
+#[cfg(windows)]
+fn powershell_exe() -> PathBuf {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 /// Install an NRPT rule scoping `zone_suffix` (and its subdomains) to the embedded responder at
 /// `dns_addr` via `Add-DnsClientNrptRule`. `#[cfg(windows)]`: only the Windows apply path calls it.
 ///
@@ -451,13 +469,17 @@ fn nrpt_namespace(zone_suffix: &str) -> io::Result<String> {
 ///      because (1) guarantees that token contains nothing PowerShell would treat as syntax. The
 ///      nameserver is `dns_addr.ip()`, a typed `IpAddr` whose `Display` is always a bare numeric
 ///      literal, so it carries no injection surface either.
+///
+/// A third, orthogonal defense covers *which* binary runs, not its arguments: PowerShell is launched
+/// by absolute System32 path via [`powershell_exe`], never a bare `"powershell"` name, so an elevated
+/// invocation can never pick up an attacker-planted `powershell.exe` from the application directory.
 #[cfg(windows)]
 fn add_nrpt_rule(zone_suffix: &str, dns_addr: SocketAddr) -> io::Result<()> {
     let namespace = nrpt_namespace(zone_suffix)?;
     // Discrete args — the fixed cmdlet/flag tokens, then the validated namespace and the typed IP as
     // their own argv entries. (NRPT has no port field; it always forwards to the nameserver on port
     // 53, which is why the Windows responder binds :53 — see frontend::default_dns_bind.)
-    let status = Command::new("powershell")
+    let status = Command::new(powershell_exe())
         .args([
             "-NoProfile",
             "-Command",
@@ -504,7 +526,7 @@ fn revert_nrpt_rule(zone_suffix: &str) {
     // `Get-DnsClientNrptRule | Where-Object Namespace -eq <ns> | Remove-DnsClientNrptRule -Force`.
     // The `Where-Object <Property> -eq <Value>` comparison-statement form (no `$_`, no script block)
     // keeps the validated namespace a plain operand; the `|` and every cmdlet/flag are fixed tokens.
-    let result = Command::new("powershell")
+    let result = Command::new(powershell_exe())
         .args([
             "-NoProfile",
             "-Command",
@@ -865,12 +887,45 @@ mod tests {
         }
     }
 
+    /// Security review LOW-1: the strict DNS-label validator that makes the NRPT (Windows) and
+    /// `/etc/resolver` (macOS) shell-outs injection-safe must reject every PowerShell/shell
+    /// metacharacter — and that invariant is asserted HERE, target-independently, directly against
+    /// the shared [`validated_resolver_zone`] chokepoint both backends route through. It therefore
+    /// gates on the Linux merge gate, unlike the `#[cfg(windows)]` `nrpt_namespace` test below, which
+    /// the build-only Windows CI job never runs under `cargo test`. (The macOS `etc_resolver_path`
+    /// test above already exercises the traversal half of the same guard on Linux.)
+    #[test]
+    fn validated_resolver_zone_rejects_powershell_metacharacters() {
+        // Baseline: ordinary DNS zones validate, with or without the trailing dot.
+        for good in ["svc.prod.internal.", "svc.prod.internal", "a", "x1-y2.z"] {
+            assert!(
+                validated_resolver_zone(good).is_ok(),
+                "a plain DNS zone must validate: {good:?}"
+            );
+        }
+        // Every PowerShell-significant character the reviewer called out — plus other shell/control
+        // bytes — embedded in an otherwise-valid zone must be refused: none is in the DNS-label
+        // alphabet `[A-Za-z0-9-]`, so a hostile marker can never smuggle one into a shell-out.
+        for c in [
+            ';', '|', '$', '(', ')', '`', ' ', '"', '\'', '&', '{', '}', '<', '>', '@', '\n', '\t',
+            '\r', '\\', '/', '*', '%', '#', '!', '^', '~', '=', '+', ',', ':', '?', '[', ']',
+        ] {
+            let zone = format!("svc{c}evil.internal");
+            assert!(
+                validated_resolver_zone(&zone).is_err(),
+                "a zone carrying metacharacter {c:?} must be refused before any shell-out: {zone:?}"
+            );
+        }
+    }
+
     /// Windows NRPT (R4): the namespace is the dot-stripped, VALIDATED zone with NRPT's leading-dot
     /// marker, and the SAME strict DNS-label validation (shared with the macOS backend) rejects any
     /// zone carrying PowerShell-injectable characters — the security property that lets the
     /// discrete-arg `Add-/Remove-DnsClientNrptRule` shell-out be safe. `#[cfg(windows)]` because
     /// `nrpt_namespace` is a Windows-only function; compile-checked under `cargo test` on Windows
-    /// (not the Stage-A build-only job, but a later live-smoke stage).
+    /// (not the Stage-A build-only job, but a later live-smoke stage). The injection-rejection
+    /// property itself is additionally gated on Linux by
+    /// [`validated_resolver_zone_rejects_powershell_metacharacters`] above (Security review LOW-1).
     #[cfg(windows)]
     #[test]
     fn nrpt_namespace_is_leading_dot_and_rejects_injectable_zones() {

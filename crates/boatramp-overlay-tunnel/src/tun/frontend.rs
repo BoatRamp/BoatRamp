@@ -411,25 +411,53 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Windows (R4): there is no `SIGTERM`/`SIGHUP`. The closest console control events for an
-/// interactive run are Ctrl-C (`CTRL_C_EVENT`, via [`tokio::signal::ctrl_c`]) and Ctrl-Break
-/// (`CTRL_BREAK_EVENT`, via `tokio::signal::windows::ctrl_break`) — the SIGINT/SIGQUIT analogs — so
-/// racing the two is the plan §3.9 clean-teardown trigger on Windows. (`tokio::signal::windows` also
-/// exposes separate `ctrl_close`/`ctrl_logoff`/`ctrl_shutdown` handlers for the non-interactive
-/// session-end events; wiring those is a later-stage refinement, not needed for the Stage-A build.)
-/// Ctrl-Break handler installation can only fail in exotic environments; as on unix, such a failure
-/// just falls back to Ctrl-C alone rather than refusing to start.
+/// Windows (R4): there is no `SIGTERM`/`SIGHUP`, so clean teardown (plan §3.9) races the full set of
+/// console control events. The interactive ones are Ctrl-C (`CTRL_C_EVENT`, via
+/// [`tokio::signal::ctrl_c`]) and Ctrl-Break (`CTRL_BREAK_EVENT`) — the SIGINT/SIGQUIT analogs — and
+/// the non-interactive session-end ones are `CTRL_CLOSE_EVENT` (console window closed),
+/// `CTRL_LOGOFF_EVENT`, and `CTRL_SHUTDOWN_EVENT`.
+///
+/// Wiring the session-end events matters for security, not just tidiness (Security review MEDIUM-2):
+/// on those events the normal teardown runs [`super::resolver`]'s `Remove-DnsClientNrptRule`, so a
+/// closed/logged-off/shutting-down session reverts its split-DNS instead of leaving a dangling NRPT
+/// rule pointing the in-zone namespace at `127.0.0.1:53` (a loopback port any unprivileged process
+/// can then rebind). The OS grants only a few seconds before it kills the process on these events, so
+/// the revert is best-effort — but best-effort beats a guaranteed leak, and the `--cleanup` /
+/// startup probe ([`super::teardown`]) now backstops whatever did not finish.
+///
+/// Each handler is installed best-effort: one that fails to register simply never fires (its branch
+/// awaits forever) rather than aborting startup, and Ctrl-C is always wired via the cross-platform
+/// helper, so there is always at least one working teardown trigger.
 #[cfg(windows)]
 async fn wait_for_shutdown_signal() {
-    match tokio::signal::windows::ctrl_break() {
-        Ok(mut ctrl_break) => {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = ctrl_break.recv() => {}
+    use std::future::pending;
+    use tokio::signal::windows;
+
+    let mut ctrl_break = windows::ctrl_break().ok();
+    let mut ctrl_close = windows::ctrl_close().ok();
+    let mut ctrl_logoff = windows::ctrl_logoff().ok();
+    let mut ctrl_shutdown = windows::ctrl_shutdown().ok();
+
+    // Await a handler if it installed, otherwise never resolve — keeps every arm present for
+    // `select!` without unwrapping a handler that failed to register.
+    macro_rules! fire_on {
+        ($handler:expr) => {
+            async {
+                match $handler.as_mut() {
+                    Some(h) => {
+                        h.recv().await;
+                    }
+                    None => pending::<()>().await,
+                }
             }
-        }
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        };
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = fire_on!(ctrl_break) => {}
+        _ = fire_on!(ctrl_close) => {}
+        _ = fire_on!(ctrl_logoff) => {}
+        _ = fire_on!(ctrl_shutdown) => {}
     }
 }
