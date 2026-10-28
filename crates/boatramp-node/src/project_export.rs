@@ -71,7 +71,8 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::project_export::{
-    ExportOptions, IdentityChoice, ImportOptions, ImportReport, ProjectExport, ProjectExportError,
+    CloneBlobRef, CloneManifest, CloneSkip, ExportOptions, IdentityChoice, ImportOptions,
+    ImportReport, ProjectExport, ProjectExportError,
 };
 use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
@@ -1740,6 +1741,19 @@ impl ProjectExport for NodeProjectExport {
         opts: &ExportOptions,
         sink: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
     ) -> Result<(), Perr> {
+        // An ordinary export is the clone stream with an EMPTY skip set (the degenerate
+        // "send everything, skip nothing" case; the target-driven reader is the superset).
+        self.export_clone(project, opts, &CloneSkip::default(), sink)
+            .await
+    }
+
+    async fn export_clone(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+        skip: &CloneSkip,
+        sink: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<(), Perr> {
         check_project_slug(project)?;
         // A data-only bundle carries NO control-plane / identity material at all, so the
         // two flags are mutually exclusive — refuse the contradiction rather than silently
@@ -1763,7 +1777,19 @@ impl ProjectExport for NodeProjectExport {
         //    member SET is decided here; each member's BIG bytes are produced later, one at a
         //    time, by the stager. (A failure here is before the first byte, so the handler can
         //    still turn it into an error status.)
-        let (specs, jobs, source) = self.plan_export(project, opts, created_at).await?;
+        let (mut specs, mut jobs, source) = self.plan_export(project, opts, created_at).await?;
+        // CLONE per-SHA skip: drop the blob members the target already holds (content-matched in
+        // ITS OWN scope — see `diff_clone_blobs`). ONLY blob members are skippable; a non-blob
+        // skip entry is IGNORED so a skip set can never drop a DB/KV/identity member. Removed from
+        // BOTH the spec list (so the MANIFEST omits them) and the stage jobs (so the stager is
+        // never asked for them), keeping the stream internally consistent for the inc2 atomic
+        // reader — the omitted objects are already present on the target bucket.
+        if !skip.skip_member_paths.is_empty() {
+            specs.retain(|s| {
+                !(s.kind == MemberKind::Blob && skip.skip_member_paths.contains(&s.path))
+            });
+            jobs.retain(|path, _| specs.iter().any(|s| &s.path == path));
+        }
 
         // 2. STREAM: run the sync v3 writer in a blocking task, bridged to (a) the caller's async
         //    `sink` over a bounded byte channel + drain, and (b) the async stager over a one-slot
@@ -2632,9 +2658,152 @@ impl ProjectExport for NodeProjectExport {
         let dir = self.resolve_resumable_dir(dir_name, false).await?;
         self.import_resumable_dir(project, &dir, opts).await
     }
+
+    async fn clone_manifest(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+    ) -> Result<CloneManifest, Perr> {
+        self.build_clone_manifest(project, opts).await
+    }
+
+    async fn clone_blobs_present(
+        &self,
+        project: &str,
+        source_project: &str,
+        blobs: &[CloneBlobRef],
+    ) -> Result<CloneSkip, Perr> {
+        self.diff_clone_blobs(project, source_project, blobs).await
+    }
 }
 
 impl NodeProjectExport {
+    /// CLONE SOURCE — produce the cheap [`CloneManifest`] for the manifest-first handshake: LIST
+    /// the project's own blob objects (member path + size + etag, from a prefix list — never a
+    /// body read) for the target's per-SHA diff, plus a light enumeration of the non-blob member
+    /// paths (pg/mysql/libsql/kv/identity) the stream will always carry. Blobs are scoped
+    /// STRUCTURALLY by the project prefix (`hblob/{project}/`, whose trailing `/` excludes a
+    /// sibling-prefix tenant), so no other tenant's object can appear — the manifest is itself a
+    /// cross-tenant boundary. Deliberately AVOIDS the engine version-detection `plan_export` does
+    /// (no DB round-trip), so the manifest stays cheap and never fails on a down database.
+    async fn build_clone_manifest(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+    ) -> Result<CloneManifest, Perr> {
+        check_project_slug(project)?;
+        if opts.data_only && opts.include_identity {
+            return Err(Perr::Other(
+                "--data-only and --include-identity are mutually exclusive".into(),
+            ));
+        }
+        let data_only = opts.data_only;
+
+        // Blobs: a metadata-only LIST under the project's OWN scope (`hblob/{project}/`).
+        let blob_metas = self
+            .blobs
+            .list(&blob_project_prefix(project))
+            .await
+            .map_err(other)?;
+        let blobs: Vec<CloneBlobRef> = blob_metas
+            .into_iter()
+            .map(|m| CloneBlobRef {
+                member_path: format!("blobs/{}", m.key),
+                size: m.size,
+                etag: m.etag,
+            })
+            .collect();
+
+        // Non-blob members (informational): the member PATHS the stream will carry, derived from
+        // config + the stores WITHOUT a version-detect/dump — cheap and never hits the DB.
+        let mut non_blob_members: Vec<String> = Vec::new();
+        if opts.include_identity {
+            non_blob_members.push(project_bundle::IDENTITY_MEMBER_PATH.to_string());
+        }
+        for (db, cfg) in &self.databases {
+            let is_managed = cfg.compute.as_deref().is_some_and(|c| !c.is_empty());
+            let dumpable = is_managed || !cfg.url_env.is_empty();
+            if kind_is_postgres(&cfg.kind) && dumpable {
+                non_blob_members.push(pg_member_path(db));
+            } else if kind_is_mysql(&cfg.kind) && dumpable {
+                non_blob_members.push(mysql_member_path(db));
+            }
+        }
+        if let Some(libsql) = &self.libsql {
+            let sites = self
+                .deploy
+                .list_sites(ProjectRef::new(project))
+                .await
+                .map_err(other)?;
+            for site in sites {
+                let qsite = ProjectRef::new(project).qualified(&site);
+                if libsql.local_database_exists(&qsite, "") {
+                    non_blob_members.push(libsql_member_path(project, &site));
+                }
+            }
+        }
+        if !data_only {
+            non_blob_members.push(project_bundle::KV_MEMBER_PATH.to_string());
+        }
+
+        Ok(CloneManifest {
+            source_project: project.to_string(),
+            data_only,
+            blobs,
+            non_blob_members,
+        })
+    }
+
+    /// CLONE TARGET — the per-SHA presence DIFF: for each source blob ref, re-key its member path
+    /// to THIS target's own scope (`source_project` → `project`, via the SAME [`target_blob_key`]
+    /// the restore uses) and check presence in the target's OWN bucket. A ref whose path is NOT
+    /// under `hblob/{source_project}/` is REFUSED fail-closed — the diff is confined to the
+    /// target's own scope and never trusts a source-declared path to reach a foreign key.
+    ///
+    /// A blob is marked present (⇒ the source will SKIP it) only on POSITIVE content-identity
+    /// evidence: the target already holds an object at the re-keyed key AND either (a) both the
+    /// manifest and the target carry an `etag` and they are equal (the strong content hash on
+    /// S3/GCS), or (b) no etag is available on either side and the declared sizes match (the
+    /// resume case on a fresh target — a present object there was written by a prior attempt of
+    /// THIS clone, so same key + same size ⇒ same bytes under the content-addressed-immutable
+    /// blob keyspace). Otherwise the blob is pulled and overwritten idempotently.
+    ///
+    // TODO(project-clone): replace the size-only fallback with a per-object content hash once the
+    // at-rest-encryption × content-addressing open question (PLAN §9.1) is resolved — a
+    // per-tenant-KEK-encrypted store breaks "same key ⇒ same ciphertext", so the strong-hash path
+    // must be mandatory there rather than the size fallback.
+    async fn diff_clone_blobs(
+        &self,
+        project: &str,
+        source_project: &str,
+        blobs: &[CloneBlobRef],
+    ) -> Result<CloneSkip, Perr> {
+        check_project_slug(project)?;
+        check_project_slug(source_project)?;
+        let mut skip = CloneSkip::default();
+        for b in blobs {
+            // Re-key to the target's own scope; fail-closed on a foreign/malformed path.
+            let target_key = target_blob_key(&b.member_path, source_project, project)?;
+            match self.blobs.head(&target_key).await {
+                Ok(meta) => {
+                    let present = match (&b.etag, &meta.etag) {
+                        (Some(src), Some(dst)) => src == dst,
+                        _ => match (b.size, meta.size) {
+                            (Some(s), Some(d)) => s == d,
+                            _ => false,
+                        },
+                    };
+                    if present {
+                        skip.skip_member_paths.insert(b.member_path.clone());
+                    }
+                }
+                Err(boatramp_core::StorageError::NotFound(_)) => {} // absent ⇒ pull it
+                Err(e) => return Err(other(e)),
+            }
+        }
+        Ok(skip)
+    }
+
     /// Enumerate every bundle member UP FRONT, in the v2 RESTORE order (identity → blobs → pg
     /// → mysql → libsql → KV), returning the ordered [`MemberSpec`] list the v2 MANIFEST
     /// declares, a per-member [`StageJob`] (how to produce each one's bytes later), and the
@@ -8756,6 +8925,258 @@ mod tests {
         assert_eq!(
             buf, big,
             "the large blob is byte-identical after a chunked export+import round-trip"
+        );
+    }
+
+    /// GATE (project-clone, C1 cross-tenant isolation — the 0.32 env-clone-leak class): a
+    /// streaming clone of ONE tenant, driven through the REAL source→target stream (manifest →
+    /// per-SHA diff → filtered export → inc2 atomic import), lands EXACTLY that tenant's data under
+    /// the target scope with ZERO foreign bytes, and leaves the SOURCE byte-unchanged. The fixture
+    /// seeds TWO tenants (`acme`, `globex`) sharing ONE blob bucket + ONE KV store — a single-tenant
+    /// fixture is structurally blind to a leak (rule 3). This test actually RUNS (not `#[ignore]`d),
+    /// wiring the live source→target stream, so a regression that leaked a foreign object or trusted
+    /// a source-declared scope fails here (rule 4).
+    #[tokio::test]
+    async fn clone_isolates_one_tenant_zero_foreign_bytes_source_unchanged() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |tag: &str| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("{tag}-blobs"))));
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            let work = tmp.path().join(format!("{tag}-work"));
+            std::fs::create_dir_all(&work).unwrap();
+            // chunk size 16 B so the (modest) blobs exercise the ChunkedTrailer streaming path too.
+            let drv =
+                NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work)
+                    .with_chunk_size(16);
+            (drv, kv, blobs)
+        };
+        let put = |blobs: Arc<dyn Storage>, key: &'static str, bytes: Vec<u8>| async move {
+            let body: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            blobs
+                .put(key, body, boatramp_core::PutMeta { content_type: None })
+                .await
+                .unwrap();
+        };
+        let read_blob = |blobs: Arc<dyn Storage>, key: String| async move {
+            let got = blobs.get(&key).await.ok()?;
+            let mut body = got.body;
+            let mut buf = Vec::new();
+            while let Some(c) = body.next().await {
+                buf.extend_from_slice(c.unwrap().as_ref());
+            }
+            Some(buf)
+        };
+
+        // --- SOURCE: two tenants sharing ONE bucket + ONE KV store (the shared keyspace). ---
+        let (src, src_kv, src_blobs) = mk("src");
+        let acme_bytes: Vec<u8> = (0u32..3000).map(|i| (i % 251) as u8).collect();
+        let globex_bytes: Vec<u8> = (0u32..2000).map(|i| ((i * 7) % 251) as u8).collect();
+        put(
+            src_blobs.clone(),
+            "hblob/acme/web/assets/a.bin",
+            acme_bytes.clone(),
+        )
+        .await;
+        put(
+            src_blobs.clone(),
+            "hblob/acme/web/assets/small.txt",
+            b"acme-tiny".to_vec(),
+        )
+        .await;
+        put(
+            src_blobs.clone(),
+            "hblob/globex/web/assets/g.bin",
+            globex_bytes.clone(),
+        )
+        .await;
+        // Non-secret, environment-neutral owned KV (survives a `--identity fresh` import) for each.
+        src_kv
+            .put("project/acme/config/tenancy", b"{\"acme\":1}".to_vec())
+            .await
+            .unwrap();
+        src_kv
+            .put("project/globex/config/tenancy", b"{\"globex\":1}".to_vec())
+            .await
+            .unwrap();
+
+        let opts = ExportOptions::default(); // full bundle (carries the control-plane KV slice)
+
+        // --- TARGET: a fresh, SEPARATE node. Clone acme (same-name) via the live handshake. ---
+        let (tgt, tgt_kv, tgt_blobs) = mk("tgt");
+
+        // 1. SOURCE manifest (cheap LIST): must carry ONLY acme's blobs — the manifest is itself a
+        //    tenancy boundary (scoped by `hblob/acme/`).
+        let manifest = src
+            .clone_manifest("acme", &opts)
+            .await
+            .expect("clone manifest");
+        assert_eq!(manifest.source_project, "acme");
+        assert_eq!(
+            manifest.blobs.len(),
+            2,
+            "manifest lists exactly acme's two blobs"
+        );
+        assert!(
+            manifest
+                .blobs
+                .iter()
+                .all(|b| b.member_path.starts_with("blobs/hblob/acme/")),
+            "NO foreign-tenant object may appear in acme's clone manifest: {:?}",
+            manifest.blobs
+        );
+
+        // 2. TARGET per-SHA diff: fresh target holds nothing ⇒ an EMPTY skip set (pull everything).
+        let skip = tgt
+            .clone_blobs_present("acme", &manifest.source_project, &manifest.blobs)
+            .await
+            .expect("diff");
+        assert!(
+            skip.skip_member_paths.is_empty(),
+            "fresh target skips nothing"
+        );
+
+        // 3. SOURCE filtered stream → 4. TARGET inc2 atomic restore (the live source→target stream).
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        src.export_clone("acme", &opts, &skip, &mut sink)
+            .await
+            .expect("filtered clone export");
+        let bundle = sink.into_inner();
+        let mut rd = futures::io::Cursor::new(bundle.clone());
+        let report = tgt
+            .import(
+                "acme",
+                &mut rd,
+                ImportOptions {
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clone import");
+        assert!(
+            report.blobs >= 2,
+            "acme's blobs restored (got {})",
+            report.blobs
+        );
+
+        // --- ASSERT: target holds EXACTLY acme's data under the target scope. ---
+        assert_eq!(
+            read_blob(tgt_blobs.clone(), "hblob/acme/web/assets/a.bin".into()).await,
+            Some(acme_bytes.clone()),
+            "acme's blob landed byte-identical under the target scope"
+        );
+        assert_eq!(
+            tgt_kv.get("project/acme/config/tenancy").await.unwrap(),
+            Some(b"{\"acme\":1}".to_vec()),
+            "acme's owned control-plane KV landed on the target"
+        );
+
+        // --- ASSERT: ZERO foreign bytes in the target (the load-bearing isolation gate). ---
+        let tgt_keys = tgt_blobs.list("hblob/").await.unwrap();
+        assert!(
+            tgt_keys.iter().all(|m| m.key.starts_with("hblob/acme/")),
+            "NO foreign-tenant object in the target bucket: {:?}",
+            tgt_keys.iter().map(|m| &m.key).collect::<Vec<_>>()
+        );
+        assert!(
+            read_blob(tgt_blobs.clone(), "hblob/globex/web/assets/g.bin".into())
+                .await
+                .is_none(),
+            "globex's object must be ABSENT from the target"
+        );
+        assert!(
+            tgt_kv
+                .get("project/globex/config/tenancy")
+                .await
+                .unwrap()
+                .is_none(),
+            "NO foreign-tenant control-plane KV in the target"
+        );
+        assert!(
+            tgt_kv
+                .list_prefix("project/globex/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the target carries no globex keyspace at all"
+        );
+
+        // --- ASSERT: the SOURCE is left byte-unchanged (a clone is a read on the source). ---
+        assert_eq!(
+            read_blob(src_blobs.clone(), "hblob/acme/web/assets/a.bin".into()).await,
+            Some(acme_bytes.clone()),
+            "source acme blob intact"
+        );
+        assert_eq!(
+            read_blob(src_blobs.clone(), "hblob/globex/web/assets/g.bin".into()).await,
+            Some(globex_bytes.clone()),
+            "source globex blob intact + untouched by acme's clone"
+        );
+        assert_eq!(
+            src_kv.get("project/globex/config/tenancy").await.unwrap(),
+            Some(b"{\"globex\":1}".to_vec()),
+            "source globex KV intact"
+        );
+
+        // --- RESUME / per-SHA skip: a re-diff against the now-populated target marks acme's blobs
+        //     PRESENT ⇒ the source would skip them (O(remaining), not a full re-stream). ---
+        let skip2 = tgt
+            .clone_blobs_present("acme", &manifest.source_project, &manifest.blobs)
+            .await
+            .expect("re-diff");
+        assert_eq!(
+            skip2.skip_member_paths.len(),
+            2,
+            "a re-run skips both already-present acme blobs: {:?}",
+            skip2.skip_member_paths
+        );
+        // The filtered re-export omits the skipped blob members (nothing left to re-stream), yet a
+        // re-import is still correct (idempotent) and leaves the target isolated.
+        let mut sink2 = futures::io::Cursor::new(Vec::<u8>::new());
+        src.export_clone("acme", &opts, &skip2, &mut sink2)
+            .await
+            .expect("resumed filtered export");
+        let mut rd2 = futures::io::Cursor::new(sink2.into_inner());
+        tgt.import(
+            "acme",
+            &mut rd2,
+            ImportOptions {
+                apply: true,
+                overwrite: true, // the target project already holds its own data
+                force: true,     // overlay the now-non-empty control-plane KV destination
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("resumed import");
+        let tgt_keys2 = tgt_blobs.list("hblob/").await.unwrap();
+        assert!(
+            tgt_keys2.iter().all(|m| m.key.starts_with("hblob/acme/")),
+            "a resumed clone still leaks ZERO foreign bytes"
+        );
+
+        // --- FAIL-CLOSED: the diff refuses a source-declared ref OUTSIDE the declared source
+        //     scope — the target never trusts a crafted manifest to reach a foreign key. ---
+        let foreign = vec![CloneBlobRef {
+            member_path: "blobs/hblob/globex/web/assets/g.bin".to_string(),
+            size: Some(10),
+            etag: None,
+        }];
+        assert!(
+            tgt.clone_blobs_present("acme", "acme", &foreign)
+                .await
+                .is_err(),
+            "a ref outside hblob/{{source}}/ must be refused fail-closed"
         );
     }
 
