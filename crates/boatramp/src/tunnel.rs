@@ -136,6 +136,15 @@ pub enum TunnelCmdError {
         String,
         #[source] boatramp_overlay_tunnel::tun::cidr::CidrError,
     ),
+    /// `--cluster`/`--dns-zone` must each be a plain DNS label — rejected early (before any connect
+    /// or device/host mutation) so a path-dangerous value can never reach the macOS
+    /// `/etc/resolver/<zone>` writer. Defence-in-depth over that writer's own fail-closed validation
+    /// (Security review HIGH-1b).
+    #[cfg(feature = "tun")]
+    #[error(
+        "bad {0} `{1}`: must be a plain DNS label (letters, digits, hyphen; no `.`, `/`, or `..`)"
+    )]
+    Zone(&'static str, String),
 }
 
 /// Translate a [`ControlPlaneError`] into the CLI's own actionable variant — the HTTP-agnostic core
@@ -338,6 +347,27 @@ async fn run_tun(
             eprintln!("boatramp tunnel --cleanup: no dirty-state marker found — nothing to do");
         }
         return Ok(());
+    }
+
+    // Validate the DNS-zone components BEFORE connecting or touching any device/host state
+    // (Security review HIGH-1b): `--cluster`/`--dns-zone` build `svc.<cluster>.<dns_zone>`, which on
+    // macOS names an `/etc/resolver/<zone>` file. A path-dangerous value is refused here with a
+    // clear message; the macOS writer/reverter also fail-closed on it, so this is the early,
+    // friendly edge of a defence-in-depth pair, not the sole guard.
+    for (what, value) in [
+        ("--cluster", cluster.as_str()),
+        ("--dns-zone", args.dns_zone.as_str()),
+    ] {
+        let ok = !value.is_empty()
+            && value.len() <= 63
+            && !value.starts_with('-')
+            && !value.ends_with('-')
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !ok {
+            return Err(TunnelCmdError::Zone(what, value.to_string()));
+        }
     }
 
     let (server, http) = crate::client::connect(args.server.clone(), config)?;

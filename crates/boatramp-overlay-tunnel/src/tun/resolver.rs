@@ -91,6 +91,24 @@ fn run(cmd: &mut Command) -> io::Result<bool> {
 }
 
 fn revert_resolvectl(tun_name: &str) {
+    // Security review INFO: `tun_name` here can come from the §3.9 marker (a file in the invoking
+    // user's config dir), so a hostile value could be a leading-dash string `resolvectl` would read
+    // as a flag. It is not shell-interpreted (no injection), but refuse anything that is not a
+    // plausible interface name (non-empty, no leading `-`, a conservative iface charset) rather than
+    // hand it to `resolvectl` as a possible option.
+    let safe = !tun_name.is_empty()
+        && !tun_name.starts_with('-')
+        && tun_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'@' | b':'));
+    if !safe {
+        tracing::warn!(
+            %tun_name,
+            "boatramp tunnel: refusing to run `resolvectl revert` for an implausible interface name \
+             (a tampered marker?) — reverted nothing"
+        );
+        return;
+    }
     if let Err(err) = Command::new("resolvectl")
         .args(["revert", tun_name])
         .status()
@@ -217,10 +235,61 @@ fn remove_resolv_conf_stanza() -> io::Result<()> {
 // matching [`revert_by_method`] arm), so a Linux box never creates or removes an `/etc/resolver`
 // file even though the code is present.
 
-/// `/etc/resolver/<zone>`, where `<zone>` is the suffix with its trailing dot stripped (resolver(5)
-/// matches a bare domain). e.g. `svc.prod.internal.` → `/etc/resolver/svc.prod.internal`.
-fn etc_resolver_path(zone_suffix: &str) -> PathBuf {
-    PathBuf::from("/etc/resolver").join(zone_suffix.trim_end_matches('.'))
+const ETC_RESOLVER_DIR: &str = "/etc/resolver";
+
+/// Validate `zone_suffix` yields a safe SINGLE file name directly under `/etc/resolver` and return
+/// it (trailing dot stripped). **Security review HIGH-1 — the load-bearing guard**: this runs as
+/// root on BOTH the apply path (`zone_suffix` from `--cluster`/`--dns-zone`) and, worse, the revert
+/// path (`zone_suffix` is the `resolver_zone` field read from the plan §3.9 marker, which lives in
+/// the invoking user's `~/.config/boatramp` — a lower-privileged context can plant a hostile value).
+/// `PathBuf::join` would otherwise honour an absolute (`/etc/resolv.conf`) or `..`-bearing zone and
+/// let a root write (apply) or a root delete (revert) escape `/etc/resolver` to any file on the box.
+/// So accept ONLY a non-empty sequence of dot-separated DNS labels (`[A-Za-z0-9-]`, no leading/
+/// trailing `-`, ≤63 each, ≤253 total) — which, by construction, contains no `/`, `\`, or `..` and
+/// is a single path component.
+fn validated_resolver_zone(zone_suffix: &str) -> io::Result<&str> {
+    let name = zone_suffix.trim_end_matches('.');
+    let valid = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing an /etc/resolver file name derived from invalid DNS zone {zone_suffix:?} \
+                 (expected dot-separated labels of [A-Za-z0-9-], no path separators or traversal)"
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+/// `/etc/resolver/<zone>` for a VALIDATED zone (see [`validated_resolver_zone`]). e.g.
+/// `svc.prod.internal.` → `/etc/resolver/svc.prod.internal`. Belt-and-suspenders: asserts the result
+/// is a single component whose parent is exactly `/etc/resolver`, so no future change to the builder
+/// can silently reintroduce the HIGH-1 traversal.
+fn etc_resolver_path(zone_suffix: &str) -> io::Result<PathBuf> {
+    let name = validated_resolver_zone(zone_suffix)?;
+    let path = Path::new(ETC_RESOLVER_DIR).join(name);
+    if path.parent() != Some(Path::new(ETC_RESOLVER_DIR))
+        || path.file_name() != Some(std::ffi::OsStr::new(name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing resolver path {path:?} — not a single component under {ETC_RESOLVER_DIR}"
+            ),
+        ));
+    }
+    Ok(path)
 }
 
 /// Pure: the resolver(5) file body pointing the zone at `dns_addr` — unit-tested below. Only
@@ -233,17 +302,33 @@ fn etc_resolver_contents(dns_addr: SocketAddr) -> String {
     format!("nameserver {}\nport {}\n", dns_addr.ip(), dns_addr.port())
 }
 
-/// Write `/etc/resolver/<zone>` (creating `/etc/resolver/` if absent), via the same atomic
-/// resolve-symlink-then-rename path the resolv.conf writer uses, so a partially-written file is
-/// never observed by the system resolver. `#[cfg(macos)]` for the same reason as
-/// [`etc_resolver_contents`] — only the macOS apply path calls it.
+/// Write `/etc/resolver/<zone>` (creating `/etc/resolver/` if absent) atomically (temp-then-rename,
+/// so a partially-written file is never observed by the system resolver). `#[cfg(macos)]` for the
+/// same reason as [`etc_resolver_contents`] — only the macOS apply path calls it.
+///
+/// Unlike the resolv.conf writer, this does NOT `resolve_target`/canonicalize first (Security review
+/// MEDIUM-1): `/etc/resolv.conf` is legitimately a managed symlink, but `/etc/resolver/<zone>` is a
+/// file we own and never legitimately a symlink. Renaming onto the RAW path replaces whatever entry
+/// is there (including a planted symlink) rather than following it to some arbitrary root-writable
+/// target; and we refuse outright if the path is already a symlink, so a pre-planted symlink is a
+/// loud error, never a write-through.
 #[cfg(target_os = "macos")]
 fn write_etc_resolver(zone_suffix: &str, dns_addr: SocketAddr) -> io::Result<()> {
-    let path = etc_resolver_path(zone_suffix);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let path = etc_resolver_path(zone_suffix)?;
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to write {} — it is a symlink, which this tool never creates; remove it \
+                 by hand if it is stale",
+                path.display()
+            ),
+        ));
     }
-    write_atomically(&resolve_target(&path), &etc_resolver_contents(dns_addr))
+    std::fs::create_dir_all(ETC_RESOLVER_DIR)?;
+    write_atomically(&path, &etc_resolver_contents(dns_addr))
 }
 
 /// Remove `/etc/resolver/<zone>` — but only a file that still points at a LOOPBACK nameserver (i.e.
@@ -251,8 +336,25 @@ fn write_etc_resolver(zone_suffix: &str, dns_addr: SocketAddr) -> io::Result<()>
 /// a non-loopback nameserver, leave it and warn rather than delete an operator's own split-DNS file.
 /// Absent ⇒ a harmless no-op (the revert path is called unconditionally, including from a fresh
 /// process where the file may or may not be there).
+///
+/// The zone is VALIDATED first (Security review HIGH-1): this is the worst sink — `zone_suffix` here
+/// is the `resolver_zone` field read from the plan §3.9 marker in the invoking user's config dir, so
+/// a hostile value could otherwise make a root `remove_file` escape `/etc/resolver`. An invalid zone
+/// is refused (warn, revert nothing) rather than acted on; the loopback check is a second,
+/// independent gate (it alone is NOT sufficient — a legitimate operator resolver file is also
+/// loopback — which is exactly why the path validation must come first).
 fn remove_etc_resolver(zone_suffix: &str) -> io::Result<()> {
-    let path = etc_resolver_path(zone_suffix);
+    let path = match etc_resolver_path(zone_suffix) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e, %zone_suffix,
+                "boatramp tunnel: refusing to revert an /etc/resolver override for an invalid zone \
+                 (a tampered marker?) — nothing removed"
+            );
+            return Ok(());
+        }
+    };
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -552,10 +654,40 @@ mod tests {
         let body = etc_resolver_contents("127.0.0.1:5353".parse().unwrap());
         assert_eq!(body, "nameserver 127.0.0.1\nport 5353\n");
         assert_eq!(
-            etc_resolver_path("svc.prod.internal."),
+            etc_resolver_path("svc.prod.internal.").unwrap(),
             std::path::Path::new("/etc/resolver/svc.prod.internal")
         );
         assert!(file_points_at_loopback(&body));
         assert!(!file_points_at_loopback("nameserver 8.8.8.8\nport 53\n"));
+    }
+
+    /// Security review HIGH-1: `etc_resolver_path` must REFUSE any zone that would escape
+    /// `/etc/resolver` (absolute, `..`-bearing, separator-bearing, empty) and accept only a plain
+    /// dot-separated DNS name. Not cfg'd to macOS — the guard is compiled (and the revert sink
+    /// reachable) on every target, so it is verified on the Linux CI gate too.
+    #[test]
+    fn etc_resolver_path_refuses_traversal_and_accepts_only_a_dns_zone() {
+        for good in ["svc.prod.internal.", "svc.prod.internal", "a", "x1-y2.z"] {
+            let p = etc_resolver_path(good).expect("a plain DNS zone must be accepted");
+            assert_eq!(p.parent(), Some(std::path::Path::new("/etc/resolver")));
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/etc/resolv.conf",
+            "../../../etc/resolv.conf",
+            "svc.x/../../../tmp/pwned.internal",
+            "svc/db",
+            "svc..db",
+            "-lead.internal",
+            "trail-.internal",
+            "bad_underscore.internal",
+        ] {
+            assert!(
+                etc_resolver_path(bad).is_err(),
+                "a zone that escapes /etc/resolver or is not a DNS name must be refused: {bad:?}"
+            );
+        }
     }
 }

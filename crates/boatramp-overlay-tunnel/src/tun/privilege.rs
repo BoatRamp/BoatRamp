@@ -18,8 +18,13 @@
 //!   user; once the TUN device is open and the route is installed (both need root/`CAP_NET_ADMIN`),
 //!   [`drop_to_unprivileged`] drops to that identity — group membership (`setgroups`), GID, then
 //!   UID, in that order — for everything after: the DNS responder, the netstack poll loop, the
-//!   catalog/cap-cache/dial path. This path's drop IS real and complete (full `root` → an
-//!   unprivileged uid/gid with no supplementary groups), unlike the `CAP_NET_ADMIN` path above.
+//!   catalog/cap-cache/dial path. On **Linux** this drop is complete (full `root` → an unprivileged
+//!   uid/gid with no supplementary groups). On **macOS** (R3), uid + primary gid still drop, but the
+//!   supplementary-group drop CANNOT run — `nix` does not expose `setgroups` on apple and this crate
+//!   is `#![forbid(unsafe_code)]`, so root's supplementary groups are RETAINED (surfaced by a loud
+//!   warning at drop time, not silently). That residual is a documented limitation of the dev-grade
+//!   macOS root-helper (plan §3.8; the SysExt path is the real macOS privilege story) — Security
+//!   review HIGH-2, see [`RealSyscalls::setgroups`]'s non-Linux arm.
 //!
 //! Uses `nix`'s SAFE wrappers over `geteuid`/`setgroups`/`setgid`/`setuid` — this crate is
 //! `#![forbid(unsafe_code)]` (`lib.rs`), so a raw `libc` call is not an option here.
@@ -29,9 +34,10 @@
 //! not open, is the caller's job and is covered by that module's own tests.
 
 use nix::unistd::{Gid, Uid, geteuid, setgid, setuid};
-// `nix::unistd::setgroups` isn't exposed on apple targets at all (this crate's `tun` feature is
-// Linux-only in scope — plan §3 — so that's fine for the real deployment target; the cfg below
-// just keeps this module, and its tests, compiling on a non-Linux dev machine too).
+// `nix::unistd::setgroups` isn't exposed on apple targets at all. The `tun` feature now targets
+// Linux + macOS (R3), so this is a real gap on macOS, not just a dev-machine-compile convenience:
+// see [`RealSyscalls::setgroups`]'s non-Linux arm (Security review HIGH-2) for how the macOS drop
+// surfaces it. The cfg keeps the Linux `setgroups` import (and this module) compiling on non-Linux.
 #[cfg(target_os = "linux")]
 use nix::unistd::setgroups;
 
@@ -94,9 +100,23 @@ impl Syscalls for RealSyscalls {
     }
     #[cfg(not(target_os = "linux"))]
     fn setgroups(&self, _groups: &[Gid]) -> nix::Result<()> {
-        // Never reached in practice (module doc: this crate's `tun` feature is Linux-only) — kept
-        // so this module builds on a non-Linux dev machine, where `nix::unistd::setgroups` isn't
-        // even exposed.
+        // macOS (R3) + other non-Linux: `nix` does not expose `setgroups` on apple targets, and this
+        // crate is `#![forbid(unsafe_code)]`, so a raw `libc::setgroups` is not an option — the
+        // supplementary-group drop CANNOT be performed here. Surface that LOUDLY and return without
+        // claiming success-as-complete, rather than the old silent `Ok` (Security review HIGH-2: the
+        // silent no-op + the module doc both asserted a complete drop, which is false on macOS).
+        // uid/gid still drop (`setgid`/`setuid` below), so the process does leave root's user/primary
+        // group; but root's SUPPLEMENTARY groups are RETAINED while the untrusted netstack/DNS/SOCKS
+        // surface runs — a documented limitation of the dev-grade macOS root-helper (plan §3.8). The
+        // real fix is the deferred SysExt/NetworkExtension path (unprivileged, no root at all), not a
+        // post-hoc group drop; closing it in-process would require moving this crate off blanket
+        // `forbid(unsafe_code)` for a scoped `libc::setgroups`, an owner decision tracked separately.
+        tracing::warn!(
+            "boatramp tunnel: supplementary groups are NOT dropped on this platform (no safe \
+             setgroups under forbid(unsafe_code)); root's supplementary groups are RETAINED while \
+             the untrusted netstack/DNS/SOCKS parse surface runs — a known dev-grade macOS \
+             root-helper limitation (plan §3.8: the SysExt path is the real macOS privilege story)"
+        );
         Ok(())
     }
     fn setgid(&self, gid: Gid) -> nix::Result<()> {
