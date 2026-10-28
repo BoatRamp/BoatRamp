@@ -278,9 +278,20 @@ jobs:
           sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
           echo '/tmp/cores/core.%p.%s' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
           ulimit -c unlimited
-          cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace \
-            --no-default-features --features boatramp/fs,boatramp/slatedb 2>&1 | tee test-musl.log
-          rc=${PIPESTATUS[0]}
+          # TEMPORARY (T6 repro-hunt on this diagnostic branch ONLY — remove together with the fix):
+          # the teardown SIGSEGV is probabilistic per run (it did NOT reproduce on the first
+          # fixed-capture run), so loop the EXACT test command up to 8× and stop at the first core,
+          # to catch it + print the backtrace in ONE CI run instead of gambling on reruns.
+          rc=0
+          for i in $(seq 1 8); do
+            echo "::group::T6 repro attempt $i/8"
+            cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace \
+              --no-default-features --features boatramp/fs,boatramp/slatedb 2>&1 | tee test-musl.log
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            echo "T6 repro attempt $i: exit=$rc"
+            if ls /tmp/cores/core.* >/dev/null 2>&1; then echo "T6 core captured on attempt $i"; break; fi
+          done
           echo "musl test exit code: $rc"
           if ls /tmp/cores/core.* >/dev/null 2>&1; then
             echo "::warning title=T6 SlateDB-on-musl teardown SIGSEGV::core(s) captured — backtrace in the step log below + the musl-test-cores artifact"
