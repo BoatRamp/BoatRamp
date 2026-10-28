@@ -411,11 +411,14 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Windows (R4): there is no `SIGTERM`/`SIGHUP`. The equivalent console control events are Ctrl-C
-/// and Ctrl-Break (`tokio::signal::windows`), the latter of which also fires for the console
-/// close / logoff / system-shutdown events, so racing the two covers the clean-teardown triggers
-/// plan §3.9 wants. Ctrl-Break handler installation can only fail in exotic environments; as on
-/// unix, such a failure just falls back to Ctrl-C alone rather than refusing to start.
+/// Windows (R4): there is no `SIGTERM`/`SIGHUP`. The closest console control events for an
+/// interactive run are Ctrl-C (`CTRL_C_EVENT`, via [`tokio::signal::ctrl_c`]) and Ctrl-Break
+/// (`CTRL_BREAK_EVENT`, via `tokio::signal::windows::ctrl_break`) — the SIGINT/SIGQUIT analogs — so
+/// racing the two is the plan §3.9 clean-teardown trigger on Windows. (`tokio::signal::windows` also
+/// exposes separate `ctrl_close`/`ctrl_logoff`/`ctrl_shutdown` handlers for the non-interactive
+/// session-end events; wiring those is a later-stage refinement, not needed for the Stage-A build.)
+/// Ctrl-Break handler installation can only fail in exotic environments; as on unix, such a failure
+/// just falls back to Ctrl-C alone rather than refusing to start.
 #[cfg(windows)]
 async fn wait_for_shutdown_signal() {
     match tokio::signal::windows::ctrl_break() {
