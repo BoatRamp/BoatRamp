@@ -262,28 +262,39 @@ jobs:
           # libsql background thread outliving its Db and racing the static-musl exit). It could
           # NOT be reproduced on demand (~160 isolated musl runs on a dev box, zero hits), so
           # rather than keep masking it with a blind rerun, CAPTURE a core + backtrace the next
-          # time it flakes here — real evidence to root-cause the faulting thread from. Enable
-          # core dumps to a plain file (the runner's default core_pattern pipes to apport).
+          # time it flakes here — real evidence to root-cause the faulting thread from.
+          #
+          # Three collection fixes so the evidence actually arrives (the first capture resolved the
+          # binary from the core's %e = the crashing THREAD's comm, which for a test thread is the
+          # TEST-FUNCTION name, never the binary name — so the find matched nothing and gdb never
+          # ran; and a comm like `admin_api::test` put a ':' in the core name, which
+          # upload-artifact@v4 rejects, dropping the whole upload):
+          #   1. core_pattern WITHOUT %e (colon-free `%p.%s`); recover the binary from the core's
+          #      own execfn instead.
+          #   2. gdb installed UP FRONT (a post-crash apt-get could fail and leave no backtrace).
+          #   3. backtrace teed to the STEP LOG, not only the artifact, so it is visible even if the
+          #      artifact upload is dropped.
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb || true
           sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
-          echo '/tmp/cores/core.%e.%p.%s' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          echo '/tmp/cores/core.%p.%s' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
           ulimit -c unlimited
           cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace \
             --no-default-features --features boatramp/fs,boatramp/slatedb 2>&1 | tee test-musl.log
           rc=${PIPESTATUS[0]}
           echo "musl test exit code: $rc"
           if ls /tmp/cores/core.* >/dev/null 2>&1; then
-            echo "::warning title=T6 SlateDB-on-musl teardown SIGSEGV::core dump(s) captured — download the musl-test-cores artifact for the backtrace"
-            sudo apt-get update -qq && sudo apt-get install -y -qq gdb || true
+            echo "::warning title=T6 SlateDB-on-musl teardown SIGSEGV::core(s) captured — backtrace in the step log below + the musl-test-cores artifact"
             for core in /tmp/cores/core.*; do
-              exe=$(basename "$core" | cut -d'.' -f2)
-              bin=$(find target/x86_64-unknown-linux-musl/*/deps -maxdepth 1 -type f -executable -name "${exe}*" 2>/dev/null | head -1)
-              echo "===== core: $core (exe=$exe bin=$bin) =====" >> /tmp/cores/backtraces.txt
-              if [ -n "$bin" ]; then
+              # Resolve the faulting binary from the core's OWN execfn (robust; the thread comm is not
+              # the binary name). `file` prints: ... execfn: '/abs/path/to/deps/<bin>-<hash>' ...
+              bin=$(file "$core" | grep -oE "execfn: '[^']+'" | head -1 | sed -E "s/execfn: '([^']+)'/\\1/")
+              echo "===== core: $core (bin=$bin) =====" | tee -a /tmp/cores/backtraces.txt
+              if [ -n "$bin" ] && [ -f "$bin" ]; then
                 cp "$bin" /tmp/cores/ 2>/dev/null || true
-                gdb -batch -nx -ex 'set pagination off' -ex 'thread apply all bt full' "$bin" "$core" \
-                  >> /tmp/cores/backtraces.txt 2>&1 || true
+                gdb -batch -nx -ex 'set pagination off' -ex 'thread apply all bt' "$bin" "$core" 2>&1 \
+                  | tee -a /tmp/cores/backtraces.txt || true
               else
-                echo "(no matching test binary found for $exe)" >> /tmp/cores/backtraces.txt
+                echo "(could not resolve the faulting binary from the core's execfn)" | tee -a /tmp/cores/backtraces.txt
               fi
             done
           fi
