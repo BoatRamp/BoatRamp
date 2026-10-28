@@ -152,10 +152,18 @@ fn drop_to_unprivileged_with(
     syscalls
         .setuid(Uid::from_raw(uid))
         .map_err(|e| PrivilegeError::SetUid(uid, e))?;
+    // Security review LOW: keep this success line HONEST per platform — on macOS the `setgroups`
+    // step above is the warn-and-no-op (supplementary groups retained), so claiming "incl.
+    // supplementary groups" here would re-create the exact false-completeness assertion HIGH-2 fixed.
+    #[cfg(target_os = "linux")]
+    const DROPPED_GROUPS_NOTE: &str = "incl. supplementary groups";
+    #[cfg(not(target_os = "linux"))]
+    const DROPPED_GROUPS_NOTE: &str =
+        "uid + primary gid only — supplementary groups retained (see the warning above)";
     tracing::info!(
         uid,
         gid,
-        "boatramp tunnel: dropped root privileges (incl. supplementary groups) after TUN/route setup"
+        "boatramp tunnel: dropped root privileges ({DROPPED_GROUPS_NOTE}) after TUN/route setup"
     );
     Ok(true)
 }
