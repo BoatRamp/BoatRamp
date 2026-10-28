@@ -167,10 +167,13 @@ build-fixtures:
     echo "fixtures rebuilt"
 
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.
-# The test spawns `pebble` + `pebble-challtestsrv` (provided by `nix develop`),
-# mints a throwaway CA, and drives a real `*.deploy.test` wildcard issuance.
+# The test spawns `pebble` + `pebble-challtestsrv` (>= 2.10.0, provided by `nix
+# develop`), mints a throwaway CA, and drives a real `*.deploy.test` wildcard
+# issuance — the regression gate for the tokenless `dns-persist-01` challenge.
+# No longer `--ignored` (it is a real success-marker gate); it skips cleanly if
+# the pebble binaries are not on PATH.
 acme-dns-e2e:
-    cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --ignored --nocapture
+    cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --nocapture
 
 # FA-7 `function init` → `function build` → local-harness round-trip: scaffold the
 # Rust template, compile it to a `wasi:http` component, and run it through the

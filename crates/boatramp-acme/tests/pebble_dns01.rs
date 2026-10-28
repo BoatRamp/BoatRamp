@@ -7,11 +7,26 @@
 //! (solving the `_acme-challenge` TXT via challtestsrv's management API), and
 //! asserts a Pebble-signed certificate chain comes back.
 //!
-//! `#[ignore]`d — it needs the `pebble` + `pebble-challtestsrv` binaries on
-//! `PATH` (provided by the nix dev shell) and binds local ports. Run it with:
+//! **Regression gate for the `dns-persist-01` tokenless-challenge bug.** Pebble
+//! **≥ 2.10.0** includes a tokenless `dns-persist-01` challenge in every
+//! authorization (mirroring Let's Encrypt / Google Trust Services in production).
+//! instant-acme < 0.8.5 made `Challenge.token` a *required* serde field, so
+//! deserializing the authorization failed with `missing field \`token\``,
+//! wrecking the whole authorization — including the `dns-01` challenge we select —
+//! and ACME DNS-01 issuance crash-looped against the real CA. instant-acme ≥ 0.8.5
+//! tolerates the tokenless challenge, so this test now issues a cert cleanly; on
+//! the old client against the same Pebble it reproduces the deserialization crash.
+//!
+//! No longer `#[ignore]`d: it is a real success-marker gate (prints
+//! `ACME-DNS-PERSIST GATE OK: …`, which CI greps). It still needs the `pebble` +
+//! `pebble-challtestsrv` binaries (≥ 2.10.0) on `PATH` — provided by the nix dev
+//! shell (`flake.nix` pins the version) — and binds local ports; when the binaries
+//! are absent it prints a skip line and returns (so a plain `cargo test` without
+//! them is a no-op, while the CI gate guarantees they are present and greps the
+//! marker). Run it directly with:
 //!
 //! ```sh
-//! cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --ignored --nocapture
+//! cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --nocapture
 //! ```
 //! or, with everything wired up, `just acme-dns-e2e`.
 #![cfg(feature = "acme")]
@@ -24,6 +39,11 @@ use boatramp_acme::acme::{CertRequest, obtain_certificate};
 use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
 
 const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
+// `localhost` (not a bare IP): Pebble rejects a request whose `Host` is a literal IP with HTTP 400,
+// so the directory host must be `localhost` and the minted cert names `localhost`. Pebble binds the
+// IPv6 wildcard `[::]` (see the config below) so that `localhost` — which resolves to `::1` first on
+// macOS and on IPv6-enabled runners — is reachable; the issuance client resolves the same way and we
+// cannot inject a resolver into it, so the listener must cover `::1`.
 const DIRECTORY_URL: &str = "https://localhost:14000/dir";
 
 /// A [`DnsProvider`] backed by `pebble-challtestsrv`'s management API: `set-txt`
@@ -102,7 +122,6 @@ fn mint_certs(dir: &Path) -> std::path::PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
 async fn dns01_wildcard_issuance_against_pebble() {
     if !on_path("pebble") || !on_path("pebble-challtestsrv") {
         eprintln!("skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)");
@@ -113,11 +132,13 @@ async fn dns01_wildcard_issuance_against_pebble() {
     let dir = tempfile::tempdir().unwrap();
     let ca_path = mint_certs(dir.path());
 
-    // Pebble config: ACME directory on :14000, mgmt on :15000, our minted cert.
+    // Pebble config: ACME directory on :14000, mgmt on :15000, our minted cert. Bind the IPv6
+    // wildcard `[::]` so `localhost` (which resolves to `::1` first on macOS and IPv6-enabled CI
+    // runners) reaches it; on Linux `[::]` is dual-stack, so IPv4 clients work too.
     let config = serde_json::json!({
         "pebble": {
-            "listenAddress": "0.0.0.0:14000",
-            "managementListenAddress": "0.0.0.0:15000",
+            "listenAddress": "[::]:14000",
+            "managementListenAddress": "[::]:15000",
             "certificate": dir.path().join("cert.pem"),
             "privateKey": dir.path().join("key.pem"),
             "httpPort": 5002,
@@ -129,11 +150,21 @@ async fn dns01_wildcard_issuance_against_pebble() {
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
     // challtestsrv: DNS on :8053 (Pebble's VA resolves the TXT here), management
-    // API on :8055; the challenge responders we don't use are disabled.
+    // API on :8055; the challenge responders we don't use are disabled. Bind both to the IPv4
+    // loopback explicitly so the management POST (`http://127.0.0.1:8055`) and Pebble's resolver
+    // (`-dnsserver 127.0.0.1:8053`) reach them regardless of the host's IPv6 `localhost` default.
+    // NB: challtestsrv's DNS flag is `-dnsserver` (renamed from `-dns01` in older releases), and
+    // 2.10 adds a DoH responder (default `:8443`) that must be disabled too — an unknown flag makes
+    // the Go `flag` parser exit, so getting these exact names right is what keeps the process up.
     let _challtestsrv = Child(
         tokio::process::Command::new("pebble-challtestsrv")
-            .args(["-dns01", ":8053", "-management", ":8055"])
-            .args(["-http01", "", "-https01", "", "-tlsalpn01", ""])
+            .args([
+                "-dnsserver",
+                "127.0.0.1:8053",
+                "-management",
+                "127.0.0.1:8055",
+            ])
+            .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
             .kill_on_drop(true)
             .spawn()
             .expect("spawn pebble-challtestsrv"),
@@ -150,37 +181,54 @@ async fn dns01_wildcard_issuance_against_pebble() {
             .expect("spawn pebble"),
     );
 
-    // Wait for the directory to come up (TLS cert is self-signed for the probe).
+    // Wait for the directory to come up (TLS cert is self-signed for the probe). Pebble ≥ 2.10
+    // rejects any request without a `User-Agent` (HTTP 400 "All requests MUST include a User-Agent
+    // header"); instant-acme ≥ 0.8.2 sends one on the real issuance path, so set one here too.
     let probe = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .user_agent("boatramp-acme-pebble-test")
         .build()
         .unwrap();
     let mut ready = false;
+    let mut last_err = String::from("(no attempt)");
     for _ in 0..50 {
-        if probe
-            .get(DIRECTORY_URL)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            ready = true;
-            break;
+        match probe.get(DIRECTORY_URL).send().await {
+            Ok(r) if r.status().is_success() => {
+                ready = true;
+                break;
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                last_err = format!("HTTP {status}: {body}");
+            }
+            Err(e) => last_err = e.to_string(),
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    assert!(ready, "Pebble directory did not become ready");
+    assert!(ready, "Pebble directory did not become ready: {last_err}");
 
-    // Trust the throwaway CA for the real issuance client (instant-acme's
-    // `with_native_roots` honours SSL_CERT_FILE).
-    //
-    // Documented exception to the EnvSource DI rule: this is an #[ignore]d live-pebble
-    // integration test pointing an *external* ACME client at a throwaway CA — not a
-    // boatramp resolver — so the injectable-EnvSource design does not apply here. In
-    // edition 2024 `std::env::set_var` is `unsafe` (data race across threads); this test
-    // is single-threaded before any concurrent env reads, so the wrap is sound.
-    unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
+    // Wait for challtestsrv's management API too (it is spawned alongside Pebble, and the DNS
+    // solver POSTs to it the moment issuance reaches the challenge): any HTTP response — even a
+    // 404 for `GET /` — means the port is bound. Without this, a fast Pebble start can race ahead
+    // of challtestsrv and the first `set-txt` fails with a connection error.
+    let mut challtestsrv_ready = false;
+    for _ in 0..50 {
+        if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+            challtestsrv_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        challtestsrv_ready,
+        "pebble-challtestsrv management API did not come up"
+    );
 
+    // Trust the throwaway CA for the real issuance client by handing it to the account builder
+    // (`CertRequest::extra_root_ca` → `Account::builder_with_root`). Since instant-acme 0.8 the
+    // default client verifies the directory's TLS with the platform verifier, which does NOT honour
+    // `SSL_CERT_FILE` — so the earlier env-var trick no longer works and the CA must be explicit.
     let request = CertRequest {
         directory_url: DIRECTORY_URL.to_string(),
         contact_email: Some("ops@example.test".to_string()),
@@ -188,14 +236,19 @@ async fn dns01_wildcard_issuance_against_pebble() {
         dns_ttl: 1,
         propagation_delay: Duration::from_secs(1),
         timeout: Duration::from_secs(60),
+        extra_root_ca: Some(ca_path.clone()),
     };
     let provider = ChallTestSrv {
         client: reqwest::Client::new(),
     };
 
+    // The load-bearing line for the regression: `obtain_certificate` → `obtain_certificate_with`
+    // calls `order.authorizations()`, which on Pebble ≥ 2.10.0 must deserialize an authorization
+    // that carries a tokenless `dns-persist-01` challenge. instant-acme < 0.8.5 panics/errors here
+    // with `missing field \`token\``; ≥ 0.8.5 tolerates it and still selects `dns-01`.
     let issued = obtain_certificate(&request, &provider)
         .await
-        .expect("DNS-01 issuance against Pebble");
+        .expect("DNS-01 issuance against Pebble (tokenless dns-persist-01 must not break deser)");
 
     assert!(
         issued.certificate_pem.contains("BEGIN CERTIFICATE"),
@@ -204,6 +257,11 @@ async fn dns01_wildcard_issuance_against_pebble() {
     assert!(
         issued.private_key_pem.contains("PRIVATE KEY"),
         "expected a PEM private key"
+    );
+    // Success marker the CI gate greps to prove the test actually RAN (not skipped) and passed.
+    println!(
+        "ACME-DNS-PERSIST GATE OK: issued *.deploy.test against Pebble (tokenless dns-persist-01 \
+         challenge tolerated, dns-01 still selected)"
     );
     // The challenge TXT is cleaned up after issuance.
     let (left, _) = (
