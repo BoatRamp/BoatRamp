@@ -85,6 +85,31 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
+  # The Windows RELEASE build is release-only: it escapes both per-push CI (Linux musl) and the rest
+  # of this matrix — exactly the gap that shipped a broken Windows binary in v0.46.0 (an unix-only
+  # MetadataExt use that no Linux/nix gate could see). Validate the EXACT release feature union — the
+  # portable set PLUS the Windows-only tun,overlay the release archive ships — compiles + links on a
+  # native windows-latest runner HERE, so a feature-interaction or cfg break fails in nightly and in
+  # the release's own preflight rather than mid-cut. Mirrors release.yml's Windows `cargo build`
+  # (same target + features); keep the feature list in sync with release.yml's PORTABLE_FEATURES +
+  # the windows matrix row's extra_features.
+  windows-release-build:
+    name: windows release build (feature union)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: preflight-windows-release
+      # aws-lc-rs (tls / s3) needs nasm on Windows; cmake is preinstalled on the runner.
+      - uses: ilammy/setup-nasm@v1
+      - name: cargo build -p boatramp --release (portable union + tun,overlay)
+        run: cargo build -p boatramp --release --locked --target x86_64-pc-windows-msvc --features "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc,tun,overlay"
+
   # The heavy nix work, FANNED OUT across parallel runners. Was a single serial job
   # (`nix flake check` then the release-cache warm) that summed to ~1h43m; each leg now
   # runs ALONE on its own 4-vCPU/16 GB runner, so the critical path is the slowest single
