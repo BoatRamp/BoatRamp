@@ -67,6 +67,7 @@
 - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)
 - [Run on Kubernetes (the in-binary operator)](./how-to/kubernetes.md)
 - [Bring up a cluster on Hetzner](./how-to/cluster-on-hetzner.md)
+- [Reach services over the overlay (service tunneler)](./how-to/service-tunneler.md)
 - [Migrate the root key](./how-to/migrate-root-key.md)
 - [Deploy on Cloudflare Containers](./how-to/deploy-cloudflare.md)
 - [Embed boatramp as a library](./how-to/embed.md)

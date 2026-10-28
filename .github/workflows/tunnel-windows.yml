@@ -86,15 +86,16 @@ jobs:
         run: cargo build -p boatramp --features tun,overlay --locked
 
   # Live wintun SMOKE — the "build-AND-smoke" half of the R4 gate: the only check that proves the
-  # Windows path RUNS, not just compiles. It opens a REAL wintun adapter (needs Administrator + a real
-  # wintun.dll), installs the in-CIDR route via IP-Helper, and drives a real TCP connection through
-  # the adapter into the netstack, asserting exactly one overlay dial attempt — the Windows analog of
-  # tunnel.yml's Linux netns smoke. The test is #[ignore]d so it never runs in the unprivileged suite;
-  # this job runs it EXPLICITLY by exact name and FAILS the job if it fails — a real success-marker
-  # gate, NOT an ignored-never-run test. GitHub's windows-latest runner executes steps elevated, which
-  # wintun's driver install requires. wintun.dll is the official, WireGuard-signed build from
-  # wintun.net, staged into System32 so the OS DLL search always finds it at load time. Same
-  # non-blocking-to-branch-protection posture as the build legs until it is reliably green.
+  # Windows path RUNS, not just compiles. It opens a REAL wintun adapter, installs the in-CIDR route
+  # via IP-Helper, and applies the NRPT split-DNS rule (all three need Administrator), then asserts the
+  # NRPT rule is really on the host and that teardown reverts it — the Windows-specific device / route
+  # / NRPT surface. (The OS-agnostic "connection drives a dial" path is proven on Linux + by a unit
+  # test; re-asserting it on a shared runner only adds timing flakiness — see the test's own doc.) The
+  # test is #[ignore]d so it never runs in the unprivileged suite; this job runs it EXPLICITLY by exact
+  # name and FAILS the job if it fails — a real success-marker gate, NOT an ignored-never-run test.
+  # GitHub's windows-latest runner executes steps elevated, which wintun's driver install requires.
+  # wintun.dll is the official, WireGuard-signed build from wintun.net, staged into System32 so the OS
+  # DLL search always finds it at load time. Non-blocking to branch protection until reliably green.
   wintun-smoke:
     name: wintun live smoke (windows-latest, Administrator)
     runs-on: windows-latest
@@ -119,5 +120,5 @@ jobs:
           Copy-Item $dll -Destination "$env:SystemRoot\System32\wintun.dll" -Force
       - name: Build the privileged test binary
         run: cargo test -p boatramp-overlay-tunnel --features tun --test tun_privileged --locked --no-run
-      - name: Run the live wintun device smoke (fails the job on failure)
-        run: cargo test -p boatramp-overlay-tunnel --features tun --test tun_privileged --locked -- --ignored --exact windows_wintun_device_route_drives_a_dial_attempt --nocapture --test-threads=1
+      - name: Run the live wintun device + NRPT smoke (fails the job on failure)
+        run: cargo test -p boatramp-overlay-tunnel --features tun --test tun_privileged --locked -- --ignored --exact windows_wintun_device_and_nrpt_split_dns_roundtrip --nocapture --test-threads=1

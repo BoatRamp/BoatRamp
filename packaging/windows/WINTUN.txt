@@ -1,0 +1,33 @@
+boatramp on Windows — the service tunneler and wintun.dll
+=========================================================
+
+This archive bundles `wintun.dll` next to `boatramp.exe`. It is required ONLY by
+the overlay service tunneler — the `boatramp tunnel` command, which creates a
+virtual network interface so you can reach cluster services by name as if they
+were on your LAN. Every other boatramp command runs without it.
+
+What wintun.dll is
+------------------
+`wintun.dll` is the user-space half of Wintun, the WireGuard project's minimal
+TUN network-adapter driver for Windows. `boatramp tunnel` loads it at run time
+from the directory the executable lives in — keep the two files together.
+
+This is the official, Authenticode-signed build by WireGuard LLC (version
+0.14.1, amd64), downloaded from https://www.wintun.net/ and redistributed here
+UNMODIFIED. boatramp does not re-sign it. See https://www.wintun.net/ for its
+license and terms. (boatramp.exe itself is not code-signed in this release; a
+signed installer is planned but not yet shipped.)
+
+Run the tunnel as Administrator
+-------------------------------
+Creating the Wintun adapter, installing the in-tunnel route, and applying the
+split-DNS rule all require elevation. Start an elevated PowerShell/Terminal
+("Run as administrator") and run `boatramp tunnel` from there. Without
+elevation the command fails up front with a privilege error — it does not run
+degraded.
+
+On a clean exit (Ctrl-C, or the console window closing, or sign-out/shutdown)
+the tunnel removes its adapter, route, and DNS rule. If it is killed hard, the
+next `boatramp tunnel --cleanup` reverts whatever it left behind.
+
+Full guide: docs/ "Reach services over the overlay (service tunneler)".

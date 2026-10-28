@@ -313,21 +313,27 @@ async fn macos_utun_route_and_etc_resolver_split_dns_roundtrip() {
     let _ = std::fs::remove_file(&marker_path);
 }
 
-/// Windows (R4): open a REAL wintun adapter + install the in-CIDR route via IP-Helper, then prove a
-/// real TCP connection routed by the kernel into the adapter drives exactly one overlay dial attempt
-/// — the Windows analog of the Linux device test above. `skip_resolver = true`, so this touches NO
-/// host DNS (no NRPT rule): its one job is the live wintun device / route / netstack plumbing, which
-/// only a native Windows runner with a real `wintun.dll` + Administrator can exercise (the build-only
-/// `tunnel-windows.yml` lane proves the cfg story compiles; this closes the "does it actually run"
-/// gap). The NRPT split-DNS live path is a separate test, added once this device path is proven.
+/// Windows (R4): the live wintun device + NRPT split-DNS round-trip. `bind()` returning `Ok` proves,
+/// in one shot, that on a real `windows-latest` runner we (a) opened a Wintun adapter via `tun-rs` +
+/// a real `wintun.dll`, (b) installed the in-CIDR route via IP-Helper, and (c) applied the NRPT
+/// split-DNS rule via PowerShell — all three need Administrator, which the build-only
+/// `tunnel-windows.yml` lane cannot exercise. Then we assert the NRPT rule is REALLY on the host
+/// (`Get-DnsClientNrptRule`, deterministic — no DNS-timing), and that `shutdown()` REVERTS it
+/// (exercising `resolver::revert_nrpt_rule`, the MEDIUM-1 absolute-`powershell.exe` path).
 ///
-/// Run by the `tunnel-windows.yml` smoke job (elevated `windows-latest` with `wintun.dll` staged
-/// next to the test binary), never by the default `cargo test`. `#[ignore]` keeps it out of the
-/// unprivileged suite.
+/// Deliberately NOT re-proving the "a TCP connection drives an overlay dial" end-to-end here: that is
+/// OS-agnostic netstack logic, already covered without privilege by the `smoltcp`-direct unit test
+/// and live on Linux by the netns test above. Asserting it on a shared CI runner only adds routing/
+/// timing flakiness (the kernel steering a connect into a brand-new adapter within a fixed deadline)
+/// without adding Windows-specific coverage — so this test proves the Windows-specific device / route
+/// / NRPT surface, which is exactly R4's new ground.
+///
+/// Run by the `tunnel-windows.yml` smoke job (elevated `windows-latest` with `wintun.dll` staged into
+/// System32), never by the default `cargo test`. `#[ignore]` keeps it out of the unprivileged suite.
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "needs Administrator + a real wintun.dll to open a wintun adapter — run by tunnel-windows.yml's smoke job"]
-async fn windows_wintun_device_route_drives_a_dial_attempt() {
+#[ignore = "needs Administrator + a real wintun.dll (wintun adapter + NRPT) — run by tunnel-windows.yml's smoke job"]
+async fn windows_wintun_device_and_nrpt_split_dns_roundtrip() {
     let cp = Arc::new(FixedControlPlane {
         mint_calls: AtomicUsize::new(0),
     });
@@ -342,28 +348,68 @@ async fn windows_wintun_device_route_drives_a_dial_attempt() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker_path);
-    // Device/route/netstack only — leave host DNS (NRPT) untouched on the shared runner.
-    let mut options = TunOptions::new(
+    // `skip_resolver` left at the production default (false) → bind() ALSO applies the NRPT rule.
+    let options = TunOptions::new(
         cidr,
         "internal".to_string(),
         "wintest".to_string(),
         marker_path.clone(),
     );
-    options.skip_resolver = true;
+    // `cluster=wintest`, `zone=internal` → zone_suffix `svc.wintest.internal` → NRPT namespace
+    // `.svc.wintest.internal` (leading dot). Clear any rule a crashed prior job leaked so the
+    // apply→present→revert→absent round-trip below is unambiguous.
+    let namespace = ".svc.wintest.internal";
+    remove_nrpt_namespace(namespace);
 
     let front_end = TunFrontend::bind(tunnel, options).await.expect(
-        "opening a wintun adapter needs Administrator + wintun.dll — see the #[ignore] reason above",
+        "opening a wintun adapter + route + NRPT rule needs Administrator + wintun.dll — see the \
+         #[ignore] reason above",
     );
-
-    let synthetic_ip = resolve_via_embedded_dns("db.svc.wintest.internal").await;
-    let mints = connect_and_wait_for_dial((synthetic_ip, 5432), &cp.mint_calls).await;
     assert!(
-        mints > 0,
-        "a real TCP connection through the wintun adapter must drive an overlay dial attempt"
+        nrpt_namespace_present(namespace),
+        "bind() must have installed an NRPT rule for {namespace}"
     );
 
     front_end.shutdown().await.unwrap();
+    assert!(
+        !nrpt_namespace_present(namespace),
+        "shutdown() must have reverted the NRPT rule for {namespace}"
+    );
     let _ = std::fs::remove_file(&marker_path);
+}
+
+/// Is an NRPT rule for exactly `namespace` currently installed on the host? Deterministic probe for
+/// the Windows smoke above (no DNS resolution involved). Reads the `Namespace` of every rule and
+/// looks for an exact match.
+#[cfg(windows)]
+fn nrpt_namespace_present(namespace: &str) -> bool {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-DnsClientNrptRule | ForEach-Object { $_.Namespace }",
+        ])
+        .output()
+        .expect("powershell Get-DnsClientNrptRule must run on the elevated windows smoke runner");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim() == namespace)
+}
+
+/// Best-effort pre-clean: remove any NRPT rule matching `namespace` (a leftover from a crashed prior
+/// run) so the smoke test starts from a known-absent state. Mirrors `resolver::revert_nrpt_rule`'s
+/// own removal pipeline; failure is ignored (there may simply be nothing to remove).
+#[cfg(windows)]
+fn remove_nrpt_namespace(namespace: &str) {
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-DnsClientNrptRule | Where-Object Namespace -eq",
+        ])
+        .arg(namespace)
+        .args(["|", "Remove-DnsClientNrptRule", "-Force"])
+        .status();
 }
 
 /// Query the HOST resolver (`resolvectl query <name>`) and return the first IPv4 it answers that

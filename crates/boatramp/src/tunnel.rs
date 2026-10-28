@@ -37,9 +37,10 @@ pub struct TunnelArgs {
     /// only on a single-user host where that is an acceptable tradeoff.
     #[arg(long)]
     pub no_local_auth: bool,
-    /// Start the TUN virtual-interface front-end instead of SOCKS (plan §3; Linux + macOS — needs
-    /// the crate's `tun` cargo feature, and `CAP_NET_ADMIN`/root on Linux or root on macOS to open
-    /// the device; Windows is a later increment).
+    /// Start the TUN virtual-interface front-end instead of SOCKS (plan §3; Linux, macOS, and
+    /// Windows). Needs the crate's `tun` cargo feature, plus privilege to open the device:
+    /// `CAP_NET_ADMIN`/root on Linux, root on macOS, and Administrator (with the bundled `wintun.dll`
+    /// alongside the binary) on Windows.
     #[arg(long)]
     pub tun: bool,
     /// The synthetic CIDR routed into the TUN device (plan §3.2). Only meaningful with `--tun`.
