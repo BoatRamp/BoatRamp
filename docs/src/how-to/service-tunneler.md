@@ -82,7 +82,9 @@ The tunnel is a privileged, host-mutating client. It:
   credential by default — because the proxy dials under your overlay identity, a
   non-loopback bind is refused unless you pass `--allow-non-loopback`, and the
   local credential can be disabled only with `--no-local-auth` (single-user
-  hosts only).
+  hosts only), and caps concurrent accepted connections (SOCKS + `CONNECT`
+  combined) via `--max-connections` to bound a local client opening connections
+  faster than they are served.
 
 Run it under the least privilege that works, and prefer the SOCKS front-end when
 a single application — rather than the whole machine — needs overlay access.

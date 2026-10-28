@@ -89,7 +89,7 @@ flags unique to each command:
 | [`forward`](#boatramp-forward) | Forward a local port to an in-cluster service over the overlay fabric (`overlay` feature). |
 | [`expose`](#boatramp-expose) | Publish a local service INTO the cluster over the overlay fabric — the reverse of `forward` (`overlay` feature). |
 | [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial/publish capability + ticket, pair devices, administer the flow policy (`overlay` feature). |
-| [`tunnel`](#boatramp-tunnel) | Run a local SOCKS5 (+ optional HTTP CONNECT) proxy daemon that reaches overlay services by name (`overlay` feature). |
+| [`tunnel`](#boatramp-tunnel) | Run a local proxy daemon that reaches overlay services by name — SOCKS5 (+ optional HTTP CONNECT), or a full TUN virtual interface with `--tun` (the extra `tun` feature) (`overlay` feature). |
 | [`connect`](#boatramp-connect) | One-shot dial of a single overlay service, splicing stdin/stdout (`overlay` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
@@ -809,7 +809,7 @@ it is on by default; `--tun` replaces it with the TUN virtual-interface front-en
 | `--socks [<addr>]` | Bind the SOCKS5 front-end to `<addr>` — default, and the value when passed bare, `127.0.0.1:1080`. Always on unless `--tun` is passed. |
 | `--http-connect [<addr>]` | Also bind a small HTTP `CONNECT` front-end to `<addr>` (for `HTTPS_PROXY`/`http.proxy`-style clients) — default when passed bare `127.0.0.1:1081`. Off unless passed. |
 | `--no-local-auth` | Disable the auto-generated local SOCKS/CONNECT credential (required by default) — a loopback port with no local auth lets ANY local user proxy under your overlay identity. Pass this only on a single-user host where that is an acceptable tradeoff. |
-| `--tun` | Start the TUN virtual-interface front-end instead of SOCKS. Linux only — needs this binary's `tun` cargo feature and `CAP_NET_ADMIN`/root to open the device. |
+| `--tun` | Start the TUN virtual-interface front-end instead of SOCKS (Linux, macOS, Windows). Needs this binary's `tun` cargo feature plus privilege to open the device: `CAP_NET_ADMIN`/root on Linux, root on macOS, Administrator (with the bundled `wintun.dll`) on Windows. |
 | `--cidr <cidr>` | The synthetic CIDR routed into the TUN device (default `100.64.0.0/10`). Only meaningful with `--tun`. |
 | `--dns-zone <tld>` | The embedded DNS zone's TLD (default `internal`). Only meaningful with `--tun`. |
 | `--cluster <name>` | The embedded DNS zone's `<cluster>` label (defaults to `[publish].project`, else `default`). Only meaningful with `--tun`. |
