@@ -8,6 +8,10 @@ mod http_connect;
 mod server;
 
 pub use auth::{LocalAuth, LocalAuthError};
+/// The SOCKS-codec fuzz entry point (plan §5/§6, R5) — exposed for the `fuzz_socks_codec`
+/// cargo-fuzz target, exactly as `tun::netstack::fuzz_one_frame` is exposed for its own target. Not
+/// part of the normal front-end API.
+pub use codec::fuzz_one_request;
 pub use server::{DEFAULT_MAX_CONNECTIONS, SocksError, SocksServer};
 
 #[cfg(test)]

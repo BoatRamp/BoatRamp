@@ -276,9 +276,54 @@ where
     Ok(())
 }
 
+/// Feed `data` as a SOCKS client's bytes through the greeting/auth ([`negotiate_auth`]) and request
+/// ([`read_request`]) parse paths the real accept loop runs — writing any replies to a sink — and
+/// assert they never panic: on arbitrary input the hand-rolled codec (plan §2/§5/§6, an
+/// attacker-adjacent parse surface) must always return `Ok` or a [`CodecError`], never crash or grow
+/// unbounded. Shared by the nightly `fuzz_socks_codec` cargo-fuzz target and the stable, always-run
+/// regression test below, so there is exactly ONE copy of the harness to reason about — mirroring
+/// [`crate::tun::netstack::fuzz_one_frame`]. Each flat corpus entry drives BOTH parsers from the
+/// start of `data` (they run back-to-back on one real connection, but fuzzing each independently
+/// gives libfuzzer a realistic shot at both decoders); the credentialed [`verify_userpass`] path
+/// needs a live sub-negotiation on the same stream and stays covered by the unit tests, not this
+/// flat harness.
+pub fn fuzz_one_request(data: &[u8]) {
+    thread_local! {
+        // One reused current-thread runtime per fuzzing thread: the parsers do no real I/O (every
+        // read resolves immediately against the in-memory `data`) and start no timers, so a bare
+        // current-thread runtime is enough, and reusing it keeps the per-iteration cost a per-call
+        // `Runtime::new` would otherwise dominate negligible.
+        static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread tokio runtime for the SOCKS fuzz harness");
+    }
+    RT.with(|rt| {
+        rt.block_on(async {
+            let mut greeting = tokio::io::join(data, tokio::io::sink());
+            let _ = negotiate_auth(&mut greeting, None).await;
+            let mut request = tokio::io::join(data, tokio::io::sink());
+            let _ = read_request(&mut request).await;
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stable (non-nightly, always-run-in-CI) regression net for [`fuzz_one_request`] — mirrors
+    /// `tun::netstack`'s `fuzz_one_frame_never_panics_on_a_handful_of_edge_cases`: a handful of
+    /// malformed/edge greetings + requests must each drive the parser to an `Ok`/`Err` without a
+    /// panic. The nightly `fuzz_socks_codec` target explores far beyond these.
+    #[test]
+    fn fuzz_one_request_never_panics_on_a_handful_of_edge_cases() {
+        fuzz_one_request(&[]);
+        fuzz_one_request(&[0x05]); // VER only — truncated greeting
+        fuzz_one_request(&[0x05, 0xff]); // claims 255 methods, none follow
+        fuzz_one_request(&[0x04, 0x01, 0x00]); // wrong SOCKS version byte
+        fuzz_one_request(&[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0xff]); // domainname len 255, truncated
+        fuzz_one_request(&[0xffu8; 64]); // all-ones garbage
+    }
 
     /// Build a connected in-memory duplex pair: `client` is what a real SOCKS client would hold
     /// (write requests into it, read replies from it); `server` is passed to the codec functions
