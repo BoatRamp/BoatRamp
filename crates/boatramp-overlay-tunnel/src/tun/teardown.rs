@@ -28,6 +28,13 @@ pub struct Marker {
     /// between "TUN opened" and "resolver applied" correctly records "nothing persistent to revert
     /// yet", so a crash in that narrow window costs nothing to clean up.
     pub resolver: Option<ResolverMethod>,
+    /// The zone suffix the resolver override was scoped to — needed to revert the macOS
+    /// [`ResolverMethod::EtcResolver`] backend (which names its `/etc/resolver/<zone>` file by the
+    /// zone) from a FRESH process. `#[serde(default)]` so a marker written by a pre-R3 binary (no
+    /// such field) still deserializes; `None`/`""` is harmless for the Linux methods, which revert
+    /// by interface name / the fixed `/etc/resolv.conf` path instead.
+    #[serde(default)]
+    pub resolver_zone: Option<String>,
 }
 
 impl Marker {
@@ -39,6 +46,7 @@ impl Marker {
             tun_name,
             cidr,
             resolver: None,
+            resolver_zone: None,
         }
     }
 
@@ -128,7 +136,11 @@ pub fn cleanup_stale(path: &Path) -> io::Result<CleanupReport> {
     }
 
     if let Some(method) = marker.resolver {
-        super::resolver::revert_by_method(method, &marker.tun_name);
+        super::resolver::revert_by_method(
+            method,
+            &marker.tun_name,
+            marker.resolver_zone.as_deref().unwrap_or_default(),
+        );
         report.reverted_resolver = true;
     }
     Marker::remove(path)?;

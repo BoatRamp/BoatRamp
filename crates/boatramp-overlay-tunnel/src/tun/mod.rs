@@ -1,5 +1,8 @@
-//! The full TUN virtual-interface front-end (plan §3), release R2 — Linux only; see the crate-level
-//! module doc for why this whole module is feature-gated and what R1 shipped instead. The
+//! The full TUN virtual-interface front-end (plan §3), release R2 (Linux) + R3 (macOS); see the
+//! crate-level module doc for why this whole module is feature-gated and what R1 shipped instead.
+//! The device/netstack/DNS/allocator are OS-agnostic; only `device`/`resolver`/`privilege` carry
+//! per-OS specifics, and R3 added the macOS variants there (utun via `tun-rs`, `/etc/resolver`
+//! split-DNS, root privilege drop) alongside Linux's. Windows (R4) is a later increment. The
 //! submodules below mirror the plan's own breakdown:
 //!
 //! - [`cidr`] — a tiny hand-rolled IPv4 CIDR type (plan §3.2).

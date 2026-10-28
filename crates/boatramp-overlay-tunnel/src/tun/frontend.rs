@@ -168,6 +168,9 @@ impl TunFrontend {
             let guard =
                 ResolverGuard::apply(&device.name, options.dns_bind, &options.zone_suffix())?;
             marker.resolver = Some(guard.method());
+            // The zone the override was scoped to — the macOS `/etc/resolver/<zone>` backend needs
+            // it to revert from a fresh process after a crash (plan §3.9); harmless for Linux.
+            marker.resolver_zone = Some(options.zone_suffix());
             marker
                 .write(&options.marker_path)
                 .map_err(|e| TunError::Marker(options.marker_path.clone(), e))?;

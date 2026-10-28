@@ -37,8 +37,9 @@ pub struct TunnelArgs {
     /// only on a single-user host where that is an acceptable tradeoff.
     #[arg(long)]
     pub no_local_auth: bool,
-    /// Start the TUN virtual-interface front-end instead of SOCKS (plan §3; Linux only — needs
-    /// the crate's `tun` cargo feature, and `CAP_NET_ADMIN`/root to open the device).
+    /// Start the TUN virtual-interface front-end instead of SOCKS (plan §3; Linux + macOS — needs
+    /// the crate's `tun` cargo feature, and `CAP_NET_ADMIN`/root on Linux or root on macOS to open
+    /// the device; Windows is a later increment).
     #[arg(long)]
     pub tun: bool,
     /// The synthetic CIDR routed into the TUN device (plan §3.2). Only meaningful with `--tun`.
@@ -119,8 +120,8 @@ pub enum TunnelCmdError {
     ControlPlane(String),
     /// `--tun` was requested but this binary wasn't built with the crate's `tun` cargo feature.
     #[error(
-        "--tun needs this binary built with the `tun` cargo feature (plan §3/§8's R2, Linux \
-         only) — rebuild with `--features tun` (on top of `overlay`), or use `boatramp tunnel \
+        "--tun needs this binary built with the `tun` cargo feature (plan §3/§8's R2 Linux + R3 \
+         macOS) — rebuild with `--features tun` (on top of `overlay`), or use `boatramp tunnel \
          --socks` instead."
     )]
     #[cfg(not(feature = "tun"))]

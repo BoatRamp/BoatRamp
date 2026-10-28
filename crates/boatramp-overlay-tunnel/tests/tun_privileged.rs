@@ -241,6 +241,78 @@ async fn split_dns_via_the_host_resolver_scopes_only_the_zone_and_a_lookup_drive
     let _ = std::fs::remove_file(&marker_path);
 }
 
+/// macOS (R3) real-device smoke: bind on a real `utun` WITH the host-resolver override (the
+/// production default `skip_resolver = false`), prove the macOS `/etc/resolver/<zone>` split-DNS
+/// file is written (scoped to exactly the zone, pointing at the loopback responder), that a real TCP
+/// connection routed by the kernel into the utun drives an overlay dial attempt, and that shutdown
+/// removes the resolver file again (its loopback-ownership guard permitting). The embedded-DNS
+/// resolve goes straight to the responder (`127.0.0.1:5353`), NOT through the system resolver, so the
+/// assertion never depends on mDNSResponder's `/etc/resolver` pickup timing — the file's
+/// presence/content is checked directly.
+///
+/// Needs root (open a utun + write `/etc/resolver`), so `#[ignore]`d — this is infrastructure for a
+/// future `tunnel.yml` macOS leg and the plan §6 MANUAL macOS smoke, NOT an automated e2e claim. Run
+/// it by hand on macOS: `sudo cargo test -p boatramp-overlay-tunnel --features tun --test
+/// tun_privileged -- --ignored --test-threads=1 macos_utun`.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "needs root to open a real utun + write /etc/resolver — run manually on macOS / a future tunnel.yml macOS leg (plan §6)"]
+async fn macos_utun_route_and_etc_resolver_split_dns_roundtrip() {
+    let cp = Arc::new(FixedControlPlane {
+        mint_calls: AtomicUsize::new(0),
+    });
+    let holder = OverlaySecret::generate().unwrap();
+    let tunnel = Tunnel::new(Arc::clone(&cp) as Arc<dyn ControlPlane>, holder)
+        .await
+        .unwrap();
+
+    let cidr: Ipv4Cidr = "10.123.99.0/24".parse().unwrap();
+    let marker_path = std::env::temp_dir().join(format!(
+        "br-tunnel-macos-test-{}.marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker_path);
+    // `skip_resolver` left at its production default (false) → `bind()` writes
+    // `/etc/resolver/svc.mactest.internal`.
+    let options = TunOptions::new(
+        cidr,
+        "internal".to_string(),
+        "mactest".to_string(),
+        marker_path.clone(),
+    );
+    let zone_file = std::path::PathBuf::from("/etc/resolver/svc.mactest.internal");
+    let _ = std::fs::remove_file(&zone_file);
+
+    let front_end = TunFrontend::bind(tunnel, options).await.expect(
+        "opening a utun + writing /etc/resolver needs root — see the #[ignore] reason above",
+    );
+
+    let body = std::fs::read_to_string(&zone_file)
+        .expect("bind() must have written /etc/resolver/svc.mactest.internal");
+    assert!(
+        body.contains("nameserver 127.0.0.1"),
+        "the /etc/resolver file must point the zone at the loopback responder: {body:?}"
+    );
+    assert!(
+        body.contains("port 5353"),
+        "the /etc/resolver file must carry the embedded responder's port: {body:?}"
+    );
+
+    let synthetic_ip = resolve_via_embedded_dns("db.svc.mactest.internal").await;
+    let mints = connect_and_wait_for_dial((synthetic_ip, 5432), &cp.mint_calls).await;
+    assert!(
+        mints > 0,
+        "a real TCP connection through the kernel utun device must drive an overlay dial attempt"
+    );
+
+    front_end.shutdown().await.unwrap();
+    assert!(
+        !zone_file.exists(),
+        "shutdown must remove the /etc/resolver split-DNS file it created"
+    );
+    let _ = std::fs::remove_file(&marker_path);
+}
+
 /// Query the HOST resolver (`resolvectl query <name>`) and return the first IPv4 it answers that
 /// falls inside `cidr`, or `None` if it answers nothing in range within a short retry budget. Runs
 /// the blocking `resolvectl` on a blocking thread (`spawn_blocking`) so the current-thread test

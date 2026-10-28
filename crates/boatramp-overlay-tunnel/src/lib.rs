@@ -17,7 +17,7 @@
 //! - [`socks`] — the SOCKS5 front-end (plan §2): a hand-rolled, loopback-bound SOCKS5 (+ optional
 //!   HTTP `CONNECT`) server that maps an in-band hostname to a service name and calls `open`.
 //!
-//! ## Shape (R2 — this release, Linux only; behind the `tun` cargo feature, default OFF)
+//! ## Shape (R2 Linux + R3 macOS; behind the `tun` cargo feature, default OFF)
 //!
 //! - [`tun`] — the full TUN virtual-interface front-end (plan §3): a synthetic-IP allocator, an
 //!   embedded non-recursive DNS zone, a `smoltcp`-based userspace TCP/IP stack bridging accepted
