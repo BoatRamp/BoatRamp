@@ -210,6 +210,8 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
                 dns_ttl: 60,
                 propagation_delay: Duration::from_secs(15),
                 timeout: Duration::from_secs(120),
+                // The `boatramp dns` CLI issues against the public CA (no test-CA knob here).
+                extra_root_ca: None,
             };
             obtain_or_load(&wildcard, &base, provider.as_ref(), &cache).await?;
             DnsOutput::CertReady {

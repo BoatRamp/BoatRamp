@@ -295,6 +295,7 @@ pub async fn obtain_or_load(
         dns_ttl: base.dns_ttl,
         propagation_delay: base.propagation_delay,
         timeout: base.timeout,
+        extra_root_ca: base.extra_root_ca.clone(),
     };
     let cert = boatramp_acme::acme::obtain_certificate(&request, provider).await?;
     // A genuine CA issuance/renewal (cache hits returned above) — count it for
