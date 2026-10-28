@@ -162,7 +162,7 @@ enum ProjectCommand {
         #[arg(
             long = "in",
             value_name = "FILE",
-            required_unless_present = "resumable"
+            required_unless_present_any = ["resumable", "clone_from"]
         )]
         input: Option<std::path::PathBuf>,
         /// RESUMABLE import: read a member-object directory of this NAME on the NODE (under
@@ -170,6 +170,26 @@ enum ProjectCommand {
         /// resumable export) instead of sending a file. Host-confined relative name.
         #[arg(long, value_name = "DIR_NAME", conflicts_with = "input")]
         resumable: Option<String>,
+        /// STREAMING CLONE: pull the project from a LIVE source node over the network instead
+        /// of a bundle file — the target fetches the source manifest, diffs its own store, and
+        /// restores only the missing members (no bundle lands anywhere). This is the source
+        /// node's base URL. `Project·Admin` on BOTH nodes (not node-global). Mutually exclusive
+        /// with `--in`/`--resumable`.
+        #[arg(long, value_name = "SOURCE_URL", conflicts_with_all = ["input", "resumable"])]
+        clone_from: Option<String>,
+        /// The SOURCE project to clone (only with `--clone-from`). Defaults to the target
+        /// project NAME — the common same-name env-clone.
+        #[arg(long, value_name = "PROJECT", requires = "clone_from")]
+        clone_source_project: Option<String>,
+        /// File holding the operator's SOURCE-node Project-Admin token for `--clone-from`
+        /// (falls back to BOATRAMP_CLONE_SOURCE_TOKEN). The token is sent in a header over TLS,
+        /// never on the command line.
+        #[arg(long, value_name = "FILE", requires = "clone_from")]
+        clone_source_token_file: Option<std::path::PathBuf>,
+        /// Pull a `--data-only` clone (app data only — no control-plane KV). Only with
+        /// `--clone-from`.
+        #[arg(long, requires = "clone_from")]
+        clone_data_only: bool,
         /// Execute the import (default: a dry-run plan — mutate nothing).
         #[arg(long)]
         apply: bool,
@@ -231,6 +251,34 @@ fn resolve_transport_key(file: Option<&std::path::Path>, prompt: &str) -> Result
         return Err(Error::Aborted("transport key must not be empty".into()));
     }
     Ok(pw.into_bytes())
+}
+
+/// Resolve the operator's SOURCE-node Project-Admin token for `--clone-from`:
+/// `--clone-source-token-file` (trailing newline trimmed) then `BOATRAMP_CLONE_SOURCE_TOKEN`.
+/// A bearer secret, so it is read from a file / env — never a command-line argument — and sent
+/// to the target node in a header over TLS, which forwards it to the source.
+fn resolve_source_token(file: Option<&std::path::Path>) -> Result<Vec<u8>> {
+    if let Some(p) = file {
+        let s = std::fs::read_to_string(p).map_err(Error::Io)?;
+        let tok = s.trim_end_matches(['\n', '\r']).as_bytes().to_vec();
+        if tok.is_empty() {
+            return Err(Error::Aborted(format!(
+                "clone source token file {} is empty",
+                p.display()
+            )));
+        }
+        return Ok(tok);
+    }
+    if let Ok(v) = std::env::var("BOATRAMP_CLONE_SOURCE_TOKEN")
+        && !v.is_empty()
+    {
+        return Ok(v.into_bytes());
+    }
+    Err(Error::Aborted(
+        "a clone needs the SOURCE node's Project-Admin token: pass --clone-source-token-file \
+         or set BOATRAMP_CLONE_SOURCE_TOKEN"
+            .into(),
+    ))
 }
 
 /// A one-line human summary of a teardown [plan](crate::client) for the operator, e.g.
@@ -817,7 +865,32 @@ pub async fn run(
             overwrite,
             identity,
             transport_key_file,
+            clone_from,
+            clone_source_project,
+            clone_source_token_file,
+            clone_data_only,
         } => {
+            // STREAMING CLONE from a live source node — a distinct mode (no bundle file).
+            if let Some(source_url) = clone_from {
+                let source_token = resolve_source_token(clone_source_token_file.as_deref())?;
+                let report = cp
+                    .project_clone_from(
+                        &name,
+                        &source_url,
+                        clone_source_project.as_deref(),
+                        &source_token,
+                        apply,
+                        overwrite,
+                        force,
+                        clone_data_only,
+                    )
+                    .await?;
+                return Ok(ProjectOutput::Imported {
+                    project: name,
+                    applied: apply,
+                    report,
+                });
+            }
             let transport_key = if identity == "adopt" {
                 Some(resolve_transport_key(
                     transport_key_file.as_deref(),
@@ -923,6 +996,89 @@ mod tests {
         }
         // `rm` requires a name.
         assert!(parse(&["project", "rm"]).is_err());
+    }
+
+    #[test]
+    fn clone_import_flags_parse_and_are_mutually_exclusive() {
+        // `--clone-from` is a third import mode: no `--in` / `--resumable` required.
+        match parse(&[
+            "project",
+            "import",
+            "acme",
+            "--clone-from",
+            "https://src.example.com",
+            "--apply",
+        ]) {
+            Ok(ProjectCommand::Import {
+                name,
+                clone_from,
+                clone_source_project,
+                input,
+                resumable,
+                apply,
+                ..
+            }) => {
+                assert_eq!(name, "acme");
+                assert_eq!(clone_from.as_deref(), Some("https://src.example.com"));
+                assert!(clone_source_project.is_none());
+                assert!(input.is_none() && resumable.is_none());
+                assert!(apply);
+            }
+            other => panic!("expected clone import, got {other:?}"),
+        }
+        // `--clone-source-project` + data-only knob ride along.
+        match parse(&[
+            "project",
+            "import",
+            "beta",
+            "--clone-from",
+            "https://src.example.com",
+            "--clone-source-project",
+            "acme",
+            "--clone-data-only",
+        ]) {
+            Ok(ProjectCommand::Import {
+                clone_source_project,
+                clone_data_only,
+                ..
+            }) => {
+                assert_eq!(clone_source_project.as_deref(), Some("acme"));
+                assert!(clone_data_only);
+            }
+            other => panic!("expected clone import with source project, got {other:?}"),
+        }
+        // `--clone-from` is mutually exclusive with `--in` and with `--resumable`.
+        assert!(
+            parse(&[
+                "project",
+                "import",
+                "acme",
+                "--clone-from",
+                "https://s",
+                "--in",
+                "/tmp/b.brproj"
+            ])
+            .is_err(),
+            "--clone-from must conflict with --in"
+        );
+        assert!(
+            parse(&[
+                "project",
+                "import",
+                "acme",
+                "--clone-from",
+                "https://s",
+                "--resumable",
+                "d"
+            ])
+            .is_err(),
+            "--clone-from must conflict with --resumable"
+        );
+        // Without any mode, `--in` is still required (the clone mode did not relax that).
+        assert!(
+            parse(&["project", "import", "acme"]).is_err(),
+            "import still needs one of --in / --resumable / --clone-from"
+        );
     }
 
     #[test]

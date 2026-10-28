@@ -975,6 +975,62 @@ impl ControlPlane {
         }
     }
 
+    /// STREAMING CLONE (`POST /api/projects/<target>/clone/from`, `Project·Admin` — NOT the
+    /// node-global `System·Admin` import): the TARGET node pulls the whole project from `source_url`
+    /// (manifest → per-SHA diff → filtered stream → inc2 restore), so no bundle lands anywhere. The
+    /// operator's SOURCE Project-Admin bearer travels in the `X-Boatramp-Source-Token` header (over
+    /// TLS, never a URL); the client's own bearer gates the TARGET side. Returns the import-report
+    /// JSON. Dry-run unless `apply`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn project_clone_from(
+        &self,
+        target: &str,
+        source_url: &str,
+        source_project: Option<&str>,
+        source_token: &[u8],
+        apply: bool,
+        overwrite: bool,
+        force: bool,
+        data_only: bool,
+    ) -> Result<String> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let token = std::str::from_utf8(source_token).map_err(|_| {
+            ClientError::Refused(
+                "the source token must be valid UTF-8 for the request header".into(),
+            )
+        })?;
+        let mut body = serde_json::json!({
+            "source_url": source_url,
+            "apply": apply,
+            "overwrite": overwrite,
+            "force": force,
+            "data_only": data_only,
+        });
+        if let Some(sp) = source_project {
+            body["source_project"] = serde_json::Value::String(sp.to_string());
+        }
+        let resp = client
+            .post(format!("{server}/api/projects/{target}/clone/from"))
+            .header("x-boatramp-source-token", token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(ClientError::Refused(format!(
+                "project clone refused ({status}): {}",
+                text.trim_end()
+            )))
+        }
+    }
+
     /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `System·Admin`):
     /// the node writes a member-object directory of `dir_name` (under its configured base,
     /// resuming an interrupted run) — nothing streams back, so no local file is written.
