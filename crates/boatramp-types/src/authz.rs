@@ -189,7 +189,25 @@ impl Right {
     /// This is the authoritative request→right table. Unknown
     /// `/api/sites/<s>/…` subpaths fall through to the most restrictive
     /// `system · admin` so a narrow token can never reach an unmapped action.
+    ///
+    /// The path alone carries the target for every PATH-scoped endpoint; the two
+    /// native project export/import endpoints are the exception — their target
+    /// project is the `?project=` QUERY param, so their right can only be scoped
+    /// through [`required_for`](Self::required_for). This path-only entry point
+    /// therefore returns a target-less `Project·Admin` for them (a scoped per-project
+    /// admin never satisfies a target-less requirement — fail-closed — so an in-handler
+    /// re-check MUST re-derive with the query; see the admin API).
     pub fn required(method: &str, path: &str) -> Option<Self> {
+        Self::required_for(method, path, None)
+    }
+
+    /// Like [`required`](Self::required) but also given the request's `query` string, so an
+    /// endpoint whose TARGET lives in a query param (the native `/api/project-export` /
+    /// `/api/project-import`, scoped by `?project=`) resolves to a per-project
+    /// `Project·Admin` on that exact target — binding the authorization to the specific
+    /// project a Project·Admin may export/import (a Project·Admin for X must never reach Y).
+    /// `query` is consulted ONLY for those two endpoints; every other mapping is path-only.
+    pub fn required_for(method: &str, path: &str, query: Option<&str>) -> Option<Self> {
         let m = method.to_ascii_uppercase();
         let get = m == "GET";
 
@@ -759,14 +777,21 @@ impl Right {
             "/api/kv-export" => Self::new(Resource::System, None, Action::Admin),
             "/api/kv-import" => Self::new(Resource::System, None, Action::Admin),
             // Native project export/import (env-clone, `POST /api/project-export` / `POST
-            // /api/project-import`): a node-GLOBAL op that moves a project's LIVE tenant data —
-            // managed-DB dumps, the control-plane KV slice, blobs — between environments. Gated
-            // `System·Admin` EXPLICITLY (never a per-project right): an export streams real data
-            // out and an import writes/overlays it. Same hyphenated-path collision-avoidance as the
-            // kv-* arms (the SINGULAR path never matches a `/api/<family>/*` project matcher), and
-            // re-checked defense-in-depth at each handler.
-            "/api/project-export" => Self::new(Resource::System, None, Action::Admin),
-            "/api/project-import" => Self::new(Resource::System, None, Action::Admin),
+            // /api/project-import`): moves ONE project's LIVE tenant data — managed-DB dumps, the
+            // control-plane KV slice, blobs — in/out. Gated **`Project·Admin` on the TARGET project**
+            // (the accepted-decision authz, PLAN-project-clone §5 — self-serve for a Project Admin,
+            // NO node-global `System·Admin`, uniform with the `clone` family). The target is the
+            // `?project=` query param, so the right is scoped THROUGH `query` here; a Project·Admin
+            // for project X thus can export/import ONLY X (a target-less fallback when the query is
+            // absent is satisfied by no scoped grant → fail-closed, and the handler 400s an empty
+            // project anyway). Re-checked defense-in-depth at each handler, bound to the same target.
+            // NB this is the PROJECT's own data only — the whole-control-plane `/api/kv-*` arms above
+            // (sealed secrets / RBAC / routing across every tenant) stay `System·Admin`.
+            "/api/project-export" | "/api/project-import" => Self::new(
+                Resource::Project,
+                project_from_query(query).map(str::to_string),
+                Action::Admin,
+            ),
             // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
             // read-fallback secondary is attached (the node is mid-migration). A READ-only node
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
@@ -863,6 +888,17 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
 /// `/`), or the whole string when it carries no `/` (a bare project target).
 pub fn project_of(target: &str) -> &str {
     target.split_once('/').map_or(target, |(p, _)| p)
+}
+
+/// Extract the `project=<value>` parameter from a raw request `query` string, for the
+/// query-scoped project export/import endpoints (see [`Right::required_for`]). Returns the
+/// FIRST `project=` value as a raw, un-decoded slice. A conforming project slug (the only kind
+/// the handler accepts) carries no `%`/`+` escapes, so no percent-decoding is needed; an
+/// escaped/garbled value is returned verbatim and simply fails to match any conforming grant
+/// ([`target_matches`] rejects a non-conforming granted target) — fail-closed, never a bypass.
+/// `None` when the query is absent or carries no `project=` key.
+pub fn project_from_query(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|kv| kv.strip_prefix("project="))
 }
 
 /// Split an `/api/projects/<proj>/<sub…>` request path into its tenant project
@@ -2867,6 +2903,95 @@ mod tests {
             !acme_admin.allows(&globex_stream),
             "an acme grant must not reach globex's clone surface",
         );
+    }
+
+    #[test]
+    fn project_from_query_extracts_the_target() {
+        assert_eq!(
+            project_from_query(Some("project=acme&data_only=true")),
+            Some("acme")
+        );
+        assert_eq!(
+            project_from_query(Some("data_only=true&project=acme")),
+            Some("acme")
+        );
+        assert_eq!(project_from_query(Some("project=acme")), Some("acme"));
+        assert_eq!(project_from_query(Some("data_only=true")), None);
+        assert_eq!(project_from_query(Some("")), None);
+        assert_eq!(project_from_query(None), None);
+    }
+
+    /// PLAN-project-clone §5 re-gate (owner-approved): the native project export/import endpoints
+    /// move ONE project's live data, so they are gated **`Project·Admin` on the TARGET project**
+    /// (the `?project=` query param) — NOT the old node-global `System·Admin`, uniform with the
+    /// clone family. A Project·Admin for X may export/import X but NEVER Y (the cross-tenant
+    /// data-move hole this binding closes). The whole-control-plane `/api/kv-*` endpoints stay
+    /// `System·Admin`. Mutation witness: the query-scoped export/import arm — revert it to
+    /// `System·Admin` and the per-project `allows`/refusal assertions below fail.
+    #[test]
+    fn project_export_import_is_project_admin_on_the_query_target_not_system() {
+        let policy = AuthzPolicy::default_policy();
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        let globex_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "globex")]);
+
+        for path in ["/api/project-export", "/api/project-import"] {
+            // The required right is Project·Admin scoped to the `?project=` target.
+            let req_acme =
+                Right::required_for("POST", path, Some("project=acme&data_only=true")).unwrap();
+            assert_eq!(
+                req_acme,
+                Right::new(Resource::Project, Some("acme".into()), Action::Admin),
+                "{path}?project=acme must require Project·Admin on acme",
+            );
+            assert_ne!(
+                req_acme,
+                Right::new(Resource::System, None, Action::Admin),
+                "{path} must NOT be node-global System·Admin",
+            );
+
+            // A Project·Admin on acme may export/import acme, but NOT globex.
+            assert!(
+                acme_admin.allows(&req_acme),
+                "acme admin exports/imports acme ({path})"
+            );
+            let req_globex = Right::required_for("POST", path, Some("project=globex")).unwrap();
+            assert!(
+                !acme_admin.allows(&req_globex),
+                "an acme Project·Admin must NOT export/import globex ({path}) — cross-tenant hole",
+            );
+            assert!(
+                globex_admin.allows(&req_globex),
+                "globex admin handles globex ({path})"
+            );
+
+            // Fail-closed when the target is absent (a malformed request with no ?project=):
+            // target-less Project·Admin, which NO scoped per-project grant satisfies.
+            let req_none = Right::required_for("POST", path, None).unwrap();
+            assert_eq!(
+                req_none.target, None,
+                "{path} with no query ⇒ target-less (fail-closed)"
+            );
+            assert!(
+                !acme_admin.allows(&req_none),
+                "a scoped project admin must NOT satisfy a target-less export/import ({path})",
+            );
+            // The path-only `required` wrapper agrees (it is `required_for(.., None)`).
+            assert_eq!(Right::required("POST", path), Some(req_none));
+        }
+
+        // REGRESSION GUARD: the whole-control-plane kv-export/kv-import stay System·Admin (NOT
+        // re-gated) — they carry every tenant's sealed secrets / RBAC / routing.
+        for path in ["/api/kv-export", "/api/kv-import"] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(Right::new(Resource::System, None, Action::Admin)),
+                "{path} must remain node-global System·Admin",
+            );
+            assert!(
+                !acme_admin.allows(&Right::required("POST", path).unwrap()),
+                "a project admin must NOT reach the whole-control-plane {path}",
+            );
+        }
     }
 
     /// #501 Stage B — the DECLARATIVE managed-database front door (`/api/databases/…`) mints

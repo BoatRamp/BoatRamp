@@ -390,11 +390,36 @@ impl Auth {
     /// [`Auth::is_disabled`] first (a disabled auth allows everything). `pop_proof`
     /// is the presented `Boatramp-PoP` header (if any); `body_hash` is the hex
     /// SHA-256 of the (buffered) request body for a write, or `None`.
+    ///
+    /// The path-only convenience over [`authorize_with_query`] (no query ⇒ the query-scoped
+    /// project export/import endpoints resolve to a target-less, fail-closed Project·Admin).
+    /// Production always goes through `authorize_with_query` (from `require_auth`), so this
+    /// path-only form is used only by the test suite — `#[cfg(test)]` to keep the non-test lib
+    /// free of dead code.
+    #[cfg(test)]
     async fn authorize(
         &self,
         bearer: &str,
         method: &str,
         path: &str,
+        pop_proof: Option<&str>,
+        body_hash: Option<String>,
+    ) -> Result<(PrincipalKind, VerifiedPrincipal), Reject> {
+        self.authorize_with_query(bearer, method, path, None, pop_proof, body_hash)
+            .await
+    }
+
+    /// Like [`authorize`](Self::authorize) but also given the request's raw `query` string, so a
+    /// query-scoped endpoint (the native project export/import, scoped by `?project=`) authorizes
+    /// against a per-project `Project·Admin` on that exact target. `query` feeds ONLY the
+    /// required-right derivation ([`Right::required_for`]); PoP binding stays on `path` (the query
+    /// is never part of the DPoP `htp`), so holder-bound proofs are unaffected.
+    async fn authorize_with_query(
+        &self,
+        bearer: &str,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
         pop_proof: Option<&str>,
         body_hash: Option<String>,
     ) -> Result<(PrincipalKind, VerifiedPrincipal), Reject> {
@@ -404,7 +429,7 @@ impl Auth {
             .expect("authorize called on disabled auth");
         // Endpoints not gated by a right (the OIDC→token exchange) authenticate
         // by other means; the router still requires *some* bearer to reach here.
-        let Some(required) = Right::required(method, path) else {
+        let Some(required) = Right::required_for(method, path, query) else {
             // Endpoints gated only by holding *some* bearer (the handler verifies it): no RBAC
             // principal is derived here, so carry an empty one — these paths never reach the
             // overlay mint gate (which reads the principal).
@@ -874,6 +899,10 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
         Some(original) => original.0.clone(),
         None => request.uri().path().to_owned(),
     };
+    // The raw query, for the query-scoped project export/import endpoints whose TARGET project is
+    // `?project=` (every other mapping is path-only). Captured BEFORE the body is buffered for PoP
+    // (which consumes the request). NOT part of the PoP `htp` binding — see `authorize_with_query`.
+    let query = request.uri().query().map(str::to_owned);
     let pop_proof = pop_header(&request);
 
     // On a write, bind the request body into the PoP proof: buffer it (up to a
@@ -892,7 +921,14 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
     };
 
     match auth
-        .authorize(&bearer, &method, &path, pop_proof.as_deref(), body_hash)
+        .authorize_with_query(
+            &bearer,
+            &method,
+            &path,
+            query.as_deref(),
+            pop_proof.as_deref(),
+            body_hash,
+        )
         .await
     {
         Ok((kind, principal)) => {
@@ -1330,6 +1366,66 @@ mod tests {
         // classified as Tenant. `BOATRAMP_SYSPRINCIPAL_MUTATION=deploy_class_any_is_system` classifies
         // every authorized deployer as System → the operator assertion goes RED before this line.
         println!("SYSTEM PRINCIPAL DEPLOY-CLASS OK");
+    }
+
+    /// PLAN-project-clone §5 re-gate (owner-approved), the END-TO-END wiring: `/api/project-export`
+    /// & `/api/project-import` are `Project·Admin` on the `?project=` TARGET, with the query reaching
+    /// authz ONLY through `authorize_with_query`. A Project·Admin on `acme` can export/import `acme`
+    /// but is REFUSED on `globex` (the cross-tenant data-move hole the scoping closes), and a
+    /// target-less (malformed) request is refused fail-closed. Proves the query→required_for→allows
+    /// path, not just the pure mapping.
+    #[tokio::test]
+    async fn project_export_import_authz_binds_to_the_query_target() {
+        let root = holder();
+        let auth = auth_with(&root, false);
+        let now = now_unix();
+        let acme_admin = cose::mint(
+            &Claims {
+                roles: vec![GrantedRole::scoped("project_admin", "acme")],
+                kind: "role".into(),
+                ttl_secs: Some(3600),
+                now_unix: now,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+
+        for path in ["/api/project-export", "/api/project-import"] {
+            assert!(
+                auth.authorize_with_query(
+                    &acme_admin,
+                    "POST",
+                    path,
+                    Some("project=acme&data_only=true"),
+                    None,
+                    None,
+                )
+                .await
+                .is_ok(),
+                "a Project·Admin on acme must be authorized to {path} acme",
+            );
+            assert!(
+                auth.authorize_with_query(
+                    &acme_admin,
+                    "POST",
+                    path,
+                    Some("project=globex"),
+                    None,
+                    None,
+                )
+                .await
+                .is_err(),
+                "a Project·Admin on acme must be REFUSED to {path} globex (cross-tenant)",
+            );
+            assert!(
+                auth.authorize_with_query(&acme_admin, "POST", path, None, None, None)
+                    .await
+                    .is_err(),
+                "a scoped project admin must be refused a target-less {path} (fail-closed)",
+            );
+        }
+        println!("PROJECT EXPORT/IMPORT TARGET-SCOPED AUTHZ OK");
     }
 
     #[tokio::test]

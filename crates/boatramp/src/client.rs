@@ -845,7 +845,7 @@ impl ControlPlane {
         }
     }
 
-    /// Export a project to a `BRPROJ` bundle (`POST /api/project-export`, `System·Admin`),
+    /// Export a project to a `BRPROJ` bundle (`POST /api/project-export`, `Project·Admin` on the target),
     /// STREAMING the response body to `out` (written to a `.part` sibling then renamed, so a
     /// partial download never masquerades as a complete bundle). `data_only` selects the
     /// app-data-only bundle vs full schema+data.
@@ -911,7 +911,7 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Import a `BRPROJ` bundle into a project (`POST /api/project-import`, `System·Admin`),
+    /// Import a `BRPROJ` bundle into a project (`POST /api/project-import`, `Project·Admin` on the target),
     /// STREAMING `bundle` as the request body. Returns the server's report text (JSON). A
     /// non-2xx — `409` schema-skew / KV-commingle refusal, `501` no driver — is surfaced
     /// verbatim as [`ClientError::Refused`].
@@ -1031,7 +1031,7 @@ impl ControlPlane {
         }
     }
 
-    /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `System·Admin`):
+    /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `Project·Admin` on the target):
     /// the node writes a member-object directory of `dir_name` (under its configured base,
     /// resuming an interrupted run) — nothing streams back, so no local file is written.
     ///
@@ -1092,7 +1092,7 @@ impl ControlPlane {
         }
     }
 
-    /// RESUMABLE import (`POST /api/project-import?resumable=<dir_name>`, `System·Admin`):
+    /// RESUMABLE import (`POST /api/project-import?resumable=<dir_name>`, `Project·Admin` on the target):
     /// the node reads a member-object directory of `dir_name` (under its configured base) —
     /// no request body. Returns the server's report text (JSON), like [`project_import`].
     #[allow(clippy::too_many_arguments)]

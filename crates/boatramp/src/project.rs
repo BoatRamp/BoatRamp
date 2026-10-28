@@ -114,7 +114,7 @@ enum ProjectCommand {
     #[command(name = "tenant-secrets")]
     TenantSecrets(crate::project_tenant_secrets::TenantSecretsArgs),
     /// Export a project's data (managed DB dumps + the control-plane KV slice + blobs)
-    /// to a portable BRPROJ bundle, streamed from the RUNNING node (`System·Admin`).
+    /// to a portable BRPROJ bundle, streamed from the RUNNING node (`Project·Admin` on the project).
     Export {
         /// The project to export.
         name: String,
@@ -152,7 +152,7 @@ enum ProjectCommand {
         #[arg(long, value_name = "FILE")]
         transport_key_file: Option<std::path::PathBuf>,
     },
-    /// Import a BRPROJ bundle into a project on the RUNNING node (`System·Admin`).
+    /// Import a BRPROJ bundle into a project on the RUNNING node (`Project·Admin` on the target).
     /// Dry-run (a plan, no mutation) unless `--apply`.
     Import {
         /// The project to import into.

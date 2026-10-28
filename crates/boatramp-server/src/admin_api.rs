@@ -2784,9 +2784,11 @@ pub(super) async fn compute_dev_bind_messaging(
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 
-/// Defense-in-depth (mirrors `control_api::assert_kv_dump_is_system_admin`): re-derive
-/// that `path` is gated `System·Admin` inside the handler, so a routing/table regression
-/// cannot silently downgrade a node-global, data-moving export/import to a project right.
+/// Defense-in-depth (mirrors `control_api::assert_kv_dump_is_system_admin`): re-derive that
+/// `path` is gated `System·Admin` inside the handler, so a routing/table regression cannot
+/// silently downgrade a node-global endpoint to a project right. Generic — reused by the
+/// node-global credential-minting dev-bind handlers (NOT the project export/import, which are now
+/// Project·Admin — see `assert_project_export_is_project_admin`).
 fn assert_project_export_is_system_admin(method: &str, path: &str, what: &str) -> Option<Response> {
     use boatramp_core::authz::{Action, Resource, Right};
     match Right::required(method, path) {
@@ -2801,6 +2803,35 @@ fn assert_project_export_is_system_admin(method: &str, path: &str, what: &str) -
             (
                 StatusCode::FORBIDDEN,
                 format!("{what} requires System·Admin\n"),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Defense-in-depth re-check (mirrors the `clone` family + `control_api::assert_kv_dump_is_system_admin`
+/// pattern): re-derive that `path` with its `?project=<target>` is gated **`Project·Admin` on that
+/// exact target project**, so a routing/table regression cannot silently downgrade the data-moving
+/// export/import below Project·Admin or to a WRONG/target-less scope (which would open a cross-tenant
+/// data-move hole). Binds to the SAME target the request names — the authoritative token check happens
+/// in `require_auth` via `authorize_with_query`; this guards the mapping, fail-closed.
+fn assert_project_export_is_project_admin(
+    method: &str,
+    path: &str,
+    target: &str,
+    what: &str,
+) -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    // Re-derive through the same query-scoped table entry the authorizer used, with a query that
+    // names this request's target project.
+    let query = format!("project={target}");
+    let expected = Right::new(Resource::Project, Some(target.to_string()), Action::Admin);
+    match Right::required_for(method, path, Some(&query)) {
+        Some(right) if right == expected => None,
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!("{what} requires Project·Admin on {target:?}\n"),
             )
                 .into_response(),
         ),
@@ -2910,7 +2941,8 @@ fn resumable_error_response(e: boatramp_core::project_export::ProjectExportError
     }
 }
 
-/// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`System·Admin`).
+/// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`Project·Admin` on the
+/// `?project=` target — re-checked defense-in-depth in-handler, mirroring the clone family).
 /// The driver writes the bundle straight into an in-memory pipe whose read half is the
 /// response body — the node never stages the whole bundle to a temp file (peak staging is
 /// bounded to the largest single member). `501` when no export driver is wired. Because bytes
@@ -2922,11 +2954,6 @@ pub(super) async fn project_export(
     headers: HeaderMap,
     Query(q): Query<ProjectExportQuery>,
 ) -> Response {
-    if let Some(forbidden) =
-        assert_project_export_is_system_admin("POST", "/api/project-export", "project export")
-    {
-        return forbidden;
-    }
     let Some(cap) = cap else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -2941,6 +2968,17 @@ pub(super) async fn project_export(
     // and `ProjectRef::qualified` — a `..`/`/` would traverse (mirrors every sibling).
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
+    }
+    // Defense-in-depth: re-derive that this request is gated Project·Admin on THIS target project
+    // (bound to `?project=`), so a table regression can't downgrade it below Project·Admin or to a
+    // wrong/target-less scope. The authoritative token check already ran in `require_auth`.
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        "POST",
+        "/api/project-export",
+        &q.project,
+        "project export",
+    ) {
+        return forbidden;
     }
     let transport_key = transport_key_from_headers(&headers);
     if q.include_identity && transport_key.is_none() {
@@ -3063,7 +3101,8 @@ fn default_identity() -> String {
     "fresh".to_string()
 }
 
-/// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body is
+/// Import a `BRPROJ` bundle (the request body) into a project (`Project·Admin` on the `?project=`
+/// target — re-checked defense-in-depth in-handler, mirroring the clone family). The body is
 /// STREAMED straight into the driver (never staged whole to a node temp file; peak staging is
 /// bounded to the largest single member) and restored in a single forward pass; dry-run unless
 /// `?apply=true`. Returns the import report JSON. `501` when no driver is wired, `409` on a
@@ -3088,11 +3127,6 @@ pub(super) async fn project_import(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Some(forbidden) =
-        assert_project_export_is_system_admin("POST", "/api/project-import", "project import")
-    {
-        return forbidden;
-    }
     let Some(cap) = cap else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -3106,6 +3140,17 @@ pub(super) async fn project_import(
     // Slug-validate before the name reaches any path / `ProjectRef::qualified`.
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
+    }
+    // Defense-in-depth: re-derive that this request is gated Project·Admin on THIS target project
+    // (the import TARGET, bound to `?project=`), so a table regression can't downgrade it below
+    // Project·Admin or to a wrong/target-less scope. The token check already ran in `require_auth`.
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        "POST",
+        "/api/project-import",
+        &q.project,
+        "project import",
+    ) {
+        return forbidden;
     }
     let identity = match q.identity.as_str() {
         "fresh" => boatramp_core::project_export::IdentityChoice::Fresh,

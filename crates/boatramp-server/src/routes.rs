@@ -465,8 +465,9 @@ pub fn router_with_fast(
             post(compute_dev_bind_messaging),
         )
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
-        // or import one in. System·Admin (the SINGULAR hyphen paths never match a
-        // `/api/<family>/*` project matcher) + re-checked defense-in-depth at the handler.
+        // or import one in. `Project·Admin` on the `?project=` target (scoped via the query in
+        // `Right::required_for`, uniform with the `clone` family — NOT node-global System·Admin)
+        // + re-checked defense-in-depth at the handler.
         .route("/api/project-export", post(project_export))
         .route("/api/project-import", post(project_import))
         // Streaming project CLONE (PLAN-project-clone, increment 1): the SOURCE manifest + filtered
