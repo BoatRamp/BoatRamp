@@ -4,8 +4,9 @@
 [default]
 # Opaque, copy-pasteable base64url join-ticket blobs (`brjoin1.<base64url>`) shown
 # in the cluster docs are not prose — their coincidental substrings (e.g. "Jod")
-# are not typos.
-extend-ignore-re = ["brjoin1\\.[A-Za-z0-9_-]+"]
+# are not typos. Likewise Hetzner Cloud datacenter location codes (`fsn1`, `nbg1`,
+# `hel1`) in the cluster-on-Hetzner runbook are identifiers (`hel1` ≈ "help"/"hell").
+extend-ignore-re = ["brjoin1\\.[A-Za-z0-9_-]+", "\\b(?:fsn1|nbg1|hel1)\\b"]
 
 [default.extend-words]
 # `mke2fs` is the e2fsprogs tool name; not a typo of "make".

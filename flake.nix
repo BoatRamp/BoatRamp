@@ -584,6 +584,10 @@
             tunnel-tun-test-bin = overlayTunnelTunTestBin;
             project-export-test-bin = projectExportTestBin;
 
+            # hetzner-k3s (ROADMAP #11 cluster bring-up): exposed so `nix build
+            # .#hetzner-k3s` builds the exact binary the devshell ships, per system.
+            hetzner-k3s = pkgs.callPackage ./nix/hetzner-k3s.nix { };
+
             # ---- Reproducible microVM kernel (`nix build .#vmlinux`) --------
             # The uncompressed `vmlinux` ELF the embedded VMM boots via
             # `linux-loader` (`Elf::load`). Built from **Firecracker's own microVM
@@ -769,6 +773,13 @@
               pkgs.gh
               # fly.io CLI: deploy the docs app + manage its secrets/certs.
               pkgs.flyctl
+              # Cluster bring-up (ROADMAP #11): the generic "bring up a boatramp cluster"
+              # tooling, owned by the platform so every boatramp app reuses it instead of
+              # re-adding it to its own devshell. `hetzner-k3s` provisions the k3s cluster on
+              # Hetzner Cloud; `kubectl` talks to it + installs the operator. Runbook:
+              # docs/src/how-to/cluster-on-hetzner.md.
+              pkgs.kubectl
+              (pkgs.callPackage ./nix/hetzner-k3s.nix { })
               pkgs.cargo-watch
               pkgs.cargo-nextest
               pkgs.cargo-deny

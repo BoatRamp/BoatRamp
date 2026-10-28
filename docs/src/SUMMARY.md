@@ -66,6 +66,7 @@
 - [Deploy a single node in production](./how-to/deploy-single-node.md)
 - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)
 - [Run on Kubernetes (the in-binary operator)](./how-to/kubernetes.md)
+- [Bring up a cluster on Hetzner](./how-to/cluster-on-hetzner.md)
 - [Migrate the root key](./how-to/migrate-root-key.md)
 - [Deploy on Cloudflare Containers](./how-to/deploy-cloudflare.md)
 - [Embed boatramp as a library](./how-to/embed.md)
