@@ -88,9 +88,9 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Best-effort liveness check: `kill(pid, None)` (a POSIX idiom — no signal is actually delivered,
-/// only existence/permission is checked), portable across Linux and macOS (unlike parsing a
-/// Linux-only `/proc/<pid>`, which this crate's dev platform doesn't even have). A SAFE `nix`
+/// Best-effort liveness check (unix): `kill(pid, None)` (a POSIX idiom — no signal is actually
+/// delivered, only existence/permission is checked), portable across Linux and macOS (unlike parsing
+/// a Linux-only `/proc/<pid>`, which this crate's dev platform doesn't even have). A SAFE `nix`
 /// wrapper — this crate is `#![forbid(unsafe_code)]`. `EPERM` (the process exists but belongs to
 /// another user) still counts as alive; any other error (most commonly `ESRCH`, no such process)
 /// counts as dead. **Documented limitation, not a hard safety mechanism**: PIDs are reused after a
@@ -99,6 +99,7 @@ fn now_unix() -> u64 {
 /// reverting this time", never a wrong revert, since [`cleanup_stale`] only ever acts on the
 /// `tun_name`/`resolver` method already recorded in the marker, never on anything read back out of
 /// the (possibly-unrelated) live process.
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
@@ -107,6 +108,27 @@ fn process_alive(pid: u32) -> bool {
         return false; // not a representable real PID at all
     };
     matches!(kill(Pid::from_raw(pid), None), Ok(()) | Err(Errno::EPERM))
+}
+
+/// Best-effort liveness check (Windows, R4): conservatively assume the recorded owner is STILL
+/// ALIVE. There is no safe, dependency-free way under `#![forbid(unsafe_code)]` to check whether an
+/// arbitrary PID is running on Windows — `OpenProcess`/`GetExitCodeProcess` are raw winapi (unsafe),
+/// and pulling a heavy process-enumeration crate just for a liveness probe is not worth it for Stage
+/// A. Returning `true` fails SAFE for the thing that actually matters: [`cleanup_stale`] then never
+/// reverts a previous run's NRPT rule / host state out from under a possibly-live owner — the
+/// opposite error (a wrong revert of a running tunnel's split-DNS) is the one that actually breaks
+/// name resolution for a live process.
+///
+/// **Consequence, stated plainly for the reviewer**: because this always reports "alive",
+/// [`cleanup_stale`] on Windows always takes its `owner_still_running` early-return and reverts
+/// NOTHING — at a fresh run's startup check AND via `boatramp tunnel --cleanup`, which share this
+/// one path. So Stage A has NO automatic crash-recovery of a leftover NRPT rule on Windows: a
+/// genuinely crashed run's rule is removed by hand (`Remove-DnsClientNrptRule`, see
+/// [`super::resolver`]). A real PID-liveness probe — which would let a dead owner be detected and so
+/// re-enable `--cleanup`'s auto-revert here — is deferred to the live wintun smoke-test stage.
+#[cfg(windows)]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 /// What [`cleanup_stale`] actually did — surfaced so [`super::frontend::TunFrontend::bind`] and
@@ -199,7 +221,11 @@ mod tests {
 
     /// The headline plan §3.9 scenario: a marker left by a PID that is (verifiably — a child
     /// process this test itself spawned and already reaped) no longer running must be reverted and
-    /// removed.
+    /// removed. Unix-only: it spawns the `true` binary and relies on `process_alive` returning
+    /// `false` for a dead PID — the Windows `process_alive` is a conservative always-`true` (no safe
+    /// PID probe under `forbid(unsafe_code)`), so there is no dead-PID branch to exercise there; the
+    /// Windows behavior is pinned by `windows_cleanup_stale_*` below instead.
+    #[cfg(unix)]
     #[test]
     fn cleanup_stale_reverts_and_removes_a_marker_from_a_dead_pid() {
         let path = temp_marker_path("cleanup-dead");
@@ -238,6 +264,41 @@ mod tests {
         assert!(
             Marker::read(&path).unwrap().is_some(),
             "a live owner's marker must survive"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Windows (R4): `process_alive` is a deliberate conservative always-`true` (module doc), so
+    /// even a marker from a PID that is NOT this process is treated as a live owner — which is the
+    /// whole point: on Windows `cleanup_stale` must NOT auto-revert a leftover NRPT rule out from
+    /// under a possibly-live owner. Here we use a PID guaranteed not to be this process (0) and
+    /// still expect `owner_still_running` + the marker left entirely untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_stale_treats_any_marker_as_a_live_owner_and_reverts_nothing() {
+        assert!(
+            super::process_alive(0),
+            "Windows liveness check is conservatively always-alive"
+        );
+
+        let path = temp_marker_path("cleanup-win");
+        let mut marker = Marker::new("tun-win0".to_string(), "100.64.0.0/10".to_string());
+        marker.pid = 0; // not this process; still assumed alive by the conservative check
+        marker.resolver = Some(ResolverMethod::Nrpt);
+        marker.resolver_zone = Some("svc.prod.internal.".to_string());
+        marker.write(&path).unwrap();
+
+        let report = cleanup_stale(&path).unwrap();
+        assert!(report.found_marker);
+        assert!(report.owner_still_running);
+        assert!(
+            !report.reverted_resolver,
+            "nothing may be reverted on Windows auto-cleanup"
+        );
+        assert!(
+            Marker::read(&path).unwrap().is_some(),
+            "the marker must survive — Windows never auto-reverts a possibly-live owner"
         );
 
         let _ = std::fs::remove_file(&path);

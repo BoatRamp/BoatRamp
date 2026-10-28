@@ -24,8 +24,24 @@ use super::teardown::{self, Marker};
 use crate::core::Tunnel;
 
 /// Default loopback address for the embedded DNS responder (plan §3.3).
+///
+/// The PORT is per-OS. On unix the host resolver override points the zone at an explicit
+/// `address:port` (`resolvectl dns <iface> 127.0.0.1:5353`, or `/etc/resolver/<zone>`'s `port`
+/// directive), so the unprivileged, collision-unlikely `5353` is used. Windows NRPT
+/// (`Add-DnsClientNrptRule -NameServers 127.0.0.1`) has NO port field — it always forwards to the
+/// nameserver on port 53 — so the Windows responder MUST bind `127.0.0.1:53` for NRPT to reach it.
+/// Binding the privileged `:53` is fine here because the Windows tunnel runs elevated for its whole
+/// lifetime anyway (see [`super::privilege`]).
+#[cfg(not(windows))]
 fn default_dns_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 5353))
+}
+
+/// See [`default_dns_bind`]'s non-Windows twin: Windows NRPT forwards only to port 53, so the
+/// embedded responder binds `127.0.0.1:53`.
+#[cfg(windows)]
+fn default_dns_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 53))
 }
 
 /// Default MTU: headroom under common outer-tunnel/overlay-transport MTUs rather than the plain
@@ -377,6 +393,7 @@ fn spawn_device_pumps(device: Arc<tun_rs::AsyncDevice>, mtu: usize) -> DevicePum
 /// Race `SIGINT`/`SIGTERM`/`SIGHUP` (plan §3.9) and return once any of them fires. `SIGTERM`/
 /// `SIGHUP` handler installation can only fail in exotic sandboxed environments; such a failure
 /// just means this process falls back to `SIGINT` alone rather than refusing to start.
+#[cfg(unix)]
 async fn wait_for_shutdown_signal() {
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
     let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
@@ -389,6 +406,26 @@ async fn wait_for_shutdown_signal() {
             }
         }
         _ => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Windows (R4): there is no `SIGTERM`/`SIGHUP`. The equivalent console control events are Ctrl-C
+/// and Ctrl-Break (`tokio::signal::windows`), the latter of which also fires for the console
+/// close / logoff / system-shutdown events, so racing the two covers the clean-teardown triggers
+/// plan §3.9 wants. Ctrl-Break handler installation can only fail in exotic environments; as on
+/// unix, such a failure just falls back to Ctrl-C alone rather than refusing to start.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::windows::ctrl_break() {
+        Ok(mut ctrl_break) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = ctrl_break.recv() => {}
+            }
+        }
+        Err(_) => {
             let _ = tokio::signal::ctrl_c().await;
         }
     }

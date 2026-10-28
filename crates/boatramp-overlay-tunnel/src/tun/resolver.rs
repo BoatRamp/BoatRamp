@@ -1,9 +1,16 @@
 //! Host DNS split-horizon integration (plan §3.6) — Linux (`resolvectl`, falling back to an
-//! `/etc/resolv.conf` stanza) and macOS (`/etc/resolver/<zone>`, R3): point ONLY the configured zone
-//! suffix at the embedded DNS responder (plan §3.3), never the whole system — so every other
-//! hostname on the box keeps resolving exactly as it did before this front-end ran. The per-OS
-//! mechanism is chosen in [`apply_override`] (the one `#[cfg(target_os)]` branch in this module);
-//! everything else is portable. Windows (NRPT) is a later increment (plan §8, R4).
+//! `/etc/resolv.conf` stanza), macOS (`/etc/resolver/<zone>`, R3), and Windows (NRPT, R4 Stage A):
+//! point ONLY the configured zone suffix at the embedded DNS responder (plan §3.3), never the whole
+//! system — so every other hostname on the box keeps resolving exactly as it did before this
+//! front-end ran. The per-OS mechanism is chosen in [`apply_override`] (the one `#[cfg(target_os)]`
+//! branch in this module); everything else is portable.
+//!
+//! The Windows backend ([`Method::Nrpt`]) installs a Name Resolution Policy Table rule scoping the
+//! zone namespace to the loopback responder via a PowerShell shell-out (`Add-DnsClientNrptRule`),
+//! mirroring the `resolvectl` shell-out rather than taking a raw-winapi dependency (this crate is
+//! `#![forbid(unsafe_code)]`). NRPT forwards to a nameserver on port 53 only (no port field), which
+//! is why the Windows embedded responder binds `127.0.0.1:53` — see
+//! [`super::frontend::default_dns_bind`].
 //!
 //! **This is the plan §3.9 robustness requirement that actually bites**: a kernel route vanishes
 //! the instant the TUN device's file descriptor closes (plan §3.9 — "routes bound to the TUN vanish
@@ -51,6 +58,17 @@ pub enum Method {
     /// deleting a file an operator later repurposed). The zone names the file, so the plan §3.9
     /// marker records it ([`super::teardown::Marker::resolver_zone`]) for a fresh-process revert.
     EtcResolver,
+    /// Windows (plan §8, R4 Stage A): a Name Resolution Policy Table (NRPT) rule that scopes the
+    /// zone namespace (`.svc.<cluster>.<tld>`, the leading dot covering the zone and all its
+    /// subdomains) to the loopback responder. The DNS Client service consults NRPT BEFORE the
+    /// normal per-adapter resolvers, so in-zone names go to the embedded responder on `127.0.0.1:53`
+    /// while every other name resolves exactly as before — genuinely scoped split-DNS, like
+    /// `resolvectl`/`/etc/resolver` and unlike the whole-host `/etc/resolv.conf` fallback. Applied
+    /// and reverted by a PowerShell shell-out (`Add-`/`Remove-DnsClientNrptRule`); the zone names the
+    /// rule, so the plan §3.9 marker records it ([`super::teardown::Marker::resolver_zone`]) for a
+    /// fresh-process revert. Needs elevation (the Windows tunnel runs as Administrator throughout —
+    /// see [`super::privilege`]).
+    Nrpt,
 }
 
 const STANZA_BEGIN: &str = "# BEGIN boatramp-tunnel (managed — do not edit by hand)";
@@ -389,6 +407,145 @@ fn file_points_at_loopback(contents: &str) -> bool {
     })
 }
 
+// --- Windows NRPT split-DNS (plan §8, R4 Stage A) -------------------------------------------------
+//
+// Windows has no per-link resolver override like `resolvectl` and no `/etc/resolver` directory; its
+// native scoped split-DNS mechanism is the Name Resolution Policy Table. A rule scopes a DNS
+// namespace to a specific nameserver, and the DNS Client service consults NRPT BEFORE the adapter
+// resolvers — so a rule for `.<zone>` sends in-zone names (the leading dot = "this domain and every
+// subdomain") to the embedded responder on loopback, leaving all other names untouched.
+//
+// Mechanism = a PowerShell shell-out (`Add-`/`Remove-DnsClientNrptRule`), mirroring the `resolvectl`
+// shell-out above rather than a raw-winapi dependency (`#![forbid(unsafe_code)]`, and there is no
+// safe pure-Rust NRPT crate). Reached ONLY via `apply_override`'s `#[cfg(windows)]` dispatch and the
+// matching `revert_by_method` arm. The exact cmdlet/pipeline behavior is validated in the deferred
+// live wintun smoke-test stage; Stage A proves it compiles and is injection-safe by construction.
+
+/// The NRPT namespace for a VALIDATED zone: a leading `.` + the dot-stripped zone, e.g.
+/// `svc.prod.internal.` → `.svc.prod.internal`. The leading dot is NRPT's own marker for "this
+/// domain and all subdomains". Validates via [`validated_resolver_zone`] (shared with the macOS
+/// backend, so the Windows apply AND revert sinks get the SAME strict DNS-label gate) BEFORE the
+/// value can reach PowerShell — see [`add_nrpt_rule`]'s security note for why that ordering is
+/// load-bearing.
+#[cfg(windows)]
+fn nrpt_namespace(zone_suffix: &str) -> io::Result<String> {
+    let name = validated_resolver_zone(zone_suffix)?;
+    Ok(format!(".{name}"))
+}
+
+/// Install an NRPT rule scoping `zone_suffix` (and its subdomains) to the embedded responder at
+/// `dns_addr` via `Add-DnsClientNrptRule`. `#[cfg(windows)]`: only the Windows apply path calls it.
+///
+/// **Security-critical — the Windows analog of the macOS HIGH-1 guard.** `zone_suffix` is
+/// operator/marker-derived (the marker lives in the invoking user's config dir, a lower-privileged
+/// context), and it ends up inside a PowerShell command run by an elevated process. Two independent
+/// defenses, both required:
+///   1. It is VALIDATED as a strict DNS name first ([`nrpt_namespace`] → [`validated_resolver_zone`]),
+///      which by construction admits only `[A-Za-z0-9.-]` — no spaces, quotes, semicolons, `$`,
+///      `` ` ``, parentheses, or any other PowerShell metacharacter. An invalid zone FAILS CLOSED
+///      (returns the error; the caller does not apply a rule for a name it could not validate).
+///   2. Every token is passed as a DISCRETE [`Command::arg`], never interpolated into one
+///      `-Command` string. NOTE the subtlety that makes (1) non-optional: `powershell -Command`
+///      re-joins the argv tokens AFTER `-Command` with spaces into a single script before executing
+///      it, so the namespace still lands in the script text as a bare token — it is ONLY safe
+///      because (1) guarantees that token contains nothing PowerShell would treat as syntax. The
+///      nameserver is `dns_addr.ip()`, a typed `IpAddr` whose `Display` is always a bare numeric
+///      literal, so it carries no injection surface either.
+#[cfg(windows)]
+fn add_nrpt_rule(zone_suffix: &str, dns_addr: SocketAddr) -> io::Result<()> {
+    let namespace = nrpt_namespace(zone_suffix)?;
+    // Discrete args — the fixed cmdlet/flag tokens, then the validated namespace and the typed IP as
+    // their own argv entries. (NRPT has no port field; it always forwards to the nameserver on port
+    // 53, which is why the Windows responder binds :53 — see frontend::default_dns_bind.)
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Add-DnsClientNrptRule",
+            "-Namespace",
+        ])
+        .arg(&namespace)
+        .arg("-NameServers")
+        .arg(dns_addr.ip().to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "`Add-DnsClientNrptRule -Namespace {namespace}` exited with status {status}"
+        )))
+    }
+}
+
+/// Remove the NRPT rule previously installed for `zone_suffix`, matched BY NAMESPACE. Called from
+/// [`revert_by_method`]'s [`Method::Nrpt`] arm (which is compiled on every target, so this function
+/// exists on every target too — see the `#[cfg(not(windows))]` twin below).
+///
+/// Same two-defense posture as [`add_nrpt_rule`]: the zone is VALIDATED first (an invalid zone — a
+/// tampered marker — warns and reverts NOTHING, never acts) and every token is a discrete
+/// [`Command::arg`]. Matching by namespace needs a `Get | Where-Object | Remove` pipeline (there is
+/// no `Remove-DnsClientNrptRule -Namespace`); the pipe tokens and the `Where-Object` comparison are
+/// FIXED args, and only the already-validated namespace is variable, so no injection surface is
+/// introduced. `-Force` skips the confirmation prompt (this daemon has no interactive console). A
+/// failure only warns — a half-reverted override is surfaced, never a panic.
+#[cfg(windows)]
+fn revert_nrpt_rule(zone_suffix: &str) {
+    let namespace = match nrpt_namespace(zone_suffix) {
+        Ok(ns) => ns,
+        Err(err) => {
+            tracing::warn!(
+                error = %err, %zone_suffix,
+                "boatramp tunnel: refusing to revert an NRPT rule for an invalid zone (a tampered \
+                 marker?) — nothing removed"
+            );
+            return;
+        }
+    };
+    // `Get-DnsClientNrptRule | Where-Object Namespace -eq <ns> | Remove-DnsClientNrptRule -Force`.
+    // The `Where-Object <Property> -eq <Value>` comparison-statement form (no `$_`, no script block)
+    // keeps the validated namespace a plain operand; the `|` and every cmdlet/flag are fixed tokens.
+    let result = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-DnsClientNrptRule",
+            "|",
+            "Where-Object",
+            "Namespace",
+            "-eq",
+        ])
+        .arg(&namespace)
+        .args(["|", "Remove-DnsClientNrptRule", "-Force"])
+        .status();
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(
+            %namespace, %status,
+            "boatramp tunnel: `Remove-DnsClientNrptRule` exited non-zero — the NRPT rule may still \
+             be in place; remove it by hand with `Get-DnsClientNrptRule | Where-Object Namespace \
+             -eq <ns> | Remove-DnsClientNrptRule -Force` if in-zone DNS looks wrong"
+        ),
+        Err(err) => tracing::warn!(
+            %namespace, error = %err,
+            "boatramp tunnel: failed to run `Remove-DnsClientNrptRule` — the NRPT rule may still be \
+             in place"
+        ),
+    }
+}
+
+/// Non-Windows twin of [`revert_nrpt_rule`]: a marker recording [`Method::Nrpt`] on a non-Windows
+/// host can only be one carried over from a Windows box (this platform never WRITES an NRPT marker),
+/// and there is no NRPT here to revert — so warn and do nothing rather than silently claim a revert.
+/// Exists so [`revert_by_method`]'s match stays exhaustive and compiles on every target.
+#[cfg(not(windows))]
+fn revert_nrpt_rule(zone_suffix: &str) {
+    tracing::warn!(
+        %zone_suffix,
+        "boatramp tunnel: the dirty-state marker records an NRPT (Windows) resolver override, but \
+         this is not Windows — there is no NRPT rule to revert here; nothing done"
+    );
+}
+
 /// A failure applying the host resolver override.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
@@ -396,8 +553,8 @@ pub enum ResolverError {
     Io(#[from] io::Error),
     #[error(
         "the TUN front-end's host-DNS split-horizon integration (plan §3.6) has no implementation \
-         for this operating system yet — Linux (resolvectl / /etc/resolv.conf) and macOS \
-         (/etc/resolver) are supported; Windows (NRPT) is a later increment (plan §8, R4)"
+         for this operating system yet — Linux (resolvectl / /etc/resolv.conf), macOS \
+         (/etc/resolver), and Windows (NRPT, R4) are supported"
     )]
     Unsupported,
 }
@@ -446,8 +603,8 @@ impl ResolverGuard {
 
 /// The per-OS "point the zone at the embedded responder" mechanism (plan §3.6). The `#[cfg]` here is
 /// the ONLY place this module branches on the target OS: Linux prefers `resolvectl` and falls back
-/// to the `/etc/resolv.conf` stanza; macOS writes `/etc/resolver/<zone>`; any other target has no
-/// implementation yet (Windows NRPT is plan §8 R4).
+/// to the `/etc/resolv.conf` stanza; macOS writes `/etc/resolver/<zone>`; Windows installs an NRPT
+/// rule (R4 Stage A); any other target has no implementation yet.
 #[cfg(target_os = "linux")]
 fn apply_override(
     tun_name: &str,
@@ -472,7 +629,17 @@ fn apply_override(
     Ok(Method::EtcResolver)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn apply_override(
+    _tun_name: &str,
+    dns_addr: SocketAddr,
+    zone_suffix: &str,
+) -> Result<Method, ResolverError> {
+    add_nrpt_rule(zone_suffix, dns_addr)?;
+    Ok(Method::Nrpt)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn apply_override(
     _tun_name: &str,
     _dns_addr: SocketAddr,
@@ -510,6 +677,10 @@ pub fn revert_by_method(method: Method, tun_name: &str, zone_suffix: &str) {
                 );
             }
         }
+        // Windows NRPT (R4). The zone comes from the marker's `resolver_zone`; `revert_nrpt_rule`
+        // validates it before building the PowerShell removal (and warns + does nothing on a bad
+        // zone). On a non-Windows host the `#[cfg(not(windows))]` twin warns and no-ops.
+        Method::Nrpt => revert_nrpt_rule(zone_suffix),
     }
 }
 
@@ -592,6 +763,9 @@ mod tests {
     /// Security review LOW, directly: a symlinked `/etc/resolv.conf` (the common case — systemd-
     /// resolved/NetworkManager/resolvconf all manage it that way) must have the REAL target file
     /// updated, with the symlink itself left completely alone (never replaced by a plain file).
+    /// Unix-only: it builds a real symlink via `std::os::unix::fs::symlink`; the resolv.conf backend
+    /// it exercises is a Linux/macOS path anyway, so there is nothing Windows-specific to cover here.
+    #[cfg(unix)]
     #[test]
     fn write_through_a_symlink_updates_the_target_and_preserves_the_symlink() {
         let dir = temp_dir("symlink");
@@ -687,6 +861,41 @@ mod tests {
             assert!(
                 etc_resolver_path(bad).is_err(),
                 "a zone that escapes /etc/resolver or is not a DNS name must be refused: {bad:?}"
+            );
+        }
+    }
+
+    /// Windows NRPT (R4): the namespace is the dot-stripped, VALIDATED zone with NRPT's leading-dot
+    /// marker, and the SAME strict DNS-label validation (shared with the macOS backend) rejects any
+    /// zone carrying PowerShell-injectable characters — the security property that lets the
+    /// discrete-arg `Add-/Remove-DnsClientNrptRule` shell-out be safe. `#[cfg(windows)]` because
+    /// `nrpt_namespace` is a Windows-only function; compile-checked under `cargo test` on Windows
+    /// (not the Stage-A build-only job, but a later live-smoke stage).
+    #[cfg(windows)]
+    #[test]
+    fn nrpt_namespace_is_leading_dot_and_rejects_injectable_zones() {
+        assert_eq!(
+            nrpt_namespace("svc.prod.internal.").unwrap(),
+            ".svc.prod.internal"
+        );
+        assert_eq!(
+            nrpt_namespace("svc.prod.internal").unwrap(),
+            ".svc.prod.internal"
+        );
+        for bad in [
+            "",
+            "..",
+            "svc;rm.internal",
+            "svc`whoami`.internal",
+            "svc$(id).internal",
+            "svc.x/../../pwned",
+            "bad underscore.internal",
+            "bad_underscore.internal",
+            "quote\".internal",
+        ] {
+            assert!(
+                nrpt_namespace(bad).is_err(),
+                "an injectable / non-DNS zone must be refused before it can reach PowerShell: {bad:?}"
             );
         }
     }

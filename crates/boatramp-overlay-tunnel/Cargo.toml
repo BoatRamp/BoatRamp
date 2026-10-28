@@ -25,12 +25,20 @@ tun = [
   "dep:smoltcp",
   "dep:hickory-proto",
   "dep:net-route",
+  # `nix` (the unix privilege-drop / `kill(pid, None)` liveness wrappers) is declared ONLY under
+  # `[target.'cfg(unix)'.dependencies]` below — it does not build on Windows (R4) and has no business
+  # in the Windows graph. A `dep:` reference to a target-gated optional dependency is honoured by
+  # Cargo on EVERY target: on a non-unix build it is simply inert (the dep isn't in that target's
+  # graph to activate), so the Windows `--features tun` build never tries to compile `nix`. The
+  # Windows-specific privilege/teardown code paths are plain `#[cfg(windows)]` std/shell-outs that
+  # need no crate here (see `privilege.rs` / `teardown.rs`).
   "dep:nix",
   "dep:serde",
   "dep:serde_json",
-  # Signal handling for the clean-teardown path (plan §3.9: SIGINT/SIGTERM/SIGHUP). `tokio` itself
-  # is a non-optional dependency of the lean build too, so this is a feature-on-a-feature
-  # reference (not `dep:tokio`) — the lean (no-`tun`) build's tokio feature set is untouched.
+  # Signal handling for the clean-teardown path (plan §3.9: SIGINT/SIGTERM/SIGHUP on unix;
+  # Ctrl-C/Ctrl-Break on Windows R4). `tokio` itself is a non-optional dependency of the lean build
+  # too, so this is a feature-on-a-feature reference (not `dep:tokio`) — the lean (no-`tun`) build's
+  # tokio feature set is untouched. `tokio/signal` exists on Windows as well as unix.
   "tokio/signal",
 ]
 
@@ -105,23 +113,35 @@ hickory-proto = { version = "0.26", optional = true, default-features = false, f
 # Route install (plan §3.2): one cross-platform crate for the CIDR→TUN route instead of shelling a
 # native tool. Non-decision per plan §9.
 net-route = { version = "0.4", optional = true }
-# Linux privilege drop (plan §3.7 — `geteuid`/`setgid`/`setuid` after TUN+route setup, when this
-# process is root via `sudo`): `nix`'s `user` feature is a SAFE wrapper over those syscalls, which
-# this crate needs because `#![forbid(unsafe_code)]` (lib.rs) rules out calling raw `libc` directly.
-# Already transitively in the tree (via `tun-rs`); named directly only because this crate's own
-# `privilege` module calls it.
-nix = { version = "0.31", optional = true, default-features = false, features = [
-  "user",
-  # `kill(pid, None)` — the portable (Linux + macOS, unlike parsing Linux-only `/proc`) existence
-  # check `teardown::process_alive` uses to decide whether a marker's recorded PID is still alive.
-  "signal",
-] }
 # The plan §3.9 dirty-state marker: a small JSON file listing every host mutation this run made, so
 # a NEXT launch (or `boatramp tunnel --cleanup`) can detect and revert a crashed run's leftovers.
 # Already a workspace dependency (used throughout `boatramp` itself); `optional = true` here purely
 # to keep it out of the lean (no-`tun`) graph.
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+
+# ---- `tun` feature, UNIX targets only (plan §3.7/§3.9) --------------------------------------------
+#
+# `nix` does not build on Windows (R4) — it is a thin SAFE wrapper over POSIX syscalls — so it is
+# declared under a unix-only target table rather than the portable `[dependencies]` above. It stays
+# `optional = true` and is still turned on by the `tun` feature (`dep:nix` in the feature table), so
+# the lean (no-`tun`) unix graph is byte-for-byte unchanged AND the Windows `--features tun` graph
+# never pulls it. On Windows the two call sites below have `#[cfg(windows)]` std/shell-out
+# equivalents that need no crate: `privilege::drop_to_unprivileged` is a documented no-op (there is
+# no unix setuid-drop to perform), and `teardown::process_alive` answers conservatively without a
+# PID-liveness syscall (see each module's doc).
+[target.'cfg(unix)'.dependencies]
+# Unix privilege drop (plan §3.7 — `geteuid`/`setgid`/`setuid` after TUN+route setup, when this
+# process is root via `sudo`): `nix`'s `user` feature is a SAFE wrapper over those syscalls, which
+# this crate needs because `#![forbid(unsafe_code)]` (lib.rs) rules out calling raw `libc` directly.
+# Already transitively in the tree (via `tun-rs`, itself unix-gated for `nix`); named directly only
+# because this crate's own `privilege`/`teardown` modules call it.
+nix = { version = "0.31", optional = true, default-features = false, features = [
+  "user",
+  # `kill(pid, None)` — the portable (Linux + macOS, unlike parsing Linux-only `/proc`) existence
+  # check `teardown::process_alive` uses to decide whether a marker's recorded PID is still alive.
+  "signal",
+] }
 
 [lints]
 workspace = true

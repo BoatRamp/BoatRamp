@@ -1,0 +1,84 @@
+# Overlay service tunneler — Windows TUN front-end BUILD (plan §8, release R4 Stage A). Proves the
+# `tun` feature COMPILES + links on a native `windows-latest` runner (target x86_64-pc-windows-msvc),
+# the only way to verify Windows here since there is no local Windows toolchain. This is BUILD-ONLY:
+# there is deliberately NO live wintun smoke test, NO wintun.dll packaging, and NO signed installer —
+# those are later R4 stages. The unprivileged unit/integration tests stay on Linux (tunnel.yml) and
+# the live/privileged coverage on the `tunnel-tun` nixosTest; this lane only proves the Windows cfg
+# story (device = tun-rs wintun/net-route IP-Helper; privilege = no-op; teardown = conservative
+# liveness; resolver = NRPT; frontend = Ctrl-C/Ctrl-Break + :53 DNS bind) holds.
+#
+# WHY A SEPARATE WORKFLOW (not a job in ci.yml): ci.yml is the Linux-only Tier-1 merge gate; per its
+# tiering doctrine non-Linux native builds live outside it (Tier 2/3). The Windows leg needs a
+# windows-latest runner, so — exactly like mobile.yml's macOS/Windows cargo-native legs — it is a
+# plain rustup cargo lane (dtolnay/rust-toolchain adds the stable toolchain; Swatinem/rust-cache
+# keyed per job), NOT the musl/nix/cargo-zigbuild flow.
+#
+# NON-BLOCKING TO START: this is the first Windows CI, so it is intentionally NOT wired into branch
+# protection as a required check — it runs and is visible, but a red leg does not block a merge while
+# the lane is driven to green. Promote it to a required check once it is reliably green.
+# `workflow_dispatch` lets a maintainer re-run on demand during that iteration.
+name: Tunnel TUN build (Windows, R4 Stage A)
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'crates/boatramp-overlay-tunnel/**'
+      - 'crates/boatramp/src/tunnel.rs'
+      - 'crates/boatramp/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/tunnel-windows.yml'
+  pull_request:
+    paths:
+      - 'crates/boatramp-overlay-tunnel/**'
+      - 'crates/boatramp/src/tunnel.rs'
+      - 'crates/boatramp/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/tunnel-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: tunnel-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match ci.yml / tunnel.yml: no incremental (fresh CI checkout) and no debug info (small target).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # The crate this change is actually about: its `tun` feature must COMPILE + link on Windows. This
+  # is the load-bearing leg — the cfg-gating (nix → unix-only; privilege/teardown/resolver/frontend
+  # Windows arms) all lives here. `@stable` matches rust-toolchain.toml's `channel = "stable"`.
+  overlay-tunnel-crate:
+    name: boatramp-overlay-tunnel --features tun (windows-msvc build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tunnel-windows-overlay-tunnel
+      - name: cargo build -p boatramp-overlay-tunnel --features tun
+        run: cargo build -p boatramp-overlay-tunnel --features tun --locked
+
+  # The full `boatramp` binary with the tunnel wired in (`--features tun,overlay`) — the shape an
+  # operator would actually ship on Windows. Separate job (not a second step) so its result is
+  # independent of the crate leg above: a failure in the much larger server dependency graph does
+  # not mask the primary crate's green, and vice-versa (mobile.yml's fail-fast:false philosophy).
+  boatramp-server:
+    name: boatramp --features tun,overlay (windows-msvc build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tunnel-windows-boatramp
+      - name: cargo build -p boatramp --features tun,overlay
+        run: cargo build -p boatramp --features tun,overlay --locked

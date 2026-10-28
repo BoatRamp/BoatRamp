@@ -29,10 +29,25 @@
 //! Uses `nix`'s SAFE wrappers over `geteuid`/`setgroups`/`setgid`/`setuid` — this crate is
 //! `#![forbid(unsafe_code)]` (`lib.rs`), so a raw `libc` call is not an option here.
 //!
+//! **Windows (R4)** has no unix setuid-drop and so no privilege to drop: the tunnel runs as
+//! Administrator for the device's whole lifetime (the wintun adapter and the NRPT split-DNS rule
+//! BOTH require elevation, and neither can be relinquished mid-run), so [`drop_to_unprivileged`] is
+//! a documented no-op returning `Ok(false)` there — see its `#[cfg(windows)]` arm. The residual
+//! (serving the untrusted netstack/DNS/SOCKS parse surface as Administrator) is the Windows analog
+//! of the Linux `CAP_NET_ADMIN` posture above, and is just as deliberately deferred to the real
+//! unprivileged Windows story (a WFP/service-split helper, like macOS's SysExt path), NOT solved by
+//! this module.
+//!
 //! **A drop failure is treated as FATAL by the caller** ([`super::frontend::TunFrontend::bind`]):
 //! this module only ever returns the error, never swallows it — failing a security control closed,
-//! not open, is the caller's job and is covered by that module's own tests.
+//! not open, is the caller's job and is covered by that module's own tests. On Windows the no-op
+//! `Ok(false)` makes that same call site a clean no-op (it was already `Ok(false)` for the
+//! non-sudo/`CAP_NET_ADMIN` unix cases).
 
+// The nix syscall wrappers are unix-only — `nix` is declared under `[target.'cfg(unix)'.dependencies]`
+// (see Cargo.toml) and does not exist in the Windows graph at all, so this import (and everything
+// that uses it below) is `#[cfg(unix)]`-gated to keep the module compiling on Windows (R4).
+#[cfg(unix)]
 use nix::unistd::{Gid, Uid, geteuid, setgid, setuid};
 // `nix::unistd::setgroups` isn't exposed on apple targets at all. The `tun` feature now targets
 // Linux + macOS (R3), so this is a real gap on macOS, not just a dev-machine-compile convenience:
@@ -41,13 +56,20 @@ use nix::unistd::{Gid, Uid, geteuid, setgid, setuid};
 #[cfg(target_os = "linux")]
 use nix::unistd::setgroups;
 
-/// A failure dropping privileges.
+/// A failure dropping privileges. Each variant wraps a `nix::Error` from the failing syscall, so
+/// the variants are `#[cfg(unix)]`-gated (there is no `nix` on Windows). On Windows the enum has no
+/// variants — it is uninhabited and never constructed (the Windows [`drop_to_unprivileged`] cannot
+/// fail) — but it still EXISTS so the shared [`super::frontend::TunError::Privilege`] seam and the
+/// `Result<bool, PrivilegeError>` return type keep one shape across platforms.
 #[derive(Debug, thiserror::Error)]
 pub enum PrivilegeError {
+    #[cfg(unix)]
     #[error("setgroups({0}): {1}")]
     SetGroups(u32, #[source] nix::Error),
+    #[cfg(unix)]
     #[error("setgid({0}): {1}")]
     SetGid(u32, #[source] nix::Error),
+    #[cfg(unix)]
     #[error("setuid({0}): {1}")]
     SetUid(u32, #[source] nix::Error),
 }
@@ -68,6 +90,7 @@ pub enum PrivilegeError {
 /// `setuid` themselves fail — which should not happen for a legitimate root process dropping to a
 /// valid uid/gid, but is surfaced (and, by the caller, treated as fatal) rather than ignored: a
 /// failed drop silently staying privileged would be the opposite of this function's whole point.
+#[cfg(unix)]
 pub fn drop_to_unprivileged() -> Result<bool, PrivilegeError> {
     drop_to_unprivileged_with(
         geteuid().is_root(),
@@ -77,6 +100,34 @@ pub fn drop_to_unprivileged() -> Result<bool, PrivilegeError> {
     )
 }
 
+/// Windows (R4): there is no unix setuid-drop, and nothing to drop TO. The tunnel runs as
+/// Administrator for the device's entire lifetime — opening the wintun adapter ([`super::device`])
+/// and installing the NRPT split-DNS rule ([`super::resolver`]) both require elevation, and Windows
+/// has no mechanism to relinquish only part of that elevation mid-process while keeping the device
+/// and rule live. So this is a deliberate no-op returning `Ok(false)` ("nothing was dropped"), the
+/// SAME value the unix path returns for its own no-drop cases (not root / no `sudo` target) — which
+/// keeps [`super::frontend::TunFrontend::bind`]'s fatal-on-`Err` drop step a clean no-op here.
+///
+/// The residual exposure — serving the untrusted netstack/DNS/SOCKS parse surface as Administrator —
+/// is documented honestly in the module doc as the Windows analog of the Linux `CAP_NET_ADMIN`
+/// posture, and is deferred to the real unprivileged Windows story (a WFP/service-split helper),
+/// not papered over here.
+///
+/// # Errors
+/// Never — the signature matches the unix arm only so both platforms share one
+/// `Result<bool, PrivilegeError>` seam; this arm cannot fail.
+#[cfg(windows)]
+pub fn drop_to_unprivileged() -> Result<bool, PrivilegeError> {
+    tracing::info!(
+        "boatramp tunnel: no privilege drop on Windows — the tunnel runs as Administrator for the \
+         adapter + NRPT rule's whole lifetime (there is no unix setuid-drop to perform); the \
+         untrusted netstack/DNS/SOCKS parse surface runs elevated, the Windows analog of the Linux \
+         CAP_NET_ADMIN posture (module doc)"
+    );
+    Ok(false)
+}
+
+#[cfg(unix)]
 fn sudo_env(name: &str) -> Option<u32> {
     std::env::var(name).ok()?.parse().ok()
 }
@@ -85,14 +136,17 @@ fn sudo_env(name: &str) -> Option<u32> {
 /// exact sequence/arguments/fatal-on-first-error behavior are unit-testable WITHOUT actually
 /// running as root (which doing so for real in a test would alter the whole test *process's*
 /// identity for every other test sharing that binary — not an option).
+#[cfg(unix)]
 trait Syscalls {
     fn setgroups(&self, groups: &[Gid]) -> nix::Result<()>;
     fn setgid(&self, gid: Gid) -> nix::Result<()>;
     fn setuid(&self, uid: Uid) -> nix::Result<()>;
 }
 
+#[cfg(unix)]
 struct RealSyscalls;
 
+#[cfg(unix)]
 impl Syscalls for RealSyscalls {
     #[cfg(target_os = "linux")]
     fn setgroups(&self, groups: &[Gid]) -> nix::Result<()> {
@@ -131,6 +185,7 @@ impl Syscalls for RealSyscalls {
 /// identity is" / the syscalls themselves all passed in — see the module-level test
 /// `the_sudo_drop_path_calls_setgroups_before_setgid_before_setuid` and
 /// `a_setgroups_failure_is_fatal_and_stops_before_setgid` for what this buys.
+#[cfg(unix)]
 fn drop_to_unprivileged_with(
     is_root: bool,
     sudo_uid: Option<u32>,
@@ -168,7 +223,10 @@ fn drop_to_unprivileged_with(
     Ok(true)
 }
 
-#[cfg(test)]
+// The whole suite exercises the unix drop logic (nix `Gid`/`Uid`, `geteuid`, the `Syscalls`
+// double) and so is `#[cfg(all(test, unix))]`-gated — none of it exists on Windows. The Windows
+// no-op has its own tiny suite below.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -284,5 +342,19 @@ mod tests {
         let syscalls = RecordingSyscalls::default();
         assert!(!drop_to_unprivileged_with(true, None, None, &syscalls).unwrap());
         assert!(syscalls.calls.into_inner().is_empty());
+    }
+}
+
+// Windows (R4): the only behavior to pin down is that the drop is a no-op reporting "nothing
+// dropped" (`Ok(false)`) and can never fail — the same contract the unix no-drop cases honour, so
+// the caller's fatal-on-`Err` drop step stays a clean no-op. Compile-checked under `cargo test` on
+// Windows (the Stage-A build-only CI job does not run tests, but a later live-smoke stage will).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn drop_is_an_infallible_no_op_on_windows() {
+        assert!(!drop_to_unprivileged().unwrap());
     }
 }
