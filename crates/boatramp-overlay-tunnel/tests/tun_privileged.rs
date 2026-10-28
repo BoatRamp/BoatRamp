@@ -313,6 +313,59 @@ async fn macos_utun_route_and_etc_resolver_split_dns_roundtrip() {
     let _ = std::fs::remove_file(&marker_path);
 }
 
+/// Windows (R4): open a REAL wintun adapter + install the in-CIDR route via IP-Helper, then prove a
+/// real TCP connection routed by the kernel into the adapter drives exactly one overlay dial attempt
+/// — the Windows analog of the Linux device test above. `skip_resolver = true`, so this touches NO
+/// host DNS (no NRPT rule): its one job is the live wintun device / route / netstack plumbing, which
+/// only a native Windows runner with a real `wintun.dll` + Administrator can exercise (the build-only
+/// `tunnel-windows.yml` lane proves the cfg story compiles; this closes the "does it actually run"
+/// gap). The NRPT split-DNS live path is a separate test, added once this device path is proven.
+///
+/// Run by the `tunnel-windows.yml` smoke job (elevated `windows-latest` with `wintun.dll` staged
+/// next to the test binary), never by the default `cargo test`. `#[ignore]` keeps it out of the
+/// unprivileged suite.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "needs Administrator + a real wintun.dll to open a wintun adapter — run by tunnel-windows.yml's smoke job"]
+async fn windows_wintun_device_route_drives_a_dial_attempt() {
+    let cp = Arc::new(FixedControlPlane {
+        mint_calls: AtomicUsize::new(0),
+    });
+    let holder = OverlaySecret::generate().unwrap();
+    let tunnel = Tunnel::new(Arc::clone(&cp) as Arc<dyn ControlPlane>, holder)
+        .await
+        .unwrap();
+
+    let cidr: Ipv4Cidr = "10.123.88.0/24".parse().unwrap();
+    let marker_path = std::env::temp_dir().join(format!(
+        "br-tunnel-windows-test-{}.marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker_path);
+    // Device/route/netstack only — leave host DNS (NRPT) untouched on the shared runner.
+    let mut options = TunOptions::new(
+        cidr,
+        "internal".to_string(),
+        "wintest".to_string(),
+        marker_path.clone(),
+    );
+    options.skip_resolver = true;
+
+    let front_end = TunFrontend::bind(tunnel, options).await.expect(
+        "opening a wintun adapter needs Administrator + wintun.dll — see the #[ignore] reason above",
+    );
+
+    let synthetic_ip = resolve_via_embedded_dns("db.svc.wintest.internal").await;
+    let mints = connect_and_wait_for_dial((synthetic_ip, 5432), &cp.mint_calls).await;
+    assert!(
+        mints > 0,
+        "a real TCP connection through the wintun adapter must drive an overlay dial attempt"
+    );
+
+    front_end.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(&marker_path);
+}
+
 /// Query the HOST resolver (`resolvectl query <name>`) and return the first IPv4 it answers that
 /// falls inside `cidr`, or `None` if it answers nothing in range within a short retry budget. Runs
 /// the blocking `resolvectl` on a blocking thread (`spawn_blocking`) so the current-thread test
@@ -384,7 +437,11 @@ async fn dump_net_state(label: &str) {
 async fn resolve_via_embedded_dns(name: &str) -> Ipv4Addr {
     use tokio::net::UdpSocket;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    socket.connect("127.0.0.1:5353").await.unwrap();
+    // The embedded responder's default bind differs by OS (`frontend::default_dns_bind`): Windows
+    // binds :53 because NRPT only ever forwards to port 53, every other target binds :5353. The
+    // tests use the default bind, so query whichever port this OS listens on.
+    let port = if cfg!(windows) { 53 } else { 5353 };
+    socket.connect(("127.0.0.1", port)).await.unwrap();
 
     let mut query = vec![
         0x12, 0x34, // id
