@@ -1348,10 +1348,11 @@ const DEFAULT_SESSION_CONN_CAP: usize = 16_384;
 /// expensive than a parked session connection, so it carries its OWN budget — separate from both the
 /// session-socket re-entry pool and the `DEFAULT_SESSION_CONN_CAP` connection backstop — and well
 /// below them, so a promote storm can never consume the whole session-connection budget. A promote
-/// at the ceiling is refused `capacity` (retryable), fail-closed. (A future config knob can make this
-/// operator-tunable; a fixed conservative default is the hardening here.)
-#[cfg(all(feature = "tcp-listener", feature = "session"))]
-const DEFAULT_PROMOTED_SPLICE_CAP: usize = 4_096;
+/// at the ceiling is refused `capacity` (retryable), fail-closed. Operator-tunable via
+/// `[serve.handlers].max_promoted_splices` ([`HandlerEngine::with_promoted_splice_cap`]); this is the
+/// default when unset. A per-listener sub-cap (the listener's own `max_promoted_splices`, enforced by
+/// the listener accept loop) further prevents one listener from monopolizing this global budget.
+pub const DEFAULT_PROMOTED_SPLICE_CAP: usize = 4_096;
 
 /// How many epoch ticks a conn-lane guest runs before the engine epoch forces its async fiber to
 /// YIELD (`epoch_deadline_async_yield_and_update`) — PLAN-handler-tcp-inbound HIGH-fix. At
@@ -2211,6 +2212,24 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_tcp_listener(mut self, allow: bool) -> Self {
         self.allow_tcp_listener = allow;
+        self
+    }
+
+    /// Override the NODE-GLOBAL promoted persistent-splice ceiling (mailroom cap-req #22):
+    /// `[serve.handlers].max_promoted_splices`. `None` keeps [`DEFAULT_PROMOTED_SPLICE_CAP`]. A value
+    /// is floored at 1. This bounds the AGGREGATE of live duplex splices across every session listener;
+    /// each listener additionally carries its own per-listener sub-cap (enforced in the accept loop) so
+    /// one listener can't consume the whole global budget. Always compiled (a no-op when the
+    /// `tcp-listener`+`session` features are off, so the operator config plumbing stays feature-agnostic).
+    #[must_use]
+    #[allow(unused_mut)] // `self` is mutated only when the splice features are compiled in.
+    pub fn with_promoted_splice_cap(mut self, cap: Option<usize>) -> Self {
+        #[cfg(all(feature = "tcp-listener", feature = "session"))]
+        if let Some(n) = cap {
+            self.promoted_splice_semaphore = std::sync::Arc::new(Semaphore::new(n.max(1)));
+        }
+        #[cfg(not(all(feature = "tcp-listener", feature = "session")))]
+        let _ = cap;
         self
     }
 

@@ -777,6 +777,7 @@ async fn bind_and_serve_session(
                 reentry_timeout,
                 max_dur,
                 boatramp_handlers::ConnectionSecurity::plaintext(),
+                std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
             )
             .await
     });
@@ -1069,13 +1070,16 @@ async fn live_runtime_egress(
     (runtime, deploy)
 }
 
-/// Drive ONE accepted session connection through `dispatch_session_connection` with a given
-/// `egress_allowlist` (the promote authorization). Returns the dispatch handle + the listener addr.
+/// Drive ONE accepted session connection through `dispatch_session_connection` with a given set of
+/// granted `imports` + `egress_allowlist` (the promote authorization — a `promote-connection` requires
+/// BOTH the `wasi:sockets` grant in `imports` AND the target in the allowlist, Security review
+/// MEDIUM-1). Returns the dispatch handle + the listener addr.
 #[cfg(all(feature = "session", feature = "tcp-egress"))]
 async fn bind_and_serve_session_egress(
     runtime: HandlerRuntime,
     deploy: DeployStore,
     max_dur: Duration,
+    imports: Vec<String>,
     egress_allowlist: Vec<String>,
 ) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1085,6 +1089,7 @@ async fn bind_and_serve_session_egress(
         let _ = stream.set_nodelay(true);
         let (read_half, write_half) = stream.into_split();
         let fn_config = FunctionConfig {
+            imports,
             egress_allowlist,
             ..FunctionConfig::default()
         };
@@ -1101,10 +1106,42 @@ async fn bind_and_serve_session_egress(
                 Duration::from_secs(5),
                 max_dur,
                 boatramp_handlers::ConnectionSecurity::plaintext(),
+                std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
             )
             .await
     });
     (handle, addr)
+}
+
+/// A one-shot REACHABLE upstream that records whether ANY byte ever reached it (Security review
+/// LOW-2): the fail-closed test points the bridge at THIS (reachable, non-allowlisted) upstream and
+/// asserts it receives ZERO bytes — so neutering the egress gate (which would then connect + deliver
+/// the preamble) turns the assertion RED. Returns the "got bytes" flag + its addr; the accept task is
+/// detached and holds the listener for a short grace window.
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+async fn spawn_byte_detector_upstream() -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::net::SocketAddr,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let got = std::sync::Arc::new(AtomicBool::new(false));
+    let got2 = std::sync::Arc::clone(&got);
+    tokio::spawn(async move {
+        // If the gate refuses, the host never connects here, so no accept fires within the grace.
+        if let Ok(Ok((mut s, _))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
+            let mut buf = [0u8; 64];
+            if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf)).await
+                && n > 0
+            {
+                got2.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    (got, addr)
 }
 
 /// A one-shot fake upstream: accept exactly one connection and hand its socket back over a channel,
@@ -1184,6 +1221,9 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             runtime.clone(),
             deploy,
             Duration::from_secs(30),
+            // Granted egress (`wasi:sockets`) + the upstream allowlisted — the strict parity #22
+            // requires (Security review MEDIUM-1): a bridge that legitimately dials upstreams.
+            vec!["wasi:sockets".into()],
             vec![format!("127.0.0.1:{}", up_addr.port())],
         )
         .await;
@@ -1280,6 +1320,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             runtime,
             deploy,
             Duration::from_secs(2), // short absolute cap
+            vec!["wasi:sockets".into()],
             vec![format!("127.0.0.1:{}", up_addr.port())],
         )
         .await;
@@ -1317,40 +1358,107 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         );
     }
 
-    // ---- 3. FAIL-CLOSED: promote to an UN-ALLOWLISTED upstream is refused ------------------------
+    // ---- 3. FAIL-CLOSED (true guard — Security review LOW-2 + MEDIUM-1) ---------------------------
+    // Each sub-case points the bridge at a REACHABLE byte-detector upstream and asserts it receives
+    // ZERO bytes: if the gate/grant check were neutered the host WOULD connect + deliver the preamble,
+    // flipping the detector → RED. (A merely-unreachable target would pass whether refused OR just
+    // unreachable, which is why the old `127.0.0.1:1` form could not guard the gate.)
+
+    // 3a — allowlist refusal WITH the egress grant present: `wasi:sockets` granted, but the (reachable)
+    // target is NOT in the allowlist ⇒ RefusedByGate ⇒ `not-authorized`, and NO bytes reach it.
     {
         let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 62, 4).await;
-        // Allowlist a DIFFERENT port than the guest will try to bridge to.
+        let (fb_got, fb_addr) = spawn_byte_detector_upstream().await;
         let (handle, addr) = bind_and_serve_session_egress(
             runtime,
             deploy,
             Duration::from_secs(30),
+            vec!["wasi:sockets".into()],
+            // Allowlist a DECOY port — NOT the reachable detector the client will try to bridge to.
             vec!["127.0.0.1:9".to_string()],
         )
         .await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         let _ = client.set_nodelay(true);
         let _ = read_line(&mut client).await;
-        // Bridge to a port NOT in the allowlist -> RefusedByGate -> not-authorized -> `REFUSED`. The
-        // gate refuses on the resolved addr BEFORE any connect, so no upstream need exist.
-        client.write_all(b"BRIDGE 127.0.0.1 1\n").await.unwrap();
+        client
+            .write_all(format!("BRIDGE 127.0.0.1 {}\n", fb_addr.port()).as_bytes())
+            .await
+            .unwrap();
         assert_eq!(
             &read_line(&mut client).await,
             b"REFUSED\r\n",
-            "promote to an un-allowlisted upstream is refused fail-closed (NO splice)"
+            "promote to a reachable-but-UN-ALLOWLISTED upstream is refused fail-closed (NO splice)"
         );
-        // The session keeps serving re-entries after a refused promote.
+        // Session keeps serving re-entries after a refused promote.
         client.write_all(b"hello\n").await.unwrap();
         assert_eq!(
             &read_line(&mut client).await,
             b"GOT:hello\n",
             "after a refused promote the session continues in the re-entry model"
         );
+        // Grace for a (hypothetically neutered) gate to connect + deliver the preamble, then prove it
+        // did NOT: the reused egress gate refused BEFORE any connect, so the upstream got nothing.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !fb_got.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused promote must send ZERO bytes to the un-allowlisted upstream (gate guard)"
+        );
         drop(client);
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed").await;
+        let (res, _) =
+            await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed-3a").await;
         assert!(
             res.is_ok(),
-            "the connection ends cleanly after a refused promote: {res:?}"
+            "clean end after a refused promote (3a): {res:?}"
+        );
+    }
+
+    // 3b — strict egress-GRANT parity (Security review MEDIUM-1): the target IS reachable AND in the
+    // allowlist, but the listener is NOT granted `wasi:sockets` ⇒ the promote dialer gets an EMPTY
+    // allowlist ⇒ RefusedByGate ⇒ `not-authorized`, and NO bytes reach the upstream. Proves promote
+    // requires the egress GRANT, not merely the `session` grant + a populated allowlist.
+    {
+        let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 64, 4).await;
+        let (fb_got, fb_addr) = spawn_byte_detector_upstream().await;
+        let (handle, addr) = bind_and_serve_session_egress(
+            runtime,
+            deploy,
+            Duration::from_secs(30),
+            // NO `wasi:sockets` grant …
+            Vec::new(),
+            // … even though the reachable upstream IS allowlisted.
+            vec![format!("127.0.0.1:{}", fb_addr.port())],
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        let _ = read_line(&mut client).await;
+        client
+            .write_all(format!("BRIDGE 127.0.0.1 {}\n", fb_addr.port()).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            &read_line(&mut client).await,
+            b"REFUSED\r\n",
+            "promote WITHOUT the `wasi:sockets` grant is refused even to an allowlisted upstream"
+        );
+        client.write_all(b"hello\n").await.unwrap();
+        assert_eq!(
+            &read_line(&mut client).await,
+            b"GOT:hello\n",
+            "session continues after a grant-refused promote"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !fb_got.load(std::sync::atomic::Ordering::SeqCst),
+            "a promote lacking the egress grant must send ZERO bytes to the upstream (grant guard)"
+        );
+        drop(client);
+        let (res, _) =
+            await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed-3b").await;
+        assert!(
+            res.is_ok(),
+            "clean end after a grant-refused promote (3b): {res:?}"
         );
     }
 
@@ -1379,6 +1487,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
                     let allow = allow.clone();
                     tokio::spawn(async move {
                         let fc = FunctionConfig {
+                            imports: vec!["wasi:sockets".into()],
                             egress_allowlist: allow,
                             ..FunctionConfig::default()
                         };
@@ -1395,6 +1504,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
                                 Duration::from_secs(5),
                                 Duration::from_secs(30),
                                 boatramp_handlers::ConnectionSecurity::plaintext(),
+                                std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
                             )
                             .await;
                     });
@@ -1439,7 +1549,9 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         "SESSION PROMOTE LIVE OK: promote-connection escalated a session connection to a persistent \
          duplex splice (preamble written to the gate-authorized upstream, bidirectional relay across \
          20 exchanges with ZERO further re-entry), tore down on client close + on max_conn_duration, \
-         REFUSED an un-allowlisted upstream fail-closed (reused egress gate), and the live splice held \
-         no re-entry permit (lane isolation with a pool of 1)."
+         and FAIL-CLOSED as a TRUE guard — a refused promote (un-allowlisted upstream, AND a listener \
+         lacking the `wasi:sockets` grant) delivered ZERO bytes to a REACHABLE upstream (reused egress \
+         gate + strict grant parity), while the live splice held no re-entry permit (lane isolation, \
+         pool of 1)."
     );
 }

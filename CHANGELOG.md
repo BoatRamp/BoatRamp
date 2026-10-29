@@ -20,13 +20,20 @@ versions.
   the `is_global_ip` SSRF floor + the DNS-rebinding choke), optionally terminating TLS
   (`implicit-tls`), writes the guest's `preamble` (e.g. a replayed, client-tagged `LOGIN`), then
   splices both ways — waking on **both** directions, with the upstream socket **persisting** across
-  what were per-frame hibernation points. Promotion is **fail-closed and widens nothing**: an
-  upstream the guest could not already `tcp-egress`-dial is refused `not-authorized` and the session
-  continues in the re-entry model. The persistent splice runs on its **own** node-global budget —
-  never the session re-entry pool or the shared async request lane (the v0.36.0 lane-isolation
-  lesson) — and is torn down deterministically on either side closing, on `max_conn_duration_ms`, or
-  on node shutdown. Guest-facing WIT addition (`session.promote-connection`, off-by-default
-  feature-gated in `boatramp-uchron-compat`); `HOST_HANDLERS_VERSION` → `0.11.0`.
+  what were per-frame hibernation points. Promotion is **fail-closed and widens nothing**: it
+  requires the **same deploy-time grant a raw `tcp-egress` dial requires** — the listener must be
+  granted `wasi:sockets` (declared in `imports`) **and** list the upstream in `egress_allowlist`,
+  with the posture on and the SSRF floor applied — so a promote lacking the egress grant, or to an
+  un-allowlisted/private upstream, is refused `not-authorized` **before any connect** (no bytes reach
+  the upstream) and the session continues in the re-entry model. The persistent splice runs on its
+  **own** budget — a node-global ceiling (`[serve.handlers].max_promoted_splices`, default 4096) plus
+  a per-listener sub-cap (`[serve.listeners.<name>].max_promoted_splices`, default 256, so one
+  listener can't monopolize the node budget on a multi-tenant node), never the session re-entry pool
+  or the shared async request lane (the v0.36.0 lane-isolation lesson) — and is torn down
+  deterministically on either side closing, on an idle timeout (a **monotonic** watchdog, immune to a
+  wall-clock step), on `max_conn_duration_ms` (which also bounds the preamble write), or on node
+  shutdown. Guest-facing WIT addition (`session.promote-connection`, off-by-default feature-gated in
+  `boatramp-uchron-compat`); `HOST_HANDLERS_VERSION` → `0.11.0`.
 
 ## [0.43.0] - 2026-10-22
 

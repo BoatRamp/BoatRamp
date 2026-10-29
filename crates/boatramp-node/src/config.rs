@@ -628,6 +628,12 @@ impl ServerConfig {
                     " — omit it for the default",
                 );
             }
+            if l.max_promoted_splices == Some(0) {
+                return err(
+                    "`max_promoted_splices` must be > 0",
+                    " — omit it for the default, or raise the node-global `[serve.handlers].max_promoted_splices`",
+                );
+            }
             // IPv6 rate-limit bucket prefix must be a real prefix length (senior-architect review).
             if let Some(p) = l.conn_rate_ipv6_prefix
                 && !(1..=128).contains(&p)
@@ -1615,6 +1621,17 @@ pub struct HandlersConfig {
     /// `allow_guest_tcp_egress` is on and the component imports `dns-resolve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_resolve_budget: Option<u32>,
+    /// NODE-GLOBAL ceiling on concurrently-live PROMOTED persistent-splice connections (mailroom
+    /// cap-req #22 — the session→connection escalation / imap-proxy bridge). A promoted connection
+    /// leaves the hibernating re-entry model for a long-held duplex splice (two live sockets + two
+    /// copy tasks), materially more expensive than a parked session, so it carries its OWN node-global
+    /// budget — separate from the session re-entry pool and the shared async lane. A promote past this
+    /// ceiling is refused `capacity` (retryable), fail-closed. Absent ⇒
+    /// [`boatramp_handlers::DEFAULT_PROMOTED_SPLICE_CAP`] (4096). See also each listener's own
+    /// [`ListenerConfig::max_promoted_splices`] per-listener sub-cap (so one listener can't monopolize
+    /// this global budget on a multi-tenant node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_promoted_splices: Option<usize>,
     /// **JWKS freshness — `own` (first-party) tier: background-refresh age** (seconds). The soft age at
     /// which a node-fixed `token_claims.jwks_url`/`jwks_env` verifier is refreshed in the BACKGROUND
     /// (the current keys keep serving — no request blocks on the fetch). Absent ⇒ 120 s. Floored at 60 s.
@@ -2518,6 +2535,16 @@ pub struct ListenerConfig {
     /// Absolute cap (milliseconds) on a single connection's lifetime regardless of activity. `0` is
     /// refused; absent ⇒ [`DEFAULT_LISTENER_MAX_CONN_DURATION_MS`].
     pub max_conn_duration_ms: Option<u64>,
+    /// PER-LISTENER sub-cap on concurrently-live PROMOTED persistent splices (mailroom cap-req #22 —
+    /// the session→connection escalation / imap-proxy bridge) for THIS listener, atop the node-global
+    /// `[serve.handlers].max_promoted_splices` ceiling. A fairness bound: on a multi-tenant node it
+    /// stops one listener from exhausting the whole node-global splice budget and forcing `capacity`
+    /// refusals on every other listener. A `promote-connection` past EITHER cap is refused `capacity`
+    /// (retryable), fail-closed. Only meaningful for a `mode = "session"` listener whose guest is
+    /// granted egress (`wasi:sockets` in `imports` + a non-empty `egress_allowlist`). `0` is refused;
+    /// absent ⇒ [`DEFAULT_LISTENER_MAX_PROMOTED_SPLICES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_promoted_splices: Option<usize>,
     /// Per-source-IP connection-rate limit (cap-req 18): the sustained rate (connections/sec) one
     /// peer IP may open on THIS listener, atop a `conn_burst_per_ip` immediate allowance. A FaaS
     /// listener guest can't see the peer IP, so the HOST enforces this at the accept loop to keep
@@ -2663,6 +2690,13 @@ pub struct ListenerStarttlsConfig {
 /// Default per-listener live-connection cap when `[serve.listeners.<name>] max_conns` is unset
 /// (PLAN-handler-tcp-inbound). 256 — a generous but bounded ceiling on top of the engine conn lane.
 pub const DEFAULT_LISTENER_MAX_CONNS: usize = 256;
+
+/// Default PER-LISTENER promoted persistent-splice sub-cap when `max_promoted_splices` is unset
+/// (mailroom cap-req #22). 256 — a small fraction of the node-global
+/// [`boatramp_handlers::DEFAULT_PROMOTED_SPLICE_CAP`] (4096), so one listener defaults to at most
+/// ~1/16 of the global budget and a single tenant can't starve the others; an operator who runs a
+/// splice-heavy listener (a dedicated imap-proxy node) raises it explicitly.
+pub const DEFAULT_LISTENER_MAX_PROMOTED_SPLICES: usize = 256;
 
 /// Default per-listener idle timeout (ms) when `idle_timeout_ms` is unset — 60s. A connection with no
 /// bytes in either direction for this long is torn down (so a connection that opens and sends nothing

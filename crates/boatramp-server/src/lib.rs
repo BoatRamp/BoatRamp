@@ -1225,6 +1225,10 @@ impl HandlerRuntime {
         // Live wire-security of this connection (mailroom cap-req #16); the SAME handle is passed on
         // every re-entry so a guest observes a STARTTLS upgrade the moment the pump flips it.
         conn_security: boatramp_handlers::ConnectionSecurity,
+        // PER-LISTENER promoted-splice sub-cap (cap-req #22, Security review MEDIUM-2): shared across
+        // this listener's connections; a `promote-connection` acquires BOTH this and the node-global
+        // ceiling, so one listener can't monopolize the global splice budget.
+        listener_splice_gate: std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<(), String>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -1303,17 +1307,31 @@ impl HandlerRuntime {
         // cap-req 22 (session→connection escalation): build the promote-connection context ONCE for
         // this connection — the gate-reusing egress dialer scoped to THIS listener's `egress_allowlist`
         // (so a `promote-connection` dial is authorized by the EXACT same posture + allowlist + SSRF
-        // floor as a `tcp-egress` dial — not a new bypass) plus the node-global persistent-splice
-        // ceiling. Cloned into each re-entry's controller. (`None`-equivalent when the `tcp-egress`
-        // feature is off: the controller's `promote` then fail-closes `not-authorized`.)
+        // floor as a `tcp-egress` dial — not a new bypass) plus the node-global AND per-listener
+        // persistent-splice ceilings. Cloned into each re-entry's controller. (`None`-equivalent when
+        // the `tcp-egress` feature is off: the controller's `promote` then fail-closes `not-authorized`.)
+        //
+        // STRICT EGRESS-GRANT PARITY (Security review MEDIUM-1): driving a host-dialed egress leg must
+        // require the SAME deploy-time grant a raw `tcp-egress` dial requires — the component being
+        // GRANTED `wasi:sockets` (declared in `imports`) — not merely the `session` grant + a populated
+        // allowlist. So the dialer's allowlist is the listener's `egress_allowlist` ONLY when
+        // `wasi:sockets` is granted; otherwise it is EMPTY, which makes the reused gate refuse every
+        // dial `refused-by-gate` → `not-authorized`. This mirrors `function_runtime`'s
+        // `granted("wasi:sockets") && !egress_allowlist.is_empty()` guard exactly (a session listener
+        // that legitimately bridges upstreams simply declares the `wasi:sockets` token, as the egress
+        // config already documents). The posture + SSRF floor still apply inside the gate on top.
+        #[cfg(feature = "tcp-egress")]
+        let promote_allowlist: std::sync::Arc<[String]> =
+            if fn_config.imports.iter().any(|i| i == "wasi:sockets") {
+                std::sync::Arc::from(fn_config.egress_allowlist.clone())
+            } else {
+                std::sync::Arc::from(Vec::new())
+            };
         #[cfg(feature = "tcp-egress")]
         let promote_ctx = crate::session_driver::PromoteCtx {
-            dialer: std::sync::Arc::new(
-                inner
-                    .engine
-                    .egress_dialer(std::sync::Arc::from(fn_config.egress_allowlist.clone())),
-            ),
+            dialer: std::sync::Arc::new(inner.engine.egress_dialer(promote_allowlist)),
             splice_gate: inner.engine.promoted_splice_gate(),
+            listener_splice_gate: std::sync::Arc::clone(&listener_splice_gate),
             max_preamble_bytes: crate::session_driver::MAX_PROMOTE_PREAMBLE_BYTES,
         };
 

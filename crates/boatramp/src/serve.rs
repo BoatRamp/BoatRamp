@@ -3462,6 +3462,11 @@ fn spawn_listeners(
                 l.max_conn_duration_ms
                     .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONN_DURATION_MS),
             ),
+            // Per-listener promoted-splice sub-cap (cap-req #22, Security review MEDIUM-2); absent ⇒
+            // the default fraction of the node-global ceiling.
+            max_promoted_splices: l
+                .max_promoted_splices
+                .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_PROMOTED_SPLICES),
             tls: tls_config,
             starttls: starttls_grammar,
             // Session mode (cap-req 08): drive this listener's connections through the re-entrant

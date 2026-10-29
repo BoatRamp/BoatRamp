@@ -104,8 +104,8 @@ pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
 pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
-    DEFAULT_DNS_RESOLVE_BUDGET, HandlerEngine, HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN,
-    ServeTiming, build_engine, build_engine_pooling, empty_body,
+    DEFAULT_DNS_RESOLVE_BUDGET, DEFAULT_PROMOTED_SPLICE_CAP, HandlerEngine, HandlerError, Lane,
+    Limits, MAX_CONSUMER_ERROR_LEN, ServeTiming, build_engine, build_engine_pooling, empty_body,
 };
 #[cfg(feature = "engine")]
 pub use instance_stats::{

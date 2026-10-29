@@ -259,27 +259,33 @@ impl SocketSessionController {
 }
 
 /// Everything the socket controller needs to service a `promote-connection` (cap-req 22): the
-/// gate-reusing egress dialer scoped to this listener's `egress_allowlist`, the node-global
-/// persistent-splice ceiling, and the preamble cap. Built once per connection (see
+/// gate-reusing egress dialer scoped to this listener's `egress_allowlist`, the node-global AND
+/// per-listener persistent-splice ceilings, and the preamble cap. Built once per connection (see
 /// `dispatch_session_connection`) and cloned cheaply into each re-entry's controller.
 #[cfg(feature = "tcp-egress")]
 #[derive(Clone)]
 pub(crate) struct PromoteCtx {
     pub dialer: Arc<boatramp_handlers::EgressDialer>,
+    /// NODE-GLOBAL promoted-splice ceiling (the aggregate across every session listener).
     pub splice_gate: Arc<tokio::sync::Semaphore>,
+    /// PER-LISTENER promoted-splice sub-cap (Security review MEDIUM-2): a fairness bound so one
+    /// listener can't monopolize the node-global budget. A promote acquires BOTH gates.
+    pub listener_splice_gate: Arc<tokio::sync::Semaphore>,
     pub max_preamble_bytes: usize,
 }
 
 /// A recorded, already-authorized promotion (cap-req 22): the split halves of the host-dialed
 /// upstream (DECRYPTED application bytes), the preamble to write before splicing, and the held
-/// node-global splice permit (released when this drops — i.e. when the splice ends).
+/// splice permits (released when this drops — i.e. when the splice ends).
 #[cfg(feature = "tcp-egress")]
 pub(crate) struct Promotion {
     pub upstream_read: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     pub upstream_write: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     pub preamble: Vec<u8>,
-    /// Held for the splice's whole life; dropping it releases the node-global promoted-splice budget.
+    /// Held for the splice's whole life; dropping it releases the NODE-GLOBAL promoted-splice budget.
     pub _splice_permit: tokio::sync::OwnedSemaphorePermit,
+    /// Held for the splice's whole life; dropping it releases this LISTENER's promoted-splice sub-cap.
+    pub _listener_splice_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Map a reused-egress-gate error to the guest-facing `PromoteError` (cap-req 22). A gate refusal is
@@ -366,8 +372,15 @@ impl SessionController for SocketSessionController {
             if req.preamble.len() > ctx.max_preamble_bytes {
                 return Err(P::PreambleTooLarge);
             }
-            // Acquire the node-global splice permit BEFORE dialing: a ceiling refusal must cost no
-            // dial, and the permit is then held for the splice's whole life (inside `Promotion`).
+            // Acquire BOTH splice permits BEFORE dialing: a ceiling refusal must cost no dial, and the
+            // permits are then held for the splice's whole life (inside `Promotion`). The PER-LISTENER
+            // sub-cap first (Security review MEDIUM-2: a listener that has hit its own fair share is
+            // refused without touching the node-global budget), then the NODE-GLOBAL ceiling. Either
+            // at capacity ⇒ `Capacity` (retryable), and the already-taken permit releases on return.
+            let Ok(listener_permit) = Arc::clone(&ctx.listener_splice_gate).try_acquire_owned()
+            else {
+                return Err(P::Capacity);
+            };
             let Ok(permit) = Arc::clone(&ctx.splice_gate).try_acquire_owned() else {
                 return Err(P::Capacity);
             };
@@ -385,7 +398,10 @@ impl SessionController for SocketSessionController {
                 match ctx.dialer.dial(&req.host, req.port, tls).await {
                     Ok(halves) => halves,
                     Err(e) => {
-                        drop(permit); // release the splice slot — the dial did not take it
+                        // Release BOTH splice slots — the dial did not take them (also released by the
+                        // return, dropped explicitly for clarity).
+                        drop(permit);
+                        drop(listener_permit);
                         return Err(map_egress_err(e));
                     }
                 };
@@ -394,6 +410,7 @@ impl SessionController for SocketSessionController {
                 upstream_write,
                 preamble: req.preamble,
                 _splice_permit: permit,
+                _listener_splice_permit: listener_permit,
             };
             // Hand it to the driver. A lost race (closed/double-promote since the checks above) drops
             // `promo` here — closing the freshly-dialed upstream + releasing the permit (fail-closed).
@@ -436,16 +453,25 @@ where
         mut upstream_write,
         preamble,
         _splice_permit,
+        _listener_splice_permit,
     } = promo;
 
+    // Monotonic clock base for the whole splice (Security review LOW-3): the idle watchdog measures
+    // elapsed time from this `tokio::time::Instant`, NOT wall-clock `now_unix_ms()`, so a forward
+    // clock step can never prematurely reap a live splice (the same monotonic basis `deadline` uses).
+    let splice_start = tokio::time::Instant::now();
+
     // Write the preamble to the upstream BEFORE splicing (e.g. the replayed, client-tagged LOGIN).
-    // Bounded by the idle budget so a wedged upstream can't pin the task. A failure here means the
-    // upstream died before the splice — tear down (returning closes both sides).
+    // Bounded by whichever is SOONER (Security review LOW-1): the idle budget OR the connection's
+    // absolute `deadline` — so a wedged upstream during the preamble write can't pin the task/permits
+    // past a shorter `max_conn_duration`. A failure/timeout here means the upstream died before the
+    // splice — tear down (returning closes both sides and frees both permits).
     if !preamble.is_empty() {
-        match tokio::time::timeout(PROMOTED_SPLICE_IDLE, upstream_write.write_all(&preamble)).await
+        let preamble_deadline = deadline.min(splice_start + PROMOTED_SPLICE_IDLE);
+        match tokio::time::timeout_at(preamble_deadline, upstream_write.write_all(&preamble)).await
         {
             Ok(Ok(())) => {
-                let _ = tokio::time::timeout(PROMOTED_SPLICE_IDLE, upstream_write.flush()).await;
+                let _ = tokio::time::timeout_at(preamble_deadline, upstream_write.flush()).await;
             }
             _ => {
                 tracing::debug!(%peer, "promoted splice: upstream preamble write failed; closing");
@@ -454,10 +480,11 @@ where
         }
     }
 
-    // Shared last-activity clock across both directions for the idle watchdog.
-    let last = Arc::new(AtomicU64::new(now_unix_ms()));
-    let c2u = pump_half(client_read, upstream_write, Arc::clone(&last));
-    let u2c = pump_half(upstream_read, client_write, Arc::clone(&last));
+    // Shared last-activity clock across both directions for the idle watchdog: milliseconds elapsed
+    // from `splice_start` (monotonic), `0` = "at start". Each pump stores its own elapsed on activity.
+    let last = Arc::new(AtomicU64::new(0));
+    let c2u = pump_half(client_read, upstream_write, Arc::clone(&last), splice_start);
+    let u2c = pump_half(upstream_read, client_write, Arc::clone(&last), splice_start);
     tokio::pin!(c2u, u2c);
 
     // Re-arm the idle check each loop; the absolute deadline is a hard backstop.
@@ -473,7 +500,8 @@ where
                 break;
             }
             _ = tokio::time::sleep(idle_tick) => {
-                let quiet = now_unix_ms().saturating_sub(last.load(Ordering::Relaxed));
+                let quiet = (splice_start.elapsed().as_millis() as u64)
+                    .saturating_sub(last.load(Ordering::Relaxed));
                 if quiet >= PROMOTED_SPLICE_IDLE.as_millis() as u64 {
                     tracing::debug!(%peer, "promoted splice: idle timeout; closing");
                     break;
@@ -481,7 +509,8 @@ where
             }
         }
     }
-    // Returning drops `upstream_*` / `client_*` (both sockets close) + `_splice_permit` (budget freed).
+    // Returning drops `upstream_*` / `client_*` (both sockets close) + both splice permits (node-global
+    // and per-listener budgets freed).
     Ok(())
 }
 
@@ -489,7 +518,14 @@ where
 /// interactive protocol stays responsive, updating the shared activity clock. Ends on EOF (0-byte
 /// read) — best-effort shutting the write half — or any read/write error.
 #[cfg(feature = "tcp-egress")]
-async fn pump_half<Rd, Wr>(mut r: Rd, mut w: Wr, last: Arc<AtomicU64>) -> std::io::Result<()>
+async fn pump_half<Rd, Wr>(
+    mut r: Rd,
+    mut w: Wr,
+    last: Arc<AtomicU64>,
+    // Monotonic base for the shared idle clock (Security review LOW-3): activity is recorded as ms
+    // elapsed from this instant, never wall-clock, so a clock step can't skew the idle watchdog.
+    start: tokio::time::Instant,
+) -> std::io::Result<()>
 where
     Rd: tokio::io::AsyncRead + Unpin,
     Wr: tokio::io::AsyncWrite + Unpin,
@@ -501,7 +537,7 @@ where
             let _ = w.shutdown().await;
             return Ok(());
         }
-        last.store(now_unix_ms(), Ordering::Relaxed);
+        last.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         w.write_all(&buf[..n]).await?;
         w.flush().await?;
     }
@@ -576,12 +612,14 @@ mod tests {
     #[tokio::test]
     async fn promotion_cell_is_one_shot_and_write_half_reclaims() {
         let state = socket_state();
-        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        // Cap 4 ⇒ two `mk` calls can each take their global + per-listener permit (2 × 2).
+        let gate = Arc::new(tokio::sync::Semaphore::new(4));
         let mk = |g: &Arc<tokio::sync::Semaphore>| Promotion {
             upstream_read: Box::new(tokio::io::empty()),
             upstream_write: Box::new(tokio::io::sink()),
             preamble: b"pre".to_vec(),
             _splice_permit: Arc::clone(g).try_acquire_owned().unwrap(),
+            _listener_splice_permit: Arc::clone(g).try_acquire_owned().unwrap(),
         };
         assert!(state.set_promotion(mk(&gate)));
         assert!(state.is_promotion_pending());
