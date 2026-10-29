@@ -3441,9 +3441,9 @@ mod sealed_state_gate {
     const PROJECT: &str = "acme";
     const SITE: &str = "console";
 
-    /// Serializes the env-var mutation seam across the (few) binding/expiry-sensitive tests so the
-    /// process-global `BOATRAMP_SEALEDSTATE_MUTATION` can never bleed into a concurrent assertion.
-    static MUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The binding/expiry-sensitive tests are grouped `#[serial(sealed_state_env)]` so the
+    // process-global `BOATRAMP_SEALEDSTATE_MUTATION` (set only by the two mutation tests) can never
+    // bleed into a concurrent negative assertion.
 
     struct MapParams {
         state: Option<String>,
@@ -3519,7 +3519,7 @@ mod sealed_state_gate {
         let params = MapParams {
             state: token.map(str::to_owned),
         };
-        let registry = Provisioned(provisioned.iter().map(|s| s.to_string()).collect());
+        let registry = Provisioned(provisioned.iter().copied().map(String::from).collect());
         let inputs = TenantSourceInputs {
             sealed_state: Some(SealedStateInputs {
                 params: &params,
@@ -3565,12 +3565,12 @@ mod sealed_state_gate {
         );
     }
 
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn x_state_at_another_site_or_project_resolves_to_none() {
         // THE cross-tenant/cross-surface isolation: a seal minted for site X can NEVER resolve at a
         // different (project, site) — so one firm's login can't be replayed into another site's
-        // tenancy, even though the KEK is node-wide. Guarded by MUT (binding-sensitive).
-        let _g = MUT.lock().unwrap();
+        // tenancy, even though the KEK is node-wide. Serialized (binding-sensitive).
         let env = kek();
         let now = boatramp_core::time::now_unix();
         let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
@@ -3650,9 +3650,9 @@ mod sealed_state_gate {
         assert_eq!(resolve(&env, Some(&x), PROJECT, SITE, &[]).await, None);
     }
 
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn an_expired_state_resolves_to_none() {
-        let _g = MUT.lock().unwrap();
         let env = kek();
         // iat 1000s ago, ttl 300 ⇒ expired 700s ago.
         let now = boatramp_core::time::now_unix();
@@ -3673,9 +3673,9 @@ mod sealed_state_gate {
     // `sealed_state.rs` prove the SAME two seams under core's native `cfg(test)`.
 
     #[cfg(feature = "sealed-state-gate-mutation")]
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn mutation_skip_binding_opens_a_cross_site_resolution() {
-        let _g = MUT.lock().unwrap();
         let env = kek();
         let now = boatramp_core::time::now_unix();
         let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
@@ -3685,10 +3685,10 @@ mod sealed_state_gate {
             None
         );
         // Armed: neuter the per-(project,site) binding → the cross-site seal now resolves (RED).
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the `sealed_state_env` group; cleared below.
         unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_binding") };
         let leaked = resolve(&env, Some(&x), PROJECT, "other-site", &["firm-x"]).await;
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the group.
         unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
         assert_eq!(
             leaked,
@@ -3698,9 +3698,9 @@ mod sealed_state_gate {
     }
 
     #[cfg(feature = "sealed-state-gate-mutation")]
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn mutation_skip_exp_opens_an_expired_resolution() {
-        let _g = MUT.lock().unwrap();
         let env = kek();
         let now = boatramp_core::time::now_unix();
         let x = mint(&env, "firm-x", PROJECT, SITE, now - 1000, 300).await;
@@ -3708,10 +3708,10 @@ mod sealed_state_gate {
             resolve(&env, Some(&x), PROJECT, SITE, &["firm-x"]).await,
             None
         );
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the `sealed_state_env` group; cleared below.
         unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_exp") };
         let stale = resolve(&env, Some(&x), PROJECT, SITE, &["firm-x"]).await;
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the group.
         unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
         assert_eq!(
             stale,

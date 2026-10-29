@@ -70,8 +70,8 @@ impl SealedStateMintRefused {
 /// A per-invocation `sealed-state` grant: the host `[secrets]` key envelope, the host-stamped project,
 /// THIS invocation's host-resolved site + own-tenant, and whether the `mint` right was granted.
 ///
-/// Built by the server's `build_bindings` from the component's grants + the resolved own-tenant fact
-/// + the resolved site. `resolved_tenant == None` ⇒ `no-resolved-tenant`; `site == None` ⇒
+/// Built by the server's `build_bindings` from the component's grants, the resolved own-tenant fact,
+/// and the resolved site. `resolved_tenant == None` ⇒ `no-resolved-tenant`; `site == None` ⇒
 /// `no-resolved-site`.
 #[derive(Clone)]
 pub struct SealedStateMintBinding {

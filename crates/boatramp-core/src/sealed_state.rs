@@ -386,6 +386,10 @@ mod tests {
         );
     }
 
+    // Serialized with the mutation tests (same group): they set the process-global
+    // `BOATRAMP_SEALEDSTATE_MUTATION`, and this negative asserts the binding check is LIVE — so it
+    // must never run concurrently with a test that neutered it.
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn a_wrong_site_or_project_fails_closed() {
         let env = FakeKek { key: 0x5a };
@@ -402,6 +406,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn an_expired_token_fails_closed() {
         let env = FakeKek { key: 0x5a };
@@ -454,6 +459,7 @@ mod tests {
     // ---- mutation-sensitivity (anti-hollow): each seam, when armed, turns a fail-closed check GREEN,
     // proving the check is load-bearing. These run only under cfg(test). ----
 
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn mutation_skip_binding_makes_cross_site_resolve_green() {
         let env = FakeKek { key: 0x5a };
@@ -465,12 +471,11 @@ mod tests {
                 .is_err()
         );
         // Armed: the binding check is neutered → the wrong-site seal now resolves (RED gate).
-        // SAFETY: cfg(test) only; serialized via a mutex to avoid cross-test env races.
-        let _g = MUT.lock().unwrap();
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: cfg(test) only; `#[serial(sealed_state_env)]` keeps env-sensitive tests off the
+        // same process at once; the var is cleared before returning.
         unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_binding") };
         let leaked = unseal_state(&env, &token, 1_000_010, "acme", "other-site").await;
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the group.
         unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
         assert!(
             leaked.is_ok(),
@@ -478,6 +483,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial(sealed_state_env)]
     #[tokio::test]
     async fn mutation_skip_exp_makes_expired_resolve_green() {
         let env = FakeKek { key: 0x5a };
@@ -488,18 +494,14 @@ mod tests {
                 .await
                 .is_err()
         );
-        let _g = MUT.lock().unwrap();
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; `#[serial(sealed_state_env)]` serializes; cleared below.
         unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_exp") };
         let stale = unseal_state(&env, &token, now + 301, "acme", "console").await;
-        // SAFETY: test-only env var; serialized by MUT.
+        // SAFETY: test-only env var; serialized by the group.
         unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
         assert!(
             stale.is_ok(),
             "neutering the expiry check must make an expired seal resolve (the gate is live)"
         );
     }
-
-    /// Serializes the env-var mutation tests (process-global env).
-    static MUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

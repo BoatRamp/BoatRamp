@@ -199,6 +199,9 @@ async fn resolve_session_principal(
             signed_context: None,
             context_anchor: None,
             env_source: Some(inner.env_source()),
+            // The `sealed-state` source is wired on the site-handler serving path (the canonical
+            // console `/sso/callback` home); the session-primitive lane passes None (fail-closed).
+            sealed_state: None,
         },
     )
     .await
