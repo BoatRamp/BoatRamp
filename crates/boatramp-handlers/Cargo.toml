@@ -135,6 +135,13 @@ session = ["engine", "dep:async-trait"]
 # control-plane routes compile on a lean node). This gates only the WIT interface + host binding +
 # linker. Off by default; the server turns it on inside its `handlers` feature.
 tenant-secrets = ["engine", "dep:async-trait"]
+# The `sealed-state` binding (`boatramp:handlers/sealed-state`, PLAN-sealed-state-source): a guest
+# mints an AEAD-sealed state token bound to THIS invocation's host-resolved tenant+project+site, for a
+# later pre-auth SSO callback to resolve via the `sealed-state` tenancy source. The crypto
+# (`boatramp_core::sealed_state`) + the source (`boatramp_server::tenant_resolve`) are NOT
+# handlers-gated, so the lean paths compile without this; this gates only the WIT interface + host
+# binding + linker. Off by default; the server turns it on inside its `handlers` feature.
+sealed-state = ["engine", "dep:async-trait"]
 # The `blob-upload` binding (S3-compatible external blob ingress): a guest mints a short-lived, scoped
 # S3 upload credential for one of its OWN project+site's blob containers, which an external client uses
 # to upload directly (the wasm guest then reads by key via `wasi:blobstore`). The host holds the fleet

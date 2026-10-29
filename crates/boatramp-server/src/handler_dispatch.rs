@@ -2791,6 +2791,27 @@ pub(super) async fn build_bindings(
             granted("tenant-secrets:admin"),
         );
     }
+    // The `sealed-state:mint` capability (PLAN-sealed-state-source): a login-start (`/sso/start`)
+    // handler mints an AEAD-sealed `state` token bound to THIS invocation's host-resolved
+    // tenant+project+site, which the pre-auth `/sso/callback` later resolves via the `sealed-state`
+    // tenancy source. The seal reuses the per-tenant store's `[secrets]` envelope (the SAME AEAD it
+    // seals secrets with) — so no separate key store. Deny-by-default: needs the `sealed-state:mint`
+    // grant (import ∩ site allowlist) AND a wired store (the `[secrets]` substrate). The resolved
+    // tenant is the OWN-`Tenant` fact (`None` ⇒ every mint is `no-resolved-tenant`); the site is this
+    // invocation's resolved site (`None` ⇒ `no-resolved-site`). The guest never names a tenant.
+    if granted("sealed-state:mint")
+        && let Some(store) = inner.tenant_secret_store.get()
+    {
+        let resolved_tenant =
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+        bindings = bindings.with_sealed_state_mint(
+            store.envelope(),
+            project.as_str(),
+            Some(site.to_string()),
+            resolved_tenant,
+            true,
+        );
+    }
     // Gap 3: `tenancy::present-token` — a site handler that verified a tenant credential IN-GUEST
     // (a POST-body app JWT, a cookie bearer) hands it to the host, which RE-verifies it against this
     // handler's effective `token_claims` + `token` source and seals the tenant onto the

@@ -25,6 +25,7 @@ handlers = [
   "boatramp-handlers/invoke",
   "boatramp-handlers/graphql",
   "boatramp-handlers/tenant-secrets",
+  "boatramp-handlers/sealed-state",
   "dep:chrono",
   "dep:async-graphql-parser",
   "dep:async-graphql-value",

@@ -580,6 +580,75 @@ world tenant-secrets-host {
   import tenant-secrets;
 }
 
+/// Value types for the `sealed-state` capability (PLAN-sealed-state-source): a guest **mints an
+/// AEAD-sealed state token** at login-start, binding THIS invocation's host-resolved tenant (+ site
+/// + project) so a later PRE-AUTH callback — where no bearer / routed-tenant domain names the tenant
+/// — can resolve it via the `sealed-state` tenancy source. The guest supplies only the app/login
+/// fields (a PKCE verifier / its hash, the OIDC nonce, a requested TTL); the host FORCES
+/// project/site/tenant and CLAMPS the TTL, so a guest can NEVER seal a state for a different tenant.
+/// The token is AEAD-sealed under the node's `[secrets]` key envelope, so the tenant is OPAQUE to
+/// the browser and tamper-evident. Deny-by-default: an ungranted guest has no binding and `mint`
+/// returns `access-denied`; the guest never sees the host key.
+///
+/// # Tenant + project + site are HOST-forced — you never pass them
+/// This interface has NO tenant/project/site parameter. The host stamps THIS invocation's resolved
+/// own-tenant (the SAME `tenant` fact the SQL scope injector uses) + project + site into the seal. To
+/// USE it, DECLARE the import and grant `sealed-state:mint`. The returned string is the opaque
+/// `state` to send to the IdP (the app also binds it to the browser via its OWN signed cookie — the
+/// stateless anti-replay story; boatramp stores no per-login state).
+///
+/// # Footgun: an `all` / anonymous / unscoped login-start gets `no-resolved-tenant`
+/// `/sso/start` MUST run under a route whose own tenant is resolved (a `token`/`domain` source), so
+/// the host has a tenant to seal. A `mint` with no single resolved tenant returns `no-resolved-tenant`
+/// (fail-closed, before any sealing), never a project-wide or "first" tenant. Likewise with no single
+/// resolved site: `no-resolved-site`.
+interface sealed-state-types {
+  /// A request to mint a sealed state token. project/site/tenant are NOT named — the host forces them.
+  record mint-request {
+    /// The PKCE verifier (or its S256 hash) carried OPAQUELY in the seal so the app can bind the
+    /// code exchange; `none` if the app does not use PKCE (it should). boatramp never interprets it.
+    pkce: option<string>,
+    /// The OIDC `nonce` the app will match against the ID token, carried OPAQUELY; `none` if unused.
+    nonce: option<string>,
+    /// Requested lifetime in seconds; the host CLAMPS it to the operator ceiling (a login window,
+    /// at most ~15 minutes). `0` ⇒ the host default (the ceiling).
+    ttl-seconds: u64,
+  }
+
+  /// Why a mint failed.
+  variant mint-error {
+    /// The `sealed-state:mint` capability was not granted to this component (deny-by-default).
+    access-denied,
+    /// This invocation has no single resolved tenant (an `all`/anonymous/unscoped login-start), so
+    /// there is no tenant to seal — fail-closed here, BEFORE any sealing.
+    no-resolved-tenant,
+    /// This invocation has no single resolved site, so the host cannot bind the seal to a site —
+    /// fail-closed (a seal unbound to a site could resolve on another of the project's sites).
+    no-resolved-site,
+    /// No `[secrets]` key envelope is configured on the node, so there is no AEAD to seal with
+    /// (mirrors the `tenant-secrets` `not-configured`). The capability is structurally unavailable.
+    not-configured,
+    /// The host failed to seal the token (an envelope failure, or a bad lifetime). Generic detail.
+    failed(string),
+  }
+}
+
+/// The `sealed-state` capability: mint an AEAD-sealed state token bound to THIS invocation's resolved
+/// project+site+tenant. The returned string is the opaque `state` the app sends to the IdP.
+interface sealed-state {
+  use sealed-state-types.{mint-request, mint-error};
+
+  /// Mint a sealed state token per `request`. Returns the opaque `state` string (to send to the IdP
+  /// and bind to the browser via the app's own signed cookie), or a `mint-error`.
+  mint: func(request: mint-request) -> result<string, mint-error>;
+}
+
+/// The sealed-state minting world (imported into request handlers / functions). A guest WIT addition
+/// ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump.
+world sealed-state-host {
+  import sealed-state;
+}
+
 /// Value types for the `invoke` capability: a small HTTP-shaped request/response
 /// so one function can call another the same way the platform invokes it from
 /// the outside (functions are `wasi:http` handlers, so the natural call shape is

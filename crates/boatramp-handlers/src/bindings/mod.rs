@@ -55,6 +55,13 @@ pub mod messaging_stats;
 pub mod migrate;
 #[cfg(feature = "sql")]
 pub mod orm;
+/// The guest sealed-state mint binding (`boatramp:handlers/sealed-state`, PLAN-sealed-state-source): a
+/// granted guest mints an AEAD-sealed state token bound to THIS invocation's host-resolved
+/// tenant+project+site, for a later pre-auth SSO callback to resolve via the `sealed-state` tenancy
+/// source. Its own off-by-default `sealed-state` feature (the crypto + the source live in
+/// boatramp-core / boatramp-server, so the lean paths compile without it).
+#[cfg(feature = "sealed-state")]
+pub mod sealed_state;
 #[cfg(feature = "session")]
 pub mod session;
 #[cfg(feature = "sql")]
@@ -165,6 +172,11 @@ pub struct Bindings {
     /// a tenant (the host injects the resolved one).
     #[cfg(feature = "tenant-secrets")]
     tenant_secrets: Option<tenant_secrets::TenantSecretsBinding>,
+    /// The `sealed-state:mint` grant (PLAN-sealed-state-source): mint an AEAD-sealed state token
+    /// bound to THIS invocation's host-resolved tenant+project+site. `None` = not granted (every call
+    /// ⇒ `access-denied`). The guest never names a tenant — the host injects the resolved one.
+    #[cfg(feature = "sealed-state")]
+    sealed_state_mint: Option<sealed_state::SealedStateMintBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -762,5 +774,40 @@ impl Bindings {
     #[cfg(feature = "tenant-secrets")]
     pub fn tenant_secrets(&self) -> Option<&tenant_secrets::TenantSecretsBinding> {
         self.tenant_secrets.as_ref()
+    }
+
+    /// Grant the `sealed-state:mint` capability (PLAN-sealed-state-source): `env` is the node
+    /// `[secrets]` key envelope (the SAME AEAD the per-tenant secret store seals with), `project` is
+    /// host-stamped, `site` is THIS invocation's host-resolved site (`None` ⇒ every call is
+    /// `no-resolved-site`), `resolved_tenant` is THIS invocation's host-resolved own-tenant (`None` ⇒
+    /// `no-resolved-tenant`), and `can_mint` is the `sealed-state:mint` right. Deny-by-default:
+    /// without this grant every call returns `access-denied`. The guest supplies only the opaque
+    /// pkce/nonce + a requested TTL; the host forces project/site/tenant and clamps the TTL, so a
+    /// guest can never seal a different tenant.
+    #[cfg(feature = "sealed-state")]
+    pub fn with_sealed_state_mint(
+        mut self,
+        env: Arc<dyn boatramp_core::envelope::KeyEnvelope>,
+        project: impl Into<String>,
+        site: Option<String>,
+        resolved_tenant: Option<String>,
+        can_mint: bool,
+    ) -> Self {
+        self.sealed_state_mint = Some(sealed_state::SealedStateMintBinding {
+            env,
+            project: project.into(),
+            site,
+            resolved_tenant,
+            can_mint,
+        });
+        self
+    }
+
+    /// The granted `sealed-state` mint binding, if any. Public so a host-side caller (a live-gate
+    /// test) can drive the real AEAD seal without instantiating a wasm guest — the same pattern as
+    /// [`tenant_secrets`](Self::tenant_secrets).
+    #[cfg(feature = "sealed-state")]
+    pub fn sealed_state_mint(&self) -> Option<&sealed_state::SealedStateMintBinding> {
+        self.sealed_state_mint.as_ref()
     }
 }
