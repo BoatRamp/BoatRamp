@@ -1349,7 +1349,7 @@ const DEFAULT_SESSION_CONN_CAP: usize = 16_384;
 /// session-socket re-entry pool and the `DEFAULT_SESSION_CONN_CAP` connection backstop — and well
 /// below them, so a promote storm can never consume the whole session-connection budget. A promote
 /// at the ceiling is refused `capacity` (retryable), fail-closed. Operator-tunable via
-/// `[serve.handlers].max_promoted_splices` ([`HandlerEngine::with_promoted_splice_cap`]); this is the
+/// `[handlers].max_promoted_splices` ([`HandlerEngine::with_promoted_splice_cap`]); this is the
 /// default when unset. A per-listener sub-cap (the listener's own `max_promoted_splices`, enforced by
 /// the listener accept loop) further prevents one listener from monopolizing this global budget.
 pub const DEFAULT_PROMOTED_SPLICE_CAP: usize = 4_096;
@@ -2216,7 +2216,7 @@ impl HandlerEngine {
     }
 
     /// Override the NODE-GLOBAL promoted persistent-splice ceiling (mailroom cap-req #22):
-    /// `[serve.handlers].max_promoted_splices`. `None` keeps [`DEFAULT_PROMOTED_SPLICE_CAP`]. A value
+    /// `[handlers].max_promoted_splices`. `None` keeps [`DEFAULT_PROMOTED_SPLICE_CAP`]. A value
     /// is floored at 1. This bounds the AGGREGATE of live duplex splices across every session listener;
     /// each listener additionally carries its own per-listener sub-cap (enforced in the accept loop) so
     /// one listener can't consume the whole global budget. Always compiled (a no-op when the

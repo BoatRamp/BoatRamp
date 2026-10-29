@@ -631,7 +631,7 @@ impl ServerConfig {
             if l.max_promoted_splices == Some(0) {
                 return err(
                     "`max_promoted_splices` must be > 0",
-                    " — omit it for the default, or raise the node-global `[serve.handlers].max_promoted_splices`",
+                    " — omit it for the default, or raise the node-global `[handlers].max_promoted_splices`",
                 );
             }
             // IPv6 rate-limit bucket prefix must be a real prefix length (senior-architect review).
@@ -2611,7 +2611,7 @@ pub struct ListenerConfig {
     pub max_conn_duration_ms: Option<u64>,
     /// PER-LISTENER sub-cap on concurrently-live PROMOTED persistent splices (mailroom cap-req #22 —
     /// the session→connection escalation / imap-proxy bridge) for THIS listener, atop the node-global
-    /// `[serve.handlers].max_promoted_splices` ceiling. A fairness bound: on a multi-tenant node it
+    /// `[handlers].max_promoted_splices` ceiling. A fairness bound: on a multi-tenant node it
     /// stops one listener from exhausting the whole node-global splice budget and forcing `capacity`
     /// refusals on every other listener. A `promote-connection` past EITHER cap is refused `capacity`
     /// (retryable), fail-closed. Only meaningful for a `mode = "session"` listener whose guest is

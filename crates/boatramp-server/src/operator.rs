@@ -371,10 +371,11 @@ fn dir_size_recursive(dir: &std::path::Path, depth: u32) -> u64 {
     total
 }
 
-/// `GET /api/node-health` (a node-health-alerting request): the NODE-global health snapshot. Stage 1
-/// surfaces `/data` filesystem headroom — the disk-full incident signal (a silently-full `/data`
-/// bricked managed PG with no alert); managed-SQL health + the alerting loop/channels arrive in a later
-/// stage. Read-only; the authz table gates it `System·Read` (a NODE-global read — disk/health are node
+/// `GET /api/node-health` (a node-health-alerting request): the NODE-global health snapshot. Surfaces
+/// `/data` filesystem headroom — the disk-full incident signal (a silently-full `/data` bricked managed
+/// PG with no alert) — and, as of Stage 2 (v0.49.0), the `replicas_unhealthy` managed-SQL/desired-replica
+/// health section; the Stage-2 alerting loop + sealed-secret webhook/email channels live daemon-side
+/// (`[serve.alerts]`), not here. Read-only; the authz table gates it `System·Read` (a NODE-global read — disk/health are node
 /// faults, never a per-project right). The `data_*` figures are absent when the data dir is unknown or
 /// statvfs is unavailable (off-Linux); the additive `data_breakdown` object (per-top-level-subdir byte
 /// totals — kv-data-observability) is absent when the data dir cannot be listed.
