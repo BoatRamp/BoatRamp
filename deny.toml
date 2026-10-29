@@ -67,6 +67,20 @@ ignore = [
   # TLS connection skips the RSA exchange entirely. No fixed `rsa` release exists.
   # Revisit when RustCrypto/RSA ships a constant-time release or sqlx drops it.
   "RUSTSEC-2023-0071",
+
+  # zstd 0.13.3: four decompression advisories (RUSTSEC-2026-0391 cross-stream data
+  # leak on a reused context; -0398 Seekable::decompress sets a Vec length beyond
+  # capacity for out-of-range offsets; -0403 uninitialized memory exposed on a failed
+  # legacy-frame streaming decompress; -0410). Pulled transitively by BOTH wasmtime 50
+  # (its wasm module cache, via wasmtime-internal-cache) AND slatedb -> foyer (the
+  # block cache); both pin zstd 0.13 and wasmtime 50 is the LATEST published wasmtime,
+  # so NO upgrade exists at this time. Impact is low here: both only (de)compress
+  # boatramp's OWN cache blocks (wasm modules, slatedb blocks), never attacker-
+  # controlled external zstd input. Revisit when wasmtime / foyer move to zstd 0.14.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0410",
 ]
 
 [bans]
