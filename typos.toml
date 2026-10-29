@@ -6,7 +6,14 @@
 # in the cluster docs are not prose — their coincidental substrings (e.g. "Jod")
 # are not typos. Likewise Hetzner Cloud datacenter location codes (`fsn1`, `nbg1`,
 # `hel1`) in the cluster-on-Hetzner runbook are identifiers (`hel1` ≈ "help"/"hell").
-extend-ignore-re = ["brjoin1\\.[A-Za-z0-9_-]+", "\\b(?:fsn1|nbg1|hel1)\\b"]
+# The ES256 COSE_Sign1 token vectors in `cose.rs` tests (base64url of a CBOR tag-18
+# envelope, so they start `0oR…`) are opaque signed blobs — their coincidental
+# substrings (e.g. "pn") are not typos.
+extend-ignore-re = [
+  "brjoin1\\.[A-Za-z0-9_-]+",
+  "\\b(?:fsn1|nbg1|hel1)\\b",
+  "0oR[A-Za-z0-9_-]{40,}",
+]
 
 [default.extend-words]
 # `mke2fs` is the e2fsprogs tool name; not a typo of "make".

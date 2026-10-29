@@ -123,12 +123,19 @@ sqlparser.workspace = true
 # COSE/CWT tokens + Cedar authorization (`authz` feature). Optional, native only.
 coset = { version = "0.3", optional = true }
 ciborium = { version = "0.2", optional = true }
-p256 = { version = "0.13", features = [
+# ES256 (P-256). The `getrandom` feature enables the `Generate` trait's getrandom-backed
+# `SigningKey::generate()` (via crypto-common), used for ES256 key generation — the RustCrypto-0.14
+# replacement for the deprecated `SigningKey::random(&mut OsRng)`, with the same fail-stop semantics.
+p256 = { version = "0.14", features = [
   "ecdsa",
   "pkcs8",
   "pem",
+  "getrandom",
 ], optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+# `rand_core 0.6` — `OsRng` for Ed25519 key generation only. `ed25519-dalek 2` is pinned to the
+# rand_core 0.6 trait family, so its `SigningKey::generate` needs a 0.6 `OsRng`. (The P-256 path no
+# longer uses rand_core directly; it generates keys via `p256 0.14`'s getrandom-backed `generate()`.)
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 base64 = { workspace = true }
 cedar-policy = { version = "4", optional = true }
