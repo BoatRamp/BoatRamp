@@ -465,9 +465,11 @@ proptest = "1"
 # composer is tested against real federation-v2 SDL — not only synthetic fixtures.
 async-graphql = { version = "7" }
 # P-256 for the signer backends' unit tests (building SPKI/DER fixtures). Already
-# in the tree via `boatramp-core[authz]`; exposing it directly is cheap.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+# in the tree via `boatramp-core[authz]`; exposing it directly is cheap. The
+# `getrandom` feature enables the `Generate` trait's `SigningKey::generate()`, used
+# for the fixture keys (the RustCrypto-0.14 replacement for `random(&mut OsRng)`), so
+# no direct rand_core dep is needed.
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem", "getrandom"] }
 # Ed25519 for signing a test app-token the GraphQL data connector verifies via a JWKS
 # (already in the tree via `boatramp-core[authz]`). Deterministic key, no keygen rng.
 ed25519-dalek = { version = "2" }

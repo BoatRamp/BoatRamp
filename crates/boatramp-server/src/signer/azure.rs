@@ -131,9 +131,10 @@ mod tests {
 
     #[test]
     fn p256_public_key_parsed_from_ec_jwk() {
+        use p256::elliptic_curve::Generate as _;
         // Encode a real P-256 key's affine x/y as a Key Vault EC JWK, then parse.
-        let sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
-        let point = sk.verifying_key().to_encoded_point(false);
+        let sk = p256::ecdsa::SigningKey::generate();
+        let point = sk.verifying_key().to_sec1_point(false);
         let jwk = serde_json::json!({
             "kty": "EC",
             "crv": "P-256",

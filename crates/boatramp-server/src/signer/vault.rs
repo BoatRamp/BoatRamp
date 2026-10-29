@@ -171,8 +171,9 @@ mod tests {
     #[test]
     fn es256_public_key_parsed_from_transit_keys_response() {
         // Shape a `transit/keys/<key>` response around a real P-256 SPKI PEM.
+        use p256::elliptic_curve::Generate as _;
         use p256::pkcs8::{EncodePublicKey as _, LineEnding};
-        let sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let sk = p256::ecdsa::SigningKey::generate();
         let pem = sk
             .verifying_key()
             .to_public_key_pem(LineEnding::LF)
