@@ -130,8 +130,9 @@ impl StaticResolver {
                     });
                 }
             }
-            // `rec.txt` is intentionally not consulted: the consumer-lane `DnsResolver` trait exposes
-            // only MX + address resolution (no resolve-txt), so TXT overrides are inert today.
+            // Only addr + MX are overridable, by design: the consumer-lane `DnsResolver` capability
+            // does exactly `resolve-addr` + `resolve-mx` (no `resolve-txt`), so no other record type
+            // is accepted — a type is added only if/when the capability gains a lookup for it.
         }
         for records in mx.values_mut() {
             records.sort_by_key(|r| r.preference);

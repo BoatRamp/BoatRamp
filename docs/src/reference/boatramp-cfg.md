@@ -525,11 +525,12 @@ is unaffected) and has two parts, both optional:
 - **`records`** — a static `name → records` map, **consulted first**. A hit returns
   the configured answer **without touching the network**, so a test can seed exactly
   the MX / address answers a relay needs and run with no DNS or network dependency at
-  all. Each entry is `( name, addrs, mx, txt )`: `addrs` are the A/AAAA answers for the
+  all. Each entry is `( name, addrs, mx )`: `addrs` are the A/AAAA answers for the
   `resolve-addr` lookup (an IPv4 is an A record, an IPv6 an AAAA), `mx` are the
-  `resolve-mx` answers (`( preference, exchange )`, served ascending by preference). (`txt`
-  is accepted for schema completeness but **inert** today — the consumer-lane capability
-  exposes only address + MX resolution, no `resolve-txt`.)
+  `resolve-mx` answers (`( preference, exchange )`, served ascending by preference).
+  Only address + MX records are supported — the consumer-lane capability does exactly
+  `resolve-addr` + `resolve-mx` (there is no `resolve-txt`), so no other record type is
+  accepted.
 - **`upstream`** — a custom resolver `host:port` used, instead of the system resolver,
   for any name the static map does not answer. Absent ⇒ the system resolver.
 

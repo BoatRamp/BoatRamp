@@ -42,12 +42,12 @@ pub struct DnsResolveOverrideConfig {
     pub upstream: Option<String>,
 }
 
-/// One static override entry: a name and the records it answers with. `addrs` serves the A/AAAA
-/// (`resolve-addr`) lookup — v4 entries are A records, v6 are AAAA, exactly as the consumer-lane
-/// `resolve-addr` returns them combined — and `mx` serves the `resolve-mx` lookup. `txt` is accepted
-/// in the schema for completeness but is INERT today: the consumer-lane resolver trait exposes only
-/// address and MX resolution (there is no `resolve-txt`), so TXT overrides are reserved for a future
-/// capability rather than consulted now.
+/// One static override entry: a name and the records it answers with. Only ADDRESS + MX records are
+/// supported — the consumer-lane `DnsResolver` capability exposes exactly `resolve-addr` and
+/// `resolve-mx` (there is no `resolve-txt`), so TXT (and other record types) are deliberately omitted;
+/// a record type is added here only if/when the capability gains a lookup for it. `addrs` serves the
+/// A/AAAA (`resolve-addr`) lookup — v4 entries are A records, v6 are AAAA, exactly as the consumer lane
+/// returns them combined — and `mx` serves the `resolve-mx` lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StaticRecord {
@@ -59,9 +59,6 @@ pub struct StaticRecord {
     /// MX answers for `name` (the `resolve-mx` lookup), ascending preference is applied by the resolver.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mx: Vec<StaticMx>,
-    /// TXT answers — accepted but INERT on the consumer lane today (see the struct docs).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub txt: Vec<String>,
 }
 
 /// One static MX record (preference + mail-exchange host).
