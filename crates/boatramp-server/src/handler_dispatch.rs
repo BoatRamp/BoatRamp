@@ -523,6 +523,13 @@ pub(super) async fn dispatch_handler(
     // Ask B-1: split the opaque `bindings_us` into resolve vs binding-build vs messaging-build.
     let bindings_timing = std::sync::Arc::new(BindingsTiming::default());
     let t_bindings = std::time::Instant::now();
+    // Snapshot the request's query + headers for a `sealed-state` tenancy source (the pre-auth SSO
+    // callback). Owned so it outlives the borrow (the request is consumed into the serve lane below);
+    // the resolver reads the config-named param from it only when the route declares that source.
+    let state_params = crate::tenant_resolve::HttpStateParams {
+        query: request.uri().query().map(str::to_owned),
+        headers: request.headers().clone(),
+    };
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -565,6 +572,8 @@ pub(super) async fn dispatch_handler(
         Some(blob_timing.clone()),
         // Ask B-1: record the resolve / messaging-build sub-phase µs for the phase log.
         Some(bindings_timing.clone()),
+        // The `sealed-state` source reads the OIDC `state` from this request's query/headers.
+        Some(&state_params),
     )
     .await
     {
@@ -911,6 +920,9 @@ async fn resolve_gateway_caller_facts(
         signed_context: None,
         context_anchor: None,
         env_source: Some(inner.env_source()),
+        // The `sealed-state` source resolves on the plain-wasm site-handler path (the pre-auth SSO
+        // callback), not the federated `/graphql` gateway edge — fail closed here.
+        sealed_state: None,
     };
     // `imports_db = false`: the gateway component itself runs no `orm`/`sql` (it fans out); the
     // "undeclared tenancy refused under strict posture" check applies to a handler that DIRECTLY
@@ -2288,6 +2300,12 @@ pub(super) async fn build_bindings(
     // are recorded here so the dispatch path can split the opaque `bindings_us`. `None` on every
     // non-request lane ⇒ no sub-timing (identical behavior).
     bindings_timing: Option<std::sync::Arc<BindingsTiming>>,
+    // The request's query+header lookup for a `sealed-state` tenancy source (the pre-auth SSO
+    // callback). `Some` ONLY on the HTTP site-handler serving path; `None` on every background /
+    // function / test lane (the `sealed-state` source then resolves nothing — fail closed). Combined
+    // with a wired per-tenant secret store (which supplies the `[secrets]` envelope that unseals the
+    // token AND the real-tenant registry) to form the resolver's `SealedStateInputs`.
+    state_params: Option<&dyn crate::tenant_resolve::RequestParams>,
 ) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -2535,6 +2553,27 @@ pub(super) async fn build_bindings(
                         .get()
                         .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()))
                 });
+                // The `sealed-state` source (pre-auth SSO callback): built ONLY when the request
+                // carried a param lookup (HTTP serving lane) AND a per-tenant secret store is wired —
+                // the store supplies BOTH the `[secrets]` key envelope that unseals the token (the
+                // SAME AEAD it seals per-tenant secrets with, so no separate key store) AND the
+                // real-tenant registry (`TenantExists`). The project+site are THIS request's
+                // host-resolved scope, re-checked against the seal's bound (project, site). Absent any
+                // of these ⇒ `None` ⇒ the source fails closed.
+                let ss_store = inner.tenant_secret_store.get();
+                let ss_env = ss_store.map(|s| s.envelope());
+                let sealed_state = match (state_params, ss_store, ss_env.as_ref()) {
+                    (Some(params), Some(store), Some(env)) => {
+                        Some(crate::tenant_resolve::SealedStateInputs {
+                            params,
+                            env: &**env,
+                            project: project.as_str(),
+                            site,
+                            registry: &**store,
+                        })
+                    }
+                    _ => None,
+                };
                 let inputs = crate::tenant_resolve::TenantSourceInputs {
                     bearer,
                     domain_context,
@@ -2544,6 +2583,7 @@ pub(super) async fn build_bindings(
                     signed_context,
                     context_anchor: context_anchor.as_ref(),
                     env_source: Some(inner.env_source()),
+                    sealed_state,
                 };
                 crate::tenant_resolve::resolve_host_tenancy(
                     other,
@@ -3525,6 +3565,8 @@ impl ConsumerRebuild<'_> {
             // Ask-1 blob timing is request-lane only; the async consumer lane passes None (bare storage).
             None,
             // Ask B-1 bindings sub-timing is request-lane only; the consumer lane passes None.
+            None,
+            // The consumer/async lane carries no HTTP request params ⇒ no `sealed-state` source.
             None,
         )
         .await
@@ -4812,6 +4854,7 @@ mod consumer_dns_resolve_tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )

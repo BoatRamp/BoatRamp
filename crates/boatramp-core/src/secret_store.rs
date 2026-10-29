@@ -750,6 +750,40 @@ impl TenantSecretStore {
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         decode_record(raw.as_deref(), key)
     }
+
+    /// The `[secrets]` key envelope this store seals/unseals with — the SAME AEAD the `sealed-state`
+    /// tenancy source reuses for its state tokens (so there is no separate ad-hoc key store, and the
+    /// key is fleet-consistent). Cheap `Arc` clone.
+    #[must_use]
+    pub fn envelope(&self) -> Arc<dyn KeyEnvelope> {
+        self.envelope.clone()
+    }
+
+    /// Whether `tenant` is a **provisioned** tenant in `project`: it holds at least one secret name
+    /// in its per-`(project, tenant)` index. This is the concrete "is this a real tenant in the
+    /// project?" signal the `sealed-state` tenancy source requires before resolving an unsealed
+    /// tenant (defense in depth — the seal already proves host authenticity, but a decommissioned /
+    /// never-provisioned tenant must still fail closed). It is exactly aligned with the flow: a firm
+    /// doing confidential-RP SSO must have a provisioned per-firm `client_secret`, so a tenant with
+    /// no sealed secrets is not yet a usable SSO tenant. Keyed on the tenant prefix, so it can never
+    /// observe another tenant's names. A missing/empty index ⇒ `false` (fail closed). Validates the
+    /// tenant segment fail-closed first (an invalid segment is never a real tenant).
+    pub async fn tenant_exists(
+        &self,
+        project: ProjectRef<'_>,
+        tenant: &str,
+    ) -> Result<bool, SecretError> {
+        if validate_tenant(tenant).is_err() {
+            return Ok(false);
+        }
+        let idx_key = crate::deploy::keys::tenant_secret_index(project, tenant);
+        let raw = self
+            .kv
+            .get(&idx_key)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        Ok(!decode_index(raw.as_deref())?.names.is_empty())
+    }
 }
 
 /// Validate a `tenant` used as a KV key segment in the [`TenantSecretStore`]. Runs the

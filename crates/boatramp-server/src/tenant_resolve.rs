@@ -54,6 +54,131 @@ pub(crate) struct TenantSourceInputs<'a> {
     /// environment. `None` ⇒ the real process env ([`SystemEnv`](boatramp_core::env::SystemEnv)) —
     /// the default for a lane that carries no token (async/background), where it is never read.
     pub env_source: Option<&'a dyn boatramp_core::env::EnvSource>,
+    /// Inputs for the [`TenantSource::SealedState`] source (the pre-auth SSO callback): the request
+    /// param lookup, the host `[secrets]` key envelope that unseals the state token, the
+    /// host-resolved project+site (bound into the seal at mint, re-checked here), and the real-tenant
+    /// registry. `None` on any lane with no request params / no host envelope (async/background) ⇒
+    /// the `sealed-state` source resolves no value (fail-closed). Bundled so the whole capability is
+    /// present-or-absent atomically.
+    pub sealed_state: Option<SealedStateInputs<'a>>,
+}
+
+/// A request's parameter lookup surface for the `sealed-state` source — query params + headers. The
+/// serving path implements it over the live HTTP request; a background/async lane has no such params
+/// and passes no [`SealedStateInputs`] at all (the source then fails closed). A trait so the resolver
+/// is unit-testable with an in-memory map.
+pub(crate) trait RequestParams: Send + Sync {
+    /// The first value of query parameter `name` (already percent-decoded), or `None`.
+    fn query(&self, name: &str) -> Option<String>;
+    /// The value of request header `name` (case-insensitive), or `None`.
+    fn header(&self, name: &str) -> Option<String>;
+}
+
+/// A [`RequestParams`] over a live HTTP request's query string + headers — the serving-path impl the
+/// site-handler dispatch builds (an owned snapshot, so it borrows nothing from the request past the
+/// call). A header is read case-insensitively via `axum::http::HeaderMap`; a query parameter is split
+/// out of the stored query string and percent-decoded by [`decode_query_value`] (no extra dep — a
+/// URL-safe-base64 sealed token needs no decoding, but a correct decoder keeps the source general).
+pub(crate) struct HttpStateParams {
+    /// The raw query string (without the leading `?`), or `None`.
+    pub query: Option<String>,
+    /// A snapshot of the request headers.
+    pub headers: axum::http::HeaderMap,
+}
+
+impl RequestParams for HttpStateParams {
+    fn query(&self, name: &str) -> Option<String> {
+        let q = self.query.as_deref()?;
+        // First matching key wins (standard for a single-valued param like OIDC `state`).
+        for pair in q.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            if decode_query_value(k) == name {
+                return Some(decode_query_value(v));
+            }
+        }
+        None
+    }
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+}
+
+/// `application/x-www-form-urlencoded` value decode: `+` → space, `%XX` → byte, everything else
+/// verbatim. A malformed `%XX` is left literal (lossless, never a panic).
+fn decode_query_value(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Bridge the per-tenant secret store's provisioning signal into the [`TenantExists`] check: a tenant
+/// is real iff it holds at least one sealed secret name in its index. A backend error fails closed
+/// (`false`) — a source that cannot confirm the tenant resolves nothing.
+#[async_trait::async_trait]
+impl TenantExists for boatramp_core::secret_store::TenantSecretStore {
+    async fn exists(&self, project: &str, tenant: &str) -> bool {
+        self.tenant_exists(boatramp_core::project::ProjectRef::new(project), tenant)
+            .await
+            .unwrap_or(false)
+    }
+}
+
+/// Whether `tenant` is a real/provisioned tenant in `project` — the defense-in-depth check the
+/// `sealed-state` source applies to an unsealed tenant BEFORE resolving it. The AEAD seal already
+/// proves the tenant came from a host mint, but a decommissioned / never-provisioned tenant must
+/// still fail closed. The server wires this to the per-tenant secret store's index
+/// ([`TenantSecretStore::tenant_exists`](boatramp_core::secret_store::TenantSecretStore::tenant_exists));
+/// a test injects a set.
+#[async_trait::async_trait]
+pub(crate) trait TenantExists: Send + Sync {
+    /// `true` iff `tenant` is provisioned in `project`. Must fail closed (`false`) on any backend
+    /// error — a source that cannot confirm the tenant is real resolves nothing.
+    async fn exists(&self, project: &str, tenant: &str) -> bool;
+}
+
+/// Everything the [`TenantSource::SealedState`] source needs at the (pre-auth) callback. The
+/// `env`/`registry`/`params` are host-held references; `project`/`site` are THIS request's
+/// host-resolved scope (the values the seal was bound to at mint, re-checked by
+/// [`boatramp_core::sealed_state::unseal_state`]).
+#[derive(Clone, Copy)]
+pub(crate) struct SealedStateInputs<'a> {
+    /// Where the token rides (query/header), looked up by the config-named param.
+    pub params: &'a dyn RequestParams,
+    /// The host `[secrets]` key envelope (the SAME AEAD the per-tenant secret store seals with).
+    pub env: &'a dyn boatramp_core::envelope::KeyEnvelope,
+    /// This request's host-resolved project (re-checked against the seal's bound project).
+    pub project: &'a str,
+    /// This request's host-resolved site (re-checked against the seal's bound site).
+    pub site: &'a str,
+    /// The real-tenant registry (defense in depth).
+    pub registry: &'a dyn TenantExists,
 }
 
 /// The posture knobs that bound tenancy (read from the runtime's resolved [`SecurityPosture`]).
@@ -637,6 +762,58 @@ async fn resolve_value(
                     .tenant
                     .map(|t| ResolvedPrincipal::Tenant(boatramp_core::sql::SqlValue::Text(t))),
             }
+        }
+        // The pre-auth SSO callback's sealed `state`: verify + decrypt the named request param with
+        // the host `[secrets]` key envelope and extract the HOST-SEALED tenant (bound at login-start
+        // to the minting guest's OWN resolved tenant — the guest never names it). The tenant comes
+        // ONLY from the crypto seal, NEVER parsed from request text. A tampered / forged / expired /
+        // wrong-(project,site) / missing token resolves NO value — the scoped op then fails closed,
+        // never a fallback/default/first tenant. As a final belt, the unsealed tenant is validated to
+        // be a REAL provisioned tenant in the project. No `sealed_state` substrate on this lane (an
+        // async/background drain, or no `[secrets]` envelope wired) ⇒ fail closed.
+        TenantSource::SealedState { param } => {
+            use boatramp_core::tenancy::ParamKind;
+            let ss = inputs.sealed_state.as_ref()?;
+            let token = match param.kind {
+                ParamKind::Query => ss.params.query(&param.name),
+                ParamKind::Header => ss.params.header(&param.name),
+            }?;
+            let claims = match boatramp_core::sealed_state::unseal_state(
+                ss.env,
+                &token,
+                boatramp_core::time::now_unix(),
+                ss.project,
+                ss.site,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    // Uniform guest-facing outcome (no tenant → fail closed); the host logs the
+                    // precise reason so a misconfig/attack is a grep. Never logs the token or tenant.
+                    tracing::warn!(
+                        tenant_source = "sealed_state",
+                        outcome = %e,
+                        counter = "sealed_state_denied",
+                        "sealed-state: unseal refused (fail closed)"
+                    );
+                    return None;
+                }
+            };
+            // Defense in depth: the host-sealed tenant must be a REAL tenant in the project. A seal
+            // for a decommissioned / never-provisioned tenant (or a key-unsafe value) fails closed.
+            if !ss.registry.exists(ss.project, &claims.tenant).await {
+                tracing::warn!(
+                    tenant_source = "sealed_state",
+                    outcome = "unknown_tenant",
+                    counter = "sealed_state_denied",
+                    "sealed-state: unsealed tenant is not a provisioned tenant (fail closed)"
+                );
+                return None;
+            }
+            Some(ResolvedPrincipal::Tenant(
+                boatramp_core::sql::SqlValue::Text(claims.tenant),
+            ))
         }
         // Truly anonymous — no "own" tenant.
         TenantSource::None => None,
@@ -3238,5 +3415,308 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+}
+
+/// The ≥2-tenant **tenancy isolation gate** for the `sealed-state` source (PLAN-sealed-state-source).
+/// Drives the REAL path end to end — mint via [`boatramp_core::sealed_state::seal_state`], resolve via
+/// [`resolve_host_tenancy`] over a `SealedState` source — under the REAL `LocalKek` AES-256-GCM
+/// envelope (the same AEAD the per-tenant secret store uses), proving: a state minted for X resolves
+/// to X; a state minted for X can NEVER be turned into a resolution of Y; a tampered / forged /
+/// expired / wrong-(project,site) / unprovisioned / missing state resolves to NONE (fail-closed); and
+/// that the binding + expiry checks are MUTATION-SENSITIVE (neutering either turns the gate RED).
+#[cfg(test)]
+mod sealed_state_gate {
+    use super::{
+        RequestParams, SealedStateInputs, TenantExists, TenantPosture, TenantSourceInputs,
+        resolve_host_tenancy,
+    };
+    use crate::envelope::LocalKek;
+    use boatramp_core::sealed_state::{mint_claims, seal_state};
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::{
+        AccessMode, OnUnresolved, ParamKind, ScopeAxis, StateParam, Tenancy, TenantSource,
+    };
+
+    const PROJECT: &str = "acme";
+    const SITE: &str = "console";
+
+    /// Serializes the env-var mutation seam across the (few) binding/expiry-sensitive tests so the
+    /// process-global `BOATRAMP_SEALEDSTATE_MUTATION` can never bleed into a concurrent assertion.
+    static MUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct MapParams {
+        state: Option<String>,
+    }
+    impl RequestParams for MapParams {
+        fn query(&self, name: &str) -> Option<String> {
+            (name == "state").then(|| self.state.clone()).flatten()
+        }
+        fn header(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    struct Provisioned(Vec<String>);
+    #[async_trait::async_trait]
+    impl TenantExists for Provisioned {
+        async fn exists(&self, _project: &str, tenant: &str) -> bool {
+            self.0.iter().any(|t| t == tenant)
+        }
+    }
+
+    fn kek() -> LocalKek {
+        LocalKek::from_bytes([7u8; 32])
+    }
+
+    fn decision() -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SealedState {
+                param: StateParam {
+                    kind: ParamKind::Query,
+                    name: "state".into(),
+                },
+            }],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        }
+    }
+
+    /// Mint a state token for `tenant`, bound to (`project`, `site`), via the REAL AEAD seal.
+    async fn mint(
+        env: &LocalKek,
+        tenant: &str,
+        project: &str,
+        site: &str,
+        iat: u64,
+        ttl: u64,
+    ) -> String {
+        let claims = mint_claims(
+            project,
+            site,
+            tenant,
+            Some("pkce".into()),
+            Some("n".into()),
+            ttl,
+            iat,
+        );
+        seal_state(env, &claims).await.unwrap()
+    }
+
+    /// Resolve `token` at (`project`, `site`) with `provisioned` tenants, returning the resolved
+    /// own-tenant value (the `ScopeAxis::Tenant` fact), or `None` when nothing resolved (fail-closed).
+    async fn resolve(
+        env: &LocalKek,
+        token: Option<&str>,
+        project: &str,
+        site: &str,
+        provisioned: &[&str],
+    ) -> Option<String> {
+        let params = MapParams {
+            state: token.map(str::to_owned),
+        };
+        let registry = Provisioned(provisioned.iter().map(|s| s.to_string()).collect());
+        let inputs = TenantSourceInputs {
+            sealed_state: Some(SealedStateInputs {
+                params: &params,
+                env,
+                project,
+                site,
+                registry: &registry,
+            }),
+            ..Default::default()
+        };
+        let posture = TenantPosture {
+            require_declaration: true,
+            allow_cross_tenant: false,
+        };
+        let ht = resolve_host_tenancy(Some(&decision()), true, posture, inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        ht.facts()
+            .iter()
+            .find(|f| f.axis == ScopeAxis::Tenant)
+            .map(|f| match &f.value {
+                SqlValue::Text(s) => s.clone(),
+                other => panic!("tenant fact must be text, got {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn a_state_minted_for_x_resolves_to_x_and_for_y_to_y() {
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
+        let y = mint(&env, "firm-y", PROJECT, SITE, now, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, SITE, &["firm-x", "firm-y"]).await,
+            Some("firm-x".to_string()),
+            "X's sealed state resolves X"
+        );
+        assert_eq!(
+            resolve(&env, Some(&y), PROJECT, SITE, &["firm-x", "firm-y"]).await,
+            Some("firm-y".to_string()),
+            "Y's sealed state resolves Y (distinct) — the tenant rides the seal, not request text"
+        );
+    }
+
+    #[tokio::test]
+    async fn x_state_at_another_site_or_project_resolves_to_none() {
+        // THE cross-tenant/cross-surface isolation: a seal minted for site X can NEVER resolve at a
+        // different (project, site) — so one firm's login can't be replayed into another site's
+        // tenancy, even though the KEK is node-wide. Guarded by MUT (binding-sensitive).
+        let _g = MUT.lock().unwrap();
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, "other-site", &["firm-x"]).await,
+            None,
+            "a seal bound to site `console` must not resolve at site `other-site`"
+        );
+        assert_eq!(
+            resolve(&env, Some(&x), "other-proj", SITE, &["firm-x"]).await,
+            None,
+            "a seal bound to project `acme` must not resolve at project `other-proj`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_or_forged_or_missing_state_resolves_to_none() {
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
+
+        // Tampered: flip a byte in the middle of the token.
+        let mut b = x.clone().into_bytes();
+        let mid = b.len() / 2;
+        b[mid] = if b[mid] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(b).unwrap();
+        assert_eq!(
+            resolve(&env, Some(&tampered), PROJECT, SITE, &["firm-x"]).await,
+            None,
+            "a tampered state fails the AEAD tag → no tenant"
+        );
+
+        // Forged: minted under a DIFFERENT (attacker) key, resolved under the host key.
+        let attacker = LocalKek::from_bytes([9u8; 32]);
+        let forged = mint(&attacker, "firm-x", PROJECT, SITE, now, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&forged), PROJECT, SITE, &["firm-x"]).await,
+            None,
+            "a state sealed under a foreign key does not open under the host key → no tenant"
+        );
+
+        // Missing: no `state` param on the request at all.
+        assert_eq!(
+            resolve(&env, None, PROJECT, SITE, &["firm-x"]).await,
+            None,
+            "no state param → no tenant (never a fallback/default/first tenant)"
+        );
+
+        // Garbage that is not even base64url for the token.
+        assert_eq!(
+            resolve(
+                &env,
+                Some("!!! not-a-token !!!"),
+                PROJECT,
+                SITE,
+                &["firm-x"]
+            )
+            .await,
+            None,
+            "an unparseable state → no tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unprovisioned_tenant_resolves_to_none() {
+        // The seal is authentic, but the tenant is not a REAL tenant in the project (registry says
+        // no) → fail closed (defense in depth over the seal's authenticity).
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, SITE, &["firm-y"]).await,
+            None,
+            "a validly-sealed but unprovisioned tenant must not resolve"
+        );
+        // And with the empty registry nothing resolves either.
+        assert_eq!(resolve(&env, Some(&x), PROJECT, SITE, &[]).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_expired_state_resolves_to_none() {
+        let _g = MUT.lock().unwrap();
+        let env = kek();
+        // iat 1000s ago, ttl 300 ⇒ expired 700s ago.
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now - 1000, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, SITE, &["firm-x"]).await,
+            None,
+            "an expired state must not resolve"
+        );
+    }
+
+    // ---- mutation-sensitivity: neutering a fail-closed check turns the gate RED ----
+    // Gated behind `sealed-state-gate-mutation` (which enables `boatramp-core/sealed-state-gate-
+    // mutation`), because the core seam `sealed_state::mutation_skips` is active only under core's own
+    // `cfg(test)` OR that feature — and core compiles as a plain DEPENDENCY here (no `cfg(test)`). A
+    // dedicated CI lane runs `cargo test -p boatramp-server --features sealed-state-gate-mutation` to
+    // drive these, exactly like the `boatramp-storage` tenancy gate lanes. The core unit tests in
+    // `sealed_state.rs` prove the SAME two seams under core's native `cfg(test)`.
+
+    #[cfg(feature = "sealed-state-gate-mutation")]
+    #[tokio::test]
+    async fn mutation_skip_binding_opens_a_cross_site_resolution() {
+        let _g = MUT.lock().unwrap();
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now, 300).await;
+        // Baseline: cross-site is None.
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, "other-site", &["firm-x"]).await,
+            None
+        );
+        // Armed: neuter the per-(project,site) binding → the cross-site seal now resolves (RED).
+        // SAFETY: test-only env var; serialized by MUT.
+        unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_binding") };
+        let leaked = resolve(&env, Some(&x), PROJECT, "other-site", &["firm-x"]).await;
+        // SAFETY: test-only env var; serialized by MUT.
+        unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
+        assert_eq!(
+            leaked,
+            Some("firm-x".to_string()),
+            "neutering the binding check must let a cross-site seal resolve — the gate is live"
+        );
+    }
+
+    #[cfg(feature = "sealed-state-gate-mutation")]
+    #[tokio::test]
+    async fn mutation_skip_exp_opens_an_expired_resolution() {
+        let _g = MUT.lock().unwrap();
+        let env = kek();
+        let now = boatramp_core::time::now_unix();
+        let x = mint(&env, "firm-x", PROJECT, SITE, now - 1000, 300).await;
+        assert_eq!(
+            resolve(&env, Some(&x), PROJECT, SITE, &["firm-x"]).await,
+            None
+        );
+        // SAFETY: test-only env var; serialized by MUT.
+        unsafe { std::env::set_var("BOATRAMP_SEALEDSTATE_MUTATION", "skip_exp") };
+        let stale = resolve(&env, Some(&x), PROJECT, SITE, &["firm-x"]).await;
+        // SAFETY: test-only env var; serialized by MUT.
+        unsafe { std::env::remove_var("BOATRAMP_SEALEDSTATE_MUTATION") };
+        assert_eq!(
+            stale,
+            Some("firm-x".to_string()),
+            "neutering the expiry check must let an expired seal resolve — the gate is live"
+        );
     }
 }

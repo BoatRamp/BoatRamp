@@ -88,6 +88,13 @@ system-principal-gate-mutation = []
 # RED — proving the two-segment default scope is load-bearing. Compiled OUT of every real build (the
 # seam + gate test also compile under this crate's own `cfg(test)`).
 default-scope-gate-mutation = []
+# Anti-hollow gate lane for the `sealed-state` tenancy source (PLAN-sealed-state-source). Lets a test
+# / a downstream gate set `BOATRAMP_SEALEDSTATE_MUTATION` to disable ONE fail-closed check in
+# `sealed_state::unseal_state` — `skip_binding` (drop the per-(project,site) binding → a seal for site
+# X resolves at site Y), `skip_exp` (drop the expiry check → an expired seal still resolves), or
+# `skip_magic` (drop the domain-tag check) — turning the ≥2-tenant / fail-closed gate RED. Compiled
+# OUT of every real build (the seam also compiles under this crate's own `cfg(test)`).
+sealed-state-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

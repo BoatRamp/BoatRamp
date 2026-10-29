@@ -71,6 +71,7 @@ pub mod project_delta;
 /// trait node implements and the admin API / CLI consume.
 pub mod project_export;
 pub mod redact;
+pub mod sealed_state;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
 pub mod session;

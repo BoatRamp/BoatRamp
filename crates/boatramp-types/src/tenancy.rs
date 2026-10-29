@@ -71,10 +71,49 @@ pub enum TenantSource {
     /// unscoped). The guest never names a tenant. Wired since v0.4.3 (producer-stamp at publish +
     /// consumer resolution in `tenant_resolve.rs`).
     SignedContext,
+    /// Resolve the request tenant by UNSEALING an opaque request parameter — an AEAD-sealed **state
+    /// token** (the archetype: the OIDC `state` on a PRE-AUTH SSO callback). A host op mints the
+    /// token at login-start, binding the guest's OWN host-resolved tenant (the guest never names it);
+    /// at the pre-auth callback — which carries no bearer, no routed-tenant domain, so no other
+    /// source can resolve — this source verifies+decrypts the named `param` with the node's
+    /// `[secrets]` key envelope and extracts the host-bound tenant. The tenant comes from the crypto
+    /// seal, NEVER parsed from request text; a tampered / forged / expired / wrong-(project,site) /
+    /// missing token resolves **no** value (fail-closed, exactly like an unresolved token). See
+    /// [`boatramp_core::sealed_state`] and `PLAN-sealed-state-source`.
+    SealedState {
+        /// Where the sealed token rides on the request (the OIDC `state` is a `query` param on the
+        /// callback; `header` is available for non-redirect flows).
+        param: StateParam,
+    },
     /// Truly anonymous / non-token auth (funnel reads, HMAC webhooks): there is no "own" tenant,
     /// so only the `null`/`all` access modes are meaningful (an "own" mode fails closed).
     #[default]
     None,
+}
+
+/// Where a [`TenantSource::SealedState`] token rides on the request. A **plain struct** (not an
+/// internally-tagged enum) carrying a fieldless [`ParamKind`] + a `name`, so it round-trips cleanly
+/// through the RON↔JSON `ron::Value` bridge ([`de_opt_tenancy`]) — mirroring [`ClaimExtract`]'s
+/// `syntax`(fieldless)+`pattern` shape, which the bridge is known to handle. Config spelling:
+/// `param: (kind: "query", name: "state")`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateParam {
+    /// Whether the token is a query parameter or a request header.
+    pub kind: ParamKind,
+    /// The parameter / header name the token is read from (e.g. `state`).
+    pub name: String,
+}
+
+/// Which surface a [`StateParam`] names — a **fieldless** enum (like [`ExtractSyntax`]) so
+/// [`StateParam`] stays a flat, bridge-safe struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    /// A URL query-string parameter (`?state=…`) — the standard OIDC callback carrier.
+    Query,
+    /// A request header.
+    Header,
 }
 
 fn default_tid_claim() -> String {

@@ -1260,6 +1260,12 @@ pub(super) async fn build_function_bindings(
                         signed_context: None,
                         context_anchor: None,
                         env_source: Some(inner.env_source()),
+                        // The `sealed-state` source is wired on the SITE-HANDLER serving path
+                        // (`handler_dispatch::build_bindings`), the canonical home for a console's
+                        // pre-auth `/sso/callback` route. A top-level function resolving sealed-state
+                        // is a possible future extension (see PLAN-sealed-state-source); None here ⇒
+                        // the source fails closed on the function lane.
+                        sealed_state: None,
                     },
                 )
                 .await
