@@ -415,7 +415,15 @@ impl LocalSigner {
     /// Generate a fresh key for `alg`.
     pub fn generate(alg: TokenAlg) -> Self {
         match alg {
-            TokenAlg::Es256 => Self::Es256(p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)),
+            // P-256 (RustCrypto 0.14): the `Generate` trait's `generate()` draws from the system CSPRNG
+            // (`getrandom::SysRng`) and panics only if the OS RNG fails — the same fail-stop behavior as
+            // the old `SigningKey::random(&mut OsRng)` (now deprecated), with no direct rand_core dep.
+            TokenAlg::Es256 => {
+                use p256::elliptic_curve::Generate as _;
+                Self::Es256(p256::ecdsa::SigningKey::generate())
+            }
+            // Ed25519 (rand_core 0.6): `ed25519-dalek 2` is pinned to the rand_core 0.6 trait family,
+            // so its `generate` takes a 0.6 `OsRng` — unchanged by the P-256 migration.
             TokenAlg::Ed25519 => {
                 Self::Ed25519(ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng))
             }
@@ -509,10 +517,10 @@ impl TokenPublicKey {
     pub fn to_hex(&self) -> String {
         match self {
             Self::Es256(vk) => {
-                format!(
-                    "es256:{}",
-                    hex::encode(vk.to_encoded_point(true).as_bytes())
-                )
+                // ecdsa 0.17 renamed `to_encoded_point` → `to_sec1_point`. `true` = point
+                // compression, so this is the identical 33-byte compressed SEC1 point (0x02/0x03 ‖ x)
+                // the old code emitted — the on-wire trust anchor is byte-unchanged.
+                format!("es256:{}", hex::encode(vk.to_sec1_point(true).as_bytes()))
             }
             Self::Ed25519(vk) => format!("ed25519:{}", hex::encode(vk.as_bytes())),
         }
@@ -3068,6 +3076,121 @@ mod tests {
         ));
     }
 
+    /// Negative-path hardening for the ES256 migration: a truncated signature, a tampered payload
+    /// (distinct from the signature), and malformed/out-of-range raw signatures must ALL be rejected
+    /// fail-closed. A migration that silently weakened verification (e.g. accepting a short or
+    /// all-zero signature) would light this up.
+    #[tokio::test]
+    async fn es256_rejects_truncated_tampered_and_malformed_signatures() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        let token = mint(&claims(), &signer).await.unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&token)
+            .unwrap();
+
+        // (a) Truncating the trailing ES256 signature → rejected (never silently accepted).
+        for cut in [1usize, 8, 32, 64] {
+            let mut t = raw.clone();
+            t.truncate(t.len() - cut);
+            let tok = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&t);
+            assert!(
+                verify(&tok, &pubkey, NOW).is_err(),
+                "a signature truncated by {cut} bytes must be rejected"
+            );
+        }
+
+        // (b) Tampering a PAYLOAD byte (not the signature): the signed `ToBeSigned` no longer matches
+        // the signature. The flipped byte sits in the middle third — past the 2-byte tag + protected
+        // header and before the trailing 64-byte signature — so this exercises payload integrity, not
+        // the separate signature-tamper case already covered above.
+        let mut tp = raw.clone();
+        let idx = raw.len() / 3;
+        tp[idx] ^= 0x01;
+        let tok = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tp);
+        assert!(
+            verify(&tok, &pubkey, NOW).is_err(),
+            "a tampered payload byte must be rejected"
+        );
+
+        // (c) The low-level verifier rejects malformed / out-of-range raw signatures fail-closed —
+        // never a panic, never an accept.
+        let tbs = b"boatramp es256 verify fixture";
+        assert!(pubkey.verify(tbs, &[]).is_err(), "empty signature");
+        assert!(
+            pubkey.verify(tbs, &[0u8; 10]).is_err(),
+            "too-short signature"
+        );
+        assert!(
+            pubkey.verify(tbs, &[0u8; 64]).is_err(),
+            "all-zero r||s is not a valid signature"
+        );
+        assert!(
+            pubkey.verify(tbs, &[0xffu8; 64]).is_err(),
+            "out-of-range r||s is not a valid signature"
+        );
+        assert!(
+            pubkey.verify(tbs, &[0u8; 100]).is_err(),
+            "over-long signature"
+        );
+    }
+
+    /// Wire-compatibility KAT for the p256 0.13 → 0.14 migration. The vector below (public key +
+    /// role token) was minted by the PRE-migration p256 0.13 ecosystem from the fixed private scalar
+    /// `0x42…42` (captured once via a throwaway `dump_old_wire_vector` test at the parent commit).
+    /// ES256/COSE is a stable on-the-wire standard and this change is API-only, so:
+    ///   * the compressed-SEC1 public-key encoding (the config trust anchor) must be byte-identical, and
+    ///   * a token signed by p256 0.13 must still verify under p256 0.14 (ECDSA verification is a
+    ///     cross-implementation standard — there is no version-specific encoding).
+    ///
+    /// If verification had been weakened or the key/signature encoding changed, this test fails.
+    #[test]
+    fn es256_wire_compatible_with_p256_0_13_ecosystem() {
+        const OLD_PRIV: &str =
+            "es256:4242424242424242424242424242424242424242424242424242424242424242";
+        const OLD_PUB: &str =
+            "es256:033ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90af";
+        const OLD_TOKEN: &str = "0oRDoQEmoFhNpQQaZVP_EAYaZVPxAAdQF2ifvu6xifOH1SWoT0-ezmhicl9yb2xlc4KBZWFkbWlugmlwdWJsaXNoZXJkYmxvZ2dicl9raW5kZHJvbGVYQKxi52ekr8mjJnEgRyNxqRL9wCpRyudVRDhP2jQRqHbTdlLd_EjE3pnFrJ_0iqqbyavNiuX0DSFGevuxB6Rnsk0";
+
+        // 1) Key encoding unchanged: the same scalar re-loaded under p256 0.14 yields the same
+        //    compressed-SEC1 trust anchor the old code wrote.
+        let signer = LocalSigner::from_private_hex(OLD_PRIV).unwrap();
+        assert_eq!(
+            signer.public_key().to_hex(),
+            OLD_PUB,
+            "compressed-SEC1 public-key encoding must be byte-identical across the migration"
+        );
+
+        // 2) The old-ecosystem public key parses (the `from_sec1_bytes` path) and round-trips.
+        let public = TokenPublicKey::from_hex(OLD_PUB).unwrap();
+        assert_eq!(public.to_hex(), OLD_PUB);
+
+        // 3) The old (p256 0.13) token verifies under the new (p256 0.14) verifier with the exact
+        //    expected claims — the core old→new interop guarantee.
+        let v = verify(OLD_TOKEN, &public, NOW + 60).unwrap();
+        assert_eq!(v.kind, "role");
+        assert_eq!(
+            v.roles,
+            vec![
+                GrantedRole::global("admin"),
+                GrantedRole::scoped("publisher", "blog"),
+            ]
+        );
+        assert_eq!(v.exp, Some(NOW + 3600));
+
+        // 4) It also verifies against the key re-derived from the private scalar (same identity).
+        verify(OLD_TOKEN, &signer.public_key(), NOW + 60).unwrap();
+
+        // 5) The verifier is genuinely live on the old token: past `exp` it is rejected (not a no-op
+        //    accept), and a stranger key is rejected.
+        assert!(matches!(
+            verify(OLD_TOKEN, &public, NOW + 4000),
+            Err(TokenError::Expired)
+        ));
+        let stranger = LocalSigner::generate(TokenAlg::Es256).public_key();
+        assert!(verify(OLD_TOKEN, &stranger, NOW + 60).is_err());
+    }
+
     #[tokio::test]
     async fn bearer_join_token_round_trips_and_yields_a_single_use_jti() {
         let signer = LocalSigner::generate(TokenAlg::Es256);
@@ -3194,7 +3317,8 @@ mod tests {
         // Sign a message, then check the DER→raw conversion equals the native raw
         // form — the transform every DER-returning KMS (AWS/GCP) relies on.
         use p256::ecdsa::signature::Signer as _;
-        let sk = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        use p256::elliptic_curve::Generate as _;
+        let sk = p256::ecdsa::SigningKey::generate();
         let sig: p256::ecdsa::Signature = sk.sign(b"boatramp cose kms");
         let der = sig.to_der();
         let raw = super::p256_der_sig_to_raw(der.as_bytes()).unwrap();

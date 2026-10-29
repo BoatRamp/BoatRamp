@@ -187,4 +187,46 @@ mod tests {
             KernelTrustError::BadSignature
         );
     }
+
+    /// Migration hardening: under strict posture a MALFORMED or TRUNCATED signature (valid hex, but
+    /// not a valid ES256 signature over the hash) must be rejected `BadSignature` — never accepted,
+    /// never a panic. A verify path weakened by the p256 0.14 migration would surface here.
+    #[tokio::test]
+    async fn strict_rejects_a_truncated_or_bit_flipped_signature() {
+        let bytes = b"a microvm vmlinux";
+        let hash = boatramp_types::manifest::sha256_hex(bytes);
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let good = signer.sign(hash.as_bytes()).await.unwrap();
+        let pubkey = signer.public_key().to_hex();
+
+        // One byte short → not a 64-byte ES256 r‖s → rejected.
+        let kref = kref_for(bytes, Some(hex::encode(&good[..good.len() - 1])));
+        assert_eq!(
+            verify_kernel(
+                bytes,
+                &kref,
+                true,
+                std::slice::from_ref(&pubkey),
+                std::slice::from_ref(&hash),
+            )
+            .unwrap_err(),
+            KernelTrustError::BadSignature
+        );
+
+        // Right length, flipped bits → a well-formed but wrong signature → rejected.
+        let mut flipped = good.clone();
+        flipped[0] ^= 0xff;
+        let kref = kref_for(bytes, Some(hex::encode(&flipped)));
+        assert_eq!(
+            verify_kernel(
+                bytes,
+                &kref,
+                true,
+                std::slice::from_ref(&pubkey),
+                std::slice::from_ref(&hash),
+            )
+            .unwrap_err(),
+            KernelTrustError::BadSignature
+        );
+    }
 }
