@@ -1809,7 +1809,7 @@ mod tests {
     /// reason as the ORM batteries; the `test-target-plain-wasm` CI job runs it unignored on the host
     /// toolchain and greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine() {
         use boatramp_core::orm::{
             CmpOp, Expr, Func, Join, JoinKind, Predicate, Select, SelectItem,
@@ -2089,7 +2089,7 @@ mod tests {
     /// `#[ignore]`d (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-target-plain-wasm` CI job runs it +
     /// greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_or_base_folds_shared_base_on_own_and_target_on_a_real_engine() {
         use boatramp_core::orm::{Expr, ScopeMode, Select, SelectItem, TableKeys};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
@@ -2281,7 +2281,7 @@ mod tests {
     /// write are all refused. `#[ignore]`d (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-target-plain-wasm`
     /// CI job runs it unignored and greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_writes_confine_to_b_public_subset_on_a_real_engine() {
         use boatramp_core::orm::{Assignment, CmpOp, Delete, Expr, Insert, Predicate, RowValues};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
@@ -2665,7 +2665,7 @@ mod tests {
     /// rows), so the derived tenant can never be one the caller couldn't already reach. `#[ignore]`d
     /// (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-target-plain-wasm` CI job runs it + greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_attach_reference_derives_tenant_from_a_reachable_parent_on_a_real_engine()
      {
         use boatramp_core::orm::{Assignment, AttachReference, Expr, compile_attach_reference};
@@ -2825,7 +2825,7 @@ mod tests {
     /// tenant A's. Proves the exemption does not widen past the one tenant `B`. `#[ignore]`d
     /// (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-target-plain-wasm` CI job runs it + greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_capability_confines_to_tenant_b_without_a_subset_on_a_real_engine() {
         use boatramp_core::orm::{CmpOp, Expr, Predicate, Select, SelectItem};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
@@ -3057,7 +3057,7 @@ mod tests {
     /// control: the same capability is INERT at another project (no cross-project redeem). `#[ignore]`d
     /// (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-target-plain-wasm` CI job runs it + greps the marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn plain_wasm_target_capability_context_roundtrips_sub_on_a_real_engine() {
         use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_capability};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
@@ -3234,7 +3234,7 @@ mod tests {
     /// `#[ignore]`d locally (the former static-musl libsql concurrency bug, now fixed); the `test-target-plain-wasm` CI job
     /// runs it unignored on the static-musl target and greps `TENANCY OVERRIDE THREE-KEY OK`.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-target-plain-wasm CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn ceiling_exception_three_key_truth_table_on_a_real_engine() {
         use boatramp_core::orm::{Expr, Select, SelectItem};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};

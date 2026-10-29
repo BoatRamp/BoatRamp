@@ -292,7 +292,7 @@ slatedb = "0.16"
 # behind the `sql` feature). libsql = SQLite-compatible; an embedded local file
 # (single-node) or remote/embedded-replica to a shared sqld primary (cluster).
 # Drop the heavy replication/sync default features.
-libsql = { version = "0.9", default-features = false, features = [
+libsql = { version = "0.10", default-features = false, features = [
   "core",
   "remote",
   "tls",
@@ -305,7 +305,7 @@ libsql = { version = "0.9", default-features = false, features = [
 # crate's PRE-GENERATED bindings — no libclang at build time, so musl-safe) for the
 # libsql changeset true-delta engine (SQL true-delta program, Stage 4). Off by
 # default; the managed/CI build opts it in.
-libsql-ffi = { version = "0.9", default-features = false, features = [
+libsql-ffi = { version = "0.10", default-features = false, features = [
   "session",
   "preupdate_hook",
 ] }

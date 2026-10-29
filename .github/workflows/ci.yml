@@ -2355,56 +2355,6 @@ jobs:
           grep -q 'DEPLOY-RESILIENCE ASYNC/BATCH OK' deployres.log \
             || { echo "::error::deploy-resilience async/batch invariant never reached its marker (an unvalidated component activated or served, a lost old version, or a half-promoted/over-bumped batch)" >&2; exit 1; }
 
-  # libsql embedded-SQLite exec-serialization gate (static-musl concurrency fix), MUTATION-VERIFIED.
-  # ROOT CAUSE: on the fully-static musl target, concurrent execution of libsql's bundled SQLite
-  # across threads corrupts process-global memory even though libsql selects the serialized threading
-  # mode — a captured core showed the fault in `sqlite3DbMallocRawNN` (a connection's lookaside) while
-  # another thread was mid-`PRAGMA journal_mode=WAL` journal commit on a DIFFERENT connection; a
-  # dropped (read-only) transaction's CLOSE racing another thread's statement is the same race. Fixed
-  # by `boatramp_storage::sql_libsql`'s `local_sql_lock` (embedded-SQLite execution AND close
-  # serialized process-wide in local mode). This gate drives the exact faulting pattern (20 threads,
-  # each the full open(WAL)/begin/DDL/insert/commit/read cycle on its own local DB) on the shipped
-  # static-musl target, and proves the serialization is LOAD-BEARING: with it the heavy run is clean
-  # (marker), and with the `libsql-execlock-gate-mutation` seam bypassing the lock the SAME run MUST
-  # fault (SIGSEGV / SQLITE_MISUSE). Mirrors the other mutation-gate lanes.
-  test-libsql-exec-serialization:
-    name: test (libsql exec-serialization — static-musl concurrency fix)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-libsql-exec-serialization-musl
-      - name: "libsql exec-serialization gate (static-musl; mutation-verified)"
-        run: |
-          set -eo pipefail
-          # NORMAL (fix in force): the heavy concurrent workload must run CLEAN on static-musl and
-          # reach the marker. A modest round budget suffices — the serialized engine is deterministic
-          # (and WAL fsyncs make each serialized cycle costly, so keep the normal budget small).
-          GATE_ROUNDS=120 cargo-zigbuild test --target x86_64-unknown-linux-musl \
-            -p boatramp-storage --features sql --test libsql_exec_serialization_gate \
-            -- --ignored --exact libsql_exec_serialization_gate --nocapture 2>&1 | tee execgate.log
-          grep -q 'LIBSQL EXEC-SERIALIZATION GATE OK' execgate.log \
-            || { echo "::error::libsql exec-serialization gate did not reach its OK marker (the static-musl concurrency fix regressed, or the test was skipped)" >&2; exit 1; }
-          # MUTATION (`libsql-execlock-gate-mutation` + env bypasses the exec lock): the SAME workload
-          # MUST fault (a SIGSEGV, or a collected SQLITE_MISUSE → the test panics), so the run is
-          # EXPECTED to exit non-zero. A passing (exit 0) mutation run means the serialization is NOT
-          # load-bearing. The larger round budget makes the race near-certain; the test breaks on the
-          # first fault, so it is fast when the bug reproduces.
-          if BOATRAMP_LIBSQL_EXECLOCK_MUTATE=1 GATE_ROUNDS=4000 cargo-zigbuild test \
-            --target x86_64-unknown-linux-musl -p boatramp-storage \
-            --features sql,libsql-execlock-gate-mutation --test libsql_exec_serialization_gate \
-            -- --ignored --exact libsql_exec_serialization_gate --nocapture > execgate-mut.log 2>&1; then
-            echo "::error::MUTATION NOT CAUGHT: bypassing the embedded-SQLite exec lock did NOT fault — the serialization is not load-bearing" >&2
-            tail -20 execgate-mut.log >&2; exit 1
-          fi
-          if grep -q 'MUTATION NOT DETECTED' execgate-mut.log; then
-            echo "::error::libsql exec-serialization mutation did not reproduce the race within GATE_ROUNDS — raise the budget (the gate must reliably reproduce the static-musl race)" >&2
-            exit 1
-          fi
-          echo "libsql exec-serialization gate OK: serialized run clean, and bypassing the lock reproduces the static-musl race (load-bearing)"
-
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder
   # style ($N on PG, ? on MySQL); a per-dialect rendering bug in the SCOPED predicate could drop

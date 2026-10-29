@@ -586,7 +586,7 @@ mod tests {
     /// former static-musl concurrency bug now fixed); the `test-gdc-target` CI job runs it
     /// unignored on the static-musl target and greps the success marker.
     #[tokio::test]
-    #[ignore = "heavy libsql battery; run via the test-gdc-target CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run via the test-gdc-target CI job on the static-musl target (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn gdc_target_read_isolates_to_b_public_subset_on_a_real_engine() {
         use super::super::introspect::introspect_sqlite;
         use super::super::policy::{ResolvedTerm, RowOp, TargetScope, TargetTable};

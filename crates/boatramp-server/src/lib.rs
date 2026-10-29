@@ -7152,7 +7152,7 @@ mod tests {
     /// libsql segfault); the CI job runs it on the static-musl target + greps `STREAM SQL-MEMBERSHIP OK`.
     #[cfg(feature = "oidc")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI stream-sql-membership gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI stream-sql-membership gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn scoped_stream_sql_membership_isolates_mailboxes() {
         use base64::Engine;
         use boatramp_core::config::{
@@ -7292,7 +7292,7 @@ mod tests {
     /// fails closed (the pre-v0.4.6 behavior — never a leak). `#[ignore]`d (heavy libsql battery;
     /// former static-musl concurrency bug now fixed); the CI job runs it on the static-musl target + greps the marker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI graphql-propagation gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI graphql-propagation gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn graphql_run_propagates_caller_principal_to_a_scoped_subfetch() {
         use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
@@ -7460,7 +7460,7 @@ mod tests {
     /// rows); with no resolved target it fails closed. `#[ignore]`d (heavy libsql battery; former static-musl concurrency bug now fixed); the
     /// CI job runs it on the static-musl target + greps the marker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-target gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-target gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn gateway_forces_target_confinement_onto_a_wasm_subgraph() {
         use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
@@ -7651,7 +7651,7 @@ mod tests {
     /// nothing). `#[ignore]`d (heavy libsql battery; former static-musl concurrency bug now fixed); the CI job runs it on the static-musl target
     /// + greps the marker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-own-propagation gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-own-propagation gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn gateway_propagates_caller_own_principal_to_a_wasm_subgraph() {
         use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
@@ -7799,7 +7799,7 @@ mod tests {
     /// private (non-public) row. Drives the REAL gateway → invoke_target → libsql over the probe.
     /// `#[ignore]`d (heavy libsql battery; former static-musl concurrency bug now fixed); the CI job runs it on the static-musl target.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-target gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI gateway-target gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn gateway_target_or_null_includes_the_shared_base() {
         use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
@@ -7980,7 +7980,7 @@ mod tests {
     /// deploy-resilience gate runs it on the static-musl target and greps the success marker, so a
     /// silent skip fails the job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "heavy libsql battery; run on the static-musl target in the CI deploy-resilience gate (the embedded-SQLite exec-serialization fix makes musl sound)"]
+    #[ignore = "heavy libsql battery; run on the static-musl target in the CI deploy-resilience gate (libsql 0.10.0 fixes the former static-musl connection double-free)"]
     async fn async_deploy_never_activates_or_serves_an_unvalidated_component() {
         use crate::function_api::{DeployStatus, run_async_deploy};
         use boatramp_core::deploy::{DeployStore, sha256_hex};
