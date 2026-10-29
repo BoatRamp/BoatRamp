@@ -25,6 +25,7 @@ handlers = [
   "boatramp-handlers/invoke",
   "boatramp-handlers/graphql",
   "boatramp-handlers/tenant-secrets",
+  "boatramp-handlers/sealed-state",
   "dep:chrono",
   "dep:async-graphql-parser",
   "dep:async-graphql-value",
@@ -190,6 +191,15 @@ compute-messaging-shim-gate-mutation = []
 # project would re-collide with the reserved default's own two-segment scope). Compiled OUT of every
 # real build (the seam also lives under this crate's own `cfg(test)`, so the in-crate gate arms it).
 default-scope-gate-mutation = []
+
+# Anti-hollow gate lane for the `sealed-state` tenancy source (PLAN-sealed-state-source). Forwards to
+# `boatramp-core/sealed-state-gate-mutation` so the core seam `sealed_state::mutation_skips` is active
+# when the server's ≥2-tenant isolation gate (`tenant_resolve::sealed_state_gate`) runs under this
+# feature — letting a dedicated CI lane set `BOATRAMP_SEALEDSTATE_MUTATION` to neuter the
+# per-(project,site) binding (`skip_binding`) or the expiry (`skip_exp`) and prove the gate goes RED.
+# The functional isolation tests in that module run without this feature; the mutation tests are
+# `#[cfg(feature = "sealed-state-gate-mutation")]`. Compiled OUT of every real build.
+sealed-state-gate-mutation = ["boatramp-core/sealed-state-gate-mutation"]
 
 # TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
 # (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised

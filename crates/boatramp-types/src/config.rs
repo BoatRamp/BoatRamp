@@ -522,6 +522,18 @@ pub fn is_named_blob_upload_import(import: &str) -> bool {
     matches!(import, "blob-upload:write" | "blob-upload:multipart")
 }
 
+/// Whether `import` is a **sealed-state mint** grant (PLAN-sealed-state-source): `sealed-state:mint`
+/// grants the guest the `mint` op on the `boatramp:handlers/sealed-state` capability — minting an
+/// AEAD-sealed state token bound to THIS invocation's host-resolved tenant+project+site (for a later
+/// pre-auth SSO callback to resolve via the `sealed-state` tenancy source). A bare `sealed-state` is
+/// deliberately NOT a grant (name the specific right, deny-by-default / least-privilege), and there
+/// is no `sealed-state:*`. A typo (e.g. `sealed-state:seal`) is not recognized here and so fails at
+/// deploy. Parse-time recognition ONLY: the ABI/`requires` gate + the runtime grant still enforce
+/// host support + the grant at activation.
+pub fn is_named_sealed_state_import(import: &str) -> bool {
+    matches!(import, "sealed-state:mint")
+}
+
 fn check_import(import: &str) -> Result<(), ConfigError> {
     // `session` is accepted here (client-side cfg vocabulary) but is intentionally NOT in
     // `KNOWN_IMPORTS`: a session route grants the session binding intrinsically, and the host
@@ -545,6 +557,10 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // the above, intentionally NOT in `KNOWN_IMPORTS`: the host advertises the capability as
     // Experimental only when the `blob-upload` feature is compiled, so the `requires` ABI gate enforces
     // host support at activation while a deploy targeting any host build still parses offline.
+    // `sealed-state:mint` (PLAN-sealed-state-source — mint an AEAD-sealed login-start state token) is
+    // accepted here but, like the above, intentionally NOT in `KNOWN_IMPORTS`: the host advertises the
+    // capability as Experimental only when the `sealed-state` feature is compiled, so the `requires`
+    // ABI gate enforces host support at activation while a deploy targeting any host build still parses.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
         || import == "tenancy"
@@ -553,11 +569,12 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
         || is_named_admin_import(import)
         || is_named_tenant_secrets_import(import)
         || is_named_blob_upload_import(import)
+        || is_named_sealed_state_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, an admin surface `admin:{{domains,email,site,secrets}}`, a tenant-secret right `tenant-secrets:{{read,admin}}`, or a blob-upload right `blob-upload:{{write,multipart}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, an admin surface `admin:{{domains,email,site,secrets}}`, a tenant-secret right `tenant-secrets:{{read,admin}}`, a blob-upload right `blob-upload:{{write,multipart}}`, or a sealed-state right `sealed-state:mint`",
             KNOWN_IMPORTS.join(", ")
         )))
     }

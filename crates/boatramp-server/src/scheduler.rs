@@ -1051,6 +1051,8 @@ pub(super) async fn run_scheduler_tick(
                                 None,
                                 // Ask B-1 bindings sub-timing is request-lane only; background triggers pass None.
                                 None,
+                                // Background trigger (cron tick) carries no HTTP request ⇒ no `sealed-state`.
+                                None,
                             )
                             .await
                             {
@@ -1538,6 +1540,8 @@ async fn fire_cron(
         // Ask-1 blob timing is request-lane only; the cron trigger passes None (bare storage).
         None,
         // Ask B-1 bindings sub-timing is request-lane only; the cron trigger passes None.
+        None,
+        // The cron trigger carries no HTTP request ⇒ no `sealed-state` source.
         None,
     )
     .await

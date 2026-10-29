@@ -75,6 +75,7 @@ pub mod project_delta;
 pub mod project_export;
 pub mod redact;
 pub mod registry_auth;
+pub mod sealed_state;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
 pub mod session;

@@ -505,7 +505,7 @@ pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), 
     if sources_mix_is_forbidden(sources) {
         return Err(ConfigError::pattern(
             "sources",
-            "a token source declares a `namespace`, so every tenant-producing source on this route must also be namespaced — do not mix a namespaced token with a plain (un-namespaced) token, a domain source, or a signed-context source on the same tenant column (they would share one flat key space)"
+            "a token source declares a `namespace`, so every tenant-producing source on this route must also be namespaced — do not mix a namespaced token with a plain (un-namespaced) token, a domain source, a signed-context source, or a sealed-state source on the same tenant column (they would share one flat key space)"
                 .to_string(),
         ));
     }
@@ -534,7 +534,11 @@ pub fn sources_mix_is_forbidden(sources: &[crate::tenancy::TenantSource]) -> boo
                 namespace: None, ..
             }
             | TenantSource::Domain
-            | TenantSource::SignedContext => any_unnamespaced = true,
+            | TenantSource::SignedContext
+            // A sealed-state source produces an un-namespaced tenant key (the host-sealed tenant), so
+            // it shares the flat key space exactly like a domain / signed-context source — mixing it
+            // with a namespaced token is the same cross-tenant-collision hazard, refused identically.
+            | TenantSource::SealedState { .. } => any_unnamespaced = true,
             TenantSource::None => {}
         }
     }

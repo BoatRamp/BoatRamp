@@ -27,6 +27,17 @@ const MAGIC: &[u8; 4] = b"BRK1";
 const KEK_LEN: usize = 32;
 
 /// AES-256-GCM envelope under a machine-local key-encryption key (KEK).
+///
+/// **Rotation guard — sealed-state tokens (PLAN-sealed-state-source).** This same envelope also seals
+/// the short-lived `sealed-state` login tokens (`boatramp_core::sealed_state`), whose whole
+/// anti-replay story rests on a ≤[`MAX_STATE_TTL_SECS`](boatramp_core::sealed_state::MAX_STATE_TTL_SECS)
+/// (15 min) window. There is NO previous-key fallback today (a single active KEK). IF one is ever
+/// added here to make secrets-at-rest KEK rotation seamless, it MUST NOT silently apply to
+/// sealed-state tokens: a captured ≤15-min `state` plus a leaked OLD KEK must HARD-FAIL to unseal
+/// after a rotation, never resolve a tenant. Concretely, a previous-key path must either refuse
+/// sealed-state (domain-tag `BRSS1\0`) blobs outright, or bound previous-key acceptance to strictly
+/// LESS than `MAX_STATE_TTL_SECS` — otherwise rotation would widen the replay window the TTL exists to
+/// cap. When such a fallback lands, add the asserting test (an old-KEK state fails closed post-rotation).
 pub struct LocalKek {
     kek: [u8; KEK_LEN],
 }
