@@ -92,6 +92,114 @@ async fn s3_round_trip_and_range() {
     ));
 }
 
+/// PERF GATE (image-serve-latency Ask 3c — `CONCURRENT-COLD FAN-OUT`): N **concurrent cold** `/img`
+/// fetches through the REAL S3 backend must FAN OUT, not serialize at the `aws_sdk_s3` connector.
+///
+/// This exercises the real op (a real `aws_sdk_s3` client, a real TCP/TLS connection to a real
+/// S3-compatible endpoint), never a warm/local micro-bench — the `benchmark-must-exercise-real-path`
+/// rule: a localhost MinIO run is a functional + coarse fan-out smoke; the NODE run against Tigris
+/// (real cold-connect latency) is AUTHORITATIVE and is where this gate bites.
+///
+/// **Cold** means the connection pool is EMPTY when the burst fires. The object MUST already exist
+/// (seed it out-of-band — the CI tier uploads it with `mc`/`aws` and names it in
+/// `BOATRAMP_TEST_S3_COLD_KEY`) so the burst is the FIRST S3 op the process makes; absent that env the
+/// test seeds one itself and runs the same fan-out assertion as a warm smoke (clearly logged).
+///
+/// The fan-out assertion is latency-RATIO based, so it holds regardless of absolute speed: if the
+/// connector serialized the N concurrent cold fetches, the last-scheduled request waits behind all the
+/// others, so its latency ≈ N × a single op (the max/median ratio ≈ N). Fanned out ⇒ every request
+/// pays ~one op (ratio ≈ 1). The gate fails if the max is anywhere near N× the median. Prints the
+/// distribution and `CONCURRENT-COLD FAN-OUT OK` ONLY after the assertion holds (anti-silent-skip).
+///
+/// Run: the same env as `s3_round_trip_and_range`, plus ` -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live S3/MinIO perf gate: concurrent cold fetches must fan out"]
+async fn concurrent_cold_fetches_fan_out() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let Some(options) = options() else {
+        eprintln!("skip: set BOATRAMP_TEST_S3_ENDPOINT + BOATRAMP_TEST_S3_BUCKET (+ AWS_* creds)");
+        return;
+    };
+    let storage = Arc::new(S3Storage::connect(options).await);
+
+    // A ~12 KB object — a representative `/img` webp derivative. Prefer a pre-seeded key (so the burst
+    // is genuinely COLD — the first op this process makes); else seed one (warm smoke).
+    const SIZE: usize = 12 * 1024;
+    let (key, cold) = match std::env::var("BOATRAMP_TEST_S3_COLD_KEY").ok() {
+        Some(k) => (k, true),
+        None => {
+            let k = "zz/cold-fanout-12k.webp".to_string();
+            let seed = vec![0x42u8; SIZE];
+            let body: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(seed)) }).boxed();
+            storage.put(&k, body, PutMeta::default()).await.unwrap();
+            eprintln!(
+                "note: BOATRAMP_TEST_S3_COLD_KEY unset — seeded {k} (pool now WARM; this is a smoke run, \
+                 not a true cold measurement)"
+            );
+            (k, false)
+        }
+    };
+
+    // The burst is the FIRST read (cold pool when `cold`). Each task times ITS OWN get_range: under a
+    // serializing connector, tasks complete in sequence so later tasks see a growing latency.
+    const N: usize = 16;
+    let start = Instant::now();
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let s = storage.clone();
+            let k = key.clone();
+            tokio::spawn(async move {
+                let t = Instant::now();
+                let obj = s.get_range(&k, 0, None).await.expect("get_range");
+                let got = collect(obj.body).await;
+                assert!(!got.is_empty(), "object must exist + be non-empty");
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+        })
+        .collect();
+    let mut ms: Vec<f64> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    let wall = start.elapsed().as_secs_f64() * 1000.0;
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = ms[ms.len() / 2].max(0.001);
+    let max = *ms.last().unwrap();
+    println!(
+        "concurrent-cold fan-out: cold={cold} N={N} wall={wall:.1}ms \
+         per_get[median={median:.1} max={max:.1} ratio={:.1}x]",
+        max / median
+    );
+
+    // Fan-out gate. A serializing connector makes `max ≈ N × median`; fanned out makes `max ≈ median`.
+    // Require the max well below N× (generous factor + a small absolute slop for near-zero localhost
+    // medians), so the gate tolerates localhost scheduling noise yet fails loudly on real serialization.
+    let factor = (N as f64 / 2.0).max(4.0);
+    assert!(
+        max <= median * factor + 5.0,
+        "SERIALIZED: max={max:.1}ms ≈ {:.1}× median={median:.1}ms (N={N}) — concurrent cold fetches are \
+         NOT fanning out at the aws_sdk_s3 connector",
+        max / median
+    );
+    // And the wall-clock must be well under fully-serial (N × median).
+    assert!(
+        wall <= median * N as f64 * 0.6 + 10.0,
+        "SERIALIZED: wall={wall:.1}ms ≈ serial {:.1}ms (median×N) — not parallelized",
+        median * N as f64
+    );
+
+    if !cold {
+        storage.delete(&key).await.ok();
+    }
+    // End-of-test success marker — prints ONLY after the fan-out assertions held (CI greps for it +
+    // `test result: ok`, so a silent skip can never pass as success).
+    println!("CONCURRENT-COLD FAN-OUT OK");
+}
+
 /// DIAGNOSTIC (`--ignored`): does a concurrent burst of small-object GETs through the S3 backend keep
 /// per-GET latency flat, or does it balloon (serialize)? This is the `/img` serve leg — the real
 /// suspect once `build_bindings` and the pipeline were proven flat. Seeds a ~12 KB object (a webp

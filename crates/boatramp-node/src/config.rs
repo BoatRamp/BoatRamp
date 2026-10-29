@@ -812,12 +812,13 @@ const HANDLER_CONCURRENCY_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY",
 ];
 
-/// The `[handlers]` hedged-blob-read env levers (serve-path fetch-tail cut), mirroring the
-/// `blob_hedge_delay_ms` / `blob_hedge_max_inflight` fields on [`HandlersConfig`]. Kept in sync by the
-/// forgot-a-knob guard test.
+/// The `[handlers]` serve-path blob-read env levers (fetch-tail cut + read-through cache), mirroring the
+/// `blob_hedge_delay_ms` / `blob_hedge_max_inflight` / `blob_read_cache_bytes` fields on
+/// [`HandlersConfig`]. Kept in sync by the forgot-a-knob guard test.
 const HANDLER_BLOB_HEDGE_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS",
     "BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT",
+    "BOATRAMP_HANDLERS_BLOB_READ_CACHE_BYTES",
 ];
 
 /// The `[handlers]` cold-start env levers (cap-req 09): the warm floor + the portable AOT
@@ -1475,6 +1476,18 @@ pub struct HandlersConfig {
     /// when [`blob_hedge_delay_ms`](Self::blob_hedge_delay_ms) is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_hedge_max_inflight: Option<usize>,
+    /// **Blob read-through cache size** (bytes). The serve path fronts each blob backend with a bounded,
+    /// byte-LRU read-through cache of whole-object bodies (`get` / whole-object `get_range`) plus a small
+    /// positive-only cache of `head` metas, so a WARM blob/image serve — a content-addressed, immutable
+    /// `/img` derivative read on a node that already served it — is answered from memory and skips the
+    /// backend GET and its cold-connect tail entirely. A genuinely-partial range on a miss streams
+    /// through uncached (never stored as if whole); writes/deletes evict the key. Absent ⇒ 128 MiB;
+    /// `0` disables the cache (every read goes to the backend). ONE cache per backend (global + each
+    /// per-project), keyed by the fully-resolved tenant-confined key — confinement (`container_access`)
+    /// is decided before any read reaches it, so it never crosses tenants. Sized per node; image
+    /// derivatives are ~10–25 KB, so the default holds thousands of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_read_cache_bytes: Option<u64>,
     /// **Per-component serve-admission concurrency** (image-serve-latency Ask B). Caps how many
     /// requests to the SAME component (keyed by content hash) are concurrently inside the expensive
     /// `build_bindings` + instantiate + serve-to-head region; a burst beyond it (e.g. a gallery firing
@@ -4299,18 +4312,21 @@ mod tests {
         cfg.apply_env_overrides(&env(&[
             ("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS", "80"),
             ("BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT", "24"),
+            ("BOATRAMP_HANDLERS_BLOB_READ_CACHE_BYTES", "268435456"),
         ]))
         .expect("valid env overrides apply");
         let h = cfg.handlers.expect("handlers materialised from env");
         assert_eq!(h.blob_hedge_delay_ms, Some(80));
         assert_eq!(h.blob_hedge_max_inflight, Some(24));
+        assert_eq!(h.blob_read_cache_bytes, Some(268_435_456));
         for var in [
             "BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS",
             "BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT",
+            "BOATRAMP_HANDLERS_BLOB_READ_CACHE_BYTES",
         ] {
             assert!(
                 HANDLER_BLOB_HEDGE_ENV_VARS.contains(&var),
-                "{var} missing from HANDLER_BLOB_HEDGE_ENV_VARS — a hedge knob lost its env lever"
+                "{var} missing from HANDLER_BLOB_HEDGE_ENV_VARS — a blob-read knob lost its env lever"
             );
         }
     }

@@ -129,8 +129,75 @@ pub(crate) async fn apply_blob_ref(
     .await
 }
 
-/// Build the response body for the resolved `(storage, key)` — size via `head` (also the
-/// existence check), then a single-range-aware sendfile / mmap / stream body.
+/// How a (possibly absent) HTTP range resolved against a (possibly unknown) object size.
+enum RangeOutcome {
+    /// `(offset, len, partial)` — `partial` ⇒ a 206 with a `Content-Range`. `len == None` ⇒ to-end /
+    /// unknown size (chunked, no `Content-Length`).
+    Resolved(u64, Option<u64>, bool),
+    /// The range could not be satisfied against a known total → 416 with `Content-Range: bytes */total`.
+    Unsatisfiable(u64),
+}
+
+/// Resolve a (single, well-formed) range against a known total. With no range, or an unknown size, the
+/// whole object is served (the range is ignored when the size is unknown — matching the prior behavior).
+fn resolve_opt_range(spec: Option<&RangeSpec>, total: Option<u64>) -> RangeOutcome {
+    match (spec, total) {
+        (Some(spec), Some(total)) => match resolve_range(spec, total) {
+            Some((o, l)) => RangeOutcome::Resolved(o, Some(l), true),
+            None => RangeOutcome::Unsatisfiable(total),
+        },
+        // No range (or unknown size): the whole object.
+        _ => RangeOutcome::Resolved(0, total, false),
+    }
+}
+
+/// Stamp `Accept-Ranges`/`Content-Length`/`Content-Range` (+ 206 status) onto the guest's response head,
+/// overriding any stale `Content-Length` the guest set on its empty body.
+fn stamp_range_headers(
+    parts: &mut Parts,
+    offset: u64,
+    len: Option<u64>,
+    partial: bool,
+    total: Option<u64>,
+) {
+    if partial {
+        parts.status = StatusCode::PARTIAL_CONTENT;
+        if let (Some(l), Some(total)) = (len, total) {
+            set_header(
+                parts,
+                header::CONTENT_RANGE,
+                &format!("bytes {offset}-{}/{total}", offset + l - 1),
+            );
+        }
+    }
+    set_header(parts, header::ACCEPT_RANGES, "bytes");
+    if let Some(l) = len {
+        set_header(parts, header::CONTENT_LENGTH, &l.to_string());
+    } else {
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
+}
+
+/// 416, keeping the guest's head but stamping the unsatisfiable `Content-Range`.
+fn range_not_satisfiable(mut parts: Parts, total: u64) -> Response {
+    parts.status = StatusCode::RANGE_NOT_SATISFIABLE;
+    set_header(
+        &mut parts,
+        header::CONTENT_RANGE,
+        &format!("bytes */{total}"),
+    );
+    Response::from_parts(parts, Body::empty())
+}
+
+/// Build the response body for the resolved `(storage, key)` — a single-range-aware sendfile / mmap /
+/// stream body.
+///
+/// Ask 3b (kill the redundant per-serve HEAD): a whole-object `GET` derives its size from the `get`
+/// itself (the backend returns `Content-Length`), so the common `/img` serve is ONE backend round-trip,
+/// not a `HEAD` **then** a `GET`. A `HEAD` is still issued only where it is genuinely needed and cheap:
+/// an HTTP `HEAD` request (size without a body), and a **ranged** read on a remote backend (the total is
+/// needed up front to resolve a `From`/`Suffix` range and stamp `Content-Range`). Local backends take
+/// the size from the file/mapping, never a `HEAD`.
 async fn build_blob_response(
     storage: &dyn Storage,
     skey: &str,
@@ -139,65 +206,22 @@ async fn build_blob_response(
     req_range: Option<&str>,
     is_head: bool,
 ) -> Response {
-    let total: Option<u64> = match storage.head(skey).await {
-        Ok(meta) => meta.size,
-        Err(StorageError::NotFound(_)) => {
-            return deny(StatusCode::NOT_FOUND, "blob-ref: not found");
-        }
-        Err(err) => {
-            tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend head fault");
-            return deny(StatusCode::BAD_GATEWAY, "blob-ref: backend unavailable");
-        }
-    };
-
-    // Range only when both a (single, well-formed) range AND a known total are present.
     let range = req_range.and_then(parse_range);
-    let (offset, len, partial) = match (range.as_ref(), total) {
-        (Some(spec), Some(total)) => match resolve_range(spec, total) {
-            Some((o, l)) => (o, Some(l), true),
-            None => {
-                let mut p = parts;
-                p.status = StatusCode::RANGE_NOT_SATISFIABLE;
-                set_header(&mut p, header::CONTENT_RANGE, &format!("bytes */{total}"));
-                return Response::from_parts(p, Body::empty());
-            }
-        },
-        // No range (or unknown size): the whole object.
-        _ => (0, total, false),
-    };
 
-    // Response head: keep the guest's status + headers; stamp length/range/accept-ranges and
-    // override any stale Content-Length the guest set on its empty body.
-    if partial {
-        parts.status = StatusCode::PARTIAL_CONTENT;
-        if let (Some(l), Some(total)) = (len, total) {
-            set_header(
-                &mut parts,
-                header::CONTENT_RANGE,
-                &format!("bytes {offset}-{}/{total}", offset + l - 1),
-            );
-        }
-    }
-    set_header(&mut parts, header::ACCEPT_RANGES, "bytes");
-    if let Some(l) = len {
-        set_header(&mut parts, header::CONTENT_LENGTH, &l.to_string());
-    } else {
-        parts.headers.remove(header::CONTENT_LENGTH);
-    }
-
-    // HEAD: the head + computed length, no body (the codec also suppresses bodies for HEAD).
-    if is_head {
-        return Response::from_parts(parts, Body::empty());
-    }
-
-    // Local backend over a plaintext connection → zero-copy sendfile (kernel-to-kernel). Attach
-    // the file as a `SendfileSource` extension on an empty-body response; the `http_serve` bridge
-    // turns it into a `Body::File`. On TLS/HTTP2 the bridge host-reads the region (still no guest
-    // copy) — but we prefer an mmap slice there to avoid a full host buffer on a large object.
+    // --- Local backend over a plaintext connection → zero-copy sendfile (kernel-to-kernel). Size comes
+    // from the open file's metadata — NO `head`. Attach the file as a `SendfileSource` extension on an
+    // empty-body response; the `http_serve` bridge turns it into a `Body::File`. ---
     if plaintext && let Some(file) = storage.local_file(skey) {
-        let flen = len
-            .or_else(|| file.metadata().ok().map(|m| m.len()))
-            .unwrap_or(0);
+        let total = file.metadata().ok().map(|m| m.len());
+        let (offset, len, partial) = match resolve_opt_range(range.as_ref(), total) {
+            RangeOutcome::Resolved(o, l, p) => (o, l, p),
+            RangeOutcome::Unsatisfiable(t) => return range_not_satisfiable(parts, t),
+        };
+        stamp_range_headers(&mut parts, offset, len, partial, total);
+        if is_head {
+            return Response::from_parts(parts, Body::empty());
+        }
+        let flen = len.or(total).unwrap_or(0);
         parts
             .extensions
             .insert(crate::serve_pipeline::SendfileSource {
@@ -208,9 +232,18 @@ async fn build_blob_response(
         return Response::from_parts(parts, Body::empty());
     }
 
-    // Local backend (TLS) → mmap the file and serve the (optionally sliced) borrowed frame,
-    // avoiding a full host read. `None` ⇒ fall through to the stream path.
-    if !plaintext && let Some(bytes) = storage.mapped(skey) {
+    // --- Local backend (TLS, or plaintext without a sendfile handle) → mmap the file and serve the
+    // (optionally sliced) borrowed frame. Size from the mapping — NO `head`. `None` ⇒ fall through. ---
+    if let Some(bytes) = storage.mapped(skey) {
+        let total = Some(bytes.len() as u64);
+        let (offset, len, partial) = match resolve_opt_range(range.as_ref(), total) {
+            RangeOutcome::Resolved(o, l, p) => (o, l, p),
+            RangeOutcome::Unsatisfiable(t) => return range_not_satisfiable(parts, t),
+        };
+        stamp_range_headers(&mut parts, offset, len, partial, total);
+        if is_head {
+            return Response::from_parts(parts, Body::empty());
+        }
         let body = if partial {
             let start = offset as usize;
             let end = len.map_or(bytes.len(), |l| (start + l as usize).min(bytes.len()));
@@ -221,14 +254,49 @@ async fn build_blob_response(
         return Response::from_parts(parts, Body::from(body));
     }
 
-    // Remote / opaque backend → one host-side stream straight from the backend to the client.
-    let object = if partial {
-        storage.get_range(skey, offset, len).await
-    } else {
-        storage.get(skey).await
-    };
-    match object {
-        Ok(obj) => Response::from_parts(parts, Body::from_stream(obj.body)),
+    // --- Remote / opaque backend. ---
+    // A `HEAD` request, or a RANGED read, needs the size up front — the one place a `head` is still
+    // issued (and the right primitive: a `HEAD` request wants no body; a range needs the total to
+    // resolve `From`/`Suffix` and stamp `Content-Range`). A whole-object `GET` skips it: the `get`
+    // itself carries `Content-Length`.
+    if is_head || range.is_some() {
+        let total: Option<u64> = match storage.head(skey).await {
+            Ok(meta) => meta.size,
+            Err(StorageError::NotFound(_)) => {
+                return deny(StatusCode::NOT_FOUND, "blob-ref: not found");
+            }
+            Err(err) => {
+                tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend head fault");
+                return deny(StatusCode::BAD_GATEWAY, "blob-ref: backend unavailable");
+            }
+        };
+        let (offset, len, partial) = match resolve_opt_range(range.as_ref(), total) {
+            RangeOutcome::Resolved(o, l, p) => (o, l, p),
+            RangeOutcome::Unsatisfiable(t) => return range_not_satisfiable(parts, t),
+        };
+        stamp_range_headers(&mut parts, offset, len, partial, total);
+        if is_head {
+            return Response::from_parts(parts, Body::empty());
+        }
+        // A ranged GET (whole-object GET falls through to the no-head path below).
+        return match storage.get_range(skey, offset, len).await {
+            Ok(obj) => Response::from_parts(parts, Body::from_stream(obj.body)),
+            Err(StorageError::NotFound(_)) => deny(StatusCode::NOT_FOUND, "blob-ref: not found"),
+            Err(err) => {
+                tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend read fault");
+                deny(StatusCode::BAD_GATEWAY, "blob-ref: backend unavailable")
+            }
+        };
+    }
+
+    // --- Whole-object GET on a remote backend → ONE host-side stream straight from the backend, its
+    // `Content-Length` taken from the `get` response (NO preceding `head`). ---
+    match storage.get(skey).await {
+        Ok(obj) => {
+            let size = obj.meta.size;
+            stamp_range_headers(&mut parts, 0, size, false, size);
+            Response::from_parts(parts, Body::from_stream(obj.body))
+        }
         Err(StorageError::NotFound(_)) => deny(StatusCode::NOT_FOUND, "blob-ref: not found"),
         Err(err) => {
             tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend read fault");
@@ -253,12 +321,18 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt as _;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     /// A one-object backend with ACCURATE size + range slicing, and an optional backing temp
-    /// file so the sendfile (local+plaintext) leg is exercisable.
+    /// file so the sendfile (local+plaintext) leg is exercisable. Counts `head`/`get`/`get_range`
+    /// so a test can prove a whole-object GET issues NO redundant `head` (Ask 3b).
     struct MemBlob {
         key: String,
         bytes: Vec<u8>,
         local: Option<Arc<std::path::PathBuf>>, // present ⇒ `local_file` returns an open handle
+        heads: AtomicUsize,
+        gets: AtomicUsize,
+        ranges: AtomicUsize,
     }
 
     impl MemBlob {
@@ -267,6 +341,9 @@ mod tests {
                 key: key.into(),
                 bytes: bytes.to_vec(),
                 local: None,
+                heads: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+                ranges: AtomicUsize::new(0),
             }
         }
         fn local(key: &str, bytes: &[u8]) -> Self {
@@ -278,6 +355,9 @@ mod tests {
                 key: key.into(),
                 bytes: bytes.to_vec(),
                 local: Some(Arc::new(path)),
+                heads: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+                ranges: AtomicUsize::new(0),
             }
         }
         fn hit(&self, key: &str) -> bool {
@@ -288,6 +368,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Storage for MemBlob {
         async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
             if !self.hit(key) {
                 return Err(StorageError::NotFound(key.into()));
             }
@@ -308,6 +389,7 @@ mod tests {
             offset: u64,
             len: Option<u64>,
         ) -> Result<GetObject, StorageError> {
+            self.ranges.fetch_add(1, Ordering::SeqCst);
             if !self.hit(key) {
                 return Err(StorageError::NotFound(key.into()));
             }
@@ -336,6 +418,7 @@ mod tests {
             unimplemented!()
         }
         async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            self.heads.fetch_add(1, Ordering::SeqCst);
             if !self.hit(key) {
                 return Err(StorageError::NotFound(key.into()));
             }
@@ -388,6 +471,57 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "19");
         assert_eq!(body_bytes(resp).await, b"hello world payload");
+    }
+
+    /// Ask 3b: a whole-object GET serve issues the GET and NO redundant `head` — the content-length
+    /// comes from the GET itself. Before the fix this path was a serial `head` **then** `get`.
+    #[tokio::test]
+    async fn whole_object_get_issues_no_redundant_head() {
+        let s = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), false, None, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "10");
+        assert_eq!(body_bytes(resp).await, b"0123456789");
+        assert_eq!(
+            s.heads.load(Ordering::SeqCst),
+            0,
+            "no redundant HEAD on a whole-object GET"
+        );
+        assert_eq!(s.gets.load(Ordering::SeqCst), 1, "exactly one GET");
+        assert_eq!(s.ranges.load(Ordering::SeqCst), 0);
+    }
+
+    /// A ranged remote read still issues ONE `head` (the total is needed to resolve the range and stamp
+    /// `Content-Range`) then ONE `get_range` — and an HTTP HEAD request issues ONE `head` and no body.
+    #[tokio::test]
+    async fn ranged_and_head_still_use_head() {
+        let s = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), false, Some("bytes=2-4"), false).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(resp).await, b"234");
+        assert_eq!(
+            s.heads.load(Ordering::SeqCst),
+            1,
+            "ranged read needs the total"
+        );
+        assert_eq!(s.ranges.load(Ordering::SeqCst), 1);
+        assert_eq!(s.gets.load(Ordering::SeqCst), 0);
+
+        let h = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&h, "k", parts(), false, None, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "10");
+        assert!(body_bytes(resp).await.is_empty(), "HEAD carries no body");
+        assert_eq!(
+            h.heads.load(Ordering::SeqCst),
+            1,
+            "HEAD request uses head, not get"
+        );
+        assert_eq!(
+            h.gets.load(Ordering::SeqCst),
+            0,
+            "HEAD must not download the body"
+        );
     }
 
     #[tokio::test]

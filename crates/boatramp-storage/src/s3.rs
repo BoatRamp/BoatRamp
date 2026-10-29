@@ -38,6 +38,59 @@ fn with_http_tuning(builder: aws_sdk_s3::config::Builder) -> aws_sdk_s3::config:
 /// to be at least 5 MiB; 8 MiB keeps part counts low while bounding the buffer.
 const PART_SIZE: usize = 8 * 1024 * 1024;
 
+/// ONE process-wide base AWS [`SdkConfig`](aws_config::SdkConfig), loaded lazily on the first S3 backend
+/// build and reused by every later one.
+///
+/// **Cold-path serialization fix (image-serve-latency Ask 3a).** Previously every `S3Storage::connect`
+/// (the global backend AND each per-project backend) ran its own `aws_config::defaults().load()`, which
+/// — with no explicit `http_client` — builds a FRESH default HTTP connector with its OWN connection
+/// pool. N backends ⇒ N independent pools, so a cold `/img` burst spread across backends could not reuse
+/// a warm connection and each backend re-paid connection establishment. Building each S3 client
+/// `from(&base)` makes them SHARE this one config's resolved HTTP connector + pool, so concurrent cold
+/// fetches reuse warm connections across backends instead of each opening its own. Per-backend
+/// region/endpoint/path-style/credential are applied as overrides on the S3 config builder, so the
+/// SHARED thing is only the connector/pool (and the ambient credential chain, overridden when a sealed
+/// base credential is configured) — never a tenant's keys.
+static SHARED_BASE_CONFIG: tokio::sync::OnceCell<aws_config::SdkConfig> =
+    tokio::sync::OnceCell::const_new();
+
+/// The process-wide base [`SdkConfig`](aws_config::SdkConfig) (see [`SHARED_BASE_CONFIG`]), loaded once.
+async fn shared_base_config() -> &'static aws_config::SdkConfig {
+    SHARED_BASE_CONFIG
+        .get_or_init(|| async {
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await
+        })
+        .await
+}
+
+/// Apply the per-backend [`S3Options`] (region / endpoint / path-style / sealed credential) as OVERRIDES
+/// on an S3 config builder derived from the shared base — so each backend reaches its own bucket/endpoint
+/// while sharing the base's one HTTP connector + pool. `#505`: a sealed base credential replaces the
+/// ambient chain; `None` ⇒ the shared base's ambient credentials (unchanged behavior).
+fn apply_s3_overrides(
+    mut builder: aws_sdk_s3::config::Builder,
+    opts: &S3Options,
+) -> aws_sdk_s3::config::Builder {
+    if let Some(region) = opts.region.clone() {
+        builder = builder.region(aws_sdk_s3::config::Region::new(region));
+    }
+    if let Some(endpoint) = opts.endpoint.clone() {
+        builder = builder.endpoint_url(endpoint);
+    }
+    if opts.force_path_style {
+        builder = builder.force_path_style(true);
+    }
+    if let Some((access_key_id, secret_access_key)) = &opts.credential {
+        builder = builder.credentials_provider(sealed_credentials_provider(
+            access_key_id,
+            secret_access_key,
+        ));
+    }
+    with_http_tuning(builder)
+}
+
 /// Stores objects in an S3 (or S3-compatible, e.g. MinIO) bucket.
 #[derive(Debug, Clone)]
 pub struct S3Storage {
@@ -129,10 +182,12 @@ impl S3Storage {
     }
 
     /// Build a backend from the ambient AWS environment (env vars, shared
-    /// config/profile, instance metadata, ...).
+    /// config/profile, instance metadata, ...), sharing the process-wide HTTP connector/pool
+    /// (see [`SHARED_BASE_CONFIG`]).
     pub async fn from_env(bucket: impl Into<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        Self::new(aws_sdk_s3::Client::new(&config), bucket)
+        let base = shared_base_config().await;
+        let builder = with_http_tuning(aws_sdk_s3::config::Builder::from(base));
+        Self::new(aws_sdk_s3::Client::from_conf(builder.build()), bucket)
     }
 
     /// Build a backend from explicit [`S3Options`], honoring a custom endpoint
@@ -141,28 +196,11 @@ impl S3Storage {
     /// [`opts.credential`](S3Options::credential) supplies an explicit sealed base
     /// credential (#505), in which case a static provider is installed instead.
     pub async fn connect(opts: S3Options) -> Self {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(region) = opts.region.clone() {
-            loader = loader.region(aws_sdk_s3::config::Region::new(region));
-        }
-        if let Some(endpoint) = opts.endpoint.clone() {
-            loader = loader.endpoint_url(endpoint);
-        }
-        let shared = loader.load().await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&shared);
-        if opts.force_path_style {
-            builder = builder.force_path_style(true);
-        }
-        // #505: source the base credential from the sealed store instead of the ambient env chain when
-        // configured. `SharedCredentialsProvider::new(Credentials::new(...))` overrides the resolved
-        // chain, so the key the backend signs with is the sealed one.
-        if let Some((access_key_id, secret_access_key)) = &opts.credential {
-            builder = builder.credentials_provider(sealed_credentials_provider(
-                access_key_id,
-                secret_access_key,
-            ));
-        }
-        let builder = with_http_tuning(builder);
+        // Derive from the ONE shared base config so every backend shares its HTTP connector + pool
+        // (Ask 3a — see [`SHARED_BASE_CONFIG`]); region/endpoint/path-style/sealed-credential (`#505`)
+        // are applied as per-backend overrides on the S3 config builder, not the ambient loader.
+        let base = shared_base_config().await;
+        let builder = apply_s3_overrides(aws_sdk_s3::config::Builder::from(base), &opts);
         Self::new(aws_sdk_s3::Client::from_conf(builder.build()), opts.bucket)
     }
 

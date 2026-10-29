@@ -122,6 +122,10 @@ handlers = [
   # The serve path can hedge a slow blob read (race a 2nd GET) to cut the fetch tail; opt-in at runtime
   # via `[handlers] blob_hedge_delay_ms` / its env, off by default — a handlers node always ships it.
   "boatramp-storage/hedged",
+  # The serve path fronts the blob backend with a bounded read-through cache (whole-object get/get_range
+  # + head) so a warm `/img`/blob serve skips the backend round-trip entirely; sized by
+  # `[handlers] blob_read_cache_bytes` / its env (on by default, `0` disables). A handlers node ships it.
+  "boatramp-storage/cache",
   "sql",
 ]
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).

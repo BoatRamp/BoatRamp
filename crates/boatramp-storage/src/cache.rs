@@ -7,16 +7,39 @@
 //! bodies: the first read on a node streams from (and populates) the cache, and
 //! subsequent reads on the same node are served from memory.
 //!
-//! The cache is deliberately conservative:
-//! - only `get` is cached; ranges, `head`, and `list` pass straight through;
-//! - a body is cached only when its size is known up front *and* fits the byte
-//!   budget — larger or unknown-size objects stream through uncached, never
-//!   buffered;
-//! - `put`/`delete` evict the key so a stale body is never served after a write.
+//! It fronts the three READ ops a blob/image serve actually drives:
+//! - `get` — whole-object read; the body is cached when its size is known up front and fits the budget.
+//! - `get_range` — the `/img` serve reads a WHOLE object via the `get-data(0, u64::MAX)` sentinel, which
+//!   arrives here as `get_range(key, 0, None)`. A **whole-object** range read populates the cache exactly
+//!   like `get`; a cached whole body then answers ANY later range by SLICING the exact bytes it holds
+//!   (sound — we never serve a range we did not fully read). A genuinely-**partial** range on a miss
+//!   (a non-zero offset, or a bounded length that is not the whole-object sentinel) streams straight
+//!   through UNCACHED — a partial body is never stored under the key where a whole/other-range read would
+//!   later read it back wrong.
+//! - `head` — served from a cached whole body's metadata, or from a small bounded positive-only cache of
+//!   recently-`head`ed object metas (so the blob-ref serve path's size probe, and the guest
+//!   `has-object`/`object-info` probes, skip the round-trip on a warm object).
 //!
-//! boatramp's blob keys are content-addressed (immutable), so cache staleness
-//! is a non-issue in practice; the evict-on-write rule keeps the wrapper correct
-//! as a general [`Storage`] regardless.
+//! The cache is deliberately conservative:
+//! - a body is cached only when its size is known up front *and* fits the byte budget — larger or
+//!   unknown-size objects stream through uncached, never buffered;
+//! - only a POSITIVE result is cached — a `NotFound`/fault re-probes next time (a fault must not mask a
+//!   later success, and an absence must not be served as a stale positive);
+//! - `put`/`delete` evict the key (body AND head meta) so a stale body is never served after a write.
+//!
+//! boatramp's blob keys are content-addressed (immutable), so cache staleness is a non-issue in
+//! practice; the evict-on-write rule keeps the wrapper correct as a general [`Storage`] regardless.
+//!
+//! **Wiring / confinement.** Like [`crate::MarkerHeadCache`], ONE instance is created PER backend
+//! (`wrap_blob_backend`), keyed by the EXACT fully-resolved, tenant-confined storage key — never a guest
+//! name. The tenant-confinement decision (`container_access`) is made by the `wasi:blobstore` binding
+//! BEFORE any `get`/`get_range`/`head` reaches this decorator, so a cached entry can only ever be
+//! returned for an already-authorized key, and two tenants' objects are distinct keys that never collide.
+//! A process-global/`static`/one-shared-instance cache would be a cross-project confinement bypass — do
+//! NOT "optimize" it into one. Transparent accessors (`mapped`/`local_file`/`allows_prune`/`drain_pair`/
+//! `supports_watch`/`watch`) delegate to the inner backend so a cache OVER a read-fallback composite
+//! (`cache(fallback(primary, secondary))`, the required wiring order) preserves the GC refusal, the
+//! drain pair, and blob-change (FA-5) watch capability.
 
 use std::sync::{Arc, Mutex};
 
@@ -26,22 +49,33 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
 
-/// A cached object body plus the metadata to reconstruct its [`GetObject`].
+/// A cached whole-object body plus the metadata to reconstruct its [`GetObject`].
 struct Entry {
     meta: ObjectMeta,
     body: Bytes,
 }
 
-/// LRU plus a running total of cached bytes, behind one lock.
+/// LRU of whole-object bodies (byte-bounded) plus a small LRU of recently-`head`ed object metas
+/// (count-bounded — metas are tiny), behind one lock.
 struct CacheState {
+    /// Whole-object bodies; bounded by `bytes <= max_bytes`.
     lru: LruCache<String, Entry>,
+    /// Running total of cached body bytes.
     bytes: u64,
+    /// Positive-only cache of object metas for keys `head`ed without a body read. Count-bounded (a meta
+    /// costs ~0 against the byte budget, so it needs its own bound). A key present in `lru` is served
+    /// from there instead, so this never duplicates a body entry's meta.
+    heads: LruCache<String, ObjectMeta>,
 }
+
+/// Default count bound for the head-meta cache. Metas are tiny; a node serves far fewer than this many
+/// distinct objects' heads between evictions in normal operation.
+const HEAD_META_ENTRIES: usize = 8192;
 
 /// A read-through cache wrapping a shared [`Storage`] backend.
 ///
-/// Holds at most `max_bytes` of object bodies in a least-recently-used cache.
-/// See the [module docs](self) for the caching policy.
+/// Holds at most `max_bytes` of object bodies in a least-recently-used cache, plus a small bounded cache
+/// of object metas for `head`. See the [module docs](self) for the caching policy.
 pub struct CachedStorage {
     inner: Arc<dyn Storage>,
     state: Mutex<CacheState>,
@@ -56,12 +90,45 @@ impl CachedStorage {
             state: Mutex::new(CacheState {
                 lru: LruCache::unbounded(),
                 bytes: 0,
+                heads: LruCache::new(
+                    std::num::NonZeroUsize::new(HEAD_META_ENTRIES).expect("non-zero"),
+                ),
             }),
             max_bytes,
         }
     }
 
-    /// Look up a cached body, marking it most-recently-used on a hit.
+    /// Whether this is a whole-object range read — the `/img` serve's `get-data(0, u64::MAX)` sentinel
+    /// (`len == u64::MAX`) or a to-end-from-start read (`len == None`), both starting at offset 0. Only
+    /// these populate the cache on a miss; a cached whole body then slices any range.
+    fn is_whole_object(offset: u64, len: Option<u64>) -> bool {
+        offset == 0 && matches!(len, None | Some(u64::MAX))
+    }
+
+    /// Slice `[offset, offset+len)` (clamped to the body) out of a cached whole body, returning the
+    /// range `GetObject`. Sound: the body holds every byte of the object, so a slice is exactly what the
+    /// backend's `get_range` would return — `meta.size` becomes the slice length (what a backend reports
+    /// as the range's content-length), content-type/etag carried from the cached whole-object meta.
+    fn slice_range(meta: &ObjectMeta, body: &Bytes, offset: u64, len: Option<u64>) -> GetObject {
+        let total = body.len();
+        let start = (offset as usize).min(total);
+        let end = match len {
+            None | Some(u64::MAX) => total,
+            Some(l) => start.saturating_add(l as usize).min(total),
+        };
+        let slice = body.slice(start..end);
+        GetObject {
+            meta: ObjectMeta {
+                key: meta.key.clone(),
+                size: Some(slice.len() as u64),
+                content_type: meta.content_type.clone(),
+                etag: meta.etag.clone(),
+            },
+            body: bytes_stream(slice),
+        }
+    }
+
+    /// Look up a cached whole body, marking it most-recently-used on a hit.
     fn lookup(&self, key: &str) -> Option<(ObjectMeta, Bytes)> {
         let mut state = self.state.lock().expect("cache lock poisoned");
         state
@@ -70,8 +137,18 @@ impl CachedStorage {
             .map(|entry| (entry.meta.clone(), entry.body.clone()))
     }
 
-    /// Insert a body, evicting least-recently-used entries until it fits the
-    /// byte budget. Objects larger than the whole budget are not cached.
+    /// Look up a cached object meta (whole body's meta first, else the head-meta cache), marking it MRU.
+    fn lookup_meta(&self, key: &str) -> Option<ObjectMeta> {
+        let mut state = self.state.lock().expect("cache lock poisoned");
+        if let Some(entry) = state.lru.get(key) {
+            return Some(entry.meta.clone());
+        }
+        state.heads.get(key).cloned()
+    }
+
+    /// Insert a whole body, evicting least-recently-used entries until it fits the byte budget. Objects
+    /// larger than the whole budget are not cached. Also drops any head-only meta for the key (the body
+    /// entry now serves `head`).
     fn insert(&self, key: String, meta: ObjectMeta, body: Bytes) {
         let n = body.len() as u64;
         if n > self.max_bytes {
@@ -87,16 +164,28 @@ impl CachedStorage {
                 None => break,
             }
         }
+        state.heads.pop(&key);
         state.lru.put(key, Entry { meta, body });
         state.bytes += n;
     }
 
-    /// Drop any cached body for `key` (after a write or delete).
+    /// Insert a positive object meta into the head-meta cache (count-bounded by the LRU). Skipped if a
+    /// whole body for the key is already cached (that entry's meta already answers `head`).
+    fn insert_head(&self, key: String, meta: ObjectMeta) {
+        let mut state = self.state.lock().expect("cache lock poisoned");
+        if state.lru.contains(&key) {
+            return;
+        }
+        state.heads.put(key, meta);
+    }
+
+    /// Drop any cached body AND head meta for `key` (after a write or delete).
     fn evict(&self, key: &str) {
         let mut state = self.state.lock().expect("cache lock poisoned");
         if let Some(old) = state.lru.pop(key) {
             state.bytes -= old.body.len() as u64;
         }
+        state.heads.pop(key);
     }
 }
 
@@ -152,8 +241,32 @@ impl Storage for CachedStorage {
         offset: u64,
         len: Option<u64>,
     ) -> Result<GetObject, StorageError> {
-        // Range reads (media seeking) bypass the whole-object cache.
-        self.inner.get_range(key, offset, len).await
+        // A cached whole body answers ANY range by slicing the exact bytes it holds (sound).
+        if let Some((meta, body)) = self.lookup(key) {
+            return Ok(Self::slice_range(&meta, &body, offset, len));
+        }
+
+        // A WHOLE-object range read (the `/img` `get-data(0, u64::MAX)` sentinel) populates the cache
+        // exactly like `get`. A genuinely-partial range streams through UNCACHED — never stored under
+        // the key where a later whole/other-range read would read a partial body back wrong.
+        if !Self::is_whole_object(offset, len) {
+            return self.inner.get_range(key, offset, len).await;
+        }
+
+        let obj = self.inner.get_range(key, offset, len).await?;
+        let eligible = obj.meta.size.is_some_and(|s| s <= self.max_bytes);
+        if !eligible {
+            return Ok(obj);
+        }
+        let meta = obj.meta.clone();
+        let body = collect(obj.body).await?;
+        if body.len() as u64 <= self.max_bytes {
+            self.insert(key.to_string(), meta.clone(), body.clone());
+        }
+        Ok(GetObject {
+            meta,
+            body: bytes_stream(body),
+        })
     }
 
     async fn put(
@@ -167,7 +280,12 @@ impl Storage for CachedStorage {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        self.inner.head(key).await
+        if let Some(meta) = self.lookup_meta(key) {
+            return Ok(meta);
+        }
+        let meta = self.inner.head(key).await?; // POSITIVE-ONLY: a NotFound/fault re-probes next time
+        self.insert_head(key.to_string(), meta.clone());
+        Ok(meta)
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
@@ -218,6 +336,22 @@ impl Storage for CachedStorage {
     fn drain_pair(&self) -> Option<boatramp_core::DrainPair> {
         self.inner.drain_pair()
     }
+
+    /// Delegate watch/change-notification VERBATIM. This decorator sits in the handler runtime's
+    /// `inner.storage` stack, and the blob-change-trigger path (FA-5) reads `storage.supports_watch()`
+    /// / `storage.watch()` directly — inheriting the trait defaults (`false` / `Ok(None)`) would
+    /// SILENTLY disable blob triggers on a watch-capable backend (fs / fallback-over-fs) now that the
+    /// cache is wired into the serve path. Delegate, exactly as `MarkerHeadCache` does.
+    fn supports_watch(&self) -> bool {
+        self.inner.supports_watch()
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<boatramp_core::ChangeStream>, StorageError> {
+        self.inner.watch(prefix).await
+    }
 }
 
 #[cfg(test)]
@@ -226,17 +360,25 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// An in-memory [`Storage`] double that counts `get` calls, so a test can
+    /// An in-memory [`Storage`] double that counts `get`/`get_range`/`head` calls, so a test can
     /// prove the cache absorbed a read instead of hitting the backend.
     #[derive(Default)]
     struct CountingMem {
         data: Mutex<HashMap<String, Bytes>>,
         gets: AtomicUsize,
+        ranges: AtomicUsize,
+        heads: AtomicUsize,
     }
 
     impl CountingMem {
         fn get_count(&self) -> usize {
             self.gets.load(Ordering::SeqCst)
+        }
+        fn range_count(&self) -> usize {
+            self.ranges.load(Ordering::SeqCst)
+        }
+        fn head_count(&self) -> usize {
+            self.heads.load(Ordering::SeqCst)
         }
 
         fn insert(&self, key: &str, bytes: &[u8]) {
@@ -275,12 +417,18 @@ mod tests {
             offset: u64,
             len: Option<u64>,
         ) -> Result<GetObject, StorageError> {
-            let full = self.get(key).await?;
-            let bytes = collect(full.body).await?;
-            let start = offset as usize;
+            self.ranges.fetch_add(1, Ordering::SeqCst);
+            let bytes = self
+                .data
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            let start = (offset as usize).min(bytes.len());
             let end = match len {
+                None | Some(u64::MAX) => bytes.len(),
                 Some(l) => (start + l as usize).min(bytes.len()),
-                None => bytes.len(),
             };
             let slice = bytes.slice(start..end);
             Ok(GetObject {
@@ -312,6 +460,7 @@ mod tests {
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            self.heads.fetch_add(1, Ordering::SeqCst);
             let data = self.data.lock().unwrap();
             let bytes = data
                 .get(key)
@@ -348,6 +497,16 @@ mod tests {
 
     async fn read_all(store: &CachedStorage, key: &str) -> Result<Vec<u8>, StorageError> {
         let obj = store.get(key).await?;
+        Ok(collect(obj.body).await?.to_vec())
+    }
+
+    async fn read_range(
+        store: &CachedStorage,
+        key: &str,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<Vec<u8>, StorageError> {
+        let obj = store.get_range(key, offset, len).await?;
         Ok(collect(obj.body).await?.to_vec())
     }
 
@@ -468,5 +627,138 @@ mod tests {
             .unwrap();
         // The write evicted the cached body, so the next read reflects v2.
         assert_eq!(read_all(&cache, "k").await.unwrap(), b"v2");
+    }
+
+    /// The `/img` serve path: a WHOLE-object `get_range(0, None)` (the `get-data(0, u64::MAX)` sentinel
+    /// the shim passes) caches the body, and the second whole-object range serve is a cache hit.
+    #[tokio::test]
+    async fn whole_object_range_populates_and_serves_from_cache() {
+        let inner = Arc::new(CountingMem::default());
+        inner.insert("der/sha/512.webp", b"webp-derivative-bytes");
+        let cache = CachedStorage::new(inner.clone(), 1 << 20);
+
+        assert_eq!(
+            read_range(&cache, "der/sha/512.webp", 0, None)
+                .await
+                .unwrap(),
+            b"webp-derivative-bytes"
+        );
+        assert_eq!(
+            read_range(&cache, "der/sha/512.webp", 0, Some(u64::MAX))
+                .await
+                .unwrap(),
+            b"webp-derivative-bytes"
+        );
+        // One backend range round-trip; the second whole-object read was a cache hit.
+        assert_eq!(inner.range_count(), 1);
+    }
+
+    /// A cached WHOLE body answers any later sub-range by slicing — the exact bytes, never a wrong range.
+    #[tokio::test]
+    async fn sub_range_is_served_from_a_cached_whole_body() {
+        let inner = Arc::new(CountingMem::default());
+        inner.insert("obj", b"0123456789");
+        let cache = CachedStorage::new(inner.clone(), 1 << 20);
+
+        // Warm the whole object.
+        assert_eq!(
+            read_range(&cache, "obj", 0, None).await.unwrap(),
+            b"0123456789"
+        );
+        assert_eq!(inner.range_count(), 1);
+
+        // Sub-ranges are now sliced from the cached body — correct bytes, no further backend reads.
+        assert_eq!(read_range(&cache, "obj", 2, Some(3)).await.unwrap(), b"234");
+        assert_eq!(read_range(&cache, "obj", 7, None).await.unwrap(), b"789");
+        assert_eq!(read_range(&cache, "obj", 0, Some(1)).await.unwrap(), b"0");
+        assert_eq!(
+            inner.range_count(),
+            1,
+            "every sub-range was sliced from the cached whole body"
+        );
+    }
+
+    /// A GENUINELY-partial range on a MISS streams through UNCACHED — it must never be stored under the
+    /// key (a later whole-object read would otherwise read a truncated body back as if it were whole).
+    #[tokio::test]
+    async fn partial_range_miss_is_not_cached_as_whole() {
+        let inner = Arc::new(CountingMem::default());
+        inner.insert("obj", b"0123456789");
+        let cache = CachedStorage::new(inner.clone(), 1 << 20);
+
+        // A partial range (offset 2, len 3) on a cold cache: passes through, NOT cached.
+        assert_eq!(read_range(&cache, "obj", 2, Some(3)).await.unwrap(), b"234");
+        assert_eq!(inner.range_count(), 1);
+
+        // The whole object is still a MISS (the partial was not stored as the whole body) and returns
+        // the FULL correct bytes from the backend — never the truncated partial.
+        assert_eq!(read_all(&cache, "obj").await.unwrap(), b"0123456789");
+        assert_eq!(
+            inner.get_count(),
+            1,
+            "whole-object read went to the backend"
+        );
+    }
+
+    /// `head` is served from a cached whole body's meta, and from a bounded positive-only head-meta
+    /// cache otherwise; a `NotFound` is never cached (re-probes).
+    #[tokio::test]
+    async fn head_is_cached_positive_only() {
+        let inner = Arc::new(CountingMem::default());
+        inner.insert("obj", b"0123456789");
+        let cache = CachedStorage::new(inner.clone(), 1 << 20);
+
+        // First head → backend; second → cached meta.
+        assert_eq!(cache.head("obj").await.unwrap().size, Some(10));
+        assert_eq!(cache.head("obj").await.unwrap().size, Some(10));
+        assert_eq!(
+            inner.head_count(),
+            1,
+            "second head served from the meta cache"
+        );
+
+        // A whole-object read's meta also answers head with no extra round-trip.
+        read_all(&cache, "obj").await.unwrap();
+        assert_eq!(cache.head("obj").await.unwrap().size, Some(10));
+        assert_eq!(
+            inner.head_count(),
+            1,
+            "head served from the cached body's meta"
+        );
+
+        // An ABSENT key is never cached — it re-probes the backend every time.
+        assert!(matches!(
+            cache.head("missing").await,
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            cache.head("missing").await,
+            Err(StorageError::NotFound(_))
+        ));
+        assert_eq!(
+            inner.head_count(),
+            3,
+            "an absent head is never cached — re-probes each time"
+        );
+    }
+
+    /// A write/delete evicts the head-meta too, so a stale size is never served after a mutation.
+    #[tokio::test]
+    async fn write_evicts_head_meta() {
+        let inner = Arc::new(CountingMem::default());
+        inner.insert("k", b"v1");
+        let cache = CachedStorage::new(inner.clone(), 1 << 20);
+
+        assert_eq!(cache.head("k").await.unwrap().size, Some(2)); // caches meta size=2
+        cache
+            .put(
+                "k",
+                bytes_stream(Bytes::from_static(b"v2-longer")),
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+        // The write evicted the head meta, so head reflects the new size.
+        assert_eq!(cache.head("k").await.unwrap().size, Some(9));
     }
 }

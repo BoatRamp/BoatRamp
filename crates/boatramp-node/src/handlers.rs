@@ -142,23 +142,35 @@ mod sync_concurrency_default_tests {
 /// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
-/// Wrap ONE raw blob backend in the serve-path decorator stack (PLAN-per-project-blob-backend): an
-/// opt-in [`HedgedStorage`](boatramp_storage::HedgedStorage) closest to the backend (racing a 2nd GET
-/// for a slow read; `None` delay ⇒ no hedge) under a per-backend
-/// [`MarkerHeadCache`](boatramp_storage::MarkerHeadCache) (dedups the `.boatramp-container` HEAD;
-/// `0` entries ⇒ pass-through). Called ONCE for the global backend and ONCE per per-project backend, so
-/// every backend — global or per-project — gets the IDENTICAL stack and its OWN FRESH `MarkerHeadCache`.
+/// Wrap ONE raw blob backend in the serve-path decorator stack (PLAN-per-project-blob-backend).
 ///
-/// SECURITY: the `MarkerHeadCache` here is a per-backend instance and MUST stay one — a cache shared
-/// (or made `static`) across backends would serve project A's verified container marker for project B's
-/// identically-keyed container on a DIFFERENT bucket, a cross-project confinement bypass. The
-/// `BLOB PER-PROJECT ISOLATION OK` gate proves two backends wrapped here hold independent caches.
+/// Inner→outer: the raw backend, then
+/// 1. an opt-in [`HedgedStorage`](boatramp_storage::HedgedStorage) CLOSEST to the backend (racing a 2nd
+///    GET for a slow read; `None` delay ⇒ no hedge), under
+/// 2. a bounded read-through [`CachedStorage`](boatramp_storage::CachedStorage) (whole-object
+///    `get`/`get_range` bodies + `head` metas; `0` bytes ⇒ pass-through) so a WARM blob/image serve hits
+///    memory and skips the backend (and the hedge) entirely, under
+/// 3. a per-backend [`MarkerHeadCache`](boatramp_storage::MarkerHeadCache) (dedups the
+///    `.boatramp-container` HEAD; `0` entries ⇒ pass-through) OUTERMOST, so a marker HEAD short-circuits
+///    before it ever reaches the object cache.
+///
+/// Called ONCE for the global backend and ONCE per per-project backend, so every backend — global or
+/// per-project — gets the IDENTICAL stack and its OWN FRESH `MarkerHeadCache` + `CachedStorage`.
+///
+/// SECURITY: the `MarkerHeadCache` AND the `CachedStorage` here are per-backend instances and MUST stay
+/// one each — a cache shared (or made `static`) across backends would serve project A's verified marker
+/// or cached object for project B's identically-keyed container on a DIFFERENT bucket, a cross-project
+/// confinement bypass. The confinement decision (`container_access`) is made by the binding BEFORE any
+/// read reaches these decorators, and both cache by the EXACT fully-resolved tenant-confined key, so a
+/// cached entry is only ever returned for an already-authorized key. The `BLOB PER-PROJECT ISOLATION OK`
+/// gate proves two backends wrapped here hold independent caches.
 #[cfg(feature = "handlers")]
 fn wrap_blob_backend(
     raw: Arc<dyn boatramp_core::Storage>,
     hedge_delay_ms: Option<u64>,
     hedge_max_inflight: usize,
     marker_cache_entries: usize,
+    read_cache_bytes: u64,
 ) -> Arc<dyn boatramp_core::Storage> {
     let hedged: Arc<dyn boatramp_core::Storage> = match hedge_delay_ms {
         Some(delay_ms) => Arc::new(boatramp_storage::HedgedStorage::new(
@@ -168,8 +180,18 @@ fn wrap_blob_backend(
         )),
         None => raw,
     };
+    // Read-through object cache (whole-object bodies + head metas). `0` ⇒ pass-through (unwrapped), so a
+    // disabled cache allocates nothing and is byte-identical to the pre-cache stack.
+    let cached: Arc<dyn boatramp_core::Storage> = if read_cache_bytes > 0 {
+        Arc::new(boatramp_storage::CachedStorage::new(
+            hedged,
+            read_cache_bytes,
+        ))
+    } else {
+        hedged
+    };
     Arc::new(boatramp_storage::MarkerHeadCache::new(
-        hedged,
+        cached,
         marker_cache_entries,
     ))
 }
@@ -261,16 +283,32 @@ pub async fn build_handler_runtime(
     let marker_cache_entries = handlers_cfg
         .and_then(|h| h.blob_marker_cache_entries)
         .unwrap_or(DEFAULT_BLOB_MARKER_CACHE);
-    // One FRESH decorator stack per backend — see `wrap_blob_backend` (the `MarkerHeadCache` MUST be a
-    // per-backend instance, never shared/static across backends, or a verified container marker from
-    // one project's bucket would be served for another's identically-keyed container: a cross-project
-    // confinement bypass). The isolation gate proves each backend gets its own cache.
+    // (3) a bounded read-through object cache fronting each backend: a WARM blob/image serve
+    // (`/img` reads a whole content-addressed, immutable derivative) is answered from memory, skipping
+    // the backend GET + its cold-connect tail entirely. Default ON at a modest size so a serve node gets
+    // the warm-hit out of the box; `0` disables it. Sized by `[handlers] blob_read_cache_bytes` / its env.
+    const DEFAULT_BLOB_READ_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+    let read_cache_bytes = handlers_cfg
+        .and_then(|h| h.blob_read_cache_bytes)
+        .unwrap_or(DEFAULT_BLOB_READ_CACHE_BYTES);
+    if read_cache_bytes > 0 {
+        tracing::info!(
+            blob_read_cache_bytes = read_cache_bytes,
+            "blob read-through cache active: a warm whole-object/image serve hits memory, not the backend"
+        );
+    }
+    // One FRESH decorator stack per backend — see `wrap_blob_backend` (the `MarkerHeadCache` AND the
+    // `CachedStorage` MUST be per-backend instances, never shared/static across backends, or a verified
+    // container marker — or a cached object — from one project's bucket would be served for another's
+    // identically-keyed container: a cross-project confinement bypass). The isolation gate proves each
+    // backend gets its own caches.
     let wrap_blob = |raw: Arc<dyn boatramp_core::Storage>| -> Arc<dyn boatramp_core::Storage> {
         wrap_blob_backend(
             raw,
             hedge_delay_ms,
             hedge_max_inflight,
             marker_cache_entries,
+            read_cache_bytes,
         )
     };
     // The global default backend (used for the reserved `default` project, any unconfigured project,
@@ -1214,9 +1252,11 @@ mod perproject_isolation_gate {
     }
 
     /// The decorator stack used by the real serve path: hedging OFF (so the gate exercises the
-    /// marker-cache, the security-relevant decorator) + an active per-backend marker cache.
+    /// marker-cache, the security-relevant decorator) + an active per-backend marker cache AND an active
+    /// per-backend read-through object cache (`1 MiB`), so the gate proves BOTH caches are isolated
+    /// per backend — a shared object cache would serve project A's bytes for project B's identical key.
     fn decorate(raw: Arc<dyn Storage>) -> Arc<dyn Storage> {
-        wrap_blob_backend(raw, None, 0, 64)
+        wrap_blob_backend(raw, None, 0, 64, 1 << 20)
     }
 
     #[tokio::test]

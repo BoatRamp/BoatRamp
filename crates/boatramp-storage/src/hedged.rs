@@ -147,6 +147,19 @@ impl Storage for HedgedStorage {
         self.inner.local_file(key)
     }
 
+    /// Delegate the GC-refusal / drain-pair probes: a hedge is a pure read decorator, so wrapping a
+    /// read-fallback composite (`cache(hedge(fallback(primary, secondary)))`) must still surface the
+    /// composite's `allows_prune() == false` and its `drain_pair()`, or the GC refusal / daemon-mediated
+    /// drain would be bypassed by the hedge layer. (Inheriting the trait defaults — `true` / `None` —
+    /// would silently re-enable a prune the composite forbids.)
+    fn allows_prune(&self) -> bool {
+        self.inner.allows_prune()
+    }
+
+    fn drain_pair(&self) -> Option<boatramp_core::DrainPair> {
+        self.inner.drain_pair()
+    }
+
     fn supports_watch(&self) -> bool {
         self.inner.supports_watch()
     }
