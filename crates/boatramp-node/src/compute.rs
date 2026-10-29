@@ -939,17 +939,30 @@ fn reaper_liveness_gate_active() -> bool {
 pub struct NodeComputeReaper {
     backends: boatramp_core::compute::BackendRegistry,
     deploy: boatramp_core::deploy::DeployStore,
+    /// This node's scheduler id. The container-liveness probe is NODE-LOCAL (it reads the
+    /// local cgroup fs), so it can only authoritatively prove "gone" for a replica THIS
+    /// node hosts. `classify` therefore skips, fail-closed, any replica state whose
+    /// `node != self_node` — closing a post-failover window where a new leader could reap
+    /// the RECORD of a container still lingering on the OLD node (Security LOW). Single-node
+    /// is `0`, and every local replica's `node` is `0`, so this is inert there.
+    self_node: u64,
 }
 
 impl NodeComputeReaper {
-    /// Build over this node's compute backends + the control-plane store. Clone the
-    /// registry before the reconcile loop consumes the original.
+    /// Build over this node's compute backends + the control-plane store, tagged with this
+    /// node's scheduler id (`self_node`). Clone the registry before the reconcile loop
+    /// consumes the original.
     #[must_use]
     pub fn new(
         backends: boatramp_core::compute::BackendRegistry,
         deploy: boatramp_core::deploy::DeployStore,
+        self_node: u64,
     ) -> Self {
-        Self { backends, deploy }
+        Self {
+            backends,
+            deploy,
+            self_node,
+        }
     }
 
     /// Classify one observed replica against the orphan definition at `now` with `grace`.
@@ -995,7 +1008,20 @@ impl NodeComputeReaper {
             ));
         }
 
-        // (3) The container must be AFFIRMATIVELY gone. Unknown backend / un-probeable
+        // (3a) The liveness probe is NODE-LOCAL, so it is only authoritative for a replica
+        // THIS node hosts. A replica recorded against ANOTHER node is skipped fail-closed —
+        // this node cannot prove its (remote) container is gone, and reaping its record
+        // during a post-failover window could orphan a container still live on the old node
+        // (Security LOW). Inert on a single node (`self_node == o.node == 0`).
+        if o.node != self.self_node {
+            return Ok(Err(format!(
+                "replica is hosted on node {} (this node is {}) — a node-local liveness \
+                 probe cannot prove a remote container is gone; skipped fail-closed",
+                o.node, self.self_node
+            )));
+        }
+
+        // (3b) The container must be AFFIRMATIVELY gone. Unknown backend / un-probeable
         // host / live container all fail closed (skip) — only `Some(false)` admits.
         let Some(backend) = self.backends.get(&o.backend) else {
             return Ok(Err(format!(
@@ -1751,7 +1777,10 @@ mod tests {
             backend.clone() as Arc<dyn ComputeBackend>,
         );
         (
-            NodeComputeReaper::new(backends, store.clone()),
+            // self_node = 0: the single-node id, matching `observed_at`'s `node: 0` so the
+            // node-local guard is inert for the default fixtures. The cross-node test builds
+            // a record with a non-zero `node` to exercise the guard.
+            NodeComputeReaper::new(backends, store.clone(), 0),
             store,
             backend,
         )
@@ -1853,6 +1882,49 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_will_not_reap_a_replica_hosted_on_another_node() {
+        // Security LOW: a replica-state record recorded against ANOTHER node (its container
+        // lives elsewhere, reported alive there) must be skipped fail-closed — this node's
+        // node-local cgroup probe cannot prove a remote container is gone. Even with
+        // `alive = Some(true)` (live elsewhere) and no desired workload, it is never reaped.
+        let mut o = observed_at("default", "pg", 0, ReplicaPhase::Running, None);
+        o.node = 7; // a different node than the reaper's self_node (0)
+        let states = [o];
+        // `alive = Some(true)` would normally just skip on liveness; the point is the
+        // node guard fires FIRST, so the backend probe is never even consulted.
+        let (reaper, store, backend) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        if let ReapDisposition::Skipped { reason } = &report.entries[0].disposition {
+            assert!(
+                reason.contains("hosted on node 7"),
+                "expected a node-locality skip, got: {reason}"
+            );
+        } else {
+            panic!(
+                "a remote-node replica must be skipped, got {:?}",
+                report.entries[0]
+            );
+        }
+        assert!(
+            backend.stopped.lock().unwrap().is_empty(),
+            "a remote-node replica's container must never be stopped locally"
+        );
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the remote-node record must survive"
         );
     }
 

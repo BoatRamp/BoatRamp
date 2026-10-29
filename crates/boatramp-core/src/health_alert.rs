@@ -238,12 +238,13 @@ impl ReaperConfig {
     }
 }
 
-/// Outbound-webhook delivery. The URL is a **sealed-secret reference** (`boatramp:<name>`
-/// — or an `env:`/bare host-env ref where the posture permits it), never a plaintext
-/// URL, resolved server-side at send time exactly as the S3 credential is. The egress
-/// goes through the shared SSRF guard + the `is_global_ip` floor; reaching a PRIVATE
-/// address requires the explicit `allow_private` posture (so an alert webhook can't be
-/// turned into an SSRF oracle against internal services).
+/// Outbound-webhook delivery. The URL is a **sealed-secret reference** — ONLY the
+/// `boatramp:<name>` scheme (a node/operator secret under the reserved `default` project),
+/// never a plaintext URL and never a host-env (`env:`/bare) ref, resolved server-side at
+/// send time exactly as the S3 credential is. The egress goes through the shared SSRF guard
+/// and the `is_global_ip` floor; reaching a PRIVATE address requires the explicit
+/// `allow_private` posture (so an alert webhook can't be turned into an SSRF oracle against
+/// internal services).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {

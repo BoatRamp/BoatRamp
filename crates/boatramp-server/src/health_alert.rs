@@ -410,7 +410,20 @@ async fn deliver_webhook(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("webhook POST failed: {e}"))?;
+        // SECRET-LEAK FIX (Security MEDIUM): a `reqwest::Error`'s Display embeds the request
+        // URL — and the sealed webhook URL routinely carries a secret token in its path/query
+        // — so a routine delivery failure (DNS/connect/TLS/timeout) would otherwise propagate
+        // the FULL sealed URL into the `error=%e` warn log, defeating `SealedWebhookUrl`'s
+        // redaction. `without_url()` strips it. The GATE SEAM: when the sealed-leak mutation is
+        // armed we keep the leaky `{e}`, so the sealed-URL confidentiality gate goes RED —
+        // proving this strip is load-bearing. Dormant (and compiled out) in a real build.
+        .map_err(|e| {
+            if sealed_leak_active() {
+                format!("webhook POST failed: {e}")
+            } else {
+                format!("webhook POST failed: {}", e.without_url())
+            }
+        })?;
     if resp.status().is_success() {
         Ok(())
     } else {
@@ -958,6 +971,50 @@ mod tests {
         assert!(
             !err.contains("SSRF floor"),
             "allow_private must pass the floor (a later connect error is fine), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(health_alert_mutation)]
+    async fn webhook_delivery_failure_never_leaks_the_sealed_url(/* Security MEDIUM */) {
+        // A routine delivery FAILURE (connection refused) must NOT leak the sealed webhook
+        // URL — which carries a secret token in its query — into the error string that the
+        // loop logs at `error=%e`. The URL resolves to a closed loopback port so the POST
+        // fails fast; `allow_private` only passes it through the SSRF floor so we exercise
+        // the `send()` error path, not the floor refusal.
+        const SECRET: &str = "SUPERSECRET-URL-TOKEN-xyz";
+        let store =
+            sealed_store_with("wh", &format!("https://127.0.0.1:1/hook?token={SECRET}")).await;
+        let cfg = WebhookConfig {
+            url_secret: Some("boatramp:wh".into()),
+            allow_private: true,
+        };
+        let ev = sample_event();
+
+        // Dormant (default): the error must be a delivery failure WITHOUT the URL/token.
+        let err = deliver_webhook(Some(store.as_ref()), &cfg, &ev)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("webhook POST failed"),
+            "expected a send-path failure, got: {err}"
+        );
+        assert!(
+            !err.contains(SECRET) && !err.contains("127.0.0.1"),
+            "the sealed webhook URL must never appear in a delivery-failure error, got: {err}"
+        );
+
+        // Armed sealed-leak seam: the error DOES carry the URL — i.e. the assertion above
+        // would FAIL — proving the `without_url()` strip is load-bearing (gate RED).
+        // SAFETY: test-only env toggle, immediately cleared; serialized on this key.
+        unsafe { std::env::set_var("BOATRAMP_HEALTHALERT_MUTATION", "sealed_leak") };
+        let leaked = deliver_webhook(Some(store.as_ref()), &cfg, &ev)
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var("BOATRAMP_HEALTHALERT_MUTATION") };
+        assert!(
+            leaked.contains(SECRET),
+            "the armed mutation must leak the URL into the failure error (gate RED), got: {leaked}"
         );
     }
 

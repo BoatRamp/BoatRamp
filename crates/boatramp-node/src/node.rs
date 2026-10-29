@@ -920,7 +920,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // scan + opt-in auto-reap. Clone the registry before the reconcile loop consumes the
     // original below.
     let compute_reaper: Arc<dyn boatramp_core::compute::ComputeReaper> = Arc::new(
-        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone()),
+        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone(), node_id),
     );
 
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
