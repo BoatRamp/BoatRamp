@@ -1095,6 +1095,24 @@ pub(super) async fn put_compute(
     if let Some(resp) = reject_invalid_name("compute", &name) {
         return resp;
     }
+    // A `pull_secret` authenticates an OCI **image** pull; it is meaningless on a tar/rootfs
+    // source (which never pulls from a registry). Reject it fail-closed at this single choke
+    // point so the CLI, the apply manifest, and a direct API call all get the same rule — a
+    // misplaced secret ref is a clear 400, never silently ignored (parity with
+    // `compute set --pull-secret`).
+    if request.spec.pull_secret.is_some()
+        && !matches!(
+            request.spec.root,
+            boatramp_core::compute::RootSource::Image(_)
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "pull_secret applies only to an image() workload (a tar/rootfs source never \
+             pulls from a registry)\n",
+        )
+            .into_response();
+    }
     // A kernel applies only to the micro-VM source (`RootSource::Rootfs` boots
     // `vmlinux` + a rootfs image). For an OCI image (docker/cloudflare) or a tar
     // rootfs (native container) the kernel is ignored, so we neither require nor
@@ -3950,6 +3968,12 @@ pub(super) async fn compute_set_health(
     State(deploy): State<DeployStore>,
     Json(req): Json<SetHealthRequest>,
 ) -> Response {
+    // Slug-validate the request `project` before composing a `ProjectRef` (consistency with the
+    // other compute surfaces; System·Admin + read-mostly, so not a landing vector, but no reason
+    // to skip the check).
+    if let Some(resp) = reject_invalid_name("project", &req.project) {
+        return resp;
+    }
     let pref = boatramp_core::project::ProjectRef::new(&req.project);
     let states = match deploy.list_replica_states(pref, &req.workload).await {
         Ok(s) => s,
@@ -4150,6 +4174,11 @@ pub(super) async fn compute_netdiag(
     State(deploy): State<DeployStore>,
     Json(req): Json<NetdiagRequest>,
 ) -> Response {
+    // Slug-validate the request `project` before composing a `ProjectRef` (consistency with the
+    // other compute surfaces).
+    if let Some(resp) = reject_invalid_name("project", &req.project) {
+        return resp;
+    }
     let pref = boatramp_core::project::ProjectRef::new(&req.project);
     let states = match deploy.list_replica_states(pref, &req.workload).await {
         Ok(s) => s,

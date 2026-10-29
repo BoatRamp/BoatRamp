@@ -1955,6 +1955,22 @@ pub async fn reconcile_once(
                                 }
                             }
                         }
+                        // Defense-in-depth (Security MEDIUM-1): a workload that NAMES a
+                        // `pull_secret` but reaches a reconcile with NO registry-auth resolver
+                        // wired at all must FAIL CLOSED — never pull anonymously and silently
+                        // ignore the named secret. (The production node always wires a resolver,
+                        // which also fails closed for an operator host match; this guards a lean
+                        // or misconfigured reconcile for the project-scoped reference the spec
+                        // makes visible here.)
+                        (None, RootSource::Image(_)) if spec.pull_secret.is_some() => {
+                            report.errors.push(format!(
+                                "{wl}/{replica}: registry auth: pull_secret {:?} is named but no \
+                                 registry-auth resolver is configured on this node; refusing to \
+                                 pull anonymously",
+                                spec.pull_secret.as_deref().unwrap_or_default()
+                            ));
+                            continue;
+                        }
                         _ => None,
                     };
                     match launch_one(
