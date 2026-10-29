@@ -496,6 +496,11 @@ pub fn from_serve_config(
     // (the documented fallback, same as the static cluster-cert store). Warn loudly so an operator
     // enabling on-demand TLS in production configures `[secrets]`.
     let envelope_wrapped = account_envelope.is_some();
+    // DNS-01 propagation knobs (`[serve.on_demand_tls]`): a real readiness poll, max `propagation_wait`,
+    // re-checked every `propagation_poll_interval`. Default to the behaviour-equivalent 15s cap / 2s poll.
+    let propagation_wait = Duration::from_secs(cfg.propagation_wait_secs.unwrap_or(15));
+    let propagation_poll_interval =
+        Duration::from_secs(cfg.propagation_poll_interval_secs.unwrap_or(2));
     let issuer = Arc::new(AcmeIssuer::new(
         challenge,
         directory_url,
@@ -505,6 +510,8 @@ pub fn from_serve_config(
         account_kv,
         account_envelope,
         extra_root_ca,
+        propagation_wait,
+        propagation_poll_interval,
     ));
     let gate = Arc::new(DeployGate { deploy });
     let defaults = OnDemandConfig::default();
@@ -686,7 +693,11 @@ pub struct AcmeIssuer {
     contact_email: Option<String>,
     cache: Arc<CertCache>,
     dns_ttl: u32,
-    propagation_delay: Duration,
+    /// DNS-01 only: max wait for the `_acme-challenge` TXT to propagate before validating (a real
+    /// readiness poll, not a blind sleep — see `boatramp_acme::acme::wait_for_propagation`).
+    propagation_wait: Duration,
+    /// DNS-01 only: how often to re-check DNS while waiting for propagation.
+    propagation_poll_interval: Duration,
     timeout: Duration,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Where the ACME account credentials persist (replicated control-plane KV), so the account is
@@ -714,6 +725,8 @@ impl AcmeIssuer {
         account_kv: Arc<dyn boatramp_core::kv::KvStore>,
         account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
         extra_root_ca: Option<PathBuf>,
+        propagation_wait: Duration,
+        propagation_poll_interval: Duration,
     ) -> Self {
         Self {
             account: tokio::sync::OnceCell::new(),
@@ -722,7 +735,8 @@ impl AcmeIssuer {
             contact_email,
             cache,
             dns_ttl: 60,
-            propagation_delay: Duration::from_secs(15),
+            propagation_wait,
+            propagation_poll_interval,
             timeout: Duration::from_secs(120),
             now_unix,
             account_kv,
@@ -811,14 +825,38 @@ impl CertIssuer for AcmeIssuer {
             contact_email: self.contact_email.clone(),
             domains: vec![sni.to_string()],
             dns_ttl: self.dns_ttl,
-            propagation_delay: self.propagation_delay,
+            propagation_wait: self.propagation_wait,
+            propagation_poll_interval: self.propagation_poll_interval,
             timeout: self.timeout,
             extra_root_ca: self.extra_root_ca.clone(),
         };
         let issued = match &self.challenge {
             AcmeChallenge::Dns01(provider) => {
-                let solver = boatramp_acme::acme::Dns01Solver::new(provider.as_ref(), self.dns_ttl);
-                boatramp_acme::acme::obtain_certificate_with(account, &request, &solver).await
+                // Wire the propagation pre-check so we tell the CA to validate only once the
+                // `_acme-challenge` TXT is live (the fix). If the resolver can't be built, fall back to
+                // the no-pre-check solver (blind `propagation_wait`), no worse than before.
+                match boatramp_acme::acme::HickoryTxtResolver::system() {
+                    Ok(resolver) => {
+                        let solver = boatramp_acme::acme::Dns01Solver::with_resolver(
+                            provider.as_ref(),
+                            self.dns_ttl,
+                            &resolver,
+                        );
+                        boatramp_acme::acme::obtain_certificate_with(account, &request, &solver)
+                            .await
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "boatramp::acme", %sni, error = %e,
+                            "could not build the DNS-01 propagation resolver; issuing without a \
+                             readiness pre-check (blind propagation wait)"
+                        );
+                        let solver =
+                            boatramp_acme::acme::Dns01Solver::new(provider.as_ref(), self.dns_ttl);
+                        boatramp_acme::acme::obtain_certificate_with(account, &request, &solver)
+                            .await
+                    }
+                }
             }
             AcmeChallenge::TlsAlpn01 => {
                 let solver = TlsAlpn01Solver {
@@ -1585,6 +1623,11 @@ mod tests {
             Arc::new(boatramp_core::kv::MemoryKv::new()),
             None,
             Some(ca_path.clone()),
+            // Short propagation wait: the system resolver can't see challtestsrv, so the pre-check
+            // falls through quickly and Pebble's own VA (which does read challtestsrv) validates. The
+            // propagation happy-path itself is exercised by `boatramp-acme`'s `pebble_dns01` test.
+            Duration::from_secs(2),
+            Duration::from_millis(500),
         ));
         let cert_store = mem_store();
         let eng = Arc::new(OnDemandIssuer {

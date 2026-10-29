@@ -2495,6 +2495,16 @@ pub struct OnDemandTlsConfig {
     /// Max CA orders per rolling hour (the account rate-limit floor). Absent ⇒ 50; `0` ⇒ unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_per_hour: Option<u32>,
+    /// DNS-01 only: **maximum** seconds to wait for the `_acme-challenge` TXT to become visible before
+    /// telling the CA to validate. This is a real readiness poll, not a blind sleep — issuance proceeds
+    /// as soon as the record resolves, falling back to proceeding-anyway (the CA retries) only if this
+    /// elapses. Absent ⇒ 15. Ignored for the `tls-alpn-01` challenge (nothing external to wait for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propagation_wait_secs: Option<u64>,
+    /// DNS-01 only: how often (seconds) to re-check DNS while waiting for the TXT to propagate. Absent
+    /// ⇒ 2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propagation_poll_interval_secs: Option<u64>,
 }
 
 /// How [`OnDemandTlsConfig`] proves control of a name to the CA.

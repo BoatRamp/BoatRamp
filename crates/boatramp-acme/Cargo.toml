@@ -16,8 +16,11 @@ description = "boatramp wildcard TLS via ACME DNS-01 + a pluggable DNS-provider 
 [features]
 default = []
 # The ACME DNS-01 issuance driver (instant-acme + a CSR via rcgen). Heavy; off
-# by default so a build that only needs the DNS abstraction stays lean.
-acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio"]
+# by default so a build that only needs the DNS abstraction stays lean. Pulls
+# hickory-resolver for the DNS-01 propagation pre-check (resolve the
+# `_acme-challenge` TXT and confirm it is live BEFORE telling the CA to validate
+# — see `acme::wait_for_propagation`).
+acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio", "dep:hickory-resolver"]
 # DNS providers, each behind its own feature so its client deps are optional.
 cloudflare = ["dep:reqwest", "dep:serde_json"]
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
@@ -52,6 +55,16 @@ serde_json = { workspace = true, optional = true }
 # challenge we select. See tests/pebble_dns01.rs for the regression gate.
 instant-acme = { version = "0.8.5", optional = true }
 rcgen = { version = "0.13", optional = true }
+# DNS-01 propagation pre-check: resolve the `_acme-challenge` TXT and confirm the
+# expected value is live before telling the CA to validate (the fix for the
+# propagation race — see `acme::wait_for_propagation`). A plain recursive/system
+# resolver over UDP/TCP (no DoH backend pulled — `default-features = false` drops
+# the rustls/webpki stack); the names resolved are the operator's own challenge
+# names, not an SSRF surface. Matches the 0.26 line the server already uses.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+  "system-config",
+  "tokio",
+], optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-route53 = { version = "1", features = [
   "behavior-version-latest",
@@ -69,6 +82,9 @@ tokio = { workspace = true, features = [
   "rt-multi-thread",
   "process",
   "time",
+  # `test-util` powers `#[tokio::test(start_paused = true)]`, which the propagation-wait ordering
+  # tests use to drive `wait_for_propagation`'s timers deterministically (no real sleeping).
+  "test-util",
 ] }
 serde_json.workspace = true
 # The Pebble DNS-01 integration test (tests/pebble_dns01.rs, `#[ignore]`d):

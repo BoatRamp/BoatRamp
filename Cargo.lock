@@ -1693,6 +1693,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-route53",
  "base64 0.22.1",
+ "hickory-resolver",
  "hmac 0.12.1",
  "instant-acme",
  "pkcs8 0.10.2",

@@ -158,6 +158,8 @@ Nickel-generated config on a non-`.json` path). See
 | `--acme-cache <path>` | `./data/acme` | Certificate cache directory. |
 | `--acme-dns-provider <name>` | `manual` | DNS-01 provider (`--tls acme-dns`); see [DNS providers](./dns-providers.md). |
 | `--acme-wildcard-preview` | `false` | Also issue `*.deploy.<domain>` for by-id previews. |
+| `--acme-propagation-wait-secs <n>` | `15` | DNS-01: max seconds to wait for the `_acme-challenge` TXT to propagate before validating (a readiness poll, not a blind sleep). |
+| `--acme-propagation-poll-interval-secs <n>` | `2` | DNS-01: how often to re-check DNS while waiting for the TXT to propagate. |
 | `--http-redirect-addr <host:port>` | `BOATRAMP_HTTP_REDIRECT_ADDR` | Second listener that `308`s plain HTTP to HTTPS. |
 
 ### Uploads, serving, cluster

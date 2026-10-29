@@ -543,6 +543,22 @@ pub struct ServeArgs {
     )]
     acme_wildcard_preview: bool,
 
+    /// DNS-01 only: **maximum** seconds to wait for the `_acme-challenge` TXT to become visible in
+    /// the zone before telling the CA to validate. This is a real readiness poll (resolve the record
+    /// and confirm the expected value), not a blind sleep — issuance proceeds the moment the record
+    /// is live, and only falls back to proceeding-anyway (the CA retries) if this elapses first.
+    #[arg(long, env = "BOATRAMP_ACME_PROPAGATION_WAIT", default_value_t = 15)]
+    acme_propagation_wait_secs: u64,
+
+    /// DNS-01 only: how often (seconds) to re-check DNS while waiting for the `_acme-challenge` TXT to
+    /// propagate.
+    #[arg(
+        long,
+        env = "BOATRAMP_ACME_PROPAGATION_POLL_INTERVAL",
+        default_value_t = 2
+    )]
+    acme_propagation_poll_interval_secs: u64,
+
     /// Reject blob uploads larger than this many bytes (default: unlimited).
     /// Flag/env > `serve.max_upload_bytes`.
     #[arg(long, env = "BOATRAMP_MAX_UPLOAD_BYTES")]
@@ -4544,7 +4560,8 @@ async fn serve_cluster_acme_dns(
         contact_email: args.acme_contact.clone(),
         domains: Vec::new(),
         dns_ttl: 60,
-        propagation_delay: Duration::from_secs(15),
+        propagation_wait: Duration::from_secs(args.acme_propagation_wait_secs),
+        propagation_poll_interval: Duration::from_secs(args.acme_propagation_poll_interval_secs),
         timeout: Duration::from_secs(120),
         extra_root_ca: args.acme_ca_cert.clone(),
     };
@@ -4783,7 +4800,8 @@ async fn serve_acme_dns(
         contact_email: args.acme_contact.clone(),
         domains: Vec::new(),
         dns_ttl: 60,
-        propagation_delay: Duration::from_secs(15),
+        propagation_wait: Duration::from_secs(args.acme_propagation_wait_secs),
+        propagation_poll_interval: Duration::from_secs(args.acme_propagation_poll_interval_secs),
         timeout: Duration::from_secs(120),
         extra_root_ca: args.acme_ca_cert.clone(),
     };

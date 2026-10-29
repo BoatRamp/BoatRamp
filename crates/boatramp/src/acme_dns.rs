@@ -293,7 +293,8 @@ pub async fn obtain_or_load(
         contact_email: base.contact_email.clone(),
         domains: vec![domain.to_string()],
         dns_ttl: base.dns_ttl,
-        propagation_delay: base.propagation_delay,
+        propagation_wait: base.propagation_wait,
+        propagation_poll_interval: base.propagation_poll_interval,
         timeout: base.timeout,
         extra_root_ca: base.extra_root_ca.clone(),
     };
