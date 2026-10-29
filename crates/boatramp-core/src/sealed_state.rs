@@ -57,6 +57,15 @@ const MAGIC: &[u8] = b"BRSS1\0";
 /// seen) cannot widen the window past this ceiling.
 pub const MAX_STATE_TTL_SECS: u64 = 900;
 
+/// The maximum length (bytes) of the base64url `token` string [`unseal_state`] will even look at. The
+/// `state` param is ATTACKER-CONTROLLED and today only bounded by the HTTP layer, so without this an
+/// over-large value would force an O(n) base64-decode + AEAD-open before the tag inevitably fails. A
+/// legitimate token (the domain tag + the small JSON claims + AEAD overhead, base64url-expanded) is a
+/// few hundred bytes even with a long pkce/nonce; 8 KiB is a very generous ceiling that still caps the
+/// pre-auth work an unauthenticated caller can provoke. An over-long token fails closed (`TooLong` →
+/// no tenant) BEFORE any decode/decrypt.
+pub const MAX_STATE_TOKEN_LEN: usize = 8 * 1024;
+
 /// Clock-skew tolerance for the not-yet-valid (`iat` in the future) check. Applied ONLY to the
 /// lower bound — expiry (`exp`) is checked strictly, so skew can never EXTEND a token's life.
 const CLOCK_SKEW_SECS: u64 = 120;
@@ -97,6 +106,9 @@ pub struct SealedStateClaims {
 /// resolution outcome. Carries no key material and no tenant value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealedStateError {
+    /// The input `token` exceeded [`MAX_STATE_TOKEN_LEN`] — rejected BEFORE base64-decode / AEAD-open
+    /// (the `state` param is attacker-controlled; this caps the pre-auth work a large value can force).
+    TooLong,
     /// The token was not valid URL-safe base64 (unseal), or claims could not be serialized (seal).
     Codec,
     /// The AEAD open failed — wrong key, tampered ciphertext, or a foreign blob. (The dominant
@@ -121,6 +133,7 @@ pub enum SealedStateError {
 impl std::fmt::Display for SealedStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            Self::TooLong => "sealed-state: token exceeds the maximum length",
             Self::Codec => "sealed-state: codec error",
             Self::Unseal => "sealed-state: AEAD open failed (wrong key, tampered, or foreign)",
             Self::BadMagic => "sealed-state: missing domain tag (not a sealed-state token)",
@@ -216,6 +229,12 @@ pub async fn unseal_state(
     expected_site: &str,
 ) -> Result<SealedStateClaims, SealedStateError> {
     use base64::Engine as _;
+    // Length cap FIRST (before any decode/decrypt): the `state` param is attacker-controlled, so an
+    // over-long value is rejected cheaply instead of forcing O(n) base64-decode + AEAD-open work whose
+    // tag would fail anyway. Fail-closed → no tenant.
+    if token.len() > MAX_STATE_TOKEN_LEN {
+        return Err(SealedStateError::TooLong);
+    }
     let wrapped = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .map_err(|_| SealedStateError::Codec)?;
@@ -338,6 +357,41 @@ mod tests {
         assert_eq!(got.tenant, "firm-x");
         assert_eq!(got.pkce.as_deref(), Some("pkce-verifier"));
         assert_eq!(got.nonce.as_deref(), Some("oidc-nonce"));
+    }
+
+    #[tokio::test]
+    async fn an_over_long_token_is_rejected_cheaply_and_a_normal_one_passes() {
+        let env = FakeKek { key: 0x5a };
+        let now = 1_000_000;
+        // A legitimate token is a few hundred bytes and well under the ceiling.
+        let token = seal_state(&env, &claims(now)).await.unwrap();
+        assert!(
+            token.len() <= MAX_STATE_TOKEN_LEN,
+            "a real token is far below the cap ({} bytes)",
+            token.len()
+        );
+        assert!(
+            unseal_state(&env, &token, now + 10, "acme", "console")
+                .await
+                .is_ok(),
+            "a normal token still passes after the cap"
+        );
+        // An over-long attacker value is rejected BEFORE any base64-decode / AEAD-open — a distinct,
+        // fail-closed `TooLong` (not Codec/Unseal), so it never reaches the crypto path.
+        let oversized = "A".repeat(MAX_STATE_TOKEN_LEN + 1);
+        assert_eq!(
+            unseal_state(&env, &oversized, now + 10, "acme", "console").await,
+            Err(SealedStateError::TooLong),
+            "an over-long token must be rejected cheaply, before decode/decrypt"
+        );
+        // A value exactly at the ceiling is still size-admitted (it then fails later on content, but
+        // NOT with TooLong) — proving the cap is a ceiling, not an off-by-one under-reject.
+        let at_cap = "A".repeat(MAX_STATE_TOKEN_LEN);
+        assert_ne!(
+            unseal_state(&env, &at_cap, now + 10, "acme", "console").await,
+            Err(SealedStateError::TooLong),
+            "a token at exactly the cap is admitted past the length gate"
+        );
     }
 
     #[tokio::test]
