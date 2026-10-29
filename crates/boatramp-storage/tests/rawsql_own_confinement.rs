@@ -789,7 +789,7 @@ async fn run_security_findings(backend: &dyn SqlBackend, dialect: Dialect, c: &m
 
 #[cfg(feature = "sql")]
 #[tokio::test]
-#[ignore = "run via the rawsql-own-confinement CI job on the host toolchain (static-musl libsql segfault)"]
+#[ignore = "heavy libsql battery; run via the rawsql-own-confinement CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn rawsql_own_confinement_libsql() {
     use boatramp_core::sql::SqlBackends;
     use boatramp_storage::LibsqlSqlBackends;

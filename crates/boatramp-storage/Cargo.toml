@@ -165,6 +165,13 @@ blob-perproject-gate-mutation = []
 # gate runs fs→fs in a tempdir) + `fallback` (the translating fallback lives there). Compiled OUT of
 # every real build.
 default-scope-gate-mutation = ["fs", "fallback"]
+# TEST-ONLY, NEVER SHIPPED: arm the embedded-SQLite exec-serialization mutation seam
+# (`local_exec_lock`). With this ON and `BOATRAMP_LIBSQL_EXECLOCK_MUTATE` set, the process-global
+# lock that serializes embedded (local) libsql execution is BYPASSED, so the concurrent
+# `libsql_exec_serialization_gate` workload reproduces the static-musl heap corruption
+# (SIGSEGV / `SQLITE_MISUSE`) — proving the serialization is load-bearing. Implies `sql` (the seam
+# lives in the libsql backend). Compiled OUT of every real build.
+libsql-execlock-gate-mutation = ["sql"]
 
 [dependencies]
 boatramp-core.workspace = true

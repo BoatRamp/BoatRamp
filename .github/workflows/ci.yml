@@ -1776,26 +1776,28 @@ jobs:
   # silently skip it — a skip is not evidence — so this lane runs it explicitly with `sql` and
   # asserts a success marker, so a silent skip OR a cross-tenant regression fails the merge.
   #
-  # Runs on the **host** toolchain (glibc), NOT the musl cross-target: the tenant-scope SQL
-  # semantics are libc-independent (a compiled `WHERE`/stamp the engine applies), and a
-  # cross-compiled-musl *test binary* + libsql-local's bundled SQLite has a runtime quirk under the
-  # static-musl test harness that the production musl binary doesn't hit (managed libsql is proven
-  # on musl by the container capability gate + real deployments). Matching the nightly, which runs
-  # target-agnostic logic tests on the host toolchain.
+  # Runs on the shipped **static-musl** target (`cargo-zigbuild`). These libsql batteries used to be
+  # banished to the host toolchain because libsql's bundled SQLite SIGSEGV'd under the static-musl
+  # test harness — now ROOT-CAUSED and FIXED: embedded SQLite was not actually serialized across
+  # threads on static-musl (a connection CLOSE racing another thread's statement corrupts the shared
+  # heap), fixed by `boatramp_storage::sql_libsql`'s `local_sql_lock` (embedded-SQLite execution +
+  # close serialized process-wide in local mode). So the real libsql path is exercised on the target
+  # it ships on. The exec-serialization itself is mutation-verified by the `libsql-exec-serialization`
+  # gate below.
   test-orm-tenancy:
     name: test (ORM in-site tenant isolation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-orm-tenancy-host
+          key: test-orm-tenancy-musl
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # All nine are `#[ignore]`d (the general workspace lane skips them — a static-musl test
-          # binary segfaults in libsql); run them explicitly here, unignored, on the host toolchain.
+          # All nine are `#[ignore]`d (the general workspace lane skips these heavy batteries); run
+          # them explicitly here, unignored, on the static-musl target (the exec-serialization fix).
           # Nine batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
           # Stage 3 anonymous-first (TenantOrSession) disjunct, the Stage 4 durable signed-context
           # lane (publish->claim->verify->scope on a real messaging store + libsql), the #503
@@ -1804,7 +1806,7 @@ jobs:
           # (v0.12.x) the opt-in `on_unresolved: pass` null-principal pass-through (zero-rows) gate,
           # and (v0.12.x) the token-source claim-transform derived-key gate (screened / deny-on-no-match
           # / injective namespace).
-          cargo test -p boatramp-storage \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
           grep -qE 'test result: ok\. 10 passed' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 10?)" >&2; exit 1; }
@@ -1832,7 +1834,7 @@ jobs:
           # (BOATRAMP_ORMGROUPBY_MUTATION=skip_scope) leaks another tenant's rows into the grouped
           # aggregates, so the gate's equality-to-single-tenant baseline MUST fail. A pass-under-mutation
           # (a hollow gate) fails the merge.
-          if BOATRAMP_ORMGROUPBY_MUTATION=skip_scope cargo test -p boatramp-storage --features sql \
+          if BOATRAMP_ORMGROUPBY_MUTATION=skip_scope cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql \
             --test orm_tenant_isolation -- --ignored \
             orm_group_by_aggregate_is_tenant_confined_pre_aggregation_on_a_real_engine \
             > orm-groupby-mutation.log 2>&1; then
@@ -1846,7 +1848,7 @@ jobs:
           # all-rows), so the unresolved-host read leaks BOTH tenants' rows and the ZERO-ROWS assertion
           # MUST fail. A pass-under-mutation (a hollow gate) fails the merge — proving the pass-through
           # relaxes ONLY the pre-handler deny, never the row scoping.
-          if BOATRAMP_DOMAINPASS_MUTATION=skip_confine cargo test -p boatramp-storage --features sql \
+          if BOATRAMP_DOMAINPASS_MUTATION=skip_confine cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql \
             --test orm_tenant_isolation -- --ignored \
             domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_real_engine \
             > domainpass-mutation.log 2>&1; then
@@ -1865,7 +1867,7 @@ jobs:
           # un-namespaced source list, so a forged verbatim claim reads the victim's rows. A
           # pass-under-mutation (a hollow gate) fails the merge.
           for mut in skip_derived_screen extract_fallback skip_namespace_check skip_source_mix; do
-            if BOATRAMP_CLAIMTRANSFORM_MUTATION="$mut" cargo test -p boatramp-storage \
+            if BOATRAMP_CLAIMTRANSFORM_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
               --features "sql claim-transform-gate-mutation" \
               --test orm_tenant_isolation -- --ignored \
               claim_transform_derived_key_is_screened_denies_and_injective_on_a_real_engine \
@@ -1883,7 +1885,7 @@ jobs:
           # shared `tenant_id` instead of `owner_user_id` so the owner confine breaks. A pass-under-mutation
           # (a hollow gate) fails the merge.
           for mut in unscoped wrong_column; do
-            if BOATRAMP_OWNED_MUTATION="$mut" cargo test -p boatramp-storage \
+            if BOATRAMP_OWNED_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
               --features "sql owned-gate-mutation" \
               --test orm_tenant_isolation -- --ignored \
               owned_column_scope_isolates_non_unique_owners_on_a_real_engine \
@@ -1906,7 +1908,7 @@ jobs:
           # write recovers; `mutation_skip_conn_heal_bricks_the_next_write` arms
           # BOATRAMP_KVSQL_MUTATION=skip_conn_heal and asserts the next write FAILS (RED) — proving the
           # heal is load-bearing, in-process. Single-threaded because both touch the shared mutation env.
-          cargo test -p boatramp-storage --features sql --lib -- --test-threads=1 --nocapture \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql --lib -- --test-threads=1 --nocapture \
             kv_sql::sqlite_tests::sqlkv_recovers_from_a_cancelled_write_leaving_an_open_txn \
             kv_sql::sqlite_tests::mutation_skip_conn_heal_bricks_the_next_write 2>&1 | tee kv-cancel-heal.log
           grep -qE 'test result: ok\. 2 passed' kv-cancel-heal.log \
@@ -1920,8 +1922,8 @@ jobs:
           # `tenant_or_base` table (shipped since v0.4.16 as `AccessMode::Null`→`ScopeMode::NullOnly`);
           # v0.12.5 adds the TARGET-route refusal (a target carries only `B`, so a base write under it
           # would stamp the shared baseline — a cross-boundary blast). LIVE end-to-end proof on a real
-          # libsql file (host toolchain; static-musl segfaults, as the ORM tenancy gate above):
-          cargo test -p boatramp-storage --features sql --test catalog_persistence \
+          # libsql file (static-musl target; the exec-serialization fix, as the ORM tenancy gate above):
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql --test catalog_persistence \
             -- --ignored --nocapture 2>&1 | tee catalog-base-write.log
           grep -qE 'test result: ok\. 1 passed' catalog-base-write.log \
             || { echo "::error::catalog base-write live gate did not run (silent skip or a failure)" >&2; exit 1; }
@@ -1932,14 +1934,14 @@ jobs:
           # `basewrite-gate-mutation` feature, compiled OUT of shipped builds) disables ONE invariant
           # and MUST turn it RED — `leak_stamp` (a base write stamps a tenant value, not NULL) and
           # `skip_target_guard` (drops the target refusal). A pass-under-mutation (a hollow gate) fails.
-          cargo test -p boatramp-core base_write_target_stamps_null_and_refuses_target \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core base_write_target_stamps_null_and_refuses_target \
             -- --nocapture 2>&1 | tee basewrite-unit.log
           grep -qE 'test result: ok\. 1 passed' basewrite-unit.log \
             || { echo "::error::base-write write_target unit gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'BASE-WRITE WRITE-TARGET OK' basewrite-unit.log \
             || { echo "::error::base-write unit gate never reached its marker" >&2; exit 1; }
           for mut in leak_stamp skip_target_guard; do
-            if BOATRAMP_BASEWRITE_MUTATION="$mut" cargo test -p boatramp-core \
+            if BOATRAMP_BASEWRITE_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core \
               --features basewrite-gate-mutation base_write_target_stamps_null_and_refuses_target \
               > "basewrite-mutation-$mut.log" 2>&1; then
               echo "::error::base-write gate is HOLLOW — it passed under BOATRAMP_BASEWRITE_MUTATION=$mut (the NULL stamp or the target refusal is not actually enforced)" >&2
@@ -1961,12 +1963,12 @@ jobs:
           # a ledger-table reference, all tokenized under the SQLite dialect (sqlparser SQLiteDialect,
           # so a `--`-comment can't hide a COMMIT); host-mediates the owner-DDL seam (the guest holds
           # NO credential — the file is the trust boundary, there is no owner/runtime role split to
-          # model); and records a baseline without running it (U6 origin). Runs on the HOST toolchain
-          # (a static-musl test binary segfaults in libsql's bundled SQLite — same quirk as the ORM
-          # tenancy gate above), needs no service container (an embedded file under a temp dir), and
+          # model); and records a baseline without running it (U6 origin). Runs on the static-musl
+          # target (the former libsql static-musl SIGSEGV is fixed — exec-serialization — same as the
+          # ORM tenancy gate above), needs no service container (an embedded file under a temp dir), and
           # only the `migrate` feature (⇒ the embedded libsql substrate). A regression fails the
           # assertion.
-          cargo test -p boatramp-node --no-default-features --features migrate \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-node --no-default-features --features migrate \
             --test migrate_runner_libsql_live -- --nocapture 2>&1 | tee migrate-libsql.log
           grep -qE 'test result: ok\. 1 passed' migrate-libsql.log \
             || { echo "::error::migrate libsql parity gate did not run (a silent skip or a failure)" >&2; exit 1; }
@@ -1981,22 +1983,22 @@ jobs:
   # proves the fix BEHAVIORALLY on a REAL embedded libsql engine (victim tenant B's rows unchanged /
   # not disclosed), then MUTATION-VERIFIES it: it reverts the confinement to the old escapable string
   # marker (and to no-confinement) via `RAWSQL_CONFINE_MUTATION` and asserts the gate then FAILS
-  # (non-zero) — so a regression that re-opens the hole fails the merge. `#[ignore]`d (static-musl
-  # libsql SIGSEGV, like test-orm-tenancy); run unignored here on the host toolchain.
+  # (non-zero) — so a regression that re-opens the hole fails the merge. `#[ignore]`d (heavy libsql
+  # battery, like test-orm-tenancy); run unignored here on the static-musl target (exec-serialization fix).
   test-rawsql-own-confinement:
     name: test (raw-SQL own-confinement AST)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-rawsql-own-confinement-host
+          key: test-rawsql-own-confinement-musl
       - name: Raw-SQL own/session AST confinement on a real libsql engine
         run: |
           set -eo pipefail
           # 1) The real fix must PASS + reach its marker (a silent skip / a cross-tenant breach fails).
-          cargo test -p boatramp-storage --features sql --test rawsql_own_confinement \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql --test rawsql_own_confinement \
             -- --ignored --nocapture 2>&1 | tee rawsql-confine.log
           grep -qE 'test result: ok\. 1 passed' rawsql-confine.log \
             || { echo "::error::raw-SQL own-confinement gate did not pass (silent skip or failure?)" >&2; exit 1; }
@@ -2010,7 +2012,7 @@ jobs:
           # make the gate FAIL (non-zero). If either mutation still passes, the assertions don't
           # actually depend on the fix — fail the merge.
           for mut in string-marker no-confinement; do
-            if RAWSQL_CONFINE_MUTATION="$mut" cargo test -p boatramp-storage --features sql \
+            if RAWSQL_CONFINE_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage --features sql \
                  --test rawsql_own_confinement -- --ignored >/dev/null 2>&1; then
               echo "::error::mutation '$mut' did NOT fail the raw-SQL own-confinement gate — the gate is hollow (it does not depend on the AST fix)" >&2
               exit 1
@@ -2106,23 +2108,22 @@ jobs:
   # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
   # engine (compile -> SQL -> execute -> shape), returning only B's published+non-deleted rows and
   # refusing (deny-by-default) any table with no declared public subset. The test is `#[ignore]`d
-  # (the general/musl lanes skip it — a static-musl test binary segfaults in libsql's bundled
-  # SQLite, the same runtime quirk as test-orm-tenancy), so this lane runs it unignored on the host
-  # toolchain (glibc) and asserts the success marker — a silent skip OR a target-read isolation
-  # breach fails the merge.
+  # (the general lane skips this heavy battery; the former static-musl libsql SIGSEGV is fixed — see
+  # test-orm-tenancy), so this lane runs it unignored on the static-musl target and asserts the
+  # success marker — a silent skip OR a target-read isolation breach fails the merge.
   test-gdc-target:
     name: test (GDC target-tenant read isolation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-gdc-target-host
+          key: test-gdc-target-musl
       - name: Live GraphQL target-tenant read isolation on a real libsql engine
         run: |
           set -eo pipefail
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             gdc_target_read_isolates_to_b_public_subset_on_a_real_engine \
             -- --ignored --nocapture 2>&1 | tee gdc-target.log
           grep -qE 'test result: ok\. 1 passed' gdc-target.log \
@@ -2133,18 +2134,18 @@ jobs:
   # Stage 5a PLAIN-WASM target-tenant read isolation HARD GATE. The non-federated analog of
   # test-gdc-target: a `Tenancy::Target` route's `orm` AND raw-`sql` reads must both confine to
   # another tenant `B`'s declared PUBLIC subset on a REAL libsql engine (HostTenancy::target →
-  # orm_scope compile+run AND sql_marker splice+run). `#[ignore]`d (static-musl libsql segfault),
-  # run here unignored on the host toolchain + marker-asserted, so a silent skip OR a target-read
-  # isolation breach on either binding fails the merge.
+  # orm_scope compile+run AND sql_marker splice+run). `#[ignore]`d (heavy libsql battery; former
+  # static-musl libsql SIGSEGV now fixed — exec-serialization), run here unignored on the static-musl
+  # target + marker-asserted, so a silent skip OR a target-read isolation breach on either binding fails the merge.
   test-target-plain-wasm:
     name: test (plain-wasm target-tenant read isolation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-target-plain-wasm-host
+          key: test-target-plain-wasm-musl
       - name: Live plain-wasm target-tenant read + write isolation on a real libsql engine
         run: |
           set -eo pipefail
@@ -2152,7 +2153,7 @@ jobs:
           # the capability-only exemption, the delegable-capability context round-trip (v0.4.5:
           # mint -> redeem surfaces sub -> read-back -> in-guest client filter), and the per-table
           # TenantOrBase base⊕own/target fold (v0.4.16) — all on a real engine.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             plain_wasm_target \
             -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
           grep -qE 'test result: ok\. 6 passed' target-plainwasm.log \
@@ -2180,7 +2181,7 @@ jobs:
           # rows, so every corner (both keys + posture → cross-tenant; posture off → own; each missing
           # key → fail closed; sibling/gateway no-bleed) is observed in SQL. A regression that lets a
           # single key (or a bleed to a sibling/the gateway) reach cross-tenant fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             ceiling_exception_three_key_truth_table_on_a_real_engine \
             -- --ignored --nocapture 2>&1 | tee threekey.log
           grep -qE 'test result: ok\. 1 passed' threekey.log \
@@ -2194,7 +2195,7 @@ jobs:
           # FederationRunner inherits the caller's resolved principal (returns only tenant B's rows);
           # with no principal it fails closed. Proves the async lane can drive a tenant-scoped
           # supergraph read/write with no request bearer, symmetric to emit::invoke.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             graphql_run_propagates_caller_principal_to_a_scoped_subfetch \
             -- --ignored --nocapture 2>&1 | tee gqlprop.log
           grep -qE 'test result: ok\. 1 passed' gqlprop.log \
@@ -2209,7 +2210,7 @@ jobs:
           # guest's own SQL to tenant=B AND <public subset>. Returns ONLY B's public row (never B's
           # private row, never A's); no resolved target ⇒ fail closed. A leak (wrong tenant / private
           # row / no confinement) fails the assertion.
-          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,capability,oidc --lib \
             gateway_forces_target_confinement_onto_a_wasm_subgraph \
             -- --ignored --nocapture 2>&1 | tee gwtarget.log
           grep -qE 'test result: ok\. 1 passed' gwtarget.log \
@@ -2222,7 +2223,7 @@ jobs:
           # v0.4.8: scope:target_or_null reads B's public rows PLUS the shared NULL-tenant base floor,
           # each confined to the public subset — never B's private row, never a non-public base row,
           # never another tenant's row. A base-floor loss (no base_pub) OR a leak fails the assertion.
-          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,capability,oidc --lib \
             gateway_target_or_null_includes_the_shared_base \
             -- --ignored --nocapture 2>&1 | tee gwton.log
           grep -qE 'test result: ok\. 1 passed' gwton.log \
@@ -2237,7 +2238,7 @@ jobs:
           # caller's tenant rows instead of failing closed. Caller principal = tenant B ⇒ ONLY B's
           # rows; an empty (anon) principal ⇒ fail closed (anon NOT widened). A regression (empty
           # principal again, a cross-tenant leak, or an anon widening) fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             gateway_propagates_caller_own_principal_to_a_wasm_subgraph \
             -- --ignored --nocapture 2>&1 | tee gwown.log
           grep -qE 'test result: ok\. 1 passed' gwown.log \
@@ -2252,7 +2253,7 @@ jobs:
           # non-member (403) end-to-end on a real libsql engine — the 2 subscribers × 2 mailboxes
           # isolation matrix. A placeholder-bind regression (the `$N` vs `?N` bug) or a cross-mailbox
           # leak fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             scoped_stream_sql_membership_isolates_mailboxes \
             -- --ignored --nocapture 2>&1 | tee streammember.log
           grep -qE 'test result: ok\. 1 passed' streammember.log \
@@ -2266,7 +2267,7 @@ jobs:
           # token_claims, its tenant host-sealed, and the sealed durable context resolves back to that
           # tenant; a forged / wrong-issuer token seals nothing (fail-closed). Plus the per-message
           # batch-isolation of the shared producer-context cell (the security-review Finding-1 fix).
-          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,capability,oidc --lib \
             gap3_tests:: -- --nocapture 2>&1 | tee presenttoken.log
           # 3 tests: the present-token verify/seal/resolve chain, the per-message batch-isolation of
           # the shared producer-context cell, and (v0.7.3) the persona extractor's single-scalar rule
@@ -2285,7 +2286,7 @@ jobs:
           # forged message resolves no principal and fails an own op closed (never cross-tenant,
           # never unscoped). The resolved principal is the same value that propagates onto a
           # graphql::run sub-fetch. A leak / a widening / a fail-open regression fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             consumer_signed_context_dispatch_resolves_per_message_tenant_on_a_real_engine \
             -- --nocapture 2>&1 | tee consumer-sctx.log
           grep -qE 'test result: ok\. 1 passed' consumer-sctx.log \
@@ -2302,7 +2303,7 @@ jobs:
           # caught by the bounded readiness retry; an external/local DB outage is skipped (per-DB
           # resilience, NOT gated); the gate response is a 503 with Retry-After. A fail-open
           # regression (a not-ready managed DB NOT gating) fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             managed_dependency_not_ready_gates_with_a_retryable_503 \
             -- --nocapture 2>&1 | tee readiness-gate.log
           grep -qE 'test result: ok\. 1 passed' readiness-gate.log \
@@ -2317,7 +2318,7 @@ jobs:
           # HTTPS test-double lever). A REAL loopback TLS handshake to a test-CA server succeeds WITH
           # the extra CA supplied and is REJECTED without it — trust is widened, never bypassed (full
           # certificate verification always runs). A verification-bypass regression fails the assertion.
-          cargo test -p boatramp-handlers --features engine --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers --features engine --lib \
             egress_tls_tests:: -- --nocapture 2>&1 | tee egress-ca.log
           grep -qE 'test result: ok\. 1 passed' egress-ca.log \
             || { echo "::error::guest-egress extra-CA gate did not pass (silent skip or failure?)" >&2; exit 1; }
@@ -2334,13 +2335,63 @@ jobs:
           # Active and only THEN flips `active`; a batch of N staged subgraphs composes with exactly ONE
           # version bump while a non-composing batch promotes nothing. A regression (an unvalidated
           # component becoming active/serving, or a half-promoted batch) fails the assertion.
-          cargo test -p boatramp-server --features handlers,oidc --lib \
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
             async_deploy_never_activates_or_serves_an_unvalidated_component \
             -- --ignored --nocapture 2>&1 | tee deployres.log
           grep -qE 'test result: ok\. 1 passed' deployres.log \
             || { echo "::error::deploy-resilience async/batch gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'DEPLOY-RESILIENCE ASYNC/BATCH OK' deployres.log \
             || { echo "::error::deploy-resilience async/batch invariant never reached its marker (an unvalidated component activated or served, a lost old version, or a half-promoted/over-bumped batch)" >&2; exit 1; }
+
+  # libsql embedded-SQLite exec-serialization gate (static-musl concurrency fix), MUTATION-VERIFIED.
+  # ROOT CAUSE: on the fully-static musl target, concurrent execution of libsql's bundled SQLite
+  # across threads corrupts process-global memory even though libsql selects the serialized threading
+  # mode — a captured core showed the fault in `sqlite3DbMallocRawNN` (a connection's lookaside) while
+  # another thread was mid-`PRAGMA journal_mode=WAL` journal commit on a DIFFERENT connection; a
+  # dropped (read-only) transaction's CLOSE racing another thread's statement is the same race. Fixed
+  # by `boatramp_storage::sql_libsql`'s `local_sql_lock` (embedded-SQLite execution AND close
+  # serialized process-wide in local mode). This gate drives the exact faulting pattern (20 threads,
+  # each the full open(WAL)/begin/DDL/insert/commit/read cycle on its own local DB) on the shipped
+  # static-musl target, and proves the serialization is LOAD-BEARING: with it the heavy run is clean
+  # (marker), and with the `libsql-execlock-gate-mutation` seam bypassing the lock the SAME run MUST
+  # fault (SIGSEGV / SQLITE_MISUSE). Mirrors the other mutation-gate lanes.
+  test-libsql-exec-serialization:
+    name: test (libsql exec-serialization — static-musl concurrency fix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-libsql-exec-serialization-musl
+      - name: "libsql exec-serialization gate (static-musl; mutation-verified)"
+        run: |
+          set -eo pipefail
+          # NORMAL (fix in force): the heavy concurrent workload must run CLEAN on static-musl and
+          # reach the marker. A modest round budget suffices — the serialized engine is deterministic
+          # (and WAL fsyncs make each serialized cycle costly, so keep the normal budget small).
+          GATE_ROUNDS=120 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-storage --features sql --test libsql_exec_serialization_gate \
+            -- --ignored --exact libsql_exec_serialization_gate --nocapture 2>&1 | tee execgate.log
+          grep -q 'LIBSQL EXEC-SERIALIZATION GATE OK' execgate.log \
+            || { echo "::error::libsql exec-serialization gate did not reach its OK marker (the static-musl concurrency fix regressed, or the test was skipped)" >&2; exit 1; }
+          # MUTATION (`libsql-execlock-gate-mutation` + env bypasses the exec lock): the SAME workload
+          # MUST fault (a SIGSEGV, or a collected SQLITE_MISUSE → the test panics), so the run is
+          # EXPECTED to exit non-zero. A passing (exit 0) mutation run means the serialization is NOT
+          # load-bearing. The larger round budget makes the race near-certain; the test breaks on the
+          # first fault, so it is fast when the bug reproduces.
+          if BOATRAMP_LIBSQL_EXECLOCK_MUTATE=1 GATE_ROUNDS=4000 cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-storage \
+            --features sql,libsql-execlock-gate-mutation --test libsql_exec_serialization_gate \
+            -- --ignored --exact libsql_exec_serialization_gate --nocapture > execgate-mut.log 2>&1; then
+            echo "::error::MUTATION NOT CAUGHT: bypassing the embedded-SQLite exec lock did NOT fault — the serialization is not load-bearing" >&2
+            tail -20 execgate-mut.log >&2; exit 1
+          fi
+          if grep -q 'MUTATION NOT DETECTED' execgate-mut.log; then
+            echo "::error::libsql exec-serialization mutation did not reproduce the race within GATE_ROUNDS — raise the budget (the gate must reliably reproduce the static-musl race)" >&2
+            exit 1
+          fi
+          echo "libsql exec-serialization gate OK: serialized run clean, and bypassing the lock reproduces the static-musl race (load-bearing)"
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

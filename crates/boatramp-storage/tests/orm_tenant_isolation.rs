@@ -52,14 +52,16 @@ async fn run_query(tx: &mut dyn SqlTransaction, sql: &str, params: &[SqlValue]) 
     out
 }
 
-// `#[ignore]` by default so the general workspace test lane skips it (a skip is not evidence
-// there): built for the **static-musl** target and run under musl's default malloc, libsql's
-// bundled SQLite SIGSEGVs — a test-harness quirk, NOT a logic issue and NOT a production one (the
-// shipped musl binary uses jemalloc; managed libsql is proven on musl by the container capability
-// gate + real deployments). The dedicated `test-orm-tenancy` CI job runs it **unignored** on the
-// host glibc toolchain (`-- --ignored`) and asserts the success marker — that job is the evidence.
+// `#[ignore]` by default so the general workspace test lane skips these HEAVY libsql batteries (a
+// skip is not evidence there) — the dedicated `test-orm-tenancy` CI job runs them **unignored**
+// (`-- --ignored`) and asserts the success markers. That job now runs on the **static-musl** target
+// (the shipped target): the prior static-musl SIGSEGV was a real concurrency bug — libsql's bundled
+// SQLite is not actually serialized across threads on static-musl, so concurrent connections (and a
+// connection CLOSE racing another thread's statement) corrupt the shared heap — fixed in
+// `boatramp_storage::sql_libsql` (`local_sql_lock`: embedded-SQLite execution + close serialized
+// process-wide in local mode). So these now run on musl, proving the real libsql path is sound.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
     let dir = std::env::temp_dir().join(format!("boatramp-orm-tenancy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -385,10 +387,10 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
 /// `Uniform` `tenant_id` scope on the identity table compiles to `tenant_id = ?` and the engine
 /// **rejects** it (no such column), which the schema-driven per-table key avoids.
 ///
-/// Same `#[ignore]` rationale as the sibling above (static-musl libsql segfault); the
-/// `test-orm-tenancy` CI job runs it unignored on the host toolchain and greps the marker.
+/// Same `#[ignore]` rationale as the sibling above (heavy libsql battery; former static-musl concurrency bug now fixed); the
+/// `test-orm-tenancy` CI job runs it unignored on the static-musl target and greps the marker.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
     use boatramp_core::orm::{Join, JoinKind};
     use boatramp_core::tenancy::{TableScope, TenancySchema};
@@ -869,7 +871,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
 /// breaks) both turn the read-isolation assertion RED. Same `#[ignore]` + `test-orm-tenancy` CI gate
 /// rationale as the siblings above.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn owned_column_scope_isolates_non_unique_owners_on_a_real_engine() {
     use boatramp_core::tenancy::{TableScope, TenancySchema};
     use std::collections::BTreeMap;
@@ -1108,7 +1110,7 @@ async fn owned_column_scope_isolates_non_unique_owners_on_a_real_engine() {
 /// resolution, `value` = the tenant fact (or `None`), `session` = the session fact. Same `#[ignore]`
 /// rationale + `test-orm-tenancy` CI gate as the siblings above.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
     use boatramp_core::tenancy::{TableScope, TenancySchema};
     use std::collections::BTreeMap;
@@ -1399,10 +1401,10 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
 /// the real durable store + real crypto + real engine and replicates the consumer's one-line
 /// resolution (`verify_context` → tenant → [`Scope`]); the server glue that turns a verified tenant
 /// into `FnTenant::Durable`→`resolve_host_tenancy` is covered by the server unit test. Same
-/// `#[ignore]` rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI
-/// job runs it unignored on the host toolchain and greps the marker.
+/// `#[ignore]` rationale as the siblings (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-orm-tenancy` CI
+/// job runs it unignored on the static-musl target and greps the marker.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_durable_signed_context_isolates_on_a_real_engine() {
     use boatramp_core::Storage;
     use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_context, verify_context};
@@ -1580,7 +1582,7 @@ async fn orm_durable_signed_context_isolates_on_a_real_engine() {
 /// (a global write lands UNSTAMPED, a non-global stays scoped) is the WHOLE story on this engine.
 /// Built exactly as the host builds it. Same `#[ignore]` rationale as the siblings.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_unscoped_write_isolates_on_a_real_engine() {
     use boatramp_core::tenancy::{TableScope, TenancySchema};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1799,11 +1801,11 @@ fn grouped_metrics_select() -> Select {
 
 /// **Live**, mutation-verified proof that a grouped aggregate is tenant-confined PRE-aggregation on a
 /// real libsql engine — the `ORM GROUP-BY CROSS-TENANT PRE-AGGREGATION OK` gate. Same `#[ignore]`
-/// rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it
-/// unignored on the host toolchain and greps the marker, and loops the `skip_scope` mutation
+/// rationale as the siblings (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-orm-tenancy` CI job runs it
+/// unignored on the static-musl target and greps the marker, and loops the `skip_scope` mutation
 /// asserting the test then exits non-zero.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_group_by_aggregate_is_tenant_confined_pre_aggregation_on_a_real_engine() {
     // Two real engines: `shared` holds BOTH tenants' rows; `only_a` holds ONLY tenant A's rows (the
     // ground-truth baseline). A grouped aggregate run AS TENANT A over `shared` (force_scope own=acme)
@@ -1950,7 +1952,7 @@ async fn orm_group_by_aggregate_is_tenant_confined_pre_aggregation_on_a_real_eng
 /// So `count(*)` and `count(child.col)` differ by exactly the unmatched rows, and the other tenant's
 /// value never contributes. Same `#[ignore]` rationale as the siblings.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn orm_left_join_count_has_null_semantics_and_no_cross_tenant_leak_on_a_real_engine() {
     let dir =
         std::env::temp_dir().join(format!("boatramp-orm-groupby-join-{}", std::process::id()));
@@ -2083,11 +2085,11 @@ fn domainpass_skip_confine_mutation() -> bool {
 /// **Live**, mutation-verified proof (v0.12.x) that the opt-in `on_unresolved: pass` relaxes ONLY the
 /// pre-handler deny into a null-principal invocation whose scoped reads fail-closed to ZERO ROWS on a
 /// real libsql engine — the `DOMAIN-SOURCE UNRESOLVED PASS-THROUGH OK` gate. Same `#[ignore]`
-/// rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it
-/// unignored on the host toolchain, greps the marker, and loops the `skip_confine` mutation asserting
+/// rationale as the siblings (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-orm-tenancy` CI job runs it
+/// unignored on the static-musl target, greps the marker, and loops the `skip_confine` mutation asserting
 /// the test then exits non-zero.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_real_engine() {
     use boatramp_core::target_sql::{OwnKeys, OwnScope, rewrite_own_read, rewrite_own_write};
     use boatramp_core::tenancy::ResolvedScope;
@@ -2327,12 +2329,12 @@ async fn domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_
 /// rather than falling back to the verbatim claim (and thereby keying onto a VICTIM tenant's rows),
 /// and (G3) kept INJECTIVE (`namespace:span` with a reserved, span-excluded delimiter) — all on a
 /// real libsql engine. The `CLAIM TRANSFORM DERIVED-KEY SAFE OK` gate. Same `#[ignore]` rationale as
-/// the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it unignored on the
-/// host toolchain, greps the marker, and loops each `BOATRAMP_CLAIMTRANSFORM_MUTATION` asserting the
+/// the siblings (heavy libsql battery; former static-musl concurrency bug now fixed); the `test-orm-tenancy` CI job runs it unignored on the
+/// static-musl target, greps the marker, and loops each `BOATRAMP_CLAIMTRANSFORM_MUTATION` asserting the
 /// test then exits non-zero. Every assertion exercises the REAL `derive_tenant` (the mutation seam is
 /// armed in `boatramp-core` by the `claim-transform-gate-mutation` feature).
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn claim_transform_derived_key_is_screened_denies_and_injective_on_a_real_engine() {
     use boatramp_core::claim_extract::{DeriveOutcome, derive_tenant};
     use boatramp_core::tenancy::{ClaimExtract, ExtractSyntax, ResolvedScope};

@@ -102,11 +102,11 @@ async fn status_of(tx: &mut dyn SqlTransaction, id: &str) -> String {
     }
 }
 
-// `#[ignore]` by default (same rationale as `orm_tenant_isolation`: a static-musl test binary
-// segfaults in libsql's bundled SQLite). The `test-orm-tenancy` CI job runs it unignored on the host
-// toolchain and asserts the `CATALOG BASE-WRITE OK` marker.
+// `#[ignore]` by default (same rationale as `orm_tenant_isolation`: a heavy libsql battery; the
+// former static-musl libsql concurrency bug is fixed — embedded-SQLite exec-serialization). The
+// `test-orm-tenancy` CI job runs it unignored on the static-musl target + asserts `CATALOG BASE-WRITE OK`.
 #[tokio::test]
-#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+#[ignore = "heavy libsql battery; run via the test-orm-tenancy CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
 async fn catalog_base_write_isolates_on_a_real_engine() {
     let dir = std::env::temp_dir().join(format!("boatramp-catalog-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
