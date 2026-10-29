@@ -177,6 +177,11 @@ jobs:
   shipped-clippy:
     name: clippy (shipped config — all features, musl)
     runs-on: ubuntu-latest
+    # Hard cap on the heavy nix build + cachix pull/push (T4): a WEDGED Nix/cachix step
+    # (the v0.44.0 release hung ~3h40m on a stuck cachix push) must fail fast, not burn
+    # the 6h default and hang the merge gate. 90m is ample for a cold, cache-miss
+    # all-features musl-clippy closure (matches the nightly nix legs + release build).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       # Reclaim preinstalled toolchains + add swap (mirrors the nightly nix legs) so a

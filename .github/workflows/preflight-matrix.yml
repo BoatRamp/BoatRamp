@@ -205,6 +205,10 @@ jobs:
   nix-eval:
     name: nix (flake eval + pre-commit)
     runs-on: ubuntu-latest
+    # Hard cap on the nix flake eval + pre-commit build + cachix pull (T4): a wedged
+    # Nix/cachix step (the v0.44.0 cachix hang) must fail fast instead of burning the 6h
+    # default on the release precondition. 45m is generous for eval + the pre-commit closure.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
