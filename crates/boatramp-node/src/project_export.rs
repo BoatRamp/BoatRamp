@@ -129,6 +129,14 @@ const DEFAULT_IMPORT_TOTAL_CAP: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 /// Consistent with (and below) what the 64 MiB manifest-body cap admits (~2M refs).
 const MAX_CLONE_MANIFEST_BLOBS: usize = 2_000_000;
 
+/// How many per-blob HEAD presence checks the clone DIFF runs concurrently against the target's
+/// own bucket ([`NodeProjectExport::diff_clone_blobs`]). A serial `for b in blobs { head(b) }` loop
+/// is an O(blob-count) round-trip crawl — minutes for an ~18k-blob / ~33 GB env-clone before a
+/// single byte can move — so the fan-out is bound-parallelized. The bound is a belt: the COUNT cap
+/// ([`MAX_CLONE_MANIFEST_BLOBS`]) still fires FIRST, so this caps in-flight HEADs, never the total
+/// (same HEAD storm the serial path issued, just concurrently — same result set, order-independent).
+const CLONE_DIFF_CONCURRENCY: usize = 64;
+
 /// Max size of a MySQL binlog TRUE-delta member (SQL true-delta). Unlike every other member, this
 /// one is read WHOLE INTO MEMORY on both sides (drained into a buffer at export, read into a Vec at
 /// restore to pipe into `mysql`), so it carries its own fail-closed RAM bound (LOW-4). A capture
@@ -2817,27 +2825,50 @@ impl NodeProjectExport {
                 blobs.len()
             )));
         }
-        let mut skip = CloneSkip::default();
-        for b in blobs {
-            // Re-key to the target's own scope; fail-closed on a foreign/malformed path.
-            let target_key = target_blob_key(&b.member_path, source_project, project)?;
-            match self.blobs.head(&target_key).await {
-                Ok(meta) => {
-                    let present = match (&b.etag, &meta.etag) {
-                        (Some(src), Some(dst)) => src == dst,
-                        _ => match (b.size, meta.size) {
-                            (Some(s), Some(d)) => s == d,
-                            _ => false,
-                        },
-                    };
-                    if present {
-                        skip.skip_member_paths.insert(b.member_path.clone());
+        // Bound-parallelize the per-ref HEAD fan-out (the serial crawl was O(blob-count) round
+        // trips — minutes before a byte moves at ~18k blobs). Each future runs the SAME per-ref
+        // logic the serial loop did: re-key to the target's own scope (fail-closed on a
+        // foreign/malformed path — unchanged scope guard), HEAD the target's own bucket, and decide
+        // presence on the SAME content-identity rule. The count cap above already fired, so this
+        // caps in-flight HEADs (≤ CLONE_DIFF_CONCURRENCY), never the total. `try_collect` is
+        // fail-closed — the first HEAD error (other than NotFound) short-circuits the whole diff,
+        // exactly as the serial `return Err(..)` did. Results collect into a set, so the
+        // completion-order of the unordered fan-out does not affect the skip set.
+        use futures::stream::TryStreamExt; // `StreamExt` (map/buffer_unordered) is imported module-wide
+        // Own each ref's fields up front and fan out over OWNED items — a stream of borrowed
+        // `&CloneBlobRef` forces the per-item async closure to satisfy a higher-ranked lifetime it
+        // cannot (the future would borrow the stream item across its await). `source_project` /
+        // `project` are borrowed for the whole call (not from a stream item), which is fine.
+        let reqs: Vec<(String, Option<String>, Option<u64>)> = blobs
+            .iter()
+            .map(|b| (b.member_path.clone(), b.etag.clone(), b.size))
+            .collect();
+        let present: Vec<Option<String>> = futures::stream::iter(reqs)
+            .map(|(member_path, etag, size)| {
+                let blobs_store = self.blobs.clone();
+                async move {
+                    let target_key = target_blob_key(&member_path, source_project, project)?;
+                    match blobs_store.head(&target_key).await {
+                        Ok(meta) => {
+                            let is_present = match (&etag, &meta.etag) {
+                                (Some(src), Some(dst)) => src == dst,
+                                _ => match (size, meta.size) {
+                                    (Some(s), Some(d)) => s == d,
+                                    _ => false,
+                                },
+                            };
+                            Ok(is_present.then_some(member_path))
+                        }
+                        Err(boatramp_core::StorageError::NotFound(_)) => Ok(None), // absent ⇒ pull it
+                        Err(e) => Err(other(e)),
                     }
                 }
-                Err(boatramp_core::StorageError::NotFound(_)) => {} // absent ⇒ pull it
-                Err(e) => return Err(other(e)),
-            }
-        }
+            })
+            .buffer_unordered(CLONE_DIFF_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut skip = CloneSkip::default();
+        skip.skip_member_paths.extend(present.into_iter().flatten());
         Ok(skip)
     }
 
@@ -9475,6 +9506,116 @@ mod tests {
             .await
             .expect("an under-cap manifest diffs cleanly");
         assert!(skip.skip_member_paths.is_empty());
+    }
+
+    /// The bound-parallelized diff yields EXACTLY the skip set a serial per-ref pass would: for a
+    /// mixed manifest (size-matched present, size-mismatched absent, not-found absent) the
+    /// `buffer_unordered` fan-out and an independent serial reference agree set-for-set. The
+    /// completion order of the unordered fan-out must not change the result (the skip is a set).
+    #[tokio::test]
+    async fn diff_clone_blobs_parallel_matches_serial() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let put = |store: Arc<dyn Storage>, key: String, bytes: Vec<u8>| async move {
+            let body: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            store
+                .put(&key, body, boatramp_core::PutMeta { content_type: None })
+                .await
+                .unwrap();
+        };
+
+        // Seed the target's OWN bucket (same-name acme→acme ⇒ identity re-key: target key is
+        // `hblob/acme/<rest>`). 150 refs to make the concurrent fan-out meaningful:
+        //   - i % 3 == 0 → object present with a MATCHING size  ⇒ skipped
+        //   - i % 3 == 1 → object present with a MISMATCHED size ⇒ pulled (not skipped)
+        //   - i % 3 == 2 → NO object at the key                  ⇒ NotFound ⇒ pulled
+        let mut refs: Vec<CloneBlobRef> = Vec::new();
+        for i in 0..150u32 {
+            let rest = format!("web/c/obj-{i}");
+            let member_path = format!("blobs/hblob/acme/{rest}");
+            let size = 8u64 + u64::from(i % 5); // a few distinct sizes
+            match i % 3 {
+                0 => {
+                    put(
+                        blobs.clone(),
+                        format!("hblob/acme/{rest}"),
+                        vec![0u8; size as usize],
+                    )
+                    .await;
+                    refs.push(CloneBlobRef {
+                        member_path,
+                        size: Some(size),
+                        etag: None,
+                    });
+                }
+                1 => {
+                    put(
+                        blobs.clone(),
+                        format!("hblob/acme/{rest}"),
+                        vec![0u8; size as usize],
+                    )
+                    .await;
+                    refs.push(CloneBlobRef {
+                        member_path,
+                        size: Some(size + 100), // declared size disagrees ⇒ NOT present
+                        etag: None,
+                    });
+                }
+                _ => refs.push(CloneBlobRef {
+                    member_path,
+                    size: Some(size),
+                    etag: None,
+                }),
+            }
+        }
+
+        let drv = NodeProjectExport::new(
+            BTreeMap::new(),
+            DeployStore::new(blobs.clone(), kv.clone()),
+            kv.clone(),
+            blobs.clone(),
+            tmp.path().join("work"),
+        );
+
+        // Independent SERIAL reference: the same decision, one HEAD at a time.
+        let mut serial = std::collections::BTreeSet::new();
+        for b in &refs {
+            let target_key = target_blob_key(&b.member_path, "acme", "acme").unwrap();
+            match blobs.head(&target_key).await {
+                Ok(meta) => {
+                    let present = match (&b.etag, &meta.etag) {
+                        (Some(s), Some(d)) => s == d,
+                        _ => matches!((b.size, meta.size), (Some(s), Some(d)) if s == d),
+                    };
+                    if present {
+                        serial.insert(b.member_path.clone());
+                    }
+                }
+                Err(boatramp_core::StorageError::NotFound(_)) => {}
+                Err(e) => panic!("serial head failed: {e}"),
+            }
+        }
+
+        let parallel = drv
+            .diff_clone_blobs("acme", "acme", &refs)
+            .await
+            .expect("parallel diff");
+
+        assert_eq!(
+            parallel.skip_member_paths, serial,
+            "the parallel fan-out must yield the identical skip set to a serial pass"
+        );
+        // 50 of the 150 refs (i % 3 == 0) are size-matched present.
+        assert_eq!(parallel.skip_member_paths.len(), 50);
     }
 
     #[test]
