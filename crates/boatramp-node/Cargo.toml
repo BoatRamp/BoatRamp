@@ -200,12 +200,21 @@ blob-perproject-gate-mutation = [
   "handlers",
   "boatramp-storage/blob-perproject-gate-mutation",
 ]
+# CI gate lane for the orphaned-replica reaper's fail-closed liveness check
+# (node-health-alerting Stage 2). When ON, `reaper_liveness_gate_active()` compiles its env
+# check in, and `BOATRAMP_REAPER_MUTATION=ignore_liveness` SKIPS the "container must be
+# affirmatively gone" gate — so CI can prove the gate is load-bearing by asserting the
+# "won't reap a live replica" test FAILS under it. Compiled OUT of every real build (the
+# seam also lives under this crate's own `cfg(test)`).
+reaper-liveness-gate-mutation = []
 
 [dev-dependencies]
 # The in-process fidelity test (`node::tests`) drives the assembled router with a
 # synthetic request over a temp `FsStorage` + `MemoryKv` (gated on `fs`).
 axum = "0.8"
 tempfile = "3"
+# Serialize the reaper liveness-gate mutation test (it toggles a process-global env var).
+serial_test = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 # The live cross-tenant-isolation seam (`tests/tenant_isolation_live.rs`, Linux + root)

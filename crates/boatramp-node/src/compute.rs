@@ -896,6 +896,357 @@ impl boatramp_core::compute::ComputeVolumes for NodeComputeVolumes {
     }
 }
 
+/// Whether the reaper LIVENESS-gate mutation is armed — the fail-closed "container must
+/// be affirmatively gone" check is then skipped (a live / unknown replica is treated as
+/// reapable), so the "won't reap a live replica" gate goes RED. Compiled IN only under
+/// `cfg(test)` (this crate's gate tests) or the `reaper-liveness-gate-mutation` feature,
+/// and ARMED only when `BOATRAMP_REAPER_MUTATION=ignore_liveness`; ALWAYS `false` in a
+/// shipped build. Mirrors `boatramp_core::crownjewel::cas_mutation_active`.
+fn reaper_liveness_gate_active() -> bool {
+    #[cfg(any(test, feature = "reaper-liveness-gate-mutation"))]
+    {
+        std::env::var("BOATRAMP_REAPER_MUTATION").as_deref() == Ok("ignore_liveness")
+    }
+    #[cfg(not(any(test, feature = "reaper-liveness-gate-mutation")))]
+    {
+        false
+    }
+}
+
+/// The node's [`ComputeReaper`](boatramp_core::compute::ComputeReaper): the DESTRUCTIVE
+/// orphaned-replica reaper (node-health-alerting Stage 2). Backs both the leader-gated
+/// alerting loop's opt-in auto-reap and `POST /api/compute/maintenance/reap`
+/// (System·Admin). Holds the SAME two handles every compute capability does — the
+/// backend registry + the control-plane store.
+///
+/// SAFETY MODEL (fail-closed; a wrong reap destroys a running workload). A replica is an
+/// orphan — and only then may it be reaped — iff ALL hold, evaluated AT THE MOMENT of the
+/// reap (never from a stale scan):
+/// 1. `phase == Running` — a parked `Zero` replica is NEVER reaped (its container is
+///    *expected* to be absent, so "container gone" is meaningless for it);
+/// 2. its DESIRED workload is absent — `get_compute_workload(project, workload) == None`
+///    (a replica that is part of a current desired spec is never reaped, even if its
+///    container is momentarily gone — the reconcile loop owns relaunching it);
+/// 3. its container is AFFIRMATIVELY gone — [`ComputeBackend::replica_alive`] returns
+///    `Some(false)`; `Some(true)` (live) and `None` (can't determine / un-probeable host /
+///    unknown backend) both SKIP; and
+/// 4. it is past the grace window — a record WITH `started_at` must be at least
+///    `grace_secs` old; a record WITHOUT `started_at` predates started-at tracking
+///    (v0.3.12), so it provably cannot be a just-launched replica and passes the age gate.
+///
+/// Every reap emits a `tracing::warn!` AUDIT record. The default call path is DRY-RUN
+/// (report-only). `scan` is the non-destructive observer the orphan ALERT signal reads.
+pub struct NodeComputeReaper {
+    backends: boatramp_core::compute::BackendRegistry,
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
+impl NodeComputeReaper {
+    /// Build over this node's compute backends + the control-plane store. Clone the
+    /// registry before the reconcile loop consumes the original.
+    #[must_use]
+    pub fn new(
+        backends: boatramp_core::compute::BackendRegistry,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Self {
+        Self { backends, deploy }
+    }
+
+    /// Classify one observed replica against the orphan definition at `now` with `grace`.
+    /// `Ok(Ok(orphan))` — a genuine orphan safe to reap; `Ok(Err(reason))` — NOT an orphan
+    /// (fail-closed, with the human reason); `Err` — a store failure that should abort the
+    /// pass. The container-liveness probe is the load-bearing fail-closed check.
+    async fn classify(
+        &self,
+        o: &boatramp_core::compute::ObservedInstance,
+        now: u64,
+        grace_secs: u64,
+    ) -> Result<
+        Result<boatramp_core::compute::OrphanReplica, String>,
+        boatramp_core::compute::ReaperError,
+    > {
+        use boatramp_core::compute::{ReaperError, ReplicaPhase};
+        use boatramp_core::project::ProjectRef;
+
+        let project = o.handle.project.clone();
+        let workload = o.handle.workload.clone();
+        let replica = o.handle.replica;
+
+        // (1) Only a Running replica is a reap candidate — a parked Zero replica's
+        // container is intentionally absent, so it must never be reaped.
+        if o.phase != ReplicaPhase::Running {
+            return Ok(Err(
+                "replica is parked (phase=zero), not an orphan".to_string()
+            ));
+        }
+
+        // (2) The DESIRED workload must be absent. A replica that is part of a current
+        // desired spec is NEVER an orphan — the reconcile loop owns it.
+        let desired = self
+            .deploy
+            .get_compute_workload(ProjectRef::new(&project), &workload)
+            .await
+            .map_err(|e| ReaperError::Store(e.to_string()))?;
+        if desired.is_some() {
+            return Ok(Err(
+                "a desired workload still exists for this replica — the reconcile plane \
+                 owns it; never reaped"
+                    .to_string(),
+            ));
+        }
+
+        // (3) The container must be AFFIRMATIVELY gone. Unknown backend / un-probeable
+        // host / live container all fail closed (skip) — only `Some(false)` admits.
+        let Some(backend) = self.backends.get(&o.backend) else {
+            return Ok(Err(format!(
+                "backend {:?} is not present on this node — cannot prove the container is \
+                 gone; skipped",
+                o.backend
+            )));
+        };
+        let alive = backend.replica_alive(&o.handle).await;
+        // The GATE SEAM: when the liveness mutation is armed, this fail-closed liveness
+        // gate is SKIPPED (a live / unknown replica would be reaped), so the
+        // "won't reap a live replica" gate goes RED — proving the liveness check is
+        // load-bearing. Dormant everywhere else (compiled out of a shipped build).
+        if !reaper_liveness_gate_active() {
+            match alive {
+                Some(false) => {} // affirmatively gone — the only admitting case
+                Some(true) => {
+                    return Ok(Err("the container is still LIVE — never reaped".to_string()));
+                }
+                None => {
+                    return Ok(Err(
+                        "cannot determine container liveness (un-probeable host / backend) — \
+                         skipped fail-closed"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        // (4) Age gate. A record with `started_at` must be at least `grace_secs` old; a
+        // record WITHOUT `started_at` predates started-at tracking and so is provably not
+        // a recent launch (passes).
+        let age_secs = o.started_at.map(|s| now.saturating_sub(s));
+        if let Some(age) = age_secs
+            && age < grace_secs
+        {
+            return Ok(Err(format!(
+                "replica is {age}s old, under the {grace_secs}s grace — not yet reapable"
+            )));
+        }
+
+        Ok(Ok(boatramp_core::compute::OrphanReplica {
+            project: project.clone(),
+            workload: workload.clone(),
+            replica,
+            backend: o.backend.clone(),
+            age_secs,
+            volume_scope: Some(boatramp_core::compute::compute_volume_scope(
+                &project, &workload,
+            )),
+        }))
+    }
+
+    /// Execute the destroy for a classified orphan: stop the (already-gone) container
+    /// best-effort, drop the replica record, and — only when `reclaim_volumes` — free the
+    /// scoped volume staging. Audited. Returns whether the volume was reclaimed.
+    async fn execute_reap(
+        &self,
+        o: &boatramp_core::compute::ObservedInstance,
+        orphan: &boatramp_core::compute::OrphanReplica,
+        reclaim_volumes: bool,
+    ) -> Result<bool, boatramp_core::compute::ReaperError> {
+        use boatramp_core::compute::{BackendError, ReaperError};
+        use boatramp_core::project::ProjectRef;
+
+        let pref = ProjectRef::new(&orphan.project);
+        // Tear down any residual runtime + release the IP. `stop` is idempotent, so a
+        // container that is already gone converges cleanly; `Unsupported` (an edge backend
+        // with no explicit stop) is fine — there is nothing local to tear down.
+        if let Some(backend) = self.backends.get(&o.backend) {
+            match backend.stop(&o.handle).await {
+                Ok(()) | Err(BackendError::Unsupported) => {}
+                Err(e) => return Err(ReaperError::Backend(e.to_string())),
+            }
+        }
+        // Drop the stranded observed-state record — the thing that persisted
+        // PHASE=running for weeks. With no desired workload, the reconcile loop will NOT
+        // recreate it.
+        self.deploy
+            .delete_replica_state(pref, &orphan.workload, orphan.replica)
+            .await
+            .map_err(|e| ReaperError::Store(e.to_string()))?;
+
+        // Opt-in: free the scoped volume staging (e.g. a stranded managed-PG PGDATA).
+        let mut volume_reclaimed = false;
+        if reclaim_volumes
+            && let Some(scope) = orphan.volume_scope.as_deref()
+            && let Some(backend) = self.backends.get(&o.backend)
+        {
+            match backend.remove_scoped_volume(scope).await {
+                Ok(removed) => volume_reclaimed = removed,
+                // A backend without local volume staging can't free it — not a failure.
+                Err(BackendError::Unsupported) => {}
+                Err(e) => {
+                    // Best-effort: the record+container are already reaped; a volume-free
+                    // failure is logged but does not fail the reap.
+                    tracing::warn!(
+                        project = %orphan.project,
+                        workload = %orphan.workload,
+                        replica = orphan.replica,
+                        scope = %scope,
+                        error = %e,
+                        "orphan reaper: scoped volume reclamation failed (record already reaped)"
+                    );
+                }
+            }
+        }
+        tracing::warn!(
+            project = %orphan.project,
+            workload = %orphan.workload,
+            replica = orphan.replica,
+            backend = %o.backend,
+            age_secs = orphan.age_secs.unwrap_or_default(),
+            volume_reclaimed,
+            "orphan reaper: REAPED an orphaned replica (no desired workload, container gone)"
+        );
+        Ok(volume_reclaimed)
+    }
+}
+
+#[async_trait::async_trait]
+impl boatramp_core::compute::ComputeReaper for NodeComputeReaper {
+    async fn scan(
+        &self,
+        grace_secs: u64,
+    ) -> Result<Vec<boatramp_core::compute::OrphanReplica>, boatramp_core::compute::ReaperError>
+    {
+        use boatramp_core::compute::ReaperError;
+        let now = boatramp_core::time::now_unix();
+        let states = self
+            .deploy
+            .list_all_replica_states()
+            .await
+            .map_err(|e| ReaperError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for o in &states {
+            if let Ok(orphan) = self.classify(o, now, grace_secs).await? {
+                out.push(orphan);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn reap(
+        &self,
+        opts: boatramp_core::compute::ReapOptions,
+    ) -> Result<boatramp_core::compute::ReapReport, boatramp_core::compute::ReaperError> {
+        use boatramp_core::compute::{
+            OrphanReplica, ReapDisposition, ReapEntry, ReapReport, ReapTarget, ReaperError,
+        };
+        use boatramp_core::project::ProjectRef;
+        let now = boatramp_core::time::now_unix();
+
+        // Gather the candidate observed states for the target.
+        let (candidates, specific): (Vec<boatramp_core::compute::ObservedInstance>, _) =
+            match &opts.target {
+                ReapTarget::All => (
+                    self.deploy
+                        .list_all_replica_states()
+                        .await
+                        .map_err(|e| ReaperError::Store(e.to_string()))?,
+                    None,
+                ),
+                ReapTarget::One {
+                    project,
+                    workload,
+                    replica,
+                } => {
+                    let states = self
+                        .deploy
+                        .list_replica_states(ProjectRef::new(project), workload)
+                        .await
+                        .map_err(|e| ReaperError::Store(e.to_string()))?
+                        .into_iter()
+                        .filter(|s| s.handle.replica == *replica)
+                        .collect();
+                    (states, Some((project.clone(), workload.clone(), *replica)))
+                }
+            };
+
+        let mut report = ReapReport {
+            dry_run: opts.dry_run,
+            entries: Vec::new(),
+        };
+
+        // An operator-named replica that has no persisted state at all: report a clear
+        // skip so the `compute reap` lever answers "nothing to reap", never a silent no-op.
+        if let Some((project, workload, replica)) = &specific
+            && candidates.is_empty()
+        {
+            report.entries.push(ReapEntry {
+                orphan: OrphanReplica {
+                    project: project.clone(),
+                    workload: workload.clone(),
+                    replica: *replica,
+                    backend: String::new(),
+                    age_secs: None,
+                    volume_scope: None,
+                },
+                disposition: ReapDisposition::Skipped {
+                    reason: "no such replica is persisted".to_string(),
+                },
+                volume_reclaimed: false,
+            });
+            return Ok(report);
+        }
+
+        for o in &candidates {
+            match self.classify(o, now, opts.grace_secs).await? {
+                Ok(orphan) => {
+                    if opts.dry_run {
+                        report.entries.push(ReapEntry {
+                            orphan,
+                            disposition: ReapDisposition::WouldReap,
+                            volume_reclaimed: false,
+                        });
+                    } else {
+                        let volume_reclaimed =
+                            self.execute_reap(o, &orphan, opts.reclaim_volumes).await?;
+                        report.entries.push(ReapEntry {
+                            orphan,
+                            disposition: ReapDisposition::Reaped,
+                            volume_reclaimed,
+                        });
+                    }
+                }
+                Err(reason) => {
+                    // For an operator-named target, report WHY it was refused (the lever
+                    // must never silently ignore a replica it was asked about). For a
+                    // full scan, a non-orphan is simply not in the report.
+                    if specific.is_some() {
+                        report.entries.push(ReapEntry {
+                            orphan: OrphanReplica {
+                                project: o.handle.project.clone(),
+                                workload: o.handle.workload.clone(),
+                                replica: o.handle.replica,
+                                backend: o.backend.clone(),
+                                age_secs: o.started_at.map(|s| now.saturating_sub(s)),
+                                volume_scope: None,
+                            },
+                            disposition: ReapDisposition::Skipped { reason },
+                            volume_reclaimed: false,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,5 +1612,426 @@ mod tests {
             "another backend's replica IP must not be adopted by the container backend"
         );
         assert_eq!(got.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphaned-replica reaper (node-health-alerting Stage 2): the fail-closed
+    // safety model — never reap a live/desired replica; dry-run by default.
+    // -----------------------------------------------------------------------
+
+    use boatramp_core::compute::{
+        ComputeReaper, Endpoint, ObservedInstance, Readiness, ReapDisposition, ReapOptions,
+        ReapTarget, ReplicaPhase, Scheme,
+    };
+
+    /// A backend with a configurable liveness verdict + spies for `stop` and scoped-volume
+    /// removal — enough to drive the reaper without a real container node.
+    struct FakeReapBackend {
+        alive: Option<bool>,
+        stopped: Mutex<Vec<u32>>,
+        scoped_removed: Mutex<Vec<String>>,
+    }
+    impl FakeReapBackend {
+        fn new(alive: Option<bool>) -> Arc<Self> {
+            Arc::new(Self {
+                alive,
+                stopped: Mutex::new(Vec::new()),
+                scoped_removed: Mutex::new(Vec::new()),
+            })
+        }
+    }
+    #[async_trait]
+    impl ComputeBackend for FakeReapBackend {
+        fn id(&self) -> &'static str {
+            "container"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: true,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ComputeSpec,
+        ) -> Result<Artifact, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn launch(&self, _: &LaunchRequest) -> Result<Instance, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
+            self.stopped.lock().unwrap().push(handle.replica);
+            Ok(())
+        }
+        async fn health(&self, _: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Unknown)
+        }
+        async fn replica_alive(&self, _: &InstanceHandle) -> Option<bool> {
+            self.alive
+        }
+        async fn remove_scoped_volume(&self, scope: &str) -> Result<bool, BackendError> {
+            self.scoped_removed.lock().unwrap().push(scope.to_string());
+            Ok(true)
+        }
+    }
+
+    fn observed_at(
+        project: &str,
+        workload: &str,
+        replica: u32,
+        phase: ReplicaPhase,
+        started_at: Option<u64>,
+    ) -> ObservedInstance {
+        ObservedInstance {
+            handle: InstanceHandle {
+                project: project.into(),
+                workload: workload.into(),
+                replica,
+                backend_ref: "10.0.0.2:80".into(),
+            },
+            node: 0,
+            backend: "container".into(),
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: "10.0.0.2".into(),
+                port: 80,
+            },
+            region: None,
+            healthy: false,
+            started_at,
+            phase,
+            readiness: Readiness::Starting,
+            data_dir: None,
+            snapshot: None,
+        }
+    }
+
+    /// Build a reaper over one `FakeReapBackend` + a `DeployStore`; persist `states` and
+    /// register `desired` workloads. Returns (reaper, store, backend).
+    async fn reaper_with(
+        alive: Option<bool>,
+        states: &[ObservedInstance],
+        desired: &[(&str, &str)],
+    ) -> (NodeComputeReaper, DeployStore, Arc<FakeReapBackend>) {
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        for o in states {
+            store
+                .set_replica_state(ProjectRef::new(&o.handle.project), o)
+                .await
+                .expect("persist replica");
+        }
+        for (project, name) in desired {
+            let spec = spec_with_volume(None);
+            let hash = store.put_compute_spec(&spec).await.expect("put spec");
+            let workload = ComputeWorkload {
+                version: 1,
+                name: (*name).into(),
+                active: hash,
+                replicas: 1,
+                placement: Default::default(),
+            };
+            store
+                .set_compute_workload(ProjectRef::new(project), &workload)
+                .await
+                .expect("set workload");
+        }
+        let backend = FakeReapBackend::new(alive);
+        let mut backends: boatramp_core::compute::BackendRegistry = BTreeMap::new();
+        backends.insert(
+            "container".into(),
+            backend.clone() as Arc<dyn ComputeBackend>,
+        );
+        (
+            NodeComputeReaper::new(backends, store.clone()),
+            store,
+            backend,
+        )
+    }
+
+    fn reap_one(project: &str, workload: &str, replica: u32, dry_run: bool) -> ReapOptions {
+        ReapOptions {
+            target: ReapTarget::One {
+                project: project.into(),
+                workload: workload.into(),
+                replica,
+            },
+            grace_secs: 0,
+            dry_run,
+            reclaim_volumes: false,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_will_not_reap_a_live_replica() {
+        // No desired workload, but the container is affirmatively LIVE ⇒ never reaped,
+        // even on an explicit (dry_run=false) targeted reap.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, store, backend) = reaper_with(Some(true), &states, &[]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.entries[0].disposition,
+            ReapDisposition::Skipped { .. }
+        ));
+        if let ReapDisposition::Skipped { reason } = &report.entries[0].disposition {
+            assert!(reason.contains("LIVE"), "{reason}");
+        }
+        assert!(
+            backend.stopped.lock().unwrap().is_empty(),
+            "nothing stopped"
+        );
+        // The record is UNTOUCHED.
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_will_not_reap_a_replica_with_a_desired_workload() {
+        // The container is gone, but a DESIRED workload still exists ⇒ the reconcile
+        // plane owns it; never reaped.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, store, _b) = reaper_with(Some(false), &states, &[("default", "pg")]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        if let ReapDisposition::Skipped { reason } = &report.entries[0].disposition {
+            assert!(reason.contains("desired workload"), "{reason}");
+        } else {
+            panic!(
+                "a desired replica must be skipped, got {:?}",
+                report.entries[0]
+            );
+        }
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_will_not_reap_when_liveness_is_unknown() {
+        // Liveness cannot be determined (`None`) ⇒ fail-closed, never reaped.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, store, _b) = reaper_with(None, &states, &[]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.entries[0].disposition,
+            ReapDisposition::Skipped { .. }
+        ));
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_skips_a_parked_zero_replica() {
+        // A parked (Zero) replica's container is intentionally absent — never reaped.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Zero, None)];
+        let (reaper, _store, _b) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        if let ReapDisposition::Skipped { reason } = &report.entries[0].disposition {
+            assert!(reason.contains("parked"), "{reason}");
+        } else {
+            panic!("a parked replica must be skipped");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_dry_run_reports_but_destroys_nothing() {
+        // A genuine orphan (no desired workload + container gone) in DRY-RUN: reported as
+        // would-reap, but the record stays and nothing is stopped.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, store, backend) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(ReapOptions {
+                target: ReapTarget::All,
+                grace_secs: 0,
+                dry_run: true,
+                reclaim_volumes: true, // even with reclaim on, dry-run frees nothing
+            })
+            .await
+            .unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.admitted().count(), 1);
+        assert!(matches!(
+            report.entries[0].disposition,
+            ReapDisposition::WouldReap
+        ));
+        assert!(backend.stopped.lock().unwrap().is_empty());
+        assert!(backend.scoped_removed.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "dry-run must not delete the record"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_reaps_a_genuine_orphan_and_volume_reclaim_is_opt_in() {
+        // The orphan is reaped: record dropped + container stopped. With reclaim OFF the
+        // scoped volume is preserved; the default therefore never deletes PGDATA.
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, store, backend) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(ReapOptions {
+                target: ReapTarget::All,
+                grace_secs: 0,
+                dry_run: false,
+                reclaim_volumes: false,
+            })
+            .await
+            .unwrap();
+        assert!(!report.dry_run);
+        assert!(matches!(
+            report.entries[0].disposition,
+            ReapDisposition::Reaped
+        ));
+        assert_eq!(backend.stopped.lock().unwrap().as_slice(), &[0]);
+        assert!(
+            backend.scoped_removed.lock().unwrap().is_empty(),
+            "volume reclaim is opt-in: PGDATA is preserved by default"
+        );
+        assert!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stranded record must be gone"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_reclaims_the_scoped_volume_when_opted_in() {
+        let states = [observed_at("acme", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, _store, backend) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(ReapOptions {
+                target: ReapTarget::All,
+                grace_secs: 0,
+                dry_run: false,
+                reclaim_volumes: true,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.entries[0].disposition,
+            ReapDisposition::Reaped
+        ));
+        assert!(report.entries[0].volume_reclaimed);
+        // The scope for a non-default project is `<project>@<workload>`.
+        assert_eq!(
+            backend.scoped_removed.lock().unwrap().as_slice(),
+            &["acme@pg".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_respects_the_grace_window() {
+        // A just-launched orphan (age 0) with a 1h grace is NOT yet reapable (the race
+        // guard), so it is skipped — even though it is otherwise a genuine orphan.
+        let now = boatramp_core::time::now_unix();
+        let states = [observed_at(
+            "default",
+            "pg",
+            0,
+            ReplicaPhase::Running,
+            Some(now),
+        )];
+        let (reaper, store, _b) = reaper_with(Some(false), &states, &[]).await;
+        let report = reaper
+            .reap(ReapOptions {
+                target: ReapTarget::One {
+                    project: "default".into(),
+                    workload: "pg".into(),
+                    replica: 0,
+                },
+                grace_secs: 3600,
+                dry_run: false,
+                reclaim_volumes: false,
+            })
+            .await
+            .unwrap();
+        if let ReapDisposition::Skipped { reason } = &report.entries[0].disposition {
+            assert!(reason.contains("grace"), "{reason}");
+        } else {
+            panic!(
+                "a within-grace orphan must be skipped, got {:?}",
+                report.entries[0]
+            );
+        }
+        assert_eq!(
+            store
+                .list_replica_states(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the within-grace record must survive"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(reaper_mutation)]
+    async fn reaper_liveness_gate_mutation_proves_the_check_is_load_bearing() {
+        // Arming the liveness mutation makes the reaper reap a LIVE replica — i.e.
+        // `reaper_will_not_reap_a_live_replica` would FAIL — proving the fail-closed
+        // liveness gate is load-bearing. Env-var activated; serialized.
+        // SAFETY: test-only env toggle, immediately cleared; serialized on this key.
+        unsafe { std::env::set_var("BOATRAMP_REAPER_MUTATION", "ignore_liveness") };
+        let states = [observed_at("default", "pg", 0, ReplicaPhase::Running, None)];
+        let (reaper, _store, _b) = reaper_with(Some(true), &states, &[]).await;
+        let report = reaper
+            .reap(reap_one("default", "pg", 0, false))
+            .await
+            .unwrap();
+        let reaped = matches!(report.entries[0].disposition, ReapDisposition::Reaped);
+        unsafe { std::env::remove_var("BOATRAMP_REAPER_MUTATION") };
+        assert!(reaped, "the armed mutation reaps a live replica (gate RED)");
     }
 }

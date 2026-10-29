@@ -379,10 +379,37 @@ fn dir_size_recursive(dir: &std::path::Path, depth: u32) -> u64 {
 /// statvfs is unavailable (off-Linux); the additive `data_breakdown` object (per-top-level-subdir byte
 /// totals — kv-data-observability) is absent when the data dir cannot be listed.
 #[cfg(feature = "handlers")]
-pub(super) async fn node_health(Extension(handlers): Extension<Arc<HandlerRuntime>>) -> Response {
+pub(super) async fn node_health(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+) -> Response {
     let mut obj = serde_json::Map::new();
     if let Some(dir) = handlers.data_dir() {
         merge_data_usage(&mut obj, dir).await;
+    }
+    // Stage 2: managed-SQL / compute replica health — the "the database is down" signal
+    // the disk-full incident never surfaced. Lists every replica currently `phase=running`
+    // but `HEALTHY=NO` (the reachable-but-not-served / wedged-DB signature), node-wide, so
+    // an external monitor can scrape the SAME signal the alerting loop pages on. Best-effort
+    // (a store read failure drops only this section). READ-ONLY.
+    if let Ok(states) = deploy.list_all_replica_states().await {
+        let now = boatramp_core::time::now_unix();
+        let unhealthy: Vec<serde_json::Value> = states
+            .iter()
+            .filter(|o| o.phase == boatramp_core::compute::ReplicaPhase::Running && !o.healthy)
+            .map(|o| {
+                serde_json::json!({
+                    "project": o.handle.project,
+                    "workload": o.handle.workload,
+                    "replica": o.handle.replica,
+                    "age_secs": o.started_at.map(|s| now.saturating_sub(s)),
+                })
+            })
+            .collect();
+        obj.insert(
+            "replicas_unhealthy".into(),
+            serde_json::Value::Array(unhealthy),
+        );
     }
     Json(serde_json::Value::Object(obj)).into_response()
 }

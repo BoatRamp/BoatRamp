@@ -61,6 +61,7 @@
 - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)
 - [Switch the blob backend with zero downtime](./how-to/blob-backend-migration.md)
 - [Observe: logs, metrics, health, stats](./how-to/observe.md)
+- [Alert on node & system health](./how-to/node-health-alerting.md)
 - [Drive boatramp from an AI agent (MCP)](./how-to/mcp.md)
 - [Manage certificates in a cluster](./how-to/cluster-certs.md)
 - [Deploy a single node in production](./how-to/deploy-single-node.md)

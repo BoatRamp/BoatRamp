@@ -44,6 +44,30 @@ Read by `boatramp serve`. Each maps to a `serve.*` field in
 | `BOATRAMP_UPLOAD_IDLE_TIMEOUT` | Abort an upload stalled this many seconds (slowloris guard). |
 | `BOATRAMP_MAX_CONCURRENT_UPLOADS` | Cap simultaneous uploads; further uploads get 503 until a slot frees. |
 
+### Node/system-health alerting (`[serve.alerts]`)
+
+Env parity for the alerting subsystem (the `serve` segment is dropped). See
+[Alert on node & system health](../how-to/node-health-alerting.md).
+
+| Variable | Description |
+| --- | --- |
+| `BOATRAMP_ALERTS_ENABLED` | Master toggle for the alerting loop (default off). |
+| `BOATRAMP_ALERTS_INTERVAL_SECS` | Evaluation cadence in seconds (default 60; floored at 5). |
+| `BOATRAMP_ALERTS_DISK_ENABLED` | Enable the `/data` fullness signal (default on). |
+| `BOATRAMP_ALERTS_DISK_WARN_PCT` / `_CRITICAL_PCT` | `/data` warn / critical percent-used (default 75 / 90). |
+| `BOATRAMP_ALERTS_MANAGED_SQL_ENABLED` | Enable the managed-SQL replica-health signal (default on). |
+| `BOATRAMP_ALERTS_MANAGED_SQL_GRACE_SECS` | Seconds a desired replica may be `HEALTHY=NO` before alerting (default 300). |
+| `BOATRAMP_ALERTS_ORPHAN_ENABLED` | Enable the orphaned-replica signal (default on). |
+| `BOATRAMP_ALERTS_ORPHAN_GRACE_SECS` | Minimum orphan age before alerting (default 86400). |
+| `BOATRAMP_ALERTS_REAPER_ENABLED` | Turn ON the destructive orphan reaper (default off). |
+| `BOATRAMP_ALERTS_REAPER_DRY_RUN` | Report-only unless `false` (default true). |
+| `BOATRAMP_ALERTS_REAPER_GRACE_SECS` | Minimum orphan age the reaper requires (default 604800). |
+| `BOATRAMP_ALERTS_REAPER_RECLAIM_VOLUMES` | Also delete the orphan's stranded volume staging (default off). |
+| `BOATRAMP_ALERTS_WEBHOOK_URL_SECRET` | Sealed `boatramp:<name>` reference to the webhook URL. |
+| `BOATRAMP_ALERTS_WEBHOOK_ALLOW_PRIVATE` | Permit a private webhook address past the SSRF floor (default off). |
+| `BOATRAMP_ALERTS_EMAIL_PROJECT` / `_PROFILE` | The email profile's project (default `default`) + name. |
+| `BOATRAMP_ALERTS_EMAIL_TO` | Comma-separated recipient addresses. |
+
 ## Authentication & tokens
 
 See [Bootstrap authentication](../how-to/auth-bootstrap.md) and

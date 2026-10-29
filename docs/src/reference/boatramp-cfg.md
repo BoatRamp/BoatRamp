@@ -63,6 +63,7 @@ Top-level sections, all optional:
 | `kv` | table | — | Control-plane SlateDB KV durability cadence + shutdown budget. See [`serve.kv`](#servekv). |
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
 | `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
+| `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -368,6 +369,41 @@ replicated cert).
 | `max_inflight` | int | `4` | Max concurrent in-flight issuances (global). |
 | `negative_ttl_secs` | int | `300` | How long a refused/failed SNI is negatively cached. |
 | `rate_limit_per_hour` | int | `50` | Max CA orders per rolling hour (the account rate-limit floor). `0` ⇒ unlimited. |
+
+### `serve.alerts`
+
+**Node/system-health alerting** (node-health-alerting Stage 2). Off unless `enabled`. A
+leader-gated loop evaluates the health signals on a cadence and emits an alert when a
+threshold is crossed + a resolve when it clears, delivering over an operator webhook and/or
+email (de-duplicated). Secrets are **sealed references**, never plaintext here. Env parity:
+`BOATRAMP_ALERTS_*` (the `serve` segment dropped). See
+[Alert on node & system health](../how-to/node-health-alerting.md).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master toggle; `false` ⇒ the loop is never spawned. |
+| `interval_secs` | int | `60` | Evaluation cadence. Floored at 5s. |
+| `disk` | table | — | `/data` fullness thresholds (percent used). |
+| `managed_sql` | table | — | Desired-replica health grace. |
+| `orphan` | table | — | Orphaned-replica alert grace. |
+| `reaper` | table | — | The destructive orphan reaper (opt-in; dry-run by default). |
+| `webhook` | table | — | Outbound-webhook channel (sealed URL). |
+| `email` | table | — | Email channel (per-project profile). |
+
+`disk`: `enabled` (bool, default on), `warn_pct` (float, default `75.0`), `critical_pct`
+(float, default `90.0`). `managed_sql`: `enabled` (default on), `grace_secs` (default
+`300`). `orphan`: `enabled` (default on), `grace_secs` (default `86400`).
+
+`reaper`: `enabled` (bool, default `false` — opt-in), `dry_run` (bool, default `true` —
+report-only until set `false`), `grace_secs` (default `604800`, ≥ the orphan alert grace),
+`reclaim_volumes` (bool, default `false` — also delete the stranded volume staging).
+
+`webhook`: `url_secret` (a `boatramp:<name>` sealed reference to the URL; the channel is off
+when absent), `allow_private` (bool, default `false` — relax the SSRF floor to permit a
+private webhook address).
+
+`email`: `project` (default `default`), `profile` (the email-profile name; the channel is off
+when absent), `to` (list of recipient addresses; the channel is off when empty).
 
 ## `security`
 

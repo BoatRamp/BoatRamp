@@ -371,6 +371,150 @@ pub trait ComputeControl: Send + Sync {
     ) -> Result<bool, ControlError>;
 }
 
+/// A candidate / reaped ORPHANED replica in a [`ComputeReaper`] report. An orphan is a
+/// replica whose DESIRED workload is absent (`compute get` 404) AND whose backing
+/// container is affirmatively gone — stranded state the reconcile plane ignores (it
+/// converges only against desired workloads). Carries no secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanReplica {
+    /// Owning project.
+    pub project: String,
+    /// Workload name (no desired record exists for it).
+    pub workload: String,
+    /// Replica ordinal.
+    pub replica: u32,
+    /// The backend id that ran it (`"container"`, `"docker"`, …).
+    pub backend: String,
+    /// Seconds since launch (`now − started_at`), or `None` for a legacy record with no
+    /// `started_at` (which — because `started_at` predates orphaning — proves the record
+    /// is OLD, never a just-launched replica).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    /// The scoped volume-staging directory (`@<scope>`) this replica's PGDATA / data
+    /// occupies, for operator visibility — freed only when the reaper's opt-in volume
+    /// reclamation is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_scope: Option<String>,
+}
+
+/// What the reaper did (or would do) to one orphan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReapDisposition {
+    /// Dry-run / report-only: identified as reapable but NOT touched.
+    WouldReap,
+    /// Actually reaped (record dropped + container torn down).
+    Reaped,
+    /// A candidate that was SKIPPED fail-closed, with the reason (e.g. it gained a
+    /// desired workload, its container is live/unknown, or it is not yet past grace).
+    Skipped { reason: String },
+}
+
+/// One orphan's line in a [`ReapReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReapEntry {
+    /// The orphan.
+    pub orphan: OrphanReplica,
+    /// What happened to it.
+    pub disposition: ReapDisposition,
+    /// Whether the scoped volume staging was freed (opt-in reclamation + not dry-run).
+    #[serde(default)]
+    pub volume_reclaimed: bool,
+}
+
+/// The result of a reaper pass. `dry_run` echoes the mode so a consumer can tell a
+/// report-only run from a destructive one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReapReport {
+    /// Whether this pass was dry-run (report-only).
+    pub dry_run: bool,
+    /// Per-orphan outcomes (reaped / would-reap / skipped).
+    pub entries: Vec<ReapEntry>,
+}
+
+impl ReapReport {
+    /// Orphans that were (or would be) reaped — i.e. the fail-closed decision admitted
+    /// them. Excludes skipped candidates.
+    #[must_use]
+    pub fn admitted(&self) -> impl Iterator<Item = &ReapEntry> {
+        self.entries.iter().filter(|e| {
+            matches!(
+                e.disposition,
+                ReapDisposition::Reaped | ReapDisposition::WouldReap
+            )
+        })
+    }
+}
+
+/// Which replicas a reap pass targets.
+#[derive(Debug, Clone)]
+pub enum ReapTarget {
+    /// Scan every project's replicas for orphans.
+    All,
+    /// A single operator-named replica (the `boatramp compute reap` lever). Still
+    /// re-checked fail-closed (no desired workload + container gone) before any destroy —
+    /// naming a replica never bypasses the safety checks.
+    One {
+        project: String,
+        workload: String,
+        replica: u32,
+    },
+}
+
+/// Options for a reap pass.
+#[derive(Debug, Clone)]
+pub struct ReapOptions {
+    /// Which replicas to consider.
+    pub target: ReapTarget,
+    /// Minimum orphan age (seconds) required before acting (the race guard).
+    pub grace_secs: u64,
+    /// Report-only when `true` — nothing is destroyed.
+    pub dry_run: bool,
+    /// Also free the orphan's scoped volume staging (PGDATA). Off ⇒ the record +
+    /// container are reaped but the volume is preserved (reported, not deleted).
+    pub reclaim_volumes: bool,
+}
+
+/// Why a reaper operation failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ReaperError {
+    /// A control-plane store failure while listing/deleting replica state.
+    #[error("reaper store error: {0}")]
+    Store(String),
+    /// A backend failure while probing liveness / stopping / freeing staging.
+    #[error("reaper backend error: {0}")]
+    Backend(String),
+}
+
+/// The DESTRUCTIVE orphaned-compute-replica reaper (node-health-alerting Stage 2,
+/// secondary ask). Backs both the leader-gated alerting loop's opt-in auto-reap and the
+/// operator `boatramp compute reap` lever (`POST /api/compute/maintenance/reap`,
+/// System·Admin). The node implementation ([`NodeComputeReaper`](../../boatramp_node))
+/// is conservative BY CONSTRUCTION — it reaps a replica only when ALL hold, re-checked
+/// at the moment of the destroy (fail-closed, so a wrong reap can never destroy a
+/// running workload):
+/// 1. the replica is `phase == Running` (a parked `Zero` replica is never reaped — its
+///    container is *expected* to be absent);
+/// 2. its DESIRED workload is absent (`get_compute_workload` ⇒ `None`);
+/// 3. its backing container is AFFIRMATIVELY gone ([`ComputeBackend::replica_alive`] ⇒
+///    `Some(false)`; `None`/`Some(true)` ⇒ skip); and
+/// 4. it is past the grace window.
+///
+/// Every reap is AUDITED (a `tracing` record per orphan), and the default call path is
+/// DRY-RUN (report-only). `scan` is the non-destructive observer the orphan *alert*
+/// signal uses.
+#[async_trait]
+pub trait ComputeReaper: Send + Sync {
+    /// Identify the current orphaned replicas (no destroy). The orphan ALERT signal +
+    /// `boatramp compute reap --dry-run`-style listing read this. `grace_secs` bounds
+    /// the age below which a replica is not yet considered an orphan.
+    async fn scan(&self, grace_secs: u64) -> Result<Vec<OrphanReplica>, ReaperError>;
+
+    /// Reap (or, in dry-run, report) orphaned replicas per `opts`. Re-derives
+    /// orphan-ness fail-closed per replica immediately before any destroy.
+    async fn reap(&self, opts: ReapOptions) -> Result<ReapReport, ReaperError>;
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     /// Stable backend id (`"vmm"` / `"container"` / `"cloudflare"` / `"docker"`).
@@ -430,6 +574,32 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Liveness/readiness of a running replica.
     async fn health(&self, handle: &InstanceHandle) -> Result<Health, BackendError>;
+
+    /// **Affirmative liveness** of a replica's backing container/VM, for the orphan
+    /// reaper's fail-closed "is it gone?" decision — DISTINCT from [`health`](Self::health),
+    /// which conflates *gone* with merely *unreachable*. Returns:
+    /// - `Some(true)` — the container/VM is affirmatively LIVE (a process is running);
+    /// - `Some(false)` — it is affirmatively GONE (no backing process/cgroup at all);
+    /// - `None` — this backend cannot determine liveness (no local view, or an
+    ///   un-probeable host).
+    ///
+    /// The reaper destroys a replica only on an explicit `Some(false)` — `None` (unknown)
+    /// and `Some(true)` (live) both FAIL CLOSED (never reap). Default `None` so a backend
+    /// that cannot prove a container is gone never licenses a reap.
+    async fn replica_alive(&self, _handle: &InstanceHandle) -> Option<bool> {
+        None
+    }
+
+    /// Remove the persistent **scoped** volume staging directory for `(project,
+    /// workload)` — the `<volumes>/@<scope>/…` backing a managed DB's PGDATA — returning
+    /// whether anything existed. Used ONLY by the orphan reaper's opt-in volume
+    /// reclamation (the orphan has no desired workload referencing it). Distinct from
+    /// [`remove_volume`](Self::remove_volume), which addresses the legacy FLAT
+    /// `<volumes>/<name>` path and refuses a reserved `@`-prefixed name. Default
+    /// `Ok(false)` so a backend without local volume staging frees nothing.
+    async fn remove_scoped_volume(&self, _scope: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
 
     /// Snapshot a replica for scale-to-zero (backends that support it).
     async fn snapshot(&self, _handle: &InstanceHandle) -> Result<Option<Snapshot>, BackendError> {

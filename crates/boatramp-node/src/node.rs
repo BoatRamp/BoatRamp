@@ -915,6 +915,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     )
         as Arc<_>);
 
+    // The DESTRUCTIVE orphaned-replica reaper (node-health-alerting Stage 2) — backs
+    // `POST /api/compute/maintenance/reap` (System·Admin) AND the alerting loop's orphan
+    // scan + opt-in auto-reap. Clone the registry before the reconcile loop consumes the
+    // original below.
+    let compute_reaper: Arc<dyn boatramp_core::compute::ComputeReaper> = Arc::new(
+        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone()),
+    );
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -951,6 +959,33 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         });
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let tombstone_reaper: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Node/system-health ALERTING loop (node-health-alerting Stage 2), leader-gated.
+    // Spawned ONLY when `[serve.alerts] enabled` — off by default, so a node that never
+    // configures it is byte-for-byte unchanged. Reads the disk/managed-SQL/orphan signals,
+    // de-dups, and delivers over the sealed webhook / email channels; the opt-in reaper
+    // (off + dry-run by default) rides the same loop. Clone `is_leader` BEFORE the
+    // domain-verify loop below moves it.
+    let health_alert_loop: Option<tokio::task::JoinHandle<()>> = config
+        .serve
+        .as_ref()
+        .and_then(|s| s.alerts.as_ref())
+        .filter(|alerts| alerts.enabled)
+        .map(|alerts| {
+            boatramp_server::spawn_health_alert_loop(
+                boatramp_server::HealthAlertDeps {
+                    deploy: deploy.clone(),
+                    reaper: compute_reaper.clone(),
+                    secret_store: secret_store.clone(),
+                    email_profile_store: email_profile_store.clone(),
+                    data_dir: data_dir.to_path_buf(),
+                    node_label: format!("node-{node_id}"),
+                    allow_private_relay: allow_guest_private_egress,
+                },
+                alerts.clone(),
+                is_leader.clone(),
+            )
+        });
 
     // Domain-verify auto-complete: periodically re-check every site's pending
     // ownership challenges and attach any that now pass — a published token (e.g.
@@ -1080,6 +1115,8 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.dev_messaging_bind = dev_messaging_bind_resolver;
     options.compute_volumes = compute_volumes;
     options.compute_control = compute_control;
+    // The orphaned-replica reaper backs `POST /api/compute/maintenance/reap` (System·Admin).
+    options.compute_reaper = Some(compute_reaper);
     // The internal secret store backs the admin secrets API (set/list/delete). Not
     // handlers-gated — it must be reachable even on a lean node.
     options.secret_store = secret_store;
@@ -1098,6 +1135,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     }
     if let Some(dns) = internal_dns {
         reconcile.push(dns);
+    }
+    if let Some(alerts) = health_alert_loop {
+        reconcile.push(alerts);
     }
 
     Ok(RunningNode {

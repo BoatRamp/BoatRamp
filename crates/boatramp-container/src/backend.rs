@@ -1074,6 +1074,31 @@ impl ComputeBackend for ContainerBackend {
         }
     }
 
+    /// Affirmative liveness for the orphan reaper (node-health-alerting Stage 2): the
+    /// SAME cgroup-v2 probe the IPAM GC uses ([`container_cgroup_alive`]) — the container
+    /// is live iff its `/sys/fs/cgroup/boatramp/<id>/cgroup.procs` holds ≥1 pid; an absent
+    /// cgroup dir means the container is affirmatively GONE. This is DISTINCT from
+    /// [`health`](ComputeBackend::health) (a TCP reachability probe that conflates gone
+    /// with merely unreachable): the reaper must only ever destroy a replica it can prove
+    /// is gone. On a non-Linux host the probe is unavailable, so `container_cgroup_alive`
+    /// returns `true` and we map that to `None` ("can't determine") — the reaper then
+    /// fails closed and never reaps.
+    async fn replica_alive(&self, handle: &InstanceHandle) -> Option<bool> {
+        let id = container_id(&handle.project, &handle.workload, handle.replica);
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: the cgroup probe is authoritative — `false` ⇒ affirmatively gone.
+            Some(container_cgroup_alive(&id))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Off-Linux the stub reports `true` (un-probeable); surface that as "unknown"
+            // so the reaper never reaps on a host it cannot probe.
+            let _ = id;
+            None
+        }
+    }
+
     /// **Snapshot** (scale-to-zero park): CRIU-dump the container's process tree to
     /// an image directory, freeing its resources. Finds the container's pid1 (the
     /// pidns init) in its cgroup, dumps it (which kills the tree), tears down the
@@ -1359,6 +1384,29 @@ impl ComputeBackend for ContainerBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(BackendError::Other(format!(
                 "remove volume {} dir: {e}",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Remove the whole SCOPED volume-staging subtree for a `(project, workload)` —
+    /// `<data_dir>/compute/volumes/@<scope>/` and every volume under it (the managed
+    /// DB's PGDATA) — returning whether anything existed. The orphan reaper's opt-in
+    /// volume reclamation calls this for a replica with NO desired workload (nothing
+    /// references the staging). The `scope` is validated as a single safe path component
+    /// ([`validate_volume_scope`]) BEFORE any path is built, so no `..`/`/`/absolute scope
+    /// can escape `<volumes>/`. Distinct from [`remove_volume`](ComputeBackend::remove_volume)
+    /// (the legacy FLAT layout), which deliberately refuses the reserved `@` prefix.
+    async fn remove_scoped_volume(&self, scope: &str) -> Result<bool, BackendError> {
+        validate_volume_scope(scope)?;
+        let dir = self
+            .volumes_dir()
+            .join(format!("{SCOPE_DIR_PREFIX}{scope}"));
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(BackendError::Other(format!(
+                "remove scoped volume {} dir: {e}",
                 dir.display()
             ))),
         }

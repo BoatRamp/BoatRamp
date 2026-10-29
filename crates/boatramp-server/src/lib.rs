@@ -55,7 +55,7 @@ pub(crate) use admin_api::blob_mint_upload;
 pub(crate) use admin_api::{
     DevMessagingBind, activate_deployment, cert_status, clone_from, clone_manifest, clone_stream,
     compute_dev_bind_blob, compute_dev_bind_messaging, compute_dns, compute_dns_resolve,
-    compute_exec, compute_ipam, compute_netdiag, compute_reconcile, compute_restart,
+    compute_exec, compute_ipam, compute_netdiag, compute_reap, compute_reconcile, compute_restart,
     compute_set_health, compute_status, create_deployment, current_deployment, database_status,
     declare_database, delete_compute, delete_compute_volume, delete_project_tenancy, delete_site,
     drop_user, ensure_database, ensure_user, get_compute, get_daemon_config, get_database,
@@ -144,6 +144,10 @@ pub(crate) use control_api::{
 pub use email_spool::NodeEmailSpool;
 mod domain_verify;
 pub use domain_verify::{spawn_domain_verify_reconcile, verification_pending_page};
+/// The node/system-health ALERTING loop (node-health-alerting Stage 2): leader-gated
+/// periodic evaluation + the sealed-secret webhook/email delivery channels.
+mod health_alert;
+pub use health_alert::{HealthAlertDeps, spawn_health_alert_loop};
 pub mod envelope;
 #[cfg(feature = "handlers")]
 mod graphql_apq;
@@ -2888,6 +2892,12 @@ pub struct ServerOptions {
     /// `POST /api/compute/maintenance/restart`; `None` ⇒ `501`. Admin-scoped
     /// (`is_compute_maintenance_path`). Wired by the node with the compute backends.
     pub compute_control: Option<Arc<dyn boatramp_core::compute::ComputeControl>>,
+    /// The DESTRUCTIVE orphaned-compute-replica reaper (node-health-alerting Stage 2).
+    /// Backs `POST /api/compute/maintenance/reap` (System·Admin, `is_compute_maintenance_path`);
+    /// `None` ⇒ `501`. The handler forces dry-run-by-default + re-checks orphan-ness
+    /// fail-closed (no desired workload + container gone) before any destroy. Wired by the
+    /// node with the compute backends + store.
+    pub compute_reaper: Option<Arc<dyn boatramp_core::compute::ComputeReaper>>,
     /// The project-scoped internal secret store (sealed with the `[secrets]`
     /// envelope). Backs the admin secrets API (`/api/projects/{proj}/secrets{,/{name}}`,
     /// rewritten onto `/api/secrets{,/{name}}`) — set/list/delete of names + metadata,

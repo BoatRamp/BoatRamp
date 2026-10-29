@@ -42,6 +42,9 @@ pub mod deploy;
 /// guest capability — credentials host-held, config admin-reconfigurable.
 pub mod email_config;
 pub mod error;
+/// Node/system-health **alerting** config + alert domain types (node-health-alerting
+/// Stage 2) — the wasm-clean core the daemon loop + delivery channels build on.
+pub mod health_alert;
 /// Per-node guest-IP pool shared by the VMM (tap) + container (veth) backends.
 pub mod ipam;
 /// Posture-scaled kernel-trust verification (needs the `authz` signing primitives).

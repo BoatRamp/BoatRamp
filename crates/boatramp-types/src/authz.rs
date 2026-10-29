@@ -2015,6 +2015,11 @@ mod tests {
             ("POST", "/api/compute/maintenance/restart"),
             ("POST", "/api/compute/maintenance/set-health"),
             ("POST", "/api/compute/maintenance/netdiag"),
+            // The DESTRUCTIVE orphan-replica reaper (node-health-alerting Stage 2): it
+            // reaps replicas across EVERY tenant, so — like the other maintenance
+            // mutators — it must be node-global System·Admin, never a per-project right.
+            ("POST", "/api/compute/maintenance/reap"),
+            ("POST", "/api/projects/acme/compute/maintenance/reap"),
             // The dev/CI blob-bind affordance mints a site-scoped blob credential for ANY
             // project/site — node-global, so system·admin in both forms (NOT the per-project
             // right the general `/api/compute/*` mapping would otherwise give).

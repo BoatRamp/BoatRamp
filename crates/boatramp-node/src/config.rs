@@ -2410,6 +2410,15 @@ pub struct ServeConfig {
     /// See [`OnDemandTlsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_demand_tls: Option<OnDemandTlsConfig>,
+    /// `[serve.alerts]` — the node/system-health ALERTING subsystem (node-health-alerting
+    /// Stage 2). Off unless `enabled`. Declares the evaluation cadence, the disk /
+    /// managed-SQL / orphan-replica signal thresholds + graces, the webhook/email delivery
+    /// channels (secrets SEALED, never plaintext here), and the opt-in orphan reaper. The
+    /// leader-gated evaluation loop is spawned only when `enabled`. Env parity:
+    /// `BOATRAMP_ALERTS_*` (the `serve` segment dropped, like `s3_ingress_cloud`). See
+    /// [`boatramp_core::health_alert::AlertsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerts: Option<boatramp_core::health_alert::AlertsConfig>,
 }
 
 /// `[serve.on_demand_tls]` — on-demand per-SNI TLS issuance (cap-req 03). Off unless `enabled`. When
@@ -5352,6 +5361,8 @@ pub(crate) mod figment_resolve {
         "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
         "BOATRAMP_CLUSTER_ROOT_PUBKEYS",
         "BOATRAMP_CLUSTER_SEEDS",
+        // The alert email recipient list (comma-separated).
+        "BOATRAMP_ALERTS_EMAIL_TO",
     ];
 
     /// Vars whose target is a `rename_all = "lowercase"` enum with no `FromStr`.
@@ -5466,6 +5477,82 @@ pub(crate) mod figment_resolve {
         ),
     ];
 
+    /// The `serve.alerts.*` aliases (node-health-alerting Stage 2). The env names drop the
+    /// `serve` segment (like `s3_ingress_cloud`), so they are aliased explicitly to their
+    /// nested figment paths. All leaves are `Option`/defaulted, so a partial env sub-dict
+    /// deserializes without a `base_seed` entry.
+    const ALERTS: &[(&str, &[&str])] = &[
+        ("BOATRAMP_ALERTS_ENABLED", &["serve", "alerts", "enabled"]),
+        (
+            "BOATRAMP_ALERTS_INTERVAL_SECS",
+            &["serve", "alerts", "interval_secs"],
+        ),
+        (
+            "BOATRAMP_ALERTS_DISK_ENABLED",
+            &["serve", "alerts", "disk", "enabled"],
+        ),
+        (
+            "BOATRAMP_ALERTS_DISK_WARN_PCT",
+            &["serve", "alerts", "disk", "warn_pct"],
+        ),
+        (
+            "BOATRAMP_ALERTS_DISK_CRITICAL_PCT",
+            &["serve", "alerts", "disk", "critical_pct"],
+        ),
+        (
+            "BOATRAMP_ALERTS_MANAGED_SQL_ENABLED",
+            &["serve", "alerts", "managed_sql", "enabled"],
+        ),
+        (
+            "BOATRAMP_ALERTS_MANAGED_SQL_GRACE_SECS",
+            &["serve", "alerts", "managed_sql", "grace_secs"],
+        ),
+        (
+            "BOATRAMP_ALERTS_ORPHAN_ENABLED",
+            &["serve", "alerts", "orphan", "enabled"],
+        ),
+        (
+            "BOATRAMP_ALERTS_ORPHAN_GRACE_SECS",
+            &["serve", "alerts", "orphan", "grace_secs"],
+        ),
+        (
+            "BOATRAMP_ALERTS_REAPER_ENABLED",
+            &["serve", "alerts", "reaper", "enabled"],
+        ),
+        (
+            "BOATRAMP_ALERTS_REAPER_DRY_RUN",
+            &["serve", "alerts", "reaper", "dry_run"],
+        ),
+        (
+            "BOATRAMP_ALERTS_REAPER_GRACE_SECS",
+            &["serve", "alerts", "reaper", "grace_secs"],
+        ),
+        (
+            "BOATRAMP_ALERTS_REAPER_RECLAIM_VOLUMES",
+            &["serve", "alerts", "reaper", "reclaim_volumes"],
+        ),
+        (
+            "BOATRAMP_ALERTS_WEBHOOK_URL_SECRET",
+            &["serve", "alerts", "webhook", "url_secret"],
+        ),
+        (
+            "BOATRAMP_ALERTS_WEBHOOK_ALLOW_PRIVATE",
+            &["serve", "alerts", "webhook", "allow_private"],
+        ),
+        (
+            "BOATRAMP_ALERTS_EMAIL_PROJECT",
+            &["serve", "alerts", "email", "project"],
+        ),
+        (
+            "BOATRAMP_ALERTS_EMAIL_PROFILE",
+            &["serve", "alerts", "email", "profile"],
+        ),
+        (
+            "BOATRAMP_ALERTS_EMAIL_TO",
+            &["serve", "alerts", "email", "to"],
+        ),
+    ];
+
     /// Insert `value` at the nested `path`, creating intermediate dicts as needed.
     fn put(dict: &mut Dict, path: &[&str], value: Value) {
         let (last, parents) = path.split_last().expect("path is non-empty");
@@ -5525,8 +5612,9 @@ pub(crate) mod figment_resolve {
     pub(crate) fn env_overlay_dict(source: &EnvSource) -> Dict {
         let mut d = Dict::new();
 
-        // --- serve.* scalars (former Loader-A) + serve.kv.* (former Loader-C) ----
-        for (var, path) in SERVE_SCALARS.iter().chain(SERVE_KV) {
+        // --- serve.* scalars (former Loader-A) + serve.kv.* (former Loader-C) +
+        // serve.alerts.* (node-health-alerting Stage 2) ----
+        for (var, path) in SERVE_SCALARS.iter().chain(SERVE_KV).chain(ALERTS) {
             emit(&mut d, source, var, path);
         }
 
@@ -6170,6 +6258,95 @@ pub(crate) mod figment_resolve {
             );
             assert_eq!(serve.s3_region.as_deref(), Some("auto"));
             assert!(serve.s3_path_style, "s3_path_style coerced from \"true\"");
+        }
+
+        /// The `[serve.alerts]` subsystem (node-health-alerting Stage 2) resolves from env
+        /// across every nested leaf — the top-level toggle, the disk thresholds, the
+        /// managed-SQL / orphan graces, the reaper's bool/dry-run/grace/reclaim knobs, the
+        /// webhook url-secret ref + allow_private, and the email project/profile + the
+        /// comma-list recipients. A forgot-a-knob guard so a new `BOATRAMP_ALERTS_*` lever
+        /// can't silently escape the overlay. `ServeConfig`/`AlertsConfig` are `#[serde(default)]`,
+        /// so a partial env dict fills the rest.
+        #[test]
+        fn serve_alerts_resolve_from_env() {
+            let cfg = resolve_from_env(&map(&[
+                ("BOATRAMP_ALERTS_ENABLED", "true"),
+                ("BOATRAMP_ALERTS_INTERVAL_SECS", "30"),
+                ("BOATRAMP_ALERTS_DISK_WARN_PCT", "70"),
+                ("BOATRAMP_ALERTS_DISK_CRITICAL_PCT", "88"),
+                ("BOATRAMP_ALERTS_MANAGED_SQL_GRACE_SECS", "120"),
+                ("BOATRAMP_ALERTS_ORPHAN_GRACE_SECS", "3600"),
+                ("BOATRAMP_ALERTS_REAPER_ENABLED", "true"),
+                ("BOATRAMP_ALERTS_REAPER_DRY_RUN", "false"),
+                ("BOATRAMP_ALERTS_REAPER_GRACE_SECS", "86400"),
+                ("BOATRAMP_ALERTS_REAPER_RECLAIM_VOLUMES", "true"),
+                (
+                    "BOATRAMP_ALERTS_WEBHOOK_URL_SECRET",
+                    "boatramp:node-alert-webhook",
+                ),
+                ("BOATRAMP_ALERTS_WEBHOOK_ALLOW_PRIVATE", "false"),
+                ("BOATRAMP_ALERTS_EMAIL_PROJECT", "default"),
+                ("BOATRAMP_ALERTS_EMAIL_PROFILE", "alerts"),
+                (
+                    "BOATRAMP_ALERTS_EMAIL_TO",
+                    "ops@example.com, oncall@example.com",
+                ),
+            ]))
+            .expect("extract");
+            let alerts = cfg
+                .serve
+                .expect("serve materialised from env")
+                .alerts
+                .expect("alerts materialised from env");
+            assert!(alerts.enabled);
+            assert_eq!(alerts.interval().as_secs(), 30);
+            assert_eq!(alerts.disk.warn_pct(), 70.0);
+            assert_eq!(alerts.disk.critical_pct(), 88.0);
+            assert_eq!(alerts.managed_sql.grace_secs(), 120);
+            assert_eq!(alerts.orphan.grace_secs(), 3600);
+            assert!(alerts.reaper.enabled());
+            assert!(
+                !alerts.reaper.dry_run(),
+                "reaper dry_run coerced from \"false\""
+            );
+            assert_eq!(alerts.reaper.grace_secs(), 86400);
+            assert!(alerts.reaper.reclaim_volumes);
+            assert_eq!(
+                alerts.webhook.url_secret_ref(),
+                Some("boatramp:node-alert-webhook")
+            );
+            assert!(!alerts.webhook.allow_private);
+            assert_eq!(alerts.email.project(), "default");
+            assert_eq!(alerts.email.profile_name(), Some("alerts"));
+            assert_eq!(
+                alerts.email.to,
+                vec![
+                    "ops@example.com".to_string(),
+                    "oncall@example.com".to_string()
+                ],
+                "comma-list trimmed + split"
+            );
+            assert!(alerts.any_channel_configured());
+        }
+
+        /// Drift guard: every `BOATRAMP_ALERTS_*` var in the `ALERTS` table produces an
+        /// overlay entry — a future field can't silently escape `env_overlay_dict`.
+        #[test]
+        fn overlay_honors_every_alerts_var() {
+            let mut unhandled = Vec::new();
+            for (var, _) in ALERTS {
+                assert!(
+                    var.starts_with("BOATRAMP_ALERTS_"),
+                    "an alerts env var must carry the BOATRAMP_ALERTS_ prefix: {var}"
+                );
+                if env_overlay_dict(&map(&[(var, "1")])).is_empty() {
+                    unhandled.push(*var);
+                }
+            }
+            assert!(
+                unhandled.is_empty(),
+                "these ALERTS vars produced no overlay entry: {unhandled:?}"
+            );
         }
 
         /// P0#2: the dynamic blob-backends map populates at the right nested path,
