@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncWrite};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::project::ProjectRef;
@@ -369,6 +369,76 @@ pub enum ProjectExportError {
     Other(String),
 }
 
+// ---------------------------------------------------------------------------
+// Streaming project CLONE (PLAN-project-clone, increment 1) — the manifest-first,
+// target-driven handshake layered ON TOP of the existing streaming export/import.
+//
+// A clone is `import <target> --clone-from <source>`: the TARGET pulls from the SOURCE
+// and restores each format-v2/v3 member as it streams in (O(largest member), nothing
+// staged full-size). Resumable from day one via a cheap MANIFEST ([`CloneManifest`]): the
+// source lists its blob objects (SHAs/refs, NO full materialization — a LIST, not a read);
+// the target diffs that against its OWN content-addressed store ([`CloneSkip`]) and the
+// source then streams ONLY the members the target is missing. Blobs flow bucket→bucket; the
+// restore reuses the existing inc2 atomic shadow-restore + target-scope enforcement, so a
+// clone is NEVER trusted to write outside the target's own project scope.
+// ---------------------------------------------------------------------------
+
+/// One blob object the SOURCE holds, as listed in the cheap clone [`CloneManifest`]. Carries
+/// the bundle member PATH (`blobs/hblob/{source}/…` — re-keyed to the target's own scope on
+/// restore, exactly like the streaming export) plus a cheap CONTENT identity for the per-SHA
+/// presence skip: the backend `etag` when the store supplies one (real S3/GCS — the content
+/// hash, free from a LIST), else the declared `size`. Produced from a prefix LIST — never a
+/// body read — so the manifest stays O(object-count), never O(bytes), even at 33 GB.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneBlobRef {
+    /// The bundle member path (`blobs/hblob/{source}/{site}/{container}/{key}`).
+    pub member_path: String,
+    /// The object's byte length when known (the fallback content identity on a backend with
+    /// no etag, e.g. the local fs store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The backend entity tag when available (the strong content identity — a content hash on
+    /// S3/GCS). `None` ⇒ fall back to `size` for the presence skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+}
+
+/// The cheap clone MANIFEST the SOURCE produces for the manifest-first handshake — a LIST of
+/// the project's blob objects (for the target's per-SHA diff) plus the non-blob member paths
+/// (DB/KV/identity) the target will always pull. NO full materialization: blobs come from a
+/// prefix list, the non-blob members from a light enumeration (no engine version-detection /
+/// dump). The target diffs [`blobs`](Self::blobs) against its own content-addressed store and
+/// asks the source to stream only the missing members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneManifest {
+    /// The project the manifest was produced for (the clone SOURCE). The target cross-checks
+    /// this against the operator-requested source before trusting any member path.
+    pub source_project: String,
+    /// Whether the clone stream will be a `--data-only` bundle (no control-plane KV/identity).
+    pub data_only: bool,
+    /// Every blob object the source holds under the project's own `hblob/{source}/` scope — the
+    /// set the target diffs against its own store. Scoped STRUCTURALLY by the project prefix, so
+    /// no other tenant's object can appear here.
+    pub blobs: Vec<CloneBlobRef>,
+    /// The non-blob member paths (pg/mysql/libsql/kv/identity) the clone stream carries — always
+    /// pulled (small relative to blobs; the manifest-diff is a blob optimization only).
+    /// Informational for the operator/logs; the target does not gate on it.
+    #[serde(default)]
+    pub non_blob_members: Vec<String>,
+}
+
+/// The TARGET's diff result: the set of SOURCE blob member paths the target ALREADY holds
+/// (content-matched in its own scope) and so the source must OMIT from the clone stream (the
+/// per-SHA / content-presence skip). Everything the target is missing streams. On a resume the
+/// target re-diffs, so a re-run transfers only the remainder — O(remaining), not an O(largest
+/// member) re-stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneSkip {
+    /// SOURCE blob member paths (`blobs/hblob/{source}/…`) the source should NOT stream — the
+    /// target already holds a content-matched object at the re-keyed target key.
+    pub skip_member_paths: std::collections::BTreeSet<String>,
+}
+
 /// The project export/import capability (see the module docs).
 #[async_trait]
 pub trait ProjectExport: Send + Sync {
@@ -430,6 +500,54 @@ pub trait ProjectExport: Send + Sync {
     ) -> Result<ImportReport, ProjectExportError> {
         Err(ProjectExportError::Other(
             "resumable import is not available on this node".into(),
+        ))
+    }
+
+    /// CLONE SOURCE — produce the cheap [`CloneManifest`] (blob LIST + non-blob member paths, no
+    /// full materialization) the target diffs for the manifest-first handshake. `opts.data_only`
+    /// selects whether the eventual clone stream carries the control-plane KV slice. Default impl
+    /// refuses (a node without the clone capability).
+    async fn clone_manifest(
+        &self,
+        _project: &str,
+        _opts: &ExportOptions,
+    ) -> Result<CloneManifest, ProjectExportError> {
+        Err(ProjectExportError::Other(
+            "project clone is not available on this node".into(),
+        ))
+    }
+
+    /// CLONE TARGET — diff the source's listed `blobs` against THIS node's own content-addressed
+    /// store, returning the [`CloneSkip`] set of source member paths the target already holds (so
+    /// the source omits them from the stream — the per-SHA presence skip / resume). Each ref is
+    /// re-keyed to the target's OWN scope (`source_project` → this project) before the presence
+    /// check, and a ref outside `hblob/{source_project}/` is REFUSED fail-closed — the target never
+    /// reads or writes outside its own scope. Default impl refuses.
+    async fn clone_blobs_present(
+        &self,
+        _project: &str,
+        _source_project: &str,
+        _blobs: &[CloneBlobRef],
+    ) -> Result<CloneSkip, ProjectExportError> {
+        Err(ProjectExportError::Other(
+            "project clone is not available on this node".into(),
+        ))
+    }
+
+    /// CLONE SOURCE — stream a format-v2/v3 bundle of exactly the members the target is missing:
+    /// the ordinary streaming [`export`](Self::export) with the `skip`ped blob members OMITTED
+    /// from both the MANIFEST and the stream (so the target restores it through the SAME inc2
+    /// atomic reader, unchanged). Only blob members may be skipped; any other skip entry is
+    /// ignored. Default impl refuses.
+    async fn export_clone(
+        &self,
+        _project: &str,
+        _opts: &ExportOptions,
+        _skip: &CloneSkip,
+        _sink: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> Result<(), ProjectExportError> {
+        Err(ProjectExportError::Other(
+            "project clone is not available on this node".into(),
         ))
     }
 }

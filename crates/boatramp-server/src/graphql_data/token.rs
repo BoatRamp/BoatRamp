@@ -859,30 +859,13 @@ fn jwks_uri_host_pinned(jwks_uri: &str, iss: &str) -> bool {
 /// resolve and connect). `None` ⇒ refused. Split out from the fetch so it is deterministically
 /// testable (an IP-literal URL needs no network). Mirrors [`crate::proxy`]'s target guard.
 async fn ssrf_resolve_pin(url: &str) -> Option<(String, SocketAddr)> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let loopback = test_loopback_allowed();
-    match parsed.scheme() {
-        "https" => {}
-        "http" if loopback => {} // the live-gate loopback mock (test fixture only)
-        _ => return None,
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-    let host = parsed.host_str()?.to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let skip = issuertrust_mutation().as_deref() == Some("skip_ssrf_guard");
-    let mut pinned: Option<SocketAddr> = None;
-    for addr in tokio::net::lookup_host((host.as_str(), port)).await.ok()? {
-        // MUTATION SEAM (gate `skip_ssrf_guard`): drop the public-IP requirement — a URL resolving
-        // to a private/loopback address then pins (would be fetched), turning the gate RED. The
-        // `loopback` fixture (test-only) likewise permits loopback so the live mock is reachable.
-        if !skip && !loopback && !boatramp_core::access::is_global_ip(addr.ip()) {
-            return None;
-        }
-        pinned.get_or_insert(addr);
-    }
-    pinned.map(|addr| (host, addr))
+    // Delegates to the shared, always-compiled SSRF decision ([`crate::ssrf::resolve_pin`]) — the
+    // single source of truth, also used by the project-clone pull. The issuer-trust `skip_ssrf_guard`
+    // MUTATION SEAM (drops the public-IP requirement → a private/loopback target then pins, turning
+    // the gate RED) and the live-gate loopback fixture are threaded in here, so the shared decision
+    // stays free of issuer-trust-specific test seams.
+    let allow_non_global = issuertrust_mutation().as_deref() == Some("skip_ssrf_guard");
+    crate::ssrf::resolve_pin(url, allow_non_global, test_loopback_allowed()).await
 }
 
 /// An HTTPS GET fenced by [`ssrf_resolve_pin`]: the resolved public address is pinned on the client,

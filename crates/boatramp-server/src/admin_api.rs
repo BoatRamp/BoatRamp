@@ -2784,9 +2784,11 @@ pub(super) async fn compute_dev_bind_messaging(
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 
-/// Defense-in-depth (mirrors `control_api::assert_kv_dump_is_system_admin`): re-derive
-/// that `path` is gated `System·Admin` inside the handler, so a routing/table regression
-/// cannot silently downgrade a node-global, data-moving export/import to a project right.
+/// Defense-in-depth (mirrors `control_api::assert_kv_dump_is_system_admin`): re-derive that
+/// `path` is gated `System·Admin` inside the handler, so a routing/table regression cannot
+/// silently downgrade a node-global endpoint to a project right. Generic — reused by the
+/// node-global credential-minting dev-bind handlers (NOT the project export/import, which are now
+/// Project·Admin — see `assert_project_export_is_project_admin`).
 fn assert_project_export_is_system_admin(method: &str, path: &str, what: &str) -> Option<Response> {
     use boatramp_core::authz::{Action, Resource, Right};
     match Right::required(method, path) {
@@ -2801,6 +2803,35 @@ fn assert_project_export_is_system_admin(method: &str, path: &str, what: &str) -
             (
                 StatusCode::FORBIDDEN,
                 format!("{what} requires System·Admin\n"),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Defense-in-depth re-check (mirrors the `clone` family + `control_api::assert_kv_dump_is_system_admin`
+/// pattern): re-derive that `path` with its `?project=<target>` is gated **`Project·Admin` on that
+/// exact target project**, so a routing/table regression cannot silently downgrade the data-moving
+/// export/import below Project·Admin or to a WRONG/target-less scope (which would open a cross-tenant
+/// data-move hole). Binds to the SAME target the request names — the authoritative token check happens
+/// in `require_auth` via `authorize_with_query`; this guards the mapping, fail-closed.
+fn assert_project_export_is_project_admin(
+    method: &str,
+    path: &str,
+    target: &str,
+    what: &str,
+) -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    // Re-derive through the same query-scoped table entry the authorizer used, with a query that
+    // names this request's target project.
+    let query = format!("project={target}");
+    let expected = Right::new(Resource::Project, Some(target.to_string()), Action::Admin);
+    match Right::required_for(method, path, Some(&query)) {
+        Some(right) if right == expected => None,
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!("{what} requires Project·Admin on {target:?}\n"),
             )
                 .into_response(),
         ),
@@ -2910,7 +2941,8 @@ fn resumable_error_response(e: boatramp_core::project_export::ProjectExportError
     }
 }
 
-/// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`System·Admin`).
+/// Export a project to a `BRPROJ` bundle, STREAMED as the response body (`Project·Admin` on the
+/// `?project=` target — re-checked defense-in-depth in-handler, mirroring the clone family).
 /// The driver writes the bundle straight into an in-memory pipe whose read half is the
 /// response body — the node never stages the whole bundle to a temp file (peak staging is
 /// bounded to the largest single member). `501` when no export driver is wired. Because bytes
@@ -2922,11 +2954,6 @@ pub(super) async fn project_export(
     headers: HeaderMap,
     Query(q): Query<ProjectExportQuery>,
 ) -> Response {
-    if let Some(forbidden) =
-        assert_project_export_is_system_admin("POST", "/api/project-export", "project export")
-    {
-        return forbidden;
-    }
     let Some(cap) = cap else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -2941,6 +2968,17 @@ pub(super) async fn project_export(
     // and `ProjectRef::qualified` — a `..`/`/` would traverse (mirrors every sibling).
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
+    }
+    // Defense-in-depth: re-derive that this request is gated Project·Admin on THIS target project
+    // (bound to `?project=`), so a table regression can't downgrade it below Project·Admin or to a
+    // wrong/target-less scope. The authoritative token check already ran in `require_auth`.
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        "POST",
+        "/api/project-export",
+        &q.project,
+        "project export",
+    ) {
+        return forbidden;
     }
     let transport_key = transport_key_from_headers(&headers);
     if q.include_identity && transport_key.is_none() {
@@ -3063,7 +3101,8 @@ fn default_identity() -> String {
     "fresh".to_string()
 }
 
-/// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body is
+/// Import a `BRPROJ` bundle (the request body) into a project (`Project·Admin` on the `?project=`
+/// target — re-checked defense-in-depth in-handler, mirroring the clone family). The body is
 /// STREAMED straight into the driver (never staged whole to a node temp file; peak staging is
 /// bounded to the largest single member) and restored in a single forward pass; dry-run unless
 /// `?apply=true`. Returns the import report JSON. `501` when no driver is wired, `409` on a
@@ -3088,11 +3127,6 @@ pub(super) async fn project_import(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Some(forbidden) =
-        assert_project_export_is_system_admin("POST", "/api/project-import", "project import")
-    {
-        return forbidden;
-    }
     let Some(cap) = cap else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -3106,6 +3140,17 @@ pub(super) async fn project_import(
     // Slug-validate before the name reaches any path / `ProjectRef::qualified`.
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
+    }
+    // Defense-in-depth: re-derive that this request is gated Project·Admin on THIS target project
+    // (the import TARGET, bound to `?project=`), so a table regression can't downgrade it below
+    // Project·Admin or to a wrong/target-less scope. The token check already ran in `require_auth`.
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        "POST",
+        "/api/project-import",
+        &q.project,
+        "project import",
+    ) {
+        return forbidden;
     }
     let identity = match q.identity.as_str() {
         "fresh" => boatramp_core::project_export::IdentityChoice::Fresh,
@@ -3175,6 +3220,412 @@ pub(super) async fn project_import(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("project import failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming project CLONE (PLAN-project-clone, increment 1)
+//
+// Three project-scoped, `Project·Admin`-gated surfaces (NOT the node-global `System·Admin`
+// export/import above). The SOURCE side serves a cheap manifest + a filtered member stream;
+// the TARGET side is the orchestrator that pulls from the source and restores through the
+// EXISTING inc2 import path. All three live under the `clone` project family, so authz sees
+// the original `/api/projects/<proj>/clone/…` path and gates it `Project·Admin` (see
+// `authz::Right::required`), and `project_scope` injects the tenant as `ProjectContext`.
+// ---------------------------------------------------------------------------
+
+/// The HTTP header carrying the operator's SOURCE-node Project-Admin bearer for a clone pull
+/// (the operator-redeems-Project-Admin model, increment 1). A header (not a query param) so
+/// the token never lands in a URL / access log; sent over TLS. The target forwards it as the
+/// `Authorization: Bearer` to the source's clone endpoints.
+const SOURCE_TOKEN_HEADER: &str = "x-boatramp-source-token";
+
+/// The hard cap on the clone MANIFEST body the target will read from a source (`diff` OOM guard):
+/// a manifest is a blob LIST, so it is modest even for a large project, but the source is
+/// attacker-influenceable — bound it like `clone_stream` bounds its skip body. Transitively bounds
+/// `manifest.blobs.len()`; the driver also caps the count explicitly before the HEAD fan-out.
+const CLONE_MANIFEST_CAP: usize = 64 * 1024 * 1024;
+
+/// Query for the SOURCE clone surfaces (`/api/clone/manifest`, `/api/clone/stream`): whether the
+/// clone stream is `--data-only` (no control-plane KV / identity). Default `false` ⇒ a FULL clone
+/// (carries the project's control-plane KV slice); the target mints a FRESH identity on restore.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct CloneSourceQuery {
+    #[serde(default)]
+    data_only: bool,
+}
+
+/// SOURCE — produce the cheap clone MANIFEST (`GET /api/projects/<proj>/clone/manifest`,
+/// `Project·Admin`): a LIST of the project's blob objects (for the target's per-SHA diff) plus
+/// the non-blob member paths the stream will carry. No full materialization. `501` when no clone
+/// driver is wired on this node.
+pub(super) async fn clone_manifest(
+    Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    Extension(project): Extension<ProjectContext>,
+    Query(q): Query<CloneSourceQuery>,
+) -> Response {
+    let Some(cap) = cap else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "project clone is not available on this node\n",
+        )
+            .into_response();
+    };
+    let project = project.0;
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let opts = boatramp_core::project_export::ExportOptions {
+        data_only: q.data_only,
+        ..Default::default()
+    };
+    match cap.clone_manifest(&project, &opts).await {
+        Ok(manifest) => (StatusCode::OK, Json(manifest)).into_response(),
+        Err(e) => resumable_error_response(e),
+    }
+}
+
+/// SOURCE — stream the filtered clone bundle (`POST /api/projects/<proj>/clone/stream`,
+/// `Project·Admin`): the request body is a [`CloneSkip`](boatramp_core::project_export::CloneSkip)
+/// JSON (the blob member paths the target already holds); the driver streams a format-v2/v3
+/// bundle OMITTING those members, straight into the response body (bounded in-memory pipe — never
+/// staged whole, exactly like `project_export`). The target restores it through the existing inc2
+/// atomic reader.
+pub(super) async fn clone_stream(
+    Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    Extension(project): Extension<ProjectContext>,
+    Query(q): Query<CloneSourceQuery>,
+    body: Body,
+) -> Response {
+    let Some(cap) = cap else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "project clone is not available on this node\n",
+        )
+            .into_response();
+    };
+    let project = project.0;
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    // The skip set is a small JSON body (member paths); read it bounded before streaming.
+    let skip_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("clone stream: cannot read skip set body: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let skip: boatramp_core::project_export::CloneSkip = if skip_bytes.is_empty() {
+        boatramp_core::project_export::CloneSkip::default()
+    } else {
+        match serde_json::from_slice(&skip_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("clone stream: malformed skip set JSON: {e}\n"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let opts = boatramp_core::project_export::ExportOptions {
+        data_only: q.data_only,
+        ..Default::default()
+    };
+    // Same bounded-pipe streaming as `project_export`: the driver writes the filtered bundle into
+    // the duplex write half (a detached task), the response body drains the read half.
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    let (dup_w, dup_r) = tokio::io::duplex(128 * 1024);
+    tokio::spawn(async move {
+        let mut sink = dup_w.compat_write();
+        if let Err(e) = cap.export_clone(&project, &opts, &skip, &mut sink).await {
+            tracing::warn!(error = %e, project = %project, "project clone stream failed");
+        }
+    });
+    let stream = futures::stream::try_unfold(
+        (dup_r, vec![0u8; 64 * 1024]),
+        |(mut rd, mut buf)| async move {
+            use tokio::io::AsyncReadExt;
+            let n = rd.read(&mut buf).await?;
+            if n == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                Ok(Some((bytes::Bytes::copy_from_slice(&buf[..n]), (rd, buf))))
+            }
+        },
+    );
+    let mut resp = Body::from_stream(stream).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    resp
+}
+
+/// The `POST /api/projects/<target>/clone/from` body: where to pull from + the import knobs.
+#[derive(Debug, Deserialize)]
+pub(super) struct CloneFromRequest {
+    /// The SOURCE node's base URL (e.g. `https://src.example.com`). Operator-supplied.
+    source_url: String,
+    /// The SOURCE project to clone. Defaults to the target project name (the common same-name
+    /// env-clone) when absent.
+    #[serde(default)]
+    source_project: Option<String>,
+    /// Execute the restore (default `false` ⇒ a dry-run plan on the target).
+    #[serde(default)]
+    apply: bool,
+    /// Replace an existing (populated) target project.
+    #[serde(default)]
+    overwrite: bool,
+    /// Overlay a non-empty control-plane KV destination on the target.
+    #[serde(default)]
+    force: bool,
+    /// Pull a `--data-only` clone (no control-plane KV / identity).
+    #[serde(default)]
+    data_only: bool,
+}
+
+/// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
+/// authenticate to the SOURCE as Project Admin (the operator's forwarded source bearer), fetch the
+/// cheap manifest, diff it against THIS node's own content-addressed store, pull ONLY the missing
+/// members over the live stream, and restore each through the EXISTING inc2 shadow-restore path
+/// (reusing [`import`](ProjectExport::import), so the target enforces its OWN project scope on
+/// every restored member — a source-declared scope is never trusted). Returns the import report.
+pub(super) async fn clone_from(
+    Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    Extension(project): Extension<ProjectContext>,
+    headers: HeaderMap,
+    Json(req): Json<CloneFromRequest>,
+) -> Response {
+    let Some(cap) = cap else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "project clone is not available on this node\n",
+        )
+            .into_response();
+    };
+    let target = project.0;
+    if let Some(resp) = reject_invalid_name("project", &target) {
+        return resp;
+    }
+    let source_project = req.source_project.clone().unwrap_or_else(|| target.clone());
+    if let Some(resp) = reject_invalid_name("source_project", &source_project) {
+        return resp;
+    }
+    // The operator's SOURCE Project-Admin bearer (forwarded to the source). Required: a clone is
+    // TWO Project-Admin authorizations — this node already gated the target side (`Project·Admin`
+    // on `/api/projects/<target>/clone/from`); this token is the SOURCE side.
+    let source_token = match headers
+        .get(SOURCE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .filter(|t| !t.is_empty())
+    {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "clone requires the X-Boatramp-Source-Token header (the operator's Project-Admin \
+                 bearer on the SOURCE node)\n",
+            )
+                .into_response();
+        }
+    };
+    // SSRF guard [HIGH]: `source_url` is attacker-influenceable (a tenant-level Project·Admin picks
+    // it), so the target must not be tricked into fetching internal services / cloud metadata
+    // (169.254.169.254) / another tenant. RESOLVE + PIN the address and REFUSE any non-global target
+    // (loopback / private / link-local / ULA — via `is_global_ip`), require HTTPS (so the forwarded
+    // bearer never rides cleartext), and NEVER follow a redirect off the pinned host. Reuses the
+    // shared SSRF decision + pinned-client policy (`graphql_data::token`). The manifest + stream
+    // share the SAME host, so one pin covers both requests (no rebind window between them).
+    let source_base = req.source_url.trim_end_matches('/').to_string();
+    let manifest_url = format!("{source_base}/api/projects/{source_project}/clone/manifest");
+    let stream_url = format!("{source_base}/api/projects/{source_project}/clone/stream");
+    let Some((host, addr)) = crate::ssrf::resolve_pin(&manifest_url, false, false).await else {
+        tracing::warn!(
+            source_url = %source_base,
+            target = %target,
+            "clone refused: source_url is not an allowed https target resolving to a public address (SSRF guard)"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "clone source_url must be an absolute https URL resolving to a public address\n",
+        )
+            .into_response();
+    };
+    let Some(client) = crate::ssrf::pinned_client(&host, addr, true) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clone: could not build the SSRF-pinned HTTP client\n",
+        )
+            .into_response();
+    };
+    let data_only = if req.data_only { "true" } else { "false" };
+
+    // 1. Fetch the SOURCE manifest (cheap LIST), BOUNDED to `CLONE_MANIFEST_CAP` (OOM guard) with a
+    //    short per-request total timeout. A 3xx is a failure (the no-redirect client already refuses
+    //    to follow off the pinned host). The source's error body is NEVER reflected to the caller
+    //    (that would amplify a semi-blind SSRF) — it is logged server-side and a generic error returned.
+    let manifest_resp = match client
+        .get(&manifest_url)
+        .query(&[("data_only", data_only)])
+        .bearer_auth(&source_token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest fetch failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "clone: could not fetch the source manifest\n",
+            )
+                .into_response();
+        }
+    };
+    if !manifest_resp.status().is_success() {
+        tracing::warn!(status = %manifest_resp.status(), source_url = %source_base, "clone: source refused the manifest");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "clone: the source refused the manifest request\n",
+        )
+            .into_response();
+    }
+    let manifest_bytes = {
+        use futures::StreamExt;
+        let mut stream = manifest_resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if buf.len().saturating_add(chunk.len()) > CLONE_MANIFEST_CAP {
+                        tracing::warn!(source_url = %source_base, cap = CLONE_MANIFEST_CAP, "clone: source manifest exceeds the size cap");
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            "clone: the source manifest is too large\n",
+                        )
+                            .into_response();
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, source_url = %source_base, "clone: error reading the source manifest");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "clone: error reading the source manifest\n",
+                    )
+                        .into_response();
+                }
+                None => break,
+            }
+        }
+        buf
+    };
+    let manifest: boatramp_core::project_export::CloneManifest = match serde_json::from_slice(
+        &manifest_bytes,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest was not valid JSON");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "clone: the source manifest was not valid\n",
+            )
+                .into_response();
+        }
+    };
+    // Defense: the manifest MUST describe the project the operator asked to clone (never trust a
+    // source that answers for a different project).
+    if manifest.source_project != source_project {
+        tracing::warn!(got = %manifest.source_project, expected = %source_project, "clone: source manifest names a different project");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "clone: the source manifest names a different project\n",
+        )
+            .into_response();
+    }
+
+    // 2. Diff the source's blobs against THIS node's own store (re-keyed to the target scope,
+    //    fail-closed on any foreign path; the driver also caps the blob COUNT before the HEAD
+    //    fan-out) → the per-SHA skip set.
+    let skip = match cap
+        .clone_blobs_present(&target, &source_project, &manifest.blobs)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return resumable_error_response(e),
+    };
+
+    // 3. Pull ONLY the missing members over the live stream. No total timeout (a legitimate large
+    //    clone is long) — the pinned client's idle `read_timeout` bounds a stalled peer and the
+    //    import driver caps the total bytes. 3xx ⇒ failure; the source body is NEVER reflected.
+    let stream_resp = match client
+        .post(&stream_url)
+        .query(&[("data_only", data_only)])
+        .bearer_auth(&source_token)
+        .json(&skip)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, source_url = %source_base, "clone: source stream open failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "clone: could not open the source stream\n",
+            )
+                .into_response();
+        }
+    };
+    if !stream_resp.status().is_success() {
+        tracing::warn!(status = %stream_resp.status(), source_url = %source_base, "clone: source refused the stream");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "clone: the source refused the stream request\n",
+        )
+            .into_response();
+    }
+    let resp = stream_resp;
+
+    // 4. Restore through the EXISTING inc2 import reader — the target enforces its own scope on
+    //    every member (never the source-declared scope). Clone is always a FRESH identity
+    //    (a different environment); adopt/recovery is the node-global import path, not clone.
+    use futures::TryStreamExt;
+    let mut reader = resp
+        .bytes_stream()
+        .map_err(std::io::Error::other)
+        .into_async_read();
+    let opts = boatramp_core::project_export::ImportOptions {
+        apply: req.apply,
+        force: req.force,
+        allow_schema_skew: false,
+        overwrite: req.overwrite,
+        identity: boatramp_core::project_export::IdentityChoice::Fresh,
+    };
+    match cap.import(&target, &mut reader, opts).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(boatramp_core::project_export::ProjectExportError::SchemaSkew(dbs)) => (
+            StatusCode::CONFLICT,
+            format!("clone: schema skew for {dbs:?}\n"),
+        )
+            .into_response(),
+        Err(boatramp_core::project_export::ProjectExportError::Commingle(m)) => {
+            (StatusCode::CONFLICT, format!("{m}\n")).into_response()
+        }
+        Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
+            (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("clone restore failed: {e}\n"),
         )
             .into_response(),
     }

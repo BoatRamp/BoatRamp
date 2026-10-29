@@ -53,18 +53,19 @@ pub(crate) use admin_api::auth_exchange;
 #[cfg(feature = "blob-upload")]
 pub(crate) use admin_api::blob_mint_upload;
 pub(crate) use admin_api::{
-    DevMessagingBind, activate_deployment, cert_status, compute_dev_bind_blob,
-    compute_dev_bind_messaging, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
-    compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
-    create_deployment, current_deployment, database_status, declare_database, delete_compute,
-    delete_compute_volume, delete_project_tenancy, delete_site, drop_user, ensure_database,
-    ensure_user, get_compute, get_daemon_config, get_database, get_deployment, get_project_tenancy,
-    get_site_config, invalidate_cache, list_aliases, list_compute, list_compute_volumes,
-    list_databases, list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run,
-    migrate_status, project_export, project_import, prune_delete, prune_report, put_blob,
-    put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
-    repair_apply, repair_dry_run, restart_database, rollback_daemon_config, scrub_blobs, set_alias,
-    sql_exec, sql_move, sql_ping, sql_query,
+    DevMessagingBind, activate_deployment, cert_status, clone_from, clone_manifest, clone_stream,
+    compute_dev_bind_blob, compute_dev_bind_messaging, compute_dns, compute_dns_resolve,
+    compute_exec, compute_ipam, compute_netdiag, compute_reconcile, compute_restart,
+    compute_set_health, compute_status, create_deployment, current_deployment, database_status,
+    declare_database, delete_compute, delete_compute_volume, delete_project_tenancy, delete_site,
+    drop_user, ensure_database, ensure_user, get_compute, get_daemon_config, get_database,
+    get_deployment, get_project_tenancy, get_site_config, invalidate_cache, list_aliases,
+    list_compute, list_compute_volumes, list_databases, list_deployments, list_sites,
+    migrate_apply, migrate_baseline, migrate_dry_run, migrate_status, project_export,
+    project_import, prune_delete, prune_report, put_blob, put_compute, put_daemon_config,
+    put_project_tenancy, put_site_config, remove_alias, repair_apply, repair_dry_run,
+    restart_database, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
+    sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -150,6 +151,9 @@ mod graphql_apq;
 mod graphql_cache;
 #[cfg(feature = "handlers")]
 mod graphql_data;
+/// The shared, always-compiled SSRF guard (resolve+pin+`is_global_ip`, pinned no-redirect client),
+/// used by the OIDC/JWKS fetch (`graphql_data::token`) and the project-clone pull (`admin_api`).
+mod ssrf;
 /// The node-wide JWKS freshness policy (two-tier: own vs foreign) + the startup pre-warm entry, so the
 /// node (`boatramp-node::handlers`) installs the `[handlers]` JWKS knobs into the token-verification
 /// cache once at startup. See [`graphql_data::token`]. The token module is `oidc`-gated, so the export
