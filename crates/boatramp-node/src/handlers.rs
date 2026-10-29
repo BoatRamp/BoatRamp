@@ -512,6 +512,13 @@ pub async fn build_handler_runtime(
             .unwrap_or(boatramp_handlers::DEFAULT_DNS_RESOLVE_BUDGET),
     )
     .with_keep_warm_max(keep_warm_max);
+    // DEV/TEST consumer-lane DNS resolver override (mailroom cap-req #21 residual): install the
+    // operator-configured static map / custom upstream ONCE, before any guest invocation builds the
+    // shared resolver. Harmless no-op when unset or when the `tcp-egress` resolver is not compiled in
+    // (the override is simply never consulted). Operator/serve config only — never guest-settable.
+    boatramp_server::dns_resolve_override::install_override(
+        handlers_cfg.and_then(|h| h.dns_resolve_override.clone()),
+    );
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
         data_dir,

@@ -1659,6 +1659,17 @@ pub struct HandlersConfig {
     /// `allow_guest_tcp_egress` is on and the component imports `dns-resolve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_resolve_budget: Option<u32>,
+    /// **DEV/TEST resolver override** for the consumer-lane `dns-resolve` / `resolve-mx` host
+    /// capability (mailroom cap-req #21 residual). Injects a STATIC host→records map (consulted first,
+    /// answered WITHOUT touching the network — the hook for a hermetic / fully-offline direct-MX relay
+    /// proof) and/or points the resolver at a custom `upstream` nameserver instead of the host's
+    /// `/etc/resolv.conf`. OFF by default (absent ⇒ the system resolver, byte-for-byte unchanged). This
+    /// is OPERATOR/serve config only (node-global) — a guest/project can never set it — and its answers
+    /// still pass through the unchanged grant + egress posture + SSRF floor, so it is neither a tenancy
+    /// bypass nor a private-IP oracle. Takes effect only with the `tcp-egress` resolver compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_resolve_override:
+        Option<boatramp_server::dns_resolve_override::DnsResolveOverrideConfig>,
     /// **JWKS freshness — `own` (first-party) tier: background-refresh age** (seconds). The soft age at
     /// which a node-fixed `token_claims.jwks_url`/`jwks_env` verifier is refreshed in the BACKGROUND
     /// (the current keys keep serving — no request blocks on the fetch). Absent ⇒ 120 s. Floored at 60 s.
