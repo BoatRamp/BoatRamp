@@ -324,7 +324,7 @@ impl std::fmt::Debug for ImportOptions {
 }
 
 /// The outcome of an export or import — a legible summary for the operator / API JSON.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportReport {
     /// Whether this was a dry-run (no mutation).
     pub dry_run: bool,
@@ -437,6 +437,102 @@ pub struct CloneSkip {
     /// SOURCE blob member paths (`blobs/hblob/{source}/…`) the source should NOT stream — the
     /// target already holds a content-matched object at the re-keyed target key.
     pub skip_member_paths: std::collections::BTreeSet<String>,
+}
+
+/// The CHEAP PLAN a dry-run clone returns (the DEFAULT, non-`apply` posture): the outcome of the
+/// manifest-first handshake WITHOUT opening the source stream or restoring anything. Built from the
+/// source [`CloneManifest`] and the target's own [`CloneSkip`] diff — the same diff + scope logic a
+/// real clone runs, just stopped before the stream — so a `~18k`-blob / `~33 GB` env-clone answers
+/// in the time of a manifest fetch + a (bound-parallelized) HEAD diff rather than ~39 min of
+/// silence. `apply` then restores exactly this plan's `blobs_to_transfer` + `non_blob_members`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClonePlan {
+    /// The project on the SOURCE node the plan was built for.
+    pub source_project: String,
+    /// The TARGET project the clone would restore into (this node).
+    pub target_project: String,
+    /// Whether the clone stream would be `--data-only` (no control-plane KV / identity).
+    pub data_only: bool,
+    /// Blob objects the source holds under its own scope (the manifest's blob count).
+    pub blobs_total: usize,
+    /// Blobs the target ALREADY holds content-matched in its own scope (the diff skip set) — these
+    /// would NOT be transferred (the resume / per-SHA skip).
+    pub blobs_present: usize,
+    /// Blobs the target is MISSING and would pull (`blobs_total - blobs_present`).
+    pub blobs_to_transfer: usize,
+    /// Approximate bytes to transfer: the sum of the KNOWN sizes among the to-transfer blobs. A
+    /// backend with no per-object size (fallback) contributes nothing, so this is a LOWER BOUND
+    /// unless [`bytes_exact`](Self::bytes_exact) is set.
+    pub bytes_to_transfer: u64,
+    /// `true` iff EVERY to-transfer blob carried a known size (so [`bytes_to_transfer`] is exact,
+    /// not a lower bound).
+    pub bytes_exact: bool,
+    /// The non-blob member paths (managed-DB dumps, the KV slice, identity) the clone stream would
+    /// always carry — informational; the manifest diff is a blob optimization only.
+    pub non_blob_members: Vec<String>,
+}
+
+impl ClonePlan {
+    /// Build the plan from the source manifest + the target's diff skip set, for the target
+    /// project. PURE — no I/O, no scope decisions of its own: it reports what the SAME diff +
+    /// scope logic (`clone_blobs_present`) already decided. A blob is counted "present" iff its
+    /// source member path is in `skip.skip_member_paths` (exactly the set the source will omit).
+    pub fn from_manifest_and_skip(
+        manifest: &CloneManifest,
+        skip: &CloneSkip,
+        target_project: &str,
+    ) -> Self {
+        let mut blobs_present = 0usize;
+        let mut blobs_to_transfer = 0usize;
+        let mut bytes_to_transfer = 0u64;
+        let mut bytes_exact = true;
+        for b in &manifest.blobs {
+            if skip.skip_member_paths.contains(&b.member_path) {
+                blobs_present += 1;
+            } else {
+                blobs_to_transfer += 1;
+                match b.size {
+                    Some(s) => bytes_to_transfer = bytes_to_transfer.saturating_add(s),
+                    None => bytes_exact = false,
+                }
+            }
+        }
+        Self {
+            source_project: manifest.source_project.clone(),
+            target_project: target_project.to_string(),
+            data_only: manifest.data_only,
+            blobs_total: manifest.blobs.len(),
+            blobs_present,
+            blobs_to_transfer,
+            bytes_to_transfer,
+            bytes_exact,
+            non_blob_members: manifest.non_blob_members.clone(),
+        }
+    }
+}
+
+/// One line of the NDJSON progress stream a clone `--apply` (or `--clone-verify`) returns, so a
+/// long clone is never zero-output: the orchestrator sends the [`Plan`](Self::Plan) up front, then
+/// periodic [`Progress`](Self::Progress) as bytes flow, and finally exactly one terminal
+/// [`Report`](Self::Report) (success) or [`Error`](Self::Error). The dry-run (plan-only) path
+/// returns a bare [`ClonePlan`] instead — not this envelope. Internally tagged on `event` so each
+/// line is a self-describing JSON object the CLI can dispatch on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum CloneEvent {
+    /// The plan, emitted first (even on `--apply`), so the operator sees the shape before bytes move.
+    Plan(ClonePlan),
+    /// Periodic transfer progress: bytes pulled from the source so far and elapsed wall-clock.
+    Progress {
+        bytes_transferred: u64,
+        elapsed_secs: u64,
+    },
+    /// The terminal success event: the final import/restore report.
+    Report(ImportReport),
+    /// The terminal failure event: the restore failed AFTER the stream opened (an already-`200`
+    /// response can no longer change status, so the failure rides in-band — mirroring the streamed
+    /// export's own after-first-byte failure mode).
+    Error { message: String },
 }
 
 /// The project export/import capability (see the module docs).
@@ -760,5 +856,119 @@ mod tests {
             enforce_target_scoped_kv(&poisoned, target).is_err(),
             "import must refuse a siteconfig whose body does not hash to its key"
         );
+    }
+
+    fn bref(path: &str, size: Option<u64>) -> CloneBlobRef {
+        CloneBlobRef {
+            member_path: path.to_string(),
+            size,
+            etag: None,
+        }
+    }
+
+    /// The cheap plan reports exactly the diff's decision: present blobs come from the skip set,
+    /// the rest transfer, and the to-transfer bytes sum the KNOWN sizes. The plan is a pure
+    /// projection of `(manifest, skip)` — it makes NO scope decision of its own.
+    #[test]
+    fn clone_plan_counts_match_the_diff_skip_set() {
+        let manifest = CloneManifest {
+            source_project: "acme".into(),
+            data_only: false,
+            blobs: vec![
+                bref("blobs/hblob/acme/web/c/a", Some(100)),
+                bref("blobs/hblob/acme/web/c/b", Some(250)),
+                bref("blobs/hblob/acme/web/c/c", Some(50)),
+            ],
+            non_blob_members: vec!["sql/app.pgc".into(), "kv/control-plane.jsonl".into()],
+        };
+        // The target already holds `a` (present ⇒ skip); `b` and `c` must transfer.
+        let mut skip = CloneSkip::default();
+        skip.skip_member_paths
+            .insert("blobs/hblob/acme/web/c/a".into());
+
+        let plan = ClonePlan::from_manifest_and_skip(&manifest, &skip, "acme-staging");
+        assert_eq!(plan.source_project, "acme");
+        assert_eq!(plan.target_project, "acme-staging");
+        assert_eq!(plan.blobs_total, 3);
+        assert_eq!(plan.blobs_present, 1);
+        assert_eq!(plan.blobs_to_transfer, 2);
+        assert_eq!(plan.bytes_to_transfer, 300); // 250 + 50, NOT the skipped `a`'s 100
+        assert!(plan.bytes_exact, "every to-transfer blob had a known size");
+        assert_eq!(plan.non_blob_members.len(), 2);
+    }
+
+    /// A to-transfer blob with NO known size (a fallback backend) makes `bytes_to_transfer` a
+    /// lower bound and clears `bytes_exact`, so the operator is not misled into thinking a
+    /// partial byte total is the whole transfer.
+    #[test]
+    fn clone_plan_bytes_are_a_lower_bound_when_a_size_is_unknown() {
+        let manifest = CloneManifest {
+            source_project: "acme".into(),
+            data_only: false,
+            blobs: vec![
+                bref("blobs/hblob/acme/web/c/a", Some(100)),
+                bref("blobs/hblob/acme/web/c/b", None),
+            ],
+            non_blob_members: vec![],
+        };
+        let plan = ClonePlan::from_manifest_and_skip(&manifest, &CloneSkip::default(), "acme");
+        assert_eq!(plan.blobs_to_transfer, 2);
+        assert_eq!(
+            plan.bytes_to_transfer, 100,
+            "only the known size contributes"
+        );
+        assert!(
+            !plan.bytes_exact,
+            "an unknown size makes the total a lower bound"
+        );
+    }
+
+    /// The NDJSON event envelope round-trips through serde internally-tagged on `event`, so the
+    /// orchestrator's lines decode on the CLI (plan / progress / terminal report).
+    #[test]
+    fn clone_event_ndjson_round_trips() {
+        let plan = ClonePlan {
+            source_project: "acme".into(),
+            target_project: "acme".into(),
+            blobs_total: 2,
+            blobs_to_transfer: 2,
+            ..Default::default()
+        };
+        for ev in [
+            CloneEvent::Plan(plan),
+            CloneEvent::Progress {
+                bytes_transferred: 4096,
+                elapsed_secs: 3,
+            },
+            CloneEvent::Report(ImportReport {
+                blobs: 2,
+                ..Default::default()
+            }),
+            CloneEvent::Error {
+                message: "boom".into(),
+            },
+        ] {
+            let line = serde_json::to_string(&ev).unwrap();
+            let back: CloneEvent = serde_json::from_str(&line).unwrap();
+            // The tag is present and the payload survives a round-trip.
+            assert!(line.contains("\"event\""), "tagged line: {line}");
+            match (ev, back) {
+                (CloneEvent::Plan(a), CloneEvent::Plan(b)) => assert_eq!(a, b),
+                (
+                    CloneEvent::Progress {
+                        bytes_transferred, ..
+                    },
+                    CloneEvent::Progress {
+                        bytes_transferred: b,
+                        ..
+                    },
+                ) => assert_eq!(bytes_transferred, b),
+                (CloneEvent::Report(a), CloneEvent::Report(b)) => assert_eq!(a.blobs, b.blobs),
+                (CloneEvent::Error { message }, CloneEvent::Error { message: b }) => {
+                    assert_eq!(message, b);
+                }
+                _ => panic!("event variant changed across the round-trip"),
+            }
+        }
     }
 }

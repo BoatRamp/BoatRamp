@@ -40,6 +40,20 @@ pub enum ClientError {
 /// `client` module result: a control-plane API call; `Err` is [`ClientError`].
 type Result<T> = std::result::Result<T, ClientError>;
 
+/// The outcome of a [streaming clone](ApiClient::project_clone_from): either the cheap dry-run
+/// PLAN (the default — manifest + diff, no stream), or the APPLIED result (the plan plus the final
+/// import report, after streaming the bundle with live progress).
+#[derive(Debug)]
+pub enum CloneOutcome {
+    /// Dry-run: the cheap plan of what a real clone would transfer/restore. Nothing was streamed.
+    Planned(boatramp_core::project_export::ClonePlan),
+    /// `--apply` (or `--clone-verify`): the plan that was executed plus the final import report.
+    Applied {
+        plan: boatramp_core::project_export::ClonePlan,
+        report: boatramp_core::project_export::ImportReport,
+    },
+}
+
 /// Resolve the API token from `BOATRAMP_TOKEN` or `publish.token`.
 pub fn token(config: &ProjectConfig) -> Option<String> {
     std::env::var("BOATRAMP_TOKEN")
@@ -979,8 +993,13 @@ impl ControlPlane {
     /// node-global `System·Admin` import): the TARGET node pulls the whole project from `source_url`
     /// (manifest → per-SHA diff → filtered stream → inc2 restore), so no bundle lands anywhere. The
     /// operator's SOURCE Project-Admin bearer travels in the `X-Boatramp-Source-Token` header (over
-    /// TLS, never a URL); the client's own bearer gates the TARGET side. Returns the import-report
-    /// JSON. Dry-run unless `apply`.
+    /// TLS, never a URL); the client's own bearer gates the TARGET side.
+    ///
+    /// The DEFAULT dry-run (`apply=false`, `verify=false`) returns a CHEAP [`CloneOutcome::Planned`]
+    /// — the server stops after the manifest + diff, so it answers fast even at tens of GB. `apply`
+    /// (or `verify`, the stream-level validate) streams an NDJSON progress channel — the plan, then
+    /// periodic transfer heartbeats surfaced via `tracing` (stderr), then the terminal report — and
+    /// returns [`CloneOutcome::Applied`]. A long clone is therefore never zero-output.
     #[allow(clippy::too_many_arguments)]
     pub async fn project_clone_from(
         &self,
@@ -989,10 +1008,12 @@ impl ControlPlane {
         source_project: Option<&str>,
         source_token: &[u8],
         apply: bool,
+        verify: bool,
         overwrite: bool,
         force: bool,
         data_only: bool,
-    ) -> Result<String> {
+    ) -> Result<CloneOutcome> {
+        use boatramp_core::project_export::{CloneEvent, ClonePlan};
         let Self {
             http: client,
             base: server,
@@ -1006,6 +1027,7 @@ impl ControlPlane {
         let mut body = serde_json::json!({
             "source_url": source_url,
             "apply": apply,
+            "verify": verify,
             "overwrite": overwrite,
             "force": force,
             "data_only": data_only,
@@ -1020,14 +1042,82 @@ impl ControlPlane {
             .send()
             .await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            Ok(text)
-        } else {
-            Err(ClientError::Refused(format!(
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
                 "project clone refused ({status}): {}",
                 text.trim_end()
-            )))
+            )));
+        }
+
+        // The DEFAULT dry-run answers with a single cheap ClonePlan JSON (no stream).
+        if !apply && !verify {
+            let bytes = resp.bytes().await?;
+            let plan: ClonePlan = serde_json::from_slice(&bytes).map_err(|e| {
+                ClientError::Refused(format!("clone plan response was not valid JSON: {e}"))
+            })?;
+            return Ok(CloneOutcome::Planned(plan));
+        }
+
+        // apply / verify: read the NDJSON progress stream line-by-line as it arrives, surfacing the
+        // plan + transfer heartbeats on `tracing` (stderr) so the operator is never left in silence,
+        // and collecting the terminal report. A line-buffer stitches chunk boundaries.
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut plan: Option<ClonePlan> = None;
+        let mut report: Option<boatramp_core::project_export::ImportReport> = None;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=nl).collect();
+                let line = &line[..line.len() - 1];
+                if line.is_empty() {
+                    continue;
+                }
+                let ev: CloneEvent = serde_json::from_slice(line).map_err(|e| {
+                    ClientError::Refused(format!("clone progress line was not valid JSON: {e}"))
+                })?;
+                match ev {
+                    CloneEvent::Plan(p) => {
+                        tracing::info!(
+                            target = %target,
+                            source = %p.source_project,
+                            blobs_total = p.blobs_total,
+                            blobs_present = p.blobs_present,
+                            blobs_to_transfer = p.blobs_to_transfer,
+                            bytes_to_transfer = p.bytes_to_transfer,
+                            bytes_exact = p.bytes_exact,
+                            "clone plan: transferring {} of {} blobs (~{} bytes){}",
+                            p.blobs_to_transfer,
+                            p.blobs_total,
+                            p.bytes_to_transfer,
+                            if p.bytes_exact { "" } else { "+" },
+                        );
+                        plan = Some(p);
+                    }
+                    CloneEvent::Progress {
+                        bytes_transferred,
+                        elapsed_secs,
+                    } => tracing::info!(
+                        bytes_transferred,
+                        elapsed_secs,
+                        "clone progress: {bytes_transferred} bytes transferred in {elapsed_secs}s"
+                    ),
+                    CloneEvent::Report(r) => report = Some(r),
+                    CloneEvent::Error { message } => {
+                        return Err(ClientError::Refused(format!(
+                            "clone failed after the stream opened: {message}"
+                        )));
+                    }
+                }
+            }
+        }
+        match (plan, report) {
+            (Some(plan), Some(report)) => Ok(CloneOutcome::Applied { plan, report }),
+            _ => Err(ClientError::Refused(
+                "clone stream ended without a terminal report (truncated response)".into(),
+            )),
         }
     }
 

@@ -3381,6 +3381,12 @@ pub(super) struct CloneFromRequest {
     /// Execute the restore (default `false` ⇒ a dry-run plan on the target).
     #[serde(default)]
     apply: bool,
+    /// Stream-level VERIFY: with `apply=false`, open the source stream and validate the whole
+    /// bundle end-to-end WITHOUT mutating the target (the pre-v0.49 `apply=false` behavior). The
+    /// DEFAULT dry-run (`apply=false`, `verify=false`) is instead the CHEAP PLAN — manifest + diff
+    /// only, no stream. Ignored when `apply=true` (an apply already restores for real).
+    #[serde(default)]
+    verify: bool,
     /// Replace an existing (populated) target project.
     #[serde(default)]
     overwrite: bool,
@@ -3394,10 +3400,16 @@ pub(super) struct CloneFromRequest {
 
 /// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
 /// authenticate to the SOURCE as Project Admin (the operator's forwarded source bearer), fetch the
-/// cheap manifest, diff it against THIS node's own content-addressed store, pull ONLY the missing
-/// members over the live stream, and restore each through the EXISTING inc2 shadow-restore path
+/// cheap manifest, and diff it against THIS node's own content-addressed store. The DEFAULT dry-run
+/// (`apply=false`, `verify=false`) STOPS there and returns a cheap [`ClonePlan`] JSON (blob
+/// total/present/to-transfer, approx bytes, the non-blob members) — it does NOT open the stream or
+/// import. `apply=true` (or `verify=true`, the old stream-level validate) pulls ONLY the missing
+/// members over the live stream and restores each through the EXISTING inc2 shadow-restore path
 /// (reusing [`import`](ProjectExport::import), so the target enforces its OWN project scope on
-/// every restored member — a source-declared scope is never trusted). Returns the import report.
+/// every restored member — a source-declared scope is never trusted), returning an **NDJSON
+/// progress stream** (`application/x-ndjson`): the plan, periodic transfer heartbeats, then one
+/// terminal report/error. The plan/apply control flow lives in [`orchestrate_clone`] over a
+/// transport seam so it is unit-testable (the dry-run provably never opens the stream).
 pub(super) async fn clone_from(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     Extension(project): Extension<ProjectContext>,
@@ -3467,80 +3479,219 @@ pub(super) async fn clone_from(
         )
             .into_response();
     };
-    let data_only = if req.data_only { "true" } else { "false" };
+    // The SSRF-pinned transport to the source's `clone/manifest` + `clone/stream` surfaces. The
+    // orchestration (manifest → diff → PLAN → optional stream+restore) is driven by
+    // `orchestrate_clone` over this transport seam, so the plan/apply control flow is unit-testable
+    // (a mock transport proves the dry-run NEVER opens the stream) and the SSRF/pin policy stays here.
+    let transport = Arc::new(HttpCloneSource {
+        client,
+        manifest_url,
+        stream_url,
+        source_token,
+        source_base,
+        data_only: req.data_only,
+    }) as Arc<dyn CloneSourceTransport>;
 
-    // 1. Fetch the SOURCE manifest (cheap LIST), BOUNDED to `CLONE_MANIFEST_CAP` (OOM guard) with a
-    //    short per-request total timeout. A 3xx is a failure (the no-redirect client already refuses
-    //    to follow off the pinned host). The source's error body is NEVER reflected to the caller
-    //    (that would amplify a semi-blind SSRF) — it is logged server-side and a generic error returned.
-    let manifest_resp = match client
-        .get(&manifest_url)
-        .query(&[("data_only", data_only)])
-        .bearer_auth(&source_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest fetch failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "clone: could not fetch the source manifest\n",
-            )
-                .into_response();
-        }
-    };
-    if !manifest_resp.status().is_success() {
-        tracing::warn!(status = %manifest_resp.status(), source_url = %source_base, "clone: source refused the manifest");
-        return (
-            StatusCode::BAD_GATEWAY,
-            "clone: the source refused the manifest request\n",
-        )
-            .into_response();
+    orchestrate_clone(
+        cap,
+        target,
+        source_project,
+        transport,
+        req.apply,
+        req.verify,
+        req.overwrite,
+        req.force,
+    )
+    .await
+}
+
+/// How often the `--apply` / `--verify` progress stream emits a transfer heartbeat (bytes pulled +
+/// elapsed) so a long clone is never zero-output. A heartbeat, not a cost — the import keeps pulling
+/// between ticks; a tick just samples the running byte counter.
+const CLONE_PROGRESS_INTERVAL_SECS: u64 = 5;
+
+/// A transport-level failure reaching the SOURCE (manifest fetch / stream open): carries the HTTP
+/// status + the generic, non-reflective message to return to the caller (the source's own error
+/// body is NEVER echoed — that would amplify a semi-blind SSRF; the detail is logged server-side).
+struct CloneTransportError {
+    status: StatusCode,
+    message: &'static str,
+}
+
+impl CloneTransportError {
+    fn into_response(self) -> Response {
+        (self.status, format!("{}\n", self.message)).into_response()
     }
-    let manifest_bytes = {
-        use futures::StreamExt;
-        let mut stream = manifest_resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            match stream.next().await {
-                Some(Ok(chunk)) => {
-                    if buf.len().saturating_add(chunk.len()) > CLONE_MANIFEST_CAP {
-                        tracing::warn!(source_url = %source_base, cap = CLONE_MANIFEST_CAP, "clone: source manifest exceeds the size cap");
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            "clone: the source manifest is too large\n",
-                        )
-                            .into_response();
+}
+
+/// The SOURCE clone transport the orchestrator drives: fetch the cheap manifest, then (only on an
+/// apply/verify) open the filtered member stream. A trait so the orchestration control flow is
+/// testable with a mock that records whether the stream was ever opened — the DEFAULT dry-run must
+/// not open it.
+#[async_trait::async_trait]
+trait CloneSourceTransport: Send + Sync {
+    /// Fetch + parse the cheap `clone/manifest` (bounded read; a bad/oversized/wrong-scheme response
+    /// is a [`CloneTransportError`]).
+    async fn fetch_manifest(
+        &self,
+    ) -> Result<boatramp_core::project_export::CloneManifest, CloneTransportError>;
+    /// Open the `clone/stream` filtered bundle for the given skip set, returning the response body
+    /// as an async reader. Called ONLY on an apply/verify — never on the cheap plan.
+    async fn open_stream(
+        &self,
+        skip: &boatramp_core::project_export::CloneSkip,
+    ) -> Result<Box<dyn futures::io::AsyncRead + Send + Unpin>, CloneTransportError>;
+}
+
+/// The real HTTP transport over the SSRF-pinned, no-redirect reqwest client (both the manifest and
+/// the stream share the one pinned host, so a single pin covers both — no rebind window between).
+struct HttpCloneSource {
+    client: reqwest::Client,
+    manifest_url: String,
+    stream_url: String,
+    source_token: String,
+    source_base: String,
+    data_only: bool,
+}
+
+#[async_trait::async_trait]
+impl CloneSourceTransport for HttpCloneSource {
+    async fn fetch_manifest(
+        &self,
+    ) -> Result<boatramp_core::project_export::CloneManifest, CloneTransportError> {
+        let data_only = if self.data_only { "true" } else { "false" };
+        // Fetch the SOURCE manifest (cheap LIST), BOUNDED to `CLONE_MANIFEST_CAP` (OOM guard) with a
+        // short per-request total timeout. A 3xx is a failure (the no-redirect client refuses to
+        // follow off the pinned host). The source's error body is NEVER reflected to the caller.
+        let manifest_resp = match self
+            .client
+            .get(&self.manifest_url)
+            .query(&[("data_only", data_only)])
+            .bearer_auth(&self.source_token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, source_url = %self.source_base, "clone: source manifest fetch failed");
+                return Err(CloneTransportError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "clone: could not fetch the source manifest",
+                });
+            }
+        };
+        if !manifest_resp.status().is_success() {
+            tracing::warn!(status = %manifest_resp.status(), source_url = %self.source_base, "clone: source refused the manifest");
+            return Err(CloneTransportError {
+                status: StatusCode::BAD_GATEWAY,
+                message: "clone: the source refused the manifest request",
+            });
+        }
+        let manifest_bytes = {
+            use futures::StreamExt;
+            let mut stream = manifest_resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if buf.len().saturating_add(chunk.len()) > CLONE_MANIFEST_CAP {
+                            tracing::warn!(source_url = %self.source_base, cap = CLONE_MANIFEST_CAP, "clone: source manifest exceeds the size cap");
+                            return Err(CloneTransportError {
+                                status: StatusCode::BAD_GATEWAY,
+                                message: "clone: the source manifest is too large",
+                            });
+                        }
+                        buf.extend_from_slice(&chunk);
                     }
-                    buf.extend_from_slice(&chunk);
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, source_url = %self.source_base, "clone: error reading the source manifest");
+                        return Err(CloneTransportError {
+                            status: StatusCode::BAD_GATEWAY,
+                            message: "clone: error reading the source manifest",
+                        });
+                    }
+                    None => break,
                 }
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, source_url = %source_base, "clone: error reading the source manifest");
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        "clone: error reading the source manifest\n",
-                    )
-                        .into_response();
-                }
-                None => break,
+            }
+            buf
+        };
+        match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => Ok(m),
+            Err(e) => {
+                tracing::warn!(error = %e, source_url = %self.source_base, "clone: source manifest was not valid JSON");
+                Err(CloneTransportError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "clone: the source manifest was not valid",
+                })
             }
         }
-        buf
-    };
-    let manifest: boatramp_core::project_export::CloneManifest = match serde_json::from_slice(
-        &manifest_bytes,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, source_url = %source_base, "clone: source manifest was not valid JSON");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "clone: the source manifest was not valid\n",
-            )
-                .into_response();
+    }
+
+    async fn open_stream(
+        &self,
+        skip: &boatramp_core::project_export::CloneSkip,
+    ) -> Result<Box<dyn futures::io::AsyncRead + Send + Unpin>, CloneTransportError> {
+        let data_only = if self.data_only { "true" } else { "false" };
+        // Pull ONLY the missing members over the live stream. No total timeout (a legitimate large
+        // clone is long) — the pinned client's idle `read_timeout` bounds a stalled peer and the
+        // import driver caps the total bytes. 3xx ⇒ failure; the source body is NEVER reflected.
+        let stream_resp = match self
+            .client
+            .post(&self.stream_url)
+            .query(&[("data_only", data_only)])
+            .bearer_auth(&self.source_token)
+            .json(skip)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, source_url = %self.source_base, "clone: source stream open failed");
+                return Err(CloneTransportError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "clone: could not open the source stream",
+                });
+            }
+        };
+        if !stream_resp.status().is_success() {
+            tracing::warn!(status = %stream_resp.status(), source_url = %self.source_base, "clone: source refused the stream");
+            return Err(CloneTransportError {
+                status: StatusCode::BAD_GATEWAY,
+                message: "clone: the source refused the stream request",
+            });
         }
+        use futures::TryStreamExt;
+        let reader = stream_resp
+            .bytes_stream()
+            .map_err(std::io::Error::other)
+            .into_async_read();
+        Ok(Box::new(reader))
+    }
+}
+
+/// The clone ORCHESTRATION core, over the [`CloneSourceTransport`] seam (so the plan/apply control
+/// flow is unit-testable): fetch the manifest, cross-check it, run the SAME scope-enforcing diff
+/// (`clone_blobs_present`) the real clone always has, and build the [`ClonePlan`]. On the DEFAULT
+/// dry-run (`!apply && !verify`) it short-circuits and returns the CHEAP PLAN — it NEVER opens the
+/// source stream and NEVER imports. On `apply`/`verify` it opens the stream and restores through the
+/// EXISTING inc2 reader (the target enforces its OWN scope on every member — a source-declared scope
+/// is never trusted; a clone is always a FRESH identity), streaming progress as it goes.
+#[allow(clippy::too_many_arguments)]
+async fn orchestrate_clone(
+    cap: Arc<dyn boatramp_core::project_export::ProjectExport>,
+    target: String,
+    source_project: String,
+    transport: Arc<dyn CloneSourceTransport>,
+    apply: bool,
+    verify: bool,
+    overwrite: bool,
+    force: bool,
+) -> Response {
+    // 1. Manifest (cheap LIST).
+    let manifest = match transport.fetch_manifest().await {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
     };
     // Defense: the manifest MUST describe the project the operator asked to clone (never trust a
     // source that answers for a different project).
@@ -3555,7 +3706,8 @@ pub(super) async fn clone_from(
 
     // 2. Diff the source's blobs against THIS node's own store (re-keyed to the target scope,
     //    fail-closed on any foreign path; the driver also caps the blob COUNT before the HEAD
-    //    fan-out) → the per-SHA skip set.
+    //    fan-out) → the per-SHA skip set. SAME call on the plan path and the apply path — the
+    //    plan short-circuit skips NO check that gates what would be transferred/restored.
     let skip = match cap
         .clone_blobs_present(&target, &source_project, &manifest.blobs)
         .await
@@ -3564,70 +3716,131 @@ pub(super) async fn clone_from(
         Err(e) => return resumable_error_response(e),
     };
 
-    // 3. Pull ONLY the missing members over the live stream. No total timeout (a legitimate large
-    //    clone is long) — the pinned client's idle `read_timeout` bounds a stalled peer and the
-    //    import driver caps the total bytes. 3xx ⇒ failure; the source body is NEVER reflected.
-    let stream_resp = match client
-        .post(&stream_url)
-        .query(&[("data_only", data_only)])
-        .bearer_auth(&source_token)
-        .json(&skip)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, source_url = %source_base, "clone: source stream open failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                "clone: could not open the source stream\n",
-            )
-                .into_response();
-        }
-    };
-    if !stream_resp.status().is_success() {
-        tracing::warn!(status = %stream_resp.status(), source_url = %source_base, "clone: source refused the stream");
-        return (
-            StatusCode::BAD_GATEWAY,
-            "clone: the source refused the stream request\n",
-        )
-            .into_response();
-    }
-    let resp = stream_resp;
+    // 3. The plan — a pure projection of (manifest, diff): what WOULD transfer/restore.
+    let plan =
+        boatramp_core::project_export::ClonePlan::from_manifest_and_skip(&manifest, &skip, &target);
 
-    // 4. Restore through the EXISTING inc2 import reader — the target enforces its own scope on
-    //    every member (never the source-declared scope). Clone is always a FRESH identity
-    //    (a different environment); adopt/recovery is the node-global import path, not clone.
-    use futures::TryStreamExt;
-    let mut reader = resp
-        .bytes_stream()
-        .map_err(std::io::Error::other)
-        .into_async_read();
+    // 4. DEFAULT dry-run: return the CHEAP PLAN. No stream opened, nothing imported.
+    if !apply && !verify {
+        return (StatusCode::OK, Json(plan)).into_response();
+    }
+
+    // 5. apply/verify: open the filtered stream and restore (or validate-only, `apply=false`)
+    //    through the EXISTING inc2 reader, streaming progress. `verify` ⇒ `apply=false` ⇒ the
+    //    import validates the whole bundle but mutates nothing.
+    let reader = match transport.open_stream(&skip).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
     let opts = boatramp_core::project_export::ImportOptions {
-        apply: req.apply,
-        force: req.force,
+        apply,
+        force,
         allow_schema_skew: false,
-        overwrite: req.overwrite,
+        overwrite,
         identity: boatramp_core::project_export::IdentityChoice::Fresh,
     };
-    match cap.import(&target, &mut reader, opts).await {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-        Err(boatramp_core::project_export::ProjectExportError::SchemaSkew(dbs)) => (
-            StatusCode::CONFLICT,
-            format!("clone: schema skew for {dbs:?}\n"),
-        )
-            .into_response(),
-        Err(boatramp_core::project_export::ProjectExportError::Commingle(m)) => {
-            (StatusCode::CONFLICT, format!("{m}\n")).into_response()
+    clone_progress_response(cap, target, plan, reader, opts)
+}
+
+/// Build the NDJSON progress response for an apply/verify clone: a detached task emits the plan
+/// first, then a periodic transfer heartbeat sampled from a byte counter wrapping the source
+/// reader, and finally exactly one terminal report/error — so a 39-minute clone is never
+/// zero-output. The import drives the reader; the counter is sampled, never a throttle. A failure
+/// AFTER the first byte rides in-band (the `200` can no longer change), mirroring the streamed
+/// export's own after-first-byte failure mode.
+fn clone_progress_response(
+    cap: Arc<dyn boatramp_core::project_export::ProjectExport>,
+    target: String,
+    plan: boatramp_core::project_export::ClonePlan,
+    reader: Box<dyn futures::io::AsyncRead + Send + Unpin>,
+    opts: boatramp_core::project_export::ImportOptions,
+) -> Response {
+    use boatramp_core::project_export::CloneEvent;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        if !send_clone_event(&tx, CloneEvent::Plan(plan)).await {
+            return; // client already gone — nothing to restore for
         }
-        Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
-            (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response()
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut counting = CloneCountingReader {
+            inner: reader,
+            counter: counter.clone(),
+        };
+        let started = std::time::Instant::now();
+        let import_fut = cap.import(&target, &mut counting, opts);
+        tokio::pin!(import_fut);
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(CLONE_PROGRESS_INTERVAL_SECS));
+        ticker.tick().await; // the first tick fires immediately — consume it
+        let outcome = loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let ev = CloneEvent::Progress {
+                        bytes_transferred: counter.load(std::sync::atomic::Ordering::Relaxed),
+                        elapsed_secs: started.elapsed().as_secs(),
+                    };
+                    // A progress send failure (operator disconnected) is NON-fatal: keep restoring
+                    // so the target is not left half-applied just because the stream reader went away.
+                    let _sent = send_clone_event(&tx, ev).await;
+                }
+                res = &mut import_fut => break res,
+            }
+        };
+        let final_ev = match outcome {
+            Ok(report) => CloneEvent::Report(report),
+            Err(e) => CloneEvent::Error {
+                message: format!("{e}"),
+            },
+        };
+        let _sent = send_clone_event(&tx, final_ev).await;
+    });
+    let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    resp
+}
+
+/// Serialize one [`CloneEvent`](boatramp_core::project_export::CloneEvent) as an NDJSON line and
+/// push it to the response channel. Returns `false` when the receiver is gone (client
+/// disconnected). A serialize failure drops the one line (returns `true`) rather than the whole
+/// stream.
+async fn send_clone_event(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    ev: boatramp_core::project_export::CloneEvent,
+) -> bool {
+    let mut line = match serde_json::to_vec(&ev) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    line.push(b'\n');
+    tx.send(Ok(bytes::Bytes::from(line))).await.is_ok()
+}
+
+/// An [`AsyncRead`](futures::io::AsyncRead) wrapper that counts bytes read through it, so the
+/// progress stream can report transfer bytes without the import driver knowing anything about it.
+struct CloneCountingReader {
+    inner: Box<dyn futures::io::AsyncRead + Send + Unpin>,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl futures::io::AsyncRead for CloneCountingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            this.counter
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("clone restore failed: {e}\n"),
-        )
-            .into_response(),
+        r
     }
 }
 
@@ -5560,5 +5773,270 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert!(body["addrs"].as_array().unwrap().is_empty());
+    }
+
+    // ---- Streaming-clone orchestration (plan-only dry-run + apply progress) ----
+
+    /// A fake clone capability: records whether `import` ran, and reports exactly the member paths
+    /// in `present` from `clone_blobs_present` (standing in for the real scope-enforcing diff).
+    struct FakeCloneCap {
+        present: std::collections::BTreeSet<String>,
+        imported: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl boatramp_core::project_export::ProjectExport for FakeCloneCap {
+        async fn export(
+            &self,
+            _project: &str,
+            _opts: &boatramp_core::project_export::ExportOptions,
+            _sink: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+        ) -> Result<(), boatramp_core::project_export::ProjectExportError> {
+            Err(boatramp_core::project_export::ProjectExportError::Other(
+                "export not used in this test".into(),
+            ))
+        }
+
+        async fn import(
+            &self,
+            _project: &str,
+            src: &mut (dyn futures::io::AsyncRead + Send + Unpin),
+            _opts: boatramp_core::project_export::ImportOptions,
+        ) -> Result<
+            boatramp_core::project_export::ImportReport,
+            boatramp_core::project_export::ProjectExportError,
+        > {
+            use futures::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = src.read_to_end(&mut buf).await; // drain the stream the orchestrator opened
+            self.imported
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(boatramp_core::project_export::ImportReport {
+                blobs: 2,
+                kv_records: 5,
+                ..Default::default()
+            })
+        }
+
+        async fn clone_blobs_present(
+            &self,
+            _project: &str,
+            _source_project: &str,
+            blobs: &[boatramp_core::project_export::CloneBlobRef],
+        ) -> Result<
+            boatramp_core::project_export::CloneSkip,
+            boatramp_core::project_export::ProjectExportError,
+        > {
+            let mut skip = boatramp_core::project_export::CloneSkip::default();
+            for b in blobs {
+                if self.present.contains(&b.member_path) {
+                    skip.skip_member_paths.insert(b.member_path.clone());
+                }
+            }
+            Ok(skip)
+        }
+    }
+
+    /// A mock clone transport that records whether `open_stream` was ever called — the proof the
+    /// dry-run never opens the source stream.
+    struct MockCloneSource {
+        manifest: boatramp_core::project_export::CloneManifest,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+        bundle: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl CloneSourceTransport for MockCloneSource {
+        async fn fetch_manifest(
+            &self,
+        ) -> Result<boatramp_core::project_export::CloneManifest, CloneTransportError> {
+            Ok(self.manifest.clone())
+        }
+        async fn open_stream(
+            &self,
+            _skip: &boatramp_core::project_export::CloneSkip,
+        ) -> Result<Box<dyn futures::io::AsyncRead + Send + Unpin>, CloneTransportError> {
+            self.opened.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(futures::io::Cursor::new(self.bundle.clone())))
+        }
+    }
+
+    fn clone_test_manifest() -> boatramp_core::project_export::CloneManifest {
+        use boatramp_core::project_export::{CloneBlobRef, CloneManifest};
+        CloneManifest {
+            source_project: "acme".into(),
+            data_only: false,
+            blobs: vec![
+                CloneBlobRef {
+                    member_path: "blobs/hblob/acme/web/c/a".into(),
+                    size: Some(100),
+                    etag: None,
+                },
+                CloneBlobRef {
+                    member_path: "blobs/hblob/acme/web/c/b".into(),
+                    size: Some(200),
+                    etag: None,
+                },
+            ],
+            non_blob_members: vec!["sql/app.pgc".into()],
+        }
+    }
+
+    /// FIX 1 gate: the DEFAULT dry-run (`apply=false`, `verify=false`) returns the cheap PLAN and
+    /// NEVER opens the source stream or imports — the plan is a projection of the SAME diff the
+    /// apply path runs (`clone_blobs_present`), not a cheaper shortcut that skips a scope check.
+    #[tokio::test]
+    async fn clone_dry_run_returns_plan_without_opening_stream_or_importing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let imported = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let cap: Arc<dyn boatramp_core::project_export::ProjectExport> = Arc::new(FakeCloneCap {
+            present: ["blobs/hblob/acme/web/c/a".to_string()]
+                .into_iter()
+                .collect(),
+            imported: imported.clone(),
+        });
+        let transport: Arc<dyn CloneSourceTransport> = Arc::new(MockCloneSource {
+            manifest: clone_test_manifest(),
+            opened: opened.clone(),
+            bundle: b"UNUSED on a dry-run".to_vec(),
+        });
+
+        let resp = orchestrate_clone(
+            cap,
+            "acme".into(),
+            "acme".into(),
+            transport,
+            false, // apply
+            false, // verify
+            false, // overwrite
+            false, // force
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let plan: boatramp_core::project_export::ClonePlan =
+            serde_json::from_value(body_json(resp).await).expect("body is a ClonePlan");
+        assert_eq!(plan.source_project, "acme");
+        assert_eq!(plan.target_project, "acme");
+        assert_eq!(plan.blobs_total, 2);
+        assert_eq!(plan.blobs_present, 1);
+        assert_eq!(plan.blobs_to_transfer, 1);
+        assert_eq!(plan.bytes_to_transfer, 200); // `b` only; the present `a`'s 100 is not counted
+        assert!(plan.bytes_exact);
+        assert_eq!(plan.non_blob_members, vec!["sql/app.pgc".to_string()]);
+
+        assert!(
+            !opened.load(Ordering::SeqCst),
+            "a dry-run must NOT open the source stream"
+        );
+        assert!(
+            !imported.load(Ordering::SeqCst),
+            "a dry-run must NOT import/restore"
+        );
+    }
+
+    /// FIX 3 gate: `apply` opens the stream, imports, and returns the NDJSON progress channel — a
+    /// `plan` event first, then a terminal `report` event — so a long clone is never zero-output.
+    #[tokio::test]
+    async fn clone_apply_streams_plan_then_report_and_imports() {
+        use boatramp_core::project_export::CloneEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let imported = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let cap: Arc<dyn boatramp_core::project_export::ProjectExport> = Arc::new(FakeCloneCap {
+            present: std::collections::BTreeSet::new(),
+            imported: imported.clone(),
+        });
+        let transport: Arc<dyn CloneSourceTransport> = Arc::new(MockCloneSource {
+            manifest: clone_test_manifest(),
+            opened: opened.clone(),
+            bundle: b"a small fake bundle body".to_vec(),
+        });
+
+        let resp = orchestrate_clone(
+            cap,
+            "acme".into(),
+            "acme".into(),
+            transport,
+            true,  // apply
+            false, // verify
+            false, // overwrite
+            false, // force
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-ndjson"),
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read ndjson body");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let events: Vec<CloneEvent> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is a CloneEvent"))
+            .collect();
+        assert!(
+            matches!(events.first(), Some(CloneEvent::Plan(_))),
+            "the first NDJSON event is the plan: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(CloneEvent::Report(_))),
+            "the last NDJSON event is the terminal report: {events:?}"
+        );
+        assert!(
+            opened.load(Ordering::SeqCst),
+            "apply opens the source stream"
+        );
+        assert!(imported.load(Ordering::SeqCst), "apply imports/restores");
+    }
+
+    /// A manifest naming a DIFFERENT project than the operator asked to clone is refused
+    /// fail-closed BEFORE any diff/stream (the source is never trusted to answer for another
+    /// project).
+    #[tokio::test]
+    async fn clone_refuses_a_manifest_for_a_different_project() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let imported = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let cap: Arc<dyn boatramp_core::project_export::ProjectExport> = Arc::new(FakeCloneCap {
+            present: std::collections::BTreeSet::new(),
+            imported: imported.clone(),
+        });
+        let mut manifest = clone_test_manifest();
+        manifest.source_project = "evil".into(); // the source answers for a different project
+        let transport: Arc<dyn CloneSourceTransport> = Arc::new(MockCloneSource {
+            manifest,
+            opened: opened.clone(),
+            bundle: Vec::new(),
+        });
+
+        let resp = orchestrate_clone(
+            cap,
+            "acme".into(),
+            "acme".into(),
+            transport,
+            true,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !opened.load(Ordering::SeqCst),
+            "a wrong-project manifest never opens the stream"
+        );
+        assert!(
+            !imported.load(Ordering::SeqCst),
+            "a wrong-project manifest never imports"
+        );
     }
 }

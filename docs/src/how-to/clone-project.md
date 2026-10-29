@@ -88,7 +88,7 @@ $ boatramp project import acme \
 ```
 
 `--clone-from` turns `project import` into a third mode (alongside `--in <file>` and
-`--resumable <dir>`, and mutually exclusive with both). Like every import it is a **dry-run plan by
+`--resumable <dir>`, and mutually exclusive with both). Like every import it is a **dry-run by
 default** — add `--apply` to execute.
 
 | Flag | Default | Description |
@@ -97,8 +97,40 @@ default** — add `--apply` to execute.
 | `--clone-source-project <PROJECT>` | the target name | The project to clone **on the source**. Defaults to the target `<project>` you named — the common same-name env-clone (e.g. `acme` → `acme`). |
 | `--clone-source-token-file <FILE>` | — | File holding the operator's **source-node** `Project·Admin` token. Falls back to `BOATRAMP_CLONE_SOURCE_TOKEN`. The token is sent to the target in a header over TLS and forwarded to the source — **never** on the command line. |
 | `--clone-data-only` | off | Pull **application data only** — no control-plane KV / identity (the target keeps its own). |
-| `--apply` | dry-run | Execute the clone (default: a plan on the target that mutates nothing). |
+| `--apply` | dry-run | Execute the clone (default: a **cheap plan** on the target that mutates nothing — see below). |
+| `--clone-verify` | off | A **stream-level validate** (only without `--apply`): open the source stream and check the whole bundle end-to-end **without** mutating the target. The default dry-run is the cheap plan (manifest + diff only); reach for this when you want the heavier full-transfer validation a plan does not perform. |
 | `--overwrite` | off | Replace an **existing**, populated target project (otherwise a clone targets a fresh project). |
+
+### The dry-run is a cheap plan (not a trial transfer)
+
+**The default `--clone-from` dry-run is a cheap PLAN**: the target fetches the source manifest,
+diffs it against its own store, and **stops there** — it reports what a real clone *would* do
+without opening the source stream or transferring a byte. It answers in the time of a manifest
+fetch plus a diff, even for a project of tens of thousands of blobs:
+
+```console
+$ boatramp project import acme --clone-from https://src.acme.com \
+    --clone-source-token-file ./src-admin.token --server https://dst.acme.com
+clone plan for `acme` ← `acme` (full):
+  blobs: 18214 to transfer, 0 already present, 18214 total (~33203MB bytes)
+  members: sql/app.pgc, kv/control-plane.jsonl
+  (dry-run — nothing transferred; re-run with --apply to execute)
+```
+
+> **Semantics change (v0.49.0).** Before v0.49, a `--clone-from` dry-run opened the source stream
+> and pulled *every missing member* to validate the bundle without committing — i.e. it did nearly
+> all the work of a real clone and then returned a single report at the very end (minutes of silence
+> for a large project). The dry-run is now the **cheap plan** above. The old stream-level validate
+> is still available on demand behind **`--clone-verify`** (above). `--apply` is unchanged — it
+> streams and commits.
+
+### Progress on `--apply`
+
+A real clone of tens of GB can take many minutes. `--apply` (and `--clone-verify`) now surface
+**live progress**: the target prints the **plan up front**, then periodic transfer heartbeats
+(bytes transferred, elapsed) on **stderr** as members stream in, and finally the import report —
+so a long clone is never a silent wait. `--output-format json` keeps **stdout** to the clean
+final result (the plan + report) while the heartbeats stay on stderr.
 
 ### How it resumes without staging a bundle
 

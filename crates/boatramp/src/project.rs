@@ -190,6 +190,12 @@ enum ProjectCommand {
         /// `--clone-from`.
         #[arg(long, requires = "clone_from")]
         clone_data_only: bool,
+        /// Stream-level VERIFY a clone (only with `--clone-from`, no `--apply`): open the source
+        /// stream and validate the whole bundle end-to-end WITHOUT mutating the target. The default
+        /// `--clone-from` dry-run is instead the CHEAP PLAN (manifest + diff only — no stream); use
+        /// this when you want the heavier, full end-to-end validation a plan does not perform.
+        #[arg(long, requires = "clone_from", conflicts_with = "apply")]
+        clone_verify: bool,
         /// Execute the import (default: a dry-run plan — mutate nothing).
         #[arg(long)]
         apply: bool,
@@ -223,6 +229,17 @@ enum ProjectCommand {
 /// TTY.
 fn confirmation_matches(project: &str, typed: &str) -> bool {
     typed.trim() == project
+}
+
+/// Render a clone plan's to-transfer byte count. A fallback backend with no per-object size makes
+/// the total a LOWER BOUND (`exact == false`), shown with a trailing `+` and `~`, so the operator
+/// is not misled into reading a partial sum as the whole transfer.
+fn approx_bytes(bytes: u64, exact: bool) -> String {
+    if exact {
+        format!("~{bytes} bytes")
+    } else {
+        format!("≥~{bytes} bytes")
+    }
 }
 
 /// Resolve the identity-transport passphrase, in precedence order (owner decision,
@@ -602,6 +619,17 @@ pub enum ProjectOutput {
         applied: bool,
         report: String,
     },
+    /// A streaming clone DRY-RUN: the cheap plan of what a real clone would transfer/restore —
+    /// manifest + diff only, nothing streamed.
+    ClonePlanned {
+        plan: boatramp_core::project_export::ClonePlan,
+    },
+    /// A streaming clone was executed (`--apply`) or validated (`--clone-verify`): `plan` is what
+    /// ran, `report` the import/restore outcome.
+    Cloned {
+        plan: boatramp_core::project_export::ClonePlan,
+        report: boatramp_core::project_export::ImportReport,
+    },
     /// The output was already written directly by this arm (a delegated subcommand's own
     /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
     Passthrough,
@@ -672,6 +700,56 @@ impl crate::output::Rendered for ProjectOutput {
                 write!(w, "{report}")?;
                 if !report.ends_with('\n') {
                     writeln!(w)?;
+                }
+                Ok(())
+            }
+            Self::ClonePlanned { plan } => {
+                writeln!(
+                    w,
+                    "clone plan for `{}` ← `{}` ({}):",
+                    plan.target_project,
+                    plan.source_project,
+                    if plan.data_only { "data-only" } else { "full" },
+                )?;
+                writeln!(
+                    w,
+                    "  blobs: {} to transfer, {} already present, {} total ({})",
+                    plan.blobs_to_transfer,
+                    plan.blobs_present,
+                    plan.blobs_total,
+                    approx_bytes(plan.bytes_to_transfer, plan.bytes_exact),
+                )?;
+                if !plan.non_blob_members.is_empty() {
+                    writeln!(w, "  members: {}", plan.non_blob_members.join(", "))?;
+                }
+                writeln!(
+                    w,
+                    "  (dry-run — nothing transferred; re-run with --apply to execute)"
+                )
+            }
+            Self::Cloned { plan, report } => {
+                writeln!(
+                    w,
+                    "cloned `{}` ← `{}` ({}): transferred {} of {} blobs ({}){}",
+                    plan.target_project,
+                    plan.source_project,
+                    if plan.data_only { "data-only" } else { "full" },
+                    plan.blobs_to_transfer,
+                    plan.blobs_total,
+                    approx_bytes(plan.bytes_to_transfer, plan.bytes_exact),
+                    if report.dry_run {
+                        " [validate-only]"
+                    } else {
+                        ""
+                    },
+                )?;
+                writeln!(
+                    w,
+                    "  restored: {} blobs, pg {}, libsql {}, kv {} records",
+                    report.blobs, report.pg_databases, report.libsql_databases, report.kv_records,
+                )?;
+                for note in &report.notes {
+                    writeln!(w, "  note: {note}")?;
                 }
                 Ok(())
             }
@@ -869,26 +947,31 @@ pub async fn run(
             clone_source_project,
             clone_source_token_file,
             clone_data_only,
+            clone_verify,
         } => {
             // STREAMING CLONE from a live source node — a distinct mode (no bundle file).
             if let Some(source_url) = clone_from {
                 let source_token = resolve_source_token(clone_source_token_file.as_deref())?;
-                let report = cp
+                let outcome = cp
                     .project_clone_from(
                         &name,
                         &source_url,
                         clone_source_project.as_deref(),
                         &source_token,
                         apply,
+                        clone_verify,
                         overwrite,
                         force,
                         clone_data_only,
                     )
                     .await?;
-                return Ok(ProjectOutput::Imported {
-                    project: name,
-                    applied: apply,
-                    report,
+                return Ok(match outcome {
+                    crate::client::CloneOutcome::Planned(plan) => {
+                        ProjectOutput::ClonePlanned { plan }
+                    }
+                    crate::client::CloneOutcome::Applied { plan, report } => {
+                        ProjectOutput::Cloned { plan, report }
+                    }
                 });
             }
             let transport_key = if identity == "adopt" {
@@ -1078,6 +1161,39 @@ mod tests {
         assert!(
             parse(&["project", "import", "acme"]).is_err(),
             "import still needs one of --in / --resumable / --clone-from"
+        );
+        // `--clone-verify` parses with `--clone-from`, and is mutually exclusive with `--apply`
+        // (verify is the stream-level validate for a NON-apply run; the default is the cheap plan).
+        match parse(&[
+            "project",
+            "import",
+            "acme",
+            "--clone-from",
+            "https://src.example.com",
+            "--clone-verify",
+        ]) {
+            Ok(ProjectCommand::Import {
+                clone_verify,
+                apply,
+                ..
+            }) => {
+                assert!(clone_verify);
+                assert!(!apply);
+            }
+            other => panic!("expected clone import with verify, got {other:?}"),
+        }
+        assert!(
+            parse(&[
+                "project",
+                "import",
+                "acme",
+                "--clone-from",
+                "https://s",
+                "--clone-verify",
+                "--apply",
+            ])
+            .is_err(),
+            "--clone-verify must conflict with --apply"
         );
     }
 
