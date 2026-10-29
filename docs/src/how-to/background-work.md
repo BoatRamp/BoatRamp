@@ -22,6 +22,38 @@ routing: (
 ),
 ```
 
+### Test a direct-MX mailer offline
+
+A consumer that relays mail itself — resolving a recipient domain's MX and dialing
+it directly, rather than handing off to a fixed SMTP relay — imports the consumer-lane
+`dns-resolve` capability (plus the host-mediated `tcp-egress`) so it can look up
+`resolve-mx` / `resolve-addr` host-side. That resolver normally uses the node's system
+DNS, which makes a **fully-offline / hermetic test** awkward: there is no recipient
+domain to point at.
+
+For dev/test, the operator can seed a **static resolver override** in `boatramp.cfg`
+so the mailer resolves known answers with **no network**:
+
+```ron
+// boatramp.cfg (operator/serve config — DEV/TEST only, leave unset in production)
+handlers: (
+    dns_resolve_override: (
+        records: [
+            ( name: "example.com", mx: [( preference: 10, exchange: "mx1.example.com" )] ),
+            ( name: "mx1.example.com", addrs: ["93.184.216.34"] ),
+        ],
+    ),
+)
+```
+
+Now the mailer's `resolve-mx("example.com")` returns `mx1.example.com` and
+`resolve-addr("mx1.example.com")` returns the seeded address, all offline. This is an
+operator knob only — a guest/project can never set it — and the answers still pass the
+normal grant + `allow_guest_tcp_egress` posture + SSRF floor, so pointing a test MX at a
+private/loopback sink additionally needs `allow_guest_private_egress`. See
+[DEV/TEST resolver override](../reference/boatramp-cfg.md#devtest-resolver-override) for
+the full schema and security model.
+
 ### Cap a consumer's concurrency
 
 All consumers share one **async-lane** concurrency budget (`async_max_concurrency`).

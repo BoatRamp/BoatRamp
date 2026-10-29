@@ -490,6 +490,7 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 | `messaging_max_unflushed_msgs` | int | `0` | **Relaxed messaging-publish durability** (opt-in). `0` (default) = **strong**: `publish()` returns only after the message is crash-durable — *stronger* than NATS JetStream's default sync publish. `N > 0` fast-acks publishes from the in-memory buffer (≈tens of µs vs ≈one flush interval), forcing a durable checkpoint every `N` messages, so **at most `N` acknowledged-but-unflushed messages are lost on a process crash / OOM / SIGKILL / power loss**. Affects ONLY the bus publish path (control-plane, auth, and consumer ack/redelivery durability are unaffected); single-node only. The loss window is bounded by **both** `N` **and** the store's `flush_interval` (the background WAL-flush timer, ~5 ms) — so the effective steady-state bound is `min(N messages, one flush_interval)`, and on a low `flush_interval` a large `N` rarely binds. A node with `N > 0` logs a startup warning. See [Publish durability](../how-to/background-work.md#publish-durability-strong-by-default). |
 | `outbound_timeout_ms` | int | — | Optional ceiling on a guest's **outbound** `wasi:http` call (connect + first-byte), independent of the invocation timeout, so a hung upstream is bounded on its own terms. The streaming (between-bytes) timeout is left at the default so a slow token stream isn't cut. Omit ⇒ wasmtime default. |
 | `dns_resolve_budget` | int | `256` | Per-invocation cap on `dns-resolve` lookups (cap-req 20): how many MX/A/AAAA resolutions one guest invocation may issue before `rate-limited`. For a **session** listener the budget is seeded once per connection and shared across every re-entry, so a session guest can't reset it by sending another inbound frame. Takes effect only when the node posture `allow_guest_tcp_egress` is on and the component imports `dns-resolve`. |
+| `dns_resolve_override` | table | — (off) | **DEV/TEST override** of the consumer-lane DNS resolver (`dns-resolve` / `resolve-mx`). Inject a **static** host→records map (consulted first, answered with **no network** — the hook for a hermetic / fully-offline direct-MX relay test) and/or point the resolver at a custom `upstream` nameserver instead of `/etc/resolv.conf`. **Off by default** (absent ⇒ the system resolver, unchanged). Operator/serve-only and node-global — a guest/project can never set it, and its answers still pass the unchanged grant + posture + SSRF floor. See [DEV/TEST resolver override](#devtest-resolver-override). |
 | `bindings.sql` | table | — | The `sql` host binding. Omit for single-node (a per-site embedded libsql file); set `url` for a shared `sqld`. |
 
 `bindings.sql` fields: `dir`, `url`, `admin_url`, `replica_url`, `token_env`,
@@ -508,6 +509,54 @@ than the bring-your-own `databases:` map:
 
 See [Declare a managed database](../how-to/managed-databases.md#limits) for the
 `max_declared_*` pair in context.
+
+### DEV/TEST resolver override
+
+The consumer-lane `dns-resolve` / `resolve-mx` host capability (how a granted guest
+finds the MX / addresses to dial for a **direct-MX mail relay**, mailroom cap-req
+20) normally resolves through the host's system resolver (`/etc/resolv.conf`). That
+makes a **fully-offline, hermetic test** of a direct-MX relay impossible — there is
+no way to inject a known answer or point at a throwaway resolver.
+
+`handlers.dns_resolve_override` is the dev/test knob that closes that gap. It is
+**off by default** (absent ⇒ the system resolver, byte-for-byte unchanged — production
+is unaffected) and has two parts, both optional:
+
+- **`records`** — a static `name → records` map, **consulted first**. A hit returns
+  the configured answer **without touching the network**, so a test can seed exactly
+  the MX / address answers a relay needs and run with no DNS or network dependency at
+  all. Each entry is `( name, addrs, mx, txt )`: `addrs` are the A/AAAA answers for the
+  `resolve-addr` lookup (an IPv4 is an A record, an IPv6 an AAAA), `mx` are the
+  `resolve-mx` answers (`( preference, exchange )`, served ascending by preference). (`txt`
+  is accepted for schema completeness but **inert** today — the consumer-lane capability
+  exposes only address + MX resolution, no `resolve-txt`.)
+- **`upstream`** — a custom resolver `host:port` used, instead of the system resolver,
+  for any name the static map does not answer. Absent ⇒ the system resolver.
+
+```ron
+// DEV/TEST only — leave this unset in production.
+handlers: (
+    dns_resolve_override: (
+        records: [
+            // A direct-MX relay resolving `example.com` gets this MX, then dials `mx1.example.com`:
+            ( name: "example.com", mx: [( preference: 10, exchange: "mx1.example.com" )] ),
+            ( name: "mx1.example.com", addrs: ["93.184.216.34", "2606:2800:220:1::1"] ),
+        ],
+        // Optional: send every OTHER name to a throwaway resolver instead of /etc/resolv.conf.
+        upstream: "127.0.0.1:5353",
+    ),
+)
+```
+
+**It is not a tenancy bypass.** The override is operator/serve config — a node-global
+`boatramp.cfg` field — so a guest or project can never set its own resolver. And it
+only chooses *which answers* the shared resolver returns; those answers still pass,
+unchanged, through the per-invocation grant, the `allow_guest_tcp_egress` posture, and
+the SSRF floor. In particular a static **private/loopback** address (handy for pointing
+a test MX at a local sink) is still dropped by the SSRF floor unless the operator also
+turns on `allow_guest_private_egress` (dev/single-tenant) — so the override can be
+neither a cross-tenant escalation nor a private-IP oracle. Takes effect only on a build
+with the `tcp-egress` resolver compiled in.
 
 ### Memory ceilings per lane
 

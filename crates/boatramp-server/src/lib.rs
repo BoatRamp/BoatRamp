@@ -290,6 +290,10 @@ pub(crate) use scheduler::{
 /// #20); the resolver half of the egress story, built once + cached. Rides the `tcp-egress` feature.
 #[cfg(feature = "tcp-egress")]
 pub mod dns_resolve;
+/// DEV/TEST resolver override config + install hook for the consumer-lane `dns-resolve` capability
+/// (mailroom cap-req #21 residual). ALWAYS compiled (the config rides in `[handlers]`, parsed in every
+/// build); the `tcp-egress` resolver consults it. OFF by default — absent ⇒ the system resolver.
+pub mod dns_resolve_override;
 #[cfg(feature = "handlers")]
 mod function_runtime;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the
