@@ -9,7 +9,7 @@ only the day's writes.
 
 Delta export builds on the **resumable** export surface (a node-local member-object directory),
 not the single-file `BRPROJ` stream — a delta chains onto a base that lives on the node, so it
-is resumable-only. Both verbs are gated at **`System·Admin`**, like the full export.
+is resumable-only. Both verbs are gated at **`Project·Admin` on the target project**, like the full export.
 
 ## What ships as a true delta — and what falls back
 
@@ -30,7 +30,7 @@ bundle's correctness and the node's disk safety are not.
 - The node must have a **resumable export base** configured — `[serve] resumable_export_dir`
   in `boatramp.cfg`. Without it the resumable surface (and so delta export) is refused
   fail-closed. See the [`boatramp.cfg` reference](../reference/boatramp-cfg.md).
-- A token with **`System·Admin`** (the node operator).
+- A token with **`Project·Admin`** on the project being exported.
 - For a true **Postgres/MySQL** row delta: the database must have `delta_capture` enabled and
   have been **restarted** to adopt it (below). For a true **libsql** delta: the node must be
   built with the `sql-delta-libsql` feature.

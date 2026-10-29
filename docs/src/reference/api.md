@@ -42,14 +42,15 @@ target the reserved `default` project and stay byte-identical to pre-0.2.0.
 Stream a whole project — its managed-database contents, control-plane KV slice, and blobs — off a
 **running node** as a single portable `BRPROJ` bundle, and back in. This is how you **clone** a
 project into another environment (staging → prod, a per-customer copy) or recover one. Both verbs
-run against a running node and are gated `System·Admin` (the `project-export` feature; on by
-default). See [Export, import & clone a project](../how-to/clone-project.md) for the CLI and the
+run against a running node and are gated **`Project·Admin` on the `?project=` target** — a
+Project·Admin for project X can export/import X, not another project Y (the `project-export`
+feature; on by default). See [Export, import & clone a project](../how-to/clone-project.md) for the CLI and the
 full operational picture (format, atomicity, the managed-DB restore constraints).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false][&resumable=<dir>][&mode=differential\|incremental&base=<dir>]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. With `resumable=<dir>` the bundle is instead written as a **member-object directory** under the node's `[serve] resumable_export_dir` base (returns JSON naming `resumable_dir`, not a stream): each member is a separate object written `.part`-then-rename, so a re-run skips members already present + SHA-verified — a dropped export resumes instead of restarting. `mode` + `base` take a **delta** against a prior resumable `base` dir (`incremental` chains onto the parent, `differential` diffs a fixed base); both are required together and only with `resumable` (a delta is a node-local member-object directory, not a stream — else `400`). See [Incremental & true-delta export](../how-to/delta-export.md). `System·Admin`. |
-| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt][&resumable=<dir>]` | Import a `BRPROJ` bundle (the request body) into `project`, or — with `resumable=<dir>` — from the member-object directory under `[serve] resumable_export_dir` that a resumable export produced. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `System·Admin`. |
+| `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false][&resumable=<dir>][&mode=differential\|incremental&base=<dir>]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. With `resumable=<dir>` the bundle is instead written as a **member-object directory** under the node's `[serve] resumable_export_dir` base (returns JSON naming `resumable_dir`, not a stream): each member is a separate object written `.part`-then-rename, so a re-run skips members already present + SHA-verified — a dropped export resumes instead of restarting. `mode` + `base` take a **delta** against a prior resumable `base` dir (`incremental` chains onto the parent, `differential` diffs a fixed base); both are required together and only with `resumable` (a delta is a node-local member-object directory, not a stream — else `400`). See [Incremental & true-delta export](../how-to/delta-export.md). `Project·Admin` on the `?project=` target. |
+| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt][&resumable=<dir>]` | Import a `BRPROJ` bundle (the request body) into `project`, or — with `resumable=<dir>` — from the member-object directory under `[serve] resumable_export_dir` that a resumable export produced. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `Project·Admin` on the `?project=` target. |
 
 The bundle is **streamed** on both ends — the node never stages the whole bundle to a temp file.
 A small/sidecar-framed member (the control-plane KV slice, small blobs, the identity container)
@@ -85,6 +86,25 @@ failing. An extension not on the allowlist fails the restore.
 A bundle member is capped at **256 GiB**, and a whole bundle at **1 TiB** — fixed node limits, not
 currently exposed as a config key or CLI flag. Exceeding either refuses the import with a `501`
 naming the cap.
+
+### Streaming clone
+
+A **streaming clone** pulls a project directly from a live **source** node into a **target** node,
+restoring each member as it streams in — **no `BRPROJ` bundle is ever materialized** on an operator
+disk or the source volume. The target fetches a cheap manifest (a blob LIST plus the non-blob member
+paths — a list, not a body read), diffs it against its own content-addressed store, and pulls only
+the members it is missing; a re-run re-diffs and transfers only the remainder (resumable), and blobs
+flow bucket → bucket. All three endpoints are reached project-scoped as
+`/api/projects/<proj>/clone/…` and are gated **`Project·Admin`** — the source surfaces on the source
+project, the orchestrator on the target project (two Project·Admin authorizations, **no** node-global
+`System·Admin`). They back `boatramp project import <target> --clone-from <source-url>`. Present with
+the `project-export` feature.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/projects/<proj>/clone/manifest[?data_only=true\|false]` | **Source.** The cheap clone manifest — a LIST of the project's blob objects (each an `etag`/`size` content ref for the target's per-SHA presence diff) plus the non-blob member paths the stream will carry. No full materialization. `Project·Admin`. |
+| `POST` | `/api/projects/<proj>/clone/stream[?data_only=true\|false]` | **Source.** Stream a format-v2/v3 bundle of exactly the members the target is missing — the request body is the target's skip set (the content-matched blob member paths to omit). `Project·Admin`. |
+| `POST` | `/api/projects/<target>/clone/from` | **Target orchestrator.** Pull the project from a live source node: fetch its manifest, diff this node's store, pull the missing members over the stream, and restore through the same atomic shadow path as an import (always a **fresh** identity; the target enforces its own project scope on every member). Body `{ source_url, source_project?, apply?, overwrite?, force?, data_only? }`; the operator's source-node Project-Admin bearer rides in the `X-Boatramp-Source-Token` header, and `source_url` must be an absolute **https** URL resolving to a public address (SSRF-guarded). Dry-run unless `apply=true`. `Project·Admin`. |
 
 ## Sites & deployments
 

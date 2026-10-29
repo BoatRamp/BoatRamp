@@ -5,8 +5,10 @@ blobs — can be streamed off a running node as a single portable **BRPROJ bundl
 imported into a project on the same node or a different one. This is how you **clone** a
 project into another environment (staging → prod, a per-customer copy) or recover one.
 
-Both verbs run against a **running node** and are gated at **`System·Admin`** (the node
-operator — a project admin, publisher, or deployer cannot reach them).
+Both verbs run against a **running node** and are gated at **`Project·Admin` on the `?project=`
+target** — self-serve for a project's own admin (a Project·Admin for project X can export/import X,
+never another project Y), **not** node-global `System·Admin`. A project publisher or deployer still
+cannot reach them.
 
 ## Export a bundle
 
@@ -54,10 +56,11 @@ $ boatramp project import acme-copy --in acme.brproj --apply --server https://cp
 
 Server seam: `POST /api/project-import`.
 
-## Clone a project
+## Clone a project (via a bundle)
 
-There is no single `clone` verb — a clone is an **export followed by an import** into a
-new project name:
+The simplest clone is an **export followed by an import** into a new project name — it stages a
+whole `BRPROJ` bundle on the operator's disk between the two steps (for a large project, prefer
+the [streaming clone](#streaming-clone-pull-from-a-live-source-node) below, which stages nothing):
 
 ```console
 $ boatramp project export acme --out acme.brproj --server https://cp.acme.com
@@ -68,6 +71,64 @@ Clone the **data only** (the default bundle) when copying application data into 
 project — the target keeps its own identity, RBAC, and routing. For a **same-environment
 recovery** of the original project (identity intact), export with `--full
 --include-identity` and import with `--identity adopt`.
+
+## Streaming clone (pull from a live source node)
+
+A **streaming clone** pulls a project directly from a live **source** node into the **target** node
+you run the command against, restoring each member as it streams in. Nothing is staged whole: there
+is **no 33 GB `BRPROJ` bundle** parked on an operator disk (as the bundle clone above needs) or
+written out as a member-object directory on the source volume (as a resumable export needs) — the
+bytes flow source → target and land in the target's own stores as they arrive.
+
+```console
+$ boatramp project import acme \
+    --clone-from https://src.acme.com \
+    --clone-source-token-file ./src-admin.token \
+    --apply --server https://dst.acme.com
+```
+
+`--clone-from` turns `project import` into a third mode (alongside `--in <file>` and
+`--resumable <dir>`, and mutually exclusive with both). Like every import it is a **dry-run plan by
+default** — add `--apply` to execute.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--clone-from <SOURCE_URL>` | — | The **source** node's base URL — an absolute **`https://`** URL (plain-HTTP and private/loopback targets are refused by an SSRF guard). Selects the streaming-clone mode. |
+| `--clone-source-project <PROJECT>` | the target name | The project to clone **on the source**. Defaults to the target `<project>` you named — the common same-name env-clone (e.g. `acme` → `acme`). |
+| `--clone-source-token-file <FILE>` | — | File holding the operator's **source-node** `Project·Admin` token. Falls back to `BOATRAMP_CLONE_SOURCE_TOKEN`. The token is sent to the target in a header over TLS and forwarded to the source — **never** on the command line. |
+| `--clone-data-only` | off | Pull **application data only** — no control-plane KV / identity (the target keeps its own). |
+| `--apply` | dry-run | Execute the clone (default: a plan on the target that mutates nothing). |
+| `--overwrite` | off | Replace an **existing**, populated target project (otherwise a clone targets a fresh project). |
+
+### How it resumes without staging a bundle
+
+The target first fetches a cheap **manifest** from the source (`clone/manifest`) — a *list* of the
+source project's blob objects plus the non-blob member paths (managed-DB dumps, the KV slice), never
+a body read, so it stays cheap even at tens of GB. It diffs that list against its **own
+content-addressed store**, then asks the source (`clone/stream`) to stream **only the members it is
+missing**. Blobs flow **bucket → bucket**. An interrupted clone is **resumable**: a re-run re-diffs
+and transfers only what is still missing, not the whole project again. Each member is restored
+through the same **atomic shadow-restore** path a bundle import uses (a managed dedicated DB restores
+into a shadow and swaps in only after it verifies), so a failed clone leaves the live target
+untouched.
+
+### Authorization and tenancy
+
+A streaming clone carries **no node-global `System·Admin`** anywhere — it is **two `Project·Admin`
+authorizations**:
+
+- **Target.** The token you authenticate the `boatramp project import` call with (`--server` /
+  `[deploy].server`) must hold `Project·Admin` on the **target** project — it drives the orchestrator
+  (`POST /api/projects/<target>/clone/from`).
+- **Source.** The `--clone-source-token-file` / `BOATRAMP_CLONE_SOURCE_TOKEN` token must hold
+  `Project·Admin` on the **source** project — the target forwards it to the source's `clone/manifest`
+  and `clone/stream` surfaces. Clone refuses to start without it.
+
+The target always restores a **fresh** identity (a clone is a *different* environment — identity
+adoption is the recovery-oriented bundle import path, not clone) and enforces its **own** project
+scope on every member it writes: a source-declared scope is never trusted, and a blob ref outside the
+source project's own prefix is refused fail-closed. See
+[API reference: Streaming clone](../reference/api.md#streaming-clone) for the HTTP contract.
 
 ## The bundle format: streamed, not staged
 
@@ -180,6 +241,6 @@ cap refuses the import outright, naming the cap it hit.
   and managed-vs-external/single-vs-shared distinctions this page relies on.
 - [In-app schema migrations](./in-app-migrations.md#enable-an-extension) — the
   `migrate_trusted_extensions` allowlist in its original (migration) context.
-- [RBAC reference](../reference/rbac.md) — the `System·Admin` gate on both verbs.
+- [RBAC reference](../reference/rbac.md) — the `Project·Admin` gate on the export/import and clone verbs.
 - [API reference: Project export & import](../reference/api.md#project-export--import) — the
   `/api/project-export` / `/api/project-import` HTTP contract.

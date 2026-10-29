@@ -151,8 +151,11 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |
 | `GET` | `/api/metrics` | `system` · `read` |
 | `GET`/`POST` | `/api/prune`, `/api/scrub` | `system` · `admin` |
-| `POST` | `/api/project-export` | `system` · `admin` — stream a project to a `BRPROJ` bundle from a running node (`project-export` feature) |
-| `POST` | `/api/project-import` | `system` · `admin` — import a `BRPROJ` bundle into a project on a running node (`project-export` feature) |
+| `POST` | `/api/project-export` | `project` · `admin` *(proj, from `?project=`)* — stream a project to a `BRPROJ` bundle from a running node; a Project·Admin for X can export only X (`project-export` feature) |
+| `POST` | `/api/project-import` | `project` · `admin` *(proj, from `?project=`)* — import a `BRPROJ` bundle into a project on a running node; a Project·Admin for X can import only into X (`project-export` feature) |
+| `GET` | `/api/projects/<proj>/clone/manifest` | `project` · `admin` *(proj)* — streaming-clone **source** manifest (blob LIST + member paths) |
+| `POST` | `/api/projects/<proj>/clone/stream` | `project` · `admin` *(proj)* — streaming-clone **source** member stream |
+| `POST` | `/api/projects/<target>/clone/from` | `project` · `admin` *(target)* — streaming-clone **target** orchestrator (pulls from a live source node; the source bearer rides in a header) |
 | any | `/api/authz/*` | `system` · `admin` |
 | any | other `/api/*` | `system` · `admin` (deny-safe) |
 
