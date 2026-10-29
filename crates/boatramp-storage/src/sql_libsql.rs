@@ -32,6 +32,133 @@ use tokio::sync::Mutex;
 /// genuinely stuck lock surfaces as a SQL error rather than a request timeout.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
+/// Process-global serialization of **embedded (local) libsql/SQLite execution**.
+///
+/// ROOT CAUSE this guards against: on the fully-static **musl** build, concurrent execution of the
+/// bundled SQLite across OS threads corrupts process-global memory, EVEN THOUGH libsql selects the
+/// serialized threading mode (`sqlite3_config(SQLITE_CONFIG_SERIALIZED)` — confirmed to return OK,
+/// else libsql's own init `assert_eq!` would panic). A captured core shows the fault in
+/// `sqlite3DbMallocRawNN` (a connection's lookaside free-list) on one thread while another thread is
+/// mid-`PRAGMA journal_mode=WAL` journal commit/`fsync` on a DIFFERENT connection — i.e. SQLite's
+/// internal mutexes are not actually serializing global state on static-musl, so two connections
+/// racing the shared allocator/page-cache corrupt the heap. It surfaces as an intermittent
+/// `SQLITE_MISUSE` (SQLite's `API_ARMOR` catching a clobbered handle) during a run, or a SIGSEGV.
+/// Single-threaded use never hits it; the allocator (musl vs jemalloc) does not matter.
+///
+/// FIX: run no two embedded-SQLite operations at once, restoring the guarantee SQLite's
+/// (ineffective-here) internal serialization was meant to provide. Crucially this must also cover
+/// connection CLOSE (`sqlite3_close_v2`), which libsql runs from `Connection::drop` — a dropped
+/// (e.g. read-only) transaction closing on one thread while another runs a statement is exactly the
+/// observed race. A sync `Drop` cannot take an async lock, so ops and closes share ONE **sync**
+/// [`std::sync::Mutex`]: local libsql futures are synchronous (libsql itself drives them with
+/// `futures::executor::block_on`), so [`drive`] runs each op to completion under the lock without
+/// ever holding it across a tokio await (the returned future stays `Send`), and [`GuardedConn`]
+/// closes under the same lock. Per-operation (released between ops), not per-transaction — the
+/// `sql` handler binding holds several open transactions at once (`bindings/sql.rs`'s `txns` map),
+/// so a transaction-scoped lock would deadlock.
+///
+/// Scope: LOCAL (embedded single-node) mode only. REMOTE sqld talks HTTP — no embedded SQLite in
+/// this process — so remote ops pass `local = false`, await normally, and never take the lock.
+fn local_sql_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Acquire the embedded-SQLite exec lock when `local`, else `None`. Poisoning is ignored — the lock
+/// only orders execution, so a panic elsewhere must not wedge every later libsql op.
+fn local_exec_lock(local: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
+    // MUTATION SEAM (test-only, never shipped): with the `libsql-execlock-gate-mutation` feature ON
+    // and `BOATRAMP_LIBSQL_EXECLOCK_MUTATE` set, skip the serialization so the CI
+    // `libsql-exec-serialization` gate can prove it is load-bearing — the concurrent workload then
+    // reproduces the static-musl corruption (SIGSEGV / `SQLITE_MISUSE`). Compiled OUT of real builds.
+    #[cfg(feature = "libsql-execlock-gate-mutation")]
+    if std::env::var_os("BOATRAMP_LIBSQL_EXECLOCK_MUTATE").is_some() {
+        return None;
+    }
+    if local {
+        Some(
+            local_sql_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    } else {
+        None
+    }
+}
+
+/// Run one libsql op with embedded-SQLite execution serialized.
+///
+/// LOCAL: drive the op to completion SYNCHRONOUSLY under the process-global lock. libsql-local
+/// futures resolve without yielding (SQLite is synchronous — libsql drives them the same way, see
+/// `local/rows.rs`), so `block_on` returns in one poll and the lock is held across the op but NEVER
+/// across a tokio await point, keeping the returned future `Send` (required by the multi-thread
+/// server runtime). REMOTE: a normal async await, no lock (sqld serializes server-side).
+async fn drive<T>(local: bool, fut: impl std::future::Future<Output = T>) -> T {
+    if local {
+        let _g = local_exec_lock(true);
+        futures::executor::block_on(fut)
+    } else {
+        fut.await
+    }
+}
+
+/// A libsql [`Connection`] whose CLOSE (`sqlite3_close_v2`, run from libsql's `Connection::drop`) is
+/// serialized through the embedded-SQLite exec lock in local mode, so a connection closing on one
+/// thread can never race another thread's statement on static-musl.
+struct GuardedConn {
+    inner: Option<Connection>,
+    local: bool,
+}
+
+impl GuardedConn {
+    fn new(inner: Connection, local: bool) -> Self {
+        Self {
+            inner: Some(inner),
+            local,
+        }
+    }
+    fn conn(&self) -> &Connection {
+        self.inner
+            .as_ref()
+            .expect("libsql connection used after close")
+    }
+}
+
+impl Drop for GuardedConn {
+    fn drop(&mut self) {
+        // Close under the exec lock (local): `sqlite3_close_v2` touches process-global SQLite state.
+        let _g = local_exec_lock(self.local);
+        self.inner = None;
+    }
+}
+
+/// True when a libsql error is `SQLITE_BUSY`/`SQLITE_LOCKED` — the single-writer lock was held by
+/// another connection. In local mode these are retried in Rust with the exec lock released.
+fn is_sqlite_busy(e: &libsql::Error) -> bool {
+    matches!(
+        e,
+        libsql::Error::SqliteFailure(code, _)
+            if *code == libsql::ffi::SQLITE_BUSY || *code == libsql::ffi::SQLITE_LOCKED
+    )
+}
+
+/// The Rust-side busy backoff schedule: a contended writer sleeps (lock released) between attempts,
+/// capped, up to [`BUSY_TIMEOUT_MS`]. `prev` is the last backoff (`None` to start); returns the next
+/// sleep, or `None` once the deadline has passed. Keeps the exec lock from ever being held across a
+/// blocking SQLite busy-sleep (which would stall every other database).
+fn next_busy_backoff(
+    start: std::time::Instant,
+    prev: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if start.elapsed() >= std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64) {
+        return None;
+    }
+    Some(match prev {
+        None => std::time::Duration::from_millis(1),
+        Some(d) => (d * 2).min(std::time::Duration::from_millis(50)),
+    })
+}
+
 /// A libsql-backed SQL backend, scoped to a site. Open it on a local file
 /// ([`open_local`](Self::open_local), single-node) or against a remote sqld
 /// primary ([`connect_remote`](Self::connect_remote), cluster).
@@ -58,14 +185,23 @@ pub struct LibsqlSql {
 impl LibsqlSql {
     /// Open (creating if absent) a local database file at `path`, in WAL mode.
     pub async fn open_local(path: impl AsRef<Path>) -> Result<Self, SqlError> {
+        // `build()` records the path only (no embedded SQLite for a file DB); the first SQLite work
+        // is `connect()` below, which is serialized. The temp connection is a `GuardedConn` so its
+        // close is serialized too.
         let db = Builder::new_local(path)
             .build()
             .await
             .map_err(SqlError::other)?;
         // WAL persists in the database header, so setting it once on open is
         // enough; every later connection inherits it.
-        let conn = db.connect().map_err(SqlError::other)?;
-        run_pragma(&conn, "PRAGMA journal_mode=WAL").await?;
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(true);
+                db.connect().map_err(SqlError::other)?
+            },
+            true,
+        );
+        drive(true, run_pragma(conn.conn(), "PRAGMA journal_mode=WAL")).await?;
         Ok(Self {
             db: Arc::new(db),
             read_db: None,
@@ -99,10 +235,14 @@ impl LibsqlSql {
     /// **idempotent** scripts (`CREATE TABLE IF NOT EXISTS …`), since it may run
     /// again when the database is reopened.
     pub async fn execute_script(&self, sql: &str) -> Result<(), SqlError> {
-        self.db
-            .connect()
-            .map_err(SqlError::other)?
-            .execute_batch(sql)
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(self.local);
+                self.db.connect().map_err(SqlError::other)?
+            },
+            self.local,
+        );
+        drive(self.local, conn.conn().execute_batch(sql))
             .await
             .map_err(SqlError::other)?;
         Ok(())
@@ -129,17 +269,29 @@ impl LibsqlSql {
         script: &str,
         ledger_insert: &str,
     ) -> Result<(), SqlError> {
-        let conn = self.db.connect().map_err(SqlError::other)?;
-        if self.local {
-            // A contended writer waits for the lock instead of erroring (local only).
-            run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
-        }
-        conn.execute("BEGIN", ()).await.map_err(SqlError::other)?;
+        // Self-contained transactional migration step. Each embedded-SQLite op runs under the exec
+        // lock via `drive` (static-musl serialization); the temp connection is a `GuardedConn` so
+        // its close is serialized too. No `busy_timeout` PRAGMA — serialization means no concurrent
+        // writer, so there is never a contended writer here.
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(self.local);
+                self.db.connect().map_err(SqlError::other)?
+            },
+            self.local,
+        );
+        let local = self.local;
+        let c = conn.conn();
+        drive(local, c.execute("BEGIN", ()))
+            .await
+            .map_err(SqlError::other)?;
         // Run the step's DDL/DML, then the ledger row, inside the open transaction. On ANY failure,
         // roll the WHOLE thing back (best effort) and surface the original error.
         let result = async {
-            conn.execute_batch(script).await.map_err(SqlError::other)?;
-            conn.execute_batch(ledger_insert)
+            drive(local, c.execute_batch(script))
+                .await
+                .map_err(SqlError::other)?;
+            drive(local, c.execute_batch(ledger_insert))
                 .await
                 .map_err(SqlError::other)?;
             Ok::<(), SqlError>(())
@@ -147,12 +299,14 @@ impl LibsqlSql {
         .await;
         match result {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(SqlError::other)?;
+                drive(local, c.execute("COMMIT", ()))
+                    .await
+                    .map_err(SqlError::other)?;
                 Ok(())
             }
             Err(e) => {
                 // Best-effort rollback; if it fails the dropped connection rolls back anyway.
-                let _ = conn.execute("ROLLBACK", ()).await;
+                let _ = drive(local, c.execute("ROLLBACK", ())).await;
                 Err(e)
             }
         }
@@ -169,62 +323,93 @@ impl LibsqlSql {
                 .await
                 .map_err(|_| SqlError::other("libsql dump sink closed"))
         }
-        let conn = self.db.connect().map_err(SqlError::other)?;
+        // Embedded SQLite is serialized per statement via `drive` (static-musl safety). Because the
+        // mpsc `send` back-pressure must NOT run while holding the exec lock, each query is drained
+        // to formatted SQL lines UNDER the lock (bounded to one table at a time — never the whole
+        // DB), then the lines are sent OUTSIDE the lock. The temp connection is a `GuardedConn`, so
+        // its close is serialized too.
+        let local = self.local;
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(local);
+                self.db.connect().map_err(SqlError::other)?
+            },
+            local,
+        );
+        let c = conn.conn();
 
         // 1. Table DDL, in a stable order. Collect the table names (small) for the data pass.
-        let mut tables: Vec<String> = Vec::new();
-        {
-            let mut rows = conn
+        let (tables, ddl): (Vec<String>, Vec<String>) = drive(local, async {
+            let mut rows = c
                 .query(
                     "SELECT name, sql FROM sqlite_master WHERE type='table' \
                      AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name",
                     (),
                 )
-                .await
-                .map_err(SqlError::other)?;
-            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
-                let name = value_to_text(row.get_value(0).map_err(SqlError::other)?);
-                let sql = value_to_text(row.get_value(1).map_err(SqlError::other)?);
-                send(tx, format!("{sql};\n")).await?;
+                .await?;
+            let mut tables = Vec::new();
+            let mut ddl = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let name = value_to_text(row.get_value(0)?);
+                let sql = value_to_text(row.get_value(1)?);
+                ddl.push(format!("{sql};\n"));
                 tables.push(name);
             }
+            Ok::<_, libsql::Error>((tables, ddl))
+        })
+        .await
+        .map_err(SqlError::other)?;
+        for line in ddl {
+            send(tx, line).await?;
         }
 
-        // 2. Per-table data, one row at a time (`INSERT INTO "t" VALUES (...);`).
+        // 2. Per-table data (`INSERT INTO "t" VALUES (...);`). Drained to lines under the lock, one
+        //    table at a time, then sent outside the lock.
         for t in &tables {
             let quoted = t.replace('"', "\"\"");
-            let mut rows = conn
-                .query(&format!("SELECT * FROM \"{quoted}\""), ())
-                .await
-                .map_err(SqlError::other)?;
-            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
-                let n = row.column_count();
-                let mut vals = String::new();
-                for i in 0..n {
-                    if i > 0 {
-                        vals.push(',');
+            let lines: Vec<String> = drive(local, async {
+                let mut rows = c.query(&format!("SELECT * FROM \"{quoted}\""), ()).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let n = row.column_count();
+                    let mut vals = String::new();
+                    for i in 0..n {
+                        if i > 0 {
+                            vals.push(',');
+                        }
+                        push_sql_value(&mut vals, &row.get_value(i)?);
                     }
-                    push_sql_value(&mut vals, &row.get_value(i).map_err(SqlError::other)?);
+                    out.push(format!("INSERT INTO \"{quoted}\" VALUES ({vals});\n"));
                 }
-                send(tx, format!("INSERT INTO \"{quoted}\" VALUES ({vals});\n")).await?;
+                Ok::<_, libsql::Error>(out)
+            })
+            .await
+            .map_err(SqlError::other)?;
+            for line in lines {
+                send(tx, line).await?;
             }
         }
 
         // 3. Index / trigger / view DDL (after data, so a trigger never fires during the load and
         //    an index is built once on the full table).
-        {
-            let mut rows = conn
+        let idx: Vec<String> = drive(local, async {
+            let mut rows = c
                 .query(
                     "SELECT sql FROM sqlite_master WHERE type IN ('index','trigger','view') \
                      AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY type, name",
                     (),
                 )
-                .await
-                .map_err(SqlError::other)?;
-            while let Some(row) = rows.next().await.map_err(SqlError::other)? {
-                let sql = value_to_text(row.get_value(0).map_err(SqlError::other)?);
-                send(tx, format!("{sql};\n")).await?;
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(format!("{};\n", value_to_text(row.get_value(0)?)));
             }
+            Ok::<_, libsql::Error>(out)
+        })
+        .await
+        .map_err(SqlError::other)?;
+        for line in idx {
+            send(tx, line).await?;
         }
         Ok(())
     }
@@ -234,12 +419,19 @@ impl LibsqlSql {
     async fn vacuum_into(&self, path: &Path) -> Result<(), SqlError> {
         // `VACUUM INTO` takes a string literal; escape any quotes in the path.
         let target = path.to_string_lossy().replace('\'', "''");
-        self.db
-            .connect()
-            .map_err(SqlError::other)?
-            .execute(&format!("VACUUM INTO '{target}'"), ())
-            .await
-            .map_err(SqlError::other)?;
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(self.local);
+                self.db.connect().map_err(SqlError::other)?
+            },
+            self.local,
+        );
+        drive(
+            self.local,
+            conn.conn().execute(&format!("VACUUM INTO '{target}'"), ()),
+        )
+        .await
+        .map_err(SqlError::other)?;
         Ok(())
     }
 }
@@ -248,14 +440,28 @@ impl LibsqlSql {
     /// Open a `DEFERRED` transaction on `db`. Under WAL a bare `BEGIN` keeps
     /// reads concurrent and only takes the write lock on the first write.
     async fn begin_on(&self, db: &Database) -> Result<Box<dyn SqlTransaction>, SqlError> {
-        let conn = db.connect().map_err(SqlError::other)?;
-        if self.local {
-            // Per-connection: a contended writer waits for the lock rather than
-            // erroring. (Remote leaves this to sqld.)
-            run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
-        }
-        conn.execute("BEGIN", ()).await.map_err(SqlError::other)?;
-        Ok(Box::new(LibsqlTxn { conn }))
+        // Opening the connection runs embedded SQLite (`sqlite3_open_v2`), so it is serialized in
+        // local mode (see `local_sql_lock`). `db.connect()` is synchronous. The connection is held
+        // as a `GuardedConn` so its close (on txn drop) is serialized too.
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(self.local);
+                db.connect().map_err(SqlError::other)?
+            },
+            self.local,
+        );
+        // NB: no SQLite `busy_timeout` PRAGMA in local mode — a blocking in-engine busy-wait would
+        // hold the global exec lock and stall every other database. A contended writer instead
+        // retries in Rust with the lock released (`exec_sql`), preserving the "a contended writer
+        // waits" semantics without the global stall. BEGIN is DEFERRED, so it takes no write lock
+        // here and cannot be BUSY. (Remote leaves this to sqld.)
+        drive(self.local, conn.conn().execute("BEGIN", ()))
+            .await
+            .map_err(SqlError::other)?;
+        Ok(Box::new(LibsqlTxn {
+            conn,
+            local: self.local,
+        }))
     }
 }
 
@@ -284,10 +490,14 @@ impl SqlBackend for LibsqlSql {
     /// statement commits as it succeeds — the transactional per-step atomicity the migration surface
     /// needs is provided separately by [`run_migration_txn`](Self::run_migration_txn).)
     async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
-        self.db
-            .connect()
-            .map_err(SqlError::other)?
-            .execute_batch(sql)
+        let conn = GuardedConn::new(
+            {
+                let _g = local_exec_lock(self.local);
+                self.db.connect().map_err(SqlError::other)?
+            },
+            self.local,
+        );
+        drive(self.local, conn.conn().execute_batch(sql))
             .await
             .map_err(SqlError::other)?;
         Ok(())
@@ -295,7 +505,14 @@ impl SqlBackend for LibsqlSql {
 }
 
 struct LibsqlTxn {
-    conn: Connection,
+    /// A `GuardedConn` so the connection's CLOSE (on drop) is serialized through the embedded-SQLite
+    /// exec lock in local mode — a dropped read-only transaction closing while another thread runs a
+    /// statement was the observed static-musl race.
+    conn: GuardedConn,
+    /// Whether this transaction's connection is the embedded (local) engine — if so, every op is
+    /// serialized through the process-global [`local_sql_lock`] (static-musl safety); remote sqld
+    /// connections skip it (no embedded SQLite in this process).
+    local: bool,
 }
 
 #[async_trait]
@@ -307,51 +524,97 @@ impl SqlTransaction for LibsqlTxn {
         let stmt =
             crate::sql_placeholders::normalize(sql, PlaceholderDialect::Sqlite, params.len())?;
         let bound = stmt.reorder(params); // no-op for libsql (`?N` is native)
-        let mut rows = self
-            .conn
-            .query(
-                &stmt.sql,
-                libsql::params_from_iter(to_libsql(bound.as_ref())),
-            )
-            .await
-            .map_err(SqlError::other)?;
-        let columns = (0..rows.column_count())
-            .map(|i| rows.column_name(i).unwrap_or_default().to_string())
-            .collect();
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(SqlError::other)? {
-            let mut cells = Vec::with_capacity(row.column_count() as usize);
-            for i in 0..row.column_count() {
-                cells.push(from_libsql(row.get_value(i).map_err(SqlError::other)?));
+        let local = self.local;
+        let conn = self.conn.conn();
+        let start = std::time::Instant::now();
+        let mut backoff = None;
+        loop {
+            // `drive` serializes the whole statement (prepare + step-drain + the Rows drop, which
+            // finalizes the statement) under the embedded exec lock in local mode; retry a BUSY
+            // contended read in Rust with the lock released.
+            let r: Result<SqlRows, libsql::Error> = drive(local, async {
+                let mut rows = conn
+                    .query(
+                        &stmt.sql,
+                        libsql::params_from_iter(to_libsql(bound.as_ref())),
+                    )
+                    .await?;
+                let columns = (0..rows.column_count())
+                    .map(|i| rows.column_name(i).unwrap_or_default().to_string())
+                    .collect();
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let mut cells = Vec::with_capacity(row.column_count() as usize);
+                    for i in 0..row.column_count() {
+                        cells.push(from_libsql(row.get_value(i)?));
+                    }
+                    out.push(cells);
+                }
+                Ok(SqlRows { columns, rows: out })
+            })
+            .await;
+            match r {
+                Ok(rows) => return Ok(rows),
+                Err(e) if self.local && is_sqlite_busy(&e) => {
+                    match next_busy_backoff(start, backoff) {
+                        Some(d) => {
+                            tokio::time::sleep(d).await;
+                            backoff = Some(d);
+                        }
+                        None => return Err(SqlError::other(e)),
+                    }
+                }
+                Err(e) => return Err(SqlError::other(e)),
             }
-            out.push(cells);
         }
-        Ok(SqlRows { columns, rows: out })
     }
 
     async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
         let stmt =
             crate::sql_placeholders::normalize(sql, PlaceholderDialect::Sqlite, params.len())?;
-        self.conn
-            .execute(&stmt.sql, libsql::params_from_iter(to_libsql(params)))
-            .await
-            .map_err(SqlError::other)
+        self.exec_sql(&stmt.sql, params).await
     }
 
     async fn commit(self: Box<Self>) -> Result<(), SqlError> {
-        self.conn
-            .execute("COMMIT", ())
-            .await
-            .map_err(SqlError::other)?;
+        self.exec_sql("COMMIT", &[]).await?;
         Ok(())
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
-        self.conn
-            .execute("ROLLBACK", ())
-            .await
-            .map_err(SqlError::other)?;
+        self.exec_sql("ROLLBACK", &[]).await?;
         Ok(())
+    }
+}
+
+impl LibsqlTxn {
+    /// Run one write statement under the local exec lock, retrying `SQLITE_BUSY`/`SQLITE_LOCKED` in
+    /// Rust with the lock RELEASED between attempts (so a contended single-writer wait never pins
+    /// the process-global embedded-SQLite lock).
+    async fn exec_sql(&self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+        let local = self.local;
+        let conn = self.conn.conn();
+        let start = std::time::Instant::now();
+        let mut backoff = None;
+        loop {
+            let r = drive(
+                local,
+                conn.execute(sql, libsql::params_from_iter(to_libsql(params))),
+            )
+            .await;
+            match r {
+                Ok(n) => return Ok(n),
+                Err(e) if self.local && is_sqlite_busy(&e) => {
+                    match next_busy_backoff(start, backoff) {
+                        Some(d) => {
+                            tokio::time::sleep(d).await;
+                            backoff = Some(d);
+                        }
+                        None => return Err(SqlError::other(e)),
+                    }
+                }
+                Err(e) => return Err(SqlError::other(e)),
+            }
+        }
     }
 }
 
@@ -1157,17 +1420,23 @@ impl LibsqlSqlBackends {
         }
         let shadow = shadow_path_for(&live);
         remove_db_files(&shadow);
-        // Open the shadow in DELETE journal mode (no persistent `-wal`/`-shm` sidecars to orphan
-        // across the rename), with FK + synchronous OFF for a fast bulk load (it is verified +
-        // renamed only on success).
+        // A shadow is always a LOCAL embedded database. `build()` records the path (no SQLite); the
+        // connect + setup pragmas below run embedded SQLite and are serialized (static-musl safety),
+        // as are later per-chunk applies in `feed` and the eventual close.
         let db = Builder::new_local(&shadow)
             .build()
             .await
             .map_err(SqlError::other)?;
-        let conn = db.connect().map_err(SqlError::other)?;
-        run_pragma(&conn, "PRAGMA journal_mode=DELETE").await?;
-        run_pragma(&conn, "PRAGMA foreign_keys=OFF").await?;
-        run_pragma(&conn, "PRAGMA synchronous=OFF").await?;
+        // Open the shadow in DELETE journal mode (no persistent `-wal`/`-shm` sidecars to orphan
+        // across the rename), with FK + synchronous OFF for a fast bulk load (it is verified +
+        // renamed only on success).
+        let conn = {
+            let _g = local_exec_lock(true);
+            db.connect().map_err(SqlError::other)?
+        };
+        drive(true, run_pragma(&conn, "PRAGMA journal_mode=DELETE")).await?;
+        drive(true, run_pragma(&conn, "PRAGMA foreign_keys=OFF")).await?;
+        drive(true, run_pragma(&conn, "PRAGMA synchronous=OFF")).await?;
         // HIGH-1 (inc2 Security): the streamed `.dump` crosses a TRUST boundary — the trailer SHA is
         // integrity, not authenticity, so a crafted member can carry arbitrary SQL. Confine the
         // apply with a SQLite authorizer (installed AFTER our own setup pragmas) so a statement can
@@ -1176,8 +1445,11 @@ impl LibsqlSqlBackends {
         // action targeting another database name is denied. `ATTACH` is refused at PREPARE — before
         // SQLite opens the target file — so a refused import writes NOTHING outside the shadow (and
         // the compounding autocommit-escapes-the-shadow hazard never arises: the ATTACH never runs).
-        conn.authorizer(Some(shadow_apply_authorizer()))
-            .map_err(SqlError::other)?;
+        {
+            let _g = local_exec_lock(true);
+            conn.authorizer(Some(shadow_apply_authorizer()))
+                .map_err(SqlError::other)?;
+        }
         Ok(DumpShadow {
             live_path: live,
             shadow_path: shadow,
@@ -1199,25 +1471,29 @@ impl LibsqlSqlBackends {
                 .conn
                 .as_ref()
                 .ok_or_else(|| SqlError::other("shadow connection already closed"))?;
-            shadow.applier.finish(conn).await?;
+            shadow.applier.finish(conn).await?; // self-serializes each statement via `drive`.
             // The untrusted `.dump` is now fully applied under the authorizer; lift it so our OWN
             // trusted `PRAGMA integrity_check` (which the authorizer would otherwise DENY) can run.
-            conn.authorizer(None).map_err(SqlError::other)?;
-            let mut rows = conn
-                .query("PRAGMA integrity_check", ())
-                .await
-                .map_err(SqlError::other)?;
-            let ok = match rows.next().await.map_err(SqlError::other)? {
-                Some(row) => match row.get_value(0).map_err(SqlError::other)? {
-                    LibsqlValue::Text(s) => s,
-                    other => {
-                        return Err(SqlError::other(format!(
-                            "shadow integrity_check returned an unexpected result: {other:?}"
-                        )));
-                    }
-                },
-                None => return Err(SqlError::other("shadow integrity_check returned no row")),
-            };
+            // Each embedded op below is serialized via `drive` / the exec lock (static-musl safety;
+            // see `local_sql_lock`).
+            {
+                let _g = local_exec_lock(true);
+                conn.authorizer(None).map_err(SqlError::other)?;
+            }
+            let ok: String = drive(true, async {
+                let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+                let v = match rows.next().await? {
+                    Some(row) => match row.get_value(0)? {
+                        LibsqlValue::Text(s) => Some(s),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                Ok::<Option<String>, libsql::Error>(v)
+            })
+            .await
+            .map_err(SqlError::other)?
+            .ok_or_else(|| SqlError::other("shadow integrity_check returned no/invalid row"))?;
             if ok != "ok" {
                 // Leave the RAII guard armed so the shadow is torn down when `shadow` drops.
                 return Err(SqlError::other(format!(
@@ -1225,9 +1501,13 @@ impl LibsqlSqlBackends {
                 )));
             }
         }
-        // Close the shadow connection to release the file before the rename.
-        shadow.conn = None;
-        shadow._db = None;
+        // Close the shadow connection to release the file before the rename — serialized so the
+        // close never races another thread's embedded op (static-musl safety).
+        {
+            let _g = local_exec_lock(true);
+            shadow.conn = None;
+            shadow._db = None;
+        }
         // Atomic swap, then disarm the guard so Drop does NOT remove the now-live file.
         let shadow_path = shadow.shadow_path.clone();
         let live = shadow.live_path.clone();
@@ -1686,9 +1966,13 @@ impl DumpShadow {
 impl Drop for DumpShadow {
     fn drop(&mut self) {
         if self.armed {
-            // Close the connection first (release the file), then remove the shadow + its sidecars.
-            self.conn = None;
-            self._db = None;
+            // Close the connection first (release the file) under the embedded exec lock so the
+            // close never races another thread's op (static-musl safety), then remove the shadow.
+            {
+                let _g = local_exec_lock(true);
+                self.conn = None;
+                self._db = None;
+            }
             remove_db_files(&self.shadow_path);
         }
     }
@@ -1805,7 +2089,9 @@ impl SqlStatementApplier {
         if trimmed.is_empty() {
             return Ok(());
         }
-        conn.execute_batch(trimmed)
+        // The shadow is a local embedded database — serialize each applied statement through the
+        // global exec lock (static-musl safety; see `local_sql_lock`).
+        drive(true, conn.execute_batch(trimmed))
             .await
             .map(|_| ())
             .map_err(SqlError::other)

@@ -582,11 +582,11 @@ mod tests {
     /// and tenant B's rows (public, draft, and soft-deleted), then runs the GDC with a `TargetScope`
     /// for B and asserts the read returns ONLY B's published, non-deleted row — never A's, never B's
     /// draft/removed. Also proves the deny-by-default: a target read of a table with no declared
-    /// public subset is refused. `#[ignore]`d for the same reason as the ORM batteries (a static-musl
-    /// test binary segfaults in libsql's bundled SQLite); the `test-gdc-target` CI job runs it
-    /// unignored on the host toolchain and greps the success marker.
+    /// public subset is refused. `#[ignore]`d for the same reason as the ORM batteries (the former static-musl
+    /// former static-musl concurrency bug now fixed); the `test-gdc-target` CI job runs it
+    /// unignored on the static-musl target and greps the success marker.
     #[tokio::test]
-    #[ignore = "run via the test-gdc-target CI job on the host toolchain (static-musl libsql segfault)"]
+    #[ignore = "heavy libsql battery; run via the test-gdc-target CI job on the static-musl target (the embedded-SQLite exec-serialization fix makes musl sound)"]
     async fn gdc_target_read_isolates_to_b_public_subset_on_a_real_engine() {
         use super::super::introspect::introspect_sqlite;
         use super::super::policy::{ResolvedTerm, RowOp, TargetScope, TargetTable};
