@@ -20,6 +20,7 @@ Read by `sync`, `build`, `bundle`, and the other project commands. See
 | `BOATRAMP_TOKEN_HOLDER_KEY` | — | Holder **private** key (`"<alg>:<hex>"`) for a PoP-bound token: every request is signed with a fresh proof. Inert unless set alongside `BOATRAMP_TOKEN` + `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `BOATRAMP_POP_ORIGIN` | — | The server's canonical origin the PoP proof binds (`aud`); must equal the server's `serve.pop_origin`. |
 | `BOATRAMP_MCP_CONFIG` | — | Path to the [MCP](../how-to/mcp.md) instance registry (default `~/.config/boatramp/mcp.toml`). |
+| `BOATRAMP_CLONE_SOURCE_TOKEN` | — | Fallback for `project import --clone-from`: the operator's **source-node** `Project·Admin` bearer (sent in a request header over TLS, never on argv). Overridden by `--clone-source-token-file`. See [Streaming clone](../how-to/clone-project.md#streaming-clone-pull-from-a-live-source-node). |
 
 ## Server (`serve`)
 
@@ -215,8 +216,13 @@ the token itself). See [Handler bindings](../how-to/handler-bindings.md).
 | `BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS` | `bindings.sql.deprovision_grace_secs` | Soft-delete grace window (seconds) for a per-tenant managed DB. Default `604800` (7 days). On a project/site delete, a **Shared + Postgres** tenant is *soft*-deleted (its database renamed aside, role disabled) and stays recoverable for this long before a reaper hard-drops it; `0` disables the soft path (immediate, irreversible hard drop). MySQL and all `Single` tenants always hard-drop immediately. |
 | `BOATRAMP_SQL_TOKEN` | — | Auth token for a remote libsql database referenced by the SQL binding. |
 | _(your `url_env`)_ | — | Connection URL (a secret) for an external bring-your-own SQL database — the var name is whatever you set as `url_env` / `read_url_env` under `[handlers.bindings.sql.databases]`. See [Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql). |
+| `BOATRAMP_HANDLERS_BLOB_READ_CACHE_BYTES` | `blob_read_cache_bytes` | Size (bytes) of the serve-path **blob read-through cache** that fronts each blob backend, so a warm content-addressed `/img` derivative is answered from memory instead of a backend GET. Default `134217728` (128 MiB); `0` disables it. See [`[handlers]`](./boatramp-cfg.md#handlers). |
 | `BOATRAMP_FC_*` | — | Embedded-VMM / Firecracker compute-backend settings (kernel, rootfs, bridge, subnet, …). See [Run compute workloads](../how-to/compute.md). |
 | `BOATRAMP_VMM_SERIAL` | — | Attach the microVM serial console (debugging). |
+
+Other scalar `[handlers]` runtime levers (the serve-admission / blob-hedge / cold-start
+knobs) follow the same `BOATRAMP_HANDLERS_<FIELD>` convention; the authoritative list +
+defaults are in the [`[handlers]`](./boatramp-cfg.md#handlers) config reference.
 
 ### External SQL databases (`[handlers.bindings.sql.databases]`)
 

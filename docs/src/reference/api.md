@@ -489,6 +489,8 @@ maintenance/diagnostics: 0.3.14).
 | `POST` | `/api/compute/maintenance/set-health` | Override a replica's stored health. |
 | `POST` | `/api/compute/maintenance/restart` | Stop + relaunch a replica. |
 | `POST` | `/api/compute/maintenance/netdiag` | Run a network diagnostic. |
+| `POST` | `/api/compute/maintenance/reap` | Reap orphaned replicas (no desired workload + no live container). Destructive; **dry-run unless** the body sets `dry_run: false`. Body `{ project?, workload?, replica?, dry_run?, grace_secs?, reclaim_volumes? }` — a targeted reap needs all of `project`+`workload`+`replica`, else it scans every project. Fail-closed (never reaps a live/desired replica). `501` when the node has no reaper. |
+| `GET`/`POST`/`DELETE` | `/api/compute/registry-auth[/<name>]` | Operator node-wide registry pull credentials (`[compute].registry_auth`): `GET /api/compute/registry-auth` lists names + metadata, `POST` seals/rotates a `{username,password}` under a `name`, `DELETE /api/compute/registry-auth/<name>` removes one. The credential value is never returned. |
 
 See [Diagnose compute](../how-to/diagnose-compute.md).
 
@@ -668,6 +670,8 @@ Present with the `handlers` feature.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `GET` | `/api/node-health` | Node-global health snapshot (`System·Read`): `/data` filesystem headroom (`data_*` + a per-subdir `data_breakdown`) plus `replicas_unhealthy` — every replica `phase=running` but `HEALTHY=NO` (the reachable-but-not-served signature), the same signal the [alerting loop](../how-to/node-health-alerting.md) pages on. |
+| `GET` | `/api/instance-stats` | Node-global handler-runtime stats (`System·Read`): warm-cache capacity/evictions, lane occupancy, and the per-phase serve timings. |
 | `GET` | `/api/sites/:site/_boatramp/handlers` | Per-handler operator stats. |
 | `GET` | `/api/sites/:site/_boatramp/logs` | Captured per-site guest logs. |
 | `GET` | `/api/sites/:site/_boatramp/logs/stream` | Stream per-site logs (SSE). |

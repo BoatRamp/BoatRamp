@@ -137,7 +137,8 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `POST` | `/api/sql/<db>/{exec,query,ping}` | `project` · `deploy` *(default)* — SQL writes are additionally posture-gated |
 | `GET`/`DELETE` | `/api/compute/volumes[/<name>]` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
 | `GET`/`POST` | `/api/compute/{status,ipam,dns[/resolve],reconcile}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
-| `POST` | `/api/compute/maintenance/{set-health,restart,netdiag}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
+| `POST` | `/api/compute/maintenance/{set-health,restart,netdiag,reap}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right); `reap` is destructive (dry-run unless the body sets `dry_run: false`) |
+| `GET`/`POST`/`DELETE` | `/api/compute/registry-auth[/<name>]` | `system` · `admin` (node-global operator registry credentials — **not** the per-project `/api/compute/*` right; the project-scoped sibling uses `/api/projects/<p>/secrets`) |
 | `GET` | `/api/overlay/services` | `overlay` · `read` |
 | `POST` | `/api/overlay/dial` | `overlay` · `write` (mint a holder-bound dial capability) |
 | `POST` | `/api/overlay/expose` | `overlay` · `admin` — minting a **publish** capability claims a service name forward clients pin, strictly above dial's `overlay` · `write` |
@@ -150,6 +151,8 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |
 | `GET` | `/api/metrics` | `system` · `read` |
+| `GET` | `/api/node-health` | `system` · `read` (node-global disk/health + unhealthy-replica read) |
+| `GET` | `/api/instance-stats` | `system` · `read` (node-global handler-runtime stats) |
 | `GET`/`POST` | `/api/prune`, `/api/scrub` | `system` · `admin` |
 | `POST` | `/api/project-export` | `project` · `admin` *(proj, from `?project=`)* — stream a project to a `BRPROJ` bundle from a running node; a Project·Admin for X can export only X (`project-export` feature) |
 | `POST` | `/api/project-import` | `project` · `admin` *(proj, from `?project=`)* — import a `BRPROJ` bundle into a project on a running node; a Project·Admin for X can import only into X (`project-export` feature) |

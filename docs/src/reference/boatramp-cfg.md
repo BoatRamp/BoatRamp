@@ -343,7 +343,7 @@ refuse credentials over plaintext and advertise STARTTLS only before the upgrade
 | `egress_allowlist` | list | `[]` | Per-listener outbound-TCP allowlist (cap-req 19) for the guest's **host-mediated** `tcp-egress` dials: the `host:port` / `ip:port` / `CIDR:port` targets the host may dial on the guest's behalf (the host dials + terminates TLS — the guest never holds a raw socket). Takes effect only when the node posture `allow_guest_tcp_egress` is on **and** `imports` declares the `wasi:sockets` token; the dial is connect-only + SSRF-floored. Enables e.g. an imap-proxy listener dialing the IMAPS upstream. |
 | `idle_timeout_ms` | int | `60000` | Tear a connection down after this long with no bytes in either direction (in session mode, reinterpreted as the per-re-entry processing deadline). `0` is refused. |
 | `max_conn_duration_ms` | int | `3600000` | Absolute cap on a single connection's lifetime regardless of activity. `0` is refused. |
-| `max_promoted_splices` | int | `256` | **Per-listener** cap on concurrently-live **promoted** persistent splices (cap-req 22; see the escalation note below), atop the node-global `[serve.handlers].max_promoted_splices` ceiling. A multi-tenant fairness bound so one session listener can't exhaust the whole node-global splice budget; a `promote-connection` past **either** cap is refused `capacity` (retryable). Only meaningful for a `mode = "session"` listener whose guest is granted egress. `0` is refused; absent ⇒ a small fraction of the node-global ceiling. |
+| `max_promoted_splices` | int | `256` | **Per-listener** cap on concurrently-live **promoted** persistent splices (cap-req 22; see the escalation note below), atop the node-global `[handlers].max_promoted_splices` ceiling. A multi-tenant fairness bound so one session listener can't exhaust the whole node-global splice budget; a `promote-connection` past **either** cap is refused `capacity` (retryable). Only meaningful for a `mode = "session"` listener whose guest is granted egress. `0` is refused; absent ⇒ a small fraction of the node-global ceiling. |
 | `mode` | `connection` \| `session` | `connection` | How the accepted connection is driven. `connection` pins one wasm instance per connection for its whole life (exports `tcp-connection-handler`). `session` drives it through the re-entrant session model — the host owns the socket, holds no instance between batches, and a protocol-idle-but-alive peer (IMAP IDLE) is never reaped for inactivity (exports `session-handler`). |
 | `tls` | table | — | Host-side TLS termination (cap-req 06): the host terminates TLS and hands the guest a decrypted plaintext stream. Requires `cert_file` + `key_file` (PEM). Add a `starttls` sub-table (`trigger` / `response` / `tag_capture`) for in-band STARTTLS upgrade (SMTP/IMAP/POP3). Omit for a plaintext listener. |
 
@@ -386,7 +386,7 @@ same two things a `tcp-egress` dial needs.
 > never leaves the node.
 
 The persistent splice runs on its **own** budget — a node-global ceiling
-(`[serve.handlers].max_promoted_splices`) plus a per-listener sub-cap
+(`[handlers].max_promoted_splices`) plus a per-listener sub-cap
 (`max_promoted_splices` above) — separate from the session re-entry pool and the
 shared async request lane, and is torn down deterministically when either side
 closes, on `max_conn_duration_ms`, or on node shutdown. A promote past either cap is

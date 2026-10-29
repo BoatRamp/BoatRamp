@@ -138,6 +138,16 @@ boatramp compute reap <workload> --replica 0 --project <p> --execute --reclaim-v
 A replica that is live, still has a desired workload, or is younger than the grace is
 reported as `skipped` with the reason — it is never destroyed.
 
+> **Cluster caveat — reaping is node-local.** The container-liveness probe reads the
+> *local* cgroup filesystem, so the reaper can only prove a container "affirmatively gone"
+> for a replica **this** node hosts. It therefore skips, fail-closed, any orphan record
+> whose owning node is not the one running the reap — **even one you name explicitly**.
+> One consequence: a surviving node (or a new leader) **cannot** auto-reap the orphan
+> records a **decommissioned** node left behind — they carry the dead node's id, so they
+> are skipped rather than reaped against a container that might still be lingering on the
+> old host. Cleaning those up is a **per-node** action: run the reaper on a node that owns
+> the records (single-node fleets are unaffected — every record carries that node's id).
+
 ## Scrape it instead (pull)
 
 `GET /api/node-health` (admin-scoped, `System·Read`) returns the same signals for an

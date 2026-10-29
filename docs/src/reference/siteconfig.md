@@ -190,7 +190,11 @@ per-axis access grants. In `project.cfg` / `apply.cfg` RON the canonical spellin
 
 Each `TenantSource` is `{"kind":"token","claim":"tid"}` (a verified JWT claim, `claim` default
 `tid`), `{"kind":"domain"}` (the routed domain's [`contexts`](#domains) tag), `{"kind":"signed_context"}`
-(a host-verifiable envelope on an async job/message — the async-lane "own"), or `{"kind":"none"}`
+(a host-verifiable envelope on an async job/message — the async-lane "own"),
+`{"kind":"sealed_state","param":{"kind":"query","name":"state"}}` (unseal an AEAD-sealed **state
+token** off a request `query` param — or a `header` — the pre-auth OIDC-callback tenant, resolved
+from the crypto seal and never parsed from request text; a tampered/forged/expired/missing token
+resolves nothing, fail-closed), or `{"kind":"none"}`
 (anonymous — an "own" grant then fails closed).
 
 `AccessMode` is one of `none` (deny), `null` (the `tenant_id IS NULL` shared baseline only), `own`
