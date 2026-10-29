@@ -35,7 +35,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boatramp_acme::acme::{CertRequest, obtain_certificate};
+use boatramp_acme::acme::{
+    CertRequest, Dns01Solver, HickoryTxtResolver, create_account, obtain_certificate_with,
+};
 use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
 
 const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
@@ -234,7 +236,11 @@ async fn dns01_wildcard_issuance_against_pebble() {
         contact_email: Some("ops@example.test".to_string()),
         domains: vec!["*.deploy.test".to_string()],
         dns_ttl: 1,
-        propagation_delay: Duration::from_secs(1),
+        // Real readiness poll (not a blind sleep): wait up to 20s for the TXT to resolve, re-checking
+        // every 250ms. challtestsrv serves the record the instant `set-txt` returns, so the happy path
+        // observes it on the first poll and proceeds immediately.
+        propagation_wait: Duration::from_secs(20),
+        propagation_poll_interval: Duration::from_millis(250),
         timeout: Duration::from_secs(60),
         extra_root_ca: Some(ca_path.clone()),
     };
@@ -242,11 +248,27 @@ async fn dns01_wildcard_issuance_against_pebble() {
         client: reqwest::Client::new(),
     };
 
-    // The load-bearing line for the regression: `obtain_certificate` → `obtain_certificate_with`
-    // calls `order.authorizations()`, which on Pebble ≥ 2.10.0 must deserialize an authorization
-    // that carries a tokenless `dns-persist-01` challenge. instant-acme < 0.8.5 panics/errors here
-    // with `missing field \`token\``; ≥ 0.8.5 tolerates it and still selects `dns-01`.
-    let issued = obtain_certificate(&request, &provider)
+    // Point the DNS-01 propagation pre-check at challtestsrv's mock DNS (:8053) — the SAME authority
+    // Pebble's validation authority reads — so this live gate also exercises the fix: the driver waits
+    // until the `_acme-challenge` TXT is actually resolvable before telling the CA to validate. (With
+    // the system resolver it couldn't see challtestsrv and would just fall through the deadline.)
+    let resolver = HickoryTxtResolver::with_nameservers(&["127.0.0.1:8053".parse().unwrap()])
+        .expect("build a resolver pointed at challtestsrv's mock DNS");
+
+    // The load-bearing line for the regression: `order.authorizations()` on Pebble ≥ 2.10.0 must
+    // deserialize an authorization carrying a tokenless `dns-persist-01` challenge. instant-acme
+    // < 0.8.5 panics/errors here with `missing field \`token\``; ≥ 0.8.5 tolerates it and still
+    // selects `dns-01`. Driven through `obtain_certificate_with` (one explicit account) so we can
+    // inject the challtestsrv-pointed propagation resolver above.
+    let (account, _creds) = create_account(
+        &request.directory_url,
+        request.contact_email.as_deref(),
+        request.extra_root_ca.as_deref(),
+    )
+    .await
+    .expect("create an ACME account against Pebble");
+    let solver = Dns01Solver::with_resolver(&provider, request.dns_ttl, &resolver);
+    let issued = obtain_certificate_with(&account, &request, &solver)
         .await
         .expect("DNS-01 issuance against Pebble (tokenless dns-persist-01 must not break deser)");
 
@@ -261,7 +283,8 @@ async fn dns01_wildcard_issuance_against_pebble() {
     // Success marker the CI gate greps to prove the test actually RAN (not skipped) and passed.
     println!(
         "ACME-DNS-PERSIST GATE OK: issued *.deploy.test against Pebble (tokenless dns-persist-01 \
-         challenge tolerated, dns-01 still selected)"
+         challenge tolerated, dns-01 still selected, propagation pre-check observed the TXT before \
+         set_ready)"
     );
     // The challenge TXT is cleaned up after issuance.
     let (left, _) = (

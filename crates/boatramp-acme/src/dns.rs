@@ -81,6 +81,28 @@ pub trait DnsProvider: Send + Sync {
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError>;
 }
 
+/// Reads DNS **TXT** records, for the DNS-01 **propagation pre-check**: after a
+/// solver writes the `_acme-challenge` TXT via a [`DnsProvider`], the ACME driver
+/// polls one of these until the expected value is actually visible BEFORE telling
+/// the CA to validate (the CA validates immediately on that signal, so the record
+/// must already be live at the zone's nameservers — see
+/// [`acme::wait_for_propagation`](crate::acme::wait_for_propagation)).
+///
+/// Injected (like [`DnsProvider`]) so the issuance driver stays resolver-agnostic
+/// and unit-testable with a fake. A hickory-backed default,
+/// [`HickoryTxtResolver`](crate::acme::HickoryTxtResolver), ships behind the
+/// `acme` feature.
+#[async_trait]
+pub trait TxtResolver: Send + Sync {
+    /// The TXT values currently visible at `name` (each record's ≤255-byte chunks
+    /// joined into one string). An **empty** result means "nothing visible yet"
+    /// (the caller keeps waiting), which is NOT an error — a name with no TXT
+    /// records resolves to an empty vec, not `Err`. A genuine resolver/transport
+    /// failure is an `Err` (the caller treats it as "not visible yet" and retries
+    /// within the deadline).
+    async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, DnsError>;
+}
+
 /// The wildcard host that serves a site's by-id previews: `*.deploy.{host}`.
 /// One wildcard cert for this name covers every `<id>.deploy.{host}` preview.
 /// The label is `deploy` (not `_deploy`): an underscore is valid in a DNS name

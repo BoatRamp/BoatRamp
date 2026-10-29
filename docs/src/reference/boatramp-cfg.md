@@ -368,6 +368,8 @@ replicated cert).
 | `max_inflight` | int | `4` | Max concurrent in-flight issuances (global). |
 | `negative_ttl_secs` | int | `300` | How long a refused/failed SNI is negatively cached. |
 | `rate_limit_per_hour` | int | `50` | Max CA orders per rolling hour (the account rate-limit floor). `0` ⇒ unlimited. |
+| `propagation_wait_secs` | int | `15` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll (resolve the record, confirm the value), not a blind sleep. Issuance proceeds as soon as the record resolves; if this elapses first it proceeds anyway (the CA retries). Ignored for `tls-alpn-01`. |
+| `propagation_poll_interval_secs` | int | `2` | DNS-01 only: how often to re-check DNS while waiting for the TXT to propagate. |
 
 ## `security`
 

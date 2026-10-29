@@ -289,6 +289,9 @@ only — are env-settable too, so wildcard DNS-01 can be configured with no conf
 | `BOATRAMP_ACME_CACHE` | `--acme-cache` | Certificate cache directory (default `./data/acme`). |
 | `BOATRAMP_ACME_CA_CERT` | `--acme-ca-cert` | Extra root CA (PEM) to trust for the ACME server (e.g. Pebble's). |
 | `BOATRAMP_ACME_WILDCARD_PREVIEW` | `--acme-wildcard-preview` | Also issue a `*.deploy.<domain>` wildcard for preview hosts (`true`/`false`). |
+| `BOATRAMP_ACME_PROPAGATION_WAIT` | `--acme-propagation-wait-secs` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll, not a blind sleep (default `15`). |
+| `BOATRAMP_ACME_PROPAGATION_POLL_INTERVAL` | `--acme-propagation-poll-interval-secs` | DNS-01 only: how often (seconds) to re-check DNS while waiting for the TXT to propagate (default `2`). |
+| `BOATRAMP_ACME_PROPAGATION_RESOLVER` | — | DNS-01 only: override the resolver used for the propagation pre-check with a comma-separated list of `ip[:port]` recursive resolvers (UDP). Absent ⇒ the host's system resolver. Use it when the container's `/etc/resolv.conf` resolver caches negatives aggressively, or to pin a known-good public resolver (e.g. `1.1.1.1,8.8.8.8`). |
 
 An **exact** host (an apex/`www`/`console` site or cert) always wins over a wildcard,
 in both host→site routing and SNI cert selection — so `*.example.com` never shadows a

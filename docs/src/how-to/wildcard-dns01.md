@@ -59,6 +59,39 @@ acme: authorizing *.example.com, *.deploy.example.com via dns-01
 acme: certificate issued (expires 2026-10-07)
 ```
 
+## Wait for DNS propagation
+
+After writing the `_acme-challenge` TXT, boatramp **waits until the record is
+actually visible** in your zone before it tells the CA to validate — the CA
+checks the record the moment it is told to, so validating before the record has
+propagated is what makes an order fail (`challenge failed`) and a cert
+crash-loop. boatramp resolves the `_acme-challenge` name and only proceeds once
+the expected value appears:
+
+```text
+acme: published _acme-challenge.example.com TXT, waiting for propagation
+acme: _acme-challenge.example.com observed; validating
+acme: certificate issued (expires 2026-10-07)
+```
+
+The wait is a real readiness poll, not a fixed sleep:
+
+- `--acme-propagation-wait-secs` (env `BOATRAMP_ACME_PROPAGATION_WAIT`, default
+  `15`) is the **maximum** time to wait. Issuance proceeds the instant the record
+  resolves; if the wait elapses first, boatramp logs a warning and tells the CA to
+  validate anyway (the CA retries on its own), so a slow-propagating zone still
+  gets a cert rather than crashing.
+- `--acme-propagation-poll-interval-secs` (env
+  `BOATRAMP_ACME_PROPAGATION_POLL_INTERVAL`, default `2`) is how often it
+  re-checks DNS.
+- `BOATRAMP_ACME_PROPAGATION_RESOLVER` overrides the resolver used for the check
+  with a comma-separated `ip[:port]` list (UDP) — useful when the container's own
+  resolver caches negative answers aggressively; e.g.
+  `BOATRAMP_ACME_PROPAGATION_RESOLVER=1.1.1.1,8.8.8.8`.
+
+For the on-demand per-SNI issuer, the same knobs live under
+`[serve.on_demand_tls]` as `propagation_wait_secs` / `propagation_poll_interval_secs`.
+
 ## Publish the TXT record by hand
 
 Without a provider account, use the default `manual` provider. boatramp prints
