@@ -349,6 +349,31 @@ A listener's optional `tls` block may set `on_demand = true` to share the
 `[serve.on_demand_tls]` engine for per-SNI issuance on a verified custom domain in
 its own project.
 
+#### Session→connection escalation (`promote-connection`, cap-req 22)
+
+A `mode = "session"` listener guest may, **after it has authenticated the
+connection**, call `session::promote-connection(host, port, tls, sni, preamble)`
+to escalate that one connection out of the re-entrant session model into a
+**persistent duplex splice** — the transparent imap-proxy bridge. The host dials the
+guest-named upstream through the **same** egress/connect gate every `tcp-egress`
+dial uses (the `allow_guest_tcp_egress` posture + this listener's
+`egress_allowlist` + the `is_global_ip` SSRF floor), optionally terminating TLS
+(`implicit-tls`, e.g. a legacy IMAPS `:993` upstream), writes the guest's `preamble`
+(e.g. a replayed, client-tagged `LOGIN`), then splices the client ↔ upstream
+bidirectionally for the rest of the connection's life. After a successful promote
+**no further `session-handler` re-entry** occurs on that connection.
+
+Promotion is **fail-closed and adds no new reach**: an upstream the guest is not
+already allowed to `tcp-egress`-dial (posture off, not in `egress_allowlist`, or an
+SSRF-floored private address) is refused `not-authorized`, and the session simply
+continues in the re-entry model. So an imap-proxy listener bridging to a legacy
+IMAPS server must declare the IMAPS upstream in `egress_allowlist` (and the node
+posture `allow_guest_tcp_egress` must be on) — the same grant a `tcp-egress` dial
+needs. The persistent splice runs on its **own** node-global budget, separate from
+the session re-entry pool and the shared async request lane, and is torn down
+deterministically when either side closes, on `max_conn_duration_ms`, or on node
+shutdown.
+
 ### `serve.on_demand_tls`
 
 **On-demand per-SNI TLS** issuance at scale. Off unless `enabled`. When on, the

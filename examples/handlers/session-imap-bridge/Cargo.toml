@@ -1,0 +1,23 @@
+# Example WebAssembly *session* guest (mailroom cap-req #22 — session→connection escalation): a
+# transparent imap-proxy-style bridge. It greets the client (server-speaks-first), and on a `BRIDGE
+# <host> <port>` command it calls `session::promote-connection` to escalate the connection into a
+# PERSISTENT duplex splice to the named upstream — the host dialing it through the SAME egress gate as
+# `tcp-egress`. On a refused promote it replies `REFUSED` and stays in the re-entry session model.
+# Proves the promote mechanism (duplex splice + persistence + fail-closed) end to end; built to a
+# component with `cargo build --release --target wasm32-wasip2` and consumed as a fixture by the
+# session-listener live-capability gate. Excluded from the workspace (targets wasm).
+[package]
+name = "boatramp-example-session-imap-bridge"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

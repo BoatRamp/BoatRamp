@@ -98,7 +98,28 @@ pub(crate) fn controller(
 // ---- socket-driven session controller (cap-req 08) ------------------------------------------------
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "tcp-egress")]
+use std::time::Duration;
+#[cfg(feature = "tcp-egress")]
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+
+/// Upper bound on the opaque `promote-connection` preamble (cap-req 22): the bytes the host writes to
+/// the authorized upstream before splicing (e.g. a replayed `LOGIN`). A protocol auth line is small;
+/// this bounds a runaway guest while comfortably fitting a replayed credential exchange.
+#[cfg(feature = "tcp-egress")]
+pub(crate) const MAX_PROMOTE_PREAMBLE_BYTES: usize = 64 * 1024;
+
+/// Splice copy-buffer size per direction (cap-req 22) — the duplex relay moves bounded chunks each
+/// way, flushing after each so an interactive protocol (IMAP) stays responsive.
+#[cfg(feature = "tcp-egress")]
+const SPLICE_BUF: usize = 32 * 1024;
+
+/// Idle bound for a promoted duplex splice (cap-req 22): tear it down after this long with NO bytes
+/// in EITHER direction, so a silently-dead peer (no FIN) is reaped. Generous enough for an IMAP IDLE
+/// connection (which re-arms well within 29 min); the absolute `max_conn_duration` still caps overall.
+#[cfg(feature = "tcp-egress")]
+const PROMOTED_SPLICE_IDLE: Duration = Duration::from_secs(1740);
 
 /// The boxed async write half of a listener socket, shared between the connection driver and each
 /// re-entry's [`SocketSessionController`]. The `tokio::sync::Mutex` serializes guest `send`s (which run
@@ -115,6 +136,12 @@ pub(crate) struct SocketSessionState {
     checkpoint: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     closed: Arc<AtomicBool>,
     cursor: Arc<AtomicU64>,
+    /// The ONE-SHOT promotion request (cap-req 22): set by the controller's `promote` during a
+    /// re-entry (carrying the already-dialed, gate-authorized upstream + the held splice permit),
+    /// taken by the connection driver AFTER the re-entry returns to run the persistent splice.
+    /// `std::sync::Mutex` (not tokio) — only ever a quick set/take, never held across an `.await`.
+    #[cfg(feature = "tcp-egress")]
+    promotion: Arc<std::sync::Mutex<Option<Promotion>>>,
 }
 
 impl SocketSessionState {
@@ -124,7 +151,50 @@ impl SocketSessionState {
             checkpoint: Arc::new(std::sync::Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
             cursor: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "tcp-egress")]
+            promotion: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Record a promotion request (cap-req 22) — the controller calls this once the upstream is
+    /// dialed + authorized. Returns `false` (so the caller drops the dialed upstream + splice permit,
+    /// fail-closed) if the session is already closed or a promotion is already pending (double
+    /// promote). The driver takes it with [`take_promotion`](Self::take_promotion) after the re-entry.
+    #[cfg(feature = "tcp-egress")]
+    pub(crate) fn set_promotion(&self, promo: Promotion) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut g) = self.promotion.lock() else {
+            return false;
+        };
+        if g.is_some() {
+            return false;
+        }
+        *g = Some(promo);
+        true
+    }
+
+    /// Whether a promotion has already been requested on this connection (guards a double promote
+    /// within one re-entry before the driver takes it).
+    #[cfg(feature = "tcp-egress")]
+    pub(crate) fn is_promotion_pending(&self) -> bool {
+        self.promotion.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Take the pending promotion request, if any (the driver's post-re-entry check).
+    #[cfg(feature = "tcp-egress")]
+    pub(crate) fn take_promotion(&self) -> Option<Promotion> {
+        self.promotion.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Reclaim the socket write half for the splice (cap-req 22), replacing it with a sink so the
+    /// shared cell stays valid. Sound because promotion ends the re-entry model: no controller will
+    /// `send` again on this connection, so nothing else races for the writer.
+    #[cfg(feature = "tcp-egress")]
+    pub(crate) async fn take_write_half(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Unpin> {
+        let mut w = self.write.lock().await;
+        std::mem::replace(&mut *w, Box::new(tokio::io::sink()))
     }
     /// The current resume checkpoint (the `resumed` for the next re-entry's batch).
     pub(crate) fn checkpoint_snapshot(&self) -> Option<Vec<u8>> {
@@ -156,6 +226,11 @@ pub(crate) struct SocketSessionController {
     state: SocketSessionState,
     max_frame_bytes: usize,
     max_checkpoint_bytes: usize,
+    /// Promote support (cap-req 22): `Some` ⇒ this listener can escalate to a persistent splice via
+    /// the reused egress gate; `None` (no `tcp-egress` feature / posture) ⇒ `promote` fail-closes
+    /// `not-authorized`. The dialer + splice-ceiling gate are built once per connection by the driver.
+    #[cfg(feature = "tcp-egress")]
+    promote: Option<PromoteCtx>,
 }
 
 impl SocketSessionController {
@@ -168,7 +243,57 @@ impl SocketSessionController {
             state,
             max_frame_bytes,
             max_checkpoint_bytes,
+            #[cfg(feature = "tcp-egress")]
+            promote: None,
         }
+    }
+
+    /// Attach promote-connection support (cap-req 22) — the egress dialer (reusing the SAME gate as
+    /// `tcp-egress`) + the node-global persistent-splice ceiling. Built once per connection and
+    /// cloned into each re-entry's controller by the driver.
+    #[cfg(feature = "tcp-egress")]
+    pub(crate) fn with_promote(mut self, ctx: PromoteCtx) -> Self {
+        self.promote = Some(ctx);
+        self
+    }
+}
+
+/// Everything the socket controller needs to service a `promote-connection` (cap-req 22): the
+/// gate-reusing egress dialer scoped to this listener's `egress_allowlist`, the node-global
+/// persistent-splice ceiling, and the preamble cap. Built once per connection (see
+/// `dispatch_session_connection`) and cloned cheaply into each re-entry's controller.
+#[cfg(feature = "tcp-egress")]
+#[derive(Clone)]
+pub(crate) struct PromoteCtx {
+    pub dialer: Arc<boatramp_handlers::EgressDialer>,
+    pub splice_gate: Arc<tokio::sync::Semaphore>,
+    pub max_preamble_bytes: usize,
+}
+
+/// A recorded, already-authorized promotion (cap-req 22): the split halves of the host-dialed
+/// upstream (DECRYPTED application bytes), the preamble to write before splicing, and the held
+/// node-global splice permit (released when this drops — i.e. when the splice ends).
+#[cfg(feature = "tcp-egress")]
+pub(crate) struct Promotion {
+    pub upstream_read: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    pub upstream_write: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    pub preamble: Vec<u8>,
+    /// Held for the splice's whole life; dropping it releases the node-global promoted-splice budget.
+    pub _splice_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Map a reused-egress-gate error to the guest-facing `PromoteError` (cap-req 22). A gate refusal is
+/// UNDIFFERENTIATED (`NotAuthorized`) so the guest can't probe which check failed or map topology;
+/// dial failures are coarse + client-safe (the `EgressError` reasons are already sanitized).
+#[cfg(feature = "tcp-egress")]
+fn map_egress_err(e: boatramp_handlers::EgressError) -> boatramp_handlers::PromoteError {
+    use boatramp_handlers::{EgressError as E, PromoteError as P};
+    match e {
+        E::RefusedByGate => P::NotAuthorized,
+        E::DnsFailure => P::UpstreamUnreachable("dns".into()),
+        E::ConnectTimeout => P::UpstreamUnreachable("connect timeout".into()),
+        E::ConnectFailed(m) | E::TlsFailure(m) | E::Other(m) => P::UpstreamUnreachable(m),
+        E::UnsupportedVerifyMode => P::UpstreamUnreachable("tls".into()),
     }
 }
 
@@ -217,6 +342,169 @@ impl SessionController for SocketSessionController {
         let _ = w.shutdown().await;
         Ok(())
     }
+
+    async fn promote(
+        &self,
+        req: boatramp_handlers::PromoteRequest,
+    ) -> Result<(), boatramp_handlers::PromoteError> {
+        use boatramp_handlers::PromoteError as P;
+        // Fail-closed up front: a closed connection cannot be (re-)spliced.
+        if self.state.is_closed() {
+            return Err(P::NotPromotable);
+        }
+        #[cfg(feature = "tcp-egress")]
+        {
+            // Already promoting on this connection (double promote within one re-entry) — fail-closed.
+            if self.state.is_promotion_pending() {
+                return Err(P::NotPromotable);
+            }
+            // No dialer ⇒ the `tcp-egress` posture is off / not wired for this listener ⇒ the guest
+            // could not dial this upstream at all ⇒ undifferentiated `not-authorized` (fail-closed).
+            let Some(ctx) = &self.promote else {
+                return Err(P::NotAuthorized);
+            };
+            if req.preamble.len() > ctx.max_preamble_bytes {
+                return Err(P::PreambleTooLarge);
+            }
+            // Acquire the node-global splice permit BEFORE dialing: a ceiling refusal must cost no
+            // dial, and the permit is then held for the splice's whole life (inside `Promotion`).
+            let Ok(permit) = Arc::clone(&ctx.splice_gate).try_acquire_owned() else {
+                return Err(P::Capacity);
+            };
+            // Dial the upstream through the EXACT reused egress/connect gate (posture + this
+            // listener's `egress_allowlist` + SSRF floor + DNS-rebinding choke). NOT a new bypass.
+            let tls = match req.tls {
+                boatramp_handlers::PromoteTls::Plaintext => boatramp_handlers::DialTls::Plaintext,
+                boatramp_handlers::PromoteTls::ImplicitTls => {
+                    boatramp_handlers::DialTls::ImplicitTls {
+                        sni: req.sni.clone().unwrap_or_else(|| req.host.clone()),
+                    }
+                }
+            };
+            let (upstream_read, upstream_write) =
+                match ctx.dialer.dial(&req.host, req.port, tls).await {
+                    Ok(halves) => halves,
+                    Err(e) => {
+                        drop(permit); // release the splice slot — the dial did not take it
+                        return Err(map_egress_err(e));
+                    }
+                };
+            let promo = Promotion {
+                upstream_read,
+                upstream_write,
+                preamble: req.preamble,
+                _splice_permit: permit,
+            };
+            // Hand it to the driver. A lost race (closed/double-promote since the checks above) drops
+            // `promo` here — closing the freshly-dialed upstream + releasing the permit (fail-closed).
+            if self.state.set_promotion(promo) {
+                Ok(())
+            } else {
+                Err(P::NotPromotable)
+            }
+        }
+        #[cfg(not(feature = "tcp-egress"))]
+        {
+            // No outbound egress capability compiled in — there is no authorized way to dial an
+            // upstream, so promote is unreachable here. Fail-closed, undifferentiated.
+            let _ = req;
+            Err(P::NotAuthorized)
+        }
+    }
+}
+
+/// Drive a PROMOTED connection's persistent duplex splice (cap-req 22): write the guest's preamble to
+/// the (already gate-authorized) upstream, then relay client <-> upstream both ways until either side
+/// closes, the connection's absolute `deadline` fires, or the splice idles out. Runs in the listener's
+/// own per-connection task — NOT the session re-entry pool and NOT the shared async lane (the last
+/// re-entry future already completed, releasing its session-socket permit, before this begins). The
+/// node-global splice permit lives inside `promo` and releases when this returns. Teardown is
+/// deterministic: returning drops every half (closing both sockets) and the two pump futures.
+#[cfg(feature = "tcp-egress")]
+pub(crate) async fn run_promoted_splice<R>(
+    client_read: R,
+    client_write: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    promo: Promotion,
+    deadline: tokio::time::Instant,
+    peer: &str,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    let Promotion {
+        upstream_read,
+        mut upstream_write,
+        preamble,
+        _splice_permit,
+    } = promo;
+
+    // Write the preamble to the upstream BEFORE splicing (e.g. the replayed, client-tagged LOGIN).
+    // Bounded by the idle budget so a wedged upstream can't pin the task. A failure here means the
+    // upstream died before the splice — tear down (returning closes both sides).
+    if !preamble.is_empty() {
+        match tokio::time::timeout(PROMOTED_SPLICE_IDLE, upstream_write.write_all(&preamble)).await
+        {
+            Ok(Ok(())) => {
+                let _ = tokio::time::timeout(PROMOTED_SPLICE_IDLE, upstream_write.flush()).await;
+            }
+            _ => {
+                tracing::debug!(%peer, "promoted splice: upstream preamble write failed; closing");
+                return Ok(());
+            }
+        }
+    }
+
+    // Shared last-activity clock across both directions for the idle watchdog.
+    let last = Arc::new(AtomicU64::new(now_unix_ms()));
+    let c2u = pump_half(client_read, upstream_write, Arc::clone(&last));
+    let u2c = pump_half(upstream_read, client_write, Arc::clone(&last));
+    tokio::pin!(c2u, u2c);
+
+    // Re-arm the idle check each loop; the absolute deadline is a hard backstop.
+    let idle_tick = PROMOTED_SPLICE_IDLE
+        .min(Duration::from_secs(30))
+        .max(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            _ = &mut c2u => { tracing::debug!(%peer, "promoted splice: client->upstream ended; closing"); break; }
+            _ = &mut u2c => { tracing::debug!(%peer, "promoted splice: upstream->client ended; closing"); break; }
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::debug!(%peer, "promoted splice: hit max_conn_duration; closing");
+                break;
+            }
+            _ = tokio::time::sleep(idle_tick) => {
+                let quiet = now_unix_ms().saturating_sub(last.load(Ordering::Relaxed));
+                if quiet >= PROMOTED_SPLICE_IDLE.as_millis() as u64 {
+                    tracing::debug!(%peer, "promoted splice: idle timeout; closing");
+                    break;
+                }
+            }
+        }
+    }
+    // Returning drops `upstream_*` / `client_*` (both sockets close) + `_splice_permit` (budget freed).
+    Ok(())
+}
+
+/// One direction of the duplex splice: copy `r -> w` in bounded chunks, flushing after each so an
+/// interactive protocol stays responsive, updating the shared activity clock. Ends on EOF (0-byte
+/// read) — best-effort shutting the write half — or any read/write error.
+#[cfg(feature = "tcp-egress")]
+async fn pump_half<Rd, Wr>(mut r: Rd, mut w: Wr, last: Arc<AtomicU64>) -> std::io::Result<()>
+where
+    Rd: tokio::io::AsyncRead + Unpin,
+    Wr: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; SPLICE_BUF];
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            let _ = w.shutdown().await;
+            return Ok(());
+        }
+        last.store(now_unix_ms(), Ordering::Relaxed);
+        w.write_all(&buf[..n]).await?;
+        w.flush().await?;
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +515,86 @@ mod tests {
 
     fn store() -> SessionStore {
         SessionStore::new(Arc::new(MemoryKv::new()), SessionLimits::default())
+    }
+
+    // ---- cap-req 22: promote-connection fail-closed branches -------------------------------------
+
+    fn promote_req() -> boatramp_handlers::PromoteRequest {
+        boatramp_handlers::PromoteRequest {
+            host: "upstream.invalid".into(),
+            port: 143,
+            tls: boatramp_handlers::PromoteTls::Plaintext,
+            sni: None,
+            preamble: Vec::new(),
+        }
+    }
+
+    fn socket_state() -> SocketSessionState {
+        let (_client, server) = tokio::io::duplex(64);
+        let (_sr, sw) = tokio::io::split(server);
+        SocketSessionState::new(Arc::new(tokio::sync::Mutex::new(Box::new(sw))))
+    }
+
+    // The DEFAULT `SessionController::promote` (e.g. the KV/SSE `ServerSessionController`) refuses —
+    // only a socket-driven listener session can be spliced. Fail-closed by construction.
+    #[tokio::test]
+    async fn non_socket_controller_refuses_promote() {
+        let ctl = ServerSessionController::new(store(), "acme", "sess");
+        assert!(matches!(
+            SessionController::promote(&ctl, promote_req()).await,
+            Err(boatramp_handlers::PromoteError::NotPromotable)
+        ));
+    }
+
+    // A socket controller with NO promote context (the `tcp-egress` posture off / not wired) refuses
+    // UNDIFFERENTIATED `not-authorized` — the guest could not have dialed the upstream at all.
+    #[tokio::test]
+    async fn socket_controller_without_dialer_is_not_authorized() {
+        let ctl = SocketSessionController::new(socket_state(), 8, 8);
+        assert!(matches!(
+            SessionController::promote(&ctl, promote_req()).await,
+            Err(boatramp_handlers::PromoteError::NotAuthorized)
+        ));
+    }
+
+    // A closed session cannot be promoted (fail-closed up front, before any dial).
+    #[tokio::test]
+    async fn closed_session_is_not_promotable() {
+        let state = socket_state();
+        let ctl = SocketSessionController::new(state.clone(), 8, 8);
+        ctl.close("done".into()).await.unwrap();
+        assert!(matches!(
+            SessionController::promote(&ctl, promote_req()).await,
+            Err(boatramp_handlers::PromoteError::NotPromotable)
+        ));
+    }
+
+    // The promotion cell is one-shot: a second `set_promotion` is refused (so a racing double-promote
+    // drops its freshly-dialed upstream + splice permit), `take_promotion` yields it exactly once, and
+    // `take_write_half` reclaims the socket writer (replacing it with a sink).
+    #[cfg(feature = "tcp-egress")]
+    #[tokio::test]
+    async fn promotion_cell_is_one_shot_and_write_half_reclaims() {
+        let state = socket_state();
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let mk = |g: &Arc<tokio::sync::Semaphore>| Promotion {
+            upstream_read: Box::new(tokio::io::empty()),
+            upstream_write: Box::new(tokio::io::sink()),
+            preamble: b"pre".to_vec(),
+            _splice_permit: Arc::clone(g).try_acquire_owned().unwrap(),
+        };
+        assert!(state.set_promotion(mk(&gate)));
+        assert!(state.is_promotion_pending());
+        // Already pending ⇒ a second set is refused (fail-closed against double promote).
+        assert!(!state.set_promotion(mk(&gate)));
+        let taken = state.take_promotion().expect("one pending promotion");
+        assert_eq!(taken.preamble, b"pre");
+        assert!(
+            state.take_promotion().is_none(),
+            "the cell is drained after a take"
+        );
+        // The write half can be reclaimed for the splice.
+        let _writer = state.take_write_half().await;
     }
 
     #[tokio::test]

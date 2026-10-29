@@ -84,12 +84,18 @@ pub use bindings::messaging_stats::{
 #[cfg(feature = "migrate")]
 pub use bindings::migrate::MigrateBinding;
 #[cfg(feature = "session")]
-pub use bindings::session::{SessionBinding, SessionController, SessionError};
+pub use bindings::session::{
+    PromoteError, PromoteRequest, PromoteTls, SessionBinding, SessionController, SessionError,
+};
 /// The live per-connection wire-security handle for a host-owned listener connection (mailroom
 /// cap-req #16) — the serve layer constructs one per connection and threads it into the engine
 /// dispatch + (for STARTTLS) the pump.
 #[cfg(feature = "tcp-listener")]
 pub use bindings::tcp_connection_context::ConnectionSecurity;
+/// A reusable host-mediated outbound dialer (mailroom cap-req #22) reusing the EXACT `tcp-egress`
+/// egress/connect gate — used by a session guest's `promote-connection` to dial the splice upstream.
+#[cfg(all(feature = "tcp-egress", feature = "engine"))]
+pub use bindings::tcp_egress::{DialTls, EgressDialer, EgressError};
 #[cfg(feature = "messaging")]
 pub use bindings::tenancy::{ProducerContextSource, SealedPrincipal};
 #[cfg(feature = "tenant-secrets")]

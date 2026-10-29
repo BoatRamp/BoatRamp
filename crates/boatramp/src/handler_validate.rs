@@ -232,7 +232,13 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 10, 0);
+    ///
+    /// `0.11.0` (mailroom cap-req #22): the `session` capability gained
+    /// `promote-connection` (session→connection escalation — the persistent duplex
+    /// splice). It rides the EXISTING `session` import/grant (no new grant kind), so a
+    /// pre-#22 host that lacks the host-side splice simply rejects the unknown func at
+    /// link — the loud-fail the surface bump makes visible.
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 11, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]

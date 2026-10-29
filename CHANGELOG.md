@@ -5,6 +5,29 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+
+- **Session→connection escalation (`promote-connection`, mailroom cap-req #22).** A `mode =
+  "session"` inbound-TCP listener guest may, **after authenticating the connection**, call
+  `session::promote-connection(host, port, tls, sni, preamble)` to escalate that one connection out
+  of the re-entrant session model into a **persistent duplex splice** — a long-lived authenticated
+  upstream socket spliced bidirectionally with the client for the connection's life (the transparent
+  imap-proxy bridge, so a legacy-IMAPS mid-migration bridge no longer needs a native serving
+  process). The host dials the guest-named upstream through the **same** egress/connect gate every
+  `tcp-egress` dial uses (the `allow_guest_tcp_egress` posture + the listener's `egress_allowlist` +
+  the `is_global_ip` SSRF floor + the DNS-rebinding choke), optionally terminating TLS
+  (`implicit-tls`), writes the guest's `preamble` (e.g. a replayed, client-tagged `LOGIN`), then
+  splices both ways — waking on **both** directions, with the upstream socket **persisting** across
+  what were per-frame hibernation points. Promotion is **fail-closed and widens nothing**: an
+  upstream the guest could not already `tcp-egress`-dial is refused `not-authorized` and the session
+  continues in the re-entry model. The persistent splice runs on its **own** node-global budget —
+  never the session re-entry pool or the shared async request lane (the v0.36.0 lane-isolation
+  lesson) — and is torn down deterministically on either side closing, on `max_conn_duration_ms`, or
+  on node shutdown. Guest-facing WIT addition (`session.promote-connection`, off-by-default
+  feature-gated in `boatramp-uchron-compat`); `HOST_HANDLERS_VERSION` → `0.11.0`.
+
 ## [0.43.0] - 2026-10-22
 
 This release completes the overlay fabric's **enrollment & pairing** program and the **project

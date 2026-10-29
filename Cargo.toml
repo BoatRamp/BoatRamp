@@ -42,6 +42,7 @@ exclude = [
   "examples/handlers/event-consumer",
   "examples/handlers/session-echo",
   "examples/handlers/session-greet",
+  "examples/handlers/session-imap-bridge",
   "examples/handlers/invoke-caller",
   "examples/handlers/graphql-run-caller",
   "examples/handlers/graphql-accounts",

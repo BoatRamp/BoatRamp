@@ -59,6 +59,14 @@ const SESSION_ECHO: &[u8] =
 #[cfg(feature = "session")]
 const SESSION_GREET: &[u8] =
     include_bytes!("../../boatramp-handlers/tests/fixtures/session-greet.wasm");
+/// A `session-handler` guest (mailroom cap-req #22 — session→connection escalation): greets, then on
+/// a `BRIDGE <host> <port>` frame calls `session::promote-connection` to escalate the connection to a
+/// persistent duplex splice to the named upstream (host-dialed through the reused egress gate); on a
+/// refused promote it replies `REFUSED` and stays in the session model. See
+/// `examples/handlers/session-imap-bridge`.
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+const SESSION_IMAP_BRIDGE: &[u8] =
+    include_bytes!("../../boatramp-handlers/tests/fixtures/session-imap-bridge.wasm");
 
 const SITE: &str = "edgesite";
 const COMPONENT: &str = "tcp/handler.wasm";
@@ -986,5 +994,452 @@ async fn session_listener_live_connect_greeting_before_client_speaks() {
         "SESSION CONNECT GREETING OK: a server-speaks-first guest greeted at connect — BEFORE the \
          client wrote anything — then normal re-entry continued unaffected (one frame echoed), and \
          the connection tore down cleanly on EOF."
+    );
+}
+
+// ===================== cap-req 22: session→connection escalation (promote) =========================
+
+/// Like [`live_runtime`] but with host-mediated `tcp-egress` + private-egress ON (the fake upstreams
+/// are on loopback, which the SSRF floor would otherwise refuse) and a controllable `max_concurrency`
+/// so the lane-isolation scenario can size the session-socket re-entry pool down to 1.
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+async fn live_runtime_egress(
+    component_wasm: &'static [u8],
+    seq: u32,
+    max_concurrency: usize,
+) -> (HandlerRuntime, DeployStore) {
+    let kv = Arc::new(MemoryKv::new());
+    let dir = std::env::temp_dir().join(format!("br-tcp-promote-{}-{seq}", std::process::id()));
+    let storage = Arc::new(FsStorage::new(dir));
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let hash = sha256_hex(component_wasm);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(component_wasm)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        COMPONENT.to_string(),
+        FileEntry {
+            hash,
+            size: component_wasm.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig::default(),
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, SITE, &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            SITE,
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(
+        Limits {
+            max_concurrency,
+            ..Limits::default()
+        },
+        16,
+    )
+    .unwrap()
+    .with_tcp_listener(true)
+    .with_tcp_egress(true)
+    .with_private_egress(true)
+    .with_tcp_egress_timeouts(Duration::from_secs(2), Duration::from_secs(10));
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    (runtime, deploy)
+}
+
+/// Drive ONE accepted session connection through `dispatch_session_connection` with a given
+/// `egress_allowlist` (the promote authorization). Returns the dispatch handle + the listener addr.
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+async fn bind_and_serve_session_egress(
+    runtime: HandlerRuntime,
+    deploy: DeployStore,
+    max_dur: Duration,
+    egress_allowlist: Vec<String>,
+) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let (read_half, write_half) = stream.into_split();
+        let fn_config = FunctionConfig {
+            egress_allowlist,
+            ..FunctionConfig::default()
+        };
+        runtime
+            .dispatch_session_connection(
+                &deploy,
+                ProjectRef::DEFAULT.as_str(),
+                SITE,
+                COMPONENT,
+                &fn_config,
+                peer.to_string(),
+                read_half,
+                write_half,
+                Duration::from_secs(5),
+                max_dur,
+                boatramp_handlers::ConnectionSecurity::plaintext(),
+            )
+            .await
+    });
+    (handle, addr)
+}
+
+/// A one-shot fake upstream: accept exactly one connection and hand its socket back over a channel,
+/// so the test plays the upstream end of a promoted splice directly.
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+async fn spawn_one_shot_upstream() -> (
+    tokio::sync::oneshot::Receiver<TcpStream>,
+    std::net::SocketAddr,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((s, _)) = listener.accept().await {
+            let _ = s.set_nodelay(true);
+            let _ = tx.send(s);
+        }
+    });
+    (rx, addr)
+}
+
+/// cap-req 22 PROMOTE (session→connection escalation) load-bearing live gate. Drives a REAL
+/// `session-imap-bridge` guest over REAL loopback sockets and proves the four properties #22 promises,
+/// each within a bounded wall-clock so a regression turns the test RED:
+///
+///   1. **DUPLEX + PERSISTENCE + close-teardown**: after greeting, a `BRIDGE` command promotes the
+///      connection; the host writes the guest's preamble to the (gate-authorized) upstream, then
+///      splices BOTH ways for the whole session — proven by 20 interleaved client↔upstream exchanges
+///      that each would have been a separate re-entry, with `session.instantiations` UNCHANGED across
+///      them (the upstream socket persisted; the guest was never re-entered). Closing the client tears
+///      the splice down and closes the upstream socket.
+///   2. **MAX-DURATION teardown**: an idle live splice is reaped at the absolute `max_conn_duration`.
+///   3. **FAIL-CLOSED**: promoting to an upstream NOT in the listener's `egress_allowlist` is refused
+///      by the REUSED egress/connect gate (`not-authorized`) — the guest replies `REFUSED`, NO splice
+///      happens, and the session keeps serving re-entries. (Mutation-verified for free: the dial goes
+///      through `resolve_and_gate_tcp_egress`, whose gate carries the `BOATRAMP_TCPEGRESS_MUTATION`
+///      anti-hollow seam — neutering the gate turns this assertion RED.)
+///   4. **LANE ISOLATION (v0.36.0 lesson)**: with the session-socket re-entry pool sized to 1, a
+///      SECOND connection's re-entries still complete PROMPTLY while the first connection's splice is
+///      live — proving the long-held duplex splice holds NO re-entry permit (and thus cannot starve
+///      the re-entry pool or the shared async lane).
+#[cfg(all(feature = "session", feature = "tcp-egress"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
+    const GREETING: &[u8] = b"* OK session-imap-bridge ready\r\n";
+    const PREAMBLE: &[u8] = b"PREAMBLE\r\n";
+
+    async fn read_line(c: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+                .await
+                .expect("read_line timed out")
+                .expect("read_line failed");
+            buf.push(b[0]);
+            if b[0] == b'\n' {
+                break;
+            }
+        }
+        buf
+    }
+    async fn read_exact_timed(s: &mut TcpStream, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+            .await
+            .expect("splice read timed out")
+            .expect("splice read failed");
+        buf
+    }
+
+    // ---- 1. DUPLEX + PERSISTENCE + CLOSE TEARDOWN ------------------------------------------------
+    {
+        let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 60, 4).await;
+        let (up_rx, up_addr) = spawn_one_shot_upstream().await;
+        let (handle, addr) = bind_and_serve_session_egress(
+            runtime.clone(),
+            deploy,
+            Duration::from_secs(30),
+            vec![format!("127.0.0.1:{}", up_addr.port())],
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        assert_eq!(
+            &read_line(&mut client).await,
+            GREETING,
+            "connect-time greeting"
+        );
+
+        // Promote: the host dials the (allowlisted) upstream + writes the preamble, then splices.
+        client
+            .write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
+            .await
+            .unwrap();
+        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+            .await
+            .expect("the host never dialed the upstream (promote failed?)")
+            .expect("upstream sender dropped");
+        assert_eq!(
+            &read_exact_timed(&mut up, PREAMBLE.len()).await,
+            PREAMBLE,
+            "the host writes the guest preamble to the upstream BEFORE splicing"
+        );
+
+        // First duplex exchange — the splice is now live.
+        client.write_all(b"ping-01").await.unwrap();
+        assert_eq!(
+            &read_exact_timed(&mut up, 7).await,
+            b"ping-01",
+            "client -> upstream"
+        );
+        up.write_all(b"pong-01").await.unwrap();
+        assert_eq!(
+            &read_exact_timed(&mut client, 7).await,
+            b"pong-01",
+            "upstream -> client"
+        );
+
+        // PERSISTENCE: capture the instantiation count now (the promote re-entry is done) and prove it
+        // does NOT move across 19 more interleaved exchanges — the splice never re-enters the guest,
+        // and the ONE upstream socket persists across what each would have been a hibernation point.
+        let insts_baseline = runtime
+            .instance_stats()
+            .expect("engine present")
+            .session
+            .instantiations;
+        for i in 2..=20u8 {
+            let req = format!("ping-{i:02}");
+            client.write_all(req.as_bytes()).await.unwrap();
+            assert_eq!(read_exact_timed(&mut up, req.len()).await, req.as_bytes());
+            let rsp = format!("pong-{i:02}");
+            up.write_all(rsp.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_exact_timed(&mut client, rsp.len()).await,
+                rsp.as_bytes()
+            );
+        }
+        let insts_after = runtime
+            .instance_stats()
+            .expect("engine present")
+            .session
+            .instantiations;
+        assert_eq!(
+            insts_after, insts_baseline,
+            "a promoted splice must NOT re-enter the guest (the upstream socket persists; the duplex \
+             relay runs entirely off the re-entry model)"
+        );
+
+        // CLOSE TEARDOWN: drop the client -> the splice ends -> the upstream socket is closed (EOF).
+        drop(client);
+        let mut tail = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), up.read(&mut tail))
+            .await
+            .expect("upstream EOF timed out")
+            .expect("upstream read failed");
+        assert_eq!(
+            n, 0,
+            "closing the client tears the splice down + closes the upstream socket"
+        );
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "promote-splice-close").await;
+        assert!(
+            res.is_ok(),
+            "promoted splice ends cleanly on client close: {res:?}"
+        );
+    }
+
+    // ---- 2. MAX-DURATION TEARDOWN of a live splice -----------------------------------------------
+    {
+        let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 61, 4).await;
+        let (up_rx, up_addr) = spawn_one_shot_upstream().await;
+        let (handle, addr) = bind_and_serve_session_egress(
+            runtime,
+            deploy,
+            Duration::from_secs(2), // short absolute cap
+            vec![format!("127.0.0.1:{}", up_addr.port())],
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        let _ = read_line(&mut client).await;
+        client
+            .write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
+            .await
+            .unwrap();
+        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+            .await
+            .expect("upstream dial timed out")
+            .expect("upstream sender dropped");
+        let _ = read_exact_timed(&mut up, PREAMBLE.len()).await;
+        // Idle (no bytes either way) -> the absolute max_conn_duration must reap the live splice.
+        let (res, elapsed) =
+            await_dispatch(handle, Duration::from_secs(8), "promote-splice-maxdur").await;
+        assert!(
+            res.is_ok(),
+            "promoted splice ends on max_conn_duration: {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "max-duration must bound an idle live splice ({elapsed:?})"
+        );
+        let mut tail = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), up.read(&mut tail))
+            .await
+            .expect("upstream EOF timed out")
+            .expect("upstream read failed");
+        assert_eq!(
+            n, 0,
+            "the upstream socket is closed on max-duration teardown"
+        );
+    }
+
+    // ---- 3. FAIL-CLOSED: promote to an UN-ALLOWLISTED upstream is refused ------------------------
+    {
+        let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 62, 4).await;
+        // Allowlist a DIFFERENT port than the guest will try to bridge to.
+        let (handle, addr) = bind_and_serve_session_egress(
+            runtime,
+            deploy,
+            Duration::from_secs(30),
+            vec!["127.0.0.1:9".to_string()],
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        let _ = read_line(&mut client).await;
+        // Bridge to a port NOT in the allowlist -> RefusedByGate -> not-authorized -> `REFUSED`. The
+        // gate refuses on the resolved addr BEFORE any connect, so no upstream need exist.
+        client.write_all(b"BRIDGE 127.0.0.1 1\n").await.unwrap();
+        assert_eq!(
+            &read_line(&mut client).await,
+            b"REFUSED\r\n",
+            "promote to an un-allowlisted upstream is refused fail-closed (NO splice)"
+        );
+        // The session keeps serving re-entries after a refused promote.
+        client.write_all(b"hello\n").await.unwrap();
+        assert_eq!(
+            &read_line(&mut client).await,
+            b"GOT:hello\n",
+            "after a refused promote the session continues in the re-entry model"
+        );
+        drop(client);
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed").await;
+        assert!(
+            res.is_ok(),
+            "the connection ends cleanly after a refused promote: {res:?}"
+        );
+    }
+
+    // ---- 4. LANE ISOLATION: a live splice holds NO session re-entry permit -----------------------
+    {
+        // Session-socket re-entry pool = 1. If a promoted splice wrongly held a re-entry permit, a
+        // SECOND connection's re-entry would block until the splice ended. It must not.
+        let (runtime, deploy) = live_runtime_egress(SESSION_IMAP_BRIDGE, 63, 1).await;
+        let (up_rx, up_addr) = spawn_one_shot_upstream().await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let allow = vec![format!("127.0.0.1:{}", up_addr.port())];
+        {
+            let runtime = runtime.clone();
+            let deploy = deploy.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, peer) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let (r, w) = stream.into_split();
+                    let runtime = runtime.clone();
+                    let deploy = deploy.clone();
+                    let allow = allow.clone();
+                    tokio::spawn(async move {
+                        let fc = FunctionConfig {
+                            egress_allowlist: allow,
+                            ..FunctionConfig::default()
+                        };
+                        let _ = runtime
+                            .dispatch_session_connection(
+                                &deploy,
+                                ProjectRef::DEFAULT.as_str(),
+                                SITE,
+                                COMPONENT,
+                                &fc,
+                                peer.to_string(),
+                                r,
+                                w,
+                                Duration::from_secs(5),
+                                Duration::from_secs(30),
+                                boatramp_handlers::ConnectionSecurity::plaintext(),
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+        // Connection A: promote -> a live splice that must NOT hold the single re-entry permit.
+        let mut a = TcpStream::connect(addr).await.unwrap();
+        let _ = a.set_nodelay(true);
+        let _ = read_line(&mut a).await;
+        a.write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
+            .await
+            .unwrap();
+        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+            .await
+            .expect("upstream dial timed out")
+            .expect("upstream sender dropped");
+        let _ = read_exact_timed(&mut up, PREAMBLE.len()).await;
+
+        // Connection B: with A's splice live and the re-entry pool = 1, B's connect-dispatch + inbound
+        // re-entries must still complete PROMPTLY. A timeout here is the lane-isolation regression.
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let _ = b.set_nodelay(true);
+        assert_eq!(
+            &read_line(&mut b).await,
+            GREETING,
+            "client B's connect-dispatch re-entry completed while A's splice is live (not pool-starved)"
+        );
+        b.write_all(b"hi\n").await.unwrap();
+        assert_eq!(
+            &read_line(&mut b).await,
+            b"GOT:hi\n",
+            "client B's inbound re-entry completed while A's splice is live (lane isolation holds)"
+        );
+        // A's splice is still live throughout (B interleaved with it); tear everything down.
+        drop(a);
+        drop(b);
+        drop(up);
+    }
+
+    println!(
+        "SESSION PROMOTE LIVE OK: promote-connection escalated a session connection to a persistent \
+         duplex splice (preamble written to the gate-authorized upstream, bidirectional relay across \
+         20 exchanges with ZERO further re-entry), tore down on client close + on max_conn_duration, \
+         REFUSED an un-allowlisted upstream fail-closed (reused egress gate), and the live splice held \
+         no re-entry permit (lane isolation with a pool of 1)."
     );
 }
