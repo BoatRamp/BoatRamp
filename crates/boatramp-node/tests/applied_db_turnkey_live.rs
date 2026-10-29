@@ -436,7 +436,7 @@ async fn launch_with_env(
     }
 
     let artifact = backend
-        .materialize(PROJECT, &workload.name, &spec)
+        .materialize(PROJECT, &workload.name, &spec, None)
         .await
         .map_err(|e| format!("materialize (pull) image: {e}"))?;
     if !matches!(artifact, Artifact::Rootfs { .. }) {

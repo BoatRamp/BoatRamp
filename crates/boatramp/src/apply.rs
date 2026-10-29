@@ -1703,6 +1703,7 @@ mod tests {
             user: None,
             isolation: Default::default(),
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }

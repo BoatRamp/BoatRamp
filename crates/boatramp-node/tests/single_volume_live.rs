@@ -398,7 +398,7 @@ async fn provision_and_launch_tenant(
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize("default", &workload.name, &spec)
+        .materialize("default", &workload.name, &spec, None)
         .await
         .map_err(|e| format!("materialize (pull) image: {e}"))?;
     if !matches!(artifact, Artifact::Rootfs { .. }) {

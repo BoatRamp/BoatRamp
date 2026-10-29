@@ -249,7 +249,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
     let artifact = backend
-        .materialize(DEFAULT_PROJECT, COMPUTE, &spec)
+        .materialize(DEFAULT_PROJECT, COMPUTE, &spec, None)
         .await
         .expect("materialize (pull) pgvector image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));

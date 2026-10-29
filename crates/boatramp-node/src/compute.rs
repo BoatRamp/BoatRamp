@@ -977,6 +977,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &ComputeSpec,
+            _: Option<&boatramp_core::registry_auth::RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }
@@ -1034,6 +1035,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }
@@ -1142,6 +1144,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &ComputeSpec,
+            _: Option<&boatramp_core::registry_auth::RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }

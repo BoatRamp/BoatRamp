@@ -1240,6 +1240,29 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub mysql_client_image: Option<String>,
+    /// **Operator node-wide registry pull credentials** (PLAN-compute-registry-auth):
+    /// `registry-host → sealed-secret-ref` for operator-provisioned fleet images. When a
+    /// workload's `image(...)` registry host matches a key here (and the workload itself
+    /// names NO project `pull_secret`), the referenced sealed secret authenticates the
+    /// pull. The ref names a sealed `{username,password}` secret the operator sets with
+    /// System·Admin authority via `boatramp compute registry-auth set --operator`, stored
+    /// in the reserved, tenant-unreachable
+    /// [`OPERATOR_REGISTRY_PROJECT`](boatramp_core::registry_auth::OPERATOR_REGISTRY_PROJECT)
+    /// keyspace — this map holds only the NON-secret ref, NEVER a credential. The host key
+    /// matches [`registry_host_of`](boatramp_core::registry_auth::registry_host_of): e.g.
+    /// `"ghcr.io"`, `"registry.example.com:5000"`, or `"docker.io"` for Hub. A configured
+    /// host whose secret is unset fails the pull CLOSED (never anonymous). Empty (default)
+    /// ⇒ operator scope off. Dynamic daemon setting (hot-swappable like the rest of
+    /// `[compute]`). Example:
+    ///
+    /// ```toml
+    /// [compute.registry_auth]
+    /// "ghcr.io" = "fleet-ghcr"
+    /// "registry.internal:5000" = "internal-reg"
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub registry_auth: BTreeMap<String, String>,
 }
 
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
@@ -1342,6 +1365,7 @@ impl Default for ComputeConfig {
             client_image_rootfs: BTreeMap::new(),
             pg_client_image: None,
             mysql_client_image: None,
+            registry_auth: BTreeMap::new(),
         }
     }
 }

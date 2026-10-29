@@ -2781,6 +2781,141 @@ pub(super) async fn compute_dev_bind_messaging(
 }
 
 // ---------------------------------------------------------------------------
+// Operator node-wide registry pull credentials
+// (`/api/compute/registry-auth{,/{name}}`, System·Admin — PLAN-compute-registry-auth)
+// ---------------------------------------------------------------------------
+
+/// The clear `501` every operator registry-auth endpoint returns when no `[secrets]` key
+/// envelope is configured (there is then no sealed store) — never a panic or a `500`.
+const NO_REGISTRY_SECRET_STORE: &str = "no [secrets] key envelope configured; registry credentials require sealing at rest \
+     (set [secrets] envelope = \"local\" or \"vault\" in boatramp.cfg)\n";
+
+/// Body of `POST /api/compute/registry-auth` — seal an operator node-wide registry
+/// credential `{username,password}` under `name` in the reserved, tenant-unreachable
+/// operator keyspace. The password is sealed server-side and is NEVER logged or returned.
+/// `Debug` is deliberately NOT derived so a stray `{:?}` cannot echo the password.
+#[derive(serde::Deserialize)]
+pub(super) struct OperatorRegistryAuthRequest {
+    /// The credential ref name (as used in `[compute].registry_auth`'s value). Validated
+    /// fail-closed inside the store.
+    name: String,
+    /// The registry username.
+    username: String,
+    /// The registry password / token — sealed, never echoed.
+    password: String,
+}
+
+/// Map a secret-store error to a client-safe response. A backend (KV/envelope) error's
+/// detail is NOT client-safe (it can name KV shapes / a KMS status), so it is logged and
+/// returned generically — and it never carries a plaintext credential.
+fn registry_auth_store_response(err: boatramp_core::secret_store::SecretError) -> Response {
+    if err.is_conflict() {
+        (StatusCode::CONFLICT, format!("{err}\n")).into_response()
+    } else if err.is_client_error() {
+        (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response()
+    } else {
+        tracing::warn!(%err, "operator registry-auth store error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry-auth store error\n",
+        )
+            .into_response()
+    }
+}
+
+/// The reserved operator project `ProjectRef`.
+fn operator_registry_project() -> boatramp_core::project::ProjectRef<'static> {
+    boatramp_core::project::ProjectRef::new(boatramp_core::registry_auth::OPERATOR_REGISTRY_PROJECT)
+}
+
+/// `POST /api/compute/registry-auth` — seal an operator node-wide registry credential.
+/// `System·Admin` (node-global). Returns the value-free [`SecretMeta`] as `201`; never
+/// echoes the credential. `501` when no envelope is configured; `400` on an invalid name.
+pub(super) async fn set_operator_registry_auth(
+    Extension(store): Extension<Option<Arc<boatramp_core::secret_store::SecretStore>>>,
+    Json(req): Json<OperatorRegistryAuthRequest>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "POST",
+        "/api/compute/registry-auth",
+        "operator registry-auth",
+    ) {
+        return forbidden;
+    }
+    let Some(store) = store else {
+        return (StatusCode::NOT_IMPLEMENTED, NO_REGISTRY_SECRET_STORE).into_response();
+    };
+    // Seal the full `{username,password}` credential as JSON — the SAME shape the resolver
+    // expects (project + operator scopes share one plaintext shape).
+    let cred = boatramp_core::registry_auth::RegistryCredential {
+        username: req.username,
+        password: req.password,
+    };
+    let Ok(bytes) = serde_json::to_vec(&cred) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not encode credential\n",
+        )
+            .into_response();
+    };
+    match store
+        .set(operator_registry_project(), &req.name, &bytes)
+        .await
+    {
+        Ok(meta) => (StatusCode::CREATED, Json(meta)).into_response(),
+        Err(e) => registry_auth_store_response(e),
+    }
+}
+
+/// `GET /api/compute/registry-auth` — list operator registry credential names + metadata
+/// (never a value). `System·Admin`. `501` when no envelope is configured.
+pub(super) async fn list_operator_registry_auth(
+    Extension(store): Extension<Option<Arc<boatramp_core::secret_store::SecretStore>>>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "GET",
+        "/api/compute/registry-auth",
+        "operator registry-auth",
+    ) {
+        return forbidden;
+    }
+    let Some(store) = store else {
+        return (StatusCode::NOT_IMPLEMENTED, NO_REGISTRY_SECRET_STORE).into_response();
+    };
+    match store.list(operator_registry_project()).await {
+        Ok(metas) => Json(metas).into_response(),
+        Err(e) => registry_auth_store_response(e),
+    }
+}
+
+/// `DELETE /api/compute/registry-auth/{name}` — remove an operator registry credential.
+/// `System·Admin`. `204` if it existed, `404` if not; `501` when no envelope is configured.
+pub(super) async fn delete_operator_registry_auth(
+    Extension(store): Extension<Option<Arc<boatramp_core::secret_store::SecretStore>>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "DELETE",
+        "/api/compute/registry-auth/_",
+        "operator registry-auth",
+    ) {
+        return forbidden;
+    }
+    let Some(store) = store else {
+        return (StatusCode::NOT_IMPLEMENTED, NO_REGISTRY_SECRET_STORE).into_response();
+    };
+    match store.delete(operator_registry_project(), &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            "no matching operator registry credential\n",
+        )
+            .into_response(),
+        Err(e) => registry_auth_store_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 

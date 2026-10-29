@@ -34,6 +34,7 @@ use boatramp_core::compute::{
     compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
+use boatramp_core::registry_auth::RegistryAuth;
 use futures::StreamExt;
 
 use crate::config::{WorkerConfig, WorkerVolume, env_cmdline_fragment};
@@ -332,9 +333,11 @@ impl ComputeBackend for VzBackend {
         _project: &str,
         _workload: &str,
         spec: &ComputeSpec,
+        _pull_auth: Option<&RegistryAuth>,
     ) -> Result<Artifact, BackendError> {
         // The microVM boots an ext4 rootfs; an OCI image must be built into one
-        // first (`compute build`), so it is not runnable here directly.
+        // first (`compute build`), so it is not runnable here directly. It never pulls
+        // from a registry, so `_pull_auth` does not apply.
         let rootfs_hash = match &spec.root {
             RootSource::Rootfs(hash) => hash,
             RootSource::Image(_) | RootSource::Tar(_) => {
