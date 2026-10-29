@@ -45,6 +45,65 @@ fn to_wit(err: SessionError) -> session_types::SessionError {
     }
 }
 
+/// How the host terminates TLS to a promote upstream (host-native mirror of the WIT `promote-tls`,
+/// mailroom cap-req #22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteTls {
+    /// Raw TCP — no host crypto on the upstream leg.
+    Plaintext,
+    /// Implicit TLS at connect (legacy IMAPS/POP3S/SMTPS) — the host terminates TLS strict and
+    /// splices the decrypted application bytes.
+    ImplicitTls,
+}
+
+/// A request to promote the current socket-driven session connection to a persistent duplex splice
+/// to a guest-named upstream (mailroom cap-req #22). The host dials through the SAME egress/connect
+/// gate `tcp-egress` uses — this request names nothing the guest could not already dial.
+#[derive(Debug, Clone)]
+pub struct PromoteRequest {
+    /// The upstream host (DNS name or IP literal) the guest names.
+    pub host: String,
+    /// The upstream TCP port.
+    pub port: u16,
+    /// Whether the host terminates TLS to the upstream.
+    pub tls: PromoteTls,
+    /// SNI / cert-verification hostname for `ImplicitTls` (defaults to `host` when `None`).
+    pub sni: Option<String>,
+    /// Opaque bytes written to the upstream BEFORE the splice begins (e.g. a replayed authenticated
+    /// login reusing the client's own protocol tag). Bounded host-side.
+    pub preamble: Vec<u8>,
+}
+
+/// Why a promote failed (host-native; mapped to the WIT `promote-error`). Gate refusals are
+/// UNDIFFERENTIATED (`NotAuthorized`) — no topology probing.
+#[derive(Debug)]
+pub enum PromoteError {
+    /// Refused by the reused egress/connect gate (posture off / ungranted / not allowlisted / SSRF
+    /// floor). Undifferentiated — promote adds no new reach.
+    NotAuthorized,
+    /// The dial to the authorized upstream failed (DNS / connect / TLS). Coarse, client-safe reason.
+    UpstreamUnreachable(String),
+    /// Not a socket-driven listener session, already promoted, or already closed. Fail-closed.
+    NotPromotable,
+    /// The node is at its persistent-splice ceiling — retryable.
+    Capacity,
+    /// The preamble exceeded the host's cap.
+    PreambleTooLarge,
+    /// Any other host-side failure (client-safe).
+    Other(String),
+}
+
+fn to_wit_promote(err: PromoteError) -> session_types::PromoteError {
+    match err {
+        PromoteError::NotAuthorized => session_types::PromoteError::NotAuthorized,
+        PromoteError::UpstreamUnreachable(m) => session_types::PromoteError::UpstreamUnreachable(m),
+        PromoteError::NotPromotable => session_types::PromoteError::NotPromotable,
+        PromoteError::Capacity => session_types::PromoteError::Capacity,
+        PromoteError::PreambleTooLarge => session_types::PromoteError::PreambleTooLarge,
+        PromoteError::Other(m) => session_types::PromoteError::Other(m),
+    }
+}
+
 /// The server-side session controller a binding delegates to. Bound host-side to the **current**
 /// session (its id + verified principal), so the guest addresses no id. The server implements this
 /// over the KV session store; every call persists through it (crash-safe re-entry).
@@ -56,6 +115,14 @@ pub trait SessionController: Send + Sync {
     async fn checkpoint(&self, snapshot: Vec<u8>) -> Result<(), SessionError>;
     /// End the session with a reason; the client is notified.
     async fn close(&self, reason: String) -> Result<(), SessionError>;
+
+    /// Promote the current connection to a persistent duplex splice to the named upstream (mailroom
+    /// cap-req #22). The DEFAULT impl refuses with [`PromoteError::NotPromotable`] — only the
+    /// socket-driven listener controller (which owns a real client socket to splice) overrides it,
+    /// so the KV/SSE HTTP-session transport and any other controller fail-closed by construction.
+    async fn promote(&self, _req: PromoteRequest) -> Result<(), PromoteError> {
+        Err(PromoteError::NotPromotable)
+    }
 }
 
 /// A `session` grant: the controller bound to the current session. Its presence *is* the grant
@@ -100,6 +167,33 @@ impl session_iface::Host for SessionHost<'_> {
     async fn close(&mut self, reason: String) -> Result<(), session_types::SessionError> {
         let controller = self.controller()?;
         controller.close(reason).await.map_err(to_wit)
+    }
+
+    async fn promote_connection(
+        &mut self,
+        host: String,
+        port: u16,
+        tls: session_types::PromoteTls,
+        sni: Option<String>,
+        preamble: Vec<u8>,
+    ) -> Result<(), session_types::PromoteError> {
+        // Ungranted ⇒ `not-authorized` (undifferentiated — a guest can't tell "no session grant"
+        // from "egress gate refused"), matching the fail-closed posture of the gate itself.
+        let Some(binding) = self.binding else {
+            return Err(session_types::PromoteError::NotAuthorized);
+        };
+        let controller = binding.controller.clone();
+        let req = PromoteRequest {
+            host,
+            port,
+            tls: match tls {
+                session_types::PromoteTls::Plaintext => PromoteTls::Plaintext,
+                session_types::PromoteTls::ImplicitTls => PromoteTls::ImplicitTls,
+            },
+            sni,
+            preamble,
+        };
+        controller.promote(req).await.map_err(to_wit_promote)
     }
 }
 

@@ -1172,6 +1172,111 @@ async fn dial_plaintext_pipeline(
     connect_checked(candidates).await
 }
 
+// ---- promote-connection upstream dialer (mailroom cap-req #22) ------------------------------------
+
+/// The split byte halves of a host-dialed `promote-connection` upstream (cap-req #22): DECRYPTED
+/// application bytes, ready to splice with the client socket. `.0` reads from the upstream; `.1`
+/// writes to it. For `implicit-tls` these are the TLS-terminated halves; for `plaintext` the raw TCP
+/// halves — the guest/host does no crypto on either beyond the host's own TLS termination.
+pub type DialedUpstream = (BoxedRead, BoxedWrite);
+
+/// How [`EgressDialer::dial`] terminates TLS to the upstream (cap-req #22; mirrors the guest-facing
+/// `promote-tls`).
+#[derive(Debug, Clone)]
+pub enum DialTls {
+    /// Raw TCP — no host crypto on the upstream leg.
+    Plaintext,
+    /// Implicit TLS at connect: terminate TLS **strict** (webpki ⊕ operator extra-roots), verifying
+    /// the peer certificate against `sni`. The strict PULL path — never downgrades.
+    ImplicitTls { sni: String },
+}
+
+/// A reusable host-mediated outbound dialer (cap-req #22) carrying the SAME egress config the
+/// `tcp-egress` binding holds, so a `promote-connection` dial is gated IDENTICALLY to a guest's own
+/// `tcp-egress` dial — the `allow_guest_tcp_egress` posture, the per-handler `egress_allowlist`, the
+/// `is_global_ip` SSRF floor, and the one-shot DNS-rebinding choke — via the EXACT same
+/// [`resolve_and_gate_tcp_egress`] + [`connect_checked`] (+ [`handshake_tls`]) pipeline. No new
+/// predicate, no new posture, no new reach: promote can dial ONLY what `tcp-egress` could.
+#[derive(Clone)]
+pub struct EgressDialer {
+    enabled: bool,
+    allow_private: bool,
+    allowlist: Arc<[String]>,
+    extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+    connect_timeout: Duration,
+}
+
+impl EgressDialer {
+    /// Construct from the engine's egress posture/config (see `HandlerEngine::egress_dialer`).
+    pub(crate) fn new(
+        enabled: bool,
+        allow_private: bool,
+        allowlist: Arc<[String]>,
+        extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
+        connect_timeout: Duration,
+    ) -> Self {
+        Self {
+            enabled,
+            allow_private,
+            allowlist,
+            extra_roots,
+            connect_timeout,
+        }
+    }
+
+    /// Dial `host:port` through the reused egress gate and (for `ImplicitTls`) terminate TLS strict,
+    /// returning the split upstream halves. The WHOLE pipeline — DNS resolve, the gate check, the TCP
+    /// connect, and the TLS handshake — runs under exactly ONE `connect_timeout`, the same
+    /// single-deadline discipline as `connect-tls`/`connect-plaintext`. `Err(EgressError)` on
+    /// gate-refusal (`RefusedByGate`), DNS failure, connect timeout/failure, or TLS failure — the
+    /// caller maps `RefusedByGate` to the UNDIFFERENTIATED `not-authorized`.
+    pub async fn dial(
+        &self,
+        host: &str,
+        port: u16,
+        tls: DialTls,
+    ) -> Result<DialedUpstream, EgressError> {
+        match tls {
+            DialTls::Plaintext => {
+                let tcp = tokio::time::timeout(
+                    self.connect_timeout,
+                    dial_plaintext_pipeline(
+                        host,
+                        port,
+                        &self.allowlist,
+                        self.allow_private,
+                        self.enabled,
+                    ),
+                )
+                .await
+                .map_err(|_| EgressError::ConnectTimeout)
+                .and_then(|r| r)?;
+                let (read_half, write_half) = tcp.into_split();
+                Ok((Box::new(read_half), Box::new(write_half)))
+            }
+            DialTls::ImplicitTls { sni } => {
+                let dialed = tokio::time::timeout(
+                    self.connect_timeout,
+                    dial_pipeline(
+                        host,
+                        port,
+                        &sni,
+                        &self.allowlist,
+                        self.allow_private,
+                        self.enabled,
+                        VerifyMode::Strict,
+                        &self.extra_roots,
+                    ),
+                )
+                .await
+                .map_err(|_| EgressError::ConnectTimeout)
+                .and_then(|r| r)?;
+                Ok(split_boxed(dialed))
+            }
+        }
+    }
+}
+
 /// Connect to the first of the already-gate-CHECKED `addrs` to succeed, and terminate TLS (or, ONLY
 /// under the `skip_tls_wrap` mutation, nothing) over that same connected socket.
 async fn connect_and_handshake(
@@ -1556,6 +1661,73 @@ mod tests {
         assert!(matches!(err3, EgressError::RefusedByGate));
 
         println!("TCP-EGRESS GATE REUSE OK");
+    }
+
+    /// The `EgressDialer` (mailroom cap-req #22 — the session `promote-connection` upstream dialer)
+    /// reuses the EXACT same gate: a target outside the allowlist, a private target without
+    /// `allow_private`, and the posture-off case are ALL refused with `RefusedByGate` BEFORE any
+    /// network I/O — identical to the `connect-tls`/`connect-plaintext` gate above, so promote adds no
+    /// new reach. (Both `Plaintext` and `ImplicitTls` dial shapes route through the same predicate.)
+    #[tokio::test]
+    async fn egress_dialer_reuses_the_gate_fail_closed() {
+        // The dialed `Ok` type is a pair of boxed stream halves (no `Debug`), so match on the result
+        // rather than `expect_err` (which would require the `Ok` type to be `Debug`).
+        fn assert_refused(r: Result<DialedUpstream, EgressError>, what: &str) {
+            match r {
+                Err(EgressError::RefusedByGate) => {}
+                Err(other) => panic!("{what}: expected RefusedByGate, got {other:?}"),
+                Ok(_) => panic!("{what}: the gate must refuse this dial"),
+            }
+        }
+
+        // Not allowlisted ⇒ refused (plaintext shape).
+        let dialer = EgressDialer::new(
+            true,
+            false,
+            Arc::from(vec!["93.184.216.34:443".to_string()]),
+            Arc::from(Vec::new()),
+            Duration::from_secs(1),
+        );
+        assert_refused(
+            dialer.dial("8.8.4.4", 443, DialTls::Plaintext).await,
+            "a non-allowlisted promote upstream",
+        );
+
+        // Allowlisted by ip:port but PRIVATE with `allow_private` off ⇒ SSRF floor refuses (TLS shape).
+        let dialer2 = EgressDialer::new(
+            true,
+            false,
+            Arc::from(vec!["10.0.0.5:5432".to_string()]),
+            Arc::from(Vec::new()),
+            Duration::from_secs(1),
+        );
+        assert_refused(
+            dialer2
+                .dial(
+                    "10.0.0.5",
+                    5432,
+                    DialTls::ImplicitTls {
+                        sni: "db.internal".to_string(),
+                    },
+                )
+                .await,
+            "an allowlisted-but-private promote upstream",
+        );
+
+        // Posture off ⇒ deny-all, even for an otherwise-fine target.
+        let dialer3 = EgressDialer::new(
+            false,
+            true,
+            Arc::from(vec!["93.184.216.34:443".to_string()]),
+            Arc::from(Vec::new()),
+            Duration::from_secs(1),
+        );
+        assert_refused(
+            dialer3.dial("93.184.216.34", 443, DialTls::Plaintext).await,
+            "posture off",
+        );
+
+        println!("TCP-EGRESS PROMOTE DIALER GATE REUSE OK");
     }
 
     /// Build A implements `verify-mode.strict` only (on the PULL path); `opportunistic` is refused

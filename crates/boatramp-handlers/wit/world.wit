@@ -1369,13 +1369,49 @@ interface session-types {
     resumed: option<list<u8>>,
     frames: list<list<u8>>,
   }
+
+  /// How the host terminates TLS to a `promote-connection` upstream (mailroom cap-req #22).
+  enum promote-tls {
+    /// Raw TCP: the spliced bytes are whatever the guest's preamble + the two peers exchange, with
+    /// no host crypto on the upstream leg.
+    plaintext,
+    /// Implicit TLS at connect (e.g. a legacy IMAPS :993 / POP3S :995 / SMTPS :465 upstream): the
+    /// host dials AND terminates TLS strict (webpki roots ⊕ the operator's extra-roots — the SAME
+    /// trust set a guest's own `wasi:http`/`tcp-egress` egress gets), splicing the DECRYPTED
+    /// application bytes. The guest does ZERO crypto, exactly as elsewhere in boatramp.
+    implicit-tls,
+  }
+
+  /// Why `promote-connection` failed (mailroom cap-req #22). Gate refusals are DELIBERATELY
+  /// UNDIFFERENTIATED (`not-authorized`) so a guest cannot probe WHICH check failed or map the
+  /// node's internal network topology — the exact posture `tcp-egress`'s `refused-by-gate` takes.
+  variant promote-error {
+    /// The dial was refused by the reused egress/connect gate: the node posture
+    /// `allow_guest_tcp_egress` is off, the `session` capability is ungranted, the named upstream is
+    /// not in this listener's `egress_allowlist`, or it failed the `is_global_ip` SSRF floor (unless
+    /// `allow_guest_private_egress` is also on). Undifferentiated — promote adds NO new reach.
+    not-authorized,
+    /// The dial to the (authorized) upstream failed — DNS, TCP connect, or the TLS handshake.
+    /// Carries a coarse, client-safe reason; never raw peer bytes or OS error text.
+    upstream-unreachable(string),
+    /// This session cannot be spliced: it is not a socket-driven listener session (e.g. the HTTP/SSE
+    /// `session` transport), or `promote-connection` was already called on this connection, or the
+    /// session is already closed. Fail-closed.
+    not-promotable,
+    /// The node is at its persistent-splice ceiling right now — retryable (back off / shed load).
+    capacity,
+    /// The `preamble` exceeded the host's per-connection cap.
+    preamble-too-large,
+    /// Any other host-side failure (client-safe reason).
+    other(string),
+  }
 }
 
 /// The host half a session handler imports: enqueue an outbound frame, set a resumable checkpoint,
 /// and close. All operate on the **current** session, bound host-side at open — the guest names no
 /// id and cannot address another session (cross-session/cross-tenant reach is structurally absent).
 interface session {
-  use session-types.{cursor, session-error};
+  use session-types.{cursor, session-error, promote-tls, promote-error};
 
   /// Enqueue an outbound frame (host → client). Ordered; the host assigns + returns its cursor and
   /// retains it for at-least-once redelivery until the client acks.
@@ -1387,6 +1423,35 @@ interface session {
 
   /// End the session with a reason; the client is notified and no further frames flow.
   close: func(reason: string) -> result<_, session-error>;
+
+  /// Promote THIS socket-driven listener session connection to a PERSISTENT duplex splice between
+  /// the client and an upstream the guest NAMES (mailroom cap-req #22 — the transparent imap-proxy
+  /// bridge). This is the one operation that crosses the session's per-frame hibernation model into
+  /// a long-lived connection dispatch; call it only AFTER the guest has authenticated the connection.
+  ///
+  /// The host dials `host:port` through the EXACT egress/connect gate every other outbound dial uses
+  /// — the `allow_guest_tcp_egress` posture, this listener's per-handler `egress_allowlist`, the
+  /// `is_global_ip` SSRF floor, and the one-shot DNS-rebinding choke — so promote can reach ONLY what
+  /// the guest could already dial via `tcp-egress`; it is NOT a new bypass and widens nothing. With
+  /// `tls = implicit-tls` the host also terminates TLS strict to the upstream. The host then writes
+  /// `preamble` to the upstream (opaque bytes — e.g. a replayed authenticated `LOGIN` reusing the
+  /// CLIENT'S OWN protocol tag, so the upstream's tagged reply completes the client's in-flight
+  /// command), and from then on splices client <-> upstream bidirectionally — waking on BOTH
+  /// directions, with the upstream socket PERSISTING — for the rest of the connection's life.
+  ///
+  /// On `ok` NO further `session-handler` re-entry occurs on this connection; the splice runs on its
+  /// OWN host resourcing (a dedicated persistent-splice budget), NEVER the re-entry pool or the
+  /// shared async request lane, and is torn down deterministically when either side closes, on the
+  /// connection's idle/overall timeout, or on node shutdown. On `err` the session is UNCHANGED and
+  /// continues in normal re-entry mode (the guest may retry, `close`, or carry on). Fail-closed:
+  /// anything the egress gate would refuse is `not-authorized`, and any ambiguity refuses.
+  promote-connection: func(
+    host: string,
+    port: u16,
+    tls: promote-tls,
+    sni: option<string>,
+    preamble: list<u8>,
+  ) -> result<_, promote-error>;
 }
 
 /// The handler half: the host calls `handle` once per re-entry with the pending inbound batch. `ok`

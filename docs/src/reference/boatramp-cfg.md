@@ -343,12 +343,54 @@ refuse credentials over plaintext and advertise STARTTLS only before the upgrade
 | `egress_allowlist` | list | `[]` | Per-listener outbound-TCP allowlist (cap-req 19) for the guest's **host-mediated** `tcp-egress` dials: the `host:port` / `ip:port` / `CIDR:port` targets the host may dial on the guest's behalf (the host dials + terminates TLS — the guest never holds a raw socket). Takes effect only when the node posture `allow_guest_tcp_egress` is on **and** `imports` declares the `wasi:sockets` token; the dial is connect-only + SSRF-floored. Enables e.g. an imap-proxy listener dialing the IMAPS upstream. |
 | `idle_timeout_ms` | int | `60000` | Tear a connection down after this long with no bytes in either direction (in session mode, reinterpreted as the per-re-entry processing deadline). `0` is refused. |
 | `max_conn_duration_ms` | int | `3600000` | Absolute cap on a single connection's lifetime regardless of activity. `0` is refused. |
+| `max_promoted_splices` | int | `256` | **Per-listener** cap on concurrently-live **promoted** persistent splices (cap-req 22; see the escalation note below), atop the node-global `[serve.handlers].max_promoted_splices` ceiling. A multi-tenant fairness bound so one session listener can't exhaust the whole node-global splice budget; a `promote-connection` past **either** cap is refused `capacity` (retryable). Only meaningful for a `mode = "session"` listener whose guest is granted egress. `0` is refused; absent ⇒ a small fraction of the node-global ceiling. |
 | `mode` | `connection` \| `session` | `connection` | How the accepted connection is driven. `connection` pins one wasm instance per connection for its whole life (exports `tcp-connection-handler`). `session` drives it through the re-entrant session model — the host owns the socket, holds no instance between batches, and a protocol-idle-but-alive peer (IMAP IDLE) is never reaped for inactivity (exports `session-handler`). |
 | `tls` | table | — | Host-side TLS termination (cap-req 06): the host terminates TLS and hands the guest a decrypted plaintext stream. Requires `cert_file` + `key_file` (PEM). Add a `starttls` sub-table (`trigger` / `response` / `tag_capture`) for in-band STARTTLS upgrade (SMTP/IMAP/POP3). Omit for a plaintext listener. |
 
 A listener's optional `tls` block may set `on_demand = true` to share the
 `[serve.on_demand_tls]` engine for per-SNI issuance on a verified custom domain in
 its own project.
+
+#### Session→connection escalation (`promote-connection`, cap-req 22)
+
+A `mode = "session"` listener guest may, **after it has authenticated the
+connection**, call `session::promote-connection(host, port, tls, sni, preamble)`
+to escalate that one connection out of the re-entrant session model into a
+**persistent duplex splice** — the transparent imap-proxy bridge. The host dials the
+guest-named upstream through the **same** egress/connect gate every `tcp-egress`
+dial uses (the `allow_guest_tcp_egress` posture + this listener's
+`egress_allowlist` + the `is_global_ip` SSRF floor), optionally terminating TLS
+(`implicit-tls`, e.g. a legacy IMAPS `:993` upstream), writes the guest's `preamble`
+(e.g. a replayed, client-tagged `LOGIN`), then splices the client ↔ upstream
+bidirectionally for the rest of the connection's life. After a successful promote
+**no further `session-handler` re-entry** occurs on that connection.
+
+Promotion is **fail-closed and adds no new reach**: it is authorized by the **exact
+same grant a raw `tcp-egress` dial requires** — the listener must both be **granted
+the `wasi:sockets` egress capability** (declare the `wasi:sockets` token in
+`imports`) **and** list the upstream in `egress_allowlist`, with the
+`allow_guest_tcp_egress` posture on and the `is_global_ip` SSRF floor applied. A
+promote that fails any of these (no egress grant, upstream not allowlisted, posture
+off, or an SSRF-floored private address) is refused `not-authorized` **before any
+connect** — no bytes reach the upstream — and the session simply continues in the
+re-entry model. So an imap-proxy listener bridging to a legacy IMAPS server declares
+`imports = ["wasi:sockets", …]` and the IMAPS upstream in `egress_allowlist` — the
+same two things a `tcp-egress` dial needs.
+
+> **Plaintext bridges are cleartext end-to-end.** `promote-connection` with
+> `tls = plaintext` splices the `preamble` (which may carry a replayed credential)
+> **and the whole bridged session** to the upstream in the clear — appropriate only
+> for a trusted/internal link (a loopback or private-network sidecar). Any upstream
+> that is not fully trusted (anything crossing an untrusted network) **must** use
+> `tls = implicit-tls`, so the host terminates TLS to the upstream and the cleartext
+> never leaves the node.
+
+The persistent splice runs on its **own** budget — a node-global ceiling
+(`[serve.handlers].max_promoted_splices`) plus a per-listener sub-cap
+(`max_promoted_splices` above) — separate from the session re-entry pool and the
+shared async request lane, and is torn down deterministically when either side
+closes, on `max_conn_duration_ms`, or on node shutdown. A promote past either cap is
+refused `capacity` (retryable).
 
 ### `serve.on_demand_tls`
 
@@ -530,6 +572,7 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 | `outbound_timeout_ms` | int | — | Optional ceiling on a guest's **outbound** `wasi:http` call (connect + first-byte), independent of the invocation timeout, so a hung upstream is bounded on its own terms. The streaming (between-bytes) timeout is left at the default so a slow token stream isn't cut. Omit ⇒ wasmtime default. |
 | `dns_resolve_budget` | int | `256` | Per-invocation cap on `dns-resolve` lookups (cap-req 20): how many MX/A/AAAA resolutions one guest invocation may issue before `rate-limited`. For a **session** listener the budget is seeded once per connection and shared across every re-entry, so a session guest can't reset it by sending another inbound frame. Takes effect only when the node posture `allow_guest_tcp_egress` is on and the component imports `dns-resolve`. |
 | `dns_resolve_override` | table | — (off) | **DEV/TEST override** of the consumer-lane DNS resolver (`dns-resolve` / `resolve-mx`). Inject a **static** host→records map (consulted first, answered with **no network** — the hook for a hermetic / fully-offline direct-MX relay test) and/or point the resolver at a custom `upstream` nameserver instead of `/etc/resolv.conf`. **Off by default** (absent ⇒ the system resolver, unchanged). Operator/serve-only and node-global — a guest/project can never set it, and its answers still pass the unchanged grant + posture + SSRF floor. See [DEV/TEST resolver override](#devtest-resolver-override). |
+| `max_promoted_splices` | int | `4096` | **Node-global** ceiling on concurrently-live **promoted** persistent splices (cap-req 22 — the session→connection escalation / imap-proxy bridge; see [`serve.listeners`](#servelisteners)). A promoted connection leaves the hibernating re-entry model for a long-held duplex splice (two live sockets + two copy tasks), materially more expensive than a parked session, so it carries its **own** node-global budget — separate from the session re-entry pool and the shared async request lane — and a promote past it is refused `capacity` (retryable). Each session listener also has a per-listener `max_promoted_splices` sub-cap so one listener can't monopolize this budget. Floored at 1. |
 | `bindings.sql` | table | — | The `sql` host binding. Omit for single-node (a per-site embedded libsql file); set `url` for a shared `sqld`. |
 
 `bindings.sql` fields: `dir`, `url`, `admin_url`, `replica_url`, `token_env`,

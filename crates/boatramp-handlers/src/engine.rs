@@ -1342,6 +1342,18 @@ const TCP_CONN_WRITE_BUDGET: usize = 64 * 1024;
 #[cfg(all(feature = "tcp-listener", feature = "session"))]
 const DEFAULT_SESSION_CONN_CAP: usize = 16_384;
 
+/// NODE-GLOBAL ceiling on concurrently-live PROMOTED persistent-splice connections (mailroom cap-req
+/// #22 — the imap-proxy bridge). A promoted connection moves OUT of the hibernating re-entry model
+/// into a long-held duplex splice (two live sockets + two copy tasks), which is materially more
+/// expensive than a parked session connection, so it carries its OWN budget — separate from both the
+/// session-socket re-entry pool and the `DEFAULT_SESSION_CONN_CAP` connection backstop — and well
+/// below them, so a promote storm can never consume the whole session-connection budget. A promote
+/// at the ceiling is refused `capacity` (retryable), fail-closed. Operator-tunable via
+/// `[serve.handlers].max_promoted_splices` ([`HandlerEngine::with_promoted_splice_cap`]); this is the
+/// default when unset. A per-listener sub-cap (the listener's own `max_promoted_splices`, enforced by
+/// the listener accept loop) further prevents one listener from monopolizing this global budget.
+pub const DEFAULT_PROMOTED_SPLICE_CAP: usize = 4_096;
+
 /// How many epoch ticks a conn-lane guest runs before the engine epoch forces its async fiber to
 /// YIELD (`epoch_deadline_async_yield_and_update`) — PLAN-handler-tcp-inbound HIGH-fix. At
 /// [`EPOCH_TICK_MS`] (10ms) this is ~250ms. Yield ≠ trap: a long-lived `handle` is preserved, but a
@@ -1587,6 +1599,14 @@ pub struct HandlerEngine {
     /// many-idle-connections use case; `Arc` for owned per-connection permits.
     #[cfg(all(feature = "tcp-listener", feature = "session"))]
     session_conn_semaphore: std::sync::Arc<Semaphore>,
+    /// NODE-GLOBAL ceiling on concurrently-live PROMOTED persistent-splice connections (mailroom
+    /// cap-req #22). Acquired at `promote-connection` time (BEFORE the upstream is dialed, so a
+    /// ceiling refusal costs no dial) and held for the splice's WHOLE life, released when the splice
+    /// task returns. Separate from `session_socket_semaphore` (re-entry pool) and the shared async
+    /// lane — the long-held splice must not occupy either (Security review HIGH-1, v0.36.0 lesson).
+    /// `Arc` for owned per-connection permits. Defaults to [`DEFAULT_PROMOTED_SPLICE_CAP`].
+    #[cfg(all(feature = "tcp-listener", feature = "session"))]
+    promoted_splice_semaphore: std::sync::Arc<Semaphore>,
     /// The inbound-TCP connection lane ceiling — the (memory) clamp a listener dispatch is held to.
     /// Defaults to the sync `limits`; the per-invocation epoch deadline + CPU fuel are DISABLED for
     /// this lane in favor of idle + max-connection-duration timeouts (a long-lived `handle` must not
@@ -1880,6 +1900,12 @@ impl HandlerEngine {
             // Node-global live-session-connection ceiling (cap-req 08 / Security review LOW backstop).
             #[cfg(all(feature = "tcp-listener", feature = "session"))]
             session_conn_semaphore: std::sync::Arc::new(Semaphore::new(DEFAULT_SESSION_CONN_CAP)),
+            // Node-global promoted-splice ceiling (cap-req 22) — its OWN budget, below the session
+            // -connection backstop, so a promote storm can't consume the whole session budget.
+            #[cfg(all(feature = "tcp-listener", feature = "session"))]
+            promoted_splice_semaphore: std::sync::Arc::new(Semaphore::new(
+                DEFAULT_PROMOTED_SPLICE_CAP,
+            )),
             #[cfg(feature = "tcp-listener")]
             tcp_conn_limits: limits,
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
@@ -2186,6 +2212,24 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_tcp_listener(mut self, allow: bool) -> Self {
         self.allow_tcp_listener = allow;
+        self
+    }
+
+    /// Override the NODE-GLOBAL promoted persistent-splice ceiling (mailroom cap-req #22):
+    /// `[serve.handlers].max_promoted_splices`. `None` keeps [`DEFAULT_PROMOTED_SPLICE_CAP`]. A value
+    /// is floored at 1. This bounds the AGGREGATE of live duplex splices across every session listener;
+    /// each listener additionally carries its own per-listener sub-cap (enforced in the accept loop) so
+    /// one listener can't consume the whole global budget. Always compiled (a no-op when the
+    /// `tcp-listener`+`session` features are off, so the operator config plumbing stays feature-agnostic).
+    #[must_use]
+    #[allow(unused_mut)] // `self` is mutated only when the splice features are compiled in.
+    pub fn with_promoted_splice_cap(mut self, cap: Option<usize>) -> Self {
+        #[cfg(all(feature = "tcp-listener", feature = "session"))]
+        if let Some(n) = cap {
+            self.promoted_splice_semaphore = std::sync::Arc::new(Semaphore::new(n.max(1)));
+        }
+        #[cfg(not(all(feature = "tcp-listener", feature = "session")))]
+        let _ = cap;
         self
     }
 
@@ -2760,6 +2804,47 @@ impl HandlerEngine {
         std::sync::Arc::clone(&self.session_conn_semaphore)
             .try_acquire_owned()
             .ok()
+    }
+
+    /// Try to acquire a node-global PROMOTED persistent-splice permit (cap-req 22). `None` ⇒ the node
+    /// is at [`DEFAULT_PROMOTED_SPLICE_CAP`] live splices (the caller returns `capacity`, retryable).
+    /// The owned permit is held by the splice for its whole life and released when it ends — bounding
+    /// the aggregate duplex-splice footprint separately from the re-entry pool + the shared async lane.
+    #[cfg(all(feature = "tcp-listener", feature = "session"))]
+    pub fn acquire_promoted_splice(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::clone(&self.promoted_splice_semaphore)
+            .try_acquire_owned()
+            .ok()
+    }
+
+    /// The node-global promoted-splice ceiling as a shared handle (cap-req 22), so the per-connection
+    /// session controller can `try_acquire_owned` a permit at `promote-connection` time and hold it
+    /// for the splice's life. Separate budget from the re-entry pool + the shared async lane.
+    #[cfg(all(feature = "tcp-listener", feature = "session"))]
+    pub fn promoted_splice_gate(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::clone(&self.promoted_splice_semaphore)
+    }
+
+    /// Build a host-mediated [`EgressDialer`](crate::bindings::tcp_egress::EgressDialer) carrying the
+    /// EXACT egress config the `tcp-egress` binding uses (the `allow_guest_tcp_egress` posture, the
+    /// `allow_guest_private_egress` SSRF opt-in, the operator extra-roots, and the per-dial connect
+    /// timeout), scoped to `allowlist` (a session listener's own `egress_allowlist`). A session
+    /// guest's `promote-connection` dials the splice upstream through this — reusing
+    /// `resolve_and_gate_tcp_egress` verbatim, so promote can reach ONLY what a `tcp-egress` dial
+    /// could, with no new predicate or posture. The posture value is carried INTO the dialer (not
+    /// pre-filtered here), so a posture-off node fail-closes at the gate as `refused-by-gate`.
+    #[cfg(feature = "tcp-egress")]
+    pub fn egress_dialer(
+        &self,
+        allowlist: std::sync::Arc<[String]>,
+    ) -> crate::bindings::tcp_egress::EgressDialer {
+        crate::bindings::tcp_egress::EgressDialer::new(
+            self.allow_tcp_egress,
+            self.allow_private_egress,
+            allowlist,
+            self.guest_egress_extra_roots.clone(),
+            self.tcp_egress_connect_timeout,
+        )
     }
 
     #[cfg(all(feature = "session", feature = "tcp-listener"))]

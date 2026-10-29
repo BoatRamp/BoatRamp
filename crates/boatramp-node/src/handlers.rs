@@ -511,6 +511,10 @@ pub async fn build_handler_runtime(
             .and_then(|h| h.dns_resolve_budget)
             .unwrap_or(boatramp_handlers::DEFAULT_DNS_RESOLVE_BUDGET),
     )
+    // NODE-GLOBAL promoted persistent-splice ceiling (mailroom cap-req #22); `None` ⇒ the engine
+    // default (`DEFAULT_PROMOTED_SPLICE_CAP`, 4096). Each session listener also carries its own
+    // per-listener sub-cap so one listener can't monopolize this budget.
+    .with_promoted_splice_cap(handlers_cfg.and_then(|h| h.max_promoted_splices))
     .with_keep_warm_max(keep_warm_max);
     // DEV/TEST consumer-lane DNS resolver override (mailroom cap-req #21 residual): install the
     // operator-configured static map / custom upstream ONCE, before any guest invocation builds the

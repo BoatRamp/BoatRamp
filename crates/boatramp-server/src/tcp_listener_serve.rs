@@ -112,6 +112,14 @@ pub struct ListenerParams {
     /// ever sees `proxy_protocol` + empty CIDRs + `!trust_any`, so the "trust any source" posture is
     /// never reached by omission.
     pub proxy_protocol_trust_any: bool,
+    /// PER-LISTENER sub-cap on concurrently-live PROMOTED persistent splices (mailroom cap-req #22),
+    /// atop the node-global promoted-splice ceiling. A fairness bound so one session listener can't
+    /// exhaust the whole node-global splice budget. [`run_listener`] builds ONE `Semaphore` of this
+    /// size shared across the listener's connections; a `promote-connection` acquires both it and the
+    /// node-global permit (or is refused `capacity`). Only meaningful for a `session_mode` listener
+    /// whose guest is granted egress. The orchestrator copies it from the listener config (defaulting
+    /// to `DEFAULT_LISTENER_MAX_PROMOTED_SPLICES`).
+    pub max_promoted_splices: usize,
 }
 
 /// How long to wait for a connection's PROXY-protocol header before dropping it (cap-req 18): a
@@ -154,7 +162,17 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         proxy_protocol,
         proxy_protocol_trusted_cidrs,
         proxy_protocol_trust_any,
+        max_promoted_splices,
     } = params;
+
+    // PER-LISTENER promoted-splice sub-cap (mailroom cap-req #22, Security review MEDIUM-2): ONE
+    // semaphore shared across this listener's connections, so one session listener can't monopolize
+    // the node-global splice budget and force `capacity` on every other listener (multi-tenant
+    // fairness). A `promote-connection` acquires this AND the node-global permit; either at its
+    // ceiling ⇒ `capacity` (retryable). Built even for a non-session listener (cheap; never acquired
+    // there — a connection-mode guest can't promote). Floored at 1.
+    let listener_splice_gate =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(max_promoted_splices.max(1)));
 
     // Parse the trusted-proxy CIDRs once (security-review MEDIUM-1). A malformed entry fails the
     // listener CLOSED — a misconfigured trusted set must not silently fall back to trusting any
@@ -288,6 +306,9 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let site = Arc::clone(&site);
                 let component = Arc::clone(&component);
                 let fn_config = Arc::clone(&fn_config);
+                // Per-listener promoted-splice sub-cap (cap-req #22, Security review MEDIUM-2), shared
+                // across this listener's connections.
+                let listener_splice_gate = Arc::clone(&listener_splice_gate);
                 // Cheap clone (an `Arc<ServerConfig>` inside); `None` ⇒ the plaintext listener.
                 let tls = tls.clone();
                 // Declarative STARTTLS grammar (cap-req 06, Stage B); `None` ⇒ implicit TLS / plaintext.
@@ -361,6 +382,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                             &runtime, &deploy, &name, project.as_str(), site.as_str(),
                             component.as_str(), &fn_config, tls, starttls, stream,
                             peer.to_string(), idle_timeout, max_conn_duration, session_mode,
+                            &listener_splice_gate,
                         )
                         .await;
                     });
@@ -389,6 +411,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                             &runtime, &deploy, &name, project.as_str(), site.as_str(),
                             component.as_str(), &fn_config, tls, starttls, stream,
                             peer.to_string(), idle_timeout, max_conn_duration, session_mode,
+                            &listener_splice_gate,
                         )
                         .await;
                     });
@@ -434,6 +457,8 @@ async fn terminate_and_drive(
     idle_timeout: Duration,
     max_conn_duration: Duration,
     session_mode: bool,
+    // Per-listener promoted-splice sub-cap (cap-req #22); passed through to the session dispatch.
+    listener_splice_gate: &std::sync::Arc<tokio::sync::Semaphore>,
 ) {
     match (tls, starttls) {
         // Host-side TLS termination (cap-req 06, implicit TLS): complete the handshake BEFORE the
@@ -459,6 +484,7 @@ async fn terminate_and_drive(
                     max_conn_duration,
                     session_mode,
                     boatramp_handlers::ConnectionSecurity::tls(),
+                    listener_splice_gate,
                 )
                 .await;
             }
@@ -494,6 +520,7 @@ async fn terminate_and_drive(
                 max_conn_duration,
                 session_mode,
                 conn_security,
+                listener_splice_gate,
             )
             .await;
             // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket down. If the
@@ -521,6 +548,7 @@ async fn terminate_and_drive(
                 max_conn_duration,
                 session_mode,
                 boatramp_handlers::ConnectionSecurity::plaintext(),
+                listener_splice_gate,
             )
             .await;
         }
@@ -550,6 +578,9 @@ async fn drive<R, W>(
     // listener, `plaintext` for a plaintext one, `starttls-pending` (flipped to `tls` by the pump)
     // for STARTTLS. Threaded to the guest's `tcp-connection-context` import.
     conn_security: boatramp_handlers::ConnectionSecurity,
+    // Per-listener promoted-splice sub-cap (cap-req #22, Security review MEDIUM-2); used only by the
+    // session-mode dispatch (a connection-mode guest can't promote), so it is unused on other paths.
+    listener_splice_gate: &std::sync::Arc<tokio::sync::Semaphore>,
 ) where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
@@ -576,6 +607,7 @@ async fn drive<R, W>(
                     idle_timeout,
                     max_conn_duration,
                     conn_security,
+                    std::sync::Arc::clone(listener_splice_gate),
                 )
                 .await
             {

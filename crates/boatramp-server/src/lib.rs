@@ -1233,6 +1233,10 @@ impl HandlerRuntime {
         // Live wire-security of this connection (mailroom cap-req #16); the SAME handle is passed on
         // every re-entry so a guest observes a STARTTLS upgrade the moment the pump flips it.
         conn_security: boatramp_handlers::ConnectionSecurity,
+        // PER-LISTENER promoted-splice sub-cap (cap-req #22, Security review MEDIUM-2): shared across
+        // this listener's connections; a `promote-connection` acquires BOTH this and the node-global
+        // ceiling, so one listener can't monopolize the global splice budget.
+        listener_splice_gate: std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<(), String>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -1308,6 +1312,37 @@ impl HandlerRuntime {
             CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
 
+        // cap-req 22 (session→connection escalation): build the promote-connection context ONCE for
+        // this connection — the gate-reusing egress dialer scoped to THIS listener's `egress_allowlist`
+        // (so a `promote-connection` dial is authorized by the EXACT same posture + allowlist + SSRF
+        // floor as a `tcp-egress` dial — not a new bypass) plus the node-global AND per-listener
+        // persistent-splice ceilings. Cloned into each re-entry's controller. (`None`-equivalent when
+        // the `tcp-egress` feature is off: the controller's `promote` then fail-closes `not-authorized`.)
+        //
+        // STRICT EGRESS-GRANT PARITY (Security review MEDIUM-1): driving a host-dialed egress leg must
+        // require the SAME deploy-time grant a raw `tcp-egress` dial requires — the component being
+        // GRANTED `wasi:sockets` (declared in `imports`) — not merely the `session` grant + a populated
+        // allowlist. So the dialer's allowlist is the listener's `egress_allowlist` ONLY when
+        // `wasi:sockets` is granted; otherwise it is EMPTY, which makes the reused gate refuse every
+        // dial `refused-by-gate` → `not-authorized`. This mirrors `function_runtime`'s
+        // `granted("wasi:sockets") && !egress_allowlist.is_empty()` guard exactly (a session listener
+        // that legitimately bridges upstreams simply declares the `wasi:sockets` token, as the egress
+        // config already documents). The posture + SSRF floor still apply inside the gate on top.
+        #[cfg(feature = "tcp-egress")]
+        let promote_allowlist: std::sync::Arc<[String]> =
+            if fn_config.imports.iter().any(|i| i == "wasi:sockets") {
+                std::sync::Arc::from(fn_config.egress_allowlist.clone())
+            } else {
+                std::sync::Arc::from(Vec::new())
+            };
+        #[cfg(feature = "tcp-egress")]
+        let promote_ctx = crate::session_driver::PromoteCtx {
+            dialer: std::sync::Arc::new(inner.engine.egress_dialer(promote_allowlist)),
+            splice_gate: inner.engine.promoted_splice_gate(),
+            listener_splice_gate: std::sync::Arc::clone(&listener_splice_gate),
+            max_preamble_bytes: crate::session_driver::MAX_PROMOTE_PREAMBLE_BYTES,
+        };
+
         let deadline = tokio::time::Instant::now() + max_conn_duration;
 
         // Connect-time dispatch (mailroom cap-req 17): invoke the guest ONCE, BEFORE the first
@@ -1346,15 +1381,21 @@ impl HandlerRuntime {
         {
             // cap-req 19: host-mediated `tcp-egress` allowed (gated by the allowlist + posture + SSRF
             // floor), raw `wasi:sockets` stays denied — see the connection-lane wrapper above.
-            Ok(b) => b
-                .with_session(std::sync::Arc::new(
-                    crate::session_driver::SocketSessionController::new(
-                        state.clone(),
-                        session_limits.max_frame_bytes,
-                        session_limits.max_checkpoint_bytes,
-                    ),
-                ))
-                .with_host_mediated_egress(),
+            Ok(b) => {
+                #[allow(unused_mut)]
+                let mut controller = crate::session_driver::SocketSessionController::new(
+                    state.clone(),
+                    session_limits.max_frame_bytes,
+                    session_limits.max_checkpoint_bytes,
+                );
+                // cap-req 22: attach promote-connection support (the gate-reusing dialer + splice cap).
+                #[cfg(feature = "tcp-egress")]
+                {
+                    controller = controller.with_promote(promote_ctx.clone());
+                }
+                b.with_session(std::sync::Arc::new(controller))
+                    .with_host_mediated_egress()
+            }
             Err(e) => {
                 tracing::warn!(
                     %peer,
@@ -1404,6 +1445,23 @@ impl HandlerRuntime {
             state.shutdown().await;
             return Ok(());
         }
+        // cap-req 22: the guest may promote at CONNECT (before any client byte) — e.g. a protocol
+        // that authenticates on a token in the first handshake. The re-entry has returned, so its
+        // session-socket permit is already released; hand the client read half + the reclaimed write
+        // half to the persistent splice, which runs on the listener's own task (NOT the re-entry pool
+        // or the shared async lane) and owns the connection for the rest of its life.
+        #[cfg(feature = "tcp-egress")]
+        if let Some(promo) = state.take_promotion() {
+            let client_write = state.take_write_half().await;
+            return crate::session_driver::run_promoted_splice(
+                read_half,
+                client_write,
+                promo,
+                deadline,
+                &peer,
+            )
+            .await;
+        }
 
         let mut buf = vec![0u8; SESSION_CONN_READ_BUF];
         loop {
@@ -1438,15 +1496,21 @@ impl HandlerRuntime {
             .await
             {
                 // cap-req 19: host-mediated `tcp-egress` allowed, raw `wasi:sockets` denied (as above).
-                Ok(b) => b
-                    .with_session(std::sync::Arc::new(
-                        crate::session_driver::SocketSessionController::new(
-                            state.clone(),
-                            session_limits.max_frame_bytes,
-                            session_limits.max_checkpoint_bytes,
-                        ),
-                    ))
-                    .with_host_mediated_egress(),
+                Ok(b) => {
+                    #[allow(unused_mut)]
+                    let mut controller = crate::session_driver::SocketSessionController::new(
+                        state.clone(),
+                        session_limits.max_frame_bytes,
+                        session_limits.max_checkpoint_bytes,
+                    );
+                    // cap-req 22: attach promote-connection support (gate-reusing dialer + splice cap).
+                    #[cfg(feature = "tcp-egress")]
+                    {
+                        controller = controller.with_promote(promote_ctx.clone());
+                    }
+                    b.with_session(std::sync::Arc::new(controller))
+                        .with_host_mediated_egress()
+                }
                 Err(e) => {
                     tracing::warn!(%peer, "session listener bindings unavailable; closing: {e:?}");
                     break;
@@ -1493,6 +1557,24 @@ impl HandlerRuntime {
             // The guest closed the session this re-entry ⇒ end the connection.
             if state.is_closed() {
                 break;
+            }
+            // cap-req 22: the guest promoted this re-entry (after authenticating) ⇒ leave the
+            // re-entry loop and dispatch the connection as a PERSISTENT duplex splice. The re-entry
+            // future has returned (its session-socket permit released), so the splice runs on this
+            // listener task's own resourcing, never the re-entry pool / shared async lane. It owns the
+            // connection for the rest of its life (both halves + the splice permit are torn down
+            // deterministically when it returns).
+            #[cfg(feature = "tcp-egress")]
+            if let Some(promo) = state.take_promotion() {
+                let client_write = state.take_write_half().await;
+                return crate::session_driver::run_promoted_splice(
+                    read_half,
+                    client_write,
+                    promo,
+                    deadline,
+                    &peer,
+                )
+                .await;
             }
         }
         // Best-effort shut the socket on exit (no-op if the guest already closed).
