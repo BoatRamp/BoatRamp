@@ -77,6 +77,28 @@
           # `buildTrunkPackage` output.
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+          # Pebble pinned to >= 2.10.0. nixpkgs currently ships 2.6.0, but the ACME
+          # DNS-01 regression gate (crates/boatramp-acme/tests/pebble_dns01.rs) needs
+          # a CA that emits the tokenless `dns-persist-01` challenge, which Pebble
+          # only started doing in v2.10.0 (mirroring Let's Encrypt / Google Trust
+          # Services in production). On the old instant-acme (< 0.8.5) that tokenless
+          # challenge fails to deserialize ("missing field `token`") and wrecks the
+          # whole authorization; the gate proves the 0.8.5 bump tolerates it. Pebble
+          # vendors its Go deps in-tree (`vendorHash = null`), so only the src hash
+          # changes. `doCheck = false`: upstream's own Go test suite isn't our gate.
+          pebble = pkgs.pebble.overrideAttrs (
+            final: _prev: {
+              version = "2.10.1";
+              src = pkgs.fetchFromGitHub {
+                owner = "letsencrypt";
+                repo = "pebble";
+                rev = "v${final.version}";
+                hash = "sha256-O9lVC/GhbN3R7RuWZzr1kznbz0ffr+qdNSa/FpVTWzY=";
+              };
+              doCheck = false;
+            }
+          );
+
           # Args shared by the console's deps-only derivation and its Trunk
           # build. `--manifest-path` keeps `cargo` resolving the excluded console
           # + its `../boatramp-types` path dep in isolation (not the whole server
@@ -818,7 +840,10 @@
               pkgs.sqld
               # Pebble + its challenge test server: a local ACME CA for the
               # DNS-01 wildcard-cert integration test (`just acme-dns-e2e`).
-              pkgs.pebble
+              # Pinned to >= 2.10.0 (see the `pebble` override above) so the CA
+              # emits the tokenless `dns-persist-01` challenge the regression gate
+              # exercises.
+              pebble
               # The documentation site (docs/book.toml) is built with mdBook.
               pkgs.mdbook
               # Web console (crates/boatramp-console): the Yew (CSR) Wasm SPA is

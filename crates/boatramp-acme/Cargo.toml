@@ -44,7 +44,13 @@ thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-instant-acme = { version = "0.7", optional = true }
+# 0.8.5 is the first published release that tolerates a tokenless challenge
+# (`#[serde(default)]` on `Challenge.token`, PR #264): Let's Encrypt / Google
+# Trust Services / Pebble ≥ 2.10.0 now include a tokenless `dns-persist-01`
+# challenge in the authorization, which < 0.8.5 fails to deserialize ("missing
+# field `token`"), killing the whole authorization — including the `dns-01`
+# challenge we select. See tests/pebble_dns01.rs for the regression gate.
+instant-acme = { version = "0.8.5", optional = true }
 rcgen = { version = "0.13", optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-route53 = { version = "1", features = [

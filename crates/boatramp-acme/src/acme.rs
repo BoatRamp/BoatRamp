@@ -13,6 +13,7 @@
 //! (`#[ignore]`d — run via `just acme-dns-e2e`).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -39,6 +40,11 @@ pub enum AcmeError {
     /// The CA offered no challenge of the solver's type for an authorization.
     #[error("authorization offers no {0:?} challenge")]
     NoChallenge(ChallengeType),
+    /// An authorization carried a non-DNS identifier (e.g. an IP address). The DNS/TLS/HTTP
+    /// challenge solvers all key off a DNS name, and boatramp only ever orders DNS identifiers, so
+    /// this is a protocol violation rather than something to present a challenge for.
+    #[error("authorization identifier is not a DNS name")]
+    NonDnsIdentifier,
     /// The order failed validation (a challenge did not pass).
     #[error("ACME order became invalid (challenge failed)")]
     OrderInvalid,
@@ -70,6 +76,12 @@ pub struct CertRequest {
     pub propagation_delay: Duration,
     /// How long to keep polling the order before giving up.
     pub timeout: Duration,
+    /// Extra root CA (PEM file) to trust for the ACME directory's TLS, for a test/staging CA whose
+    /// directory uses a privately-issued certificate (e.g. Pebble). `None` ⇒ trust the platform's
+    /// public roots (the production Let's Encrypt / Google Trust Services case). Only consulted by
+    /// the account-creating convenience [`obtain_certificate`]; [`obtain_certificate_with`] takes an
+    /// already-built account whose HTTP client already encodes this choice.
+    pub extra_root_ca: Option<PathBuf>,
 }
 
 impl Default for CertRequest {
@@ -81,6 +93,7 @@ impl Default for CertRequest {
             dns_ttl: 60,
             propagation_delay: Duration::from_secs(15),
             timeout: Duration::from_secs(120),
+            extra_root_ca: None,
         }
     }
 }
@@ -121,30 +134,40 @@ pub async fn obtain_certificate_with(
         .iter()
         .map(|d| Identifier::Dns(d.clone()))
         .collect();
-    let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
-        .await?;
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
     let want = solver.challenge_type();
     // Identifiers we presented a challenge for, so we clean exactly those up afterward.
     let mut presented: Vec<String> = Vec::new();
-    let authorizations = order.authorizations().await?;
-    for authz in &authorizations {
-        if authz.status == AuthorizationStatus::Valid {
-            continue;
+    // instant-acme 0.8 exposes the authorizations as a stream-like iterator that borrows the order
+    // mutably; scope it so the borrow is released before `drive_to_certificate` reborrows `order`.
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(authz) = authorizations.next().await {
+            let mut authz = authz?;
+            // An already-valid authorization (e.g. a reused account's cached validation) needs no
+            // challenge presented.
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            // Select the solver's challenge type. Since 0.8.5, a tokenless challenge the CA may now
+            // also offer (e.g. `dns-persist-01`, Let's Encrypt / Pebble ≥ 2.10.0) no longer fails
+            // deserialization and so no longer wrecks this selection — `dns-01` is still picked.
+            let Some(mut challenge) = authz.challenge(want.clone()) else {
+                return Err(AcmeError::NoChallenge(want.clone()));
+            };
+            // boatramp only ever orders DNS identifiers; the base domain (wildcards arrive here
+            // stripped to their base, with the wildcard flag carried separately) is what the
+            // solver writes `_acme-challenge.<base>` / builds the challenge cert for.
+            let identifier = match &challenge.identifier().identifier {
+                Identifier::Dns(dns) => dns.clone(),
+                _ => return Err(AcmeError::NonDnsIdentifier),
+            };
+            let key_auth = challenge.key_authorization();
+            solver.present(&identifier, &key_auth).await?;
+            presented.push(identifier);
+            challenge.set_ready().await?;
         }
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == want)
-            .ok_or_else(|| AcmeError::NoChallenge(want.clone()))?;
-        let Identifier::Dns(identifier) = &authz.identifier;
-        let key_auth = order.key_authorization(challenge);
-        solver.present(identifier, &key_auth).await?;
-        presented.push(identifier.clone());
-        order.set_challenge_ready(&challenge.url).await?;
     }
 
     let result = drive_to_certificate(&mut order, request).await;
@@ -165,8 +188,12 @@ pub async fn obtain_certificate(
     request: &CertRequest,
     provider: &dyn DnsProvider,
 ) -> Result<IssuedCert, AcmeError> {
-    let (account, _credentials) =
-        create_account(&request.directory_url, request.contact_email.as_deref()).await?;
+    let (account, _credentials) = create_account(
+        &request.directory_url,
+        request.contact_email.as_deref(),
+        request.extra_root_ca.as_deref(),
+    )
+    .await?;
     let solver = Dns01Solver::new(provider, request.dns_ttl);
     obtain_certificate_with(&account, request, &solver).await
 }
@@ -273,29 +300,54 @@ fn tls_alpn01_cert_from_digest(
 pub async fn create_account(
     directory_url: &str,
     contact_email: Option<&str>,
+    extra_root_ca: Option<&Path>,
 ) -> Result<(Account, AccountCredentials), AcmeError> {
     let contact: Vec<String> = contact_email
         .into_iter()
         .map(|email| format!("mailto:{email}"))
         .collect();
     let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
-    let (account, credentials) = Account::create(
-        &NewAccount {
-            contact: &contact_refs,
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        directory_url,
-        None,
-    )
-    .await?;
+    let (account, credentials) = account_builder(extra_root_ca)?
+        .create(
+            &NewAccount {
+                contact: &contact_refs,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url.to_owned(),
+            None,
+        )
+        .await?;
     Ok((account, credentials))
 }
 
 /// Restore a previously-created account from stored [`AccountCredentials`] (no CA round trip for a
 /// new account). The caller keeps its own serialized copy; this consumes the parsed credentials.
-pub async fn restore_account(credentials: AccountCredentials) -> Result<Account, AcmeError> {
-    Ok(Account::from_credentials(credentials).await?)
+/// `extra_root_ca` configures the restored account's HTTP client exactly as for [`create_account`]
+/// (the restored account still talks to the directory for every order).
+pub async fn restore_account(
+    credentials: AccountCredentials,
+    extra_root_ca: Option<&Path>,
+) -> Result<Account, AcmeError> {
+    Ok(account_builder(extra_root_ca)?
+        .from_credentials(credentials)
+        .await?)
+}
+
+/// Build the instant-acme account HTTP-client builder, trusting an extra root CA when one is given.
+///
+/// Since instant-acme 0.8 the default client (`Account::builder`) verifies the directory's TLS with
+/// the platform verifier, which does **not** honour `SSL_CERT_FILE`; a test/staging CA with a
+/// privately-issued directory cert must be trusted explicitly via `builder_with_root` (RFC: "your
+/// ACME server uses a testing PKI"). Production (Let's Encrypt / Google Trust Services) passes
+/// `None` and uses the platform's public roots.
+fn account_builder(
+    extra_root_ca: Option<&Path>,
+) -> Result<instant_acme::AccountBuilder, AcmeError> {
+    Ok(match extra_root_ca {
+        Some(ca) => Account::builder_with_root(ca)?,
+        None => Account::builder()?,
+    })
 }
 
 /// Wait for the order to become ready, finalize it with a CSR, and fetch the
@@ -322,12 +374,14 @@ async fn drive_to_certificate(
         delay = (delay * 2).min(Duration::from_secs(10));
     }
 
-    // Generate the key + CSR for the requested SANs.
+    // Generate the key + CSR for the requested SANs. We supply our own CSR (via `finalize_csr`)
+    // rather than instant-acme's no-arg `finalize` — keeping the key material ours (rcgen,
+    // never leaving this process) and the DN empty, exactly as before the 0.8 bump.
     let key_pair = rcgen::KeyPair::generate()?;
     let mut params = rcgen::CertificateParams::new(request.domains.clone())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let csr = params.serialize_request(&key_pair)?;
-    order.finalize(csr.der()).await?;
+    order.finalize_csr(csr.der()).await?;
 
     // Poll for the issued certificate chain.
     let deadline = tokio::time::Instant::now() + request.timeout;
@@ -372,6 +426,78 @@ mod tests {
         // The challenge cert is bound to the key-authorization digest — a different digest ⇒ a
         // different cert (the acmeIdentifier extension differs).
         assert_ne!(cert_a, cert_b, "the cert must incorporate the digest");
+    }
+
+    /// A real `*.deploy.test` **wildcard** authorization as emitted by Pebble **2.10.1** (captured
+    /// live from the `pebble_dns01` integration test). It carries THREE challenges — and the
+    /// `dns-persist-01` one is **tokenless** (Pebble marshals `token` with `omitempty` and sets it
+    /// to `""`, so the field is absent on the wire). Let's Encrypt and Google Trust Services now
+    /// emit the same tokenless `dns-persist-01` in production.
+    ///
+    /// This is the exact JSON that instant-acme **< 0.8.5** could not deserialize: its
+    /// `Challenge.token` was a *required* field, so the token-less entry failed with
+    /// `missing field \`token\``, which aborted the whole authorization — dropping the `dns-01`
+    /// challenge boatramp selects and crash-looping DNS-01 issuance against the real CA. 0.8.5 added
+    /// `#[serde(default)]` on `Challenge.token`, so the authorization now deserializes and `dns-01`
+    /// is still selectable. This unit test is the pebble-free regression guard for that seam.
+    #[cfg(feature = "acme")]
+    const PEBBLE_2_10_WILDCARD_AUTHZ_JSON: &str = r#"{
+        "status": "pending",
+        "identifier": { "type": "dns", "value": "deploy.test" },
+        "challenges": [
+            {
+                "type": "dns-persist-01",
+                "url": "https://localhost:14000/chalZ/y9-HB3ia7eNzLFc0lIV4UlQbiP6h9SHwLVh2RMTZw_U",
+                "status": "pending",
+                "accounturi": "https://localhost:14000/my-account/1",
+                "issuer-domain-names": ["pebble.letsencrypt.org"]
+            },
+            {
+                "type": "dns-account-01",
+                "url": "https://localhost:14000/chalZ/UDJxA781Eee1pmUTwJO65ECWesCb0zl0m-12_zlZ-q4",
+                "token": "Ezuat7vfdG5CG6BZME06wIye1G__6Gz1HnEkJHbbT6s",
+                "status": "pending"
+            },
+            {
+                "type": "dns-01",
+                "url": "https://localhost:14000/chalZ/BVIs1EetnsQEpmaUS_01CibqlTJDSIDSt-LCZwJSp3c",
+                "token": "NL-zq0hjJc_wvNMaIO2Wxfirhv8BgKEvO937tJYpyBk",
+                "status": "pending"
+            }
+        ],
+        "expires": "2026-11-05T00:00:00Z",
+        "wildcard": true
+    }"#;
+
+    /// The bumped instant-acme (>= 0.8.5) deserializes the tokenless-challenge authorization and
+    /// still exposes the `dns-01` challenge with its token. On instant-acme < 0.8.5 the same
+    /// `from_str` returned `Err("missing field \`token\`")` (verified against the 0.7.2 types).
+    #[cfg(feature = "acme")]
+    #[test]
+    fn tokenless_dns_persist_01_authorization_still_deserializes_and_keeps_dns01() {
+        let authz: instant_acme::AuthorizationState =
+            serde_json::from_str(PEBBLE_2_10_WILDCARD_AUTHZ_JSON)
+                .expect("instant-acme >= 0.8.5 must tolerate a tokenless challenge in the authz");
+
+        // The tokenless `dns-persist-01` is present and really has an empty token (the field that
+        // the old client required) — so this fixture keeps exercising the exact regression.
+        let persist = authz
+            .challenges
+            .iter()
+            .find(|c| c.r#type == ChallengeType::Unknown("dns-persist-01".to_string()))
+            .expect("the tokenless dns-persist-01 challenge must be present");
+        assert!(
+            persist.token.is_empty(),
+            "dns-persist-01 is the tokenless challenge that broke the old required-token deser"
+        );
+
+        // The `dns-01` challenge boatramp selects survived and carries its token.
+        let dns01 = authz
+            .challenges
+            .iter()
+            .find(|c| c.r#type == ChallengeType::Dns01)
+            .expect("the dns-01 challenge must still be selectable");
+        assert!(!dns01.token.is_empty(), "dns-01 must keep its real token");
     }
 
     #[test]

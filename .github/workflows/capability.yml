@@ -735,3 +735,62 @@ jobs:
             || { echo "::error::session capability test did not pass" >&2; exit 1; }
           grep -q 'SESSION CAPABILITY GATE OK' session.log \
             || { echo "::error::session capability never reached the success marker (silent skip or broken duplex/resume?)" >&2; exit 1; }
+
+  # Tier J — the ACME DNS-01 `dns-persist-01` regression gate. Drives the REAL issuance path
+  # (boatramp-acme `obtain_certificate` → `order.authorizations()` → `finalize_csr` → cert) against a
+  # local Pebble CA pinned to >= 2.10.0. Pebble >= 2.10.0 includes a TOKENLESS `dns-persist-01`
+  # challenge in every authorization — exactly as Let's Encrypt and Google Trust Services now do in
+  # production. instant-acme < 0.8.5 made `Challenge.token` a required serde field, so that tokenless
+  # challenge failed to deserialize ("missing field `token`"), aborting the whole authorization —
+  # including the `dns-01` challenge boatramp selects — and crash-looping real DNS-01 issuance. The
+  # 0.8.5 bump tolerates it. This is a HARD success-marker gate (NOT an `#[ignore]`d test): the test
+  # prints `ACME-DNS-PERSIST GATE OK` only after a Pebble-signed cert comes back, and we grep for it
+  # so a silent skip (pebble not on PATH) fails the job. No privileges, no secrets, no egress — a
+  # local Pebble test-double, like the other test-double gates here.
+  acme-dns-persist:
+    name: ACME DNS-01 dns-persist-01 gate (Pebble >= 2.10.0)
+    runs-on: ubuntu-latest
+    env:
+      # Pin a Pebble >= 2.10.0 (2.10.0 is the first release that emits the tokenless dns-persist-01
+      # challenge). nixpkgs still ships 2.6.0, so CI fetches the pinned upstream release binary — the
+      # nix dev shell pins the same version via a `pkgs.pebble` override in flake.nix.
+      PEBBLE_VERSION: "2.10.1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-acme-dns-persist
+
+      - name: Install Pebble + pebble-challtestsrv (>= 2.10.0, emits dns-persist-01)
+        run: |
+          set -o pipefail
+          base="https://github.com/letsencrypt/pebble/releases/download/v${PEBBLE_VERSION}"
+          mkdir -p "$HOME/pebble-bin"
+          for b in pebble pebble-challtestsrv; do
+            curl -fsSL "${base}/${b}-linux-amd64.tar.gz" -o "/tmp/${b}.tar.gz"
+            tar -xzf "/tmp/${b}.tar.gz" -C /tmp
+            install -m 0755 "$(find /tmp -type f -name "$b" | head -n1)" "$HOME/pebble-bin/$b"
+          done
+          echo "$HOME/pebble-bin" >> "$GITHUB_PATH"
+          "$HOME/pebble-bin/pebble" -version
+          # Fail loud if the pin ever resolves to a pre-2.10 Pebble (which would NOT emit the
+          # tokenless dns-persist-01 challenge, so the gate would no longer exercise the regression).
+          "$HOME/pebble-bin/pebble" -version 2>&1 | grep -q "version: ${PEBBLE_VERSION}" \
+            || { echo "::error::Pebble is not the pinned >= 2.10.0 build; the gate would not emit dns-persist-01" >&2; exit 1; }
+
+      - name: Issue a wildcard cert via DNS-01 against Pebble (hard gate)
+        run: |
+          set -o pipefail
+          # NOT `--ignored`: this is a real gate. The test spawns pebble + pebble-challtestsrv from
+          # PATH (installed above), mints a throwaway CA, and issues `*.deploy.test`. The
+          # authorization Pebble >= 2.10.0 returns carries the tokenless `dns-persist-01` challenge
+          # the dep bump must tolerate.
+          cargo test -p boatramp-acme --features acme --test pebble_dns01 \
+            -- --nocapture --test-threads=1 2>&1 | tee pebble.log
+          grep -qE 'test result: ok' pebble.log \
+            || { echo "::error::ACME DNS-01 pebble gate did not pass" >&2; exit 1; }
+          # The anti-silent-skip guard: the marker prints ONLY after a Pebble-signed cert is returned,
+          # so if pebble was missing (the test's on_path guard returns early) this grep fails the job.
+          grep -q 'ACME-DNS-PERSIST GATE OK' pebble.log \
+            || { echo "::error::pebble gate never reached the success marker (silent skip or dns-persist-01 regression?)" >&2; exit 1; }

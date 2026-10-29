@@ -16,6 +16,7 @@
 //! backend ([`CertIssuer`]) and the allowlist ([`IssuanceGate`]) so it is unit-testable offline.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -456,6 +457,7 @@ pub fn from_serve_config(
     dns_provider: Option<Arc<dyn boatramp_acme::dns::DnsProvider>>,
     account_kv: Arc<dyn boatramp_core::kv::KvStore>,
     account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
+    extra_root_ca: Option<PathBuf>,
 ) -> Option<OnDemandTls> {
     if !cfg.enabled {
         return None;
@@ -502,6 +504,7 @@ pub fn from_serve_config(
         Arc::clone(&now_unix),
         account_kv,
         account_envelope,
+        extra_root_ca,
     ));
     let gate = Arc::new(DeployGate { deploy });
     let defaults = OnDemandConfig::default();
@@ -692,6 +695,12 @@ pub struct AcmeIssuer {
     /// Wraps the stored account credentials at rest (the account key is sensitive), when `[secrets]`
     /// is configured — mirrors `KvCertStore`'s key-wrap. `None` ⇒ stored in the clear.
     account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
+    /// Extra root CA (PEM file) to trust for the ACME directory's TLS (a test/staging CA, e.g.
+    /// Pebble). `None` ⇒ the platform's public roots (production Let's Encrypt / Google Trust
+    /// Services). Threaded into both the account-create and account-restore paths so the instant-acme
+    /// HTTP client trusts it — since instant-acme 0.8 the default client's platform verifier no
+    /// longer honours `SSL_CERT_FILE`, so this must be set explicitly.
+    extra_root_ca: Option<PathBuf>,
 }
 
 impl AcmeIssuer {
@@ -704,6 +713,7 @@ impl AcmeIssuer {
         now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
         account_kv: Arc<dyn boatramp_core::kv::KvStore>,
         account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
+        extra_root_ca: Option<PathBuf>,
     ) -> Self {
         Self {
             account: tokio::sync::OnceCell::new(),
@@ -717,6 +727,7 @@ impl AcmeIssuer {
             now_unix,
             account_kv,
             account_envelope,
+            extra_root_ca,
         }
     }
 
@@ -762,7 +773,7 @@ impl AcmeIssuer {
                 // 1. Try to restore a previously-stored account (no CA `newAccount`).
                 if let Ok(Some(raw)) = self.account_kv.get(&key).await {
                     match self.decode_creds(&raw).await {
-                        Ok(creds) => match boatramp_acme::acme::restore_account(creds).await {
+                        Ok(creds) => match boatramp_acme::acme::restore_account(creds, self.extra_root_ca.as_deref()).await {
                             Ok(acc) => return Ok(Arc::new(acc)),
                             Err(e) => tracing::warn!(target: "boatramp::acme", error = %e, "stored ACME account failed to restore; creating a new one"),
                         },
@@ -773,6 +784,7 @@ impl AcmeIssuer {
                 let (acc, creds) = boatramp_acme::acme::create_account(
                     &self.directory_url,
                     self.contact_email.as_deref(),
+                    self.extra_root_ca.as_deref(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -801,6 +813,7 @@ impl CertIssuer for AcmeIssuer {
             dns_ttl: self.dns_ttl,
             propagation_delay: self.propagation_delay,
             timeout: self.timeout,
+            extra_root_ca: self.extra_root_ca.clone(),
         };
         let issued = match &self.challenge {
             AcmeChallenge::Dns01(provider) => {
@@ -1482,16 +1495,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("br-ondemand-pebble-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca_path = mint_certs(&dir);
+        // Bind the IPv6 wildcard so `localhost` (IPv6-first on macOS / IPv6-enabled runners) reaches
+        // Pebble; the cert names `localhost` and Pebble rejects bare-IP `Host` headers with 400.
         let config = serde_json::json!({ "pebble": {
-            "listenAddress": "0.0.0.0:14000", "managementListenAddress": "0.0.0.0:15000",
+            "listenAddress": "[::]:14000", "managementListenAddress": "[::]:15000",
             "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
             "httpPort": 5002, "tlsPort": 5001, "ocspResponderURL": "" } });
         let config_path = dir.join("pebble.json");
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        // challtestsrv >= 2.10: DNS flag is `-dnsserver` (was `-dns01`) and a DoH responder (`-doh`)
+        // must be disabled too; bound to the IPv4 loopback the management POSTs / Pebble resolver use.
         let _challtestsrv = Child(
             tokio::process::Command::new("pebble-challtestsrv")
-                .args(["-dns01", ":8053", "-management", ":8055"])
-                .args(["-http01", "", "-https01", "", "-tlsalpn01", ""])
+                .args([
+                    "-dnsserver",
+                    "127.0.0.1:8053",
+                    "-management",
+                    "127.0.0.1:8055",
+                ])
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn pebble-challtestsrv"),
@@ -1505,8 +1527,10 @@ mod tests {
                 .spawn()
                 .expect("spawn pebble"),
         );
+        // Pebble >= 2.10 rejects any request without a `User-Agent` (HTTP 400); set one for the probe.
         let probe = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .user_agent("boatramp-ondemand-pebble-test")
             .build()
             .unwrap();
         let mut ready = false;
@@ -1524,9 +1548,23 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         assert!(ready, "Pebble directory did not become ready");
-        // Trust the throwaway CA for instant-acme (honors SSL_CERT_FILE). Single-threaded here, before
-        // any concurrent env reads — the same documented exception as the boatramp-acme pebble test.
-        unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
+        // Wait for challtestsrv's management API too (any HTTP response means the port is bound),
+        // so the first `set-txt` during issuance doesn't race a slow-to-bind challtestsrv.
+        let mut challtestsrv_ready = false;
+        for _ in 0..50 {
+            if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+                challtestsrv_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            challtestsrv_ready,
+            "pebble-challtestsrv management API did not come up"
+        );
+        // Trust the throwaway CA for instant-acme by passing it to the issuer (`extra_root_ca`).
+        // Since instant-acme 0.8 the default client uses the platform verifier, which does NOT
+        // honour `SSL_CERT_FILE`, so the CA must be configured explicitly on the account builder.
 
         // A real on-demand engine: DNS-01 via challtestsrv, an in-memory store, one authorized SNI.
         let cache = Arc::new(CertCache::default());
@@ -1546,6 +1584,7 @@ mod tests {
             Arc::clone(&now_unix),
             Arc::new(boatramp_core::kv::MemoryKv::new()),
             None,
+            Some(ca_path.clone()),
         ));
         let cert_store = mem_store();
         let eng = Arc::new(OnDemandIssuer {

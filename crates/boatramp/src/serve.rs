@@ -4526,6 +4526,7 @@ async fn serve_cluster_acme_dns(
                 Some(provider.clone()),
                 account_kv.clone(),
                 account_envelope.clone(),
+                args.acme_ca_cert.clone(),
             )
         })
         .map(Arc::new);
@@ -4545,6 +4546,7 @@ async fn serve_cluster_acme_dns(
         dns_ttl: 60,
         propagation_delay: Duration::from_secs(15),
         timeout: Duration::from_secs(120),
+        extra_root_ca: args.acme_ca_cert.clone(),
     };
     let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
     let cache = args.acme_cache.clone();
@@ -4783,6 +4785,7 @@ async fn serve_acme_dns(
         dns_ttl: 60,
         propagation_delay: Duration::from_secs(15),
         timeout: Duration::from_secs(120),
+        extra_root_ca: args.acme_ca_cert.clone(),
     };
     let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
 
