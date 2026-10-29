@@ -136,6 +136,59 @@ NAME  REPLICAS  PORT  ISOLATION  STATE
 web   2/2       80    trusted    Healthy
 ```
 
+## Pull from a private registry
+
+An `--image` in a private registry pulls with a **sealed** credential — boatramp never
+stores a registry username/password in `boatramp.cfg` or `project.cfg` in the clear. A
+credential is `{username, password}`, sealed at rest with the same `[secrets]` key envelope
+that seals a managed-DB credential, and unsealed host-side only at pull time. (The live
+authenticated pull is on the `docker` backend; the native `container` backend cannot yet
+apply a credential and refuses a private-image workload rather than pull it anonymously.)
+
+**Project author (your own project).** Set a sealed credential in this project's secret
+store, then reference it from the workload with `--pull-secret`:
+
+```sh
+# Seal the credential (the token never hits argv / shell history with --password-stdin):
+printf '%s' "$GHCR_TOKEN" | boatramp compute registry-auth set ghcr-pull \
+  --username acme-bot --password-stdin
+
+# Reference it when setting the workload:
+boatramp compute set worker \
+  --image ghcr.io/acme/private-worker:1 --port 8080 --pull-secret ghcr-pull
+```
+
+List or rotate/remove credentials (the value is never shown):
+
+```sh
+boatramp compute registry-auth ls
+boatramp compute registry-auth rm ghcr-pull
+```
+
+The credential is scoped to your project: a workload can only ever resolve a pull secret
+from its **own** project, never another tenant's.
+
+**Operator (node-wide fleet images).** An operator can map a registry host to a sealed
+credential once, so every workload pulling from that host is authenticated without each
+author setting a `--pull-secret`. Set the credential with System·Admin authority:
+
+```sh
+printf '%s' "$TOKEN" | boatramp compute registry-auth set fleet-ghcr \
+  --username fleet-bot --password-stdin --operator
+```
+
+then map the host to it in `[compute].registry_auth` (a daemon setting):
+
+```toml
+[compute.registry_auth]
+"ghcr.io" = "fleet-ghcr"
+```
+
+**Fail-closed.** A workload that references a credential which is missing or unauthorized
+fails the pull **closed** — it is never silently downgraded to an anonymous pull. An
+anonymous pull happens only when no `--pull-secret` is set AND no operator host entry
+matches (a public image). A wrong/failed credential never echoes the token in an error.
+
 ## Choose the isolation level
 
 `--isolation` decides which backend may run the workload:

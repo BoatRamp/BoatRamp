@@ -249,6 +249,30 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             envelope,
         ))
     });
+    // The compute **registry pull-credential resolver** (PLAN-compute-registry-auth): resolves a
+    // workload's image pull credential from either its project `pull_secret` sealed secret or the
+    // operator `[compute].registry_auth` host map (sealed under the reserved operator keyspace),
+    // fail-closed. Built from the SAME project secret store that seals managed-DB credentials.
+    // Built UNCONDITIONALLY (even on a node with NO `[secrets]` envelope — `secret_store` is then
+    // `None`) so it can still enforce fail-closed: a workload that REFERENCES a credential on an
+    // envelope-less node fails the pull closed (`NoSecretBackend`) rather than silently pulling
+    // anonymously (Security MEDIUM-1); a workload that references nothing resolves to anonymous.
+    // Threaded into the reconcile below.
+    let registry_auth_resolver: Option<
+        Arc<dyn boatramp_core::registry_auth::RegistryAuthResolver>,
+    > = {
+        let operator = config
+            .compute
+            .as_ref()
+            .map(|c| c.registry_auth.clone())
+            .unwrap_or_default();
+        Some(Arc::new(
+            boatramp_core::registry_auth::SealedRegistryAuthResolver::new(
+                secret_store.clone(),
+                operator,
+            ),
+        ) as Arc<_>)
+    };
 
     // Dev-posture guest-egress extra CA(s): when the posture permits (off/refused under
     // multi-tenant) AND the operator pointed `BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE` at a PEM, parse
@@ -925,6 +949,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         COMPUTE_IDLE_TIMEOUT,
         binding_resolver,
         managed_db_resolver,
+        registry_auth_resolver,
     );
 
     // Tenant tombstone reaper: leader-gated hard-drop of soft-deleted Shared-Postgres

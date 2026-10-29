@@ -35,6 +35,7 @@ use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Health, Instance,
     InstanceHandle, IsolationClass, LaunchRequest, RootSource,
 };
+use boatramp_core::registry_auth::RegistryAuth;
 
 /// A Cloudflare Containers instance tier. The vCPU/memory envelope is fixed by
 /// the platform; we pick the smallest tier that fits the spec
@@ -126,6 +127,16 @@ pub struct CfContainer {
     pub instances: u32,
     /// The platform instance tier (cpu/mem envelope).
     pub instance_type: InstanceType,
+    /// The project-scoped **registry pull-secret NAME** (`spec.pull_secret`) for a
+    /// private `image`, carried through so the wrangler emitter (`boatramp cloudflare`)
+    /// can resolve it and configure the Cloudflare-side registry credential at
+    /// `wrangler deploy` time. Cloudflare performs the actual pull edge-side, so the
+    /// boatramp CF backend never authenticates in-process — this is the SURFACE that
+    /// makes the private-registry pull ready for the CF path (the emitter wiring is the
+    /// documented follow-up). `None`/omitted ⇒ a public image. Only the NAME, never a
+    /// credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_secret: Option<String>,
 }
 
 impl CfContainer {
@@ -138,6 +149,7 @@ impl CfContainer {
             image: spec.root.as_str().to_string(),
             instances,
             instance_type: InstanceType::for_mem(spec.mem_mib),
+            pull_secret: spec.pull_secret.clone(),
         }
     }
 }
@@ -212,9 +224,14 @@ impl ComputeBackend for CloudflareBackend {
         _project: &str,
         _workload: &str,
         spec: &ComputeSpec,
+        _pull_auth: Option<&RegistryAuth>,
     ) -> Result<Artifact, BackendError> {
-        // The CF backend pulls an OCI image reference; nothing to stage locally. An
-        // ext4 rootfs is not runnable here.
+        // The CF backend performs NO in-process pull — Cloudflare pulls the image
+        // edge-side at `wrangler deploy`. So `_pull_auth` (the in-process puller's
+        // credential) is deliberately unused here; a private image's credential is
+        // configured CF-side by the wrangler emitter from `spec.pull_secret` (carried on
+        // `CfContainer::pull_secret`). Nothing to stage locally; an ext4 rootfs is not
+        // runnable here.
         let reference = match &spec.root {
             RootSource::Image(reference) if !reference.is_empty() => reference.clone(),
             RootSource::Image(_) => {
@@ -296,6 +313,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }
@@ -373,7 +391,7 @@ mod tests {
     async fn materialize_records_image_and_rejects_empty() {
         let b = CloudflareBackend::new("example.com");
         let art = b
-            .materialize("default", "edge", &spec(256, "registry/app:1"))
+            .materialize("default", "edge", &spec(256, "registry/app:1"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -383,7 +401,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            b.materialize("default", "edge", &spec(256, "")).await,
+            b.materialize("default", "edge", &spec(256, ""), None).await,
             Err(BackendError::Materialize(_))
         ));
     }

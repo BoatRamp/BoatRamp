@@ -1241,6 +1241,36 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub mysql_client_image: Option<String>,
+    /// **Operator node-wide registry pull credentials** (PLAN-compute-registry-auth):
+    /// `registry-host → `[`OperatorRegistryAuth`](boatramp_core::registry_auth::OperatorRegistryAuth)
+    /// for operator-provisioned fleet images. When a workload's `image(...)` registry host matches a
+    /// key here (and the workload itself names NO project `pull_secret`), the referenced sealed
+    /// secret authenticates the pull. The ref names a sealed `{username,password}` secret the
+    /// operator sets with System·Admin authority via `boatramp compute registry-auth set --operator`,
+    /// stored in the reserved, tenant-unreachable
+    /// [`OPERATOR_REGISTRY_PROJECT`](boatramp_core::registry_auth::OPERATOR_REGISTRY_PROJECT)
+    /// keyspace — this map holds only the NON-secret ref, NEVER a credential. The host key matches
+    /// [`registry_host_of`](boatramp_core::registry_auth::registry_host_of): e.g. `"ghcr.io"`,
+    /// `"registry.example.com:5000"`, or `"docker.io"` for Hub.
+    ///
+    /// Each value is EITHER a bare string (host-wide, back-compat) OR a struct carrying an optional
+    /// repository-path-prefix allowlist (`repos`): a scoped entry attaches ONLY to images whose repo
+    /// path ([`registry_repo_of`](boatramp_core::registry_auth::registry_repo_of)) starts with one of
+    /// the prefixes, so a tenant can't borrow a node-wide credential for UNRELATED private repos at
+    /// the same host (Security MEDIUM-2). A configured+matching host whose secret is unset fails the
+    /// pull CLOSED (never anonymous); a host-match-but-repo-no-match falls through to anonymous.
+    /// Empty (default) ⇒ operator scope off. Dynamic daemon setting (hot-swappable like the rest of
+    /// `[compute]`). Example (RON):
+    ///
+    /// ```ron
+    /// registry_auth: {
+    ///     "ghcr.io": "fleet-ghcr",                                      // host-wide
+    ///     "registry.internal:5000": ( secret: "internal-reg", repos: ["myorg/base-"] ),
+    /// }
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub registry_auth: BTreeMap<String, boatramp_core::registry_auth::OperatorRegistryAuth>,
 }
 
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
@@ -1343,6 +1373,7 @@ impl Default for ComputeConfig {
             client_image_rootfs: BTreeMap::new(),
             pg_client_image: None,
             mysql_client_image: None,
+            registry_auth: BTreeMap::new(),
         }
     }
 }
@@ -3185,6 +3216,36 @@ mod tests {
         assert!(!compute.internal_dns);
         assert_eq!(compute.dns_upstream, "10.0.0.53:53");
         assert_eq!(compute.dns_domain, "svc.internal");
+    }
+
+    #[test]
+    fn registry_auth_parses_host_wide_and_repo_scoped_forms_from_ron() {
+        // The operator `[compute].registry_auth` map accepts EITHER a bare string (host-wide,
+        // back-compat) OR a `( secret, repos: [...] )` struct (repo-scoped, MEDIUM-2) — the
+        // untagged enum must deserialize both from RON, the real config format.
+        use boatramp_core::registry_auth::OperatorRegistryAuth;
+        let cfg = server(
+            r#"(
+                compute: ( registry_auth: {
+                    "ghcr.io": "fleet-ghcr",
+                    "registry.internal:5000": ( secret: "internal-reg", repos: ["myorg/base-", "myorg/runtime-"] ),
+                } ),
+            )"#,
+        );
+        let compute = cfg.compute.expect("compute section");
+        assert_eq!(
+            compute.registry_auth.get("ghcr.io"),
+            Some(&OperatorRegistryAuth::HostWide("fleet-ghcr".into())),
+            "a bare string is host-wide"
+        );
+        assert_eq!(
+            compute.registry_auth.get("registry.internal:5000"),
+            Some(&OperatorRegistryAuth::Scoped {
+                secret: "internal-reg".into(),
+                repos: vec!["myorg/base-".into(), "myorg/runtime-".into()],
+            }),
+            "the struct form carries the repos prefix allowlist"
+        );
     }
 
     #[test]

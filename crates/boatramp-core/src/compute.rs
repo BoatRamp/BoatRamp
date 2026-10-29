@@ -17,6 +17,7 @@ pub use boatramp_types::compute::*;
 
 use crate::deploy::DeployStore;
 use crate::project::ProjectRef;
+use crate::registry_auth::{RegistryAuth, RegistryAuthResolver};
 
 // ---------------------------------------------------------------------------
 // Backend trait + value types
@@ -388,11 +389,22 @@ pub trait ComputeBackend: Send + Sync {
     /// workloads that name a volume identically (every managed DB's `"data"`) shared one
     /// host directory. A backend that delegates storage (cloudflare/docker) or derives
     /// nothing from the volume ignores the identity.
+    ///
+    /// `pull_auth` is the HOST-RESOLVED registry credential for an
+    /// [`RootSource::Image`] pull (`None` ⇒ an anonymous/public pull, or a non-registry
+    /// source). It is resolved fail-closed before launch (see
+    /// [`RegistryAuthResolver`]), so a backend receives either a credential it MUST use
+    /// to pull a private image, `None` for a public one, or the launch never reaches
+    /// here (a referenced-but-missing credential already failed closed). A backend that
+    /// pulls from a registry (docker) authenticates with it; a backend that cannot apply
+    /// it to its pull path MUST fail closed rather than silently pull anonymously when it
+    /// is `Some`.
     async fn materialize(
         &self,
         project: &str,
         workload: &str,
         spec: &ComputeSpec,
+        pull_auth: Option<&RegistryAuth>,
     ) -> Result<Artifact, BackendError>;
 
     /// **Adopt** the guest IPs already assigned to persisted/running replicas of
@@ -1724,6 +1736,7 @@ pub fn managed_db_spec(
         user: None,
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
+        pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
     }
@@ -1738,6 +1751,7 @@ pub fn managed_db_spec(
 ///
 /// For now the chosen backend is invoked locally (the leader also runs it).
 /// Cross-node dispatch via messaging is a later refinement.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_once(
     deploy: &DeployStore,
     backends: &BackendRegistry,
@@ -1746,6 +1760,7 @@ pub async fn reconcile_once(
     activity: &dyn ActivitySource,
     resolver: Option<&dyn ComputeBindingResolver>,
     managed_db: Option<&dyn ManagedDbEnvResolver>,
+    registry_auth: Option<&dyn RegistryAuthResolver>,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
     // Per-backend capabilities (the planner gates scale-to-zero on them).
@@ -1920,6 +1935,44 @@ pub async fn reconcile_once(
                         Some(m) => m.managed_db_privilege(&project_name, &wl).await,
                         None => None,
                     };
+                    // Resolve the registry pull credential for an image-sourced workload,
+                    // HOST-SIDE, honoring the project `pull_secret` then the operator host
+                    // map, else anonymous. A referenced-but-missing/unauthorized credential
+                    // fails CLOSED here (the replica is not launched), never a silent
+                    // anonymous pull. A non-image source needs no auth (resolver skipped).
+                    let pull_auth = match (registry_auth, &spec.root) {
+                        (Some(ra), RootSource::Image(reference)) => {
+                            match ra
+                                .resolve(&project_name, reference, spec.pull_secret.as_deref())
+                                .await
+                            {
+                                Ok(auth) => auth,
+                                Err(e) => {
+                                    report
+                                        .errors
+                                        .push(format!("{wl}/{replica}: registry auth: {e}"));
+                                    continue;
+                                }
+                            }
+                        }
+                        // Defense-in-depth (Security MEDIUM-1): a workload that NAMES a
+                        // `pull_secret` but reaches a reconcile with NO registry-auth resolver
+                        // wired at all must FAIL CLOSED — never pull anonymously and silently
+                        // ignore the named secret. (The production node always wires a resolver,
+                        // which also fails closed for an operator host match; this guards a lean
+                        // or misconfigured reconcile for the project-scoped reference the spec
+                        // makes visible here.)
+                        (None, RootSource::Image(_)) if spec.pull_secret.is_some() => {
+                            report.errors.push(format!(
+                                "{wl}/{replica}: registry auth: pull_secret {:?} is named but no \
+                                 registry-auth resolver is configured on this node; refusing to \
+                                 pull anonymously",
+                                spec.pull_secret.as_deref().unwrap_or_default()
+                            ));
+                            continue;
+                        }
+                        _ => None,
+                    };
                     match launch_one(
                         b.as_ref(),
                         &project_name,
@@ -1930,6 +1983,7 @@ pub async fn reconcile_once(
                         &spec,
                         &launch_env,
                         privilege.as_ref(),
+                        pull_auth.as_ref(),
                     )
                     .await
                     {
@@ -2209,11 +2263,14 @@ async fn launch_one(
     spec: &ComputeSpec,
     extra_env: &[(String, String)],
     privilege: Option<&PrivilegeDirective>,
+    pull_auth: Option<&RegistryAuth>,
 ) -> Result<ObservedInstance, BackendError> {
     // The launch wall-clock time, so the next reconcile tick can grant this replica a
     // startup grace before treating it as a broken launch (see `reconcile_plan`).
     let started_at = crate::time::now_unix();
-    let artifact = backend.materialize(project, workload, spec).await?;
+    let artifact = backend
+        .materialize(project, workload, spec, pull_auth)
+        .await?;
     // Fold the resolved binding env into the launched spec. The workload's own env
     // wins on a collision, so a hand-set value is never clobbered by a binding.
     let mut spec = spec.clone();
@@ -2580,6 +2637,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }
@@ -3414,6 +3472,7 @@ mod tests {
             _project: &str,
             _workload: &str,
             _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
@@ -3462,7 +3521,10 @@ mod tests {
         let backend: Box<dyn ComputeBackend> = Box::new(FakeBackend);
         assert_eq!(backend.id(), "fake");
         let s = spec(1, 128);
-        let artifact = backend.materialize("default", "fake", &s).await.unwrap();
+        let artifact = backend
+            .materialize("default", "fake", &s, None)
+            .await
+            .unwrap();
         let inst = backend
             .launch(&LaunchRequest {
                 project: "default".into(),
@@ -3504,6 +3566,7 @@ mod tests {
             _project: &str,
             _workload: &str,
             _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
@@ -3540,9 +3603,20 @@ mod tests {
     async fn launch_one_records_probed_readiness_not_a_blind_true() {
         let s = spec(1, 128);
         // Not-ready backend → healthy:false, but the replica IS launched (phase Running).
-        let unready = launch_one(&NotReadyBackend, "default", "pg", 0, 1, None, &s, &[], None)
-            .await
-            .unwrap();
+        let unready = launch_one(
+            &NotReadyBackend,
+            "default",
+            "pg",
+            0,
+            1,
+            None,
+            &s,
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             !unready.healthy,
             "a launched-but-unready replica is recorded unhealthy so the next tick relaunches it"
@@ -3550,9 +3624,20 @@ mod tests {
         assert_eq!(unready.phase, ReplicaPhase::Running);
 
         // A ready backend still records healthy:true (the happy path is unchanged).
-        let ready = launch_one(&FakeBackend, "default", "pg", 0, 1, None, &s, &[], None)
-            .await
-            .unwrap();
+        let ready = launch_one(
+            &FakeBackend,
+            "default",
+            "pg",
+            0,
+            1,
+            None,
+            &s,
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(ready.healthy);
 
         // And the plan then Stops+relaunches the unhealthy one (RestartPolicy::Always),
@@ -3676,6 +3761,7 @@ mod tests {
             _project: &str,
             _workload: &str,
             _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
@@ -3773,6 +3859,7 @@ mod tests {
             &FixedActivity(WorkloadActivity::Active),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3785,6 +3872,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
+            None,
             None,
             None,
         )
@@ -3809,6 +3897,7 @@ mod tests {
             &FixedActivity(WorkloadActivity::Idle),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3821,6 +3910,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
             None,
         )
@@ -3869,6 +3959,7 @@ mod tests {
             &AlwaysActive,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3892,6 +3983,7 @@ mod tests {
             &nodes,
             &policy,
             &AlwaysActive,
+            None,
             None,
             None,
         )
@@ -3919,6 +4011,7 @@ mod tests {
             &nodes,
             &policy,
             &AlwaysActive,
+            None,
             None,
             None,
         )
@@ -3959,6 +4052,7 @@ mod tests {
             _project: &str,
             _workload: &str,
             _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Ok(Artifact::Image {
                 reference: "img:latest".into(),
@@ -4057,6 +4151,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle), // idle → the Zero replica stays parked
+            None,
             None,
             None,
         )

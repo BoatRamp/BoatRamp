@@ -111,6 +111,7 @@ fn spec_for(rootfs_hash: &str) -> ComputeSpec {
         user: None,
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
+        pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
     }
@@ -152,7 +153,7 @@ async fn container_live_launch_and_hold() {
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
     let artifact = backend
-        .materialize("default", "clive", &spec)
+        .materialize("default", "clive", &spec, None)
         .await
         .expect("materialize rootfs");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
@@ -271,7 +272,7 @@ async fn run_pg_e2e(host_root: bool) {
         .insert("POSTGRES_DB".to_string(), "app".to_string());
 
     let artifact = backend
-        .materialize("default", &format!("cpg{tag}"), &spec)
+        .materialize("default", &format!("cpg{tag}"), &spec, None)
         .await
         .expect("materialize (pull) pgvector image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
@@ -400,7 +401,7 @@ async fn launch_managed_pg(
     wl: &str,
 ) -> boatramp_core::compute::Instance {
     let artifact = backend
-        .materialize("default", wl, spec)
+        .materialize("default", wl, spec, None)
         .await
         .expect("materialize (pull) pgvector image");
     let req = LaunchRequest {
@@ -828,7 +829,9 @@ async fn container_legacy_data_volume_adopted_only_by_the_claimant() {
     std::fs::write(legacy.join("PG_VERSION"), "16").unwrap();
     std::fs::write(legacy.join("marker"), "OWNER-DATA").unwrap();
     let ambiguous = mk(); // claimant: None
-    let refused = ambiguous.materialize("default", "analytics", &spec).await;
+    let refused = ambiguous
+        .materialize("default", "analytics", &spec, None)
+        .await;
     assert!(
         refused.is_err(),
         "with no proven owner, a managed DB must refuse to launch over an unclaimed legacy dir"
@@ -1194,7 +1197,7 @@ async fn container_criu_roundtrip() {
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
     let artifact = backend
-        .materialize("default", "ccriu", &spec)
+        .materialize("default", "ccriu", &spec, None)
         .await
         .expect("materialize");
     let req = LaunchRequest {
@@ -1273,7 +1276,7 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
     let hash = "d".repeat(64);
     let spec = spec_for(&hash);
     let artifact = backend
-        .materialize("default", "cexec", &spec)
+        .materialize("default", "cexec", &spec, None)
         .await
         .expect("materialize");
     let req = LaunchRequest {

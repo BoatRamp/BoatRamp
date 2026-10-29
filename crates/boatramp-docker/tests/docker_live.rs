@@ -41,6 +41,7 @@ fn spec() -> ComputeSpec {
         user: None,
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
+        pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
     }
@@ -56,7 +57,7 @@ async fn docker_round_trip() {
     let spec = spec();
 
     let artifact = backend
-        .materialize("default", "ittest", &spec)
+        .materialize("default", "ittest", &spec, None)
         .await
         .expect("materialize (pull)");
     let req = LaunchRequest {

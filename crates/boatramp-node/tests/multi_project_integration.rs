@@ -196,6 +196,7 @@ impl ComputeBackend for FakeComputeBackend {
         _project: &str,
         _workload: &str,
         spec: &ComputeSpec,
+        _pull_auth: Option<&boatramp_core::registry_auth::RegistryAuth>,
     ) -> Result<Artifact, BackendError> {
         // The fake doesn't stage a real rootfs; echo an opaque image ref.
         Ok(Artifact::Image {
@@ -523,6 +524,7 @@ async fn reconcile(
         &AlwaysActive,
         None,
         None,
+        None,
     )
     .await
     .expect("reconcile pass")
@@ -815,6 +817,7 @@ fn plain_web_spec() -> ComputeSpec {
         user: None,
         isolation: boatramp_core::compute::IsolationRequirement::Trusted,
         prefer_backend: None,
+        pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
     }

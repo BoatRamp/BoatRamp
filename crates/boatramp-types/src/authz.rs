@@ -969,6 +969,15 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             // project on the node — node-global like the tools above, so `system·admin`, never a
             // per-project grant. Posture-gated (`allow_dev_messaging_bind`) at the handler too.
             || rest == "dev-bind-messaging"
+            // Operator node-wide registry pull credentials (`compute registry-auth
+            // --operator`): set/list/remove a sealed `{username,password}` in the reserved,
+            // tenant-unreachable operator keyspace (PLAN-compute-registry-auth). NODE-GLOBAL
+            // operator authority — `system·admin`, never a per-project grant the general
+            // `/api/compute/*` catch-all would otherwise give. The project-scoped sibling
+            // (`compute registry-auth set`, no `--operator`) uses the ordinary
+            // `/api/projects/<p>/secrets` surface (Project·Admin), NOT this path.
+            || rest == "registry-auth"
+            || rest.starts_with("registry-auth/")
     )
 }
 
@@ -2020,6 +2029,12 @@ mod tests {
             // right the general `/api/compute/*` mapping would otherwise give).
             ("POST", "/api/compute/dev-bind-blob"),
             ("POST", "/api/compute/dev-bind-messaging"),
+            // Operator node-wide registry pull credentials — node-global operator authority,
+            // so system·admin, never a per-project grant (the project-scoped sibling uses
+            // the ordinary `/api/projects/<p>/secrets` surface instead).
+            ("GET", "/api/compute/registry-auth"),
+            ("POST", "/api/compute/registry-auth"),
+            ("DELETE", "/api/compute/registry-auth/ghcr"),
             // Project-scoped form (the `project_scope` rewrite's original path).
             ("GET", "/api/projects/acme/compute/status"),
             ("POST", "/api/projects/acme/compute/maintenance/set-health"),

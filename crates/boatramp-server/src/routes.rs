@@ -464,6 +464,21 @@ pub fn router_with_fast(
             "/api/compute/dev-bind-messaging",
             post(compute_dev_bind_messaging),
         )
+        // Operator node-wide registry pull credentials (PLAN-compute-registry-auth):
+        // set/list/remove a sealed `{username,password}` referenced by host from
+        // `[compute].registry_auth`. Registered BEFORE `/api/compute/{name}` so the literal
+        // `registry-auth` segment wins over the `{name}` param. NODE-GLOBAL operator
+        // authority: `Right::required` gates it `System·Admin` (`is_compute_maintenance_path`)
+        // — never the per-project right the general `/api/compute/*` mapping gives. The
+        // project-scoped sibling uses the ordinary `/api/projects/<p>/secrets` surface.
+        .route(
+            "/api/compute/registry-auth",
+            get(list_operator_registry_auth).post(set_operator_registry_auth),
+        )
+        .route(
+            "/api/compute/registry-auth/{name}",
+            axum::routing::delete(delete_operator_registry_auth),
+        )
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
         // or import one in. `Project·Admin` on the `?project=` target (scoped via the query in
         // `Right::required_for`, uniform with the `clone` family — NOT node-global System·Admin)

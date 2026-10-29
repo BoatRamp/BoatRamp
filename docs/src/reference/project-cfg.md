@@ -164,6 +164,7 @@ malformed spec fails at parse time). It mirrors the server's `PutComputeRequest`
 | `scale_to_zero` | bool | `false` | Snapshot + stop when idle; cold-restore on the next request. |
 | `writable_root` | bool | `false` | Writable root FS instead of the hardened read-only default (honored only under the single-tenant posture). |
 | `bindings` | list\<ComputeBinding\> | `[]` | Managed resources (`kind: sql`, …) resolved to a tenant-scoped endpoint + credential injected into the guest env at launch. |
+| `pull_secret` | string | — | For a private `image(…)` source: the NAME of a sealed registry pull credential in THIS project's secret store (set with `boatramp compute registry-auth set`). The host unseals it and authenticates the image pull; a missing/unauthorized credential fails the pull **closed** (never an anonymous fallback). Only the name is stored — never a credential. Omit for a public image or when an operator node-wide credential covers the registry host (see below). Ignored for a non-`image` source. |
 
 ### `RootSource`
 
@@ -181,8 +182,52 @@ compute: [
     ( name: "api",
       spec: ( root: image("ghcr.io/acme/api:1"), vcpus: 1, mem_mib: 512, port: 8080 ),
       replicas: 2 ),
+    // A PRIVATE image: `pull_secret` names a sealed credential in this project's
+    // secret store (set it first: `boatramp compute registry-auth set ghcr-pull …`).
+    ( name: "worker",
+      spec: ( root: image("ghcr.io/acme/private-worker:1"), vcpus: 1, mem_mib: 512,
+              port: 8080, pull_secret: "ghcr-pull" ),
+      replicas: 1 ),
 ]
 ```
+
+### Private registry pull credentials
+
+A workload whose `image(…)` lives in a private registry pulls with a **sealed**
+credential — boatramp never puts a registry username/password in `boatramp.cfg` or
+`project.cfg` in the clear. A credential is `{username, password}`, stored sealed with
+the same `[secrets]` key envelope that seals a managed-DB credential, and resolved
+HOST-SIDE at pull time. There are two scopes, tried in this order, **fail-closed**:
+
+1. **Project author (tenant-scoped).** The spec's `pull_secret` names a sealed secret in
+   the workload's OWN project. Set it with:
+
+   ```console
+   $ printf '%s' "$GHCR_TOKEN" | boatramp compute registry-auth set ghcr-pull \
+       --username acme-bot --password-stdin
+   ```
+
+   then reference it as `pull_secret: "ghcr-pull"` (or `compute set --pull-secret
+   ghcr-pull`). The owning project comes from the workload's key, never from the field,
+   so a workload can only ever resolve a credential from its own project — never another
+   tenant's.
+
+2. **Operator (node-wide).** For operator-provisioned fleet images, map a registry host →
+   a sealed credential ref in `[compute].registry_auth` (a daemon setting — see the
+   [boatramp.cfg reference](boatramp-cfg.md)). It is auto-applied when a workload's image
+   host matches and the workload names no `pull_secret` of its own. Set the operator
+   credential with System·Admin authority:
+
+   ```console
+   $ printf '%s' "$TOKEN" | boatramp compute registry-auth set fleet-ghcr \
+       --username fleet-bot --password-stdin --operator
+   ```
+
+A workload that **references** a credential which is missing or unauthorized fails the
+pull **closed** — it is never silently downgraded to an anonymous pull. An anonymous pull
+happens only when no `pull_secret` is set AND no operator host entry matches (a public
+image). The password is sealed at rest and is never returned, logged, or echoed in an
+error.
 
 ## Managed databases (`databases`)
 

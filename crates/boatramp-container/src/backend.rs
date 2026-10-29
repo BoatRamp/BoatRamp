@@ -24,6 +24,7 @@ use boatramp_core::compute::{
     RootSource, Scheme, Snapshot, VolumeInfo, compute_instance_id, compute_volume_scope,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
+use boatramp_core::registry_auth::RegistryAuth;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -905,7 +906,22 @@ impl ComputeBackend for ContainerBackend {
         project: &str,
         workload: &str,
         spec: &ComputeSpec,
+        pull_auth: Option<&RegistryAuth>,
     ) -> Result<Artifact, BackendError> {
+        // The native container backend pulls an OCI image over its OWN daemonless registry
+        // HTTP client, which does not yet carry registry credentials. Rather than silently
+        // pull a private image anonymously (and fail opaquely, or — worse — succeed against a
+        // same-named public image), FAIL CLOSED when a credential was resolved for an image
+        // source: a private image must run on the `docker` backend until the daemonless
+        // puller learns auth (a documented follow-up). A public image (`pull_auth == None`)
+        // is unaffected; a non-image source never carries auth.
+        if pull_auth.is_some() && matches!(spec.root, RootSource::Image(_)) {
+            return Err(BackendError::Materialize(
+                "the native container backend cannot apply a registry credential; \
+                 run this private-image workload on the `docker` backend"
+                    .into(),
+            ));
+        }
         // Key this workload's persistent volumes by the collision-free `(project, workload)`
         // scope (the SAME identity the container id/cgroup/veth use) so two co-located managed
         // DBs never share a host directory. Migrate any reused volume from the legacy flat
@@ -2261,6 +2277,7 @@ impl ContainerBackend {
             user: None,
             isolation: boatramp_core::compute::IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: Vec::new(),
             post_launch: Vec::new(),
         };
@@ -3781,6 +3798,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }
@@ -4084,7 +4102,7 @@ mod tests {
         let spec = spec_for(&hash);
 
         let art = backend
-            .materialize("default", "pg", &spec)
+            .materialize("default", "pg", &spec, None)
             .await
             .expect("materialize");
         let dir = match &art {
@@ -4099,7 +4117,7 @@ mod tests {
 
         // Idempotent: a second materialize re-uses the staged dir.
         let art2 = backend
-            .materialize("default", "pg", &spec)
+            .materialize("default", "pg", &spec, None)
             .await
             .expect("materialize 2");
         assert_eq!(art, art2);
@@ -4128,7 +4146,7 @@ mod tests {
         spec.root = RootSource::Image("pgvector/pgvector:pg16".into());
 
         let art = backend
-            .materialize("default", "pg", &spec)
+            .materialize("default", "pg", &spec, None)
             .await
             .expect("materialize image");
         let dir = match &art {
@@ -4157,7 +4175,7 @@ mod tests {
 
         // Idempotent: a second materialize re-uses the pulled rootfs (no re-pull).
         let art2 = backend
-            .materialize("default", "pg", &spec)
+            .materialize("default", "pg", &spec, None)
             .await
             .expect("materialize image 2");
         assert_eq!(art, art2);

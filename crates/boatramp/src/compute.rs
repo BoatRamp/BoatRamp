@@ -168,6 +168,15 @@ enum ComputeCommand {
         /// and claim); use `messaging:<topic>` to confine it to one topic.
         #[arg(long = "bind")]
         bind: Vec<String>,
+        /// Name of a **sealed registry pull credential** in THIS project's secret store
+        /// for a private `--image` pull (set it first with `boatramp compute registry-auth
+        /// set <name> --username … --password-stdin`). The host unseals it and
+        /// authenticates the image pull at launch; a missing/unauthorized credential fails
+        /// the pull CLOSED (never an anonymous fallback). Only meaningful with `--image`.
+        /// Omit for a public image (or when an operator node-wide credential covers the
+        /// registry host).
+        #[arg(long = "pull-secret")]
+        pull_secret: Option<String>,
     },
     /// Build an ext4 rootfs from an OCI image, upload it, and set the workload.
     /// Needs the `e2fsprogs` `mke2fs` tool on this host.
@@ -358,6 +367,56 @@ enum ComputeCommand {
         /// Workload name.
         workload: String,
     },
+    /// Manage **sealed registry pull credentials** for private `image(...)` workloads.
+    /// Project-scoped by default (a credential in THIS project's secret store, referenced
+    /// from `compute set --pull-secret <name>`); `--operator` manages the node-wide
+    /// `[compute].registry_auth` host-map credentials instead (System·Admin). The password
+    /// is sealed server-side and is never echoed back.
+    #[command(subcommand)]
+    RegistryAuth(RegistryAuthCommand),
+}
+
+/// `boatramp compute registry-auth …` — set / list / remove a sealed registry pull
+/// credential. A credential is `{username, password}`; the password is sealed at rest and
+/// never returned.
+#[derive(Debug, clap::Subcommand)]
+enum RegistryAuthCommand {
+    /// Seal (or rotate) a registry credential under `name`. Project-scoped unless
+    /// `--operator`. Setting an existing name rotates it.
+    Set {
+        /// The credential name. Project scope: the `--pull-secret <name>` a workload
+        /// references. Operator scope: the ref used as a `[compute].registry_auth` value.
+        name: String,
+        /// The registry username.
+        #[arg(long)]
+        username: String,
+        /// Read the password/token from standard input (preferred: nothing hits
+        /// argv/shell history).
+        #[arg(long, group = "pw")]
+        password_stdin: bool,
+        /// The password/token inline. Convenient, but it lands in your shell history and
+        /// the process table — prefer `--password-stdin`.
+        #[arg(long, group = "pw")]
+        password: Option<String>,
+        /// Manage the OPERATOR node-wide credential (System·Admin) instead of this
+        /// project's. Matched to a registry host via `[compute].registry_auth`.
+        #[arg(long)]
+        operator: bool,
+    },
+    /// List registry credential names + metadata (never a value).
+    Ls {
+        /// List the OPERATOR node-wide credentials instead of this project's.
+        #[arg(long)]
+        operator: bool,
+    },
+    /// Remove a registry credential by name.
+    Rm {
+        /// The credential name.
+        name: String,
+        /// Remove an OPERATOR node-wide credential instead of this project's.
+        #[arg(long)]
+        operator: bool,
+    },
 }
 
 /// `boatramp compute ip …` — IP-plane diagnostics.
@@ -511,6 +570,21 @@ pub enum ComputeOutput {
         workload: String,
         replicas: Vec<serde_json::Value>,
     },
+    /// `compute registry-auth set` — a registry credential was sealed (metadata only; the
+    /// value is never echoed).
+    RegistryAuthSet {
+        name: String,
+        revision: u32,
+        /// Whether this was the operator node-wide credential (`--operator`).
+        operator: bool,
+    },
+    /// `compute registry-auth ls` — the sealed registry credentials as value-free metadata.
+    RegistryAuthList {
+        credentials: Vec<boatramp_core::secret_store::SecretMeta>,
+        operator: bool,
+    },
+    /// `compute registry-auth rm` — a registry credential was removed.
+    RegistryAuthRemoved { name: String, operator: bool },
 }
 
 impl crate::output::Rendered for ComputeOutput {
@@ -569,6 +643,35 @@ impl crate::output::Rendered for ComputeOutput {
                 }
             }
             Self::Netdiag { workload, replicas } => write_netdiag(workload, replicas, w),
+            Self::RegistryAuthSet {
+                name,
+                revision,
+                operator,
+            } => {
+                let scope = if *operator { "operator " } else { "" };
+                writeln!(
+                    w,
+                    "set {scope}registry credential {name} (revision {revision})"
+                )
+            }
+            Self::RegistryAuthList {
+                credentials,
+                operator,
+            } => {
+                let scope = if *operator { "operator " } else { "" };
+                if credentials.is_empty() {
+                    return writeln!(w, "no {scope}registry credentials");
+                }
+                writeln!(w, "{:<32}  {:>8}  UPDATED", "NAME", "REVISION")?;
+                for c in credentials {
+                    writeln!(w, "{:<32}  {:>8}  {}", c.name, c.revision, c.updated_at)?;
+                }
+                Ok(())
+            }
+            Self::RegistryAuthRemoved { name, operator } => {
+                let scope = if *operator { "operator " } else { "" };
+                writeln!(w, "removed {scope}registry credential {name}")
+            }
         }
     }
 }
@@ -811,6 +914,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             isolation,
             regions,
             bind,
+            pull_secret,
         } => {
             // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
             // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
@@ -835,6 +939,13 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 Some(k) => cp.resolve_artifact(&k).await?,
                 None => String::new(), // empty ⇒ the node substitutes its default
             };
+            // `--pull-secret` only authenticates an image pull; reject it on a tar/rootfs
+            // source fail-closed so a misplaced flag is never silently ignored.
+            if pull_secret.is_some() && !matches!(root, RootSource::Image(_)) {
+                return Err(Error::Args(
+                    "--pull-secret applies only to an --image workload".into(),
+                ));
+            }
             let spec = build_spec(
                 root,
                 kernel,
@@ -851,6 +962,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 user,
                 isolation,
                 parse_bindings(&bind)?,
+                pull_secret,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Set { name, spec: hash }
@@ -927,6 +1039,9 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 user,
                 isolation,
                 parse_bindings(&bind)?,
+                // A `compute build` workload is a locally-built rootfs, not a registry
+                // pull, so it carries no pull credential.
+                None,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Build { name, spec: hash }
@@ -1258,8 +1373,166 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 .await?;
             ComputeOutput::Netdiag { workload, replicas }
         }
+        ComputeCommand::RegistryAuth(cmd) => run_registry_auth(cmd, &http, &server, config).await?,
     };
     Ok(out)
+}
+
+/// The JSON body `POST /api/projects/{proj}/secrets` (project scope) seals: the credential
+/// serialized as `{"username":…,"password":…}` becomes the sealed secret's VALUE.
+#[derive(serde::Serialize)]
+struct RegistryCredentialValue<'a> {
+    username: &'a str,
+    password: &'a str,
+}
+
+/// The JSON body `POST /api/compute/registry-auth` (operator scope) expects.
+#[derive(serde::Serialize)]
+struct OperatorRegistryAuthBody<'a> {
+    name: &'a str,
+    username: &'a str,
+    password: &'a str,
+}
+
+/// Drive `compute registry-auth {set,ls,rm}` for both scopes. The project scope reuses the
+/// ordinary `/api/projects/<proj>/secrets` surface (Project·Admin) — the credential is
+/// `{username,password}` JSON sealed as a normal project secret; the operator scope uses
+/// the dedicated `/api/compute/registry-auth` endpoint (System·Admin). The password is sent
+/// once to be sealed and is NEVER printed back.
+async fn run_registry_auth(
+    cmd: RegistryAuthCommand,
+    http: &client::ApiClient,
+    server: &str,
+    config: &ProjectConfig,
+) -> Result<ComputeOutput> {
+    // The project secrets collection segment (`secrets` for default, else
+    // `projects/<proj>/secrets`), mirroring the `secrets` subcommand's routing.
+    let secrets_seg = client::project_seg(&client::resolve_project(config), "secrets");
+    match cmd {
+        RegistryAuthCommand::Set {
+            name,
+            username,
+            password_stdin,
+            password,
+            operator,
+        } => {
+            let password = read_password(password_stdin, password)?;
+            let revision = if operator {
+                let resp = http
+                    .post(format!("{server}/api/compute/registry-auth"))
+                    .json(&OperatorRegistryAuthBody {
+                        name: &name,
+                        username: &username,
+                        password: &password,
+                    })
+                    .send()
+                    .await?;
+                parse_secret_meta(resp).await?.revision
+            } else {
+                // Project scope: seal `{username,password}` JSON as a normal project secret.
+                let value = serde_json::to_string(&RegistryCredentialValue {
+                    username: &username,
+                    password: &password,
+                })
+                .map_err(|e| Error::Args(format!("encoding credential: {e}")))?;
+                let resp = http
+                    .post(format!("{server}/api/{secrets_seg}"))
+                    .json(&serde_json::json!({ "name": name, "value": value }))
+                    .send()
+                    .await?;
+                parse_secret_meta(resp).await?.revision
+            };
+            Ok(ComputeOutput::RegistryAuthSet {
+                name,
+                revision,
+                operator,
+            })
+        }
+        RegistryAuthCommand::Ls { operator } => {
+            let url = if operator {
+                format!("{server}/api/compute/registry-auth")
+            } else {
+                format!("{server}/api/{secrets_seg}")
+            };
+            let resp = http.get(url).send().await?;
+            let credentials = parse_secret_meta_list(resp).await?;
+            Ok(ComputeOutput::RegistryAuthList {
+                credentials,
+                operator,
+            })
+        }
+        RegistryAuthCommand::Rm { name, operator } => {
+            let url = if operator {
+                format!("{server}/api/compute/registry-auth/{name}")
+            } else {
+                format!("{server}/api/{secrets_seg}/{name}")
+            };
+            let resp = http.delete(url).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Args(format!(
+                    "server returned HTTP {status}: {}",
+                    body.trim()
+                )));
+            }
+            Ok(ComputeOutput::RegistryAuthRemoved { name, operator })
+        }
+    }
+}
+
+/// Read the registry password from stdin (preferred) or the inline `--password`. Clap's
+/// group makes the two mutually exclusive; this requires exactly one.
+fn read_password(stdin: bool, inline: Option<String>) -> Result<String> {
+    use std::io::Read as _;
+    if stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| Error::Args(format!("reading password from stdin: {e}")))?;
+        Ok(buf.trim_end_matches('\n').to_string())
+    } else if let Some(p) = inline {
+        Ok(p)
+    } else {
+        Err(Error::Args(
+            "a password is required: pass --password-stdin (preferred) or --password <VALUE>"
+                .into(),
+        ))
+    }
+}
+
+/// Parse a `SecretMeta` success body, surfacing a non-2xx status + its (value-free) message.
+async fn parse_secret_meta(
+    resp: reqwest::Response,
+) -> Result<boatramp_core::secret_store::SecretMeta> {
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        return Err(Error::Args(format!(
+            "server returned HTTP {}: {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes).trim()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Args(format!("could not parse response: {e}")))
+}
+
+/// Parse a `Vec<SecretMeta>` listing body.
+async fn parse_secret_meta_list(
+    resp: reqwest::Response,
+) -> Result<Vec<boatramp_core::secret_store::SecretMeta>> {
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        return Err(Error::Args(format!(
+            "server returned HTTP {}: {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes).trim()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Args(format!("could not parse response: {e}")))
 }
 
 /// Render a byte count as a compact human-readable size for the `volume ls` table.
@@ -1296,6 +1569,7 @@ fn build_spec(
     user: Option<String>,
     isolation: Isolation,
     bindings: Vec<ComputeBinding>,
+    pull_secret: Option<String>,
 ) -> Result<ComputeSpec> {
     let mut env_map = BTreeMap::new();
     for pair in env {
@@ -1326,6 +1600,7 @@ fn build_spec(
         user,
         isolation: isolation.into(),
         prefer_backend: None,
+        pull_secret,
         bindings,
         post_launch: Vec::new(),
     })
@@ -1433,6 +1708,113 @@ mod tests {
     }
 
     #[test]
+    fn compute_set_pull_secret_parses() {
+        match parse(&[
+            "compute",
+            "set",
+            "worker",
+            "--image",
+            "ghcr.io/acme/app:1",
+            "--port",
+            "8080",
+            "--pull-secret",
+            "ghcr-pull",
+        ]) {
+            Ok(ComputeCommand::Set { pull_secret, .. }) => {
+                assert_eq!(pull_secret.as_deref(), Some("ghcr-pull"));
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // Omitted ⇒ None (public image / operator host match).
+        match parse(&[
+            "compute", "set", "web", "--image", "nginx:1", "--port", "80",
+        ]) {
+            Ok(ComputeCommand::Set { pull_secret, .. }) => assert!(pull_secret.is_none()),
+            other => panic!("expected compute set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_registry_auth_subcommand_parses() {
+        // set: project scope by default, --operator flips it; the two password sources are
+        // mutually exclusive and at least one is required.
+        match parse(&[
+            "compute",
+            "registry-auth",
+            "set",
+            "ghcr-pull",
+            "--username",
+            "bot",
+            "--password-stdin",
+        ]) {
+            Ok(ComputeCommand::RegistryAuth(RegistryAuthCommand::Set {
+                name,
+                username,
+                password_stdin,
+                operator,
+                ..
+            })) => {
+                assert_eq!(name, "ghcr-pull");
+                assert_eq!(username, "bot");
+                assert!(password_stdin && !operator);
+            }
+            other => panic!("expected registry-auth set, got {other:?}"),
+        }
+        // --operator is accepted (operator scope).
+        match parse(&[
+            "compute",
+            "registry-auth",
+            "set",
+            "fleet",
+            "--username",
+            "bot",
+            "--password",
+            "p",
+            "--operator",
+        ]) {
+            Ok(ComputeCommand::RegistryAuth(RegistryAuthCommand::Set { operator, .. })) => {
+                assert!(operator);
+            }
+            other => panic!("expected registry-auth set --operator, got {other:?}"),
+        }
+        // Two password sources at once is a parse error (mutually exclusive group).
+        assert!(
+            parse(&[
+                "compute",
+                "registry-auth",
+                "set",
+                "x",
+                "--username",
+                "u",
+                "--password-stdin",
+                "--password",
+                "p",
+            ])
+            .is_err()
+        );
+        // ls / rm, with the --operator switch.
+        assert!(matches!(
+            parse(&["compute", "registry-auth", "ls"]),
+            Ok(ComputeCommand::RegistryAuth(RegistryAuthCommand::Ls {
+                operator: false
+            }))
+        ));
+        assert!(matches!(
+            parse(&["compute", "registry-auth", "ls", "--operator"]),
+            Ok(ComputeCommand::RegistryAuth(RegistryAuthCommand::Ls {
+                operator: true
+            }))
+        ));
+        assert!(matches!(
+            parse(&["compute", "registry-auth", "rm", "ghcr-pull"]),
+            Ok(ComputeCommand::RegistryAuth(RegistryAuthCommand::Rm {
+                operator: false,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn compute_set_startup_grace_parses_and_defaults() {
         // `--startup-grace-secs 45` parses into the field and flows into the spec.
         match parse(&[
@@ -1484,6 +1866,7 @@ mod tests {
             None,
             Isolation::Trusted,
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(with.startup_grace_secs, 45);
@@ -1503,6 +1886,7 @@ mod tests {
             None,
             Isolation::Trusted,
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);

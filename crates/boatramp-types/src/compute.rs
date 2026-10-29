@@ -215,6 +215,24 @@ pub struct ComputeSpec {
     /// the scheduler honors it when the backend is eligible, else falls back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_backend: Option<String>,
+    /// Optional **project-scoped registry pull credential reference** for an
+    /// [`RootSource::Image`] source: the NAME of a sealed secret in THIS workload's
+    /// own project secret store (`project/<proj>/secret/<name>`) whose plaintext is a
+    /// JSON `{ "username": …, "password": … }` registry credential. At materialize
+    /// time the host unseals it and authenticates the image pull (docker backend
+    /// live; cloudflare at the deploy surface). The owning project comes from the
+    /// workload's key, NEVER from this field — so a workload can only ever name a
+    /// secret in its OWN project (tenancy is structural, exactly like
+    /// [`ComputeBinding`]). A referenced-but-missing secret fails the pull CLOSED (no
+    /// silent anonymous fallback). Only the NAME is stored here — never a credential —
+    /// so it is safe on the wire and in the content hash. Ignored for a non-`Image`
+    /// root. Empty/`None` ⇒ no project credential; the host then tries the operator
+    /// node-wide `[compute].registry_auth` host map, else an anonymous pull. Omitted
+    /// from the wire + the content hash when `None` (back-compat: existing specs keep
+    /// their id; rotating the secret's VALUE never remints the spec, only its name
+    /// would).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_secret: Option<String>,
     /// Managed resources this workload depends on — the opaque-process analogue of a
     /// handler's `imports`. boatramp resolves each to a **tenant-scoped** endpoint +
     /// credential at launch and injects the address into the guest env, so a workload
@@ -745,6 +763,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
         }
@@ -811,6 +830,24 @@ mod tests {
             url_env: Some("ANALYTICS_URL".into()),
         };
         assert_eq!(custom.url_env(), "ANALYTICS_URL");
+    }
+
+    #[test]
+    fn empty_pull_secret_does_not_change_the_spec_hash() {
+        // A spec that names no pull secret serializes without the field, so it hashes
+        // identically to a pre-pull_secret spec (back-compat / schema stays v1).
+        let a = spec();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("pull_secret"),
+            "a `None` pull_secret is omitted from the wire + content hash"
+        );
+        // Naming a pull secret is recorded and changes the content hash (it is part of
+        // the workload's identity — the NAME, never the credential value).
+        let mut b = spec();
+        b.pull_secret = Some("ghcr-pull".into());
+        assert_ne!(a.id(), b.id(), "a named pull_secret changes the id");
+        assert!(serde_json::to_string(&b).unwrap().contains("ghcr-pull"));
     }
 
     #[test]

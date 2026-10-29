@@ -18,7 +18,9 @@ use boatramp_core::compute::{
     Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
     Scheme, VolumeRef, compute_instance_id,
 };
+use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, KillContainerOptions, LogOutput,
     RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
@@ -321,6 +323,20 @@ fn decode_ref(s: &str) -> Option<(String, String, u16)> {
     Some((name.to_string(), ip.to_string(), port.parse().ok()?))
 }
 
+/// Convert a host-resolved [`RegistryAuth`] into bollard's [`DockerCredentials`] for the
+/// `create_image` `X-Registry-Auth`. Only `username`/`password`/`serveraddress` are set
+/// (basic registry auth); the rest stay `None`. The resulting struct is passed straight to
+/// the daemon and dropped — it is never logged (bollard's own `Debug` would print it, so it
+/// is never formatted into an error here; see `pull_image`).
+fn docker_credentials(auth: &RegistryAuth) -> DockerCredentials {
+    DockerCredentials {
+        username: Some(auth.username.clone()),
+        password: Some(auth.password.clone()),
+        serveraddress: Some(auth.serveraddress.clone()),
+        ..Default::default()
+    }
+}
+
 /// Split an image reference into the `fromImage` name + `tag` the daemon's
 /// `create_image` wants, defaulting an untagged reference to `latest`. A tag is a
 /// `:` in the **last path component** (so a registry `host:port/repo` port isn't
@@ -438,6 +454,7 @@ impl ComputeBackend for DockerBackend {
         _project: &str,
         _workload: &str,
         spec: &ComputeSpec,
+        pull_auth: Option<&RegistryAuth>,
     ) -> Result<Artifact, BackendError> {
         // The docker backend pulls an OCI **image reference** (registry/repo:tag or a
         // digest); an ext4 rootfs is not runnable here.
@@ -449,7 +466,10 @@ impl ComputeBackend for DockerBackend {
                 ));
             }
         };
-        let reference = self.pull_image(&reference).await?;
+        // Authenticate the pull with the host-resolved registry credential (private
+        // image), or `None` for a public/anonymous pull. The credential is a sealed
+        // secret resolved fail-closed before launch — it never appears in config/argv.
+        let reference = self.pull_image(&reference, pull_auth).await?;
         Ok(Artifact::Image { reference })
     }
 
@@ -730,8 +750,10 @@ impl ComputeBackend for DockerBackend {
         }
         let has_stdin = stdin.is_some();
 
-        // Pull the client image (pg_dump/pg_restore/psql live here).
-        let reference = self.pull_image(image).await?;
+        // Pull the client image (pg_dump/pg_restore/psql live here). These are public
+        // images (pgvector/mysql); a private client image is a documented follow-up —
+        // thread the operator auth here when one is wanted. Anonymous for now.
+        let reference = self.pull_image(image, None).await?;
 
         // Hardened one-shot: dropped caps, read-only root, no-new-privileges, PID cap,
         // auto-removed on exit, and NO published port — it only needs network egress to
@@ -984,16 +1006,33 @@ impl DockerBackend {
     /// to `:latest`. Without a tag the daemon's `fromImage=<name>` (no `tag`) pulls
     /// **every** tag of the repo — slow, and 501s on any repo that still carries an
     /// ancient v1-manifest tag. A digest-pinned reference is passed whole (no tag).
-    async fn pull_image(&self, reference: &str) -> Result<String, BackendError> {
+    async fn pull_image(
+        &self,
+        reference: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> Result<String, BackendError> {
         let (from_image, tag) = image_pull_target(reference);
         let options = CreateImageOptions {
             from_image: from_image.clone(),
             tag: tag.clone(),
             ..Default::default()
         };
-        let mut pull = self.docker.create_image(Some(options), None, None);
+        // When a credential was resolved (a private image), pass it as bollard's
+        // `X-Registry-Auth`; `None` ⇒ an anonymous pull. The credential lives only in
+        // this transient `DockerCredentials` (a `RegistryAuth` with redacting `Debug`),
+        // never in the error path below — a failed pull surfaces the daemon's status
+        // message, never the token.
+        let credentials = auth.map(docker_credentials);
+        let mut pull = self.docker.create_image(Some(options), None, credentials);
         while let Some(step) = pull.next().await {
-            step.map_err(|e| BackendError::Materialize(format!("pull {reference}: {e}")))?;
+            // NB: `e` is the daemon's pull error (an HTTP status / manifest message),
+            // which never carries the submitted credential — safe to surface + redacted
+            // of any DSN shape by the shared redactor as defense-in-depth.
+            step.map_err(|e| {
+                BackendError::Materialize(boatramp_core::redact::redact_dsn(&format!(
+                    "pull {reference}: {e}"
+                )))
+            })?;
         }
         Ok(if tag.is_empty() {
             reference.to_string()
@@ -1050,6 +1089,31 @@ impl DockerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_credentials_maps_registry_auth_and_never_leaks_the_secret() {
+        // The resolved credential maps 1:1 to bollard's basic-auth fields…
+        let auth = RegistryAuth {
+            username: "robot".into(),
+            password: "sup3r-s3cret-token".into(),
+            serveraddress: "ghcr.io".into(),
+        };
+        let dc = docker_credentials(&auth);
+        assert_eq!(dc.username.as_deref(), Some("robot"));
+        assert_eq!(dc.password.as_deref(), Some("sup3r-s3cret-token"));
+        assert_eq!(dc.serveraddress.as_deref(), Some("ghcr.io"));
+        assert!(dc.auth.is_none() && dc.identitytoken.is_none());
+
+        // …and the SOURCE credential type redacts its password under `{:?}` (the shape a
+        // careless log/tracing/error takes), so the token can never reach a diagnostic
+        // via the backend. Mutating `RegistryAuth`'s Debug to print the password turns
+        // this RED (defense-in-depth over the core redaction test).
+        let dbg = format!("{auth:?}");
+        assert!(
+            !dbg.contains("sup3r-s3cret-token"),
+            "token leaked via Debug: {dbg}"
+        );
+    }
 
     #[test]
     fn image_pull_target_defaults_untagged_to_latest() {
