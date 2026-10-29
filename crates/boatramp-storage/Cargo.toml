@@ -24,6 +24,10 @@ s3 = [
   "dep:aws-sdk-sqs",
   "dep:serde_json",
   "dep:bytes",
+  # `tokio::sync::OnceCell` caches ONE process-wide base `SdkConfig`, so every S3 backend (global +
+  # each per-project) shares ONE HTTP connector + connection pool instead of building N independent
+  # ones — a cold `/img` burst spread across backends reuses warm connections, not N× cold connects.
+  "tokio/sync",
 ]
 # GCS backend (native google-cloud-storage SDK). `tokio/sync` for the upload
 # channel bridge (Send-only ByteStream → the SDK's Send+Sync upload stream).

@@ -794,3 +794,57 @@ jobs:
           # so if pebble was missing (the test's on_path guard returns early) this grep fails the job.
           grep -q 'ACME-DNS-PERSIST GATE OK' pebble.log \
             || { echo "::error::pebble gate never reached the success marker (silent skip or dns-persist-01 regression?)" >&2; exit 1; }
+
+  # Tier — the blob `/img` COLD-PATH FAN-OUT gate (image-serve-latency Ask 3c). N concurrent COLD
+  # fetches through the REAL `aws_sdk_s3` backend must FAN OUT, not serialize at the connector. MinIO is
+  # the local S3-compatible endpoint (a real aws client, real TCP — the `benchmark-must-exercise-real
+  # -path` rule: no warm/in-memory stand-in). The object is PRE-SEEDED (so the burst is the first — cold
+  # — op, empty pool). On a localhost endpoint this is a functional + coarse fan-out smoke; the NODE run
+  # against Tigris (real cold-connect latency) is the AUTHORITATIVE measurement.
+  blob-cold-fanout:
+    name: blob /img cold-path fan-out (MinIO)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      BOATRAMP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      BOATRAMP_TEST_S3_BUCKET: boatramp
+      # Pre-seeded key ⇒ the test's burst is the first S3 op (empty pool = genuinely cold).
+      BOATRAMP_TEST_S3_COLD_KEY: zz/cold-fanout-seed.webp
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-blob-cold-fanout
+
+      - name: Start MinIO + pre-seed a 12 KB object
+        run: |
+          set -o pipefail
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # aws CLI (preinstalled on the runner) reads the AWS_* creds from the job env.
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://boatramp
+          head -c 12288 /dev/zero > /tmp/seed.webp
+          aws --endpoint-url http://127.0.0.1:9000 s3 cp /tmp/seed.webp \
+            s3://boatramp/zz/cold-fanout-seed.webp
+          echo "minio up + seeded"
+
+      - name: N concurrent cold fetches must fan out, not serialize (hard gate)
+        run: |
+          set -o pipefail
+          # The REAL aws_sdk_s3 backend against MinIO, firing N concurrent cold get_range. The gate
+          # asserts the max per-request latency is not ~N× the median (serialization) and prints the
+          # marker ONLY after the fan-out assertions hold.
+          cargo test -p boatramp-storage --features s3 --test s3_minio \
+            concurrent_cold_fetches_fan_out -- --ignored --nocapture 2>&1 | tee fanout.log
+          grep -qE 'test result: ok' fanout.log \
+            || { echo "::error::blob cold fan-out gate did not pass (serialized, or a failure)" >&2; exit 1; }
+          grep -q 'CONCURRENT-COLD FAN-OUT OK' fanout.log \
+            || { echo "::error::blob cold fan-out never reached the success marker (silent skip or serialization?)" >&2; exit 1; }
