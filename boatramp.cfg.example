@@ -29,6 +29,35 @@
 
         // Require a control-plane token to view deployment previews.
         // protect_previews: true,
+
+        // Node/system-health ALERTING (node-health-alerting Stage 2). Off unless
+        // `enabled`. A leader-gated loop evaluates health signals on a cadence and
+        // emits an alert when a threshold is crossed + a RESOLVE when it clears,
+        // delivering over an operator webhook and/or email. Secrets are SEALED
+        // references (never plaintext here). Env parity: BOATRAMP_ALERTS_* (the
+        // `serve` segment dropped — e.g. BOATRAMP_ALERTS_DISK_WARN_PCT).
+        // alerts: (
+        //     enabled: true,
+        //     // Evaluation cadence (seconds). Default 60; floored at 5.
+        //     interval_secs: 60,
+        //     // /data fullness — the signal the disk-full outage needed.
+        //     disk: ( warn_pct: 75.0, critical_pct: 90.0 ),
+        //     // Alert when a managed-SQL / desired replica is HEALTHY=NO past a grace.
+        //     managed_sql: ( grace_secs: 300 ),
+        //     // Alert on orphaned replicas (no desired workload + no live container).
+        //     orphan: ( grace_secs: 86400 ),
+        //     // DESTRUCTIVE orphan reaper — opt-in + dry-run by default. It NEVER
+        //     // reaps a live or desired replica; `dry_run: false` to actually reap,
+        //     // `reclaim_volumes: true` to also delete the stranded PGDATA staging.
+        //     reaper: ( enabled: false, dry_run: true, grace_secs: 604800, reclaim_volumes: false ),
+        //     // Outbound webhook. `url_secret` is a sealed-store reference resolved
+        //     // server-side (store it with `boatramp secrets set node-alert-webhook <url>`);
+        //     // egress goes through the SSRF floor — a private target needs allow_private.
+        //     webhook: ( url_secret: "boatramp:node-alert-webhook", allow_private: false ),
+        //     // Email via boatramp's mail path. Names a per-project email profile
+        //     // (its SMTP password is sealed in the profile) + recipients.
+        //     email: ( project: "default", profile: "alerts", to: ["ops@example.com"] ),
+        // ),
     ),
 
     // Operator security posture. Optional; absent ⇒ the strict `multi-tenant`

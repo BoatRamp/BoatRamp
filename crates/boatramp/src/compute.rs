@@ -374,6 +374,31 @@ enum ComputeCommand {
     /// is sealed server-side and is never echoed back.
     #[command(subcommand)]
     RegistryAuth(RegistryAuthCommand),
+    /// Reap stuck ORPHANED compute replicas — a replica with NO desired workload AND no
+    /// live container that the reconcile plane ignores (it converges only against desired
+    /// workloads). DESTRUCTIVE + node-global; admin-scoped. **Dry-run by default**: it
+    /// reports what it WOULD reap and changes nothing unless `--execute` is passed. Fail-
+    /// closed — it never reaps a replica that is live or part of a desired spec, even one
+    /// you name explicitly. Name a `<workload>` + `--replica` to target one; omit both to
+    /// scan every project.
+    Reap {
+        /// Reap only this workload's replica (requires `--replica`). Omit to scan all.
+        workload: Option<String>,
+        /// Replica ordinal (with `<workload>`).
+        #[arg(long)]
+        replica: Option<u32>,
+        /// Actually reap. Without this the command is a dry-run (report only).
+        #[arg(long)]
+        execute: bool,
+        /// Also delete the orphan's persistent volume staging (e.g. a stranded managed-PG
+        /// PGDATA). Off by default — the record + container are reaped but data preserved.
+        #[arg(long)]
+        reclaim_volumes: bool,
+        /// Minimum orphan age (seconds) required before acting. Default 0 for an explicit
+        /// target (the no-desired-workload + container-gone checks are the real guarantee).
+        #[arg(long)]
+        grace_secs: Option<u64>,
+    },
 }
 
 /// `boatramp compute registry-auth …` — set / list / remove a sealed registry pull
@@ -585,6 +610,13 @@ pub enum ComputeOutput {
     },
     /// `compute registry-auth rm` — a registry credential was removed.
     RegistryAuthRemoved { name: String, operator: bool },
+    /// `compute reap` — the orphan-reaper report (dry-run or executed).
+    Reap {
+        /// Whether this was a dry-run (report-only).
+        dry_run: bool,
+        /// The per-orphan entries (`orphan`, `disposition`, `volume_reclaimed`).
+        entries: Vec<serde_json::Value>,
+    },
 }
 
 impl crate::output::Rendered for ComputeOutput {
@@ -672,8 +704,51 @@ impl crate::output::Rendered for ComputeOutput {
                 let scope = if *operator { "operator " } else { "" };
                 writeln!(w, "removed {scope}registry credential {name}")
             }
+            Self::Reap { dry_run, entries } => write_reap(*dry_run, entries, w),
         }
     }
+}
+
+/// Render the `compute reap` report.
+fn write_reap(
+    dry_run: bool,
+    entries: &[serde_json::Value],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if dry_run {
+        writeln!(w, "DRY-RUN (nothing was reaped — pass --execute to act)")?;
+    }
+    if entries.is_empty() {
+        return writeln!(w, "no orphaned replicas");
+    }
+    for e in entries {
+        let o = &e["orphan"];
+        let owner = format!(
+            "{}/{}/{}",
+            o["project"].as_str().unwrap_or("?"),
+            o["workload"].as_str().unwrap_or("?"),
+            o["replica"].as_u64().unwrap_or(0)
+        );
+        // `disposition` is a snake_case-tagged enum: "would_reap" / "reaped" /
+        // { "skipped": { "reason": ... } }.
+        let disp = &e["disposition"];
+        let (verb, detail) = if disp == "would_reap" {
+            ("WOULD REAP".to_string(), String::new())
+        } else if disp == "reaped" {
+            let vol = if e["volume_reclaimed"].as_bool().unwrap_or(false) {
+                " (+ volume reclaimed)"
+            } else {
+                ""
+            };
+            ("REAPED".to_string(), vol.to_string())
+        } else if let Some(reason) = disp["skipped"]["reason"].as_str() {
+            ("skipped".to_string(), format!(": {reason}"))
+        } else {
+            ("?".to_string(), String::new())
+        };
+        writeln!(w, "{owner}  {verb}{detail}")?;
+    }
+    Ok(())
 }
 
 /// Render the `compute ls` listing.
@@ -1374,6 +1449,55 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             ComputeOutput::Netdiag { workload, replicas }
         }
         ComputeCommand::RegistryAuth(cmd) => run_registry_auth(cmd, &http, &server, config).await?,
+        ComputeCommand::Reap {
+            workload,
+            replica,
+            execute,
+            reclaim_volumes,
+            grace_secs,
+        } => {
+            // A targeted reap needs workload + replica (project from --project); omit both
+            // to scan every project. A partial target is refused by the server.
+            let mut body = serde_json::Map::new();
+            body.insert("dry_run".into(), serde_json::json!(!execute));
+            body.insert("reclaim_volumes".into(), serde_json::json!(reclaim_volumes));
+            if let Some(g) = grace_secs {
+                body.insert("grace_secs".into(), serde_json::json!(g));
+            }
+            if let Some(wl) = &workload {
+                let Some(rep) = replica else {
+                    return Err(Error::Server(
+                        "a targeted reap needs --replica with the workload (or omit both to \
+                         scan every project)"
+                            .to_string(),
+                    ));
+                };
+                body.insert(
+                    "project".into(),
+                    serde_json::json!(client::resolve_project(config)),
+                );
+                body.insert("workload".into(), serde_json::json!(wl));
+                body.insert("replica".into(), serde_json::json!(rep));
+            }
+            let resp = http
+                .post(format!("{server}/api/compute/maintenance/reap"))
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "reap failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let report: serde_json::Value = resp.json().await?;
+            ComputeOutput::Reap {
+                dry_run: report["dry_run"].as_bool().unwrap_or(true),
+                entries: report["entries"].as_array().cloned().unwrap_or_default(),
+            }
+        }
     };
     Ok(out)
 }

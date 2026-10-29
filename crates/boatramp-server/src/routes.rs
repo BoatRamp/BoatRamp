@@ -58,6 +58,9 @@ pub fn router_with_fast(
     let project_export_cap = options.project_export.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
     let compute_control_cap = options.compute_control.clone();
+    // The orphaned-replica reaper (node-health-alerting Stage 2) — `None` ⇒ the reap
+    // endpoint fails closed with a 501. Backs `POST /api/compute/maintenance/reap`.
+    let compute_reaper_cap = options.compute_reaper.clone();
     // The project-scoped internal secret store (`None` when no `[secrets]` envelope
     // is configured — the admin secrets endpoints then fail closed with a clear 501).
     // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
@@ -445,6 +448,11 @@ pub fn router_with_fast(
         )
         .route("/api/compute/maintenance/restart", post(compute_restart))
         .route("/api/compute/maintenance/netdiag", post(compute_netdiag))
+        // DESTRUCTIVE orphaned-replica reaper (node-health-alerting Stage 2). System·Admin
+        // (node-global, `is_compute_maintenance_path`), re-asserted defense-in-depth in the
+        // handler; dry-run by default. `maintenance/reap` is swept by the existing
+        // `maintenance/*` matcher, so authz needs no new arm.
+        .route("/api/compute/maintenance/reap", post(compute_reap))
         .route(
             "/api/compute/{name}",
             get(get_compute).put(put_compute).delete(delete_compute),
@@ -797,6 +805,7 @@ pub fn router_with_fast(
         .layer(Extension(project_export_cap))
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))
+        .layer(Extension(compute_reaper_cap))
         .layer(Extension(secret_store_cap))
         .layer(Extension(tenant_secret_store_cap))
         .layer(Extension(email_store_cap))

@@ -137,6 +137,16 @@ issuer-trust-gate-mutation = ["oidc"]
 # RED. Needs `handlers`+`oidc` (the gate composes subgraphs + verifies tokens). Compiled OUT of every
 # real build (the seam also lives under this crate's own `cfg(test)`).
 jwks-gate-mutation = ["handlers", "oidc"]
+# Node-health-alerting (Stage 2) anti-hollow lanes. Each arms a `#[cfg(feature = …)]` seam
+# in `health_alert.rs` that turns the matching mutation-verified gate RED, proving the check
+# is load-bearing. Compiled OUT of every real build (the gate tests also live under this
+# crate's own `cfg(test)`).
+#  - sealed: `SealedWebhookUrl`'s Debug leaks the URL → the redaction test fails.
+#  - ssrf:   the webhook drops the `is_global_ip` floor → the SSRF-floor test fails.
+#  - dedupe: the alert reconciler re-emits every tick → the de-dup test fails.
+health-alert-sealed-gate-mutation = []
+health-alert-ssrf-gate-mutation = []
+health-alert-dedupe-mutation = []
 # TEST-ONLY anti-hollow lane for the consumer/cron blob-scope fix (boatramp-consumer-blob-scope-bug):
 # `BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope` makes `scheduler.rs::consumer_dispatch_scope` drop the
 # project qualification (the pre-fix bug), so the gate — asserting a consumer's scope equals the

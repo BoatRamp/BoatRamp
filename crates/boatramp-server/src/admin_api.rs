@@ -4344,6 +4344,103 @@ pub(super) async fn compute_restart(
     }
 }
 
+/// Defense-in-depth (mirrors [`assert_store_migrate_is_system_admin`](crate::store_migrate)):
+/// re-derive the right the authoritative table requires for the reap path and assert it is
+/// node-global `System·Admin` before the DESTRUCTIVE reap. The auth middleware already enforced
+/// it (`is_compute_maintenance_path` → `System·Admin`); this catches a future routing/table
+/// regression that might silently downgrade this node-global destructive op to a project right.
+fn assert_compute_reap_is_system_admin() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/compute/maintenance/reap") {
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "the orphan-replica reaper requires System·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Body of `POST /api/compute/maintenance/reap` — the DESTRUCTIVE orphaned-replica reaper
+/// lever (node-health-alerting Stage 2). With `project`+`workload`+`replica` it targets one
+/// replica (still fail-closed re-checked); otherwise it scans every project. `dry_run`
+/// DEFAULTS TO TRUE (report-only) — the caller must send `dry_run: false` to actually reap.
+#[derive(Deserialize)]
+pub(super) struct ReapRequest {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    workload: Option<String>,
+    #[serde(default)]
+    replica: Option<u32>,
+    /// Report-only unless explicitly `false`. Absent ⇒ `true` (dry-run), the safe default.
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// Minimum orphan age (seconds) required before acting. Absent ⇒ `0` for an explicitly
+    /// targeted replica (conditions "no desired workload" + "container gone" are the real
+    /// guarantee), i.e. the operator named it deliberately.
+    #[serde(default)]
+    grace_secs: Option<u64>,
+    /// Also free the orphan's scoped volume staging (PGDATA). Default `false`.
+    #[serde(default)]
+    reclaim_volumes: bool,
+}
+
+/// `POST /api/compute/maintenance/reap` — reap (or, dry-run, report) orphaned compute
+/// replicas: a replica with NO desired workload AND no live container, past the grace.
+/// DESTRUCTIVE → `System·Admin` (node-global, `is_compute_maintenance_path`), re-asserted
+/// here defense-in-depth. Dry-run by default. `None` capability ⇒ `501`.
+pub(super) async fn compute_reap(
+    Extension(reaper): Extension<Option<Arc<dyn boatramp_core::compute::ComputeReaper>>>,
+    Json(req): Json<ReapRequest>,
+) -> Response {
+    if let Some(forbidden) = assert_compute_reap_is_system_admin() {
+        return forbidden;
+    }
+    let Some(reaper) = reaper else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "the orphan-replica reaper is not available on this node\n",
+        )
+            .into_response();
+    };
+    let target = match (req.project, req.workload, req.replica) {
+        (Some(project), Some(workload), Some(replica)) => boatramp_core::compute::ReapTarget::One {
+            project,
+            workload,
+            replica,
+        },
+        // A partial target is ambiguous — refuse rather than silently scanning all.
+        (p, w, r) if p.is_some() || w.is_some() || r.is_some() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "a targeted reap needs all of project + workload + replica (or none, to \
+                 scan every project)\n",
+            )
+                .into_response();
+        }
+        _ => boatramp_core::compute::ReapTarget::All,
+    };
+    let opts = boatramp_core::compute::ReapOptions {
+        target,
+        grace_secs: req.grace_secs.unwrap_or(0),
+        dry_run: req.dry_run.unwrap_or(true),
+        reclaim_volumes: req.reclaim_volumes,
+    };
+    match reaper.reap(opts).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("reap failed: {e}\n")).into_response(),
+    }
+}
+
 /// Attempt a TCP connect to `host:port` with a short timeout — an active reachability
 /// probe. `ToSocketAddrs` resolves both a literal IP (the co-located container case)
 /// and a hostname; a resolve/connect failure or timeout ⇒ `false`.
