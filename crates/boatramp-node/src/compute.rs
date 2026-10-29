@@ -1688,6 +1688,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &ComputeSpec,
+            _: Option<&boatramp_core::registry_auth::RegistryAuth>,
         ) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }
