@@ -229,7 +229,11 @@ pub fn registry_host_of(reference: &str) -> String {
 ///
 /// Examples: `ghcr.io/myorg/base-api:1` → `myorg/base-api`;
 /// `registry.example.com:5000/team/app` → `team/app`; `localhost:5000/app:1` → `app`;
-/// `ghcr.io/o/a@sha256:abc` → `o/a`; `nginx:latest` → `nginx`; `library/alpine` → `library/alpine`.
+/// `ghcr.io/o/a@sha256:abc` → `o/a`; `ghcr.io/o/a:1@sha256:abc` → `o/a`; `nginx:latest` → `nginx`;
+/// `library/alpine` → `library/alpine`.
+///
+/// This is a PURE parse (no validation); the scope gate's structural fail-closed against traversal
+/// refs lives in [`OperatorRegistryAuth::applies_to_repo`].
 #[must_use]
 pub fn registry_repo_of(reference: &str) -> String {
     // Strip the host if the first `/`-segment is one (same rule as `registry_host_of`).
@@ -241,19 +245,31 @@ pub fn registry_repo_of(reference: &str) -> String {
         }
         _ => reference,
     };
-    // A digest pin (`@sha256:…`) ends the repo path.
-    if let Some((repo, _digest)) = after_host.split_once('@') {
-        return repo.to_string();
-    }
-    // Otherwise strip a tag — a `:` in the LAST path component (a registry `host:port` is already
-    // gone, so any `:` now is a tag). `rfind(':')` is safe: the only remaining `:` is the tag's.
-    let last = after_host.rsplit('/').next().unwrap_or(after_host);
+    // Drop the digest first (`@sha256:…` is always the suffix) so the tag strip below sees a clean
+    // `repo[:tag]` with no digest `:` to confuse it — this also clears the `:tag` residue a
+    // `name:tag@digest` ref would otherwise leave.
+    let no_digest = after_host
+        .split_once('@')
+        .map_or(after_host, |(repo, _digest)| repo);
+    // Then strip a tag — a `:` in the LAST path component (a registry `host:port` and the digest are
+    // already gone, so any remaining `:` is the tag's). `rfind(':')` is safe for the same reason.
+    let last = no_digest.rsplit('/').next().unwrap_or(no_digest);
     if last.contains(':')
-        && let Some(idx) = after_host.rfind(':')
+        && let Some(idx) = no_digest.rfind(':')
     {
-        return after_host[..idx].to_string();
+        return no_digest[..idx].to_string();
     }
-    after_host.to_string()
+    no_digest.to_string()
+}
+
+/// Whether a parsed repository path is **well-formed** for scope matching: non-empty and free of any
+/// empty or `..` path segment. A traversal/malformed ref (`myorg/base-/../../secret`, `a//b`, a
+/// leading/trailing `/`) is NOT well-formed — [`OperatorRegistryAuth::applies_to_repo`] refuses to
+/// match it against ANY prefix, so a node-wide operator credential is never attached to it. This
+/// makes the scope gate SELF-SUFFICIENT (Security LOW): it never relies on the downstream puller to
+/// reject a `..` ref before it reaches a registry.
+fn repo_path_is_well_formed(repo: &str) -> bool {
+    !repo.is_empty() && !repo.split('/').any(|seg| seg.is_empty() || seg == "..")
 }
 
 /// An operator node-wide registry credential binding (`[compute].registry_auth` value): a
@@ -307,10 +323,19 @@ impl OperatorRegistryAuth {
     }
 
     /// Whether this binding applies to an image whose repository path is `repo`. Host-wide (or an
-    /// empty `repos`) always matches; a prefix-scoped binding matches only when `repo` starts with
-    /// one of the configured prefixes (byte prefix, case-sensitive).
+    /// empty `repos`) matches any WELL-FORMED repo; a prefix-scoped binding matches only when `repo`
+    /// starts with one of the configured prefixes (byte prefix, case-sensitive).
+    ///
+    /// A malformed/traversal `repo` (an empty or `..` path segment, e.g. `myorg/base-/../../secret`)
+    /// matches NOTHING — not even a host-wide binding — so the node-wide operator credential is never
+    /// attached to it (Security LOW: the scope gate is self-sufficient and does not rely on the
+    /// downstream puller to reject a `..` ref). The pull then falls through to the project
+    /// `pull_secret` rules / anonymous, exactly as a non-matching repo does.
     #[must_use]
     pub fn applies_to_repo(&self, repo: &str) -> bool {
+        if !repo_path_is_well_formed(repo) {
+            return false;
+        }
         match self {
             Self::HostWide(_) => true,
             Self::Scoped { repos, .. } if repos.is_empty() => true,
@@ -507,6 +532,13 @@ mod tests {
         );
         assert_eq!(registry_repo_of("localhost:5000/app:1"), "app");
         assert_eq!(registry_repo_of("ghcr.io/o/a@sha256:abc"), "o/a");
+        // A `name:tag@digest` ref yields a CLEAN repo (no `:tag` residue — digest dropped first,
+        // then the tag).
+        assert_eq!(registry_repo_of("ghcr.io/o/a:1@sha256:abc"), "o/a");
+        assert_eq!(
+            registry_repo_of("myorg/app:2.1@sha256:deadbeef"),
+            "myorg/app"
+        );
         // Docker Hub refs keep their bare repo path (no implicit library/ added).
         assert_eq!(registry_repo_of("nginx:latest"), "nginx");
         assert_eq!(registry_repo_of("library/alpine"), "library/alpine");
@@ -535,6 +567,27 @@ mod tests {
         assert!(!scoped.applies_to_repo("otherorg/base-api"));
         // Case-sensitive (registries are).
         assert!(!scoped.applies_to_repo("MyOrg/base-api"));
+
+        // Security LOW (structural fail-closed): a traversal ref that BYTE-matches a prefix must
+        // NOT match — the `..`/empty-segment guard makes the scope gate self-sufficient (it does not
+        // rely on the downstream puller to reject a `..` ref). Deleting the `repo_path_is_well_formed`
+        // check turns these RED (the raw `starts_with` would let the traversal through).
+        assert!(
+            !scoped.applies_to_repo("myorg/base-/../../secret-service"),
+            "a `..` traversal that byte-matches the prefix must NOT attach the operator cred"
+        );
+        assert!(
+            !scoped.applies_to_repo("myorg/base-/../secret"),
+            "a single `..` segment is still a traversal"
+        );
+        assert!(
+            !scoped.applies_to_repo("myorg/base-//evil"),
+            "an empty path segment is malformed and must NOT match"
+        );
+        // Even a host-wide binding refuses a malformed/traversal ref (it matches nothing).
+        assert!(!hw.applies_to_repo("myorg/base-/../../secret"));
+        assert!(!hw.applies_to_repo(""));
+        assert!(!empty.applies_to_repo("a//b"));
     }
 
     #[test]
@@ -853,6 +906,18 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a non-prefix-matching repo must NOT borrow the node-wide operator credential"
+        );
+
+        // Security LOW: a `..` traversal ref that BYTE-matches the `myorg/base-` prefix must NOT
+        // attach the operator credential either — the scope gate rejects it structurally, so it
+        // falls through to anonymous (Ok(None)) rather than reaching `secret-service` with the
+        // node-wide cred. End-to-end proof the gate does not rely on the docker daemon's `..` reject.
+        assert!(
+            r.resolve("acme", "ghcr.io/myorg/base-/../../secret-service:1", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a `..` traversal that byte-matches the prefix must NOT borrow the node-wide credential"
         );
 
         // A non-matching repo that DOES name its own project pull_secret still resolves that per the
