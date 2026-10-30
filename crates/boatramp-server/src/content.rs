@@ -253,7 +253,11 @@ pub(super) const MAX_RANGES: usize = 64;
 /// malformed or **every** range is unsatisfiable (caller responds `416`); a
 /// returned `Vec` has at least one range. Unsatisfiable ranges in an otherwise
 /// satisfiable set are dropped (RFC 7233 §4.1).
-pub(super) fn parse_ranges(spec: &str, total: u64) -> Option<Vec<(u64, u64)>> {
+///
+/// `pub` (not `pub(super)`): this is the privsep fuzz harness's entry point
+/// (`fuzz/fuzz_targets/fuzz_byte_range.rs`) for the client-controlled `Range` header text —
+/// the one hand-rolled untrusted-byte parser on the blob/static-file serving path.
+pub fn parse_ranges(spec: &str, total: u64) -> Option<Vec<(u64, u64)>> {
     let spec = spec.strip_prefix("bytes=")?;
     let mut out = Vec::new();
     let mut saw_range = false;
@@ -365,4 +369,37 @@ pub(super) async fn multipart_byteranges(
         Body::from_stream(body),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The stable regression net for the privsep fuzz harness
+    // (`../fuzz/fuzz_targets/fuzz_byte_range.rs`): a client-controlled `Range` header is pure
+    // text, so a handful of valid + malformed specs here double as its seed corpus.
+    #[test]
+    fn parse_ranges_accepts_valid_specs() {
+        assert_eq!(parse_ranges("bytes=0-499", 1000), Some(vec![(0, 500)]));
+        assert_eq!(parse_ranges("bytes=500-", 1000), Some(vec![(500, 500)]));
+        assert_eq!(parse_ranges("bytes=-500", 1000), Some(vec![(500, 500)]));
+        assert_eq!(
+            parse_ranges("bytes=0-0,999-999", 1000),
+            Some(vec![(0, 1), (999, 1)])
+        );
+        // End clamped to the resource's last byte.
+        assert_eq!(parse_ranges("bytes=0-99999", 1000), Some(vec![(0, 1000)]));
+    }
+
+    #[test]
+    fn parse_ranges_rejects_malformed_or_unsatisfiable_specs() {
+        assert_eq!(parse_ranges("", 1000), None);
+        assert_eq!(parse_ranges("bytes=", 1000), None);
+        assert_eq!(parse_ranges("items=0-1", 1000), None); // wrong unit
+        assert_eq!(parse_ranges("bytes=abc-def", 1000), None);
+        assert_eq!(parse_ranges("bytes=1000-", 1000), None); // start >= total
+        assert_eq!(parse_ranges("bytes=500-100", 1000), None); // end < start
+        assert_eq!(parse_ranges("bytes=-0", 1000), None); // zero suffix
+        assert_eq!(parse_ranges("bytes=0-499", 0), None); // empty resource
+    }
 }
