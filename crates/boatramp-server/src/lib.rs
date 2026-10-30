@@ -47,6 +47,11 @@ pub mod aot;
 mod blob_ref;
 pub mod blob_shim;
 pub mod messaging_shim;
+/// The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
+/// allow-list (`exec*` denied) + a Landlock filesystem confinement, installed on the serving
+/// process after startup. Always compiled; the real Linux enforcement is gated on
+/// `cfg(all(target_os = "linux", feature = "sandbox"))` and everything else is a logged no-op.
+pub mod sandbox;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;

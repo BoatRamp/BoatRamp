@@ -72,6 +72,7 @@ default = [
   "mcp",
   "project-export",
   "overlay",
+  "sandbox",
 ]
 # The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
 # `FallbackStorage` over the built primary. Generic (no cloud dep of its own), so each blob-backend
@@ -111,6 +112,11 @@ overlay = [
 # before R2 lands real (much heavier) TUN deps behind it. `dep:` is listed explicitly (not just via
 # `overlay`) so enabling `tun` alone still resolves, even without `overlay` also enabled.
 tun = ["dep:boatramp-overlay-tunnel", "boatramp-overlay-tunnel/tun"]
+# The whole-process OS sandbox (privsep Phase 0, WS1): forwards to `boatramp-server/sandbox` (seccomp-bpf
+# + Landlock, installed on the serving process after startup; `exec*` denied). Batteries-included; the
+# runtime `[serve.sandbox] enabled` default is ON where the platform supports it (Linux), off elsewhere.
+# On a non-Linux host this feature compiles only the no-op path, so the default build still builds.
+sandbox = ["boatramp-server/sandbox"]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]

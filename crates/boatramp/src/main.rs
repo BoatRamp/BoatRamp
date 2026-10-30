@@ -517,7 +517,7 @@ async fn async_main() -> Result<(), CliError> {
         // the file decoder (RON/JSON).
         let config =
             config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))?;
-        serve::run(args, &config).await?;
+        serve::run(args, &config, &path).await?;
         return Ok(());
     }
 

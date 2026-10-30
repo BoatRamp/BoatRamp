@@ -2087,6 +2087,7 @@ dependencies = [
  "include_dir",
  "ipnet",
  "jsonwebtoken",
+ "landlock",
  "libc",
  "lru 0.18.5",
  "p256",
@@ -2096,12 +2097,14 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rustls 0.23.46",
+ "seccompiler",
  "serde",
  "serde_json",
  "serial_test",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "subtle",
+ "syscalls",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -3834,6 +3837,26 @@ name = "enum-ordinalize-derive"
 version = "4.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42e528e2d34ba8a67a1a650b86beae8ef69fc5fdb638016f386b973226590432"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6340,6 +6363,17 @@ checksum = "b5baa5e9ff84f1aefd264e6869907646538a52147a755d494517a8007fb48733"
 dependencies = [
  "regex-automata",
  "rustversion",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

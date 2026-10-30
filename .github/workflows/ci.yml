@@ -821,6 +821,24 @@ jobs:
           grep -q 'SESSION PROMOTE LIVE OK' tcp-listener-live.log \
             || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
 
+      # privsep Phase 0 WS1 WHOLE-PROCESS SANDBOX LIVE GATE (marker `SANDBOX LIVE OK`). Proves the
+      # seccomp-bpf + Landlock process sandbox against the REAL kernel: a forked child that installs the
+      # sandbox has (a) `execve` REFUSED by the seccomp allow-list (exec* denied) and (b) a write OUTSIDE
+      # the node data_dir REFUSED by Landlock — while a child that does NOT install it has BOTH ops
+      # SUCCEED (the in-test mutation that proves the gate detects a real difference, not a no-op). The
+      # test is `#[ignore]`d (it forks + installs a whole-process filter), so it runs ONLY here via
+      # --include-ignored, NEVER in the general --all-features suite (the v0.40 lesson: a live test in
+      # the general suite flaked). Greps the marker + pass count so a silent skip/compile-out fails.
+      - name: "whole-process sandbox live gate (seccomp exec-deny + Landlock data_dir confinement; mutation-verified)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features sandbox --test sandbox_live -- --include-ignored --nocapture 2>&1 | tee sandbox-live.log
+          grep -qE 'test result: ok\. 1 passed' sandbox-live.log \
+            || { echo "::error::sandbox live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SANDBOX LIVE OK' sandbox-live.log \
+            || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
+
       # EXT-METHOD ROUTING gate (mailroom #4, marker `EXT-METHOD ROUTING OK`). Edge routing accepts
       # extension / WebDAV verbs (PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL, MOVE, COPY — CalDAV
       # RFC 4791 / CardDAV RFC 6352) and an explicit per-route `methods: ["*"]` catch-all, while STILL

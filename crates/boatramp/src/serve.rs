@@ -1357,7 +1357,61 @@ async fn spawn_overlay_roles(
     ))
 }
 
-pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
+/// Build the [`SandboxPolicy`](boatramp_server::sandbox::SandboxPolicy) from `[serve.sandbox]` + the
+/// node `data_dir` + the config-file dir + the TLS/cert paths `serve` reads at runtime, then install
+/// the whole-process OS sandbox (seccomp-bpf + Landlock). Best-effort: a genuine install error is
+/// LOGGED but never fails startup (matching the no-op-on-unsupported contract). `enabled` is unset ⇒
+/// the platform default: ON where supported (Linux), off elsewhere; `[serve.sandbox] enabled = false`
+/// opts out. Linux-only; a documented no-op on other platforms.
+fn install_process_sandbox(
+    serve_cfg: &boatramp_node::config::ServeConfig,
+    data_dir: &Path,
+    config_path: &Path,
+    args: &ServeArgs,
+) {
+    let sb = serve_cfg.sandbox.clone().unwrap_or_default();
+    // Unset ⇒ platform default: ON where the platform supports it (Linux), off elsewhere.
+    let enabled = sb.enabled.unwrap_or(cfg!(target_os = "linux"));
+
+    let mut policy = boatramp_server::sandbox::SandboxPolicy::for_server(enabled, data_dir);
+    // The config file's directory — the server may read files adjacent to its config; harmless to
+    // allow even when it doesn't.
+    if let Some(dir) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        policy = policy.allow_read(dir);
+    }
+    // TLS material the serve loop reads at/after the install point (`--tls custom`/`acme`): confine to
+    // the containing directories (Landlock grants are per-directory-subtree).
+    for cert in [
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+        args.acme_ca_cert.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(dir) = cert.parent().filter(|p| !p.as_os_str().is_empty()) {
+            policy = policy.allow_read(dir);
+        }
+    }
+    // The ACME cert cache is WRITTEN during serving (certificate renewal).
+    policy = policy.allow_write(args.acme_cache.clone());
+    for p in &sb.extra_read_paths {
+        policy = policy.allow_read(p.clone());
+    }
+    for p in &sb.extra_write_paths {
+        policy = policy.allow_write(p.clone());
+    }
+
+    if let Err(e) = boatramp_server::sandbox::install(&policy) {
+        tracing::error!(
+            error = %e,
+            "process sandbox install FAILED — continuing WITHOUT a sandbox (best-effort; set \
+             `[serve.sandbox] enabled = false` to silence, or investigate the kernel/allow-list)"
+        );
+    }
+}
+
+pub async fn run(args: ServeArgs, config: &ServerConfig, config_path: &Path) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
     // Resolve the operator security posture once (profile preset + overrides);
     // absent `[security]` ⇒ the strict `multi-tenant` default. Threaded into
@@ -1554,6 +1608,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         return run_cluster(
             args,
             config,
+            config_path,
             cluster_cfg,
             addr,
             data_dir,
@@ -2047,6 +2102,15 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         )
         .await?;
     }
+    // Whole-process OS sandbox (privsep Phase 0, WS1): seccomp-bpf default-deny allow-list (`exec*`
+    // DENIED) + Landlock filesystem confinement to `data_dir` (+ the config/cert paths). Installed
+    // HERE — the node is assembled, backends connected, and the listeners above are already bound — so
+    // the allow-list can exclude boot-only syscalls; the main public listener binds inside the serve
+    // loop below, which `bind`/`listen`/`socket` stay allowed for. Linux-only + opt-out via
+    // `[serve.sandbox] enabled = false`; a logged no-op elsewhere that never fails startup. NOTE: this
+    // denies `exec*` process-wide for the serving life — see the WS1 integration notes re: the compute
+    // re-exec.
+    install_process_sandbox(&serve_cfg, &data_dir, config_path, &args);
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
@@ -3855,6 +3919,7 @@ impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
 async fn run_cluster(
     args: ServeArgs,
     config: &ServerConfig,
+    config_path: &Path,
     mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
@@ -4415,6 +4480,10 @@ async fn run_cluster(
             cluster_serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
+    // Whole-process OS sandbox (privsep Phase 0, WS1) — cluster serve path. Same seccomp-bpf + Landlock
+    // install as the single-node path, after the node is assembled + listeners are bound. Linux-only +
+    // opt-out via `[serve.sandbox] enabled = false`; a logged no-op elsewhere that never fails startup.
+    install_process_sandbox(&cluster_serve_cfg, &data_dir, config_path, &args);
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await

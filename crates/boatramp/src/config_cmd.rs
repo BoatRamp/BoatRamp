@@ -448,6 +448,12 @@ fn restart_class_section(key: &str) -> Option<&'static str> {
             Some("serve")
         }
         k if k.starts_with("tls") || k.starts_with("acme") => Some("serve"),
+        // The whole-process OS sandbox (`[serve.sandbox]`, privsep Phase 0 WS1) is a posture-class,
+        // restart-only setting — the seccomp + Landlock filter is installed once at serve start and
+        // never changed at runtime, so it is file+restart, not a dynamic daemon-config key.
+        k if k == "sandbox" || k.starts_with("sandbox.") || k.starts_with("sandbox_") => {
+            Some("serve")
+        }
         k if k.starts_with("security.") || k == "security" => Some("security"),
         k if k.starts_with("cluster.") || k == "cluster" => Some("cluster"),
         _ => None,
@@ -658,6 +664,11 @@ mod tests {
             ),
             Err(Error::RestartClass(_, "security"))
         ));
+        // The whole-process OS sandbox is restart-class under `[serve]` (privsep Phase 0 WS1).
+        assert!(matches!(
+            write_key(&mut cfg, "sandbox.enabled", "false"),
+            Err(Error::RestartClass(_, "serve"))
+        ));
         // A genuinely unknown key.
         assert!(matches!(
             write_key(&mut cfg, "nope", "1"),
@@ -674,5 +685,24 @@ mod tests {
     fn read_key_reports_unset() {
         let cfg = DaemonConfig::default();
         assert!(read_key(&cfg, "default_site").unwrap().contains("unset"));
+    }
+
+    #[test]
+    fn describe_surfaces_sandbox_as_restart_class() {
+        // The `config` discovery command classifies the WS1 sandbox keys as restart-class under
+        // `[serve]` (file + restart), so an operator learns they are not runtime-settable.
+        for key in ["sandbox", "sandbox.enabled"] {
+            assert!(
+                matches!(
+                    describe(key),
+                    ConfigOutput::Describe {
+                        class: "restart",
+                        section: Some("serve"),
+                        ..
+                    }
+                ),
+                "`config describe {key}` must report restart-class under [serve]"
+            );
+        }
     }
 }

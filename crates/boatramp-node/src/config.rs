@@ -2491,6 +2491,15 @@ pub struct ServeConfig {
     /// [`boatramp_core::health_alert::AlertsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alerts: Option<boatramp_core::health_alert::AlertsConfig>,
+    /// `[serve.sandbox]` — the whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf
+    /// default-deny syscall allow-list (`exec*` DENIED) + a Landlock filesystem confinement to the
+    /// node's `data_dir` (+ the config/cert paths the server reads at runtime), installed on the
+    /// serving process AFTER startup (listeners bound, backends connected). **Linux-only** — a
+    /// documented no-op elsewhere that logs a warning and does NOT fail startup. Absent ⇒ the platform
+    /// default: **ON where the platform supports it (Linux)**; set `enabled = false` to opt out. Env
+    /// parity: `BOATRAMP_SERVE_SANDBOX_*`. See [`SandboxConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 /// `[serve.on_demand_tls]` — on-demand per-SNI TLS issuance (cap-req 03). Off unless `enabled`. When
@@ -3140,6 +3149,31 @@ pub struct ConsoleConfig {
     /// URL path prefix the console mounts at (default `/_console`). Kept under the
     /// reserved `/_` namespace so it never collides with a published site path.
     pub path: Option<String>,
+}
+
+/// `[serve.sandbox]` — the whole-process OS sandbox (privsep Phase 0, WS1). A seccomp-bpf
+/// default-deny syscall allow-list (`exec*` denied) plus a Landlock filesystem confinement, installed
+/// on the serving process after startup. **Linux-only**; a logged no-op on other platforms (and in a
+/// build without the `sandbox` feature) that never fails startup. Best-effort on older kernels (ABI
+/// downgrade + a warning rather than a hard failure).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// Master toggle. **Absent (`None`) ⇒ the platform default: ON where supported (Linux)**; set
+    /// `false` to opt out explicitly, or `true` to force-request it (on a non-Linux/unsupported build
+    /// that still no-ops with a warning). Kept an `Option` so "unset = platform default" is distinct
+    /// from an explicit `true`/`false`.
+    pub enabled: Option<bool>,
+    /// Extra read-only filesystem roots to allow under Landlock, beyond the auto-derived set
+    /// (`data_dir`, the config-file dir, the cert/TLS paths, and the conservative system read roots —
+    /// `/usr`, `/lib*`, `/etc`, `/proc`, `/sys`, `/dev`, `/run`). For a deployment that reads from an
+    /// unusual location. Non-existent paths are skipped at install time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_read_paths: Vec<PathBuf>,
+    /// Extra read-write filesystem roots to allow under Landlock, beyond `data_dir` + the system temp
+    /// dirs (`/tmp`, `/var/tmp`, `$TMPDIR`). Non-existent paths are skipped at install time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_write_paths: Vec<PathBuf>,
 }
 
 /// `publish` section — where and what to deploy (the `sync` target).
