@@ -25,7 +25,9 @@ with its own kernel (build one from an OCI image with `compute build`). It gives
 hardware-level isolation for untrusted or tenant-supplied code, at the cost of a
 heavier boot and a kernel per instance.
 boatramp ships both an external-Firecracker backend and an embedded rust-vmm
-backend; a microVM backend is available on Linux hosts with `/dev/kvm`.
+backend on Linux hosts with `/dev/kvm`, plus a native backend on Apple-silicon
+macOS (15+) via Virtualization.framework — see
+[Run a container or microVM](../how-to/compute.md).
 
 ## The root filesystem is typed
 
@@ -73,5 +75,6 @@ the guest where it paused rather than booting it. See
 The control plane schedules workloads across nodes that advertise compute
 capacity and reconciles the running replicas toward the desired count. The
 backends are capability-detected per host (container where allowed, microVM where
-`/dev/kvm` exists), so the same workload definition runs wherever it can. See the
+`/dev/kvm` exists or, on Apple-silicon macOS, via Virtualization.framework), so
+the same workload definition runs wherever it can. See the
 [architecture overview](./architecture.md).

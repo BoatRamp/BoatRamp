@@ -116,6 +116,8 @@ Nickel-generated config on a non-`.json` path). See
 | `--kv <slatedb\|memory\|cloudflare>` | `BOATRAMP_KV` | `slatedb` | KV backend (`cloudflare` is in the default build). |
 | `--kv-s3` | `BOATRAMP_KV_S3` | `false` | Run the SlateDB KV on the S3/R2 object store (reusing the `--blobs s3` config) instead of local disk — durable metadata for a volumeless container. |
 | `--kv-s3-prefix <prefix>` | `BOATRAMP_KV_S3_PREFIX` | `_kv` | Key prefix for the `--kv-s3` store within the bucket. |
+| `--strict-kv` | `BOATRAMP_KV_STRICT` | `false` | Paranoid mode: fail loud on ANY torn control-plane SlateDB store instead of auto-quarantining a provably-safe trailing tail (the default since v0.9.0). A cluster node-local store is always strict regardless of this flag. |
+| `--repair-wal` | `BOATRAMP_KV_REPAIR` | `false` | **Legacy, now a no-op** on the single-node store (self-heal-on-open is the default since v0.9.0; honored with a one-line log). On a cluster node it still opts the node-local Raft store into tail repair. |
 | `--s3-bucket <name>` | `BOATRAMP_S3_BUCKET` | — | S3/R2 bucket (`--blobs s3` and/or `--kv-s3`). |
 | `--s3-endpoint <url>` | `BOATRAMP_S3_ENDPOINT` | — | S3 endpoint (MinIO / R2). |
 | `--s3-region <region>` | `BOATRAMP_S3_REGION` | — | S3 region (R2: `auto`). |
@@ -174,7 +176,7 @@ Nickel-generated config on a non-`.json` path). See
 | `--protect-previews` | `BOATRAMP_PROTECT_PREVIEWS` | `false` | Require a token to view `/_deploy` previews. |
 | `--auto-migrate` | — | `false` | Migrate a pre-0.2.0 store to the project-scoped layout at startup instead of refusing to serve. The migration is online, idempotent, and resumable; see [`migrate`](#boatramp-migrate) for the explicit operator step. |
 | `--cluster-rate-limit` | `BOATRAMP_CLUSTER_RATE_LIMIT` | `false` | Rate-limit cluster-wide via the KV, not per node. |
-| `--shared-cache-coherence` | `BOATRAMP_SHARED_CACHE_COHERENCE` | `false` | Keep the config cache coherent across processes sharing one KV. |
+| `--shared-cache-coherence` | `BOATRAMP_SHARED_CACHE_COHERENCE` | `false` | **Deprecated** — keep the config cache coherent across processes sharing one KV. Now auto-derived from the backend's writer model (on automatically under a multi-writer backend); only still needed for the legacy shared-SlateDB/Cloudflare-KV topology. |
 | `--cluster-init` | `BOATRAMP_CLUSTER_INIT` | `false` | **Found** a new cluster from this node (explicit, one-time). See [Deploy a cluster](../how-to/deploy-cluster.md). |
 | `--cluster-join <ticket>` | `BOATRAMP_CLUSTER_JOIN` | — | **Join** an existing cluster with a one-paste ticket from `cluster add`. |
 | `--cluster-advertise-addr <url>` | `BOATRAMP_CLUSTER_ADVERTISE_ADDR` | `https://<cluster.listen>` | This node's reachable mesh URL peers dial (set behind NAT / `0.0.0.0`). |
@@ -268,6 +270,7 @@ Build (optional) and publish a folder as a new atomic deployment. Argument:
 | `--source <rev>` | Source revision (defaults to the current git commit SHA). |
 | `--branch <branch>` | Source branch (defaults to the current git branch). |
 | `--author <author>` | Deploy author. |
+| `--tag <KEY=VALUE>` | Arbitrary key-value tag recorded with the deployment and shown in the CLI/console (repeatable, e.g. `--tag env=prod`). |
 
 ## `boatramp build`
 
@@ -350,6 +353,7 @@ Attach/detach hostnames to a site (virtualhost routing). See
 | `verify <host>` | Check the challenge; on success the host is attached. |
 | `rm <host>` | Detach a hostname and drop its verification. |
 | `ls` | List the site's hostnames and pending verifications. |
+| `verify-records <host> --record <SPEC>...` | **Operator-only** diagnostic: verify a set of DNS records resolve as expected (read-only — attaches/persists nothing). Needs `domain-verify-dns` + a `system·admin` token. |
 
 `domain add` flags:
 
@@ -358,6 +362,11 @@ Attach/detach hostnames to a site (virtualhost routing). See
 | `--method <http\|dns>` | `http` | Serve a token file (`http`) or publish a TXT record (`dns`, needs `domain-verify-dns`). |
 | `--provider <name>` | — | Managed-DNS provider (e.g. `cloudflare`, `route53`): publish the `_boatramp-verify` TXT, poll, and attach — no manual DNS edit. Implies `--method dns`; needs `acme-dns`. |
 | `--no-wait` | — | Only start the challenge and print instructions; skip the immediate verify+attach self-check. |
+| `--unverified` | — | **Admin only.** Attach the host WITHOUT proving ownership (you assert it out-of-band); it then bypasses the mandatory-verification gate. Refused for a site-scoped token — needs a `system·admin` token. |
+
+`domain verify-records` takes one or more `--record`/`-r <SPEC>` (`KIND[/MODE]:NAME=VALUE`,
+`KIND` = `txt`\|`mx`\|`cname`\|`a`, `MODE` = `exact` (default) \| `contains` \| `prefix` — the
+latter two TXT-only), e.g. `--record txt:_acme.example.com=tok --record a:example.com=192.0.2.1`.
 
 ## `boatramp alias`
 
@@ -382,6 +391,8 @@ Configure visitor access control. See
 | `ip allow\|deny\|clear` | Manage IP allow/deny rules (CIDR or bare address); deny wins over allow. |
 | `rate-limit set\|off` | Set the per-client requests/second (+ optional burst) or disable it. |
 | `trusted-proxy add\|clear` | Trust a reverse proxy by CIDR so its `X-Forwarded-For` is believed. |
+| `waf user-agent [--deny <pattern>]... [--allow <pattern>]...` / `waf user-agent-off` | Enable user-agent filtering (`--deny`/`--allow` each **replace** that list when given) / disable it. |
+| `waf anomaly [--threshold <n>]` / `waf anomaly-off` | Enable heuristic anomaly scoring (optional block threshold) / disable it. See [the WAF](../how-to/visitor-access.md#the-waf). |
 
 ## `boatramp handlers`
 
@@ -437,7 +448,7 @@ sub-actions also read `--site`.
 | --- | --- |
 | `ls [--site <s>]` | List functions (optionally for one site). |
 | `get <site>/<name>` | Show one function by its `<site>/<name>`. |
-| `deploy <name> <wasm> [--substrate wasm\|microvm\|container] [--webhook-secret-env <var>] [--webhook-ingress-topic <t>]` | Deploy a version of a function from a component `.wasm` (uploaded as a blob). |
+| `deploy <name> --component <wasm> [--runtime wasm\|microvm\|container] [--webhook-secret-env <var>] [--webhook-publish <topic>]` | Deploy a version of a function from a component `.wasm` (uploaded as a blob). `--webhook-publish` makes the webhook an **ingress**: a verified request publishes its body to the project bus at `<topic>` and returns `202` with no component run (needs `--webhook-secret-env`). |
 | `rollback <name> --to <version>` | Roll a function's active version back to a specific version. |
 | `alias <name> <label> <version>` | Point an alias label (e.g. `prod`, `staging`) at a version. |
 | `rm <name>` | Remove a top-level function. |
@@ -474,7 +485,7 @@ federation subgraph registry. See [Serve a GraphQL API](../how-to/graphql.md).
 | Sub-action | Description |
 | --- | --- |
 | `safelist add [<op>\|--file <path>]` | Register a trusted operation (query text inline or from a file). |
-| `safelist ls` | List the registered trusted operations. |
+| `safelist list` | List the registered trusted operations. |
 | `safelist rm <hash>` | Remove a trusted operation by its hash. |
 | `subgraph put <name> <sdl-file>` | Publish (or replace) a Wasm subgraph from its SDL file. |
 | `subgraph sql <name> <json-file>` | Publish (or replace) a SQL subgraph from a request JSON file (`{site, config}`). |
@@ -547,14 +558,21 @@ Manage control-plane API tokens. See
 | `ls` | List issued tokens (short id, label, roles, expiry). |
 | `rm <id>` | Revoke a token by its id or a unique prefix. |
 
-`create` / `mint` flags:
+`create` / `mint` share flags:
 
 | Flag | Description |
 | --- | --- |
 | `--role <role>` | Role, repeatable: `<role>` (global), `<role>:<project>/<site>` (site-scoped), or `<role>:<project>` (project-scoped). A legacy `<role>:<site>` is read as `default/<site>`. Required. See the [RBAC reference](./rbac.md). |
 | `--ttl-secs <n>` | Time-to-live in seconds (omit for no expiry). |
 | `--holder-pub <alg:hex>` | Make the token delegatable: embed this holder public key as the `cnf`. |
-| `--pop` | Make the token PoP-bound: generate a holder keypair, mint against its public half, and print `BOATRAMP_TOKEN` + `BOATRAMP_TOKEN_HOLDER_KEY` exports. Conflicts with `--holder-pub`. See [PoP-bind a token](../how-to/pop-tokens.md). |
+
+`create`-only: `--pop` — make the token PoP-bound: generate a holder keypair, mint
+against its public half, and print `BOATRAMP_TOKEN` + `BOATRAMP_TOKEN_HOLDER_KEY`
+exports. Conflicts with `--holder-pub`. See [PoP-bind a token](../how-to/pop-tokens.md).
+
+`mint`-only: `--config <path>` (default `boatramp.cfg`) — the config file supplying
+the offline signer (`[serve.signer]` / `auth_root_private_key`); ignored when
+`BOATRAMP_AUTH_ROOT_PRIVATE_KEY` is set in the environment.
 
 `attenuate` flags:
 
@@ -1211,13 +1229,27 @@ command-specific flags.
 
 ## `boatramp dlq`
 
-Purge or redrive a consumer topic's dead-letter queue. See
-[Run background work](../how-to/background-work.md).
+Inspect, redrive, or drop a consumer topic's **dead-letter queue** (messages that
+exhausted `max_attempts`). Takes the common `--server` / `--site` flags. Add `--bus`
+to target the shared **project bus** (`{project}/bus/{topic}`) instead of a single
+site's queue — `ls`/`show` then need `Project·Read`, the destructive ops
+`Project·Admin`; `--bus` cannot combine with `--alias` (the shared bus has no
+background-alias scope). See [Run background work](../how-to/background-work.md).
 
 | Sub-action | Description |
 | --- | --- |
-| `purge <topic>` | Drop a topic's dead-lettered messages (records + payloads). |
-| `redrive <topic>` | Requeue a topic's dead-lettered messages with a fresh attempt count. |
+| `ls <topic> [--alias <a>] [filters]` | List a topic's dead-lettered messages (metadata only: id, attempts, last_error). |
+| `show <topic> <id> [--group <g>] [--alias <a>]` | Print one dead-lettered message in full, including its payload. |
+| `redrive <topic> [filters] [--dry-run] [--yes]` | Requeue the matching dead-lettered messages with a fresh attempt count. |
+| `discard <topic> [filters] [--dry-run] [--yes]` | Drop only the matching dead-lettered messages (records + payloads). |
+| `purge <topic> [--alias <a>] [--yes]` | Drop **all** of a topic's dead-lettered messages (records + payloads). |
+
+`ls`/`redrive`/`discard` share the same AND-composed filter flags: `--id <id>`
+(exact message), `--group <name>` (a specific consumer-group lane; omit for the
+work-queue lane), `--older-than-ms <n>` (age from the message's own id), `--match
+<substr>` (the host `last_error` contains it), `--limit <n>` (cap the count).
+`redrive`/`discard` also take `--dry-run` (preview the matching set without
+mutating) and require `--yes` to confirm a filter-less (whole-DLQ) mutation.
 
 ## `boatramp queue`
 
