@@ -57,15 +57,15 @@ impl BlobClass {
     /// `true` ONLY for [`Derivative`](Self::Derivative). A broader action over a baseline/primary
     /// is the louder, explicit opt-in the callers gate separately — it is never this default.
     pub fn is_regenerable(self) -> bool {
-        matches!(self, BlobClass::Derivative)
+        matches!(self, Self::Derivative)
     }
 
     /// A short, stable label for logs / reports (`"der"`, `"base"`, `"primary"`).
     pub fn label(self) -> &'static str {
         match self {
-            BlobClass::Derivative => "der",
-            BlobClass::Baseline => "base",
-            BlobClass::Primary => "primary",
+            Self::Derivative => "der",
+            Self::Baseline => "base",
+            Self::Primary => "primary",
         }
     }
 }

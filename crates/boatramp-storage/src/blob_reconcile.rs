@@ -262,10 +262,13 @@ mod tests {
     /// so a test can create the declared≠stored drift (`head` returns the override; `get` returns
     /// the real bytes). A `put` writes the real bytes and CLEARS the override (declared == stored
     /// again — the reconcile fix), a `delete` removes it.
+    /// key -> (declared-size override, bytes). A `Some` override is the fault injection that makes
+    /// `head` report a size different from the real body `get` returns (the declared≠stored drift).
+    type FakeObj = (Option<u64>, Vec<u8>);
+
     #[derive(Default)]
     struct FakeBlobs {
-        // key -> (declared_override, bytes)
-        objs: Mutex<HashMap<String, (Option<u64>, Vec<u8>)>>,
+        objs: Mutex<HashMap<String, FakeObj>>,
     }
     impl FakeBlobs {
         fn insert(&self, key: &str, declared: Option<u64>, bytes: &[u8]) {
