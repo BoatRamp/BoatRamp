@@ -50,6 +50,8 @@ pub mod ipam;
 /// Posture-scaled kernel-trust verification (needs the `authz` signing primitives).
 #[cfg(feature = "authz")]
 pub mod kernel_trust;
+/// Key-material hygiene (mlock + zeroize-on-drop + redacting Debug) for crown-jewel key buffers.
+pub mod keyguard;
 pub mod kv;
 /// Portable, versioned, backend-agnostic KV dump format + a generic `KvStore`↔`KvStore` copier
 /// (kv-sql WS7) — the one representation behind `kv export` / `import` / `migrate`.

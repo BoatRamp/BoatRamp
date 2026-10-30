@@ -126,6 +126,9 @@ tracing.workspace = true
 # and casing/quoting handled, so a hostile guest cannot smuggle a reserved
 # `boatramp.*` / `@boatramp_*` write past a naive string filter.
 sqlparser.workspace = true
+# Key-material hygiene (`keyguard`, `sealed_state`, `cert`): zeroize plaintext key/secret buffers on
+# drop and redact them from `Debug`. wasm-clean (no OS deps). mlock itself is `cfg(unix)`-gated below.
+zeroize = "1"
 
 # COSE/CWT tokens + Cedar authorization (`authz` feature). Optional, native only.
 coset = { version = "0.3", optional = true }
@@ -153,6 +156,12 @@ cedar-policy = { version = "4", optional = true }
 # wasm32-wasi) are unaffected.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["js"] }
+
+# `keyguard` locks plaintext key pages against swap via `mlock`/`munlock`. These exist on every unix
+# (Linux + macOS); `libc` is pulled ONLY on unix so the wasm-clean core still compiles on wasm32
+# (where the lock is a documented no-op). No raw syscalls on non-unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
