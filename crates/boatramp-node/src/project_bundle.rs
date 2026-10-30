@@ -3060,7 +3060,13 @@ mod tests {
                 members: members.iter().map(|(s, ..)| s.clone()).collect(),
                 delta: None,
             };
-            append_bytes(&mut b, MANIFEST_PATH, 0, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+            append_bytes(
+                &mut b,
+                MANIFEST_PATH,
+                0,
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
             for (spec, size, sha, body) in members {
                 let meta = MemberMeta {
                     size: *size,
@@ -3153,7 +3159,10 @@ mod tests {
         )
         .unwrap();
         assert!(restored.is_empty(), "a skipped der member is not restored");
-        assert!(r.sidecars.is_empty(), "a skipped der member is NEVER applied");
+        assert!(
+            r.sidecars.is_empty(),
+            "a skipped der member is NEVER applied"
+        );
         assert_eq!(mm.len(), 1);
         assert_eq!(mm[0].class, MemberClass::Derivative);
         assert_eq!(mm[0].kind, MismatchKind::Checksum);
@@ -3179,7 +3188,10 @@ mod tests {
         );
         assert!(r2.sidecars.is_empty(), "nothing applied on the hard fail");
         assert_eq!(mm2.len(), 1, "the baseline mismatch is still recorded");
-        assert!(!mm2[0].skipped, "a hard-failed member is recorded as NOT skipped");
+        assert!(
+            !mm2[0].skipped,
+            "a hard-failed member is recorded as NOT skipped"
+        );
     }
 
     /// The STRICT default is unchanged: a `der/` mismatch STILL hard-fails when `skip_mismatch` is
@@ -3202,7 +3214,10 @@ mod tests {
             |_, _| {},
             &mut r,
         );
-        assert!(matches!(res, Err(BundleError::ChecksumMismatch { .. })), "{res:?}");
+        assert!(
+            matches!(res, Err(BundleError::ChecksumMismatch { .. })),
+            "{res:?}"
+        );
         // The 4-arg strict reader (legacy callers) behaves identically.
         let bundle2 = v2_sidecar_bundle(&[(
             blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg"),
@@ -3276,7 +3291,10 @@ mod tests {
         assert_eq!(mm[0].kind, MismatchKind::Checksum);
         assert_eq!(mm[1].class, MemberClass::Baseline);
         assert_eq!(mm[1].kind, MismatchKind::Size);
-        assert!(mm.iter().all(|m| !m.skipped), "enumerate findings are reported, not skipped");
+        assert!(
+            mm.iter().all(|m| !m.skipped),
+            "enumerate findings are reported, not skipped"
+        );
         // The GOOD member was applied; neither bad member was.
         assert_eq!(r.sidecars.len(), 1, "only the good KV member applied");
         assert_eq!(r.sidecars[0].0.path, KV_MEMBER_PATH);
@@ -3367,8 +3385,13 @@ mod tests {
                     )],
                     delta: None,
                 };
-                append_bytes(&mut b, MANIFEST_PATH, 0, &serde_json::to_vec(&manifest).unwrap())
-                    .unwrap();
+                append_bytes(
+                    &mut b,
+                    MANIFEST_PATH,
+                    0,
+                    &serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
                 append_bytes(&mut b, &chunk_part_path(base_path, 0), 0, body).unwrap();
                 let trailer = MemberTrailer {
                     size: body.len() as u64,

@@ -146,16 +146,28 @@ mod tests {
             classify_blob_key("hblob/acme/blog/uploads/original/photo.png"),
             BlobClass::Primary
         );
-        assert_eq!(classify_blob_key("hblob/acme/blog/favicon.ico"), BlobClass::Primary);
+        assert_eq!(
+            classify_blob_key("hblob/acme/blog/favicon.ico"),
+            BlobClass::Primary
+        );
     }
 
     #[test]
     fn der_is_a_whole_component_never_a_substring() {
         // A segment that merely CONTAINS "der"/"base" is NOT a derivative/baseline — the match is
         // on a whole path component, so these are load-bearing primaries (hard-fail, never skip).
-        assert_eq!(classify_blob_key("hblob/acme/thunder/x.bin"), BlobClass::Primary);
-        assert_eq!(classify_blob_key("hblob/acme/database/x.bin"), BlobClass::Primary);
-        assert_eq!(classify_blob_key("hblob/acme/derby/x.bin"), BlobClass::Primary);
+        assert_eq!(
+            classify_blob_key("hblob/acme/thunder/x.bin"),
+            BlobClass::Primary
+        );
+        assert_eq!(
+            classify_blob_key("hblob/acme/database/x.bin"),
+            BlobClass::Primary
+        );
+        assert_eq!(
+            classify_blob_key("hblob/acme/derby/x.bin"),
+            BlobClass::Primary
+        );
     }
 
     #[test]
@@ -201,9 +213,18 @@ mod tests {
             "jpg"
         ));
         // A primary `.jpg` is likewise untouchable.
-        assert!(!is_superseded_derivative("hblob/acme/blog/photo.jpg", "jpg"));
+        assert!(!is_superseded_derivative(
+            "hblob/acme/blog/photo.jpg",
+            "jpg"
+        ));
         // An empty/absent extension never matches.
-        assert!(!is_superseded_derivative("hblob/acme/blog/der/abc/noext", "jpg"));
-        assert!(!is_superseded_derivative("hblob/acme/blog/der/abc/512.jpg", ""));
+        assert!(!is_superseded_derivative(
+            "hblob/acme/blog/der/abc/noext",
+            "jpg"
+        ));
+        assert!(!is_superseded_derivative(
+            "hblob/acme/blog/der/abc/512.jpg",
+            ""
+        ));
     }
 }

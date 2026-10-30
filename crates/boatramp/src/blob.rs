@@ -724,7 +724,10 @@ fn write_verify(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::i
             let declared = m.get("declared").and_then(serde_json::Value::as_u64);
             let stored = m.get("stored").and_then(serde_json::Value::as_u64);
             let declared = declared.map_or_else(|| "?".to_string(), |v| v.to_string());
-            let stored = stored.map_or_else(|| "(backend reports no size)".to_string(), |v| v.to_string());
+            let stored = stored.map_or_else(
+                || "(backend reports no size)".to_string(),
+                |v| v.to_string(),
+            );
             writeln!(
                 w,
                 "  • {hash}  declared {declared}, stored {stored}  ({referrer})"
@@ -742,7 +745,12 @@ fn write_verify(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::i
 
 /// Render the `blob reconcile` report (human lines).
 fn write_reconcile(report: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-    let u = |k: &str| report.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let u = |k: &str| {
+        report
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
     let apply = report
         .get("apply")
         .and_then(serde_json::Value::as_bool)
@@ -751,7 +759,11 @@ fn write_reconcile(report: &serde_json::Value, w: &mut dyn std::io::Write) -> st
         .get("include_primary")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let verb = if apply { "reconciled" } else { "would reconcile" };
+    let verb = if apply {
+        "reconciled"
+    } else {
+        "would reconcile"
+    };
     let acted = if apply {
         u("reconciled")
     } else {
@@ -1037,7 +1049,12 @@ async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<BlobOutput> {
     };
 
     let final_report = cp
-        .blob_purge(mode, a.apply, a.prefix.as_deref(), a.superseded_ext.as_deref())
+        .blob_purge(
+            mode,
+            a.apply,
+            a.prefix.as_deref(),
+            a.superseded_ext.as_deref(),
+        )
         .await?;
 
     // A storage error in the final report means the purge did NOT complete (non-zero exit). A 409

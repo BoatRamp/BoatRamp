@@ -7650,7 +7650,11 @@ mod tests {
         // the stored object must NOT hash to its key. `bad` is 9 bytes, `good` is 12 bytes.
         store
             .storage()
-            .put(&keys::blob(&bad), once_bytes(b"truncated"), PutMeta::default())
+            .put(
+                &keys::blob(&bad),
+                once_bytes(b"truncated"),
+                PutMeta::default(),
+            )
             .await
             .unwrap();
         store
@@ -7684,7 +7688,10 @@ mod tests {
             },
         );
         let id = store.put_manifest(&m).await.unwrap();
-        store.activate(ProjectRef::DEFAULT, "www", &id).await.unwrap();
+        store
+            .activate(ProjectRef::DEFAULT, "www", &id)
+            .await
+            .unwrap();
 
         let mism = store
             .verify_blob_sizes(&GcOptions::default())

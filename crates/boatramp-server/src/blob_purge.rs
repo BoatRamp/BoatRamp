@@ -191,7 +191,10 @@ async fn purge_legacy(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            format!("{{\"error\":{}}}\n", serde_json::Value::String(e.to_string())),
+            format!(
+                "{{\"error\":{}}}\n",
+                serde_json::Value::String(e.to_string())
+            ),
         )
             .into_response(),
     }

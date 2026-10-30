@@ -239,7 +239,9 @@ pub async fn purge_legacy_derivatives(
             report.skipped_not_superseded += 1;
             continue;
         }
-        let size = meta.size.or(storage.head(&key).await.ok().and_then(|m| m.size));
+        let size = meta
+            .size
+            .or(storage.head(&key).await.ok().and_then(|m| m.size));
         if opts.apply {
             storage.delete(&key).await?;
             report.purged += 1;
@@ -402,9 +404,16 @@ mod tests {
         assert_eq!(rep.considered, 1, "only the der/ object is in scope");
         assert_eq!(rep.drifted, 1);
         assert_eq!(rep.reconciled, 1, "the der/ drift is blessed");
-        assert_eq!(rep.skipped_out_of_scope, 1, "the baseline is skipped by default");
+        assert_eq!(
+            rep.skipped_out_of_scope, 1,
+            "the baseline is skipped by default"
+        );
         // The der/ object's declared size now matches its body (9), the baseline still drifts (26599).
-        assert_eq!(fake.head_size(DER), Some(9), "der/ declared size blessed to the stored 9 bytes");
+        assert_eq!(
+            fake.head_size(DER),
+            Some(9),
+            "der/ declared size blessed to the stored 9 bytes"
+        );
         assert_eq!(
             fake.head_size(BASE),
             Some(26599),
@@ -445,7 +454,11 @@ mod tests {
         assert_eq!(rep.drifted, 1);
         assert_eq!(rep.would_reconcile, 1);
         assert_eq!(rep.reconciled, 0);
-        assert_eq!(fake.head_size(DER), Some(26599), "dry-run left the drift in place");
+        assert_eq!(
+            fake.head_size(DER),
+            Some(26599),
+            "dry-run left the drift in place"
+        );
     }
 
     /// An object whose declared size already matches its body is not re-written.
@@ -491,7 +504,10 @@ mod tests {
         // The load-bearing guard: a baseline with the SAME extension, a primary, and the current
         // derivative are ALL preserved.
         assert!(fake.has(der_webp), "the current-format derivative survives");
-        assert!(fake.has(base_jpg), "the baseline survives despite the matching .jpg extension");
+        assert!(
+            fake.has(base_jpg),
+            "the baseline survives despite the matching .jpg extension"
+        );
         assert!(fake.has(primary_jpg), "the primary object survives");
     }
 

@@ -120,8 +120,16 @@ mod tests {
             },
         );
         let sizes = m.blob_sizes();
-        assert_eq!(sizes.get("filehash"), Some(&4096), "the file entry's declared size");
-        assert_eq!(sizes.get("varhash"), Some(&100), "a variant's declared size too");
+        assert_eq!(
+            sizes.get("filehash"),
+            Some(&4096),
+            "the file entry's declared size"
+        );
+        assert_eq!(
+            sizes.get("varhash"),
+            Some(&100),
+            "a variant's declared size too"
+        );
         // Same keyset as blob_hashes (so the size map covers exactly the referenced blobs).
         let hashes = m.blob_hashes();
         assert_eq!(sizes.keys().cloned().collect::<BTreeSet<_>>(), hashes);

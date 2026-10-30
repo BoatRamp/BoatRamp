@@ -1946,7 +1946,10 @@ mod tests {
         assert!(!proj_admin.satisfies(&required));
         assert!(Right::new(Resource::System, None, Action::Admin).satisfies(&required));
         // It is the same grade as the sibling destructive blob purge.
-        assert_eq!(required, Right::required("POST", "/api/blob-purge").unwrap());
+        assert_eq!(
+            required,
+            Right::required("POST", "/api/blob-purge").unwrap()
+        );
         // The hyphen path must NOT collide with the `/api/blobs/` Blobs·Deploy prefix matcher (a
         // ship-only publisher holds Blobs·Deploy — a collision would be an escalation).
         let blobs_deploy = Right::new(Resource::Blobs, Some("acme".into()), Action::Deploy);
