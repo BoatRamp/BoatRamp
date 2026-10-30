@@ -801,6 +801,9 @@
               # Hetzner Cloud; `kubectl` talks to it + installs the operator. Runbook:
               # docs/src/how-to/cluster-on-hetzner.md.
               pkgs.kubectl
+              # helm: hetzner-k3s v2 + the operator install both require it (a consuming
+              # app had to layer `nixpkgs#kubernetes-helm` by hand — surface it here).
+              pkgs.kubernetes-helm
               (pkgs.callPackage ./nix/hetzner-k3s.nix { })
               pkgs.cargo-watch
               pkgs.cargo-nextest
