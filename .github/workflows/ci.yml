@@ -804,7 +804,7 @@ jobs:
         run: |
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
-            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --nocapture 2>&1 | tee tcp-listener-live.log
+            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --include-ignored --nocapture 2>&1 | tee tcp-listener-live.log
           grep -qE 'test result: ok\. 6 passed' tcp-listener-live.log \
             || { echo "::error::tcp-listener live gate did not run all six cases (silent skip or a failure)" >&2; exit 1; }
           grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
