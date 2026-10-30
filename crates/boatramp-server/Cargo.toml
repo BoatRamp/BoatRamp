@@ -338,6 +338,10 @@ aws-lc-rs = "1.17"
 # Argon2id KDF for the project-export identity transport container (passphrase ->
 # 32-byte AES key; the PKCS#12-pattern wrapper around the exported KEK).
 argon2.workspace = true
+# Key-material hygiene for the secrets-at-rest envelope (privsep Phase 0, WS2): zeroize the Vault
+# bearer token + transient derived keys on drop. (The raw local KEK is held in
+# `boatramp_core::keyguard::MlockedKey`, which also mlocks it.)
+zeroize = "1"
 # Implementing the core `DomainProbe` trait (domain ownership verification).
 async-trait.workspace = true
 
