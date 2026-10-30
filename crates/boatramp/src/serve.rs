@@ -183,6 +183,24 @@ pub enum Error {
     /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
     #[error("{0}")]
     ContradictoryCoordination(String),
+    /// `[serve.sandbox] posture = strict` on a node that runs a compute backend which re-execs the
+    /// boatramp binary to launch workers (privsep Phase 0 WS1): the strict serving-process sandbox
+    /// cannot coexist with it (the inherited seccomp/Landlock domain would kill the worker, and the
+    /// parent needs `setns`, which the filter denies). Fail-closed.
+    #[error(
+        "[serve.sandbox] posture=strict can't coexist with compute backend '{0}', which needs host \
+         re-exec to launch workers; use a docker/cloudflare backend, remove [compute], or set \
+         posture=auto (which skips the sandbox on this node)"
+    )]
+    SandboxPostureConflict(&'static str),
+    /// `posture = strict` but the process sandbox could not be FULLY installed (Landlock only partially
+    /// enforced on this kernel, or the platform/build cannot sandbox at all). The owner's explicit
+    /// strict request cannot be met, so startup is refused rather than silently serving unsandboxed.
+    #[error(
+        "[serve.sandbox] posture=strict could not be fully enforced ({0}); refusing to serve \
+         unsandboxed — upgrade the kernel/build, or set posture=auto"
+    )]
+    SandboxStrictNotEnforced(String),
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -1357,30 +1375,75 @@ async fn spawn_overlay_roles(
     ))
 }
 
-/// Build the [`SandboxPolicy`](boatramp_server::sandbox::SandboxPolicy) from `[serve.sandbox]` + the
-/// node `data_dir` + the config-file dir + the TLS/cert paths `serve` reads at runtime, then install
-/// the whole-process OS sandbox (seccomp-bpf + Landlock). Best-effort: a genuine install error is
-/// LOGGED but never fails startup (matching the no-op-on-unsupported contract). `enabled` is unset ⇒
-/// the platform default: ON where supported (Linux), off elsewhere; `[serve.sandbox] enabled = false`
-/// opts out. Linux-only; a documented no-op on other platforms.
-fn install_process_sandbox(
-    serve_cfg: &boatramp_node::config::ServeConfig,
-    data_dir: &Path,
+/// Install the **whole-process OS sandbox** (privsep Phase 0 WS1) BEFORE the Tokio runtime starts
+/// (called from `main::run` on the single main thread, so every runtime worker thread the builder
+/// spawns inherits the seccomp filter + Landlock domain via `clone`). A late install (on one worker
+/// thread) would leave the sibling request-handler threads unsandboxed.
+///
+/// Resolves `[serve.sandbox] posture` against whether this node runs a compute backend that re-execs
+/// the boatramp binary (container / embedded-VMM / macOS-VZ — resolved SYNCHRONOUSLY from `[compute]`
+/// since the async `build_compute` has not run yet):
+///   - `off` / `permissive` ⇒ no install.
+///   - `auto` (default): full sandbox, UNLESS a native-spawn backend is present ⇒ SKIP BOTH (a loud
+///     INFO naming the backend) — the sandbox can't coexist with ongoing worker re-exec + `setns`.
+///   - `strict`: full sandbox ALWAYS; a native-spawn backend ⇒ FAIL-CLOSED ([`Error::SandboxPostureConflict`]).
+///
+/// Fail policy (owner decision): `auto` + a genuine install error ⇒ fail-OPEN (warn, serve on); `strict`
+/// + an install error / only-Partial Landlock / an unsupported platform-or-build ⇒ FAIL-CLOSED.
+pub fn install_presandbox(
+    config: &ServerConfig,
     config_path: &Path,
     args: &ServeArgs,
-) {
+) -> Result<()> {
+    use boatramp_node::config::SandboxPosture as P;
+    let serve_cfg = config.serve.clone().unwrap_or_default();
     let sb = serve_cfg.sandbox.clone().unwrap_or_default();
-    // Unset ⇒ platform default: ON where the platform supports it (Linux), off elsewhere.
-    let enabled = sb.enabled.unwrap_or(cfg!(target_os = "linux"));
+    let native_spawn =
+        boatramp_node::compute::host_privileged_spawn_backend(config.compute.as_ref());
 
-    let mut policy = boatramp_server::sandbox::SandboxPolicy::for_server(enabled, data_dir);
-    // The config file's directory — the server may read files adjacent to its config; harmless to
-    // allow even when it doesn't.
+    let strict = match sb.posture {
+        P::Off => {
+            tracing::info!("process sandbox disabled ([serve.sandbox] posture = off)");
+            return Ok(());
+        }
+        P::Permissive => {
+            tracing::info!(
+                "process sandbox disabled ([serve.sandbox] posture = permissive — the operator \
+                 opts out of serving-process hardening)"
+            );
+            return Ok(());
+        }
+        P::Auto => {
+            if let Some(backend) = native_spawn {
+                tracing::info!(
+                    backend,
+                    "process sandbox SKIPPED on a native-compute node ([serve.sandbox] posture = \
+                     auto): the compute backend re-execs the boatramp binary to launch workers, \
+                     which a seccomp/Landlock domain would kill; NO serving-process hardening on \
+                     this node — see privsep Phase 1"
+                );
+                return Ok(());
+            }
+            false
+        }
+        P::Strict => {
+            if let Some(backend) = native_spawn {
+                return Err(Error::SandboxPostureConflict(backend));
+            }
+            true
+        }
+    };
+
+    let data_dir = serve_cfg
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    let mut policy = boatramp_server::sandbox::SandboxPolicy::for_server(&data_dir);
     if let Some(dir) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         policy = policy.allow_read(dir);
     }
-    // TLS material the serve loop reads at/after the install point (`--tls custom`/`acme`): confine to
-    // the containing directories (Landlock grants are per-directory-subtree).
+    // TLS material the serve loop reads (`--tls custom`/`acme`): confine to the containing dirs
+    // (Landlock grants are per-directory-subtree).
     for cert in [
         args.tls_cert.as_deref(),
         args.tls_key.as_deref(),
@@ -1402,16 +1465,31 @@ fn install_process_sandbox(
         policy = policy.allow_write(p.clone());
     }
 
-    if let Err(e) = boatramp_server::sandbox::install(&policy) {
-        tracing::error!(
-            error = %e,
-            "process sandbox install FAILED — continuing WITHOUT a sandbox (best-effort; set \
-             `[serve.sandbox] enabled = false` to silence, or investigate the kernel/allow-list)"
-        );
+    use boatramp_server::sandbox::SandboxStatus as S;
+    match boatramp_server::sandbox::install(&policy) {
+        Ok(S::Enforced) => Ok(()),
+        Ok(S::Partial) if strict => Err(Error::SandboxStrictNotEnforced(
+            "Landlock only partially enforced on this kernel".to_string(),
+        )),
+        Ok(S::Partial) => Ok(()), // auto best-effort: seccomp on, Landlock partial — serve on
+        Ok(S::Unsupported) if strict => Err(Error::SandboxStrictNotEnforced(
+            "the platform or build has no seccomp/Landlock sandbox".to_string(),
+        )),
+        Ok(S::Unsupported) => Ok(()), // auto on a non-Linux / no-feature build: documented no-op
+        Ok(S::Disabled) => Ok(()),
+        Err(e) if strict => Err(Error::SandboxStrictNotEnforced(e.to_string())),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "process sandbox install failed; continuing WITHOUT a sandbox (posture=auto, \
+                 best-effort) — set posture=strict to fail closed, or posture=off to silence"
+            );
+            Ok(())
+        }
     }
 }
 
-pub async fn run(args: ServeArgs, config: &ServerConfig, config_path: &Path) -> Result<()> {
+pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
     // Resolve the operator security posture once (profile preset + overrides);
     // absent `[security]` ⇒ the strict `multi-tenant` default. Threaded into
@@ -1608,7 +1686,6 @@ pub async fn run(args: ServeArgs, config: &ServerConfig, config_path: &Path) -> 
         return run_cluster(
             args,
             config,
-            config_path,
             cluster_cfg,
             addr,
             data_dir,
@@ -2102,15 +2179,6 @@ pub async fn run(args: ServeArgs, config: &ServerConfig, config_path: &Path) -> 
         )
         .await?;
     }
-    // Whole-process OS sandbox (privsep Phase 0, WS1): seccomp-bpf default-deny allow-list (`exec*`
-    // DENIED) + Landlock filesystem confinement to `data_dir` (+ the config/cert paths). Installed
-    // HERE — the node is assembled, backends connected, and the listeners above are already bound — so
-    // the allow-list can exclude boot-only syscalls; the main public listener binds inside the serve
-    // loop below, which `bind`/`listen`/`socket` stay allowed for. Linux-only + opt-out via
-    // `[serve.sandbox] enabled = false`; a logged no-op elsewhere that never fails startup. NOTE: this
-    // denies `exec*` process-wide for the serving life — see the WS1 integration notes re: the compute
-    // re-exec.
-    install_process_sandbox(&serve_cfg, &data_dir, config_path, &args);
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
@@ -3919,7 +3987,6 @@ impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
 async fn run_cluster(
     args: ServeArgs,
     config: &ServerConfig,
-    config_path: &Path,
     mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
@@ -4480,10 +4547,6 @@ async fn run_cluster(
             cluster_serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
-    // Whole-process OS sandbox (privsep Phase 0, WS1) — cluster serve path. Same seccomp-bpf + Landlock
-    // install as the single-node path, after the node is assembled + listeners are bound. Linux-only +
-    // opt-out via `[serve.sandbox] enabled = false`; a logged no-op elsewhere that never fails startup.
-    install_process_sandbox(&cluster_serve_cfg, &data_dir, config_path, &args);
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await

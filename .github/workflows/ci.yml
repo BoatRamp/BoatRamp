@@ -822,13 +822,15 @@ jobs:
             || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
 
       # privsep Phase 0 WS1 WHOLE-PROCESS SANDBOX LIVE GATE (marker `SANDBOX LIVE OK`). Proves the
-      # seccomp-bpf + Landlock process sandbox against the REAL kernel: a forked child that installs the
-      # sandbox has (a) `execve` REFUSED by the seccomp allow-list (exec* denied) and (b) a write OUTSIDE
-      # the node data_dir REFUSED by Landlock — while a child that does NOT install it has BOTH ops
-      # SUCCEED (the in-test mutation that proves the gate detects a real difference, not a no-op). The
-      # test is `#[ignore]`d (it forks + installs a whole-process filter), so it runs ONLY here via
-      # --include-ignored, NEVER in the general --all-features suite (the v0.40 lesson: a live test in
-      # the general suite flaked). Greps the marker + pass count so a silent skip/compile-out fails.
+      # seccomp-bpf + Landlock process sandbox against the REAL kernel, FROM A NON-INSTALLING THREAD
+      # (the whole-process coverage property): a forked child installs the sandbox on its main thread,
+      # spawns a second thread, and that thread finds (a) `execve` KILLED by the seccomp filter
+      # (exec* + escape surface → SIGSYS) and (b) a write OUTSIDE the node data_dir REFUSED by Landlock
+      # — while a child that does NOT install it has BOTH ops SUCCEED (the in-test mutation that proves
+      # the gate detects a real difference, not a no-op). The test is `#[ignore]`d (it forks + installs
+      # a whole-process filter), so it runs ONLY here via --include-ignored, NEVER in the general
+      # --all-features suite (the v0.40 lesson: a live test in the general suite flaked). Greps the
+      # marker + pass count so a silent skip/compile-out fails.
       - name: "whole-process sandbox live gate (seccomp exec-deny + Landlock data_dir confinement; mutation-verified)"
         run: |
           set -eo pipefail

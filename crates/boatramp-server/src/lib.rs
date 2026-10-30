@@ -48,9 +48,11 @@ mod blob_ref;
 pub mod blob_shim;
 pub mod messaging_shim;
 /// The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
-/// allow-list (`exec*` denied) + a Landlock filesystem confinement, installed on the serving
-/// process after startup. Always compiled; the real Linux enforcement is gated on
-/// `cfg(all(target_os = "linux", feature = "sandbox"))` and everything else is a logged no-op.
+/// allow-list (`exec*` + the kernel-escape surface KILLED, other misses `EPERM`) + a Landlock
+/// filesystem confinement. Installed BEFORE the Tokio runtime starts so every worker thread
+/// inherits it via `clone` (plus TSYNC for the seccomp layer). Always compiled; the real Linux
+/// enforcement is gated on `cfg(all(target_os = "linux", feature = "sandbox"))` and everything
+/// else is a logged no-op.
 pub mod sandbox;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]

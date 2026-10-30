@@ -67,6 +67,15 @@ pub struct Capabilities {
     pub max_vcpus: Option<u32>,
     /// Max memory (MiB) per replica, if bounded.
     pub max_mem_mib: Option<u32>,
+    /// Whether this backend launches workers by **re-execing the boatramp binary** on the host (the
+    /// native `container` + the embedded/KVM/VZ `vmm` backends fork+exec a jailed `__sandbox`/
+    /// `__vmm-run`/`__vz-run` worker, ongoing during serving; docker talks to a daemon over a socket,
+    /// and cloudflare is remote — neither re-execs). The serving-process OS sandbox (privsep Phase 0
+    /// WS1) CANNOT coexist with such a backend: the inherited seccomp/Landlock domain would kill the
+    /// worker, and the parent itself needs `setns(CLONE_NEWNET)` to wire the worker netns — which the
+    /// filter denies. So a node offering any such backend skips the sandbox (or, under `strict`, refuses
+    /// to start). See `boatramp-node`'s `compute::host_privileged_spawn_backend`.
+    pub requires_host_privileged_spawn: bool,
 }
 
 /// A backend-specific, materialized artifact for a spec (what the backend boots).
@@ -3251,6 +3260,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             },
         );
         m
@@ -3635,6 +3645,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
@@ -3729,6 +3740,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
@@ -3924,6 +3936,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
@@ -4215,6 +4228,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
