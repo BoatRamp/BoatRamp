@@ -1,48 +1,60 @@
 //! The **whole-process OS sandbox** (privsep Phase 0, WS1): a seccomp-bpf
 //! default-deny syscall allow-list **plus** a Landlock filesystem restriction,
-//! installed on the running `boatramp` server process **after** startup is complete
-//! (listeners bound, backends connected) so the allow-list can exclude boot-only
-//! syscalls.
+//! installed on the `boatramp` server process **before the Tokio runtime starts**.
+//!
+//! WHOLE-PROCESS COVERAGE (the critical property). The install runs on the single
+//! main thread, *before* the multi-threaded runtime spawns its workers, so every
+//! worker thread inherits the seccomp filter + the Landlock domain via `clone`. A
+//! late install (on one worker thread while its siblings already exist) would leave
+//! those sibling request-handler threads unsandboxed — the escape an RCE would use.
+//! For belt-and-suspenders the seccomp layer additionally uses TSYNC
+//! (`apply_filter_all_threads`), so even a late install would cover every thread;
+//! Landlock has no TSYNC equivalent, hence the pre-runtime (single-threaded) install.
 //!
 //! This is the server-process analog of the container backend's per-worker seccomp
 //! filter (`boatramp-container`'s `seccomp` module), with two deliberate differences:
 //!
-//!   1. **`exec*` is DENIED.** The container filter *allows* `execve`/`execveat`
+//!   1. **`exec*` is DENIED — and KILLED.** The container filter *allows* `execve`
 //!      because the worker execs the guest entrypoint under the filter; the server
 //!      process, once serving, never legitimately execs, so the whole-process
-//!      allow-list omits the exec family (and `fork`/`vfork`) — an RCE that lands in
-//!      the server address space cannot spawn a shell or a new binary.
+//!      allow-list omits the exec family (and `fork`/`vfork`). They — plus the
+//!      kernel-escape surface (`ptrace`, `mount`, `setns`, `bpf`, `init_module`, …) —
+//!      are given an explicit `SECCOMP_RET_KILL_PROCESS` action, so an RCE that lands
+//!      in the server address space is killed hard (not merely `EPERM`'d) and is
+//!      alertable. A benign allow-list *miss* still degrades to `EPERM` (soft).
 //!   2. **Landlock** confines the process's filesystem view to the node's `data_dir`
-//!      (+ the system temp dir) for writes, and a conservative set of system read
+//!      (+ the system temp dirs) for writes, and a conservative set of system read
 //!      roots (so the server can still read `/etc/resolv.conf`, load shared objects,
 //!      read `/proc`, …) for reads — everything else is denied.
 //!
 //! **Platform:** Linux only, and only when the crate is built with the `sandbox`
-//! feature. On macOS / other platforms, or a build without the feature,
-//! [`install`] is a documented no-op that logs a warning and returns
-//! [`SandboxStatus::Unsupported`] — it never fails startup.
+//! feature. On macOS / other platforms, or a build without the feature, [`install`]
+//! is a documented no-op that logs a warning and returns
+//! [`SandboxStatus::Unsupported`] — it never fails startup itself (the *caller*
+//! decides, per posture, whether an unsupported platform is a hard error).
 //!
 //! **Best-effort on older kernels:** the Landlock layer uses the `landlock` crate's
 //! ABI-compatibility handling (`CompatLevel::BestEffort`), so a kernel without (full)
-//! Landlock support degrades to a partial/absent FS restriction + a logged warning
-//! rather than a hard failure. The seccomp layer skips any allow-list name the
-//! running kernel/arch doesn't know (logged at debug) rather than refusing the whole
-//! filter.
+//! Landlock support degrades to a partial/absent FS restriction (reported as
+//! [`SandboxStatus::Partial`]) rather than a hard failure. The seccomp layer skips any
+//! allow-list name the running kernel/arch doesn't know (logged at debug).
 //!
-//! The default action for an unlisted syscall is `EPERM` (errno), matching the
-//! container backend's trusted-tier action — a denied syscall fails the call rather
-//! than killing the process. (A `SECCOMP_RET_KILL_PROCESS` variant is a possible
-//! hardening follow-up; see the WS1 notes.)
+//! The POSTURE decision (install / skip / fail-closed, and the per-backend
+//! native-compute skip) lives in the caller (`boatramp`'s `serve::install_presandbox`,
+//! called from `main::run` before the runtime is built) — this module is the pure
+//! mechanism.
 
 use std::path::PathBuf;
 
-/// What [`install`] actually did, for logging + the live gate.
+/// What [`install`] actually did, for logging + the caller's posture handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxStatus {
-    /// Turned off by config (`[serve.sandbox] enabled = false`).
+    /// The caller decided not to install (kept for API symmetry; `install` itself
+    /// never returns this — the posture decision is made before `install` is called).
     Disabled,
     /// This platform/build has no OS sandbox — non-Linux, or built without the
-    /// `sandbox` feature. A logged no-op; startup continues unsandboxed.
+    /// `sandbox` feature. A logged no-op; whether that is fatal is the caller's call
+    /// (fail-closed under `strict`).
     Unsupported,
     /// seccomp installed and Landlock **fully** enforced.
     Enforced,
@@ -64,14 +76,12 @@ pub enum SandboxError {
     Landlock(String),
 }
 
-/// The resolved filesystem + enable decision handed to [`install`]. Built by the
-/// serve path from `[serve.sandbox]` + the node's `data_dir` + the config/cert paths
-/// the server reads at runtime.
+/// The resolved filesystem roots handed to [`install`]. Built by the caller from
+/// `[serve.sandbox]` + the node's `data_dir` + the config/cert paths the server reads.
+/// Whether to install at all (posture / native-compute skip) is the caller's decision,
+/// so this carries no `enabled` flag.
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
-    /// Install the sandbox at all. `false` ⇒ [`install`] logs + returns
-    /// [`SandboxStatus::Disabled`].
-    pub enabled: bool,
     /// The node data directory — the primary read+write root.
     pub data_dir: PathBuf,
     /// Filesystem roots the process may **read** (recursively). Non-existent paths are
@@ -85,11 +95,11 @@ pub struct SandboxPolicy {
 impl SandboxPolicy {
     /// A sensible default server policy: `data_dir` + the system temp dirs are
     /// read-write; a conservative set of system roots (`/usr`, `/lib*`, `/etc`,
-    /// `/proc`, `/sys`, `/dev`, `/run`, …) are read-only so the server keeps working
+    /// `/proc`, `/sys`, `/dev`, `/run`) are read-only so the server keeps working
     /// (DNS resolution, shared-object loading, `/proc` reads). Everything else is
     /// denied. Callers layer the config-file dir + cert/TLS paths on with
     /// [`allow_read`](Self::allow_read) / [`allow_write`](Self::allow_write).
-    pub fn for_server(enabled: bool, data_dir: impl Into<PathBuf>) -> Self {
+    pub fn for_server(data_dir: impl Into<PathBuf>) -> Self {
         let data_dir = data_dir.into();
         let read_only_paths = [
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run",
@@ -109,7 +119,6 @@ impl SandboxPolicy {
             }
         }
         Self {
-            enabled,
             data_dir,
             read_only_paths,
             read_write_paths,
@@ -135,14 +144,12 @@ impl SandboxPolicy {
     }
 }
 
-/// Install the whole-process sandbox per `policy`. See the module docs for the
-/// platform/kernel behaviour. Never panics; returns [`SandboxStatus`] on success and
-/// [`SandboxError`] only on a genuine (non-capability) failure.
+/// Install the whole-process sandbox per `policy`. MUST be called before the Tokio
+/// runtime spawns its worker threads (so they inherit the domain via `clone`). See the
+/// module docs for the platform/kernel behaviour. Never panics; returns
+/// [`SandboxStatus`] on success and [`SandboxError`] only on a genuine (non-capability)
+/// failure.
 pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
-    if !policy.enabled {
-        tracing::info!("process sandbox disabled by config ([serve.sandbox] enabled = false)");
-        return Ok(SandboxStatus::Disabled);
-    }
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     {
         linux::install(policy)
@@ -152,13 +159,13 @@ pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
         let _ = policy;
         #[cfg(not(target_os = "linux"))]
         tracing::warn!(
-            "sandbox unsupported on this platform (seccomp-bpf + Landlock are Linux-only); \
+            "process sandbox unsupported on this platform (seccomp-bpf + Landlock are Linux-only); \
              continuing WITHOUT a process sandbox"
         );
         #[cfg(target_os = "linux")]
         tracing::warn!(
-            "process sandbox requested but this build lacks the `sandbox` feature; \
-             continuing WITHOUT a process sandbox"
+            "process sandbox requested but this build lacks the `sandbox` feature; continuing \
+             WITHOUT a process sandbox"
         );
         Ok(SandboxStatus::Unsupported)
     }
@@ -166,7 +173,8 @@ pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
 
 /// The Linux seccomp + Landlock implementation. Compiled only with
 /// `cfg(all(target_os = "linux", feature = "sandbox"))`; the live gate drives the
-/// `prepare_*` primitives directly (it installs them in a forked child).
+/// `prepare_*` primitives directly (it installs them in a forked child, on a
+/// non-installing thread).
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod linux {
     use std::collections::BTreeMap;
@@ -188,20 +196,17 @@ pub mod linux {
 
     /// The Landlock ABI the ruleset handles. `V1` is the universally-available floor
     /// (Linux 5.13+); `CompatLevel::BestEffort` upgrades confinement on newer kernels
-    /// and downgrades gracefully on older ones. (Handling a higher ABI — to also
-    /// confine `refer`/`truncate`/`ioctl_dev` — is a cheap follow-up.)
+    /// and downgrades gracefully on older ones.
     const LANDLOCK_ABI: landlock::ABI = landlock::ABI::V1;
 
     /// Syscalls that must NEVER appear in the whole-process allow-list — the exec
     /// family + the kernel-attack / escape surface. A regression guard (see the unit
-    /// test); `exec*` denial is the headline WS1 property.
+    /// tests); the [`KILL_SURFACE`] subset additionally gets `KILL_PROCESS`.
     pub const DENIED: &[&str] = &[
-        // exec family — the headline deny (an RCE in-process cannot spawn a binary).
         "execve",
         "execveat",
         "fork",
         "vfork",
-        // kernel-attack / container-escape surface (mirrors the container tier).
         "ptrace",
         "process_vm_readv",
         "process_vm_writev",
@@ -230,13 +235,39 @@ pub mod linux {
         "quotactl",
     ];
 
+    /// The high-severity subset of [`DENIED`] given an explicit `SECCOMP_RET_KILL_PROCESS`
+    /// action (Change 4 of the WS1 review): the exec family + the sharpest escape /
+    /// code-injection primitives. An attempt to use one of these kills the process hard
+    /// (`SIGSYS`) rather than returning `EPERM` — turning an exploit attempt into a loud,
+    /// alertable crash. (Everything else not in the allow-list still returns `EPERM`, so a
+    /// benign allow-list bug degrades softly.)
+    pub const KILL_SURFACE: &[&str] = &[
+        "execve",
+        "execveat",
+        "fork",
+        "vfork",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "mount",
+        "pivot_root",
+        "setns",
+        "unshare",
+        "bpf",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "keyctl",
+    ];
+
     /// The whole-process allow-list: the syscalls a running `boatramp` server needs
-    /// (default-deny — everything else is `EPERM`). Derived from the container
-    /// backend's trusted-tier list (`boatramp-container`'s `seccomp::default_allowlist`),
-    /// MINUS the exec family (`execve`/`execveat`/`fork`/`vfork`), plus a couple of
-    /// newer event-loop/futex syscalls a long-lived tokio server may issue. Returned
-    /// sorted + de-duplicated. Names the kernel/arch doesn't know are skipped at
-    /// compile time, so including a newer syscall is safe across kernels.
+    /// (default-deny — everything else is `EPERM`, with the [`KILL_SURFACE`] killed).
+    /// Derived from the container backend's trusted-tier list
+    /// (`boatramp-container`'s `seccomp::default_allowlist`), MINUS the exec family
+    /// (`execve`/`execveat`/`fork`/`vfork`), plus a couple of newer event-loop/futex
+    /// syscalls a long-lived tokio server may issue. Returned sorted + de-duplicated.
+    /// Names the kernel/arch doesn't know are skipped at compile time.
     pub fn whole_process_allowlist() -> Vec<String> {
         let mut names: Vec<String> = ALLOWED
             .iter()
@@ -250,7 +281,8 @@ pub mod linux {
 
     /// The curated allow-list (deduplicated/sorted by [`whole_process_allowlist`]).
     const ALLOWED: &[&str] = &[
-        // process / threads / scheduling (NO exec*, NO fork/vfork — those are denied).
+        // process / threads / scheduling (NO exec*, NO fork/vfork — those are killed).
+        // `clone`/`clone3` stay allowed: tokio spawns worker + blocking threads with them.
         "clone",
         "clone3",
         "exit",
@@ -258,7 +290,6 @@ pub mod linux {
         "wait4",
         "waitid",
         "futex",
-        // newer glibc futex multi-wait (skipped on kernels/arches that lack it).
         "futex_waitv",
         "set_robust_list",
         "get_robust_list",
@@ -383,7 +414,6 @@ pub mod linux {
         "epoll_ctl",
         "epoll_wait",
         "epoll_pwait",
-        // newer epoll wait (skipped where unknown).
         "epoll_pwait2",
         "eventfd",
         "eventfd2",
@@ -396,7 +426,7 @@ pub mod linux {
         "inotify_init1",
         "inotify_add_watch",
         "inotify_rm_watch",
-        // networking (bind/listen/accept/connect stay allowed — the server still opens
+        // networking (bind/listen/accept/connect stay allowed — the server opens its
         // listeners + outbound connections after the sandbox is installed).
         "socket",
         "socketpair",
@@ -456,8 +486,7 @@ pub mod linux {
     ];
 
     /// Set `PR_SET_NO_NEW_PRIVS` on the calling process — required so an unprivileged
-    /// process can install a seccomp filter + a Landlock ruleset without
-    /// `CAP_SYS_ADMIN`.
+    /// process can install a seccomp filter + a Landlock ruleset without `CAP_SYS_ADMIN`.
     pub fn set_no_new_privs() -> Result<(), SandboxError> {
         // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` takes no pointers and only
         // tightens the calling process's own privilege state.
@@ -473,8 +502,7 @@ pub mod linux {
 
     /// Query the running kernel's Landlock ABI (the version `landlock_create_ruleset`
     /// with `LANDLOCK_CREATE_RULESET_VERSION` reports). `> 0` ⇒ Landlock is available.
-    /// Used by the live gate to fail with a clear message on a kernel without Landlock
-    /// rather than a confusing assertion mismatch.
+    /// Used by the live gate to fail with a clear message on a kernel without Landlock.
     pub fn landlock_kernel_abi() -> i64 {
         const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
         // SAFETY: a NULL attr + size 0 with the VERSION flag is the documented ABI
@@ -489,30 +517,34 @@ pub mod linux {
         }
     }
 
-    /// Compile the whole-process allow-list to a seccomp-bpf program (default action
-    /// `EPERM`; listed syscalls allowed). Unknown names are skipped (logged at debug).
-    fn compile_filter(allow: &[String]) -> Result<seccompiler::BpfProgram, SandboxError> {
-        use seccompiler::{SeccompAction, SeccompFilter};
-
+    /// Resolve a list of syscall names to numbers, skipping (at debug) any the running
+    /// kernel/arch doesn't know — so including a newer syscall is safe across kernels.
+    fn resolve(
+        names: impl IntoIterator<Item = String>,
+    ) -> BTreeMap<i64, Vec<seccompiler::SeccompRule>> {
         let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
-        for name in allow {
+        for name in names {
             match name.parse::<syscalls::Sysno>() {
                 Ok(sysno) => {
-                    // Empty rule list ⇒ match unconditionally → the match action (Allow).
                     rules.insert(i64::from(sysno.id()), Vec::new());
                 }
                 Err(_) => {
-                    tracing::debug!(syscall = %name, "sandbox: allow-list name unknown on this kernel/arch — skipping");
+                    tracing::debug!(syscall = %name, "sandbox: syscall name unknown on this kernel/arch — skipping");
                 }
             }
         }
-        let filter = SeccompFilter::new(
-            rules,
-            SeccompAction::Errno(libc::EPERM as u32), // unlisted → EPERM
-            SeccompAction::Allow,                     // listed → allow
-            ARCH,
-        )
-        .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
+        rules
+    }
+
+    /// Compile a filter with the given matched/unmatched actions.
+    fn compile(
+        names: impl IntoIterator<Item = String>,
+        match_action: seccompiler::SeccompAction,
+        mismatch_action: seccompiler::SeccompAction,
+    ) -> Result<seccompiler::BpfProgram, SandboxError> {
+        let filter =
+            seccompiler::SeccompFilter::new(resolve(names), mismatch_action, match_action, ARCH)
+                .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
         filter
             .try_into()
             .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
@@ -551,32 +583,39 @@ pub mod linux {
     fn status_of(ruleset: RulesetStatus) -> SandboxStatus {
         match ruleset {
             RulesetStatus::FullyEnforced => SandboxStatus::Enforced,
-            // Partially enforced (newer ABI on an older kernel) or not enforced at all
-            // (no Landlock): seccomp is still installed, so the process is partially
-            // sandboxed either way.
             RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => SandboxStatus::Partial,
         }
     }
 
-    /// A compiled-but-not-yet-installed seccomp filter. Built in advance so a caller
-    /// (e.g. the live gate, which installs it in a `fork`ed child) applies it with no
-    /// heap allocation after the fork.
+    /// Two compiled-but-not-yet-installed seccomp filters: a KILL filter (the
+    /// [`KILL_SURFACE`] → `KILL_PROCESS`, everything else → allow) stacked over the
+    /// allow-list filter (allow-list → allow, everything else → `EPERM`). Built in
+    /// advance so a caller (e.g. the live gate, which installs it in a `fork`ed child)
+    /// applies it with no heap allocation after the fork. The kernel evaluates stacked
+    /// filters and takes the most-severe action, so a [`KILL_SURFACE`] syscall is
+    /// killed, a listed syscall is allowed, and any other miss returns `EPERM`.
     pub struct PreparedSeccomp {
-        program: seccompiler::BpfProgram,
+        kill: seccompiler::BpfProgram,
+        allow: seccompiler::BpfProgram,
     }
 
     impl PreparedSeccomp {
-        /// Apply the filter to the calling process (sets `no_new_privs` first). After
-        /// this returns, any unlisted syscall (notably `execve`) fails with `EPERM`.
+        /// Apply both filters to **every thread** of the calling process (TSYNC), after
+        /// setting `no_new_privs`. After this returns, a [`KILL_SURFACE`] syscall
+        /// (notably `execve`) kills the process with `SIGSYS`; any other unlisted
+        /// syscall returns `EPERM`.
         pub fn apply(&self) -> Result<(), SandboxError> {
             set_no_new_privs()?;
-            seccompiler::apply_filter(&self.program)
+            seccompiler::apply_filter_all_threads(&self.kill)
+                .map_err(|e| SandboxError::Seccomp(e.to_string()))?;
+            seccompiler::apply_filter_all_threads(&self.allow)
                 .map_err(|e| SandboxError::Seccomp(e.to_string()))
         }
     }
 
     /// A built-but-not-yet-restricted Landlock ruleset (holds its ruleset fd, which is
-    /// inherited across `fork`). [`apply`](Self::apply) restricts the calling process.
+    /// inherited across `fork`). [`apply`](Self::apply) restricts the calling process
+    /// (and every thread it later `clone`s).
     pub struct PreparedLandlock {
         created: RulesetCreated,
     }
@@ -593,12 +632,20 @@ pub mod linux {
         }
     }
 
-    /// Compile the whole-process seccomp filter (no allocation after this is cheap to
-    /// carry across a `fork`).
+    /// Compile the whole-process seccomp filters (KILL + allow-list).
     pub fn prepare_seccomp() -> Result<PreparedSeccomp, SandboxError> {
-        Ok(PreparedSeccomp {
-            program: compile_filter(&whole_process_allowlist())?,
-        })
+        use seccompiler::SeccompAction;
+        let kill = compile(
+            KILL_SURFACE.iter().map(|s| (*s).to_string()),
+            SeccompAction::KillProcess,
+            SeccompAction::Allow,
+        )?;
+        let allow = compile(
+            whole_process_allowlist(),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+        )?;
+        Ok(PreparedSeccomp { kill, allow })
     }
 
     /// Build the Landlock ruleset for the given read-only / read-write roots.
@@ -612,7 +659,7 @@ pub mod linux {
     }
 
     /// Install both layers on the current process: Landlock first (it needs its own
-    /// syscalls + `openat`), then the seccomp filter (which denies `exec*`).
+    /// syscalls + `openat`), then the seccomp filters (which kill `exec*`).
     pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
         set_no_new_privs()?;
         let landlock_status = prepare_landlock(&policy.read_only_paths, &policy.read_write_paths)?
@@ -623,8 +670,8 @@ pub mod linux {
             landlock = ?landlock_status,
             read_only_roots = policy.read_only_paths.len(),
             read_write_roots = policy.read_write_paths.len(),
-            "process sandbox installed: seccomp-bpf default-deny allow-list (exec* DENIED) + \
-             Landlock filesystem confinement to data_dir"
+            "process sandbox installed: seccomp-bpf allow-list (exec* + escape surface KILLED, other \
+             misses EPERM) + Landlock filesystem confinement to data_dir"
         );
         Ok(landlock_status)
     }
@@ -654,9 +701,25 @@ pub mod linux {
                     "whole-process allow-list must NOT contain {danger} (exec*/escape surface)"
                 );
             }
-            // The headline WS1 property, asserted explicitly.
             for exec in ["execve", "execveat", "fork", "vfork"] {
                 assert!(!list.contains(exec), "exec* must be denied: {exec}");
+            }
+        }
+
+        #[test]
+        fn kill_surface_is_a_subset_of_denied_and_covers_exec() {
+            let denied: BTreeSet<&str> = DENIED.iter().copied().collect();
+            for k in KILL_SURFACE {
+                assert!(
+                    denied.contains(k),
+                    "KILL_SURFACE entry {k} must also be in DENIED"
+                );
+            }
+            for exec in ["execve", "execveat", "fork", "vfork"] {
+                assert!(
+                    KILL_SURFACE.contains(&exec),
+                    "exec* must be in the KILL_SURFACE: {exec}"
+                );
             }
         }
 
@@ -691,8 +754,8 @@ pub mod linux {
             }
         }
 
-        // Every allow-list entry that the kernel knows must resolve to a syscall number
-        // (a typo'd name would be silently skipped, so this guards the common names).
+        // Every allow-list + KILL_SURFACE entry the kernel knows must resolve (a typo'd
+        // name would be silently skipped, so this guards the common names).
         #[test]
         fn core_names_resolve_to_syscall_numbers() {
             for name in [
@@ -704,10 +767,13 @@ pub mod linux {
                 "exit_group",
                 "socket",
                 "epoll_wait",
+                "execve",
+                "setns",
+                "mount",
             ] {
                 assert!(
                     name.parse::<syscalls::Sysno>().is_ok(),
-                    "core allow-list name does not resolve on this arch: {name}"
+                    "core syscall name does not resolve on this arch: {name}"
                 );
             }
         }

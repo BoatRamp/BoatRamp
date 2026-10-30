@@ -685,6 +685,9 @@ impl ComputeBackend for EmbeddedVmmBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Launches each microVM by re-execing `boatramp __vmm-run` (jailed worker) + wires its
+            // tap netns from the parent — incompatible with the serving-process OS sandbox.
+            requires_host_privileged_spawn: true,
         }
     }
 

@@ -156,6 +156,9 @@ impl ComputeBackend for VmmBackend {
             persistent_volumes: false,
             max_vcpus: None,
             max_mem_mib: None,
+            // Spawns a jailed `firecracker` VMM subprocess + wires its netns from the parent —
+            // incompatible with the serving-process OS sandbox.
+            requires_host_privileged_spawn: true,
         }
     }
 

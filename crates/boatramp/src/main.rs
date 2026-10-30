@@ -350,11 +350,62 @@ fn run() -> Result<(), CliError> {
     if std::env::args().nth(1).as_deref() == Some(boatramp_vz::VZ_RUN_SUBCOMMAND) {
         return run_vz_worker(std::env::args().nth(2));
     }
+    // Initialise logging + parse the CLI HERE (still single-threaded, before the Tokio runtime is
+    // built), so the whole-process OS sandbox can install before any worker thread exists and its
+    // logs are captured. The raw `__*` worker checks above run FIRST (clap doesn't know them).
+    init_tracing();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)
+        .expect("clap re-derive from its own validated matches is infallible");
+
+    // WHOLE-PROCESS OS SANDBOX (privsep Phase 0 WS1): install on THIS single main thread, BEFORE the
+    // multi-threaded runtime spawns its workers, so every worker thread inherits the seccomp filter +
+    // Landlock domain via `clone` (a late install would cover only the installing thread). Serve-only;
+    // `install_presandbox` resolves the posture (auto/strict/permissive/off) + the native-compute skip
+    // and may hard-fail startup under `posture = strict`.
+    if let Command::Serve(args) = &cli.command {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
+        match config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))
+        {
+            Ok(config) => serve::install_presandbox(&config, &path, args)?,
+            // A config that won't load means we can't know the posture; skip the pre-install and let
+            // `async_main`'s own load (below) surface the real error + abort. A broken-config node
+            // never serves anyway, so this cannot silently serve unsandboxed.
+            Err(e) => tracing::debug!(
+                error = %e,
+                "sandbox pre-install skipped: serve config failed to load (startup will abort on it)"
+            ),
+        }
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(CliError::Runtime)?
-        .block_on(async_main())
+        .block_on(async_main(cli, matches))
+}
+
+/// Structured logs (incl. the `boatramp::access` line) go to STDERR — explicitly, because
+/// `tracing_subscriber::fmt()` otherwise defaults to stdout, which would co-mingle diagnostics with
+/// (and corrupt the JSON of) a command's result on stdout. `BOATRAMP_LOG_FORMAT=json` selects a
+/// machine-readable JSON sink. Called once, from `run`, before the runtime is built.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("boatramp=info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    let json = std::env::var("BOATRAMP_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }
 
 /// The container self-jail worker (`boatramp __sandbox`): read a [`SandboxPlan`]
@@ -462,31 +513,10 @@ fn serve_cli_flags(matches: &clap::ArgMatches) -> std::collections::BTreeMap<Str
     out
 }
 
-async fn async_main() -> Result<(), CliError> {
-    // Structured logs (incl. the `boatramp::access` line) go to STDERR — explicitly, because
-    // `tracing_subscriber::fmt()` otherwise defaults to stdout, which would co-mingle diagnostics with
-    // (and corrupt the JSON of) a command's result on stdout. Set `BOATRAMP_LOG_FORMAT=json` for a
-    // machine-readable JSON sink.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("boatramp=info"));
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    let json = std::env::var("BOATRAMP_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-    if json {
-        builder.json().init();
-    } else {
-        builder.init();
-    }
-
-    // Parse via ArgMatches (not `Cli::parse()`) so the serve flag layer can read each arg's
-    // `ValueSource` (CommandLine vs env vs default). `from_arg_matches` on clap's OWN matches
-    // is infallible — it is exactly what `Cli::parse()` does internally.
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches)
-        .expect("clap re-derive from its own validated matches is infallible");
+async fn async_main(cli: Cli, matches: clap::ArgMatches) -> Result<(), CliError> {
+    // Tracing is already initialised + the CLI already parsed by `run` (before the Tokio runtime was
+    // built, so the whole-process sandbox could install first). `matches` is threaded in so the serve
+    // flag layer can read each arg's `ValueSource` (CommandLine vs env vs default).
 
     // `completions` / `man` are pure generators over the command tree — no config,
     // no network. Handle them before any config load.
@@ -517,7 +547,7 @@ async fn async_main() -> Result<(), CliError> {
         // the file decoder (RON/JSON).
         let config =
             config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))?;
-        serve::run(args, &config, &path).await?;
+        serve::run(args, &config).await?;
         return Ok(());
     }
 

@@ -446,6 +446,9 @@ impl ComputeBackend for DockerBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Talks to a Docker daemon over a socket — does NOT re-exec boatramp or wire netns from
+            // this process, so it coexists with the serving-process OS sandbox.
+            requires_host_privileged_spawn: false,
         }
     }
 

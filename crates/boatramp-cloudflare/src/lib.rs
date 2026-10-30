@@ -216,6 +216,9 @@ impl ComputeBackend for CloudflareBackend {
             persistent_volumes: false,
             max_vcpus: None,
             max_mem_mib: Some(InstanceType::Standard.mem_mib()),
+            // A remote managed platform — nothing is spawned on this host, so it coexists with the
+            // serving-process OS sandbox.
+            requires_host_privileged_spawn: false,
         }
     }
 

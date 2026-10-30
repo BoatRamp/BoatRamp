@@ -666,7 +666,7 @@ mod tests {
         ));
         // The whole-process OS sandbox is restart-class under `[serve]` (privsep Phase 0 WS1).
         assert!(matches!(
-            write_key(&mut cfg, "sandbox.enabled", "false"),
+            write_key(&mut cfg, "sandbox.posture", "strict"),
             Err(Error::RestartClass(_, "serve"))
         ));
         // A genuinely unknown key.
@@ -691,7 +691,7 @@ mod tests {
     fn describe_surfaces_sandbox_as_restart_class() {
         // The `config` discovery command classifies the WS1 sandbox keys as restart-class under
         // `[serve]` (file + restart), so an operator learns they are not runtime-settable.
-        for key in ["sandbox", "sandbox.enabled"] {
+        for key in ["sandbox", "sandbox.posture"] {
             assert!(
                 matches!(
                     describe(key),

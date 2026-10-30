@@ -325,6 +325,9 @@ impl ComputeBackend for VzBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Launches each microVM by re-execing `boatramp __vz-run` (per-VM worker) —
+            // incompatible with the serving-process OS sandbox.
+            requires_host_privileged_spawn: true,
         }
     }
 
@@ -654,6 +657,7 @@ mod tests {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            requires_host_privileged_spawn: true,
         };
         assert!(caps.isolation.is_strong());
         assert!(caps.scale_to_zero);

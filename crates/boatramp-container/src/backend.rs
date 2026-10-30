@@ -898,6 +898,9 @@ impl ComputeBackend for ContainerBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Launches workers by re-execing `boatramp __sandbox` (self-jail worker) + wires their
+            // netns from the parent — incompatible with the serving-process OS sandbox.
+            requires_host_privileged_spawn: true,
         }
     }
 
