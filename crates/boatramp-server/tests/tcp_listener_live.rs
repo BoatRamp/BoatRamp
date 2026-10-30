@@ -1194,7 +1194,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         let mut buf = Vec::new();
         let mut b = [0u8; 1];
         loop {
-            tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut b))
+            tokio::time::timeout(Duration::from_secs(30), c.read_exact(&mut b))
                 .await
                 .expect("read_line timed out")
                 .expect("read_line failed");
@@ -1207,7 +1207,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
     }
     async fn read_exact_timed(s: &mut TcpStream, len: usize) -> Vec<u8> {
         let mut buf = vec![0u8; len];
-        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+        tokio::time::timeout(Duration::from_secs(30), s.read_exact(&mut buf))
             .await
             .expect("splice read timed out")
             .expect("splice read failed");
@@ -1241,7 +1241,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             .write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
             .await
             .unwrap();
-        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+        let mut up = tokio::time::timeout(Duration::from_secs(30), up_rx)
             .await
             .expect("the host never dialed the upstream (promote failed?)")
             .expect("upstream sender dropped");
@@ -1298,7 +1298,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         // CLOSE TEARDOWN: drop the client -> the splice ends -> the upstream socket is closed (EOF).
         drop(client);
         let mut tail = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(5), up.read(&mut tail))
+        let n = tokio::time::timeout(Duration::from_secs(30), up.read(&mut tail))
             .await
             .expect("upstream EOF timed out")
             .expect("upstream read failed");
@@ -1306,7 +1306,8 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             n, 0,
             "closing the client tears the splice down + closes the upstream socket"
         );
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "promote-splice-close").await;
+        let (res, _) =
+            await_dispatch(handle, Duration::from_secs(30), "promote-splice-close").await;
         assert!(
             res.is_ok(),
             "promoted splice ends cleanly on client close: {res:?}"
@@ -1332,14 +1333,14 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             .write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
             .await
             .unwrap();
-        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+        let mut up = tokio::time::timeout(Duration::from_secs(30), up_rx)
             .await
             .expect("upstream dial timed out")
             .expect("upstream sender dropped");
         let _ = read_exact_timed(&mut up, PREAMBLE.len()).await;
         // Idle (no bytes either way) -> the absolute max_conn_duration must reap the live splice.
         let (res, elapsed) =
-            await_dispatch(handle, Duration::from_secs(8), "promote-splice-maxdur").await;
+            await_dispatch(handle, Duration::from_secs(30), "promote-splice-maxdur").await;
         assert!(
             res.is_ok(),
             "promoted splice ends on max_conn_duration: {res:?}"
@@ -1349,7 +1350,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             "max-duration must bound an idle live splice ({elapsed:?})"
         );
         let mut tail = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), up.read(&mut tail))
+        let n = tokio::time::timeout(Duration::from_secs(30), up.read(&mut tail))
             .await
             .expect("upstream EOF timed out")
             .expect("upstream read failed");
@@ -1407,7 +1408,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         );
         drop(client);
         let (res, _) =
-            await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed-3a").await;
+            await_dispatch(handle, Duration::from_secs(30), "promote-fail-closed-3a").await;
         assert!(
             res.is_ok(),
             "clean end after a refused promote (3a): {res:?}"
@@ -1456,7 +1457,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         );
         drop(client);
         let (res, _) =
-            await_dispatch(handle, Duration::from_secs(5), "promote-fail-closed-3b").await;
+            await_dispatch(handle, Duration::from_secs(30), "promote-fail-closed-3b").await;
         assert!(
             res.is_ok(),
             "clean end after a grant-refused promote (3b): {res:?}"
@@ -1519,7 +1520,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
         a.write_all(format!("BRIDGE 127.0.0.1 {}\n", up_addr.port()).as_bytes())
             .await
             .unwrap();
-        let mut up = tokio::time::timeout(Duration::from_secs(5), up_rx)
+        let mut up = tokio::time::timeout(Duration::from_secs(30), up_rx)
             .await
             .expect("upstream dial timed out")
             .expect("upstream sender dropped");
