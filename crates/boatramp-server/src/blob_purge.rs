@@ -35,6 +35,7 @@ use super::*;
 
 use boatramp_storage::blob_migrate;
 use boatramp_storage::blob_purge::{self, PurgeReport};
+use boatramp_storage::blob_reconcile;
 
 /// The mode of a `POST /api/blob-purge`: which provably-safe object set to reclaim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -48,6 +49,12 @@ pub(super) enum PurgeMode {
     /// ONLY once it is provably duplicated (present at matching size) in the primary. Requires a
     /// configured `[serve.blob_fallback]` (else 422). Fail-closed: an unconfirmed key survives.
     DrainedSource,
+    /// Delete stale image derivatives of a SUPERSEDED format (the pre-WEBP `.jpg` leftovers) under
+    /// the key `prefix`. Deletes ONLY a `der/` object whose extension is `superseded_ext` — a
+    /// baseline/primary with the same extension, and the current-format derivative, are NEVER
+    /// touched (they self-heal — a dropped derivative is regenerated on next access). Fail-closed by
+    /// construction via the shared blob-key classifier. `superseded_ext` is required (else 422).
+    LegacyDerivatives,
 }
 
 /// The `POST /api/blob-purge` request body. Rejects unknown fields (a typo'd mode/knob is a 422, not
@@ -61,10 +68,16 @@ pub(super) struct PurgeRequest {
     /// Actually delete (`true`) vs dry-run report only (`false`, the default).
     #[serde(default)]
     pub apply: bool,
-    /// Restrict a `drained_source` purge to source keys under this prefix; `None`/absent ⇒ all.
-    /// (Ignored by `unreferenced`, which GCs the whole content-addressed keyspace.)
+    /// Restrict a `drained_source` / `legacy_derivatives` purge to keys under this prefix (e.g.
+    /// `hblob/<project>/`); `None`/absent ⇒ all. (Ignored by `unreferenced`, which GCs the whole
+    /// content-addressed keyspace.)
     #[serde(default)]
     pub prefix: Option<String>,
+    /// For `legacy_derivatives`: the SUPERSEDED image extension to drop (e.g. `jpg`). Required for
+    /// that mode (a `legacy_derivatives` purge with no `superseded_ext` is a 422 — never a blanket
+    /// delete). Ignored by the other modes.
+    #[serde(default)]
+    pub superseded_ext: Option<String>,
 }
 
 /// Defense-in-depth (mirrors [`assert_blob_drain_is_system_admin`](crate::blob_drain)): re-derive the
@@ -109,7 +122,149 @@ pub(super) async fn blob_purge(
         PurgeMode::DrainedSource => {
             purge_drained_source(&deploy, req.apply, req.prefix.unwrap_or_default()).await
         }
+        PurgeMode::LegacyDerivatives => {
+            purge_legacy(&deploy, req.apply, req.prefix, req.superseded_ext).await
+        }
     }
+}
+
+/// `legacy_derivatives` mode: delete stale `der/` objects of a superseded format under `prefix` via
+/// [`blob_reconcile::purge_legacy_derivatives`], emitting a start + final NDJSON line (the static
+/// shape, same as `unreferenced`). A missing/empty `superseded_ext` is a **422** (never a blanket
+/// delete). The classifier is the inner guard — a baseline/primary/current-format object is kept.
+async fn purge_legacy(
+    deploy: &DeployStore,
+    apply: bool,
+    prefix: Option<String>,
+    superseded_ext: Option<String>,
+) -> Response {
+    let ext = superseded_ext.unwrap_or_default();
+    if ext.trim_start_matches('.').is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\":\"legacy_derivatives purge requires a non-empty superseded_ext (e.g. \
+             \\\"jpg\\\") — refusing a blanket derivative delete\"}\n",
+        )
+            .into_response();
+    }
+    let opts = blob_reconcile::LegacyPurgeOptions {
+        prefix: prefix.unwrap_or_default(),
+        apply,
+        superseded_ext: ext,
+    };
+    match blob_reconcile::purge_legacy_derivatives(deploy.storage().clone(), &opts).await {
+        Ok(report) => {
+            let start = serde_json::json!({
+                "type": "progress",
+                "mode": "legacy_derivatives",
+                "apply": apply,
+                "message": "scanning for superseded-format derivatives",
+            });
+            let verb = if apply { "purged" } else { "would purge" };
+            let msg = format!(
+                "legacy-derivative purge {}: {} {} superseded der/ object(s) ({} byte(s)); kept {} \
+                 non-superseded object(s)",
+                if apply { "complete" } else { "(dry-run)" },
+                verb,
+                if apply {
+                    report.purged
+                } else {
+                    report.would_purge
+                },
+                report.bytes_purged,
+                report.skipped_not_superseded,
+            );
+            let final_line = serde_json::json!({
+                "type": "report",
+                "mode": "legacy_derivatives",
+                "apply": apply,
+                "considered": report.considered,
+                "purged": report.purged,
+                "would_purge": report.would_purge,
+                "skipped_not_superseded": report.skipped_not_superseded,
+                "bytes_purged": report.bytes_purged,
+                "message": msg,
+            });
+            ndjson_response(vec![format!("{start}\n"), format!("{final_line}\n")])
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("{{\"error\":{}}}\n", serde_json::Value::String(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// Reconcile an index↔object size drift by blessing the stored bytes (`POST /api/blob-reconcile`,
+/// `System·Admin`). Dry-run by default (`apply=false`); `apply=true` re-writes each drifted object so
+/// its declared size matches its body. DEFAULT-scoped to re-generable `der/` derivatives; a
+/// baseline/primary object is reconciled ONLY under the explicit, audited `include_primary` opt-in.
+/// Returns a single JSON report object (not NDJSON — a reconcile is a bounded one-pass op).
+pub(super) async fn blob_reconcile(
+    State(deploy): State<DeployStore>,
+    Json(req): Json<ReconcileRequest>,
+) -> Response {
+    // Defense-in-depth: a reconcile MUTATES blob bytes, so re-derive that the authoritative table
+    // still gates this path at System·Admin before writing (mirrors blob_purge).
+    use boatramp_core::authz::{Action, Resource, Right};
+    let gated = matches!(
+        Right::required("POST", "/api/blob-reconcile"),
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin
+    );
+    if !gated {
+        return (
+            StatusCode::FORBIDDEN,
+            "blob reconcile requires System·Admin\n",
+        )
+            .into_response();
+    }
+    let opts = blob_reconcile::ReconcileOptions {
+        prefix: req.prefix.unwrap_or_default(),
+        apply: req.apply,
+        include_primary: req.include_primary,
+        ..Default::default()
+    };
+    match blob_reconcile::reconcile(deploy.storage().clone(), &opts).await {
+        Ok(report) => Json(serde_json::json!({
+            "apply": req.apply,
+            "include_primary": req.include_primary,
+            "considered": report.considered,
+            "drifted": report.drifted,
+            "reconciled": report.reconciled,
+            "would_reconcile": report.would_reconcile,
+            "skipped_out_of_scope": report.skipped_out_of_scope,
+            "skipped_too_large": report.skipped_too_large,
+            "skipped_unreadable": report.skipped_unreadable,
+            "bytes_reconciled": report.bytes_reconciled,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blob reconcile failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// The `POST /api/blob-reconcile` body. Rejects unknown fields. `apply` defaults to dry-run;
+/// `include_primary` is the DANGEROUS audited opt-in to also bless baseline/primary objects.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconcileRequest {
+    /// Restrict the scan to keys under this prefix (e.g. `hblob/<project>/`); absent ⇒ all.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Actually re-write drifted objects (`true`) vs dry-run report only (`false`, default).
+    #[serde(default)]
+    pub apply: bool,
+    /// DANGEROUS audited opt-in: also reconcile baseline/primary objects, not just `der/` derivatives.
+    #[serde(default)]
+    pub include_primary: bool,
 }
 
 /// `unreferenced` mode: on-demand GC of blobs no live manifest references. Emits a start NDJSON line
@@ -211,23 +366,43 @@ pub(super) async fn blob_status(State(deploy): State<DeployStore>) -> Response {
     Json(serde_json::json!({ "blob_fallback_active": active })).into_response()
 }
 
-/// Dead content-addressed references (`GET /api/blob-verify`, `System·Read`): every blob a LIVE site
-/// deployment or function references but that is MISSING from the backend — an invoke/serve of it
-/// would 404 (a production `identity` incident shape). Read-only. To repair a dead reference,
-/// re-upload the bytes (`boatramp blob put <file>`) or re-deploy the resource; the fix that STOPS the
-/// GC from creating them (referencing live function components) shipped alongside this.
+/// Blob integrity report (`GET /api/blob-verify`, `System·Read`). Read-only, two classes:
+/// - `dead_references` — every blob a LIVE site deployment or function references but that is
+///   MISSING from the backend (an invoke/serve would 404 — a production `identity` incident shape);
+/// - `size_mismatches` — every referenced blob whose DECLARED size (a live manifest entry/variant)
+///   disagrees with the size the backend STORES (the index↔object drift that streams a truncated
+///   `Content-Length` response and makes a streaming clone fail-closed — PLAN-clone-robustness #3).
+///
+/// To repair a dead reference, re-upload the bytes (`boatramp blob put <file>`) or re-deploy the
+/// resource. A size mismatch on a re-generable derivative can be blessed with `boatramp blob
+/// reconcile`; on primary data it signals a truncation/corruption to investigate.
 pub(super) async fn blob_verify(State(deploy): State<DeployStore>) -> Response {
-    match deploy
-        .verify_blobs(&boatramp_core::deploy::GcOptions::default())
-        .await
-    {
-        Ok(dead) => Json(serde_json::json!({ "dead_references": dead })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("blob verify failed: {e}\n"),
-        )
-            .into_response(),
-    }
+    let opts = boatramp_core::deploy::GcOptions::default();
+    let dead = match deploy.verify_blobs(&opts).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob verify failed: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let size_mismatches = match deploy.verify_blob_sizes(&opts).await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob verify (size) failed: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({
+        "dead_references": dead,
+        "size_mismatches": size_mismatches,
+    }))
+    .into_response()
 }
 
 /// Serialize the final `unreferenced` (GC) report line (trailing `\n`), tagged `"type":"report"`.

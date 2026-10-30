@@ -216,6 +216,18 @@ pub enum BundleError {
     /// without its preceding sidecar, a mismatched pairing, or a member out of declared order.
     #[error("malformed v2 bundle stream: {0}")]
     MalformedStream(String),
+    /// One or more members failed integrity verification under an ENUMERATE-ALL pass — the loud
+    /// aggregate reject raised AFTER the whole bundle was scanned (so an operator sees the full
+    /// scope in one run, not just the first mismatch). The per-member detail (path, class, size vs
+    /// checksum, declared vs streamed) is collected out-of-band in the caller's mismatch sink.
+    #[error(
+        "{count} member(s) failed integrity verification (declared ≠ streamed) — see the \
+         enumerated mismatch report"
+    )]
+    MembersMismatched {
+        /// How many members mismatched in the pass.
+        count: usize,
+    },
     /// A member's streamed byte count did not match the size it declared (sidecar/manifest).
     #[error("size MISMATCH for member {path:?}: declared {expected}, streamed {actual}")]
     SizeMismatch {
@@ -1077,6 +1089,46 @@ fn stage_and_verify_member<F>(
 where
     F: FnMut(&MemberSpec, &Path) -> Result<(), BundleError>,
 {
+    // The strict staged reader is the policy reader under [`VerifyPolicy::strict`] with a throwaway
+    // sink: a mismatch hard-fails on the first member (never `Skipped`), so the sink is unused.
+    let mut sink = Vec::new();
+    match stage_verify_member_policy(
+        body,
+        spec,
+        expected_size,
+        expected_sha,
+        stage_dir,
+        counter,
+        &VerifyPolicy::strict(),
+        &mut sink,
+        restore,
+    )? {
+        MemberOutcome::Applied | MemberOutcome::Skipped => Ok(()),
+    }
+}
+
+/// Stream `body` into a bounded temp under `stage_dir` while hashing + counting, then compare the
+/// staged size + SHA-256 to the declared values. On a MATCH, hand the verified temp to
+/// `restore(spec, &temp)` and return [`MemberOutcome::Applied`]. On a MISMATCH, the temp is deleted
+/// UNAPPLIED and `policy` decides: under [`VerifyPolicy::strict`] (and any non-tolerated class) the
+/// loud `Err` propagates; under enumerate/skip the mismatch is recorded into `mismatches` and
+/// [`MemberOutcome::Skipped`] is returned (the member is never applied). This is the sidecar /
+/// v1-member half of the mismatch-tolerance policy (PLAN-clone-robustness #1 + #2).
+#[allow(clippy::too_many_arguments)]
+fn stage_verify_member_policy<F>(
+    body: &mut dyn Read,
+    spec: &MemberSpec,
+    expected_size: u64,
+    expected_sha: &str,
+    stage_dir: &Path,
+    counter: &mut u64,
+    policy: &VerifyPolicy,
+    mismatches: &mut Vec<MemberMismatch>,
+    restore: &mut F,
+) -> Result<MemberOutcome, BundleError>
+where
+    F: FnMut(&MemberSpec, &Path) -> Result<(), BundleError>,
+{
     let temp = stage_dir.join(format!("brimport-{counter}"));
     *counter += 1;
     let mut hasher = Sha256::new();
@@ -1096,26 +1148,44 @@ where
         f.flush()?;
     }
     let sha = hex::encode(hasher.finalize());
+    // Size is checked first (matching the strict order), then checksum.
     if total != expected_size {
         let _ = std::fs::remove_file(&temp);
-        return Err(BundleError::SizeMismatch {
-            path: spec.path.clone(),
-            expected: expected_size,
-            actual: total,
-        });
+        policy.record_mismatch(
+            spec,
+            MismatchKind::Size,
+            expected_size.to_string(),
+            total.to_string(),
+            BundleError::SizeMismatch {
+                path: spec.path.clone(),
+                expected: expected_size,
+                actual: total,
+            },
+            mismatches,
+        )?;
+        return Ok(MemberOutcome::Skipped);
     }
     if sha != expected_sha {
         let _ = std::fs::remove_file(&temp);
-        return Err(BundleError::ChecksumMismatch {
+        let hard = BundleError::ChecksumMismatch {
             path: spec.path.clone(),
             expected: expected_sha.to_string(),
-            actual: sha,
-        });
+            actual: sha.clone(),
+        };
+        policy.record_mismatch(
+            spec,
+            MismatchKind::Checksum,
+            expected_sha.to_string(),
+            sha,
+            hard,
+            mismatches,
+        )?;
+        return Ok(MemberOutcome::Skipped);
     }
     // Verified — NOW apply the staged temp, then free it.
     let r = restore(spec, &temp);
     let _ = std::fs::remove_file(&temp);
-    r
+    r.map(|()| MemberOutcome::Applied)
 }
 
 /// Read a bundle from `src` in a SINGLE FORWARD PASS, handing each member to `restore` as it
@@ -1306,6 +1376,201 @@ where
     Ok(restored)
 }
 
+// ============================================================================
+// Member-mismatch tolerance policy (clone robustness — PLAN-clone-robustness #1 + #2)
+//
+// By default a member whose streamed bytes disagree with its declared size/SHA-256 is a LOUD
+// reject at the FIRST mismatch (unchanged — [`VerifyPolicy::strict`]). A streaming clone that
+// fail-closed on ONE stale re-generable thumbnail had no recourse, so [`VerifyPolicy`] adds two
+// bounded relaxations, BOTH scoped by the load-bearing integrity rule (`boatramp_core::blob_class`):
+//   • ENUMERATE-ALL  — scan every member, collect EVERY mismatch, apply none of them, fail at the
+//     end. The assessment tool ("1 stale blob or many?"), never a mutation.
+//   • SKIP-MEMBER-MISMATCH — warn + continue past a mismatched member (the target re-derives it),
+//     DEFAULT-scoped to re-generable `der/` derivatives; a baseline/primary/non-blob mismatch STILL
+//     hard-fails. A broader scope ([`SkipScope::AnyBlob`]) is the louder, explicit opt-in — and even
+//     that never tolerates a non-blob (DB/KV/identity) member.
+// ============================================================================
+
+/// The integrity class of a bundle member, for the mismatch-tolerance policy. Only a re-generable
+/// image DERIVATIVE is safe to skip/bless on a declared≠stored mismatch (it self-heals on the
+/// target — `serve_img` serves the baseline and regenerates on access); everything else is
+/// load-bearing. Thin wrapper over [`boatramp_core::blob_class::BlobClass`] that also distinguishes
+/// a NON-blob member (a SQL dump / the KV slice / identity), which is NEVER skippable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberClass {
+    /// A re-generable image derivative blob (`der/` key component) — the only skippable class.
+    Derivative,
+    /// An image baseline blob (`base/` key component) — load-bearing; never skippable.
+    Baseline,
+    /// Any other blob object (an original/primary/user object) — load-bearing; never skippable.
+    PrimaryBlob,
+    /// A non-blob member (a SQL dump, the control-plane KV slice, or the identity container) —
+    /// load-bearing; NEVER skippable under any scope.
+    NonBlob,
+}
+
+impl MemberClass {
+    /// A short, stable label for logs / reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            MemberClass::Derivative => "der",
+            MemberClass::Baseline => "base",
+            MemberClass::PrimaryBlob => "primary",
+            MemberClass::NonBlob => "non-blob",
+        }
+    }
+}
+
+/// Classify a bundle member for the mismatch-tolerance policy. A non-blob member is
+/// [`NonBlob`](MemberClass::NonBlob); a blob member's class comes from the shared, audited
+/// [`boatramp_core::blob_class::classify_blob_key`] over its storage key (the member path with its
+/// `blobs/` transport prefix stripped) — so the clone-skip boundary and the `blob reconcile`/`purge`
+/// boundary are the SAME rule.
+pub fn classify_member(spec: &MemberSpec) -> MemberClass {
+    if spec.kind != MemberKind::Blob {
+        return MemberClass::NonBlob;
+    }
+    let key = spec.path.strip_prefix("blobs/").unwrap_or(&spec.path);
+    match boatramp_core::blob_class::classify_blob_key(key) {
+        boatramp_core::blob_class::BlobClass::Derivative => MemberClass::Derivative,
+        boatramp_core::blob_class::BlobClass::Baseline => MemberClass::Baseline,
+        boatramp_core::blob_class::BlobClass::Primary => MemberClass::PrimaryBlob,
+    }
+}
+
+/// Which member classes a [`VerifyPolicy::skip_mismatch`] tolerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipScope {
+    /// Re-generable `der/` derivatives ONLY — the safe default (construens's integrity line).
+    #[default]
+    DerivativesOnly,
+    /// ANY blob member (baselines + primaries too) — the louder, explicit broad opt-in. NEVER a
+    /// non-blob (DB/KV/identity) member even so.
+    AnyBlob,
+}
+
+/// Which kind of integrity check a member failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MismatchKind {
+    /// Streamed byte count ≠ the declared size.
+    Size,
+    /// Streamed SHA-256 ≠ the declared checksum.
+    Checksum,
+}
+
+/// One member that failed integrity verification, collected by an enumerate/skip pass so the
+/// operator (and the import report) sees the full scope and the per-member class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberMismatch {
+    /// The offending member path.
+    pub path: String,
+    /// Its integrity class (der/base/primary/non-blob) — which decides skippability.
+    pub class: MemberClass,
+    /// Whether the size or the checksum failed.
+    pub kind: MismatchKind,
+    /// What the bundle declared (the size, or the hex SHA-256).
+    pub declared: String,
+    /// What actually streamed (the size, or the hex SHA-256).
+    pub streamed: String,
+    /// `true` iff the member was TOLERATED (warned + skipped, and the import still succeeded).
+    /// `false` for an enumerate-pass finding or a member that hard-failed.
+    pub skipped: bool,
+}
+
+/// How the v3-capable atomic reader treats a member whose streamed bytes disagree with its
+/// declared size/SHA-256. [`strict`](Self::strict) (the [`Default`]) is the historical behaviour:
+/// hard-fail on the FIRST mismatch. See the section comment above for the two relaxations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerifyPolicy {
+    /// Scan EVERY member, collect EVERY mismatch, APPLY none of them, and fail at the END (with
+    /// [`BundleError::MembersMismatched`]) — the assessment pass. Overrides `skip_mismatch` (an
+    /// enumerate is never a mutation, so even a `der/` finding is reported, not silently skipped).
+    pub enumerate_all: bool,
+    /// Warn + continue past a mismatched member (NOT applying it) instead of hard-failing — the
+    /// target re-derives a skipped derivative on access. Scoped by [`skip_scope`](Self::skip_scope);
+    /// a member outside the scope STILL hard-fails immediately.
+    pub skip_mismatch: bool,
+    /// Which classes `skip_mismatch` covers. Default: re-generable `der/` derivatives ONLY.
+    pub skip_scope: SkipScope,
+}
+
+/// The disposition of a member after verification — applied (verified) or skipped (mismatched,
+/// not applied). A HARD-FAIL is a propagated `Err`, never this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberOutcome {
+    /// Verified and applied by the restorer.
+    Applied,
+    /// Mismatched and NOT applied (tolerated by skip, or recorded by enumerate) — continue.
+    Skipped,
+}
+
+impl VerifyPolicy {
+    /// The strict default: hard-fail on the FIRST member mismatch (the historical behaviour, so an
+    /// existing caller that passes this is byte-for-byte unchanged).
+    pub fn strict() -> Self {
+        Self::default()
+    }
+
+    /// Whether a `skip_mismatch` policy TOLERATES a mismatch on `class` — `der/` under the default
+    /// scope, any blob under [`SkipScope::AnyBlob`], NEVER a non-blob member.
+    fn tolerates(&self, class: MemberClass) -> bool {
+        if !self.skip_mismatch {
+            return false;
+        }
+        match (self.skip_scope, class) {
+            (_, MemberClass::NonBlob) => false,
+            (SkipScope::DerivativesOnly, MemberClass::Derivative) => true,
+            (SkipScope::DerivativesOnly, _) => false,
+            (
+                SkipScope::AnyBlob,
+                MemberClass::Derivative | MemberClass::Baseline | MemberClass::PrimaryBlob,
+            ) => true,
+        }
+    }
+
+    /// RECORD a detected member mismatch into `sink` and decide its disposition. Returns `Ok(())`
+    /// to CONTINUE (enumerate finding, or a tolerated skip — the member is NOT applied), or the
+    /// loud `Err` to HARD-FAIL now (`hard_err`, the specific [`BundleError::SizeMismatch`] /
+    /// [`BundleError::ChecksumMismatch`]).
+    fn record_mismatch(
+        &self,
+        spec: &MemberSpec,
+        kind: MismatchKind,
+        declared: String,
+        streamed: String,
+        hard_err: BundleError,
+        sink: &mut Vec<MemberMismatch>,
+    ) -> Result<(), BundleError> {
+        let class = classify_member(spec);
+        // Enumerate is an assessment: record + continue (never applied), fail at the very end.
+        // Otherwise a tolerated class is a warn+skip (success); anything else hard-fails NOW.
+        let tolerated = !self.enumerate_all && self.tolerates(class);
+        let hard = !self.enumerate_all && !tolerated;
+        sink.push(MemberMismatch {
+            path: spec.path.clone(),
+            class,
+            kind,
+            declared,
+            streamed,
+            skipped: tolerated,
+        });
+        if hard {
+            return Err(hard_err);
+        }
+        if tolerated {
+            tracing::warn!(
+                member = %spec.path, class = class.label(), kind = ?kind,
+                "import: TOLERATING a re-generable member integrity mismatch (skip-member-mismatch) \
+                 — the member is NOT applied; the target re-derives it on access"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The restore policy the v3-capable single-pass reader [`read_bundle_streaming_atomic`] drives,
 /// one method per member shape. The format layer owns the PARSE + the per-member integrity VERIFY;
 /// the implementor (the import driver) owns the APPLY (where a member is re-keyed to the target,
@@ -1348,6 +1613,40 @@ pub trait BundleRestorer {
 pub fn read_bundle_streaming_atomic<R, H>(
     src: R,
     stage_dir: &Path,
+    on_head: H,
+    restorer: &mut dyn BundleRestorer,
+) -> Result<Vec<MemberSpec>, BundleError>
+where
+    R: Read,
+    H: FnMut(bool, &SourceInfo),
+{
+    // The strict reader is the policy reader under [`VerifyPolicy::strict`] with a throwaway sink.
+    let mut mismatches = Vec::new();
+    read_bundle_streaming_atomic_policy(
+        src,
+        stage_dir,
+        &VerifyPolicy::strict(),
+        &mut mismatches,
+        on_head,
+        restorer,
+    )
+}
+
+/// The **mismatch-policy-aware** v3-capable atomic reader (PLAN-clone-robustness #1 + #2) — the
+/// superset of [`read_bundle_streaming_atomic`] the clone/import driver uses. Identical in every
+/// respect except that a member whose streamed bytes disagree with its declared size/SHA-256 is
+/// routed through `policy`: strict (the default) hard-fails on the first mismatch; ENUMERATE-ALL
+/// scans every member, APPLIES none that mismatch, records each into `mismatches`, and fails at the
+/// END with [`BundleError::MembersMismatched`]; SKIP-MEMBER-MISMATCH warns + continues past a
+/// mismatched member whose class the scope tolerates (re-generable `der/` derivatives by default),
+/// recording it into `mismatches`, while a baseline/primary/non-blob mismatch STILL hard-fails. A
+/// skipped/enumerated member is NEVER applied (its sidecar temp is dropped unapplied, its chunked
+/// sink dropped) and is NOT included in the returned restored-members list.
+pub fn read_bundle_streaming_atomic_policy<R, H>(
+    src: R,
+    stage_dir: &Path,
+    policy: &VerifyPolicy,
+    mismatches: &mut Vec<MemberMismatch>,
     mut on_head: H,
     restorer: &mut dyn BundleRestorer,
 ) -> Result<Vec<MemberSpec>, BundleError>
@@ -1389,17 +1688,21 @@ where
                 .find(|m| m.path == path)
                 .ok_or_else(|| BundleError::UnexpectedMember(path.clone()))?;
             let spec = MemberSpec::sidecar(mm.path.clone(), mm.kind, mm.pg.clone());
-            stage_and_verify_member(
+            let outcome = stage_verify_member_policy(
                 &mut entry,
                 &spec,
                 mm.size,
                 &mm.sha256,
                 stage_dir,
                 &mut counter,
+                policy,
+                mismatches,
                 &mut |s, t| restorer.restore_sidecar(s, t),
             )?;
             seen.insert(path);
-            restored.push(spec);
+            if outcome == MemberOutcome::Applied {
+                restored.push(spec);
+            }
         }
         for m in &manifest.members {
             if !seen.contains(&m.path) {
@@ -1448,20 +1751,27 @@ where
                             spec.path
                         )));
                     }
-                    stage_and_verify_member(
+                    let outcome = stage_verify_member_policy(
                         &mut body_entry,
                         &spec,
                         meta.size,
                         &meta.sha256,
                         stage_dir,
                         &mut counter,
+                        policy,
+                        mismatches,
                         &mut |s, t| restorer.restore_sidecar(s, t),
                     )?;
-                    restored.push(spec);
+                    if outcome == MemberOutcome::Applied {
+                        restored.push(spec);
+                    }
                 }
                 MemberFraming::ChunkedTrailer => {
-                    read_chunked_member(&mut entries, &spec, restorer)?;
-                    restored.push(spec);
+                    let outcome =
+                        read_chunked_member(&mut entries, &spec, restorer, policy, mismatches)?;
+                    if outcome == MemberOutcome::Applied {
+                        restored.push(spec);
+                    }
                 }
             }
         }
@@ -1477,6 +1787,14 @@ where
             supported: BUNDLE_FORMAT_VERSION_V3,
         });
     }
+
+    // ENUMERATE-ALL: the whole bundle was scanned and nothing mismatched member applied — now raise
+    // the loud aggregate reject so an operator sees the full scope (the detail is in `mismatches`).
+    if policy.enumerate_all && !mismatches.is_empty() {
+        return Err(BundleError::MembersMismatched {
+            count: mismatches.len(),
+        });
+    }
     Ok(restored)
 }
 
@@ -1489,7 +1807,9 @@ fn read_chunked_member<R: Read>(
     entries: &mut tar::Entries<'_, R>,
     spec: &MemberSpec,
     restorer: &mut dyn BundleRestorer,
-) -> Result<(), BundleError> {
+    policy: &VerifyPolicy,
+    mismatches: &mut Vec<MemberMismatch>,
+) -> Result<MemberOutcome, BundleError> {
     restorer.begin_chunked(spec)?;
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
@@ -1578,26 +1898,49 @@ fn read_chunked_member<R: Read>(
             let actual = hex::encode(hasher.finalize());
             let verified = total == trailer.size && actual == trailer.sha256;
             // Tell the sink whether to commit or drop BEFORE raising a loud mismatch, so the
-            // shadow is torn down on a bad member even as the error propagates.
+            // shadow is torn down on a bad member even as the error propagates. A skipped/enumerated
+            // member is ALWAYS dropped (nothing partial reaches live) — only a VERIFIED member
+            // commits.
             restorer.finish_chunked(spec, verified)?;
+            if verified {
+                return Ok(MemberOutcome::Applied);
+            }
+            // A well-formed trailer that disagrees with the streamed bytes — the declared≠streamed
+            // mismatch the policy governs (size first, then checksum). The sink was already dropped.
             if total != trailer.size {
-                return Err(BundleError::SizeMismatch {
-                    path: spec.path.clone(),
-                    expected: trailer.size,
-                    actual: total,
-                });
+                policy.record_mismatch(
+                    spec,
+                    MismatchKind::Size,
+                    trailer.size.to_string(),
+                    total.to_string(),
+                    BundleError::SizeMismatch {
+                        path: spec.path.clone(),
+                        expected: trailer.size,
+                        actual: total,
+                    },
+                    mismatches,
+                )?;
+                return Ok(MemberOutcome::Skipped);
             }
-            if actual != trailer.sha256 {
-                return Err(BundleError::ChecksumMismatch {
-                    path: spec.path.clone(),
-                    expected: trailer.sha256,
-                    actual,
-                });
-            }
-            Ok(())
+            let hard = BundleError::ChecksumMismatch {
+                path: spec.path.clone(),
+                expected: trailer.sha256.clone(),
+                actual: actual.clone(),
+            };
+            policy.record_mismatch(
+                spec,
+                MismatchKind::Checksum,
+                trailer.sha256,
+                actual,
+                hard,
+                mismatches,
+            )?;
+            Ok(MemberOutcome::Skipped)
         }
         Err(e) => {
-            // Abort the sink (drop the shadow) on any streaming/parse failure, then surface it.
+            // Abort the sink (drop the shadow) on any streaming/parse failure, then surface it. A
+            // malformed/truncated-before-trailer member is a HARD structural failure, never a
+            // tolerable declared≠streamed mismatch — it is not routed through the policy.
             let _ = restorer.finish_chunked(spec, false);
             Err(e)
         }
@@ -2688,5 +3031,411 @@ mod tests {
         let mut s = String::new();
         first.read_to_string(&mut s).unwrap();
         peek_format_version(&s).unwrap()
+    }
+
+    // ---- member-mismatch tolerance policy (clone robustness #1 + #2) -----------------------
+
+    /// Hex SHA-256 of `bytes` (test helper for crafting correct/lying sidecar checksums).
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// Build a v2 bundle of SIDECAR members whose `.brmeta` declares `(size, sha)` that may
+    /// DELIBERATELY LIE about the `body` — so the reader's integrity check fires. Members are
+    /// written in MANIFEST order.
+    fn v2_sidecar_bundle(members: &[(MemberSpec, u64, String, Vec<u8>)]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let manifest = StreamManifest {
+                magic: BUNDLE_MAGIC.to_string(),
+                format_version: BUNDLE_FORMAT_VERSION_V2,
+                created_at: 0,
+                data_only: true,
+                source: SourceInfo {
+                    project: "acme".to_string(),
+                    site: None,
+                },
+                members: members.iter().map(|(s, ..)| s.clone()).collect(),
+                delta: None,
+            };
+            append_bytes(&mut b, MANIFEST_PATH, 0, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+            for (spec, size, sha, body) in members {
+                let meta = MemberMeta {
+                    size: *size,
+                    sha256: sha.clone(),
+                };
+                append_bytes(
+                    &mut b,
+                    &StreamManifest::meta_path(&spec.path),
+                    0,
+                    &serde_json::to_vec(&meta).unwrap(),
+                )
+                .unwrap();
+                append_bytes(&mut b, &spec.path, 0, body).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        buf
+    }
+
+    fn blob_member(path: &str) -> MemberSpec {
+        MemberSpec::sidecar(path.to_string(), MemberKind::Blob, None)
+    }
+
+    fn der_skip() -> VerifyPolicy {
+        VerifyPolicy {
+            enumerate_all: false,
+            skip_mismatch: true,
+            skip_scope: SkipScope::DerivativesOnly,
+        }
+    }
+
+    /// Classification maps a member's path+kind to the right class (the boundary the policy keys
+    /// off). A blob under `der/` is skippable; `base/` + any other blob + every non-blob member are
+    /// NOT.
+    #[test]
+    fn classify_member_der_base_primary_and_nonblob() {
+        assert_eq!(
+            classify_member(&blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg")),
+            MemberClass::Derivative
+        );
+        assert_eq!(
+            classify_member(&blob_member("blobs/hblob/acme/blog/img/base/abc.jpg")),
+            MemberClass::Baseline
+        );
+        assert_eq!(
+            classify_member(&blob_member("blobs/hblob/acme/blog/photo.png")),
+            MemberClass::PrimaryBlob
+        );
+        // A SQL dump / KV slice / identity member is NonBlob whatever its path looks like.
+        assert_eq!(
+            classify_member(&MemberSpec::sidecar(
+                "sql/der.pgc".to_string(),
+                MemberKind::PgDump,
+                None
+            )),
+            MemberClass::NonBlob
+        );
+        assert_eq!(
+            classify_member(&MemberSpec::sidecar(
+                KV_MEMBER_PATH.to_string(),
+                MemberKind::Kv,
+                None
+            )),
+            MemberClass::NonBlob
+        );
+    }
+
+    /// THE mutation-verified der-vs-baseline boundary: the SAME lying bytes are SKIPPED at a `der/`
+    /// path (tolerated, never applied, import OK) but HARD-FAIL at a `base/` path — flip the class,
+    /// flip the outcome.
+    #[test]
+    fn der_mismatch_skipped_baseline_mismatch_hard_fails() {
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let body = b"stale-regenerable-thumbnail-bytes".to_vec();
+
+        // der/: a lying checksum (size honest) → ChecksumMismatch, but TOLERATED under der-skip.
+        let der = blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg");
+        let bundle = v2_sidecar_bundle(&[(der, body.len() as u64, "00".repeat(32), body.clone())]);
+        let mut mm = Vec::new();
+        let mut r = RecordingRestorer::default();
+        let restored = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &der_skip(),
+            &mut mm,
+            |_, _| {},
+            &mut r,
+        )
+        .unwrap();
+        assert!(restored.is_empty(), "a skipped der member is not restored");
+        assert!(r.sidecars.is_empty(), "a skipped der member is NEVER applied");
+        assert_eq!(mm.len(), 1);
+        assert_eq!(mm[0].class, MemberClass::Derivative);
+        assert_eq!(mm[0].kind, MismatchKind::Checksum);
+        assert!(mm[0].skipped, "the der member was tolerated");
+
+        // MUTATION FLIP — the identical lying member at a BASELINE path hard-fails (the integrity
+        // line): same bytes, same lie, only the class changed from der → base.
+        let base = blob_member("blobs/hblob/acme/blog/img/base/abc.jpg");
+        let bundle = v2_sidecar_bundle(&[(base, body.len() as u64, "00".repeat(32), body.clone())]);
+        let mut mm2 = Vec::new();
+        let mut r2 = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &der_skip(),
+            &mut mm2,
+            |_, _| {},
+            &mut r2,
+        );
+        assert!(
+            matches!(res, Err(BundleError::ChecksumMismatch { .. })),
+            "a BASELINE mismatch HARD-FAILS under the der-only scope: {res:?}"
+        );
+        assert!(r2.sidecars.is_empty(), "nothing applied on the hard fail");
+        assert_eq!(mm2.len(), 1, "the baseline mismatch is still recorded");
+        assert!(!mm2[0].skipped, "a hard-failed member is recorded as NOT skipped");
+    }
+
+    /// The STRICT default is unchanged: a `der/` mismatch STILL hard-fails when `skip_mismatch` is
+    /// off (so tolerance is strictly opt-in — the mutation sensitivity for the skip flag itself).
+    #[test]
+    fn strict_policy_hard_fails_even_a_der_mismatch() {
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let body = b"x".to_vec();
+        let der = blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg");
+        let bundle = v2_sidecar_bundle(&[(der, body.len() as u64, "00".repeat(32), body.clone())]);
+        let mut mm = Vec::new();
+        let mut r = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &VerifyPolicy::strict(),
+            &mut mm,
+            |_, _| {},
+            &mut r,
+        );
+        assert!(matches!(res, Err(BundleError::ChecksumMismatch { .. })), "{res:?}");
+        // The 4-arg strict reader (legacy callers) behaves identically.
+        let bundle2 = v2_sidecar_bundle(&[(
+            blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg"),
+            1,
+            "00".repeat(32),
+            b"x".to_vec(),
+        )]);
+        let mut r2 = RecordingRestorer::default();
+        assert!(matches!(
+            read_bundle_streaming_atomic(bundle2.as_slice(), &stage, |_, _| {}, &mut r2),
+            Err(BundleError::ChecksumMismatch { .. })
+        ));
+    }
+
+    /// ENUMERATE-ALL scans the WHOLE bundle, records EVERY mismatch (size + checksum), applies none
+    /// of the bad members (but DOES apply the good ones), and fails at the END.
+    #[test]
+    fn enumerate_all_collects_every_mismatch_and_fails_at_end() {
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let der_body = b"der-bytes".to_vec();
+        let base_body = b"base-bytes-longer".to_vec();
+        let good_body = b"BRKVDUMP-GOOD".to_vec();
+        let members = vec![
+            // der/: lying CHECKSUM (size honest).
+            (
+                blob_member("blobs/hblob/acme/blog/img/der/abc/512.jpg"),
+                der_body.len() as u64,
+                "11".repeat(32),
+                der_body.clone(),
+            ),
+            // a GOOD KV member in the middle — must still be applied under enumerate.
+            (
+                MemberSpec::sidecar(KV_MEMBER_PATH.to_string(), MemberKind::Kv, None),
+                good_body.len() as u64,
+                sha_hex(&good_body),
+                good_body.clone(),
+            ),
+            // base/: lying SIZE (declares a wrong, larger size).
+            (
+                blob_member("blobs/hblob/acme/blog/img/base/def.jpg"),
+                base_body.len() as u64 + 99,
+                sha_hex(&base_body),
+                base_body.clone(),
+            ),
+        ];
+        let bundle = v2_sidecar_bundle(&members);
+        let policy = VerifyPolicy {
+            enumerate_all: true,
+            skip_mismatch: false,
+            skip_scope: SkipScope::DerivativesOnly,
+        };
+        let mut mm = Vec::new();
+        let mut r = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &policy,
+            &mut mm,
+            |_, _| {},
+            &mut r,
+        );
+        assert!(
+            matches!(res, Err(BundleError::MembersMismatched { count: 2 })),
+            "enumerate fails at the end with the full count: {res:?}"
+        );
+        assert_eq!(mm.len(), 2, "both mismatches collected in one pass");
+        assert_eq!(mm[0].class, MemberClass::Derivative);
+        assert_eq!(mm[0].kind, MismatchKind::Checksum);
+        assert_eq!(mm[1].class, MemberClass::Baseline);
+        assert_eq!(mm[1].kind, MismatchKind::Size);
+        assert!(mm.iter().all(|m| !m.skipped), "enumerate findings are reported, not skipped");
+        // The GOOD member was applied; neither bad member was.
+        assert_eq!(r.sidecars.len(), 1, "only the good KV member applied");
+        assert_eq!(r.sidecars[0].0.path, KV_MEMBER_PATH);
+    }
+
+    /// The broad `AnyBlob` opt-in tolerates a BASELINE mismatch — but a NON-BLOB (KV) mismatch STILL
+    /// hard-fails under ANY scope (the load-bearing floor: DB/KV/identity is never blessed).
+    #[test]
+    fn any_blob_scope_tolerates_baseline_but_never_a_nonblob() {
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let any = VerifyPolicy {
+            enumerate_all: false,
+            skip_mismatch: true,
+            skip_scope: SkipScope::AnyBlob,
+        };
+
+        // A baseline mismatch is tolerated under AnyBlob.
+        let body = b"baseline-bytes".to_vec();
+        let bundle = v2_sidecar_bundle(&[(
+            blob_member("blobs/hblob/acme/blog/img/base/abc.jpg"),
+            body.len() as u64,
+            "00".repeat(32),
+            body.clone(),
+        )]);
+        let mut mm = Vec::new();
+        let mut r = RecordingRestorer::default();
+        read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &any,
+            &mut mm,
+            |_, _| {},
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(mm.len(), 1);
+        assert_eq!(mm[0].class, MemberClass::Baseline);
+        assert!(mm[0].skipped);
+        assert!(r.sidecars.is_empty());
+
+        // A NON-BLOB (KV) mismatch hard-fails even under AnyBlob — the floor the opt-in can't lift.
+        let kv_body = b"kv-bytes".to_vec();
+        let bundle = v2_sidecar_bundle(&[(
+            MemberSpec::sidecar(KV_MEMBER_PATH.to_string(), MemberKind::Kv, None),
+            kv_body.len() as u64,
+            "00".repeat(32),
+            kv_body.clone(),
+        )]);
+        let mut mm2 = Vec::new();
+        let mut r2 = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &any,
+            &mut mm2,
+            |_, _| {},
+            &mut r2,
+        );
+        assert!(
+            matches!(res, Err(BundleError::ChecksumMismatch { .. })),
+            "a NON-BLOB member is never tolerated, even under AnyBlob: {res:?}"
+        );
+    }
+
+    /// The CHUNKED path honors the policy too: a chunked `der/` member whose trailer lies is dropped
+    /// (never committed) + tolerated under der-skip; a chunked `base/` member hard-fails.
+    #[test]
+    fn chunked_der_mismatch_skipped_baseline_hard_fails() {
+        fn chunked_bundle(base_path: &str, body: &[u8], trailer_sha: &str) -> Vec<u8> {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut b = tar::Builder::new(&mut buf);
+                let manifest = StreamManifest {
+                    magic: BUNDLE_MAGIC.to_string(),
+                    format_version: BUNDLE_FORMAT_VERSION_V3,
+                    created_at: 0,
+                    data_only: true,
+                    source: SourceInfo {
+                        project: "acme".to_string(),
+                        site: None,
+                    },
+                    members: vec![MemberSpec::chunked(
+                        base_path.to_string(),
+                        MemberKind::Blob,
+                        None,
+                    )],
+                    delta: None,
+                };
+                append_bytes(&mut b, MANIFEST_PATH, 0, &serde_json::to_vec(&manifest).unwrap())
+                    .unwrap();
+                append_bytes(&mut b, &chunk_part_path(base_path, 0), 0, body).unwrap();
+                let trailer = MemberTrailer {
+                    size: body.len() as u64,
+                    sha256: trailer_sha.to_string(),
+                };
+                append_bytes(
+                    &mut b,
+                    &chunk_trailer_path(base_path),
+                    0,
+                    &serde_json::to_vec(&trailer).unwrap(),
+                )
+                .unwrap();
+                b.finish().unwrap();
+            }
+            buf
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let stage = td.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let body = b"chunked-der-bytes".to_vec();
+
+        // der/ chunked, lying trailer sha → tolerated (dropped, not committed) under der-skip.
+        let der_path = "blobs/hblob/acme/blog/img/der/abc/512.jpg";
+        let bundle = chunked_bundle(der_path, &body, &"00".repeat(32));
+        let mut mm = Vec::new();
+        let mut r = RecordingRestorer::default();
+        read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &der_skip(),
+            &mut mm,
+            |_, _| {},
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(mm.len(), 1);
+        assert_eq!(mm[0].class, MemberClass::Derivative);
+        assert!(mm[0].skipped);
+        assert_eq!(
+            r.finishes,
+            vec![(der_path.to_string(), false)],
+            "the chunked der sink is DROPPED (never committed) on a tolerated skip"
+        );
+        assert!(r.committed_chunked.is_empty());
+
+        // base/ chunked, lying trailer → hard-fail under the der-only scope.
+        let base_path = "blobs/hblob/acme/blog/img/base/abc.jpg";
+        let bundle = chunked_bundle(base_path, &body, &"00".repeat(32));
+        let mut mm2 = Vec::new();
+        let mut r2 = RecordingRestorer::default();
+        let res = read_bundle_streaming_atomic_policy(
+            bundle.as_slice(),
+            &stage,
+            &der_skip(),
+            &mut mm2,
+            |_, _| {},
+            &mut r2,
+        );
+        assert!(
+            matches!(res, Err(BundleError::ChecksumMismatch { .. })),
+            "a chunked BASELINE mismatch hard-fails: {res:?}"
+        );
+        assert_eq!(
+            r2.finishes,
+            vec![(base_path.to_string(), false)],
+            "the sink is dropped on the hard fail too"
+        );
     }
 }

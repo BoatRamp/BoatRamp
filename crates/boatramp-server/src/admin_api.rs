@@ -3248,6 +3248,20 @@ pub(super) struct ProjectImportQuery {
     /// export), instead of a streamed request body. Host-confined under the base.
     #[serde(default)]
     resumable: Option<String>,
+    /// Clone-robustness (PLAN-clone-robustness #1): scan ALL members, report EVERY declared≠streamed
+    /// integrity mismatch in one pass, and fail at the end (assessment — applies nothing that
+    /// mismatches). Default `false`.
+    #[serde(default)]
+    enumerate_mismatches: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): warn + continue past a mismatched member (not
+    /// applied — the target re-derives it), DEFAULT-scoped to re-generable `der/` derivatives.
+    /// Default `false`.
+    #[serde(default)]
+    skip_member_mismatch: bool,
+    /// Clone-robustness: broaden `skip_member_mismatch` to ANY blob member (never a non-blob one) —
+    /// the louder opt-in. Default `false`.
+    #[serde(default)]
+    skip_any_blob_mismatch: bool,
 }
 
 fn default_identity() -> String {
@@ -3333,6 +3347,9 @@ pub(super) async fn project_import(
         allow_schema_skew: q.allow_schema_skew,
         overwrite: q.overwrite,
         identity,
+        enumerate_mismatches: q.enumerate_mismatches,
+        skip_member_mismatch: q.skip_member_mismatch,
+        skip_any_blob_mismatch: q.skip_any_blob_mismatch,
     };
     // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
     // resumable export) named relative to the configured base — no request body. The host
@@ -3549,6 +3566,20 @@ pub(super) struct CloneFromRequest {
     /// Pull a `--data-only` clone (no control-plane KV / identity).
     #[serde(default)]
     data_only: bool,
+    /// Clone-robustness (PLAN-clone-robustness #1): with `verify` (or `apply`), scan ALL members
+    /// and report EVERY declared≠streamed integrity mismatch in one pass, failing at the end — the
+    /// assess-scope pass (applies nothing that mismatches). Default `false`.
+    #[serde(default)]
+    enumerate_mismatches: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): warn + continue past a mismatched member
+    /// instead of aborting the clone — the target re-derives a skipped derivative on access.
+    /// DEFAULT-scoped to re-generable `der/` derivatives. Default `false`.
+    #[serde(default)]
+    skip_member_mismatch: bool,
+    /// Clone-robustness: broaden `skip_member_mismatch` to ANY blob member (never a non-blob one) —
+    /// the louder opt-in. Default `false`.
+    #[serde(default)]
+    skip_any_blob_mismatch: bool,
 }
 
 /// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
@@ -3654,8 +3685,26 @@ pub(super) async fn clone_from(
         req.verify,
         req.overwrite,
         req.force,
+        CloneMismatchPolicy {
+            enumerate: req.enumerate_mismatches,
+            skip: req.skip_member_mismatch,
+            skip_any_blob: req.skip_any_blob_mismatch,
+        },
     )
     .await
+}
+
+/// The clone-robustness member-mismatch knobs (PLAN-clone-robustness #1 + #2) carried from the
+/// clone request into [`orchestrate_clone`] → the target's [`ImportOptions`]. Grouped so a future
+/// knob does not widen the already-long orchestrator signature.
+#[derive(Debug, Clone, Copy, Default)]
+struct CloneMismatchPolicy {
+    /// Enumerate every mismatch + fail at the end (assess scope).
+    enumerate: bool,
+    /// Warn + skip a `der/` mismatch (broadened by `skip_any_blob`).
+    skip: bool,
+    /// Broaden the skip to any blob member (never a non-blob one).
+    skip_any_blob: bool,
 }
 
 /// How often the `--apply` / `--verify` progress stream emits a transfer heartbeat (bytes pulled +
@@ -3840,6 +3889,7 @@ async fn orchestrate_clone(
     verify: bool,
     overwrite: bool,
     force: bool,
+    mismatch: CloneMismatchPolicy,
 ) -> Response {
     // 1. Manifest (cheap LIST).
     let manifest = match transport.fetch_manifest().await {
@@ -3891,6 +3941,9 @@ async fn orchestrate_clone(
         allow_schema_skew: false,
         overwrite,
         identity: boatramp_core::project_export::IdentityChoice::Fresh,
+        enumerate_mismatches: mismatch.enumerate,
+        skip_member_mismatch: mismatch.skip,
+        skip_any_blob_mismatch: mismatch.skip_any_blob,
     };
     clone_progress_response(cap, target, plan, reader, opts)
 }
@@ -6172,6 +6225,7 @@ mod tests {
             false, // verify
             false, // overwrite
             false, // force
+            CloneMismatchPolicy::default(),
         )
         .await;
 
@@ -6224,6 +6278,7 @@ mod tests {
             false, // verify
             false, // overwrite
             false, // force
+            CloneMismatchPolicy::default(),
         )
         .await;
 
@@ -6287,6 +6342,7 @@ mod tests {
             false,
             false,
             false,
+            CloneMismatchPolicy::default(),
         )
         .await;
 

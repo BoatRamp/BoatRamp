@@ -68,6 +68,23 @@ impl Manifest {
         }
         hashes
     }
+
+    /// Every blob hash this manifest references paired with the DECLARED byte size recorded for it
+    /// (a file entry and each precompressed variant), including variants. This is the size the
+    /// serve path emits as `Content-Length`, so a blob whose stored object is shorter than its
+    /// declared size would stream a truncated/hung response — the declared≠stored class `blob
+    /// verify` detects (PLAN-clone-robustness #3). A hash that appears more than once (shared
+    /// content) keeps its first declared size; the sizes agree when the content is identical.
+    pub fn blob_sizes(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut sizes = std::collections::BTreeMap::new();
+        for entry in self.files.values() {
+            sizes.entry(entry.hash.clone()).or_insert(entry.size);
+            for variant in entry.variants.values() {
+                sizes.entry(variant.hash.clone()).or_insert(variant.size);
+            }
+        }
+        sizes
+    }
 }
 
 /// SHA-256 of `data`, hex-encoded.
@@ -75,4 +92,38 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::{FileEntry, Variant};
+
+    #[test]
+    fn blob_sizes_pairs_every_hash_with_its_declared_size_incl_variants() {
+        let mut m = Manifest::default();
+        let mut variants = BTreeMap::new();
+        variants.insert(
+            "br".to_string(),
+            Variant {
+                hash: "varhash".to_string(),
+                size: 100,
+            },
+        );
+        m.files.insert(
+            "index.html".to_string(),
+            FileEntry {
+                hash: "filehash".to_string(),
+                size: 4096,
+                content_type: Some("text/html".to_string()),
+                variants,
+            },
+        );
+        let sizes = m.blob_sizes();
+        assert_eq!(sizes.get("filehash"), Some(&4096), "the file entry's declared size");
+        assert_eq!(sizes.get("varhash"), Some(&100), "a variant's declared size too");
+        // Same keyset as blob_hashes (so the size map covers exactly the referenced blobs).
+        let hashes = m.blob_hashes();
+        assert_eq!(sizes.keys().cloned().collect::<BTreeSet<_>>(), hashes);
+    }
 }

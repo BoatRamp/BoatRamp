@@ -220,6 +220,27 @@ enum ProjectCommand {
         /// BOATRAMP_EXPORT_TRANSPORT_KEY, then an interactive prompt.
         #[arg(long, value_name = "FILE")]
         transport_key_file: Option<std::path::PathBuf>,
+        /// Clone robustness — ASSESS SCOPE: scan every member and report EVERY declared≠streamed
+        /// integrity mismatch (path + class: der/base/primary) in one pass, then FAIL at the end,
+        /// instead of aborting at the first. Applies nothing that mismatches — an assessment, so
+        /// pair it with a dry-run (no `--apply`) or `--clone-verify`. Tells you "1 stale blob or
+        /// many?" before any fix-blind retry.
+        #[arg(long)]
+        enumerate_mismatches: bool,
+        /// Clone robustness — GET THE CLONE THROUGH: WARN + CONTINUE past a member whose stored
+        /// bytes disagree with its declared size/checksum, instead of hard-failing. DEFAULT-scoped
+        /// to re-generable `der/` image derivatives (the target re-derives a skipped one on
+        /// access); a mismatch on a baseline, a primary/original blob, or any DB/KV/identity member
+        /// STILL hard-fails. Broaden with `--skip-member-mismatch-any-blob`.
+        #[arg(long)]
+        skip_member_mismatch: bool,
+        /// Clone robustness — the LOUDER opt-in: broaden `--skip-member-mismatch` beyond `der/`
+        /// derivatives to ANY blob member (baselines + primaries too). NEVER tolerates a non-blob
+        /// (DB/KV/identity) member even so. Dangerous — it blesses a truncation on load-bearing
+        /// blob data; prefer fixing the source (`blob reconcile`/`blob purge`). Requires
+        /// `--skip-member-mismatch`.
+        #[arg(long, requires = "skip_member_mismatch")]
+        skip_member_mismatch_any_blob: bool,
     },
 }
 
@@ -948,7 +969,15 @@ pub async fn run(
             clone_source_token_file,
             clone_data_only,
             clone_verify,
+            enumerate_mismatches,
+            skip_member_mismatch,
+            skip_member_mismatch_any_blob,
         } => {
+            let mismatch = crate::client::MismatchFlags {
+                enumerate: enumerate_mismatches,
+                skip: skip_member_mismatch,
+                skip_any_blob: skip_member_mismatch_any_blob,
+            };
             // STREAMING CLONE from a live source node — a distinct mode (no bundle file).
             if let Some(source_url) = clone_from {
                 let source_token = resolve_source_token(clone_source_token_file.as_deref())?;
@@ -963,6 +992,7 @@ pub async fn run(
                         overwrite,
                         force,
                         clone_data_only,
+                        mismatch,
                     )
                     .await?;
                 return Ok(match outcome {
@@ -1006,6 +1036,7 @@ pub async fn run(
                     overwrite,
                     &identity,
                     transport_key,
+                    mismatch,
                 )
                 .await?
             };

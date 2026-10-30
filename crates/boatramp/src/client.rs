@@ -54,6 +54,20 @@ pub enum CloneOutcome {
     },
 }
 
+/// Clone-robustness member-mismatch knobs (PLAN-clone-robustness #1 + #2) shared by
+/// [`ApiClient::project_import`] and [`ApiClient::project_clone_from`] — carried to the node's
+/// import as query params (file import) / JSON (clone). All-false (the [`Default`]) is the strict,
+/// hard-fail-the-first-mismatch behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MismatchFlags {
+    /// Scan ALL members, report EVERY declared≠streamed mismatch in one pass, fail at the end.
+    pub enumerate: bool,
+    /// Warn + continue past a mismatched member (not applied), scoped to re-generable `der/`.
+    pub skip: bool,
+    /// Broaden `skip` to ANY blob member (never a non-blob one) — the louder opt-in.
+    pub skip_any_blob: bool,
+}
+
 /// Resolve the API token from `BOATRAMP_TOKEN` or `publish.token`.
 pub fn token(config: &ProjectConfig) -> Option<String> {
     std::env::var("BOATRAMP_TOKEN")
@@ -933,6 +947,7 @@ impl ControlPlane {
     // overwrite/identity/transport-key); a wrapper struct would only move the same fields the
     // single CLI caller already unpacks, so mirror the API surface directly.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn project_import(
         &self,
         project: &str,
@@ -943,6 +958,7 @@ impl ControlPlane {
         overwrite: bool,
         identity: &str,
         transport_key: Option<Vec<u8>>,
+        mismatch: MismatchFlags,
     ) -> Result<String> {
         let Self {
             http: client,
@@ -953,18 +969,19 @@ impl ControlPlane {
             .await
             .map_err(|e| ClientError::Refused(format!("cannot open {}: {e}", bundle.display())))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let bstr = |b: bool| if b { "true" } else { "false" };
         let mut req = client
             .post(format!("{server}/api/project-import"))
             .query(&[
                 ("project", project),
-                ("apply", if apply { "true" } else { "false" }),
-                ("force", if force { "true" } else { "false" }),
-                (
-                    "allow_schema_skew",
-                    if allow_schema_skew { "true" } else { "false" },
-                ),
-                ("overwrite", if overwrite { "true" } else { "false" }),
+                ("apply", bstr(apply)),
+                ("force", bstr(force)),
+                ("allow_schema_skew", bstr(allow_schema_skew)),
+                ("overwrite", bstr(overwrite)),
                 ("identity", identity),
+                ("enumerate_mismatches", bstr(mismatch.enumerate)),
+                ("skip_member_mismatch", bstr(mismatch.skip)),
+                ("skip_any_blob_mismatch", bstr(mismatch.skip_any_blob)),
             ])
             .header("content-type", "application/octet-stream");
         if let Some(key) = &transport_key {
@@ -1012,6 +1029,7 @@ impl ControlPlane {
         overwrite: bool,
         force: bool,
         data_only: bool,
+        mismatch: MismatchFlags,
     ) -> Result<CloneOutcome> {
         use boatramp_core::project_export::{CloneEvent, ClonePlan};
         let Self {
@@ -1031,6 +1049,9 @@ impl ControlPlane {
             "overwrite": overwrite,
             "force": force,
             "data_only": data_only,
+            "enumerate_mismatches": mismatch.enumerate,
+            "skip_member_mismatch": mismatch.skip,
+            "skip_any_blob_mismatch": mismatch.skip_any_blob,
         });
         if let Some(sp) = source_project {
             body["source_project"] = serde_json::Value::String(sp.to_string());
@@ -2489,15 +2510,21 @@ impl ControlPlane {
         mode: &str,
         apply: bool,
         prefix: Option<&str>,
+        superseded_ext: Option<&str>,
     ) -> Result<serde_json::Value> {
         let Self {
             http, base: server, ..
         } = self;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "mode": mode,
             "apply": apply,
             "prefix": prefix,
         });
+        // Only the `legacy_derivatives` mode reads `superseded_ext`; the server rejects an unknown
+        // field, so send it ONLY when present.
+        if let Some(ext) = superseded_ext {
+            body["superseded_ext"] = serde_json::Value::String(ext.to_string());
+        }
         let resp = http
             .post(format!("{server}/api/blob-purge"))
             .json(&body)
@@ -2543,6 +2570,40 @@ impl ControlPlane {
             .send()
             .await?
             .error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    /// Guarded blob reconcile (`POST /api/blob-reconcile`, `System·Admin`, PLAN-clone-robustness #4):
+    /// bless an index↔object size drift by re-writing each in-scope object so its declared size
+    /// matches its body. Dry-run unless `apply`; `include_primary` is the audited opt-in to also
+    /// reconcile baseline/primary objects (default der/-only). Returns the JSON report object.
+    pub async fn blob_reconcile(
+        &self,
+        prefix: Option<&str>,
+        apply: bool,
+        include_primary: bool,
+    ) -> Result<serde_json::Value> {
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = serde_json::json!({
+            "prefix": prefix,
+            "apply": apply,
+            "include_primary": include_primary,
+        });
+        let resp = http
+            .post(format!("{server}/api/blob-reconcile"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "blob reconcile refused ({status}): {}",
+                text.trim()
+            )));
+        }
         Ok(resp.json::<serde_json::Value>().await?)
     }
 
