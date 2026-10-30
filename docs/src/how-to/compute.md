@@ -7,10 +7,13 @@ runtime, or code that needs a full OS. For the choice between a handler, a
 container, and a microVM, see
 [Compute: handlers vs containers vs microVMs](../explanation/compute-model.md).
 
-Compute backends are Linux-only and capability-detected at startup: a container
-backend where the host allows it, and a microVM backend where `/dev/kvm` exists.
-Enable compute by adding a `compute:` section to `boatramp.cfg` (see the
-[schema](../reference/boatramp-cfg.md#compute)).
+Compute backends are capability-detected at startup: on Linux, a container
+backend where the host allows it and a microVM backend where `/dev/kvm` exists;
+on Apple-silicon macOS (15+), a native microVM backend (`vmm-vz`) via
+Virtualization.framework (see "Kernels are per guest-arch" below). Elsewhere
+(Intel macOS, Windows), compute runs through the remote-`docker` backend
+against a reachable Docker daemon. Enable compute by adding a `compute:`
+section to `boatramp.cfg` (see the [schema](../reference/boatramp-cfg.md#compute)).
 
 ## Provision a kernel
 

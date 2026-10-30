@@ -63,6 +63,7 @@ Some features imply others: `http3`/`acme-dns` imply `tls`; `cluster` implies
 | `blob-upload-cloud` | yes | The **cloud** blob-upload minters (`blob-upload-aws`/`-gcs`/`-azure`): broker a native scoped credential (AWS STS session policy / GCS signed URL + CAB / Azure user-delegation SAS) so a client uploads directly to a cloud-backed blob container. |
 | `console` | yes | Bake the web management console (a Wasm SPA) into the binary; serve it at an operator-configured host+path (`[serve.console]`). On in every shipped build (release binaries + Nix/OCI images), which stage the built SPA in; a from-source build embeds a placeholder unless you build the SPA first with `just console`. |
 | `mcp` | yes | The [Model Context Protocol](../how-to/mcp.md) server: the `boatramp mcp` stdio subcommand + the HTTP `/mcp` endpoint on `serve`. Also enables `boatramp-server/mcp`. |
+| `sandbox` | yes | The whole-process OS sandbox (privsep Phase 0): seccomp-bpf + Landlock, installed on the serving process before it starts serving. **Linux-only** — on another platform this feature compiles only the documented no-op path, so the default build still builds everywhere. Runtime behavior is `[serve.sandbox]`'s `posture` (default `auto`); see the [config reference](./boatramp-cfg.md#servesandbox). |
 
 Two more features are on by default but omitted from the table above:
 `domain-verify-dns` (verify a host's `_boatramp-verify` TXT over public DNS) and
@@ -86,12 +87,15 @@ execution backends differ:
 | Platform | Compute backends |
 | --- | --- |
 | Linux `x86_64`, `aarch64` | microVM (needs `/dev/kvm`), native container, remote-docker |
-| macOS, Windows | remote-docker only |
+| macOS (Apple silicon, macOS 15+) | native microVM via Virtualization.framework (`vmm-vz`), remote-docker |
+| macOS (Intel), Windows | remote-docker only |
 
-The microVM and native-container backends need `/dev/kvm`, namespaces, and the
-jailer, so they are Linux-only; on macOS and Windows that code compiles to
-no-ops and compute runs through the remote-docker backend against a Linux Docker
-host.
+The microVM and native-container Linux backends need `/dev/kvm`, namespaces, and
+the jailer, so they are Linux-only. Apple-silicon macOS instead gets its own
+native microVM backend (`vmm-vz`, boots each replica as a Linux VM via
+Virtualization.framework — see [`compute`](./boatramp-cfg.md#compute)); Intel
+macOS and Windows have no native backend, so compute there runs through the
+remote-docker backend against a Linux Docker host.
 
 ## See also
 
