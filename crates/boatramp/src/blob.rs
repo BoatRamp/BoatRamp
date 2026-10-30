@@ -608,42 +608,88 @@ fn write_status(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::i
     }
 }
 
-/// Render the `blob verify` dead-reference report (human lines).
+/// Render the `blob verify` report (human lines): dead references (missing) + size mismatches
+/// (declared≠stored).
 fn write_verify(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
     let dead = state
         .get("dead_references")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if dead.is_empty() {
+    let size_mismatches = state
+        .get("size_mismatches")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if dead.is_empty() && size_mismatches.is_empty() {
         return writeln!(
             w,
-            "blob verify: OK — every referenced blob is present in the backend."
+            "blob verify: OK — every referenced blob is present AND matches its declared size."
         );
     }
-    writeln!(
-        w,
-        "blob verify: {} DEAD reference(s) — referenced by a live deployment/function but MISSING \
-         from the backend (would 404 on invoke/serve):",
-        dead.len()
-    )?;
-    for d in &dead {
-        let hash = d
-            .get("hash")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let referrer = d
-            .get("referrer")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        writeln!(w, "  • {hash}  ({referrer})")?;
+
+    if !dead.is_empty() {
+        writeln!(
+            w,
+            "blob verify: {} DEAD reference(s) — referenced by a live deployment/function but \
+             MISSING from the backend (would 404 on invoke/serve):",
+            dead.len()
+        )?;
+        for d in &dead {
+            let hash = d
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let referrer = d
+                .get("referrer")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            writeln!(w, "  • {hash}  ({referrer})")?;
+        }
+        writeln!(
+            w,
+            "\nTo repair a dead reference: re-upload each missing blob (`boatramp blob put <file>` \
+             restores it under the same content hash) or re-deploy the resource."
+        )?;
     }
-    writeln!(
-        w,
-        "\nTo repair: re-upload each missing blob (`boatramp blob put <file>` restores it under the \
-         same content hash) or re-deploy the resource. (A node on this release no longer creates \
-         these — GC now references live function components.)"
-    )
+
+    if !size_mismatches.is_empty() {
+        if !dead.is_empty() {
+            writeln!(w)?;
+        }
+        writeln!(
+            w,
+            "blob verify: {} SIZE mismatch(es) — the backend stores a different byte count than the \
+             manifest declares (a truncated/hung Content-Length; also blocks a streaming clone):",
+            size_mismatches.len()
+        )?;
+        for m in &size_mismatches {
+            let hash = m
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let referrer = m
+                .get("referrer")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let declared = m.get("declared").and_then(serde_json::Value::as_u64);
+            let stored = m.get("stored").and_then(serde_json::Value::as_u64);
+            let declared = declared.map_or_else(|| "?".to_string(), |v| v.to_string());
+            let stored = stored.map_or_else(|| "(backend reports no size)".to_string(), |v| v.to_string());
+            writeln!(
+                w,
+                "  • {hash}  declared {declared}, stored {stored}  ({referrer})"
+            )?;
+        }
+        writeln!(
+            w,
+            "\nTo repair a size mismatch: a re-generable derivative can be blessed with `boatramp \
+             blob reconcile` (recomputes the declared size from the stored bytes); on primary data \
+             a mismatch signals a truncation/corruption to investigate (re-upload / re-deploy)."
+        )?;
+    }
+    Ok(())
 }
 
 /// Render the `blob rehome` summary (human line).

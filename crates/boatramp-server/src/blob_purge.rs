@@ -211,23 +211,43 @@ pub(super) async fn blob_status(State(deploy): State<DeployStore>) -> Response {
     Json(serde_json::json!({ "blob_fallback_active": active })).into_response()
 }
 
-/// Dead content-addressed references (`GET /api/blob-verify`, `System·Read`): every blob a LIVE site
-/// deployment or function references but that is MISSING from the backend — an invoke/serve of it
-/// would 404 (a production `identity` incident shape). Read-only. To repair a dead reference,
-/// re-upload the bytes (`boatramp blob put <file>`) or re-deploy the resource; the fix that STOPS the
-/// GC from creating them (referencing live function components) shipped alongside this.
+/// Blob integrity report (`GET /api/blob-verify`, `System·Read`). Read-only, two classes:
+/// - `dead_references` — every blob a LIVE site deployment or function references but that is
+///   MISSING from the backend (an invoke/serve would 404 — a production `identity` incident shape);
+/// - `size_mismatches` — every referenced blob whose DECLARED size (a live manifest entry/variant)
+///   disagrees with the size the backend STORES (the index↔object drift that streams a truncated
+///   `Content-Length` response and makes a streaming clone fail-closed — PLAN-clone-robustness #3).
+///
+/// To repair a dead reference, re-upload the bytes (`boatramp blob put <file>`) or re-deploy the
+/// resource. A size mismatch on a re-generable derivative can be blessed with `boatramp blob
+/// reconcile`; on primary data it signals a truncation/corruption to investigate.
 pub(super) async fn blob_verify(State(deploy): State<DeployStore>) -> Response {
-    match deploy
-        .verify_blobs(&boatramp_core::deploy::GcOptions::default())
-        .await
-    {
-        Ok(dead) => Json(serde_json::json!({ "dead_references": dead })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("blob verify failed: {e}\n"),
-        )
-            .into_response(),
-    }
+    let opts = boatramp_core::deploy::GcOptions::default();
+    let dead = match deploy.verify_blobs(&opts).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob verify failed: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let size_mismatches = match deploy.verify_blob_sizes(&opts).await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob verify (size) failed: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({
+        "dead_references": dead,
+        "size_mismatches": size_mismatches,
+    }))
+    .into_response()
 }
 
 /// Serialize the final `unreferenced` (GC) report line (trailing `\n`), tagged `"type":"report"`.

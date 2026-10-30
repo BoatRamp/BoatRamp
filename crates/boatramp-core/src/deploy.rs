@@ -79,6 +79,24 @@ pub struct DeadBlobReference {
     pub referrer: String,
 }
 
+/// A referenced blob whose DECLARED size (in a live manifest's file entry / variant) disagrees with
+/// the size the backend actually STORES — an index↔object drift (`boatramp blob verify`,
+/// PLAN-clone-robustness #3). The serve path emits the declared size as `Content-Length`, so a
+/// stored object shorter than its declared size streams a truncated/hung response; such a blob is
+/// also exactly what makes a streaming clone of this project fail-closed. Read-only detection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlobSizeMismatch {
+    /// The blob's content hash (its CAS key is `{hash[..2]}/{hash}`).
+    pub hash: String,
+    /// A human hint at what references it.
+    pub referrer: String,
+    /// The size the manifest declares for this blob (the `Content-Length` the serve path emits).
+    pub declared: u64,
+    /// The size the backend actually stores (`head().size`); `None` when the backend reports no
+    /// size (so a bare presence check could not compare — surfaced so it is not silently ignored).
+    pub stored: Option<u64>,
+}
+
 /// Most recent activations retained per site.
 const MAX_HISTORY: usize = 100;
 
@@ -4314,6 +4332,76 @@ impl DeployStore {
         Ok(dead)
     }
 
+    /// Every referenced blob hash paired with the DECLARED size recorded for it in a live/in-grace
+    /// site manifest (file entries + precompressed variants). The size-aware companion of
+    /// [`referenced_blobs`](Self::referenced_blobs). Function-component blobs are EXCLUDED — they
+    /// carry only a content hash, no declared size, so there is nothing to compare (their integrity
+    /// is the hash, covered by [`scrub_blobs`](Self::scrub_blobs)).
+    pub async fn referenced_blob_sizes(
+        &self,
+        opts: &GcOptions,
+    ) -> Result<std::collections::BTreeMap<String, u64>, DeployError> {
+        let live_ids = self.live_deployment_ids(opts).await?;
+        let now = now_unix();
+        let mut sizes = std::collections::BTreeMap::new();
+        for key in self.kv.list_prefix("manifests/").await? {
+            let id = key.strip_prefix("manifests/").unwrap_or(&key);
+            if (live_ids.contains(id) || self.within_grace(id, now, opts).await?)
+                && let Some(bytes) = self.kv.get(&key).await?
+                && let Ok(manifest) = Manifest::from_bytes(&bytes)
+            {
+                for (hash, size) in manifest.blob_sizes() {
+                    sizes.entry(hash).or_insert(size);
+                }
+            }
+        }
+        Ok(sizes)
+    }
+
+    /// Referenced blobs whose DECLARED size (a live manifest's entry/variant) disagrees with the
+    /// size the backend STORES — the index↔object drift (`boatramp blob verify`,
+    /// PLAN-clone-robustness #3). Read-only: it `head`s each referenced blob and compares. A blob
+    /// that is ABSENT is NOT reported here (that is a dead reference, [`verify_blobs`](Self::verify_blobs)'s
+    /// job); a present blob whose backend reports NO size is recorded with `stored: None` (surfaced,
+    /// never silently passed). NOTE this detects the declared≠stored drift against the MANIFEST's
+    /// declared size; it is the host-CAS site-file analogue of the clone's der/ derivative drift.
+    pub async fn verify_blob_sizes(
+        &self,
+        opts: &GcOptions,
+    ) -> Result<Vec<BlobSizeMismatch>, DeployError> {
+        let declared = self.referenced_blob_sizes(opts).await?;
+        let mut mismatches = Vec::new();
+        for (hash, declared_size) in declared {
+            match self.storage.head(&keys::blob(&hash)).await {
+                Ok(meta) => match meta.size {
+                    Some(stored) if stored == declared_size => {}
+                    Some(stored) => {
+                        let referrer = self.describe_blob_referrer(&hash).await;
+                        mismatches.push(BlobSizeMismatch {
+                            hash,
+                            referrer,
+                            declared: declared_size,
+                            stored: Some(stored),
+                        });
+                    }
+                    None => {
+                        let referrer = self.describe_blob_referrer(&hash).await;
+                        mismatches.push(BlobSizeMismatch {
+                            hash,
+                            referrer,
+                            declared: declared_size,
+                            stored: None,
+                        });
+                    }
+                },
+                // Absent is a DEAD reference, not a size mismatch — left to `verify_blobs`.
+                Err(StorageError::NotFound(_)) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(mismatches)
+    }
+
     /// Best-effort human description of what references `hash` (a live function `project/name`, or a
     /// site deployment) — for the `verify` report. Returns `"unknown"` if it can't be attributed.
     async fn describe_blob_referrer(&self, hash: &str) -> String {
@@ -7544,6 +7632,78 @@ mod tests {
             dead[0].referrer.contains("identity"),
             "the dead reference must name the referring function: {}",
             dead[0].referrer
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_blob_sizes_detects_declared_vs_stored_drift() {
+        // A live manifest declares a blob's size, but the STORED object is a DIFFERENT length (the
+        // stale/truncated-derivative shape — declared 26599 but 9 bytes stored). `verify_blob_sizes`
+        // reports exactly that drift and ignores a blob whose declared size matches its stored size.
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+        let bad = sha256_hex(b"stale-key-bad");
+        let good = sha256_hex(b"intact-key-good");
+        // Store arbitrary-length objects at the CAS keys directly (bypassing the content-verified
+        // `put_blob`): the drift under test is exactly "stored bytes ≠ what the index declares", so
+        // the stored object must NOT hash to its key. `bad` is 9 bytes, `good` is 12 bytes.
+        store
+            .storage()
+            .put(&keys::blob(&bad), once_bytes(b"truncated"), PutMeta::default())
+            .await
+            .unwrap();
+        store
+            .storage()
+            .put(
+                &keys::blob(&good),
+                once_bytes(b"intact-bytes"),
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        // The live manifest DECLARES bad=26599 (≠ 9) and good=12 (= 12).
+        let mut m = Manifest::default();
+        m.files.insert(
+            "thumb.jpg".into(),
+            FileEntry {
+                hash: bad.clone(),
+                size: 26599,
+                content_type: None,
+                variants: Default::default(),
+            },
+        );
+        m.files.insert(
+            "logo.png".into(),
+            FileEntry {
+                hash: good.clone(),
+                size: 12,
+                content_type: None,
+                variants: Default::default(),
+            },
+        );
+        let id = store.put_manifest(&m).await.unwrap();
+        store.activate(ProjectRef::DEFAULT, "www", &id).await.unwrap();
+
+        let mism = store
+            .verify_blob_sizes(&GcOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            mism.len(),
+            1,
+            "only the drifted blob is a size mismatch (the matching one is silent): {mism:?}"
+        );
+        assert_eq!(mism[0].hash, bad);
+        assert_eq!(mism[0].declared, 26599, "the manifest-declared size");
+        assert_eq!(mism[0].stored, Some(9), "the actual stored byte count");
+
+        // The matching blob is NOT reported — proves the detector compares declared vs stored, not
+        // a vacuous declared-vs-declared (which would surface zero OR both).
+        assert!(
+            mism.iter().all(|m| m.hash != good),
+            "a blob whose stored size matches its declared size is never reported"
         );
     }
 
