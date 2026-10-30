@@ -17,8 +17,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Manual dry run against a ref (no publish) for pipeline changes.
+  # Manual dry run against a ref (no publish) for pipeline changes. With
+  # `multiarch_test: true` it instead exercises ONLY the GHCR per-arch build +
+  # multi-arch manifest-list assembly against a throwaway `ci-multiarch-test` tag
+  # (no signing, no `release-signing` environment, the heavy build/preflight jobs
+  # skipped), so the multi-arch wiring can be verified end-to-end BEFORE a real
+  # `vX.Y.Z` cut. It never creates or moves a real release tag.
   workflow_dispatch:
+    inputs:
+      multiarch_test:
+        description: "GHCR multi-arch dry run → ghcr.io/<owner>/boatramp:ci-multiarch-test (amd64+arm64, UNSIGNED). No real tags touched."
+        type: boolean
+        default: false
 
 permissions:
   contents: write # create the release + upload assets
@@ -42,6 +52,9 @@ jobs:
   # decision: nightly is a release precondition; this enforces the ordering structurally instead of
   # relying on running it by hand before the tag.)
   preflight:
+    # Skipped on the GHCR multi-arch dry run (that path exercises only the container
+    # jobs). Runs on every other trigger — tag push AND the plain dispatch dry-run.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
     uses: ./.github/workflows/preflight-matrix.yml
     secrets: inherit
 
@@ -52,6 +65,9 @@ jobs:
   # so every shipped binary (Linux/macOS/Windows) embeds the same real console.
   console-dist:
     name: console SPA (Nix)
+    # Skipped on the GHCR multi-arch dry run (containers build their console via Nix,
+    # not this artifact). Runs on tag push and the plain dispatch dry-run.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
     runs-on: ubuntu-latest
     # Hard cap: a Nix/cachix step that WEDGES (the v0.44.0 release hung ~3h40m in a stuck
     # cachix push) must fail fast, not burn the 6h default. Generous vs a cold no-cache build.
@@ -85,6 +101,9 @@ jobs:
   build:
     name: build · ${{ matrix.target }}
     needs: console-dist
+    # Skipped on the GHCR multi-arch dry run (a plain `if` keeps the implicit
+    # needs-success gate, so a real release still requires console-dist green).
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
     runs-on: ${{ matrix.os }}
     # Hard cap on the per-target build (Nix static build + cachix read/push) — fail a wedge
     # fast instead of the 6h default. 90m is ample for a cold, cache-miss build.
@@ -316,21 +335,52 @@ jobs:
             release/install.ps1
           generate_release_notes: true
 
-  container:
-    name: GHCR images (base + cloudflare, Nix)
+  # ── GHCR images, leg 1: per-arch build + push-by-digest (matrix) ────────────
+  # The GHCR images are now MULTI-ARCH (linux/amd64 + linux/arm64). This matrix leg
+  # builds the FOUR Nix image closures for ITS OWN native arch and pushes every
+  # variant to an arch-suffixed staging tag, recording the immutable per-arch
+  # digest; the dependent `container` job then joins the two arches into a manifest
+  # list per human tag and signs the lists. nixpkgs `dockerTools` stamps the image
+  # config's `architecture` from the build host's GOARCH, so the x86_64 runner
+  # yields an amd64 image and the `ubuntu-24.04-arm` runner an arm64 image — each
+  # arch is built NATIVELY, never cross-compiled.
+  #
+  # Runs on a real `vX.Y.Z` tag push (the release) AND on a `workflow_dispatch` with
+  # `multiarch_test: true` (a throwaway `ci-multiarch-test` dry run, no signing). On
+  # the release path it gates on `build` + `preflight` succeeding exactly as the old
+  # single-arch job did; on the dry-run path those heavy jobs are skipped (see their
+  # `if`), so the `if` below uses `!cancelled()` to run despite the skipped `needs`
+  # and re-asserts build/preflight success on the release branch only.
+  container-build:
+    name: GHCR build · ${{ matrix.arch }}
     needs: [build, preflight]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    # Scopes the release signing key (COSIGN_PRIVATE_KEY) to this job via a protected environment,
-    # so the private half is never exposed to the build/test jobs that run untrusted-ish code.
-    environment: release-signing
-    # Hard cap: the GHCR image build pushes a large Nix closure to cachix — the exact step
-    # that wedged for ~3h40m in v0.44.0. Fail a stuck push fast instead of the 6h default.
+    if: >-
+      ${{ !cancelled() &&
+          (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+              && needs.build.result == 'success' && needs.preflight.result == 'success')
+            || (github.event_name == 'workflow_dispatch' && inputs.multiarch_test)
+          ) }}
+    runs-on: ${{ matrix.runs-on }}
+    # Hard cap: the GHCR image build pushes a large Nix closure to cachix — the exact
+    # step that wedged for ~3h40m in v0.44.0. Fail a stuck push fast, not at 6h.
     timeout-minutes: 90
+    strategy:
+      # A hiccup on one arch must not abort the other — but note the assembly job
+      # below requires BOTH legs green (it needs both digests), so a failed leg still
+      # fails the release.
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runs-on: ubuntu-latest }
+          - { arch: arm64, runs-on: ubuntu-24.04-arm }
+    env:
+      IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v5
       # Building the boatramp binaries through Nix is disk- and memory-heavy on a
       # stock runner (see the CI `nix` job): reclaim unused toolchains + add swap.
+      # The arm64 runner needs the same headroom as the x86_64 one.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -347,10 +397,11 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
       - uses: DeterminateSystems/nix-installer-action@main
-      # THE big win: `.#container`/`.#container-cloudflare` wrap `boatrampMuslBin`,
-      # the exact closure nightly pushes to boatramp.cachix.org. With the cache as a
-      # substituter the Rust build downloads and only the thin `mkImage` layer builds
-      # — the GHCR step collapses to (layer + skopeo push) instead of a full recompile.
+      # THE big win: `.#container*` wrap `boatrampMuslBin`, the exact closure the
+      # caches push to boatramp.cachix.org — x86_64's by preflight-matrix, arm64's by
+      # cache.yml's now-enabled aarch64-linux leg. With the cache as a substituter the
+      # Rust build downloads and only the thin `mkImage` layer builds. A cold arm64
+      # cache falls back to a (slow but correct) from-source build under `--max-jobs 1`.
       - uses: cachix/cachix-action@v15
         continue-on-error: true
         with:
@@ -368,101 +419,262 @@ jobs:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
         run: |
-          # Every tool in this job authenticates to ghcr.io from ~/.docker/config.json:
-          # skopeo falls back to it, and cosign/syft/helm read only it (they do NOT
-          # read skopeo's containers-auth). Write it once, directly, so the push,
-          # the keyless signing/SBOM, and the helm push all use the same creds — and
-          # so a runner-configured docker credStore can't intercept `docker login`.
+          # skopeo falls back to ~/.docker/config.json; write it once, directly, so a
+          # runner-configured docker credStore can't intercept `docker login`.
           mkdir -p "$HOME/.docker"
           auth="$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)"
           printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$auth" > "$HOME/.docker/config.json"
-      # Two reproducible Nix images, built on the runner arch (a multi-arch manifest
-      # joins the aarch64 image in a fast-follow — needs an arm64 Nix builder):
-      #   base       → ghcr.io/<owner>/boatramp             (fs + SlateDB)
-      #   cloudflare → ghcr.io/<owner>/boatramp-cloudflare   (R2 + KV)
-      - name: Build + push images
+      - name: Resolve push mode
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          # Release → the real `vX.Y.Z`; dry run → the throwaway test tag. Both legs
+          # and the assembly job derive the same PUSH_TAG the same way.
+          if [ "${IS_RELEASE}" = "true" ]; then
+            echo "PUSH_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "PUSH_TAG=ci-multiarch-test" >> "$GITHUB_ENV"
+          fi
+      # Build the four closures for THIS arch and push each to `<repo>:<PUSH_TAG>-<arch>`
+      # (debug variants: `<repo>:<PUSH_TAG>-debug-<arch>`), recording the per-arch digest
+      # the manifest-list job joins on. These arch-suffixed tags are immutable, version-
+      # pinned, and are themselves usefully arch-pinnable by consumers.
+      - name: Build + push per-arch images (by digest)
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
           base="ghcr.io/${GITHUB_REPOSITORY,,}"
-          : > image-refs.txt
-          # Realize all FOUR image closures (lean base + cloudflare, plus their opt-in `-debug`
-          # swap-ins) in ONE `nix build`, so the daemon substitutes their (nightly-cached) tarballs
-          # from cachix CONCURRENTLY. Substitution is NOT gated by `--max-jobs`, so `--max-jobs 1`
-          # stays as the OOM guard for a rare cache-miss recompile; only the download parallelises.
-          # The debug layers (shell + strace/ltrace/procps/lsof) dedup against the shared app +
-          # cacert layers, so GHCR only uploads the extra layers.
+          cf="${base}-cloudflare"
+          # Realize all FOUR image closures in ONE `nix build`, so the daemon substitutes
+          # their (cached) tarballs CONCURRENTLY. Substitution is NOT gated by `--max-jobs`,
+          # so `--max-jobs 1` stays as the OOM guard for a rare cache-miss recompile; only
+          # the download parallelises. `.#container*` resolve to this runner's native arch.
           nix build ".#container" ".#container-cloudflare" \
                     ".#container-debug" ".#container-cloudflare-debug" \
             --max-jobs 1 --cores 2 --no-link --print-build-logs
 
-          # Push one variant under one or more tags; record the immutable digest (first tag) + the
-          # local archive path for the sign/SBOM step. Resolve each store path by ATTR (a cache hit
-          # after the batch build above), so the mapping never depends on build-output ordering.
-          push() {  # $1=attr  $2=repo  $3…=tags (first = the immutable one to digest-record)
-            local attr="$1" repo="$2"; shift 2
-            local tar; tar="$(nix build ".#${attr}" --no-link --print-out-paths)"
-            local t
-            for t in "$@"; do
-              nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:${t}"
-            done
-            local digest
-            digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${1}")"
-            echo "${repo}@${digest} ${tar}" >> image-refs.txt
+          : > "digests-${arch}.txt"
+          : > "paths-${arch}.txt"
+          # Push one variant to its arch-suffixed staging tag; record `<attr> <repo> <digest>`
+          # for the assembly job and `<attr> <tar>` for the SBOM step. Resolve the store path
+          # by ATTR (a cache hit after the batch build) so it never depends on build order.
+          push() {  # $1=attr  $2=repo  $3=staging-tag
+            local attr="$1" repo="$2" stag="$3" tar dig
+            tar="$(nix build ".#${attr}" --no-link --print-out-paths)"
+            echo "${attr} ${tar}" >> "paths-${arch}.txt"
+            nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:${stag}"
+            dig="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${stag}")"
+            echo "${attr} ${repo} ${dig}" >> "digests-${arch}.txt"
+            echo "pushed ${attr} → ${repo}:${stag}  (${dig})"
           }
+          push container                  "$base" "${PUSH_TAG}-${arch}"
+          push container-debug            "$base" "${PUSH_TAG}-debug-${arch}"
+          push container-cloudflare       "$cf"   "${PUSH_TAG}-${arch}"
+          push container-cloudflare-debug "$cf"   "${PUSH_TAG}-debug-${arch}"
+          echo "---- digests-${arch}.txt ----"; cat "digests-${arch}.txt"
+      # Build the per-arch CycloneDX SBOMs from the LOCAL nix archive (no network
+      # re-pull — the same optimization the old job made). syft's docker-archive reader
+      # needs an UNCOMPRESSED tar (the nix output is gzipped) and the syft nix shell has
+      # no gzip, so decompress each with the RUNNER's gzip first, then run syft inside the
+      # shell. The predicate JSON is signed/attested later in `container` (which holds the
+      # key). Release path only — the dry run signs/attests nothing.
+      - name: Build CycloneDX SBOMs (per arch)
+        if: ${{ env.IS_RELEASE == 'true' }}
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          while read -r attr tar; do
+            [ -n "$attr" ] || continue
+            zcat -f "$tar" > "sbom-src-${attr}.tar"   # `zcat -f` passes a non-gzip tar through unchanged
+          done < "paths-${arch}.txt"
+          nix shell nixpkgs#syft -c bash -euo pipefail -c '
+            arch="'"${arch}"'"
+            while read -r attr tar; do
+              [ -n "$attr" ] || continue
+              syft "docker-archive:sbom-src-${attr}.tar" -o cyclonedx-json > "sbom-${attr}-${arch}.json"
+            done < "paths-${arch}.txt"
+          '
+          rm -f sbom-src-*.tar
+          ls -l sbom-*-"${arch}".json
+      # Hand the per-arch digests (+ SBOMs on the release path) to the assembly job.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-arts-${{ matrix.arch }}
+          path: |
+            digests-${{ matrix.arch }}.txt
+            sbom-*-${{ matrix.arch }}.json
+          if-no-files-found: ignore
+          retention-days: 5
 
-          #   base             → ghcr.io/<owner>/boatramp            :<tag>        :latest
-          #   base-debug       → ghcr.io/<owner>/boatramp            :<tag>-debug  :debug
-          #   cloudflare       → ghcr.io/<owner>/boatramp-cloudflare  :<tag>        :latest
-          #   cloudflare-debug → ghcr.io/<owner>/boatramp-cloudflare  :<tag>-debug  :debug
-          push container                  "$base"              "$tag"         latest
-          push container-debug            "$base"              "${tag}-debug" debug
-          push container-cloudflare       "${base}-cloudflare" "$tag"         latest
-          push container-cloudflare-debug "${base}-cloudflare" "${tag}-debug" debug
-          cat image-refs.txt
+  # ── GHCR images, leg 2: manifest-list assembly + signing ────────────────────
+  # Joins the two per-arch child digests into a multi-arch manifest list per human
+  # tag — `<tag>` + `latest` (lean) and `<tag>-debug` + `debug` (debug), on both the
+  # `boatramp` and `boatramp-cloudflare` repos — with `docker buildx imagetools
+  # create` (skopeo cannot create lists). Then KEY-signs each DISTINCT list digest
+  # `--recursive` (the list + both arch children), so the verifier contract is
+  # UNCHANGED for a multi-arch tag:
+  #   cosign verify --key cosign.pub ghcr.io/<owner>/boatramp:<tag>
+  # resolves the tag to the list digest and finds the signature. Per-arch CycloneDX
+  # SBOMs (built on the legs) are attested to each arch child by digest.
+  #
+  # The job keeps the id `container` (crates-io `needs: container`). The
+  # `release-signing` environment — which scopes COSIGN_PRIVATE_KEY away from the
+  # build jobs — is attached ONLY on the real release path; the `ci-multiarch-test`
+  # dry run gets NO environment (no approval gate, no key) and signs nothing.
+  container:
+    name: GHCR images (base + cloudflare, Nix)
+    needs: [container-build]
+    if: >-
+      ${{ !cancelled() && needs.container-build.result == 'success' &&
+          (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+            || (github.event_name == 'workflow_dispatch' && inputs.multiarch_test)
+          ) }}
+    runs-on: ubuntu-latest
+    # Protected environment on the release path only; empty string = no environment
+    # (so the dry run needs no reviewer approval and gets no signing secret).
+    environment: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'release-signing' || '' }}
+    timeout-minutes: 60
+    env:
+      IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Log in to GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          # `docker buildx imagetools`, cosign and skopeo all read ~/.docker/config.json;
+          # write it once (directly, so a runner credStore can't intercept `docker login`).
+          mkdir -p "$HOME/.docker"
+          auth="$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$auth" > "$HOME/.docker/config.json"
+      - name: Use a v2 registries.conf for skopeo
+        run: |
+          printf 'unqualified-search-registries = []\n' > "$RUNNER_TEMP/registries.conf"
+          echo "CONTAINERS_REGISTRIES_CONF=$RUNNER_TEMP/registries.conf" >> "$GITHUB_ENV"
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Resolve push mode
+        run: |
+          set -euo pipefail
+          if [ "${IS_RELEASE}" = "true" ]; then
+            echo "PUSH_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "PUSH_TAG=ci-multiarch-test" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: arts
+          pattern: container-arts-*
+          merge-multiple: true
+      # Assemble one multi-arch manifest list per variant and resolve its (immutable)
+      # list digest. Signing is done by digest in the next step to avoid any tag race.
+      - name: Assemble multi-arch manifest lists
+        run: |
+          set -euo pipefail
+          # Each repo comes from the per-arch digests files (written by the legs), so no
+          # repo base is needed here.
+          test -f arts/digests-amd64.txt || { echo "::error::missing amd64 digests"; exit 1; }
+          test -f arts/digests-arm64.txt || { echo "::error::missing arm64 digests"; exit 1; }
+          declare -A AMD ARM REPO
+          while read -r attr repo dig; do [ -n "$attr" ] || continue; AMD[$attr]="$dig"; REPO[$attr]="$repo"; done < arts/digests-amd64.txt
+          while read -r attr repo dig; do [ -n "$attr" ] || continue; ARM[$attr]="$dig"; REPO[$attr]="$repo"; done < arts/digests-arm64.txt
 
-      # Supply chain: KEY-sign each image + attach a CycloneDX SBOM. Signed with the project's
-      # release signing key — the SAME key the migrated historical images were re-signed under, so a
-      # verifier uses ONE command for every tag, old and new:
-      #   cosign verify --key cosign.pub <ref>
-      #   cosign verify-attestation --key cosign.pub --type cyclonedx <ref>
-      # (cosign.pub is committed at the repo root; the private half is the COSIGN_PRIVATE_KEY secret,
-      # scoped to the protected `release-signing` environment below.)
-      - name: Sign images + attach SBOM (cosign key + syft)
+          # Final human tags per variant. Lean → <tag> (+latest on release); debug →
+          # <tag>-debug (+debug on release). The dry run uses only the ci-multiarch-test
+          # family and NEVER the floating latest/debug tags (so it can't shadow a release).
+          declare -A TAGS
+          if [ "${IS_RELEASE}" = "true" ]; then
+            TAGS[container]="${PUSH_TAG} latest"
+            TAGS[container-debug]="${PUSH_TAG}-debug debug"
+            TAGS[container-cloudflare]="${PUSH_TAG} latest"
+            TAGS[container-cloudflare-debug]="${PUSH_TAG}-debug debug"
+          else
+            TAGS[container]="${PUSH_TAG}"
+            TAGS[container-debug]="${PUSH_TAG}-debug"
+            TAGS[container-cloudflare]="${PUSH_TAG}"
+            TAGS[container-cloudflare-debug]="${PUSH_TAG}-debug"
+          fi
+
+          : > sign-lists.txt
+          : > attest-plan.txt
+          for attr in container container-debug container-cloudflare container-cloudflare-debug; do
+            repo="${REPO[$attr]:-}"; amd="${AMD[$attr]:-}"; arm="${ARM[$attr]:-}"
+            if [ -z "$repo" ] || [ -z "$amd" ] || [ -z "$arm" ]; then
+              echo "::error::missing digest for ${attr} (repo=$repo amd=$amd arm=$arm)"; exit 1
+            fi
+            # First tag is the immutable version-pinned one; the rest are floating
+            # aliases of the SAME list (same digest), so signing one covers all.
+            read -r -a tags <<< "${TAGS[$attr]}"
+            targs=(); for t in "${tags[@]}"; do targs+=(-t "${repo}:${t}"); done
+            echo "manifest list ${repo} [${tags[*]}]  ← amd64:${amd} arm64:${arm}"
+            docker buildx imagetools create "${targs[@]}" "${repo}@${amd}" "${repo}@${arm}"
+            listref="${repo}:${tags[0]}"
+            # Best-effort digest log (non-fatal): useful for debugging, not relied on.
+            listdig="$(docker buildx imagetools inspect "${listref}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+            echo "  list ref: ${listref}  digest: ${listdig:-<unresolved>}"
+            # Sign/attest by the immutable tag (cosign resolves the list digest itself;
+            # nothing moves the tag within this job). `cosign sign --recursive` then
+            # covers the list + both arch children; the floating aliases share the digest.
+            echo "${listref}" >> sign-lists.txt
+            # Attest BOTH per-arch SBOMs to the list (which the human tag resolves to),
+            # so the existing single-command verifier flow keeps working on a tag:
+            #   cosign verify-attestation --key cosign.pub --type cyclonedx <repo>:<tag>
+            # surfaces both arches' CycloneDX SBOMs. Present only on the release path.
+            [ -f "arts/sbom-${attr}-amd64.json" ] && echo "${listref} arts/sbom-${attr}-amd64.json" >> attest-plan.txt
+            [ -f "arts/sbom-${attr}-arm64.json" ] && echo "${listref} arts/sbom-${attr}-arm64.json" >> attest-plan.txt
+          done
+          echo "---- sign-lists.txt ----"; cat sign-lists.txt
+          echo "---- attest-plan.txt ----"; cat attest-plan.txt || true
+      # Proof-of-multi-arch gate: assert each lean list really advertises BOTH arches.
+      # This is the explicit check the dry run exists for; it also guards the release.
+      - name: Verify both arches are present
+        run: |
+          set -euo pipefail
+          base="ghcr.io/${GITHUB_REPOSITORY,,}"
+          cf="${base}-cloudflare"
+          check() {  # $1=repo:tag
+            local ref="$1" raw arches
+            raw="$(nix run nixpkgs#skopeo -- inspect --raw "docker://${ref}")"
+            arches="$(printf '%s' "$raw" | jq -r '.manifests[]?.platform.architecture' 2>/dev/null | sort -u)"
+            echo "${ref} → arches: $(printf '%s' "$arches" | paste -sd, -)"
+            if printf '%s\n' "$arches" | grep -qx amd64 && printf '%s\n' "$arches" | grep -qx arm64; then
+              return 0
+            fi
+            echo "::error::${ref} is not a complete amd64+arm64 manifest list"
+            printf '%s\n' "$raw"
+            exit 1
+          }
+          check "${base}:${PUSH_TAG}"
+          check "${cf}:${PUSH_TAG}"
+      # KEY-sign each manifest list by its immutable tag, `--recursive` (so the list +
+      # both arch children are signed), and attest the per-arch CycloneDX SBOMs to the
+      # list, so the UNCHANGED single-command verifier flow works on any human tag:
+      #   cosign verify             --key cosign.pub <repo>:<tag>
+      #   cosign verify-attestation --key cosign.pub --type cyclonedx <repo>:<tag>
+      # The private half is COSIGN_PRIVATE_KEY, scoped to `release-signing`. Release only.
+      - name: Sign manifest lists + attest SBOMs (cosign key + syft)
+        if: ${{ env.IS_RELEASE == 'true' }}
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: "" # the release key is passwordless; it lives only as the CI secret
         run: |
           set -euo pipefail
-          # syft's `docker-archive:` reader needs an UNCOMPRESSED tar. The nix image output is a
-          # GZIPPED docker-archive: skopeo auto-decompresses it on push (the build step above works),
-          # but syft reads the gzip magic as a tar header and dies (`archive/tar: invalid tar
-          # header`). Decompress each archive once here into a WRITABLE workdir file — the `$tar`
-          # paths are now read-only `/nix/store` paths, and the nix store can't be written to; the
-          # runner has gzip, the cosign/syft nix shell does not. Keyed by a counter so both loops
-          # agree on the name. Still the LOCAL archive (no network re-pull, which dominated the old
-          # ~7.6 min); `zcat -f` passes a non-gzip archive through unchanged.
-          n=0
-          while read -r ref tar; do
-            [ -n "$ref" ] || continue
-            n=$((n + 1))
-            zcat -f "$tar" > "sbom-src-${n}.tar"
-          done < image-refs.txt
-          # Resolve cosign + syft ONCE for the whole loop — a per-op `nix run nixpkgs#…`
+          # Resolve cosign ONCE for the whole loop — a per-op `nix run nixpkgs#…`
           # re-evaluates nixpkgs each time.
-          nix shell nixpkgs#cosign nixpkgs#syft -c bash -euo pipefail -c '
-            n=0
-            while read -r ref tar; do
+          nix shell nixpkgs#cosign -c bash -euo pipefail -c '
+            while read -r ref; do
               [ -n "$ref" ] || continue
-              n=$((n + 1))
-              cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$ref"
-              syft "docker-archive:sbom-src-${n}.tar" -o cyclonedx-json > sbom.json
-              cosign attest --yes --key env://COSIGN_PRIVATE_KEY --predicate sbom.json --type cyclonedx "$ref"
-            done < image-refs.txt
+              cosign sign --yes --recursive --key env://COSIGN_PRIVATE_KEY "$ref"
+            done < sign-lists.txt
+            while read -r ref sbom; do
+              [ -n "$ref" ] || continue
+              cosign attest --yes --key env://COSIGN_PRIVATE_KEY --predicate "$sbom" --type cyclonedx "$ref"
+            done < attest-plan.txt
           '
 
-      # Publish the operator Helm chart as an OCI artifact alongside the images.
+      # Publish the operator Helm chart as an OCI artifact alongside the images. Release only.
       - name: Package + push the Helm chart
+        if: ${{ env.IS_RELEASE == 'true' }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"

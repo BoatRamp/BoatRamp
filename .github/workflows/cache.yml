@@ -7,12 +7,13 @@ name: Cache
 # touch the existing CI/nightly/release workflows.
 #
 # Cross-platform coverage is data-driven: the `matrix.include` list below pairs
-# each Nix `system` with the GitHub runner that can build it natively. Today we
-# populate the cache for Linux **and** Apple Silicon (macOS `aarch64-darwin`), so
-# a fresh Apple-Silicon machine substitutes the whole `.#default` closure —
-# including the `boatramp-console-trunk` wasm/Trunk bundle it depends on — instead
-# of compiling. Add `x86_64-darwin` / `aarch64-linux` by uncommenting the entries
-# below (a native runner is the only requirement); no job needs copy-pasting.
+# each Nix `system` with the GitHub runner that can build it natively. We populate
+# the cache for x86_64-linux, **aarch64-linux** (so the multi-arch release's arm64
+# OCI image closure is warmed, not compiled on the critical path — see the container
+# build step), and Apple Silicon (macOS `aarch64-darwin`), so a fresh machine
+# substitutes the whole `.#default` closure — including the `boatramp-console-trunk`
+# wasm/Trunk bundle it depends on — instead of compiling. Add `x86_64-darwin` by
+# uncommenting its entry below (a native runner is the only requirement).
 #
 # Pushing needs the `CACHIX_AUTH_TOKEN` repo secret (the push token / signing key
 # for the `boatramp` cache) — the SAME secret every other workflow uses; there is
@@ -50,12 +51,14 @@ jobs:
             runs-on: ubuntu-latest
           - system: aarch64-darwin
             runs-on: macos-14 # GitHub's Apple-Silicon runner
-          # Toggle either of these on by uncommenting — each just needs a native
-          # runner; the steps below are already system-agnostic:
+          # aarch64-linux is ENABLED so the release's arm64 OCI image closure is
+          # warmed here (see the container build step below) instead of compiled from
+          # source on the multi-arch release leg. x86_64-darwin stays off — toggle it
+          # on by uncommenting (a native runner is the only requirement):
+          - system: aarch64-linux
+            runs-on: ubuntu-24.04-arm # GitHub's Linux arm64 runner
           # - system: x86_64-darwin
           #   runs-on: macos-13 # Intel macOS runner
-          # - system: aarch64-linux
-          #   runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
@@ -73,3 +76,22 @@ jobs:
       # job — to the cache, not just the CLI leaf.
       - name: Build + cache the boatramp closure
         run: nix build .#packages.${{ matrix.system }}.default --print-build-logs --print-out-paths
+
+      # The release OCI images wrap `boatramp-static` (the fully-static musl + jemalloc
+      # binary) — a DIFFERENT derivation from the glibc `default` above, so the build
+      # of `.#default` does NOT warm the image closure. The x86_64 image closure is
+      # already warmed by preflight-matrix's (x86_64) nix legs, but nothing else builds
+      # the arm64 one — so warm it HERE for the multi-arch release, on the native arm64
+      # runner. cachix-action's post-step then pushes the realized closure to the cache,
+      # and the release `container-build` arm64 leg substitutes it instead of compiling
+      # from source. (Harmless on any future Linux arch added to the matrix.)
+      - name: Warm the arm64 OCI image closure
+        if: matrix.system == 'aarch64-linux'
+        run: |
+          nix build \
+            .#packages.aarch64-linux.boatramp-static \
+            .#packages.aarch64-linux.container \
+            .#packages.aarch64-linux.container-cloudflare \
+            .#packages.aarch64-linux.container-debug \
+            .#packages.aarch64-linux.container-cloudflare-debug \
+            --print-build-logs --print-out-paths
