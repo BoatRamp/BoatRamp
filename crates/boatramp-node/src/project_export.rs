@@ -97,6 +97,37 @@ fn other<E: std::fmt::Display>(e: E) -> Perr {
     Perr::Other(e.to_string())
 }
 
+/// Turn a bundle error into a [`Perr`], expanding an ENUMERATE-ALL
+/// [`MembersMismatched`](project_bundle::BundleError::MembersMismatched) aggregate (which carries
+/// only a count) into a legible per-member report — path · class · size/checksum · declared vs
+/// streamed — so the operator sees the full scope the one-pass scan found. Every other bundle error
+/// passes through [`other`] unchanged.
+fn enumerated_import_error(
+    be: project_bundle::BundleError,
+    mismatches: &[project_bundle::MemberMismatch],
+) -> Perr {
+    match &be {
+        project_bundle::BundleError::MembersMismatched { count } => {
+            let mut lines = Vec::with_capacity(mismatches.len() + 1);
+            lines.push(format!(
+                "{count} member(s) failed integrity verification (declared ≠ streamed):"
+            ));
+            for m in mismatches {
+                lines.push(format!(
+                    "  • {} [{}] {:?}: declared {}, streamed {}",
+                    m.path,
+                    m.class.label(),
+                    m.kind,
+                    m.declared,
+                    m.streamed
+                ));
+            }
+            Perr::Other(lines.join("\n"))
+        }
+        _ => other(be),
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2031,36 +2062,58 @@ impl ProjectExport for NodeProjectExport {
         // reaches live) and stages a blob/KV member to a temp restored via the SAME re-key/enforce
         // as a sidecar member. Reads v1, v2 AND v3 bundles.
         let member_cap = self.import_member_cap;
+        // Clone-robustness (PLAN-clone-robustness #1 + #2): the member-mismatch tolerance policy,
+        // built from the import options. Strict by default (hard-fail the first declared≠streamed
+        // mismatch); `enumerate_mismatches` scans all + fails at the end; `skip_member_mismatch`
+        // warns + continues past a re-generable `der/` mismatch (broadened by `skip_any_blob_mismatch`
+        // to any blob — never a non-blob member).
+        let verify_policy = project_bundle::VerifyPolicy {
+            enumerate_all: opts.enumerate_mismatches,
+            skip_mismatch: opts.skip_member_mismatch,
+            skip_scope: if opts.skip_any_blob_mismatch {
+                project_bundle::SkipScope::AnyBlob
+            } else {
+                project_bundle::SkipScope::DerivativesOnly
+            },
+        };
         let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ImportMsg>(1);
         let reader = ChannelReader::new(byte_rx);
         let stage_dir_task = stage_dir.clone();
         let req_tx_task = req_tx.clone();
-        let read_handle = tokio::task::spawn_blocking(
-            move || -> Result<Vec<MemberSpec>, project_bundle::BundleError> {
-                let head_tx = req_tx_task.clone();
-                let on_head = move |data_only: bool, source: &SourceInfo| {
-                    // Surfaced before any member: the servicer needs the source project (to
-                    // re-key each member to the TARGET) and the data-only flag.
-                    let _ = head_tx.blocking_send(ImportMsg::Head {
-                        data_only,
-                        source_project: source.project.clone(),
-                    });
-                };
-                let mut bridge = ImportBridge {
-                    req_tx: req_tx_task,
-                    body_tx: None,
-                    chunked_bytes: 0,
-                    member_cap,
-                };
-                project_bundle::read_bundle_streaming_atomic(
-                    reader,
-                    &stage_dir_task,
-                    on_head,
-                    &mut bridge,
-                )
-            },
+        // The blocking reader returns BOTH its result AND the mismatch sink (so the enumerate/skip
+        // detail survives even on the `MembersMismatched` error path, for the report + the error).
+        type ReadOutput = (
+            Result<Vec<MemberSpec>, project_bundle::BundleError>,
+            Vec<project_bundle::MemberMismatch>,
         );
+        let read_handle = tokio::task::spawn_blocking(move || -> ReadOutput {
+            let head_tx = req_tx_task.clone();
+            let on_head = move |data_only: bool, source: &SourceInfo| {
+                // Surfaced before any member: the servicer needs the source project (to
+                // re-key each member to the TARGET) and the data-only flag.
+                let _ = head_tx.blocking_send(ImportMsg::Head {
+                    data_only,
+                    source_project: source.project.clone(),
+                });
+            };
+            let mut bridge = ImportBridge {
+                req_tx: req_tx_task,
+                body_tx: None,
+                chunked_bytes: 0,
+                member_cap,
+            };
+            let mut mismatches = Vec::new();
+            let res = project_bundle::read_bundle_streaming_atomic_policy(
+                reader,
+                &stage_dir_task,
+                &verify_policy,
+                &mut mismatches,
+                on_head,
+                &mut bridge,
+            );
+            (res, mismatches)
+        });
         drop(req_tx); // only the blocking reader keeps the request channel alive now
 
         // Async feeder: pump the caller's bundle stream into the blocking reader, enforcing the
@@ -2591,20 +2644,40 @@ impl ProjectExport for NodeProjectExport {
                 return Err(e);
             }
         };
-        match read_res {
-            Ok(Ok(_specs)) => {}
-            Ok(Err(be)) => {
+        let member_mismatches = match read_res {
+            Ok((Ok(_specs), mm)) => mm,
+            Ok((Err(be), mm)) => {
                 let _ = tokio::fs::remove_dir_all(&session).await;
-                return Err(other(be));
+                // Expand an ENUMERATE-ALL aggregate into a legible per-member report; other bundle
+                // errors pass through unchanged.
+                return Err(enumerated_import_error(be, &mm));
             }
             Err(je) => {
                 let _ = tokio::fs::remove_dir_all(&session).await;
                 return Err(other(je));
             }
-        }
+        };
         if let Err(e) = feed_res {
             let _ = tokio::fs::remove_dir_all(&session).await;
             return Err(e);
+        }
+
+        // Clone-robustness (PLAN-clone-robustness #2): record every TOLERATED member-mismatch skip
+        // in the report notes, so the operator sees exactly which re-generable derivatives were
+        // skipped (and thus will be re-derived on the target on next access). A clean strict pass
+        // leaves this empty.
+        for m in &member_mismatches {
+            if m.skipped {
+                report.notes.push(format!(
+                    "SKIPPED member {:?} [{}] ({:?} mismatch: declared {}, streamed {}) — NOT \
+                     applied; the target re-derives it on access",
+                    m.path,
+                    m.class.label(),
+                    m.kind,
+                    m.declared,
+                    m.streamed
+                ));
+            }
         }
 
         // --- post-stream steps (only after a clean, fully-verified pass) ---

@@ -309,6 +309,23 @@ pub struct ImportOptions {
     pub overwrite: bool,
     /// Adopt the source identity (recovery) or mint fresh (a different environment).
     pub identity: IdentityChoice,
+    /// Clone-robustness (PLAN-clone-robustness #1): ENUMERATE every member whose streamed bytes
+    /// disagree with its declared size/SHA-256 in ONE pass and fail at the end (reporting each
+    /// path + class), instead of aborting at the first — so an operator can assess the scope of a
+    /// stale/truncated source population. Applies no mismatched member (an assessment, never a
+    /// mutation); pairs with a dry-run / clone-verify. Default `false`.
+    pub enumerate_mismatches: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): WARN + CONTINUE past a member whose streamed
+    /// bytes disagree with its declared size/SHA-256 instead of hard-failing — the target
+    /// re-derives a skipped derivative on access. DEFAULT-scoped to re-generable `der/` derivatives
+    /// (a baseline/primary/non-blob mismatch STILL hard-fails); broaden with
+    /// [`skip_any_blob_mismatch`](Self::skip_any_blob_mismatch). Default `false`.
+    pub skip_member_mismatch: bool,
+    /// Clone-robustness: broaden [`skip_member_mismatch`](Self::skip_member_mismatch) beyond
+    /// re-generable `der/` derivatives to ANY blob member (baselines + primaries too) — the louder,
+    /// explicit opt-in. NEVER tolerates a non-blob (DB/KV/identity) member even so. Ignored unless
+    /// `skip_member_mismatch` is set. Default `false`.
+    pub skip_any_blob_mismatch: bool,
 }
 
 impl std::fmt::Debug for ImportOptions {
@@ -319,6 +336,9 @@ impl std::fmt::Debug for ImportOptions {
             .field("allow_schema_skew", &self.allow_schema_skew)
             .field("overwrite", &self.overwrite)
             .field("identity", &self.identity)
+            .field("enumerate_mismatches", &self.enumerate_mismatches)
+            .field("skip_member_mismatch", &self.skip_member_mismatch)
+            .field("skip_any_blob_mismatch", &self.skip_any_blob_mismatch)
             .finish()
     }
 }
