@@ -264,11 +264,17 @@ jobs:
       - name: Test (musl)
         run: |
           set -o pipefail
-          # T6: the SlateDB-on-musl *teardown* SIGSEGV is a rare process-EXIT race (a slatedb/
-          # libsql background thread outliving its Db and racing the static-musl exit). It could
-          # NOT be reproduced on demand (~160 isolated musl runs on a dev box, zero hits), so
-          # rather than keep masking it with a blind rerun, CAPTURE a core + backtrace the next
-          # time it flakes here — real evidence to root-cause the faulting thread from.
+          # T6: the process-EXIT SIGSEGV on the static-musl `--workspace` run. ROOT-CAUSED (v0.50.0
+          # investigation) to the **libsql connection double-free-on-drop**, FIXED in v0.49.0 by the
+          # libsql 0.9.30 -> 0.10.0 bump (0.10 nulls `self.raw` after free). It surfaced as a "SlateDB
+          # teardown" crash only because slatedb + libsql share this ONE musl exit — the faulting Drop
+          # was libsql's, not slatedb's. SlateDB was RULED OUT: its background work (compactor/GC/
+          # flusher/writer) is tokio tasks joined at runtime drop, the default block cache is in-memory
+          # foyer (no bg thread) and the disk object-store cache is off — so NO slatedb OS thread
+          # outlives its Db to race exit; ~1500 slatedb teardown events under heavy musl oversubscription
+          # on lighthouse produced zero cores (matching the earlier ~160-run miss). The capture net below
+          # STAYS ARMED (cheap) so any genuine recurrence still arrives as a core + backtrace, never a
+          # blind rerun.
           #
           # Three collection fixes so the evidence actually arrives (the first capture resolved the
           # binary from the core's %e = the crashing THREAD's comm, which for a test thread is the
