@@ -28,7 +28,13 @@
 #![cfg(all(target_os = "linux", feature = "sandbox"))]
 
 use std::ffi::CString;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::ptr;
+use std::time::Duration;
 
 use boatramp_server::sandbox;
 
@@ -36,6 +42,11 @@ use boatramp_server::sandbox;
 const FS_OUTSIDE_REFUSED_INSIDE_OK: i32 = 21; // Landlock ON: outside refused, inside allowed
 const FS_BOTH_OK: i32 = 22; // sandbox OFF (or a hole): both writes succeeded
 const FS_UNEXPECTED: i32 = 23; // inside refused and/or an impossible combination
+// SERVE smoke (M2): the ALLOW set must pass the REAL serving byte-movers under the filter.
+const SERVE_OK: i32 = 31; // sendfile file-body + splice reverse-proxy relay both delivered in full
+const SERVE_SENDFILE_FAILED: i32 = 32; // sendfile EPERM'd / short (H1 missing `sendfile`)
+const SERVE_SPLICE_FAILED: i32 = 33; // splice EPERM'd / short (H1 missing `splice`)
+const SERVE_SETUP_FAILED: i32 = 34; // socket/pipe/file plumbing failed (not a filter verdict)
 const SELFTEST_INSTALL_FAILED: i32 = 99; // the sandbox install itself errored in the child
 
 fn cstr(s: &str) -> CString {
@@ -186,6 +197,169 @@ fn probe_fs(install: bool, data_dir: &str, inside: &CString, outside: &CString) 
     wait_code(pid)
 }
 
+/// `sendfile(2)` the whole `in_fd` to `out_fd`, looping over partial transfers. EPERM (seccomp without
+/// H1's `sendfile`) surfaces as an `Err` here.
+fn sendfile_all(out_fd: i32, in_fd: i32, count: usize) -> std::io::Result<usize> {
+    let mut sent = 0usize;
+    let mut offset: libc::off_t = 0;
+    while sent < count {
+        // SAFETY: valid fds the caller owns; `offset` is a valid out-pointer; `count` bounds the move.
+        let n = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count - sent) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            break;
+        }
+        sent += n as usize;
+    }
+    Ok(sent)
+}
+
+/// `splice(2)` once from `fd_in` into `fd_out` (one of which is a pipe end). Returns bytes moved (0 =
+/// EOF). EPERM (seccomp without H1's `splice`) surfaces as an `Err`.
+fn splice_once(fd_in: i32, fd_out: i32, len: usize) -> std::io::Result<isize> {
+    // SAFETY: valid fds the caller owns; NULL offsets (stream/pipe), no SPLICE_F flags.
+    let n = unsafe { libc::splice(fd_in, ptr::null_mut(), fd_out, ptr::null_mut(), len, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+/// (a) Serve a local-fs file body over a plaintext loopback `TcpStream` via `sendfile` (the exact
+/// `boatramp-http` HTTP/1.1 file-body syscall). Returns Ok(true) iff the client receives the full body.
+fn sendfile_smoke(body_path: &str) -> std::io::Result<bool> {
+    let body = std::fs::read(body_path)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let mut client = TcpStream::connect(addr)?; // loopback connect completes before accept
+    client.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (server, _) = listener.accept()?;
+    let file = File::open(body_path)?;
+    let sent = sendfile_all(server.as_raw_fd(), file.as_raw_fd(), body.len())?;
+    if sent != body.len() {
+        return Ok(false);
+    }
+    let mut got = vec![0u8; body.len()];
+    client.read_exact(&mut got)?;
+    // Keep `server` alive until the client has read (dropping it early could reset the conn).
+    drop(server);
+    Ok(got == body)
+}
+
+/// (b) Relay one plaintext HTTP/1.1 reverse-proxy response upstream→downstream via a pipe + `splice`
+/// (the exact `boatramp-server::splice` data-plane pattern). Returns Ok(true) iff the client receives
+/// the full response.
+fn splice_smoke() -> std::io::Result<bool> {
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    // Upstream connection: `u_srv` is the upstream server; the front reads from `u_cli`.
+    let up = TcpListener::bind("127.0.0.1:0")?;
+    let up_addr = up.local_addr()?;
+    let u_cli = TcpStream::connect(up_addr)?;
+    let (mut u_srv, _) = up.accept()?;
+    // Downstream connection: the front writes `d_srv`; the real client reads `d_cli`.
+    let down = TcpListener::bind("127.0.0.1:0")?;
+    let down_addr = down.local_addr()?;
+    let mut d_cli = TcpStream::connect(down_addr)?;
+    d_cli.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (d_srv, _) = down.accept()?;
+
+    // The upstream speaks its response, then half-closes so the relay sees EOF after it.
+    u_srv.write_all(RESPONSE)?;
+    u_srv.shutdown(Shutdown::Write)?;
+
+    // Front relay: u_cli -> pipe -> d_srv via splice, until upstream EOF.
+    let mut pipefd = [0 as libc::c_int; 2];
+    // SAFETY: valid out array; O_CLOEXEC pipe.
+    if unsafe { libc::pipe2(pipefd.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (pr, pw) = (pipefd[0], pipefd[1]);
+    let relay = (|| -> std::io::Result<usize> {
+        let mut relayed = 0usize;
+        loop {
+            let n = splice_once(u_cli.as_raw_fd(), pw, 65536)?;
+            if n == 0 {
+                break; // upstream EOF
+            }
+            let mut moved: isize = 0;
+            while moved < n {
+                let m = splice_once(pr, d_srv.as_raw_fd(), (n - moved) as usize)?;
+                if m == 0 {
+                    break;
+                }
+                moved += m;
+                relayed += m as usize;
+            }
+        }
+        Ok(relayed)
+    })();
+    // SAFETY: close the pipe ends regardless of the relay outcome.
+    unsafe {
+        libc::close(pr);
+        libc::close(pw);
+    }
+    let relayed = relay?;
+    drop(d_srv); // close downstream so the client sees EOF
+    let mut got = Vec::new();
+    d_cli.read_to_end(&mut got)?;
+    Ok(got == RESPONSE && relayed == RESPONSE.len())
+}
+
+/// The serve ops, run on a NON-installing worker thread (symmetric with the deny probes): prove the
+/// ALLOW set passes the real serving byte-movers (`sendfile` + `splice`) under the filter.
+fn serve_ops(body_path: &str) -> i32 {
+    match sendfile_smoke(body_path) {
+        Ok(true) => {}
+        Ok(false) => return SERVE_SENDFILE_FAILED,
+        Err(_) => return SERVE_SENDFILE_FAILED,
+    }
+    match splice_smoke() {
+        Ok(true) => {}
+        Ok(false) => return SERVE_SPLICE_FAILED,
+        Err(_) => return SERVE_SPLICE_FAILED,
+    }
+    SERVE_OK
+}
+
+/// Fork a child that (optionally) installs the REAL combined `install()` filter on its MAIN thread,
+/// then serves a file body (`sendfile`) + relays a reverse-proxy response (`splice`) on a SECOND
+/// (spawned) thread. Proves the ALLOW set against the real serving path (H1) and guards the class.
+fn probe_serve(install: bool, data_dir: &str) -> i32 {
+    let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let body_path = format!("{data_dir}/serve-body.bin");
+    if std::fs::write(&body_path, &body).is_err() {
+        return SERVE_SETUP_FAILED;
+    }
+    let policy = sandbox::SandboxPolicy::for_server(data_dir);
+
+    // SAFETY: the child installs the pre-resolved policy, then serves on a spawned thread. Single-test
+    // binary ⇒ no concurrent harness allocation at the fork instant.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let _ = std::fs::remove_file(&body_path);
+        panic!("fork() failed: {}", std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        if install && sandbox::install(&policy).is_err() {
+            unsafe { libc::_exit(SELFTEST_INSTALL_FAILED) };
+        }
+        let path = body_path.clone();
+        let code = std::thread::spawn(move || serve_ops(&path))
+            .join()
+            .unwrap_or(SERVE_SETUP_FAILED);
+        unsafe { libc::_exit(code) };
+    }
+    let code = wait_code(pid);
+    let _ = std::fs::remove_file(&body_path);
+    code
+}
+
 #[test]
 #[ignore = "live/privileged OS-sandbox gate: forks children that install seccomp-bpf + Landlock against the real kernel and probe from a non-installing thread; runs ONLY in the dedicated sandbox-live CI step via --include-ignored, not the general --all-features suite"]
 fn sandbox_live_blocks_exec_and_out_of_data_dir_writes() {
@@ -244,11 +418,33 @@ fn sandbox_live_blocks_exec_and_out_of_data_dir_writes() {
          real; child exit was {fs_off}"
     );
 
+    // ---- SERVE smoke (H1 / M2): prove the ALLOW set passes the real serving byte-movers -------------
+    // Under the REAL combined install() filter, on a NON-installing worker thread, serving a file body
+    // (sendfile) + relaying a plaintext HTTP/1.1 reverse-proxy response (splice) must BOTH complete. If
+    // H1's fd byte-movers were missing from the allow-list, these EPERM mid-response → RED.
+    let serve_on = probe_serve(true, data_dir_s);
+    assert_eq!(
+        serve_on, SERVE_OK,
+        "under the REAL combined sandbox filter, sendfile (file body over a plaintext TcpStream) AND \
+         splice (plaintext HTTP/1.1 reverse-proxy relay) must both deliver the full payload (H1); child \
+         exit was {serve_on} ({SERVE_SENDFILE_FAILED}=sendfile EPERM/short, \
+         {SERVE_SPLICE_FAILED}=splice EPERM/short, {SERVE_SETUP_FAILED}=plumbing)"
+    );
+    // Sanity: the same plumbing without the filter also serves (so SERVE_OK above is about the filter,
+    // not a broken harness).
+    let serve_off = probe_serve(false, data_dir_s);
+    assert_eq!(
+        serve_off, SERVE_OK,
+        "serve-smoke plumbing sanity WITHOUT the filter; child exit was {serve_off}"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 
-    // The single marker the CI gate greps for — printed ONLY after all four probes held.
+    // The single marker the CI gate greps for — printed ONLY after all probes held.
     println!(
         "SANDBOX LIVE OK: on a NON-installing thread, seccomp-bpf KILLED exec* (SIGSYS) and Landlock \
-         refused a write outside data_dir; with the sandbox OFF both ops succeeded (mutation-verified)."
+         refused a write outside data_dir; under the REAL combined filter, sendfile (file body) + \
+         splice (reverse-proxy relay) both served in full (H1); and with the sandbox OFF the deny ops \
+         both succeeded (mutation-verified)."
     );
 }

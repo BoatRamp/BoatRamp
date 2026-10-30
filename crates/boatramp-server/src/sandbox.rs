@@ -14,14 +14,20 @@
 //! This is the server-process analog of the container backend's per-worker seccomp
 //! filter (`boatramp-container`'s `seccomp` module), with two deliberate differences:
 //!
-//!   1. **`exec*` is DENIED — and KILLED.** The container filter *allows* `execve`
-//!      because the worker execs the guest entrypoint under the filter; the server
-//!      process, once serving, never legitimately execs, so the whole-process
-//!      allow-list omits the exec family (and `fork`/`vfork`). They — plus the
-//!      kernel-escape surface (`ptrace`, `mount`, `setns`, `bpf`, `init_module`, …) —
-//!      are given an explicit `SECCOMP_RET_KILL_PROCESS` action, so an RCE that lands
-//!      in the server address space is killed hard (not merely `EPERM`'d) and is
-//!      alertable. A benign allow-list *miss* still degrades to `EPERM` (soft).
+//!   1. **`exec*` is KILLED.** The container filter *allows* `execve` because the
+//!      worker execs the guest entrypoint under the filter; the server process, once
+//!      serving, never legitimately execs, so the whole-process allow-list omits the
+//!      exec family. `execve`/`execveat` — plus the kernel-escape surface (`ptrace`,
+//!      `mount`, `setns`, `bpf`, `init_module`, …) — are given an explicit
+//!      `SECCOMP_RET_KILL_PROCESS` action, so an RCE that lands in the server address
+//!      space cannot spawn a shell or a new binary: it is killed hard (not merely
+//!      `EPERM`'d) and is alertable. A benign allow-list *miss* still degrades to
+//!      `EPERM` (soft). (`fork`/`vfork` are also killed, but as DEFENSE-IN-DEPTH only,
+//!      NOT a guarantee that process creation is blocked: musl's `fork()` is issued as
+//!      `clone` — which stays allowed because the tokio runtime creates its threads with
+//!      it — so on a musl build the `fork`/`vfork` syscall kills are inert. The
+//!      load-bearing barrier is the exec family: a child without `exec` cannot become a
+//!      new program.)
 //!   2. **Landlock** confines the process's filesystem view to the node's `data_dir`
 //!      (+ the system temp dirs) for writes, and a conservative set of system read
 //!      roots (so the server can still read `/etc/resolv.conf`, load shared objects,
@@ -241,6 +247,11 @@ pub mod linux {
     /// (`SIGSYS`) rather than returning `EPERM` — turning an exploit attempt into a loud,
     /// alertable crash. (Everything else not in the allow-list still returns `EPERM`, so a
     /// benign allow-list bug degrades softly.)
+    ///
+    /// `fork`/`vfork` are listed as DEFENSE-IN-DEPTH, not a guarantee that process creation is
+    /// blocked: musl issues `fork()` as `clone` (allowed for the tokio runtime's threads), so on a
+    /// musl build these two kills are inert. The load-bearing barrier is `execve`/`execveat` — a
+    /// forked child that cannot `exec` cannot become a new program.
     pub const KILL_SURFACE: &[&str] = &[
         "execve",
         "execveat",
@@ -376,6 +387,18 @@ pub mod linux {
         "dup3",
         "pipe",
         "pipe2",
+        // fd-to-fd byte movers (H1): the HTTP/1.1 file-body hot path (`boatramp-http`'s `sendfile`)
+        // and the plaintext reverse-proxy data plane (`boatramp-server`'s `splice`) commit to these
+        // AFTER the response head is flushed, with no userspace fallback for a non-WouldBlock errno —
+        // so an EPERM here truncates the body + drops the connection. They only move bytes between fds
+        // the process already holds (no exec/escape/module-load/cross-process read), so the blast
+        // radius is unchanged. (`tee`/`vmsplice` added for completeness.)
+        "sendfile",
+        "sendfile64",
+        "splice",
+        "copy_file_range",
+        "tee",
+        "vmsplice",
         "fcntl",
         "ioctl",
         "flock",
@@ -658,22 +681,84 @@ pub mod linux {
         })
     }
 
-    /// Install both layers on the current process: Landlock first (it needs its own
-    /// syscalls + `openat`), then the seccomp filters (which kill `exec*`).
+    /// Install both layers on the current process, INDEPENDENTLY (M1): Landlock first (it needs its
+    /// own syscalls + `openat`), then the seccomp filters (which kill `exec*`) — a FAILURE of ONE layer
+    /// never skips the other. The returned [`SandboxStatus`] is the coarse enforcement level the
+    /// caller's posture gate consumes ([`crate::serve`]'s `install_presandbox`). `Enforced` means
+    /// seccomp applied AND Landlock fully enforced. `Partial` means `no_new_privs` is set but NOT both
+    /// layers are fully enforced (Landlock only partial, or one layer failed to apply); the specifics
+    /// are logged WARN/ERROR here. `Err` is reserved for the precondition failure (`no_new_privs`),
+    /// where neither layer can apply. Under `auto` the caller fails OPEN on `Partial` (serve on; the
+    /// ERROR log is alertable); under `strict` it fails CLOSED on anything less than `Enforced`. The
+    /// high-value exec-kill (seccomp) is therefore installed even when Landlock cannot be — closing the
+    /// hole where a Landlock error used to drop the whole sandbox under `auto`.
     pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
+        // Precondition for BOTH layers; if it fails, neither can apply → propagate.
         set_no_new_privs()?;
-        let landlock_status = prepare_landlock(&policy.read_only_paths, &policy.read_write_paths)?
-            .apply()
-            .inspect_err(|e| tracing::warn!(error = %e, "Landlock restriction failed"))?;
-        prepare_seccomp()?.apply()?;
-        tracing::info!(
-            landlock = ?landlock_status,
-            read_only_roots = policy.read_only_paths.len(),
-            read_write_roots = policy.read_write_paths.len(),
-            "process sandbox installed: seccomp-bpf allow-list (exec* + escape surface KILLED, other \
-             misses EPERM) + Landlock filesystem confinement to data_dir"
-        );
-        Ok(landlock_status)
+
+        // Landlock (independent). A genuine error is captured, logged, and does NOT skip seccomp.
+        let landlock = match prepare_landlock(&policy.read_only_paths, &policy.read_write_paths)
+            .and_then(PreparedLandlock::apply)
+        {
+            Ok(status) => Some(status),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Landlock FS confinement FAILED to apply — the serving process is NOT filesystem-\
+                     confined (seccomp exec-kill is still attempted below)"
+                );
+                None
+            }
+        };
+
+        // seccomp (independent — the cheaper, higher-value layer carrying the exec-kill).
+        let seccomp_ok = match prepare_seccomp().and_then(|p| p.apply()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "seccomp filter FAILED to apply — exec* is NOT killed");
+                false
+            }
+        };
+
+        let status = match (seccomp_ok, landlock) {
+            (true, Some(SandboxStatus::Enforced)) => {
+                tracing::info!(
+                    read_only_roots = policy.read_only_paths.len(),
+                    read_write_roots = policy.read_write_paths.len(),
+                    "process sandbox installed: seccomp-bpf allow-list (exec* + escape surface KILLED, \
+                     other misses EPERM) + Landlock filesystem confinement to data_dir"
+                );
+                SandboxStatus::Enforced
+            }
+            (true, Some(_)) => {
+                tracing::warn!(
+                    "process sandbox PARTIAL: seccomp exec-kill active, but Landlock FS confinement is \
+                     only partially enforced on this kernel"
+                );
+                SandboxStatus::Partial
+            }
+            (true, None) => {
+                tracing::warn!(
+                    "process sandbox PARTIAL: seccomp exec-kill active, but Landlock FS confinement is \
+                     MISSING (see the error above)"
+                );
+                SandboxStatus::Partial
+            }
+            (false, Some(_)) => {
+                tracing::warn!(
+                    "process sandbox PARTIAL: Landlock FS confinement active, but the seccomp filter is \
+                     MISSING — exec* is NOT killed"
+                );
+                SandboxStatus::Partial
+            }
+            (false, None) => {
+                tracing::error!(
+                    "process sandbox NOT installed: BOTH seccomp and Landlock failed to apply"
+                );
+                SandboxStatus::Partial
+            }
+        };
+        Ok(status)
     }
 
     #[cfg(test)]
@@ -750,6 +835,27 @@ pub mod linux {
                 assert!(
                     list.contains(needed),
                     "allow-list missing core syscall {needed}"
+                );
+            }
+        }
+
+        // H1 regression guard: the fd-to-fd byte movers MUST stay in the allow-list, or the HTTP/1.1
+        // sendfile file-body path + the plaintext reverse-proxy splice path EPERM mid-response (no
+        // userspace fallback). The `sandbox_live` SERVE smoke proves this against the real filter.
+        #[test]
+        fn covers_the_fd_byte_movers() {
+            let list: BTreeSet<String> = whole_process_allowlist().into_iter().collect();
+            for needed in [
+                "sendfile",
+                "sendfile64",
+                "splice",
+                "copy_file_range",
+                "tee",
+                "vmsplice",
+            ] {
+                assert!(
+                    list.contains(needed),
+                    "allow-list missing fd byte-mover {needed} (H1): file-serving + reverse-proxy break"
                 );
             }
         }
