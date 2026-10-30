@@ -50,7 +50,7 @@ full operational picture (format, atomicity, the managed-DB restore constraints)
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/project-export?project=<name>[&data_only=true\|false][&include_identity=true\|false][&resumable=<dir>][&mode=differential\|incremental&base=<dir>]` | Stream a `BRPROJ` bundle of `project` out as the response body (`application/octet-stream`). `data_only` defaults to `true` (app data only — no identity/RBAC/routing); `include_identity=true` implies a full bundle and requires the `X-Boatramp-Transport-Key` header. With `resumable=<dir>` the bundle is instead written as a **member-object directory** under the node's `[serve] resumable_export_dir` base (returns JSON naming `resumable_dir`, not a stream): each member is a separate object written `.part`-then-rename, so a re-run skips members already present + SHA-verified — a dropped export resumes instead of restarting. `mode` + `base` take a **delta** against a prior resumable `base` dir (`incremental` chains onto the parent, `differential` diffs a fixed base); both are required together and only with `resumable` (a delta is a node-local member-object directory, not a stream — else `400`). See [Incremental & true-delta export](../how-to/delta-export.md). `Project·Admin` on the `?project=` target. |
-| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt][&resumable=<dir>]` | Import a `BRPROJ` bundle (the request body) into `project`, or — with `resumable=<dir>` — from the member-object directory under `[serve] resumable_export_dir` that a resumable export produced. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. Returns the import report as JSON. `Project·Admin` on the `?project=` target. |
+| `POST` | `/api/project-import?project=<name>[&apply=true][&force=true][&overwrite=true][&allow_schema_skew=true][&identity=fresh\|adopt][&resumable=<dir>][&enumerate_mismatches=true][&skip_member_mismatch=true][&skip_any_blob_mismatch=true]` | Import a `BRPROJ` bundle (the request body) into `project`, or — with `resumable=<dir>` — from the member-object directory under `[serve] resumable_export_dir` that a resumable export produced. Dry-run (a plan, mutates nothing) unless `apply=true`. `identity=adopt` requires the `X-Boatramp-Transport-Key` header. The three `*mismatch*` params are the clone-robustness member-mismatch policy (see [Member-mismatch tolerance](#member-mismatch-tolerance) below); not accepted with `resumable`. Returns the import report as JSON. `Project·Admin` on the `?project=` target. |
 
 The bundle is **streamed** on both ends — the node never stages the whole bundle to a temp file.
 A small/sidecar-framed member (the control-plane KV slice, small blobs, the identity container)
@@ -87,6 +87,47 @@ A bundle member is capped at **256 GiB**, and a whole bundle at **1 TiB** — fi
 currently exposed as a config key or CLI flag. Exceeding either refuses the import with a `501`
 naming the cap.
 
+### Member-mismatch tolerance
+
+By default, an import (either `/api/project-import` or the `clone/from` orchestrator below)
+**hard-fails on the first member** whose streamed bytes disagree with its declared size/SHA-256
+(a strict verify-then-apply). Three independent query params / body fields (shared by both
+surfaces) relax that for the common "one stale re-generable derivative blocks a huge clone" case —
+see [Recover from a mismatched/stale clone member](../how-to/clone-project.md#recover-from-a-mismatched-or-stale-clone-member)
+for the worked recovery flow:
+
+| Param (query on `project-import`, JSON field on `clone/from`) | Default | Effect |
+| --- | --- | --- |
+| `enumerate_mismatches` | `false` | **Assess scope.** Scan every member, record **every** mismatch (path + class `der`/`base`/`primary` + size/checksum, declared vs. streamed), apply nothing that mismatches, and fail at the end instead of at the first — so the caller learns the full scope in one pass. |
+| `skip_member_mismatch` | `false` | **Tolerate.** Warn + continue past a mismatched member instead of hard-failing (the member is **not** applied — the target re-derives a skipped derivative on access). **Default-scoped to re-generable `der/` derivatives** — see the blob-key classification below; a baseline/primary/non-blob mismatch **still hard-fails**. Each tolerated skip is recorded in the returned `ImportReport.notes`. |
+| `skip_any_blob_mismatch` | `false` | Broaden `skip_member_mismatch` from `der/`-only to **any** blob member (baselines + primaries too). Requires `skip_member_mismatch`. **Never** tolerates a non-blob (DB/KV/identity) member even so. |
+
+`enumerate_mismatches` overrides `skip_member_mismatch` — an enumerate pass is always a pure
+assessment (nothing is ever applied), never a mutation, even for a `der/`-class finding.
+
+#### The `der`/`base` blob-key convention (guest-facing contract)
+
+Which blob objects are safe to skip, bless, or purge is decided **structurally**, from the
+object's storage key, by one shared classifier (`boatramp_core::blob_class`) — not by a flag the
+caller sets. A key is classified by its `/`-separated path **components** (never a substring —
+a segment `thunder` or `database` does **not** match):
+
+- a component exactly `base` → **baseline** (load-bearing; never skipped/reconciled/purged without
+  the explicit, audited `--include-primary`/`--skip-member-mismatch-any-blob` opt-in);
+- else a component exactly `der` → **derivative** (re-generable — the only class tolerated by
+  the *default* scope of clone skip, `blob reconcile`, and `blob purge --legacy-derivatives`);
+- a key with **both** `base`/`der` has `base` win (the conservative bias — load-bearing wins ties);
+- anything else → **primary** (an original/user object; load-bearing, same treatment as baseline).
+
+This is a **contract your application must honor**, not an implementation detail: if a guest
+stores load-bearing data under a literal `der` path component, that data becomes eligible to be
+silently skipped on a tolerant clone, blessed (declared-size-rewritten) by a default `blob
+reconcile`, or deleted by `blob purge --legacy-derivatives` — because the host can only tell a
+re-generable derivative from load-bearing data by this path convention. Put **only** genuinely
+re-generable derivatives (thumbnails, format transcodes, resized variants — anything your
+application regenerates on a cache miss) under a `der/` component, and keep baselines/originals
+under `base/` or any path with neither component.
+
 ### Streaming clone
 
 A **streaming clone** pulls a project directly from a live **source** node into a **target** node,
@@ -104,7 +145,7 @@ the `project-export` feature.
 | --- | --- | --- |
 | `GET` | `/api/projects/<proj>/clone/manifest[?data_only=true\|false]` | **Source.** The cheap clone manifest — a LIST of the project's blob objects (each an `etag`/`size` content ref for the target's per-SHA presence diff) plus the non-blob member paths the stream will carry. No full materialization. `Project·Admin`. |
 | `POST` | `/api/projects/<proj>/clone/stream[?data_only=true\|false]` | **Source.** Stream a format-v2/v3 bundle of exactly the members the target is missing — the request body is the target's skip set (the content-matched blob member paths to omit). `Project·Admin`. |
-| `POST` | `/api/projects/<target>/clone/from` | **Target orchestrator.** Pull the project from a live source node: fetch its manifest, diff this node's store, and (on apply) pull the missing members over the stream and restore through the same atomic shadow path as an import (always a **fresh** identity; the target enforces its own project scope on every member). Body `{ source_url, source_project?, apply?, verify?, overwrite?, force?, data_only? }`; the operator's source-node Project-Admin bearer rides in the `X-Boatramp-Source-Token` header, and `source_url` must be an absolute **https** URL resolving to a public address (SSRF-guarded). The **default** (`apply=false`, `verify=false`) returns a cheap **`ClonePlan`** JSON (manifest + diff only — **no** stream, nothing restored). `apply=true` (or `verify=true`, the stream-level validate) returns an **NDJSON progress stream** (`application/x-ndjson`): a `plan` event, periodic `progress` heartbeats, then one terminal `report`/`error` event. `Project·Admin`. |
+| `POST` | `/api/projects/<target>/clone/from` | **Target orchestrator.** Pull the project from a live source node: fetch its manifest, diff this node's store, and (on apply) pull the missing members over the stream and restore through the same atomic shadow path as an import (always a **fresh** identity; the target enforces its own project scope on every member). Body `{ source_url, source_project?, apply?, verify?, overwrite?, force?, data_only?, enumerate_mismatches?, skip_member_mismatch?, skip_any_blob_mismatch? }` — the last three are the [member-mismatch tolerance](#member-mismatch-tolerance) policy, same semantics as `project-import`; the operator's source-node Project-Admin bearer rides in the `X-Boatramp-Source-Token` header, and `source_url` must be an absolute **https** URL resolving to a public address (SSRF-guarded). The **default** (`apply=false`, `verify=false`) returns a cheap **`ClonePlan`** JSON (manifest + diff only — **no** stream, nothing restored). `apply=true` (or `verify=true`, the stream-level validate) returns an **NDJSON progress stream** (`application/x-ndjson`): a `plan` event, periodic `progress` heartbeats, then one terminal `report`/`error` event. `Project·Admin`. |
 
 ## Sites & deployments
 
@@ -182,8 +223,9 @@ log warning. `system` · `read`.
 
 #### `POST /api/blob-purge`
 
-Since 0.6.4. Reclaim a **provably-safe-only** object set on the node's blob store. Dry-run by
-default (report only, delete nothing); `apply: true` deletes. `system` · `admin`.
+Since 0.6.4 (`legacy_derivatives` mode: v0.50.0). Reclaim a **provably-safe-only** object set on
+the node's blob store. Dry-run by default (report only, delete nothing); `apply: true` deletes.
+`system` · `admin`.
 
 ```json
 { "mode": "unreferenced", "apply": false, "prefix": "" }
@@ -199,15 +241,71 @@ default (report only, delete nothing); `apply: true` deletes. `system` · `admin
   that are **byte-confirmed present in the primary** (fail-closed — an unconfirmed object is
   kept). `prefix` restricts the scope. With no `[serve].blob_fallback` configured, the request is
   a **422**.
+- `"legacy_derivatives"` — delete stale image derivatives of a **superseded format** (e.g. the
+  pre-WEBP `.jpg` leftovers): deletes **only** `der/`-classified objects (see
+  [the `der`/`base` convention](#member-mismatch-tolerance)) whose extension matches
+  `superseded_ext`, under `prefix`. A referenced baseline/primary — even with the same extension —
+  and the current-format derivative are **never** touched. `superseded_ext` is **required**; a
+  missing or empty value is a **422** (`"legacy_derivatives purge requires a non-empty
+  superseded_ext … refusing a blanket derivative delete"`), never a blanket delete.
+
+```json
+{ "mode": "legacy_derivatives", "apply": false, "prefix": "hblob/acme/", "superseded_ext": "jpg" }
+```
 
 The response is **NDJSON** (progress lines then a final `"type":"report"` line), the same shape
 as the drain:
 
 ```
 {"type":"report","mode":"drained_source","apply":true,"considered":3,"purged":1,"would_purge":0,"skipped_unconfirmed":2,"purged_bytes":17,"message":"drained-source purge complete: reclaimed 1 confirmed-duplicated object(s) (17 byte(s)); kept 2 unconfirmed"}
+{"type":"report","mode":"legacy_derivatives","apply":true,"considered":4200,"purged":12,"would_purge":0,"skipped_not_superseded":4188,"bytes_purged":98765,"message":"legacy-derivative purge complete: purged 12 superseded der/ object(s) (98765 byte(s)); kept 4188 non-superseded object(s)"}
 ```
 
 See [Migrate the blob backend](../how-to/blob-backend-migration.md).
+
+#### `GET /api/blob-verify`
+
+Blob integrity report. Read-only, `system` · `read`. Two classes:
+
+```json
+{ "dead_references": [ { "hash": "<sha256>", "referrer": "acme/blog" } ],
+  "size_mismatches": [ { "hash": "<sha256>", "referrer": "acme/blog", "declared": 48213, "stored": 12345 } ] }
+```
+
+- `dead_references` — a blob a live site deployment or function references that is **missing**
+  from the backend (would `404` on invoke/serve) — unchanged since this endpoint shipped.
+- `size_mismatches` (**v0.50.0**) — a **referenced** blob whose manifest-declared size disagrees
+  with what the backend actually stores. The serve path emits the *declared* size as
+  `Content-Length`, so a shorter stored object streams a truncated/hung response — and this is
+  exactly the index↔object drift that makes a streaming clone fail-closed (`stored` is `null`
+  when the backend reports no size for an otherwise-present object; it is never dropped from the
+  list on that account). Repair a `der/`-classified entry with `POST /api/blob-reconcile`; a
+  baseline/primary entry signals a truncation/corruption to investigate.
+
+#### `POST /api/blob-reconcile`
+
+Since v0.50.0. **Guarded repair** for the `size_mismatches` class above: bless an index↔object
+size drift by re-writing each in-scope object so its declared size matches its stored body.
+Dry-run by default (report only, writes nothing); `apply: true` writes. `system` · `admin` — the
+same node-destructive grade as `/api/blob-purge` (re-checked defense-in-depth in the handler, not
+just the authz middleware); the singular hyphenated path cannot collide with the
+`/api/blobs/` (`blobs` · `deploy`) content-upload matcher.
+
+```json
+{ "prefix": "", "apply": false, "include_primary": false }
+```
+
+`deny_unknown_fields`. **Default-scoped to re-generable `der/`-classified objects** (see
+[the `der`/`base` convention](#member-mismatch-tolerance)); `include_primary: true` is the
+**dangerous, audited opt-in** to also reconcile baseline/primary objects — it blesses a possible
+truncation on load-bearing data, so use it only after confirming the drift is benign. Returns a
+single JSON report (not NDJSON — a reconcile is a bounded one-pass operation):
+
+```json
+{ "apply": true, "include_primary": false, "considered": 4200, "drifted": 3, "reconciled": 3,
+  "would_reconcile": 0, "skipped_out_of_scope": 1, "skipped_too_large": 0, "skipped_unreadable": 0,
+  "bytes_reconciled": 9876 }
+```
 
 ## Domains
 

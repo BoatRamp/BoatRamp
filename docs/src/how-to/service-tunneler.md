@@ -88,3 +88,11 @@ The tunnel is a privileged, host-mutating client. It:
 
 Run it under the least privilege that works, and prefer the SOCKS front-end when
 a single application — rather than the whole machine — needs overlay access.
+
+**Hardening (v0.50.0).** The TUN netstack now drops an inbound IPv4 frame whose **source**
+address is unspecified (`0.0.0.0`) at ingress, before it reaches `smoltcp`. A crafted fresh-SYN
+with that source previously made the embedded netstack build a reply whose *destination* was
+also `0.0.0.0`, tripping an internal `smoltcp` assertion and aborting the whole poll loop — a
+remotely-reachable, single-packet DoS against every connection the tunnel was carrying. Found by
+the `fuzz_netstack_ingress` fuzz target; fixed at boatramp's own ingress boundary (no client
+action needed — update to v0.50.0 or later).

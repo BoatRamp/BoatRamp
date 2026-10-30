@@ -53,8 +53,12 @@ $ boatramp project import acme-copy --in acme.brproj --apply --server https://cp
 | `--allow-schema-skew` | off | Proceed despite a Postgres schema-ledger fingerprint mismatch between the bundle and the target. |
 | `--identity <fresh\|adopt>` | `fresh` | `fresh` — the target mints its own identity and source-sealed secrets are dropped. `adopt` — install the bundle's KEK for a same-environment recovery (requires a transport key). |
 | `--transport-key-file <FILE>` | — | File holding the transport passphrase (for `--identity adopt`). Falls back to `BOATRAMP_EXPORT_TRANSPORT_KEY`, then an interactive prompt. |
+| `--enumerate-mismatches` | off | **Assess scope**: scan every member, report every declared≠streamed integrity mismatch (path + class), apply nothing that mismatches, and fail at the end. See [Recover from a mismatched/stale clone member](#recover-from-a-mismatched-or-stale-clone-member). |
+| `--skip-member-mismatch` | off | Warn + continue past a mismatched member instead of hard-failing, scoped to re-generable `der/` derivatives by default. See below. |
+| `--skip-member-mismatch-any-blob` | off | Broaden `--skip-member-mismatch` to any blob member (never non-blob). Requires `--skip-member-mismatch`. See below. |
 
-Server seam: `POST /api/project-import`.
+Server seam: `POST /api/project-import`. (The three member-mismatch flags are **not** accepted
+with `--resumable`.)
 
 ## Clone a project (via a bundle)
 
@@ -100,6 +104,9 @@ default** — add `--apply` to execute.
 | `--apply` | dry-run | Execute the clone (default: a **cheap plan** on the target that mutates nothing — see below). |
 | `--clone-verify` | off | A **stream-level validate** (only without `--apply`): open the source stream and check the whole bundle end-to-end **without** mutating the target. The default dry-run is the cheap plan (manifest + diff only); reach for this when you want the heavier full-transfer validation a plan does not perform. |
 | `--overwrite` | off | Replace an **existing**, populated target project (otherwise a clone targets a fresh project). |
+| `--enumerate-mismatches` | off | **Assess scope**: scan every member, report every declared≠streamed integrity mismatch (path + class), apply nothing that mismatches, and fail at the end. Pair with `--clone-verify` or the default dry-run plan. See [below](#recover-from-a-mismatched-or-stale-clone-member). |
+| `--skip-member-mismatch` | off | Warn + continue past a mismatched member instead of hard-failing, scoped to re-generable `der/` derivatives by default. See [below](#recover-from-a-mismatched-or-stale-clone-member). |
+| `--skip-member-mismatch-any-blob` | off | Broaden `--skip-member-mismatch` to any blob member (never non-blob). Requires `--skip-member-mismatch`. |
 
 ### The dry-run is a cheap plan (not a trial transfer)
 
@@ -161,6 +168,115 @@ adoption is the recovery-oriented bundle import path, not clone) and enforces it
 scope on every member it writes: a source-declared scope is never trusted, and a blob ref outside the
 source project's own prefix is refused fail-closed. See
 [API reference: Streaming clone](../reference/api.md#streaming-clone) for the HTTP contract.
+
+## Recover from a mismatched or stale clone member
+
+A large project occasionally accumulates a few blob objects whose **declared** size/checksum (in
+the manifest) no longer agrees with what the backend actually **stores** — most often a stale
+image derivative left over from a format change (pre-WEBP `.jpg` thumbnails, say). By default,
+both `--in <file>` and `--clone-from` import **hard-fail on the first such mismatch** — a correct,
+but blunt, response when the mismatch is on data the target can regenerate on its own.
+
+This is the realistic shape: a 43.5 GB clone fails partway through with something like
+
+```
+error: clone failed after the stream opened: size MISMATCH for member
+"blobs/acme/blog/images/der/<sha>/512.jpg": declared 48213, streamed 12345
+```
+
+### 1. Assess the scope — is it one stale blob, or many?
+
+Re-run with `--enumerate-mismatches` (pair it with `--clone-verify` for a stream-level clone, or
+just the default dry-run plan for a bundle import) to scan **every** member in one pass and report
+**every** mismatch — path, class (`der`/`base`/`primary`), and the declared-vs-streamed
+size/checksum — before touching anything:
+
+```console
+$ boatramp project import acme --clone-from https://src.acme.com \
+    --clone-source-token-file ./src-admin.token --clone-verify --enumerate-mismatches \
+    --server https://dst.acme.com
+error: clone failed after the stream opened: 3 member(s) failed integrity verification (declared ≠ streamed):
+  • "blobs/acme/blog/images/der/<sha1>/512.jpg" [der] Size: declared 48213, streamed 12345
+  • "blobs/acme/blog/images/der/<sha2>/256.jpg" [der] Size: declared 9871, streamed 9871
+  • "blobs/acme/sql/app.pgc" [non-blob] Checksum: declared <hash>, streamed <hash>
+```
+
+(Non-zero exit — `--enumerate-mismatches` always ends in this error when at least one mismatch
+exists; it never applies anything.)
+
+An enumerate pass **applies nothing** — it is a pure assessment, even for a `der/`-class finding.
+A non-blob (DB/KV/identity) or baseline/primary finding in that list is one `--skip-member-mismatch`
+will **not** fix (see step 2) — it needs its own repair (re-export the source, or fix it at the
+source with `blob reconcile`/`blob purge`, step 3).
+
+### 2. Get the clone through — tolerate the re-generable ones
+
+If every hard finding is a `der/` derivative, re-run with `--skip-member-mismatch`: it warns and
+continues past each `der/` mismatch instead of hard-failing — the member is **not** applied, and
+the target re-derives it the first time something requests it. A baseline, a primary/original
+blob, or any DB/KV/identity member still hard-fails, so this cannot silently swallow a mismatch on
+load-bearing data:
+
+```console
+$ boatramp project import acme --clone-from https://src.acme.com \
+    --clone-source-token-file ./src-admin.token --apply --skip-member-mismatch \
+    --server https://dst.acme.com
+cloned `acme` ← `acme` (full): transferred 18214 of 18214 blobs (~33203MB bytes)
+  restored: 18213 blobs, pg 1, libsql 0, kv 412 records
+  note: SKIPPED member "blobs/acme/blog/images/der/<sha1>/512.jpg" [der] (Size mismatch: declared 48213, streamed 12345) — NOT applied; the target re-derives it on access
+```
+
+Each tolerated skip is echoed as a `note:` line (for `--clone-from`) or in the import report JSON
+(for `--in <file>`) — so you know exactly what the target will regenerate on first access. If a
+baseline/primary mismatch turns out to be one you've decided is actually safe to bless (rare —
+double-check it is not real corruption first), the louder, explicit
+`--skip-member-mismatch-any-blob` broadens the tolerance to any blob member; it still never
+tolerates a non-blob member.
+
+### 3. Optionally, clean up the source so the next clone is clean
+
+`--skip-member-mismatch` treats the symptom on the target; the drift still exists on the
+**source**'s index. Two source-side tools fix it there:
+
+- **`boatramp blob reconcile`** blesses the drift by rewriting the source's stored bytes so the
+  declared size matches the body — default-scoped to `der/` (the audited `--include-primary` opt-in
+  covers baseline/primary, but double-check first — it blesses a possible truncation).
+- **`boatramp blob purge --legacy-derivatives --superseded-ext jpg`** instead **deletes** the
+  stale-format derivatives outright (rather than blessing their declared size) — the right call
+  when the mismatch is really leftover pre-format-change cruft the application will regenerate
+  anyway.
+
+```console
+$ boatramp blob verify --server https://cp.acme.com                                   # confirm scope
+$ boatramp blob reconcile --prefix hblob/acme/ --server https://cp.acme.com            # dry-run
+$ boatramp blob reconcile --prefix hblob/acme/ --apply --server https://cp.acme.com    # bless
+```
+
+See [`blob verify`](../reference/cli.md#blob-verify), [`blob reconcile`](../reference/cli.md#blob-reconcile),
+and [`blob purge`](../reference/cli.md#blob-purge) in the CLI reference, and
+[the `der`/`base` blob-key convention](../reference/api.md#member-mismatch-tolerance) for exactly
+which objects each tool is allowed to touch.
+
+### The `der`/`base` convention is a contract your application must honor
+
+Every one of these tools — the clone-skip above, `blob reconcile`'s default scope, and
+`blob purge --legacy-derivatives` — decides "safe to skip/bless/delete" **structurally**, from a
+whole `/`-separated path **component** on the blob's storage key, never from a flag you pass per
+object:
+
+- a component exactly `base` → **baseline** (load-bearing — never touched without an explicit,
+  audited opt-in);
+- else a component exactly `der` → **derivative** (re-generable — the only class these tools
+  touch by default);
+- `base` wins a tie (a key with both components is a baseline);
+- anything else → **primary** (an original/user object — load-bearing, treated like a baseline).
+
+The match is on whole segments, not substrings (a segment `thunder` or `database` is **primary**,
+not a derivative). If your application stores load-bearing data under a literal `der` path
+component, that data becomes eligible to be silently skipped on a tolerant clone, blessed by a
+default `blob reconcile`, or deleted by a legacy-derivative purge — so keep `der/` for genuinely
+re-generable content only (thumbnails, transcodes, resized variants your app regenerates on a
+cache miss), and put everything else under `base/` or a path with neither component.
 
 ## The bundle format: streamed, not staged
 
@@ -273,6 +389,13 @@ cap refuses the import outright, naming the cap it hit.
   and managed-vs-external/single-vs-shared distinctions this page relies on.
 - [In-app schema migrations](./in-app-migrations.md#enable-an-extension) — the
   `migrate_trusted_extensions` allowlist in its original (migration) context.
-- [RBAC reference](../reference/rbac.md) — the `Project·Admin` gate on the export/import and clone verbs.
+- [RBAC reference](../reference/rbac.md) — the `Project·Admin` gate on the export/import and clone verbs,
+  and the `System·Admin` gate on `blob reconcile`/`blob purge`.
 - [API reference: Project export & import](../reference/api.md#project-export--import) — the
-  `/api/project-export` / `/api/project-import` HTTP contract.
+  `/api/project-export` / `/api/project-import` HTTP contract, including
+  [member-mismatch tolerance](../reference/api.md#member-mismatch-tolerance) and the `der`/`base`
+  blob-key convention.
+- [CLI reference: `blob verify`](../reference/cli.md#blob-verify),
+  [`blob reconcile`](../reference/cli.md#blob-reconcile), and
+  [`blob purge`](../reference/cli.md#blob-purge) — the source-side integrity tools this page's
+  [clone-mismatch recovery](#recover-from-a-mismatched-or-stale-clone-member) flow uses.

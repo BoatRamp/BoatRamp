@@ -111,6 +111,11 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `POST` | `/api/cluster/join` | none (single-use join token) |
 | `PUT` | `/api/blobs/<hash>` | `blobs` · `deploy` |
 | `POST` | `/api/blob-mint-upload` | `blob_upload` · `write` *(proj, from the request path)* — `blob-upload` feature |
+| `POST` | `/api/blob-drain` | `system` · `admin` (node-level: drains the node's **own** configured `[serve.blob_fallback]` pair, never a client-named backend) |
+| `GET` | `/api/blob-status` | `system` · `read` |
+| `GET` | `/api/blob-verify` | `system` · `read` (read-only; `dead_references` + `size_mismatches`) |
+| `POST` | `/api/blob-purge` | `system` · `admin` (`unreferenced` / `drained_source` / `legacy_derivatives` — all node-level, re-checked defense-in-depth in the handler) |
+| `POST` | `/api/blob-reconcile` | `system` · `admin` — the **same node-destructive grade as `/api/blob-purge`** (re-writes stored blob bytes across the node's store); default-scoped to re-generable `der/` objects, `include_primary` is an audited opt-in, never a per-project right |
 | `GET` | `/api/sites` | `system` · `read` |
 | `GET` | `/api/projects` | `system` · `read` |
 | `POST` | `/api/projects` | `system` · `admin` |

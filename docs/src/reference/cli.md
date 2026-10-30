@@ -202,9 +202,12 @@ resolves to. Takes the common `--server` flag.
 | `tenant-secrets {set,rotate,ls,rm}` | Manage the project's **per-tenant** sealed secrets — each tenant's own third-party credential, sealed server-side under `(tenant, name)`, each verb taking `--tenant <t>`. Distinct from the per-project `boatramp secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`. |
 | `export <name> --out <file>` | Stream the project (managed-DB dumps + control-plane KV slice + blobs) to a portable `BRPROJ` bundle, from a **running node** (`Project·Admin` on the project). See [Export, import & clone a project](../how-to/clone-project.md). |
 | `export <name> --resumable <DIR> [--mode <differential\|incremental> --base <DIR>]` | Write a **resumable** member-object directory under the node's `[serve] resumable_export_dir` base (a re-run skips members already present + SHA-verified) instead of streaming a file. `--mode`/`--base` take a **delta** against a prior resumable `--base` dir — `incremental` (vs the parent, forming a chain) or `differential` (vs a fixed base); omit for a full resumable export. `--out` and `--resumable` are mutually exclusive. See [Incremental & true-delta export](../how-to/delta-export.md). |
-| `import <name> --in <file>` | Import a `BRPROJ` bundle into a project on a **running node** (`Project·Admin` on the target project); a dry-run plan by default, `--apply` executes. See [Export, import & clone a project](../how-to/clone-project.md). |
-| `import <name> --resumable <DIR> [--apply]` | Import a **resumable**/delta member-object directory of this name on the node (the output of a resumable export). A delta's whole chain (base → … → this link) is resolved and applied in order. `--in` and `--resumable` are mutually exclusive; dry-run by default. |
-| `import <name> --clone-from <URL> [--clone-source-project <P>] [--clone-source-token-file <FILE>] [--clone-data-only] [--clone-verify] [--apply]` | **Streaming clone:** pull the project directly from a live **source** node (an `https://` URL) and restore each member as it streams in — no `BRPROJ` bundle staged anywhere (manifest-diff resumable, blobs bucket → bucket). `--clone-source-project` defaults to the target name; the source-node `Project·Admin` token comes from `--clone-source-token-file` or `BOATRAMP_CLONE_SOURCE_TOKEN` (sent in a header, never on argv). Needs `Project·Admin` on **both** the source and the target. `--clone-from` is mutually exclusive with `--in`/`--resumable`. The **default dry-run is a cheap plan** (manifest + diff only — no transfer); `--apply` streams + commits with live progress; `--clone-verify` is a stream-level validate without mutating. See [Streaming clone](../how-to/clone-project.md#streaming-clone-pull-from-a-live-source-node). |
+| `import <name> --in <file> [--enumerate-mismatches \| --skip-member-mismatch [--skip-member-mismatch-any-blob]]` | Import a `BRPROJ` bundle into a project on a **running node** (`Project·Admin` on the target project); a dry-run plan by default, `--apply` executes. The member-mismatch flags (below) also apply here. See [Export, import & clone a project](../how-to/clone-project.md). |
+| `import <name> --resumable <DIR> [--apply]` | Import a **resumable**/delta member-object directory of this name on the node (the output of a resumable export). A delta's whole chain (base → … → this link) is resolved and applied in order. `--in` and `--resumable` are mutually exclusive; dry-run by default. Does **not** take the member-mismatch flags. |
+| `import <name> --clone-from <URL> [--clone-source-project <P>] [--clone-source-token-file <FILE>] [--clone-data-only] [--clone-verify] [--apply] [--enumerate-mismatches \| --skip-member-mismatch [--skip-member-mismatch-any-blob]]` | **Streaming clone:** pull the project directly from a live **source** node (an `https://` URL) and restore each member as it streams in — no `BRPROJ` bundle staged anywhere (manifest-diff resumable, blobs bucket → bucket). `--clone-source-project` defaults to the target name; the source-node `Project·Admin` token comes from `--clone-source-token-file` or `BOATRAMP_CLONE_SOURCE_TOKEN` (sent in a header, never on argv). Needs `Project·Admin` on **both** the source and the target. `--clone-from` is mutually exclusive with `--in`/`--resumable`. The **default dry-run is a cheap plan** (manifest + diff only — no transfer); `--apply` streams + commits with live progress; `--clone-verify` is a stream-level validate without mutating. See [Streaming clone](../how-to/clone-project.md#streaming-clone-pull-from-a-live-source-node). |
+| `--enumerate-mismatches` *(either import mode)* | **Clone robustness — assess scope.** Scan **every** member, report **every** declared≠streamed integrity mismatch (path + class `der`/`base`/`primary`) in one pass, and fail at the end instead of aborting at the first — applies nothing that mismatches. Pair with a dry-run (no `--apply`) or `--clone-verify` to assess before touching anything. |
+| `--skip-member-mismatch` *(either import mode)* | **Clone robustness — get the clone through.** Warn + continue past a member whose stored bytes disagree with its declared size/checksum instead of hard-failing. **Default-scoped to re-generable `der/` derivatives** (the target re-derives a skipped one on access); a mismatch on a baseline, a primary/original blob, or any DB/KV/identity member **still hard-fails**. The import report's `notes` list each tolerated skip. |
+| `--skip-member-mismatch-any-blob` *(requires `--skip-member-mismatch`)* | The **louder opt-in**: broaden `--skip-member-mismatch` beyond `der/` derivatives to **any** blob member (baselines + primaries too). **Never** tolerates a non-blob (DB/KV/identity) member even so. Dangerous — it blesses a possible truncation on load-bearing data; prefer fixing the source (`blob reconcile`/`blob purge --legacy-derivatives`) instead. See [Recover from a mismatched/stale clone member](../how-to/clone-project.md#recover-from-a-mismatched-or-stale-clone-member). |
 
 ## `boatramp apply`
 
@@ -997,9 +1000,10 @@ without a re-apply, then reclaim the old store.
 | `mint-upload` | Mint a scoped, short-lived S3 upload credential for a project+site's blob container, so an external client (browser, bulk agent) can upload directly over the S3 protocol; TTL + max-bytes clamp to operator ceilings. `blob-upload` feature, gated `BlobUpload·Write`. See [Direct-to-storage blob ingress](../how-to/blob-ingress.md). |
 | [`migrate`](#blob-migrate) | **Offline, node-local** copy of every object from one blob backend to another. |
 | [`drain`](#blob-drain) | **Daemon-mediated** drain of a managed node's configured read-fallback secondary → primary. |
-| [`purge`](#blob-purge) | Reclaim unreferenced blobs, or a drained secondary's objects (dry-run by default). |
+| [`purge`](#blob-purge) | Reclaim unreferenced blobs, a drained secondary's objects, or stale legacy-format derivatives (dry-run by default). |
 | [`status`](#blob-status) | Print the node's blob migration posture (`{ blob_fallback_active }`). |
-| `verify` | List every blob a live site deployment or function references that is MISSING from the backend — a dead reference that would 404 on invoke/serve. Read-only (`System·Read`). |
+| [`verify`](#blob-verify) | List every blob a live site deployment or function references that is MISSING from the backend (a dead reference that would 404 on invoke/serve), **and** every referenced blob whose declared size disagrees with what the backend stores (`size_mismatches`). Read-only (`System·Read`). |
+| [`reconcile`](#blob-reconcile) | **Guarded repair:** bless an index↔object size drift by re-writing the stored bytes so the declared size matches the body. Default-scoped to re-generable `der/` derivatives; dry-run by default. Gated `System·Admin`. |
 | `rehome` | Default-scope blob re-home (v0.31.0): re-homes the node's own bare default-scoped blob objects to their two-segment `…/default/…` spelling, in place. Offline + node-local, mirrors `boatramp migrate --stage`/`--finalize`. Run with the node stopped. |
 
 > **The three blob-storage `migrate`/`drain` verbs.** `blob migrate` is **offline** — it
@@ -1072,8 +1076,9 @@ what *would* be reclaimed and deletes nothing) — pass `--apply` to execute. Ga
 | --- | --- |
 | `--unreferenced` | On-demand garbage collection: prune content-addressed blobs that **no live deploy manifest references** (the everyday storage reclaim). **Refused (`409`)** while a read-fallback secondary is attached (`[serve.blob_fallback]`) — drain and drop the fallback first, else GC could phantom-reclaim a secondary-only orphan. |
 | `--drained-source` | The migration **decommission**: after a `drain`/`migrate`, delete each old-secondary object **only once it is byte-confirmed** (present at a matching size) in the primary. **Fail-closed** — an unconfirmed object survives, never deleted. Requires a configured `[serve.blob_fallback]` (else `422`). |
+| `--legacy-derivatives --superseded-ext <ext>` | Drop stale image derivatives of a **superseded format** (e.g. the pre-WEBP `.jpg` leftovers): deletes **only** `der/` objects whose extension is `<ext>`, under `--prefix`. A referenced baseline/primary (even with that extension) and the current-format derivative are **never** touched — a dropped derivative self-heals (regenerates on next access). `--superseded-ext` is required (an empty value is a `422` — never a blanket derivative delete). |
 | `--apply` | Actually delete (default: dry-run — report only). |
-| `--prefix <p>` | Restrict a `--drained-source` purge to source keys under this prefix (ignored by `--unreferenced`). |
+| `--prefix <p>` | Restrict a `--drained-source`/`--legacy-derivatives` purge to keys under this prefix (ignored by `--unreferenced`). |
 
 JSON output: pass the global `--output-format json` flag; progress lines stay on stderr.
 
@@ -1085,6 +1090,52 @@ The direct answer to "is this node still in transition mode?", instead of greppi
 startup log warning. Read-only (`System·Read`).
 
 Pass the global `--output-format json` flag for the structured `{ "blob_fallback_active": <bool> }` posture.
+
+### `blob verify`
+
+List every **content-addressed integrity problem** a live site deployment or function
+exposes, over the control plane. **Read-only** (`System·Read`) — it never writes anything.
+Two classes, both reported together:
+
+| Class | Meaning |
+| --- | --- |
+| `dead_references` | A blob a live deployment/function **references** but that is **missing** from the backend — would `404` on invoke/serve. Repair: re-upload the bytes (`boatramp blob put <file>`, which restores them under the same content hash) or re-deploy the resource. |
+| `size_mismatches` | A **referenced** blob whose manifest-**declared** size disagrees with the size the backend actually **stores** — a truncated/hung `Content-Length` on serve, and exactly the index↔object drift that makes a streaming clone fail-closed (see [Recover from a mismatched/stale clone member](../how-to/clone-project.md#recover-from-a-mismatched-or-stale-clone-member)). Repair: a re-generable `der/` derivative can be **blessed** with [`blob reconcile`](#blob-reconcile); a mismatch on baseline/primary data signals a truncation/corruption to investigate (re-upload/re-deploy). |
+
+```console
+$ boatramp blob verify --server https://cp.acme.com
+blob verify: 1 SIZE mismatch(es) — the backend stores a different byte count than the
+manifest declares (a truncated/hung Content-Length; also blocks a streaming clone):
+  • <sha256>  declared 48213, stored 12345  (acme/blog images/der/<sha>/512.webp)
+```
+
+JSON output: pass the global `--output-format json` flag (`{ "dead_references": [...], "size_mismatches": [...] }`).
+
+### `blob reconcile`
+
+**Guarded repair** for the `size_mismatches` class `blob verify` reports: bless an
+index↔object size drift by **re-writing the stored bytes** so the backend's declared size
+matches the body it actually holds. **Dry-run by default** (report-then-confirm: run once to
+see the plan, re-run with `--apply` to write) and gated at **`System·Admin`**.
+**Default-scoped to re-generable `der/` derivatives** (safe — a `der/` object self-heals on
+next access even if wrong); reconciling a baseline/primary object blesses a possible
+truncation on load-bearing data, so it needs the explicit, audited `--include-primary`.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--apply` | dry-run | Actually re-write drifted objects (default: report what *would* be reconciled, write nothing). |
+| `--prefix <p>` | all | Restrict the scan to keys under this prefix (e.g. `hblob/<project>/`). |
+| `--include-primary` | off | **Dangerous, audited opt-in:** also reconcile baseline/primary objects, not just `der/` derivatives. Each such object is named in the report. |
+
+```console
+$ boatramp blob reconcile --server https://cp.acme.com                    # dry-run
+blob reconcile (dry-run) [der/ scope]: would reconcile 3 of 3 drifted object(s) (9876 byte(s));
+considered 4200 in-scope, skipped 1 out-of-scope (baseline/primary), 0 too-large, 0 unreadable.
+(dry-run — nothing written; re-run with --apply to bless the stored bytes)
+$ boatramp blob reconcile --apply --server https://cp.acme.com            # write
+```
+
+JSON output: pass the global `--output-format json` flag. Server seam: `POST /api/blob-reconcile`.
 
 ## `boatramp kv`
 
