@@ -96,6 +96,29 @@ impl ChannelDevice {
             mtu,
         }
     }
+
+    /// Queue one raw inbound frame for the next [`Interface::poll`]. This is the SINGLE place a
+    /// frame ever enters the netstack — the live poll loop ([`run`]) and the fuzz/test driver
+    /// ([`drive_one_frame`]) both go through here — so the one ingress drop-filter lives here and
+    /// covers every path uniformly (including `accept_fresh_syns`, which only ever scans frames
+    /// that made it into `inbound`).
+    ///
+    /// Drops a frame `smoltcp` (0.12.0) would otherwise mishandle into a panic: an IPv4 packet
+    /// with an unspecified (`0.0.0.0`) **source** address, which drives `smoltcp` to build a reply
+    /// to an unspecified **destination** and trip an `assert!` in `dispatch_ip`, aborting the whole
+    /// poll loop — a crafted-`SYN` DoS. See [`super::packet::ipv4_source_is_unspecified`] for the
+    /// full root cause. Everything else is queued verbatim: `smoltcp` drops other malformed or
+    /// hostile input safely on its own (the `fuzz_netstack_ingress` target is the open-ended proof).
+    fn ingest(&mut self, frame: Vec<u8>) {
+        if super::packet::ipv4_source_is_unspecified(&frame) {
+            tracing::debug!(
+                "boatramp tunnel: dropping an inbound IPv4 frame with an unspecified (0.0.0.0) \
+                 source address (smoltcp would panic building a reply to it)"
+            );
+            return;
+        }
+        self.inbound.push_back(frame);
+    }
 }
 
 struct RxToken(Vec<u8>);
@@ -230,7 +253,7 @@ pub async fn run(
             _ = &mut shutdown => break,
             maybe = raw_in.recv() => {
                 match maybe {
-                    Some(frame) => device.inbound.push_back(frame),
+                    Some(frame) => device.ingest(frame),
                     None => break,
                 }
             }
@@ -238,7 +261,7 @@ pub async fn run(
         }
         // Drain whatever else already arrived without waiting again this iteration.
         while let Ok(frame) = raw_in.try_recv() {
-            device.inbound.push_back(frame);
+            device.ingest(frame);
         }
 
         accept_fresh_syns(
@@ -471,7 +494,7 @@ fn drive_one_frame(config: &NetStackConfig, allocator: &SyntheticIpAllocator, fr
     let mut conns: HashMap<smoltcp::iface::SocketHandle, Conn> = HashMap::new();
     let mut listening: HashMap<(Ipv4Addr, u16), smoltcp::iface::SocketHandle> = HashMap::new();
 
-    device.inbound.push_back(frame.to_vec());
+    device.ingest(frame.to_vec());
     accept_fresh_syns(
         &device.inbound,
         config,
@@ -891,11 +914,83 @@ mod tests {
         fuzz_one_frame(&[0x45u8; 40]); // version/IHL looks right, everything else garbage
 
         // A frame that `peek_tcp` parses as a real (if minimal) TCP SYN — exercises the deeper
-        // "a socket gets created, smoltcp processes a real-looking segment" path too.
+        // "a socket gets created, smoltcp processes a real-looking segment" path too. The source
+        // (bytes 12..16) is a real unicast address, NOT 0.0.0.0: an unspecified source is dropped at
+        // ingress (see the regression below), so a unicast source is what keeps this case reaching
+        // the `smoltcp` poll in both of `fuzz_one_frame`'s variants.
         let mut syn_like = vec![0u8; 40];
         syn_like[0] = 0x45;
         syn_like[9] = 6;
+        syn_like[12..16].copy_from_slice(&[100, 64, 0, 9]); // unicast source
         syn_like[20 + 13] = 0x02; // SYN flag
         fuzz_one_frame(&syn_like);
+
+        // WS3 fuzz-found crash, verbatim (`fuzz_netstack_ingress`, smoltcp 0.12.0 `dispatch_ip`
+        // `assert!(!dst.is_unspecified())` at mod.rs:1134). Decoded via `fuzz_one_frame`'s "anchored"
+        // variant: an IPv4/TCP *fresh SYN* (flags 0x82 = SYN, no ACK) whose SOURCE is 0.0.0.0 and
+        // whose destination is the anchored (really-allocated) service address, with IPv4 + TCP
+        // checksums the coverage-guided fuzzer solved so the segment actually reached smoltcp's TCP
+        // socket-accept path. `accept_fresh_syns` created a listener, smoltcp accepted the SYN and
+        // built a `SYN|ACK` to 0.0.0.0 → panic. With the ingress drop-filter this frame never
+        // reaches `poll`; must not panic. Kept verbatim so this exact path can never silently regress.
+        fuzz_one_frame(&[
+            0, 0, 0, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 130, 130, 130, 130, 130,
+            130, 130, 130, 130, 120, 130, 130, 130, 130, 130, 130, 130, 130, 130, 130, 0, 0, 130,
+            130, 130, 130, 120, 130, 130, 130, 130, 130, 130, 130, 130, 130, 146, 184, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 146, 146, 146, 2, 138,
+        ]);
+    }
+
+    /// Focused, human-readable form of the WS3 fuzz finding: a *well-formed* TCP `SYN` (valid IPv4
+    /// and TCP checksums, so it genuinely reaches smoltcp's TCP processing) from the unspecified
+    /// source `0.0.0.0`, aimed at a really-allocated service address. Before the ingress drop-filter
+    /// this made `accept_fresh_syns` create a listener, smoltcp accept the `SYN`, build a `SYN|ACK`
+    /// to `0.0.0.0`, and panic in `dispatch_ip`. The netstack must instead drop it at ingress and
+    /// survive. (Remove `ChannelDevice::ingest`'s filter and this test panics — exactly the DoS.)
+    #[test]
+    fn a_well_formed_syn_from_an_unspecified_source_does_not_panic_the_netstack() {
+        let config = test_config();
+        let allocator = SyntheticIpAllocator::new(config.cidr);
+        let svc_addr = allocator
+            .allocate("svc/unspecified-source-regression")
+            .expect("a single allocation from a fresh pool never exhausts it");
+
+        let frame = build_frame(
+            (Ipv4Addr::UNSPECIFIED, 40000),
+            (svc_addr, 443),
+            0x02, // SYN, no ACK — a fresh connection attempt
+            1000,
+            0,
+            &[],
+        );
+
+        // Drive EXACTLY what `run`/`drive_one_frame` do — through the production ingress choke
+        // point — on a netstack whose allocator recognizes the destination (so a listener would be
+        // created and the SYN accepted, were the frame not dropped first).
+        let mut device = ChannelDevice::new(config.mtu);
+        let mut iface = configure_interface(&mut device, &config);
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut conns: HashMap<smoltcp::iface::SocketHandle, Conn> = HashMap::new();
+        let mut listening: HashMap<(Ipv4Addr, u16), smoltcp::iface::SocketHandle> = HashMap::new();
+
+        device.ingest(frame);
+        assert!(
+            device.inbound.is_empty(),
+            "an unspecified-source (0.0.0.0) frame must be dropped at ingress, never queued"
+        );
+        accept_fresh_syns(
+            &device.inbound,
+            &config,
+            &allocator,
+            &mut sockets,
+            &mut conns,
+            &mut listening,
+        );
+        iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+        // Reaching here without a panic is the assertion: the dropped frame produced no reply.
+        assert!(
+            conns.is_empty(),
+            "no socket should have been created for the dropped frame"
+        );
     }
 }

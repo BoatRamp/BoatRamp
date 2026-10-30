@@ -36,6 +36,36 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const TCP_MIN_HEADER_LEN: usize = 14;
 /// IPv4 "protocol" field value for TCP (RFC 790).
 const IP_PROTO_TCP: u8 = 6;
+/// Byte offset of the IPv4 *source* address within the header (after version/IHL, DSCP/ECN,
+/// total-length, identification, flags/fragment-offset, TTL, protocol, and header checksum).
+const IPV4_SRC_ADDR_OFFSET: usize = 12;
+
+/// Is `frame` an IPv4 packet whose **source** address is the unspecified address (`0.0.0.0`)?
+///
+/// This is the one inbound-frame shape the netstack must drop before `smoltcp` (0.12.0) ever sees
+/// it. `smoltcp`'s own ingress filter (`iface/interface/ipv4.rs::process_ipv4`) deliberately lets a
+/// packet with an unspecified *source* through — "Discard packets with non-unicast source addresses
+/// but allow unspecified" — while dropping every *other* non-unicast source (broadcast, multicast).
+/// That carve-out is for protocols like DHCP where a client has no address yet; this front-end runs
+/// none (IPv4 + TCP only, no DHCP socket). The gap it leaves is a real, remotely-reachable panic:
+/// when a freshly-listening socket ([`super::netstack`]'s `accept_fresh_syns`) accepts a `SYN` from
+/// `0.0.0.0`, `smoltcp` builds a `SYN|ACK` whose *destination* is that same `0.0.0.0` and then trips
+/// `assert!(!ip_repr.dst_addr().is_unspecified())` in `dispatch_ip`, **aborting the whole netstack
+/// poll loop** (a crafted-`SYN` DoS against the TUN front-end; `smoltcp` 0.13+/0.14 fixed it by
+/// dropping such packets in `process_tcp` *before* socket processing — we apply the identical
+/// semantic one layer earlier, at our own ingress boundary, in [`super::netstack`]'s `ChannelDevice`).
+/// A TCP service endpoint has no one to reply to at `0.0.0.0`, so dropping the frame loses nothing.
+///
+/// Bounds-checked throughout — **never panics**, on any input (the property the fuzz target asserts).
+#[must_use]
+pub fn ipv4_source_is_unspecified(frame: &[u8]) -> bool {
+    frame.len() >= IPV4_MIN_HEADER_LEN
+        && (frame[0] >> 4) == 4
+        && frame[IPV4_SRC_ADDR_OFFSET] == 0
+        && frame[IPV4_SRC_ADDR_OFFSET + 1] == 0
+        && frame[IPV4_SRC_ADDR_OFFSET + 2] == 0
+        && frame[IPV4_SRC_ADDR_OFFSET + 3] == 0
+}
 
 /// Best-effort peek at `frame` as an IPv4 packet carrying a TCP segment. `None` for anything that
 /// is not well-formed enough to extract a 4-tuple + flags from: too short, wrong IP version, an IHL
@@ -175,5 +205,40 @@ mod tests {
             }
             let _ = peek_tcp(&buf); // must not panic regardless of outcome
         }
+    }
+
+    #[test]
+    fn an_unspecified_ipv4_source_is_recognized() {
+        // A well-formed IPv4 header whose source (bytes 12..16) is 0.0.0.0 — the shape the netstack
+        // ingress drops to avoid the `smoltcp` `dispatch_ip` panic (see `ipv4_source_is_unspecified`).
+        let frame = build_frame(
+            (Ipv4Addr::UNSPECIFIED, 40000),
+            (Ipv4Addr::new(100, 64, 0, 5), 443),
+            0x02,
+        );
+        assert!(ipv4_source_is_unspecified(&frame));
+    }
+
+    #[test]
+    fn a_unicast_ipv4_source_is_not_flagged() {
+        let frame = build_frame(
+            (Ipv4Addr::new(100, 64, 0, 9), 51000),
+            (Ipv4Addr::new(100, 64, 0, 5), 443),
+            0x02,
+        );
+        assert!(!ipv4_source_is_unspecified(&frame));
+    }
+
+    #[test]
+    fn unspecified_source_check_is_bounds_safe_and_ipv4_only() {
+        // Too short to hold a source address: must be `false`, never panic.
+        for len in 0..IPV4_MIN_HEADER_LEN {
+            assert!(!ipv4_source_is_unspecified(&vec![0u8; len]));
+        }
+        // All-zero but a non-IPv4 version nibble (here 0): not an IPv4 packet, so not our concern —
+        // `smoltcp` drops it for an unknown version long before any reply is built.
+        let mut not_v4 = vec![0u8; IPV4_MIN_HEADER_LEN];
+        not_v4[0] = 0x60; // version 6
+        assert!(!ipv4_source_is_unspecified(&not_v4));
     }
 }
