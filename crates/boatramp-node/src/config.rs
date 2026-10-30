@@ -2497,8 +2497,9 @@ pub struct ServeConfig {
     /// config/cert paths the server reads). Installed BEFORE the Tokio runtime starts, on the single
     /// main thread, so every worker thread inherits the filter + domain via `clone` (whole-process).
     /// **Linux-only** — a documented no-op elsewhere. Absent ⇒ the `auto` posture (ON where supported,
-    /// auto-skipped on a native-compute node). See [`SandboxConfig`] / [`SandboxPosture`]. Env parity:
-    /// `BOATRAMP_SERVE_SANDBOX_*`.
+    /// auto-skipped on a native-compute node). See [`SandboxConfig`] / [`SandboxPosture`]. Env: the
+    /// posture knob is `BOATRAMP_SERVE_SANDBOX_POSTURE`; the `extra_*_paths` lists are FILE-ONLY (no
+    /// scalar env form).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxConfig>,
 }
@@ -5625,6 +5626,14 @@ pub(crate) mod figment_resolve {
             "BOATRAMP_SHARED_CACHE_COHERENCE",
             &["serve", "shared_cache_coherence"],
         ),
+        // The whole-process OS sandbox posture (privsep Phase 0 WS1). KEEPS the `serve` segment
+        // (`BOATRAMP_SERVE_SANDBOX_POSTURE`) — the key operator knob for container/k8s deploys. A
+        // scalar enum string figment coerces into `SandboxPosture`. The `extra_read_paths`/
+        // `extra_write_paths` list fields have no scalar env form and stay FILE-ONLY.
+        (
+            "BOATRAMP_SERVE_SANDBOX_POSTURE",
+            &["serve", "sandbox", "posture"],
+        ),
     ];
 
     /// The `serve.kv.*` aliases (the former Loader-C ad-hoc `std::env::var` surface). The env
@@ -6723,6 +6732,22 @@ pub(crate) mod figment_resolve {
                 unhandled.is_empty(),
                 "overlay produced nothing for these serve vars: {unhandled:?}"
             );
+        }
+
+        /// Env parity (WS1 FIX 2): `BOATRAMP_SERVE_SANDBOX_POSTURE` resolves end-to-end into
+        /// `[serve.sandbox].posture` (the operator knob for container/k8s deploys). The
+        /// `extra_*_paths` list fields are file-only (no scalar env form).
+        #[test]
+        fn env_sets_sandbox_posture() {
+            let cfg = figment_env(&[("BOATRAMP_SERVE_SANDBOX_POSTURE", "strict")]);
+            let sandbox = cfg
+                .serve
+                .expect("serve materialised")
+                .sandbox
+                .expect("[serve.sandbox] materialised from the env posture");
+            assert_eq!(sandbox.posture, SandboxPosture::Strict);
+            assert!(sandbox.extra_read_paths.is_empty());
+            assert!(sandbox.extra_write_paths.is_empty());
         }
 
         // --- the flag layer: precedence + the config dump redaction ---------------
