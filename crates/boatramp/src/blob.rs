@@ -166,7 +166,20 @@ enum BlobCommand {
     /// (present at matching size) in the primary. Fail-closed: an unconfirmed key SURVIVES. Requires a
     /// configured `[serve.blob_fallback]` (else 422); runs while the fallback is still attached, then
     /// you drop it.
+    ///
+    /// `--legacy-derivatives --superseded-ext <ext>` — drop stale image derivatives of a SUPERSEDED
+    /// format (the pre-WEBP `.jpg` leftovers): delete ONLY `der/` objects of `<ext>` under `--prefix`.
+    /// A referenced baseline/primary (even with that extension) and the current-format derivative are
+    /// NEVER touched — a dropped derivative self-heals (regenerates on next access).
     Purge(PurgeArgs),
+    /// **Guarded reconcile** (System·Admin, PLAN-clone-robustness #4): repair an index↔object SIZE
+    /// drift (a blob whose declared size disagrees with its stored bytes — what `blob verify` reports
+    /// and what fail-closes a streaming clone) by "blessing" the stored bytes: re-write each in-scope
+    /// object so the backend's declared size matches its body. DEFAULT-scoped to re-generable `der/`
+    /// derivatives (safe — they self-heal); a baseline/primary reconcile blesses a possible truncation
+    /// on load-bearing data, so it needs the explicit `--include-primary`. Dry-run by default
+    /// (report-then-confirm); pass `--apply` to write.
+    Reconcile(ReconcileArgs),
     /// Print the node's structured blob transition-mode state (v0.6.4): whether a read-fallback
     /// secondary is currently attached (the node is mid-migration). The direct, structured answer to
     /// "is this node still in TRANSITION mode?" — no log-grepping. Read-only (System·Read).
@@ -222,7 +235,7 @@ pub struct RehomeArgs {
 #[command(group(
     clap::ArgGroup::new("purge_mode")
         .required(true)
-        .args(["unreferenced", "drained_source"]),
+        .args(["unreferenced", "drained_source", "legacy_derivatives"]),
 ))]
 pub struct PurgeArgs {
     /// Reclaim content-addressed blobs no live manifest references (on-demand GC). Refused (409)
@@ -233,13 +246,42 @@ pub struct PurgeArgs {
     /// primary (fail-closed). Requires a configured `[serve.blob_fallback]`.
     #[arg(long)]
     drained_source: bool,
+    /// Drop stale image derivatives of a SUPERSEDED format (the pre-WEBP `.jpg` leftovers): delete
+    /// ONLY `der/` objects of the `--superseded-ext` format under `--prefix`. A referenced
+    /// baseline/primary (even with the same extension) and the current-format derivative are NEVER
+    /// touched — a dropped derivative self-heals (regenerates on next access). Requires
+    /// `--superseded-ext`.
+    #[arg(long, requires = "superseded_ext")]
+    legacy_derivatives: bool,
+    /// The superseded image extension to drop (e.g. `jpg`), for `--legacy-derivatives` only.
+    #[arg(long, value_name = "EXT")]
+    superseded_ext: Option<String>,
     /// Actually delete (default: dry-run — report what WOULD be reclaimed, delete nothing).
     #[arg(long)]
     apply: bool,
-    /// Restrict a `--drained-source` purge to source keys under this prefix (default: all objects).
-    /// Ignored by `--unreferenced` (which GCs the whole content-addressed keyspace).
+    /// Restrict a `--drained-source` / `--legacy-derivatives` purge to keys under this prefix (e.g.
+    /// `hblob/<project>/`; default: all objects). Ignored by `--unreferenced` (which GCs the whole
+    /// content-addressed keyspace).
     #[arg(long)]
     prefix: Option<String>,
+}
+
+/// Arguments for `boatramp blob reconcile`.
+#[derive(Debug, clap::Args)]
+pub struct ReconcileArgs {
+    /// Actually re-write drifted objects (default: dry-run — report what WOULD be reconciled, write
+    /// nothing). Report-then-confirm: run without this first, inspect the plan, then re-run with it.
+    #[arg(long)]
+    apply: bool,
+    /// Restrict the scan to keys under this prefix (e.g. `hblob/<project>/`; default: all objects).
+    #[arg(long)]
+    prefix: Option<String>,
+    /// DANGEROUS, audited opt-in: also reconcile BASELINE/PRIMARY objects, not just re-generable
+    /// `der/` derivatives. This blesses a truncation on load-bearing data (makes the index agree
+    /// with possibly-corrupt bytes), so it is off by default — a primary-blob reconcile needs this
+    /// explicit flag, and each such object is logged.
+    #[arg(long)]
+    include_primary: bool,
 }
 
 /// Arguments for `boatramp blob status`.
@@ -422,8 +464,13 @@ pub enum BlobOutput {
     },
     /// `blob verify` — the dead-reference report (opaque server JSON).
     Verify {
-        /// The server's verification object (carries `dead_references`).
+        /// The server's verification object (carries `dead_references` + `size_mismatches`).
         state: serde_json::Value,
+    },
+    /// `blob reconcile` — the guarded size-drift reconcile report (opaque server JSON).
+    Reconcile {
+        /// The server's reconcile report object.
+        report: serde_json::Value,
     },
     /// `blob rehome` — the offline default-scope re-home summary.
     Rehome {
@@ -474,6 +521,7 @@ impl crate::output::Rendered for BlobOutput {
             Self::Purge { report } => write_purge(report, w),
             Self::Status { state } => write_status(state, w),
             Self::Verify { state } => write_verify(state, w),
+            Self::Reconcile { report } => write_reconcile(report, w),
             Self::Rehome {
                 phase,
                 dry_run,
@@ -692,6 +740,51 @@ fn write_verify(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::i
     Ok(())
 }
 
+/// Render the `blob reconcile` report (human lines).
+fn write_reconcile(report: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    let u = |k: &str| report.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let apply = report
+        .get("apply")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let include_primary = report
+        .get("include_primary")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let verb = if apply { "reconciled" } else { "would reconcile" };
+    let acted = if apply {
+        u("reconciled")
+    } else {
+        u("would_reconcile")
+    };
+    writeln!(
+        w,
+        "blob reconcile {}{}: {} {} of {} drifted object(s) ({} byte(s)); considered {} in-scope, \
+         skipped {} out-of-scope (baseline/primary), {} too-large, {} unreadable.",
+        if apply { "complete" } else { "(dry-run)" },
+        if include_primary {
+            " [--include-primary: ALSO blessing baseline/primary]"
+        } else {
+            " [der/ scope]"
+        },
+        verb,
+        acted,
+        u("drifted"),
+        u("bytes_reconciled"),
+        u("considered"),
+        u("skipped_out_of_scope"),
+        u("skipped_too_large"),
+        u("skipped_unreadable"),
+    )?;
+    if !apply && u("drifted") > 0 {
+        writeln!(
+            w,
+            "(dry-run — nothing written; re-run with --apply to bless the stored bytes)"
+        )?;
+    }
+    Ok(())
+}
+
 /// Render the `blob rehome` summary (human line).
 #[allow(clippy::too_many_arguments)]
 fn write_rehome(
@@ -765,6 +858,7 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<BlobOutput> {
         BlobCommand::Drain(a) => drain(&cp, a).await?,
         // General provably-safe purge + structured transition status (v0.6.4), both control-plane clients.
         BlobCommand::Purge(a) => purge(&cp, a).await?,
+        BlobCommand::Reconcile(a) => reconcile(&cp, a).await?,
         BlobCommand::Status(_) => status(&cp).await?,
         BlobCommand::Verify(_) => verify(&cp).await?,
         // Handled node-locally above (returned before the control-plane client was built).
@@ -935,12 +1029,16 @@ async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<BlobOutput> {
     // but map it explicitly so the wire value is unambiguous.
     let mode = if a.unreferenced {
         "unreferenced"
+    } else if a.legacy_derivatives {
+        "legacy_derivatives"
     } else {
-        // The group is `required`, so `drained_source` is set when `unreferenced` is not.
+        // The group is `required`, so `drained_source` is set when neither of the others is.
         "drained_source"
     };
 
-    let final_report = cp.blob_purge(mode, a.apply, a.prefix.as_deref()).await?;
+    let final_report = cp
+        .blob_purge(mode, a.apply, a.prefix.as_deref(), a.superseded_ext.as_deref())
+        .await?;
 
     // A storage error in the final report means the purge did NOT complete (non-zero exit). A 409
     // (unreferenced refused while a fallback is attached) or a 422 (no fallback for drained-source)
@@ -971,6 +1069,15 @@ async fn status(cp: &client::ControlPlane) -> Result<BlobOutput> {
 async fn verify(cp: &client::ControlPlane) -> Result<BlobOutput> {
     let state = cp.blob_verify().await?;
     Ok(BlobOutput::Verify { state })
+}
+
+/// `boatramp blob reconcile`: bless an index↔object size drift (der/-scoped by default). Dry-run
+/// unless `--apply`; `--include-primary` is the audited opt-in to also reconcile baseline/primary.
+async fn reconcile(cp: &client::ControlPlane, a: ReconcileArgs) -> Result<BlobOutput> {
+    let report = cp
+        .blob_reconcile(a.prefix.as_deref(), a.apply, a.include_primary)
+        .await?;
+    Ok(BlobOutput::Reconcile { report })
 }
 
 /// Run the offline, node-local blob-backend migration (`boatramp blob migrate`). Resolves the SOURCE

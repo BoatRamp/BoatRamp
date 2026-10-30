@@ -2510,15 +2510,21 @@ impl ControlPlane {
         mode: &str,
         apply: bool,
         prefix: Option<&str>,
+        superseded_ext: Option<&str>,
     ) -> Result<serde_json::Value> {
         let Self {
             http, base: server, ..
         } = self;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "mode": mode,
             "apply": apply,
             "prefix": prefix,
         });
+        // Only the `legacy_derivatives` mode reads `superseded_ext`; the server rejects an unknown
+        // field, so send it ONLY when present.
+        if let Some(ext) = superseded_ext {
+            body["superseded_ext"] = serde_json::Value::String(ext.to_string());
+        }
         let resp = http
             .post(format!("{server}/api/blob-purge"))
             .json(&body)
@@ -2564,6 +2570,40 @@ impl ControlPlane {
             .send()
             .await?
             .error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    /// Guarded blob reconcile (`POST /api/blob-reconcile`, `System·Admin`, PLAN-clone-robustness #4):
+    /// bless an index↔object size drift by re-writing each in-scope object so its declared size
+    /// matches its body. Dry-run unless `apply`; `include_primary` is the audited opt-in to also
+    /// reconcile baseline/primary objects (default der/-only). Returns the JSON report object.
+    pub async fn blob_reconcile(
+        &self,
+        prefix: Option<&str>,
+        apply: bool,
+        include_primary: bool,
+    ) -> Result<serde_json::Value> {
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = serde_json::json!({
+            "prefix": prefix,
+            "apply": apply,
+            "include_primary": include_primary,
+        });
+        let resp = http
+            .post(format!("{server}/api/blob-reconcile"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "blob reconcile refused ({status}): {}",
+                text.trim()
+            )));
+        }
         Ok(resp.json::<serde_json::Value>().await?)
     }
 

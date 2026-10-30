@@ -760,6 +760,15 @@ impl Right {
             // explicitly here (above the deny-safe `_` default that resolves the same, so a
             // routing/table regression is visible) and re-checked defense-in-depth at the handler.
             "/api/blob-purge" => Self::new(Resource::System, None, Action::Admin),
+            // Guarded blob reconcile (`POST /api/blob-reconcile`, PLAN-clone-robustness #4): repair an
+            // index↔object size drift by re-writing (blessing) each in-scope object's stored bytes —
+            // a NODE-level DESTRUCTIVE op touching every tenant's blobs on the node's store, not
+            // scoped to a project, so `system·admin` (never a per-project right), exactly like
+            // `/api/blob-purge`. Same SINGULAR, HYPHENATED path discipline (does NOT match the
+            // `/api/blobs/` Blobs·Deploy prefix matcher — a collision would be an escalation). Gated
+            // explicitly here above the deny-safe `_` default (so a table regression is visible) and
+            // re-checked defense-in-depth at the handler.
+            "/api/blob-reconcile" => Self::new(Resource::System, None, Action::Admin),
             // The on-demand LIVE control-plane KV checkpoint (`POST /api/kv-checkpoint`, v0.9.0
             // KV-recovery, #3): a node-level MUTATING op (freeze WAL→L0, advance the durable
             // frontier) not scoped to a project, so `system·admin` — never a per-project right.
@@ -1923,6 +1932,25 @@ mod tests {
             Right::required("PATCH", "/api/sites/blog/frobnicate"),
             Some(Right::new(Resource::System, None, Action::Admin))
         );
+    }
+
+    #[test]
+    fn blob_reconcile_is_system_admin_only() {
+        // A reconcile MUTATES blob bytes across every tenant on the node's store, so it must be gated
+        // System·Admin — the SAME node-destructive grade as `/api/blob-purge`, never a per-project
+        // right a tenant token could satisfy.
+        let required = Right::required("POST", "/api/blob-reconcile").expect("route is gated");
+        assert_eq!(required, Right::new(Resource::System, None, Action::Admin));
+        // A Project·Admin on some project does NOT satisfy the node-global admin gate.
+        let proj_admin = Right::new(Resource::Project, Some("acme".into()), Action::Admin);
+        assert!(!proj_admin.satisfies(&required));
+        assert!(Right::new(Resource::System, None, Action::Admin).satisfies(&required));
+        // It is the same grade as the sibling destructive blob purge.
+        assert_eq!(required, Right::required("POST", "/api/blob-purge").unwrap());
+        // The hyphen path must NOT collide with the `/api/blobs/` Blobs·Deploy prefix matcher (a
+        // ship-only publisher holds Blobs·Deploy — a collision would be an escalation).
+        let blobs_deploy = Right::new(Resource::Blobs, Some("acme".into()), Action::Deploy);
+        assert!(!blobs_deploy.satisfies(&required));
     }
 
     #[test]

@@ -353,6 +353,12 @@ pub fn router_with_fast(
         // in `authz::Right::required` (same grade as /api/blob-status); the hyphen path avoids the
         // /api/blobs/ matcher.
         .route("/api/blob-verify", get(blob_verify_handler))
+        // Guarded blob reconcile (PLAN-clone-robustness #4): repair an index↔object size drift by
+        // blessing the stored bytes. MUTATES blob data → System·Admin in `authz::Right::required`
+        // (the hyphen path avoids the `/api/blobs/` matcher) + re-checked defense-in-depth in the
+        // handler. Default-scoped to re-generable der/ derivatives; a baseline/primary reconcile is
+        // the explicit, audited `include_primary` opt-in.
+        .route("/api/blob-reconcile", post(blob_reconcile_handler))
         // Control-plane STORE-layout migration (the default-scope re-home) — the console wizard's back
         // end. `status` is System·Read; `arm` (persist the operator's answers for the next boot-time
         // stage) and `abort` (un-arm / roll back a dual-soak) are node-destructive → System·Admin,
