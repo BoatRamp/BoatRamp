@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::secret_store::{SecretError, SecretStore};
 
@@ -84,6 +85,15 @@ impl std::fmt::Debug for RegistryCredential {
     }
 }
 
+impl Drop for RegistryCredential {
+    /// Wipe the unsealed credential when it drops — the `password` is a live registry secret and
+    /// must not linger in reclaimed heap after the pull is handed off.
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.username.zeroize();
+    }
+}
+
 /// A **resolved** registry pull credential, handed transiently to a backend's materialize/pull
 /// path. Carries the `serveraddress` (the registry host the credential is for) so the backend can
 /// set it on the wire auth. `Debug` REDACTS the password — never derive it.
@@ -108,11 +118,24 @@ impl std::fmt::Debug for RegistryAuth {
     }
 }
 
+impl Drop for RegistryAuth {
+    /// Wipe the resolved credential when it drops — same reasoning as [`RegistryCredential`]; the
+    /// backend holds this only transiently across the pull.
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.username.zeroize();
+    }
+}
+
 impl RegistryAuth {
-    fn from_credential(cred: RegistryCredential, host: &str) -> Self {
+    fn from_credential(mut cred: RegistryCredential, host: &str) -> Self {
+        // `std::mem::take` moves the Strings out while leaving `cred` with empty ones, so the
+        // credential's own `Drop` has nothing left to wipe and we never move a field out of a
+        // `Drop` type (which the compiler forbids). The secret now lives in the returned
+        // `RegistryAuth`, which zeroizes it on its own drop.
         Self {
-            username: cred.username,
-            password: cred.password,
+            username: std::mem::take(&mut cred.username),
+            password: std::mem::take(&mut cred.password),
             serveraddress: host.to_string(),
         }
     }
@@ -396,14 +419,18 @@ impl SealedRegistryAuthResolver {
                 scope,
             });
         };
-        let bytes = store
-            .get(project, secret_ref)
-            .await
-            .map_err(|source| RegistryAuthError::Store {
-                secret: secret_ref.to_string(),
-                source,
-            })?
-            .ok_or_else(missing)?;
+        // The unsealed secret JSON is cleartext credential material; hold it in a zeroizing buffer so
+        // the intermediate copy is wiped the moment we finish parsing it into a `RegistryCredential`.
+        let bytes = Zeroizing::new(
+            store
+                .get(project, secret_ref)
+                .await
+                .map_err(|source| RegistryAuthError::Store {
+                    secret: secret_ref.to_string(),
+                    source,
+                })?
+                .ok_or_else(missing)?,
+        );
         let cred: RegistryCredential = serde_json::from_slice(&bytes).map_err(|_e| {
             // NEVER include `_e` / the bytes — a parse error message can echo the plaintext.
             RegistryAuthError::MalformedCredential {

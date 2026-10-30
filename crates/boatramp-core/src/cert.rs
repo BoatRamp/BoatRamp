@@ -33,7 +33,11 @@ pub use boatramp_types::cert::CertStatus;
 
 /// A stored certificate: the PEM chain + private key, plus the expiry used to
 /// decide renewal. Pinned `v1` like every boatramp schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to REDACT `key_pem`: on the read path (`KvCertStore::get` with an
+/// envelope) this field holds the **decrypted private key** in cleartext, which must never reach a
+/// log / `tracing` event. `chain_pem` (public leaf+chain) and the expiry are not secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCert {
     /// Pinned schema discriminant (`v1`).
     #[serde(default = "crate::schema_version")]
@@ -44,6 +48,17 @@ pub struct StoredCert {
     pub key_pem: String,
     /// `notAfter` as a Unix timestamp (seconds), for renewal decisions.
     pub not_after_unix: u64,
+}
+
+impl std::fmt::Debug for StoredCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCert")
+            .field("version", &self.version)
+            .field("chain_pem", &self.chain_pem)
+            .field("key_pem", &"<redacted>")
+            .field("not_after_unix", &self.not_after_unix)
+            .finish()
+    }
 }
 
 impl StoredCert {
@@ -296,6 +311,24 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(StoredCert::new("CHAIN", "KEY", not_after)))
         }
+    }
+
+    #[test]
+    fn stored_cert_debug_redacts_the_private_key() {
+        // On the read path `key_pem` holds the decrypted private key; a `{:?}` render must not leak
+        // it, while the public chain + expiry stay visible.
+        let cert = StoredCert::new(
+            "PUBLIC-CHAIN-PEM",
+            "-----BEGIN PRIVATE KEY-----\nSUPER-SECRET-KEY-MATERIAL\n-----END PRIVATE KEY-----",
+            9999,
+        );
+        let d = format!("{cert:?}");
+        assert!(
+            !d.contains("SUPER-SECRET-KEY-MATERIAL"),
+            "private key leaked in Debug: {d}"
+        );
+        assert!(d.contains("<redacted>"), "expected redaction marker: {d}");
+        assert!(d.contains("PUBLIC-CHAIN-PEM"), "chain is not secret: {d}");
     }
 
     #[tokio::test]
