@@ -64,4 +64,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_settings"
+path = "fuzz_targets/fuzz_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_h2_headers"
+path = "fuzz_targets/fuzz_h2_headers.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
