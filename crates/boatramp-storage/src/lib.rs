@@ -150,6 +150,15 @@ pub mod blob_migrate;
 /// exit code, not a println marker.
 pub mod blob_purge;
 
+/// The backend-agnostic **guarded reconcile + targeted legacy-derivative purge** engines
+/// (PLAN-clone-robustness #4 + #5): repair an index↔object size drift by blessing the stored bytes
+/// ([`blob_reconcile::reconcile`]), and delete stale derivatives of a superseded image format
+/// ([`blob_reconcile::purge_legacy_derivatives`]). BOTH gated by the shared `der/`-vs-`base/`-vs-
+/// primary boundary ([`boatramp_core::blob_class`]) so neither blesses or deletes load-bearing data
+/// by default — a baseline/primary reconcile needs the explicit `include_primary` opt-in, and a
+/// legacy purge only ever deletes a `der/` object of the named superseded format.
+pub mod blob_reconcile;
+
 #[cfg(feature = "fs")]
 pub use fs::FsStorage;
 
