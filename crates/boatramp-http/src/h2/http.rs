@@ -36,10 +36,12 @@ pub(crate) fn is_connection_specific(name: &[u8]) -> bool {
 /// **stream** error of type PROTOCOL_ERROR (RFC 7540 §8.1.2.6) so one bad request
 /// resets its stream without killing the connection. The body is set separately once
 /// the request's DATA has arrived.
-pub(crate) fn request_from_headers(
-    id: u32,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Result<Request, H2Error> {
+///
+/// `pub` (not `pub(crate)`): the privsep fuzz harness (`fuzz/fuzz_targets/fuzz_h2_headers.rs`)
+/// composes this with [`crate::h2::hpack::Hpack::decode`] to exercise the full
+/// attacker-controlled-bytes → decoded header list → validated `Request` pipeline, not just
+/// the HPACK decode step `fuzz_hpack` already covers.
+pub fn request_from_headers(id: u32, headers: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Request, H2Error> {
     let bad = || H2Error::stream(id, ErrorCode::ProtocolError);
     let mut method: Option<Vec<u8>> = None;
     let mut path: Option<Vec<u8>> = None;

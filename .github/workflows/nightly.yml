@@ -17,3 +17,65 @@ jobs:
   matrix:
     uses: ./.github/workflows/preflight-matrix.yml
     secrets: inherit
+
+  # Coverage-guided fuzzing of the untrusted-byte parsers (privsep phase 0, WS3): each
+  # `crates/*/fuzz/` target gets a bounded `cargo fuzz run` — a crash (panic, OOB, OOM, a
+  # found libFuzzer timeout) fails the job. This is a nightly PRECONDITION like the rest of
+  # this workflow ([[ci-tiering-policy]]: nightly = pre-cut, never post-cut), not a per-push
+  # gate — a 60s-per-target budget across 13 targets plus their instrumented builds doesn't
+  # fit the merge-gate CI gate's latency budget.
+  #
+  # cargo-fuzz needs an active NIGHTLY `cargo`/`rustc` (its libFuzzer sanitizer/coverage
+  # instrumentation is a `-Z` unstable-flag codegen option) — one below the pinned stable
+  # toolchain (`rust-toolchain.toml`) the rest of the workspace builds with. There is no
+  # rustup here (nix puts exactly one toolchain on PATH), so `cargo +nightly fuzz` doesn't
+  # resolve; instead `flake.nix`'s `devShells.fuzz` puts a plain nightly `rust-bin` toolchain +
+  # `cargo-fuzz` on PATH directly, and every step below runs through `nix develop .#fuzz`.
+  fuzz:
+    name: Fuzz (bounded; untrusted-byte parsers)
+    runs-on: ubuntu-latest
+    # Hard cap so a wedged build or a runaway target fails the precondition instead of
+    # burning the 6h default (the same T4 lesson preflight-matrix.yml's legs apply).
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Fuzz every target, bounded (a crash fails the job)
+        env:
+          # Per-target budget for `-max_total_time=<seconds>`: generous enough to shake out a
+          # shallow panic/overflow, bounded enough that all targets' builds + runs fit one
+          # nightly job. Raise HERE (not per-target) if the whole sweep needs more time;
+          # lengthen one target's own budget in the loop below instead if only it does.
+          FUZZ_SECONDS: 60
+        run: |
+          set -euo pipefail
+          run() { # <crate> <target>
+            echo "::group::cargo fuzz run $2 ($1, ${FUZZ_SECONDS}s)"
+            nix develop .#fuzz --command cargo fuzz run "$2" --fuzz-dir "crates/$1/fuzz" \
+              -- "-max_total_time=${FUZZ_SECONDS}"
+            echo "::endgroup::"
+          }
+          # boatramp-http: h1 request/chunked parsing + the h1-vs-hyper differential oracle;
+          # h2 frame + SETTINGS-apply + HPACK + the decoded-header-list -> Request pipeline.
+          for t in fuzz_parse fuzz_differential fuzz_chunked fuzz_frame fuzz_settings \
+                   fuzz_hpack fuzz_h2_headers; do
+            run boatramp-http "$t"
+          done
+          # overlay service tunneler: the smoltcp TUN netstack ingress + the SOCKS5 codec.
+          for t in fuzz_netstack_ingress fuzz_socks_codec; do
+            run boatramp-overlay-tunnel "$t"
+          done
+          # overlay fabric: the resumable-circuit frame codec (every byte a peer sends over a
+          # circuit link).
+          run boatramp-overlay-proto fuzz_circuit_frame
+          # boatramp-server's own hand-rolled untrusted-byte parsers: the HTTP `Range:` header,
+          # the SMTP/IMAP/POP3 STARTTLS trigger line, and the GraphQL query text handed to
+          # `async-graphql-parser`.
+          for t in fuzz_byte_range fuzz_starttls_trigger fuzz_graphql_query; do
+            run boatramp-server "$t"
+          done

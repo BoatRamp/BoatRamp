@@ -112,7 +112,11 @@ pub(crate) use store_migrate::{
 pub mod blob_upload_minter;
 #[cfg(feature = "console")]
 pub mod console;
-mod content;
+// `pub` (not the former private `mod`) only so the privsep fuzz harness
+// (`fuzz/fuzz_targets/fuzz_byte_range.rs`) can reach `content::parse_ranges` — the HTTP
+// `Range:` header parser — as an external dependency; every other item here stays
+// `pub(super)`/private and gains no new external surface.
+pub mod content;
 mod control_api;
 /// The node-side email delivery spool (best-effort + durable) backing the `email`
 /// guest capability.

@@ -1,0 +1,54 @@
+# Coverage-guided fuzz targets for the privsep-phase-0 untrusted-byte surfaces boatramp-server
+# itself hand-parses (text the party on the other end of a socket fully controls):
+#   - fuzz_byte_range: the HTTP `Range:` header on the blob/static-file serving path.
+#   - fuzz_starttls_trigger: the STARTTLS trigger line — the ONE client line the host itself
+#     inspects on an SMTP/IMAP/POP3 listener before the TLS upgrade; the guest owns every other
+#     line of the dialog (see ../src/tcp_starttls.rs's module doc), so this is the full extent of
+#     the host-side "SMTP/IMAP parsing" surface — there is no host-side command grammar beyond it.
+#   - fuzz_graphql_query: the GraphQL query text boatramp hands to `async-graphql-parser`
+#     (`graphql_plan.rs` / `graphql_data/compile.rs` / `graphql_gateway.rs` all call
+#     `async_graphql_parser::parse_query` directly) — boatramp has no GraphQL grammar of its own,
+#     so this fuzzes the exact third-party entry point it calls, not a boatramp wrapper.
+# Run with a nightly toolchain:  cargo +nightly fuzz run <target>
+[package]
+name = "boatramp-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `tcp-listener`: gates the `tcp_starttls` module (rustls/tokio-rustls are unconditional deps of
+# the crate; the feature only gates the module path). No other boatramp-server feature needed —
+# `content` (the Range parser) is unconditional.
+boatramp-server = { path = "..", features = ["tcp-listener"] }
+# The exact query parser boatramp calls — pulled in directly rather than through
+# boatramp-server's own (heavier, `handlers`-feature-gated) GraphQL surface, since the parser
+# call itself, not boatramp's plumbing around it, is what's fuzzed here.
+async-graphql-parser = "7"
+
+[[bin]]
+name = "fuzz_byte_range"
+path = "fuzz_targets/fuzz_byte_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_starttls_trigger"
+path = "fuzz_targets/fuzz_starttls_trigger.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_graphql_query"
+path = "fuzz_targets/fuzz_graphql_query.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

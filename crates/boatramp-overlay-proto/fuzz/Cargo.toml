@@ -1,0 +1,31 @@
+# Coverage-guided fuzz target for the overlay fabric's resumable-circuit frame codec (privsep
+# phase 0, WS3): `XgressFrame::decode` is the pure parser EVERY byte a peer sends over a circuit
+# link passes through before the pump ([`boatramp_overlay::circuit`], in the sibling runtime
+# crate) interprets it as `Payload`/`Ack`/`Fin` — the actual "overlay framing" untrusted-byte
+# surface (the frame tag + length bytes are attacker-controlled; the 4-byte length prefix itself
+# is stripped by the transport before `decode` sees the body). Run with a nightly toolchain:
+# cargo +nightly fuzz run fuzz_circuit_frame
+# The stable regression net lives in ../src/circuit.rs's own `frame_codec_round_trips` +
+# `decode_rejects_malformed` tests (same split boatramp-http/fuzz takes between its nightly fuzz
+# targets and its own `tests/*_smoke.rs`).
+[package]
+name = "boatramp-overlay-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+boatramp-overlay-proto = { path = ".." }
+
+[[bin]]
+name = "fuzz_circuit_frame"
+path = "fuzz_targets/fuzz_circuit_frame.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
