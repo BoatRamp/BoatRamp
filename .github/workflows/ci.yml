@@ -363,6 +363,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # This job compiles the server feature union + every gate test binary on the
+      # cramped runner root disk; reclaim the preinstalled toolchains we don't use
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom (else the later gate
+      # binaries hit `No space left on device`).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       # Compile + run this feature-gated surface on the SHIPPED musl target.
       - uses: ./.github/actions/setup-musl
 
