@@ -494,18 +494,69 @@ pub struct PrivsepInstanceConfig {
     pub links: Vec<String>,
 }
 
-/// The per-instance Phase-0 sandbox posture (design §1.3 / §2 F6).
+/// The **per-instance profile-DERIVATION posture** (design §1.3 / §2 F6):
+/// `[privsep].instances.<name>.sandbox`. It answers *how THIS instance's per-capability
+/// seccomp/Landlock profile is shaped*.
+///
+/// **Reconciliation with the node posture (WS-D).** This is a DISTINCT axis from the
+/// node-wide `[serve.sandbox].posture` (`boatramp_node::config::SandboxPosture` =
+/// `Auto|Strict|Permissive|Off`), which is the Phase-0 install-DECISION for the monolith
+/// serve path. The two are deliberately NOT merged into one mixed-meaning enum; instead the
+/// per-instance posture here DRIVES a Phase-0 install of a DERIVED profile, reusing the
+/// Phase-0 machinery (`boatramp_server::sandbox`'s `SandboxPolicy` / `SandboxStatus` /
+/// install) — see [`SandboxPosture::enforcement`] and `boatramp_server::sandbox`'s
+/// `privsep_install_plan` / `enforce_privsep_status`. Under `[privsep]` enforcement is ALWAYS
+/// fail-closed `Enforced` (F6) — not operator-tunable — except `Off`, which is dev-only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxPosture {
     /// Derive the tightest per-capability seccomp/Landlock profile the instance's capability
-    /// set needs (the Phase-1 derivation; WS-B). The default.
+    /// set needs (the Phase-1 derivation). The default. Fail-closed `Enforced` under `[privsep]`.
     #[default]
     Derived,
-    /// Clamp harder than `Derived` (operator-chosen tightening).
+    /// Clamp harder than `Derived` (operator-chosen tightening — e.g. drop the shared system
+    /// temp dirs from the FS view). Also fail-closed `Enforced` under `[privsep]`.
     Strict,
-    /// **Dev-only.** No profile installed. Under `[privsep]` a non-default composition
-    /// REFUSES `Off` (the wall is load-bearing; design §2 F6). WS-B enforces the refusal.
+    /// **Dev-only.** No profile installed. Under `[privsep]` a non-default composition REFUSES
+    /// `Off` unless the node `[serve.sandbox].posture` is itself a dev posture (the wall is
+    /// load-bearing; design §2 F6). WS-B enforces the refusal via
+    /// `boatramp_server::sandbox::privsep_install_plan`.
     Off,
+}
+
+impl SandboxPosture {
+    /// The enforcement this posture demands of the installed per-instance profile — the
+    /// single bridge encoding the F6 fail-closed rule purely from the posture (consumed by
+    /// `boatramp_server::sandbox::privsep_install_plan`). `Derived`/`Strict` ⇒
+    /// [`ProfileEnforcement::RequireEnforced`] (the profile MUST report `Enforced`, fleetwide);
+    /// `Off` ⇒ [`ProfileEnforcement::DevOnlyOff`] (no profile; legal only on a dev node).
+    pub const fn enforcement(self) -> ProfileEnforcement {
+        match self {
+            Self::Derived | Self::Strict => ProfileEnforcement::RequireEnforced,
+            Self::Off => ProfileEnforcement::DevOnlyOff,
+        }
+    }
+
+    /// Whether this posture installs a per-capability profile at all (`true` for
+    /// `Derived`/`Strict`; `false` for the dev-only `Off`).
+    pub const fn installs_profile(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// What a [`SandboxPosture`] demands of the installed per-instance profile under `[privsep]`
+/// (design §2 F6 / §5 inv7) — the enforcement half of the SandboxPosture reconciliation,
+/// kept here in the wasm-clean types layer so both the config model and
+/// `boatramp_server::sandbox`'s install path share one source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileEnforcement {
+    /// The derived profile MUST install and report `Enforced` — FLEETWIDE, for every instance,
+    /// not just crown-jewel ones. A kernel that can deliver only `Partial` refuses privsep
+    /// (contrast Phase-0 `auto`, which fails OPEN on `Partial`). The wall is load-bearing.
+    RequireEnforced,
+    /// No profile is installed (`Off`). Legal ONLY on a dev node (the node
+    /// `[serve.sandbox].posture` is `off`/`permissive`); otherwise a real `[privsep]`
+    /// composition REFUSES it.
+    DevOnlyOff,
 }
 
 /// One logical inter-instance link (design §3). WS-A carries `from`/`to`/`transport`; the
