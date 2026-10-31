@@ -360,6 +360,13 @@ const DEFAULT_TCP_EGRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// resolve + one address resolve per message), low enough to blunt a granted guest used as a scanner.
 pub const DEFAULT_DNS_RESOLVE_BUDGET: u32 = 256;
 
+/// Default per-INVOCATION `dns-publish` budget — how many DNS mutations one invocation (one store) may
+/// issue (cap-req #24 WS3), so a granted guest cannot drive the host as a bulk DNS-write amplifier.
+/// Mirrors [`DEFAULT_DNS_RESOLVE_BUDGET`]; smaller, because a mutation is heavier and rarer than a
+/// lookup (a full mail record set — MX + SPF/DKIM/DMARC TXT + a couple of SRV/CAA — is well under this).
+/// Overridable per node via [`HandlerEngine::with_dns_publish_budget`].
+pub const DEFAULT_DNS_PUBLISH_BUDGET: u32 = 64;
+
 /// Upper bound (chars) on the guest-returned error text carried by
 /// [`HandlerError::ConsumerError`]. The guest controls this string, so it is bounded here before it
 /// is stored (and the DLQ layer sanitizes control chars before an operator sees it).
@@ -515,6 +522,21 @@ struct HostState {
     /// connection. The request/consumer/HTTP-session paths leave the per-store default (per-invocation).
     #[cfg(feature = "tcp-egress")]
     dns_resolve_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Whether this invocation's guest may WRITE DNS through the `dns-publish` capability (copied from
+    /// the engine's `allow_dns_publish` posture — the `allow_guest_dns_publish` flag). `false` is the
+    /// deny-by-default; the binding fail-closes to `access-denied` when off, exactly like a resolve
+    /// under its egress posture (cap-req #24 WS3).
+    #[cfg(feature = "dns-publish")]
+    dns_publish_enabled: bool,
+    /// This invocation's remaining `dns-publish` budget (cap-req #24 WS3). STORE-RESIDENT so it
+    /// persists across the per-call rebuild of `DnsPublishHost` — the binding borrows this counter and
+    /// `spend()` decrements it, so the per-invocation mutation cap is actually enforced (a view-local
+    /// counter would reset every call; the same `DnsResolveHost` HIGH-1 footgun). An `AtomicU32` (not a
+    /// `Cell`) because the async host-call future it is borrowed into must be `Send`. Per-store
+    /// (per-invocation) on every lane — `dns-publish` is not offered on the session-listener lane, so
+    /// it needs no per-connection scoping.
+    #[cfg(feature = "dns-publish")]
+    dns_publish_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -1726,6 +1748,19 @@ pub struct HandlerEngine {
     /// counter the driver shares across every re-entry (so the budget is per-connection, not per-frame).
     #[cfg_attr(not(feature = "tcp-egress"), allow(dead_code))]
     dns_resolve_budget_default: u32,
+    /// Whether the node posture allows a guest to WRITE DNS through the `dns-publish` capability
+    /// (`allow_guest_dns_publish`, OFF by default in every profile) — cap-req #24 WS3. `false` (the
+    /// default) makes the binding fail-closed to `access-denied` for every call, regardless of grant or
+    /// allowlist; `true` lets a granted component actually mutate (still bounded by its per-grant
+    /// writable-zone allowlist + the publish budget + the central guardrail). INDEPENDENT of the egress
+    /// knobs — DNS write is a distinct authority gated separately.
+    #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
+    allow_dns_publish: bool,
+    /// Default per-INVOCATION `dns-publish` budget seeded into each new store (cap-req #24 WS3).
+    /// Operator-configurable via [`with_dns_publish_budget`](Self::with_dns_publish_budget); defaults to
+    /// [`DEFAULT_DNS_PUBLISH_BUDGET`].
+    #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
+    dns_publish_budget_default: u32,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -1945,6 +1980,10 @@ impl HandlerEngine {
             #[cfg(feature = "tcp-egress")]
             tcp_egress_idle_timeout: DEFAULT_TCP_EGRESS_IDLE_TIMEOUT,
             dns_resolve_budget_default: DEFAULT_DNS_RESOLVE_BUDGET,
+            // Deny-by-default: DNS write is off until an operator opts the posture in via
+            // `with_dns_publish`. A node that never calls it can never let a guest mutate DNS.
+            allow_dns_publish: false,
+            dns_publish_budget_default: DEFAULT_DNS_PUBLISH_BUDGET,
             limits,
             epoch_ticker,
         })
@@ -2262,6 +2301,32 @@ impl HandlerEngine {
     /// The session-listener driver reads this to seed its one per-connection budget counter.
     pub fn dns_resolve_budget_default(&self) -> u32 {
         self.dns_resolve_budget_default
+    }
+
+    /// Permit (or refuse) a guest to WRITE DNS through the `dns-publish` capability — the operator
+    /// posture's `allow_guest_dns_publish` (cap-req #24 WS3). Default (`false`, off in every profile)
+    /// makes the binding fail-closed to `access-denied` for every call regardless of grant or
+    /// allowlist; `true` lets a granted component mutate within its per-grant writable-zone allowlist
+    /// (still budget-bounded + guardrail-checked). INDEPENDENT of every egress knob (DNS write is a
+    /// distinct authority). Any single wiring omission fails CLOSED.
+    #[must_use]
+    pub fn with_dns_publish(mut self, allow: bool) -> Self {
+        self.allow_dns_publish = allow;
+        self
+    }
+
+    /// Override the per-INVOCATION `dns-publish` budget (cap-req #24 WS3): how many DNS mutations one
+    /// invocation (one store) may issue before `rate-limited`. Defaults to [`DEFAULT_DNS_PUBLISH_BUDGET`]
+    /// when never called.
+    #[must_use]
+    pub fn with_dns_publish_budget(mut self, n: u32) -> Self {
+        self.dns_publish_budget_default = n;
+        self
+    }
+
+    /// The configured default per-invocation `dns-publish` budget ([`with_dns_publish_budget`](Self::with_dns_publish_budget)).
+    pub fn dns_publish_budget_default(&self) -> u32 {
+        self.dns_publish_budget_default
     }
 
     /// Add operator-supplied EXTRA trust anchors (DER certs) to a guest's outbound `wasi:http` TLS
@@ -3350,6 +3415,20 @@ impl HandlerEngine {
                 state.dns_resolve_budget.as_ref(),
             )
         })?;
+        // Host-side DNS publish (write) capability (cap-req #24 WS3): the WRITE counterpart to the
+        // resolver above. Gated deny-by-default (binding `None` ⇒ `access-denied`) AND by the node
+        // posture `allow_dns_publish` (`dns_publish_enabled`); each record is held to the per-grant
+        // writable-zone allowlist (own name only), the store-resident publish budget, and the central
+        // `validate_writable` guardrail. The budget is BORROWED from the store-resident `HostState`
+        // field (the per-call view-rebuild footgun — see `DnsPublishHost`'s STORE-RESIDENT note).
+        #[cfg(feature = "dns-publish")]
+        bindings::dns_publish::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::dns_publish::DnsPublishHost::new(
+                state.bindings.dns_publish(),
+                state.dns_publish_enabled,
+                state.dns_publish_budget.as_ref(),
+            )
+        })?;
         Ok(linker)
     }
 
@@ -3491,6 +3570,12 @@ impl HandlerEngine {
             #[cfg(feature = "tcp-egress")]
             dns_resolve_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 self.dns_resolve_budget_default,
+            )),
+            #[cfg(feature = "dns-publish")]
+            dns_publish_enabled: self.allow_dns_publish,
+            #[cfg(feature = "dns-publish")]
+            dns_publish_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                self.dns_publish_budget_default,
             )),
             #[cfg(feature = "sql")]
             sql,

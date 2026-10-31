@@ -1798,3 +1798,141 @@ interface dns-resolve {
 world dns-resolve-host {
   import dns-resolve;
 }
+
+/// The host-side **DNS publish** (write) capability (`boatramp:handlers/dns-publish`, cap-req #24):
+/// the WRITE counterpart to `dns-resolve`. A granted guest names a zone/record and the HOST performs
+/// the mutation through an operator-configured, host-held [`DnsProvider`] credential — the guest never
+/// holds a zone-write token. The typed record model mirrors the writable `boatramp-acme` `RecordKind`
+/// sum (A/AAAA/CNAME/TXT/MX/SRV/CAA/HTTPS/SVCB/NS/PTR/TLSA). Tier-3 provider-managed types (SOA, the
+/// apex NS set, the DNSSEC family) are deliberately UNREPRESENTABLE here — there is no variant for
+/// them, so a guest cannot even express one, and the central write guardrail refuses an apex `NS`.
+///
+/// # Gated, fail-closed (three layers — the security core)
+/// 1. **Node posture** `allow_guest_dns_publish` (OFF by default in every profile): posture off ⇒
+///    every call is `access-denied`, exactly like a resolver dial under its egress posture.
+/// 2. **Per-grant writable-zone allowlist**: the host REJECTS any record whose OWN name/owner falls
+///    outside the operator's authorized zone suffixes (empty allowlist ⇒ deny-all). The scope
+///    constrains the record's OWN name ONLY — an rdata TARGET (a CNAME/MX/SRV/NS exchange/target) may
+///    legitimately point at another domain and is NEVER constrained.
+/// 3. **Rate budget + audit**: a per-invocation publish budget (mirrors the `dns-resolve` budget) and
+///    a redacted audit log of every mutation (name, type, provider, outcome — never a credential).
+///
+/// Plus the central `boatramp-acme` `validate_writable` guardrail (apex-NS refusal, per-provider
+/// supported-kind capability, malformed-rdata refusal) runs before any adapter is dispatched — never a
+/// silent drop, never a partial/best-effort apply.
+interface dns-publish {
+  /// One HTTPS/SVCB **SvcParam** (RFC 9460): a key (`alpn`, `port`, `ipv4hint`, `ech`, a numeric
+  /// `keyNNNNN`, …) and its presentation-form value. Carried opaquely (the per-provider wire encoding
+  /// is the adapter's concern).
+  record svc-param {
+    key: string,
+    value: string,
+  }
+
+  /// A CAA record's property tag (RFC 8659).
+  enum caa-tag {
+    /// `issue` — authorize a CA to issue for the exact name.
+    issue,
+    /// `issuewild` — authorize a CA to issue wildcard certs for the name.
+    issue-wild,
+    /// `iodef` — a URL for the CA to report policy-violation incidents to.
+    iodef,
+  }
+
+  /// Mail-exchange rdata: a delivery `preference` (lower tried first) and the mail host.
+  record mx-data { preference: u16, exchange: string }
+
+  /// Service-location rdata (RFC 2782): SIP/XMPP/autodiscover/`_minecraft`/…
+  record srv-data { priority: u16, weight: u16, port: u16, target: string }
+
+  /// Certification-Authority-Authorization rdata (RFC 8659). (`flags` is a WIT keyword, so the field
+  /// is escaped `%flags`; the guest imports it as `flags`.)
+  record caa-data { %flags: u8, tag: caa-tag, value: string }
+
+  /// HTTPS/SVCB service-binding rdata (RFC 9460).
+  record svcb-data { priority: u16, target: string, params: list<svc-param> }
+
+  /// DANE TLSA rdata (Tier 2).
+  record tlsa-data { usage: u8, selector: u8, matching: u8, data: string }
+
+  /// The typed rdata of a writable DNS record. Tier-3 provider-managed types (SOA, apex NS, the DNSSEC
+  /// family) have NO variant here — they are unrepresentable, so the writer can never clobber a zone's
+  /// authority. Mirrors the `boatramp-acme` `RecordKind` sum one-to-one.
+  variant rdata {
+    /// IPv4 address, textual (e.g. "203.0.113.7"). A malformed address is `invalid-record`.
+    a(string),
+    /// IPv6 address, textual (e.g. "2001:db8::1"). A malformed address is `invalid-record`.
+    aaaa(string),
+    /// Canonical-name alias target.
+    cname(string),
+    /// Text record as MULTIPLE character-strings (each ≤255 bytes) so SPF/DKIM/DMARC and long
+    /// verification values work. At least one string is required.
+    txt(list<string>),
+    mx(mx-data),
+    srv(srv-data),
+    caa(caa-data),
+    https(svcb-data),
+    svcb(svcb-data),
+    /// Sub-zone delegation only — an `ns` at the zone apex is refused by the central guardrail.
+    ns(string),
+    /// Reverse-DNS pointer (Tier 2).
+    ptr(string),
+    tlsa(tlsa-data),
+  }
+
+  /// A single DNS record to upsert or delete.
+  record dns-record {
+    /// Fully-qualified record name / owner (trailing dot optional), e.g. `mail.example.com` or
+    /// `_dmarc.example.com`. This is the name the writable-zone allowlist constrains.
+    name: string,
+    /// Time-to-live in seconds.
+    ttl: u32,
+    /// The record type with its typed rdata.
+    data: rdata,
+  }
+
+  /// Why a publish was refused. Every refusal is explicit — the writer NEVER silently drops a record.
+  variant publish-error {
+    /// The `dns-publish` grant was not conferred, OR the node posture `allow_guest_dns_publish` is off
+    /// (deny-by-default, fail-closed).
+    access-denied,
+    /// The record's OWN name falls outside this grant's authorized writable-zone allowlist (or the
+    /// allowlist is empty ⇒ deny-all). Carries the rejected name. The rdata TARGET is never checked.
+    not-authorized(string),
+    /// The target provider cannot write this record type (not in its supported kinds). Carries a
+    /// client-safe description — refused up front, never best-effort applied.
+    unsupported(string),
+    /// An `NS` record was targeted at the zone apex (the zone's authority NS set is provider-managed).
+    apex-refused(string),
+    /// The record's rdata is malformed (a TXT character-string over 255 bytes, an empty CAA value, a
+    /// bad IP literal, …). Carries a client-safe reason.
+    invalid-record(string),
+    /// This invocation's publish budget is exhausted — a bound on how many mutations one invocation may
+    /// issue so a granted guest can't drive the host as a bulk DNS-write amplifier.
+    rate-limited,
+    /// The provider's API rejected the write or was unreachable. Carries a GENERIC client-safe reason
+    /// (the detail is logged host-side, never surfaced — a backend message may name internal zone ids).
+    backend(string),
+  }
+
+  /// Create-or-replace one record (idempotent: a retried upsert converges rather than duplicating).
+  /// (`record` is a WIT keyword, so the parameter is named `rec`.)
+  upsert: func(rec: dns-record) -> result<_, publish-error>;
+
+  /// Remove one record. A record that is already absent is success (a retried teardown converges).
+  delete: func(rec: dns-record) -> result<_, publish-error>;
+
+  /// Upsert a whole record set. Fail-closed and all-or-nothing on VALIDATION: every record is gated
+  /// (allowlist) and guardrail-validated (apex/supported/rdata) BEFORE any is written, and the whole
+  /// invocation's budget for the set is reserved up front — so a set with one bad record writes
+  /// NOTHING. The adapter writes are then applied in order; a backend failure mid-set returns the
+  /// error (the already-applied upserts are idempotent and converge on retry). Never a silent drop.
+  upsert-set: func(records: list<dns-record>) -> result<_, publish-error>;
+}
+
+/// Import-only world for the `dns-publish` host binding (the `DnsPublishHost` Host impl). Off by
+/// default — feature-gated (`dns-publish`) and provided ONLY when the node posture
+/// `allow_guest_dns_publish` is on. A guest WIT addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump.
+world dns-publish-host {
+  import dns-publish;
+}
