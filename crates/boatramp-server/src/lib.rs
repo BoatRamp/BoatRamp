@@ -9416,6 +9416,7 @@ mod tests {
             upload_containers: &[],
             blobstore_containers: &[],
             egress_allowlist: &[],
+            dns_publish_zones: &[],
             secret_allowlist: &[],
         };
 

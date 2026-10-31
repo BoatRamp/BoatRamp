@@ -545,19 +545,20 @@ mod tests {
         RecordKindTag::Txt,
     ];
 
+    /// One collected audit row (op, record name, type, provider, outcome) — never the rdata value.
+    type AuditRow = (
+        DnsPublishOp,
+        String,
+        RecordKindTag,
+        &'static str,
+        DnsPublishOutcome,
+    );
+
     /// A collecting audit sink: records every entry as an owned tuple so a test can assert what was
     /// logged (and that it is redacted — no rdata value is ever present to log).
     #[derive(Default)]
     struct CollectingSink {
-        entries: Mutex<
-            Vec<(
-                DnsPublishOp,
-                String,
-                RecordKindTag,
-                &'static str,
-                DnsPublishOutcome,
-            )>,
-        >,
+        entries: Mutex<Vec<AuditRow>>,
     }
     impl DnsPublishAuditSink for CollectingSink {
         fn record(&self, e: &DnsPublishAuditEntry<'_>) {
@@ -579,7 +580,7 @@ mod tests {
         DnsPublishBinding::new(
             provider,
             zone_root,
-            zones.iter().map(|s| s.to_string()).collect(),
+            zones.iter().map(|s| (*s).to_string()).collect(),
             Arc::new(TracingDnsPublishSink),
         )
     }

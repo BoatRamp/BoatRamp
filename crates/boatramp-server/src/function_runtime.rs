@@ -4196,6 +4196,7 @@ mod blobstore_dimension0_tests {
             upload_containers: &[],
             blobstore_containers: &containers,
             egress_allowlist: &[],
+            dns_publish_zones: &[],
             secret_allowlist: &[],
         };
         let bindings = rebuild
