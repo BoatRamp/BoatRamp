@@ -17,3 +17,36 @@ jobs:
   matrix:
     uses: ./.github/workflows/preflight-matrix.yml
     secrets: inherit
+
+  # The promote-splice e2e (cap-req 22 session->connection gate) runs HERE in Nightly, NOT the
+  # per-push merge gate and NOT the reusable preflight-matrix. It is a full wasm-guest
+  # session->promote->splice test that is timing-fragile under per-push runner load (the
+  # second-promote block's upstream dial exceeds budget on a slow runner — flaked 2026-10-30/31).
+  # Owner decision 2026-10-31: keep it as a Nightly PRE-CUT precondition (nightly must be green
+  # before a tag) + run it on lighthouse (unloaded, reliable), but off the per-push gate so it
+  # stops blocking merges, and off preflight-matrix so a flake here can never block a release cut.
+  # It is `#[ignore]`d in the source, so `--ignored` runs exactly this one case.
+  promote-live-gate:
+    name: promote-splice live gate (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: promote-live-gate-musl
+      - name: "promote-splice live gate (cap-req 22 session->connection e2e)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --ignored --nocapture 2>&1 | tee promote-live.log
+          grep -qE 'test result: ok\. 1 passed' promote-live.log \
+            || { echo "::error::promote-splice live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SESSION PROMOTE LIVE OK' promote-live.log \
+            || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice regressed)" >&2; exit 1; }

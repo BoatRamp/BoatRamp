@@ -1186,7 +1186,7 @@ async fn spawn_one_shot_upstream() -> (
 ///      the re-entry pool or the shared async lane).
 #[cfg(all(feature = "session", feature = "tcp-egress"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "live promote-splice gate: timing-sensitive, runs only in the dedicated tcp-listener-live CI job via --include-ignored, not the general --all-features suite (flaked on a loaded runner 2026-10-30)"]
+#[ignore = "promote-splice e2e: a full wasm-guest session->connection gate, timing-fragile under per-push CI load (the second-promote block's upstream dial exceeds budget on a slow runner — flaked 2026-10-30/31). MOVED OFF the per-push merge gate 2026-10-31 (owner decision): runs in the scheduled Nightly `promote-live-gate` job (pre-cut precondition) via `--ignored`, and on lighthouse (unloaded, reliable). NOT in the per-push live-gate-tcp-listener job, NOT in the release preflight (so it can't flake the cut)."]
 async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
     const GREETING: &[u8] = b"* OK session-imap-bridge ready\r\n";
     const PREAMBLE: &[u8] = b"PREAMBLE\r\n";

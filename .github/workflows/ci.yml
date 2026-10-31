@@ -1515,13 +1515,19 @@ jobs:
       # HANGS), (d) peer-drop cleanup. Each scenario asserts within a bounded wall-clock, so a
       # regression turns the test RED rather than hanging CI. The gate greps the success marker + the
       # pass count, so a silent skip/compile-out fails the job.
-      - name: "tcp-listener live gate (echo / idle / spin-preempt / peer-drop + TLS + STARTTLS + session + connect-greeting + promote-splice)"
+      # The promote-splice case (cap-req 22) is DELIBERATELY NOT in this per-push gate — it is a
+      # full wasm-guest session->connection e2e that is timing-fragile under per-push runner load
+      # (the second-promote block's upstream dial can exceed its budget on a slow runner). It is
+      # `#[ignore]`d here and runs instead in the scheduled Nightly (`promote-live-gate` job) as a
+      # pre-cut precondition + on lighthouse (unloaded, reliable). So this per-push gate runs the five
+      # stable cases WITHOUT `--include-ignored`.
+      - name: "tcp-listener live gate (echo / idle / spin-preempt / peer-drop + TLS + STARTTLS + session + connect-greeting)"
         run: |
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
-            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --include-ignored --nocapture 2>&1 | tee tcp-listener-live.log
-          grep -qE 'test result: ok\. 6 passed' tcp-listener-live.log \
-            || { echo "::error::tcp-listener live gate did not run all six cases (silent skip or a failure)" >&2; exit 1; }
+            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --nocapture 2>&1 | tee tcp-listener-live.log
+          grep -qE 'test result: ok\. 5 passed' tcp-listener-live.log \
+            || { echo "::error::tcp-listener live gate did not run all five per-push cases (silent skip or a failure)" >&2; exit 1; }
           grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
             || { echo "::error::tcp-listener live gate never reached its marker (an inbound-TCP serve-path regression — likely the conn-lane epoch-yield/teardown)" >&2; exit 1; }
           grep -q 'TCP-LISTENER-TLS LIVE OK' tcp-listener-live.log \
@@ -1532,8 +1538,6 @@ jobs:
             || { echo "::error::session-listener live gate never reached its marker (cap-req 08: the session-over-listener instance-release / checkpoint-resume regression)" >&2; exit 1; }
           grep -q 'SESSION CONNECT GREETING OK' tcp-listener-live.log \
             || { echo "::error::session connect-greeting live gate never reached its marker (cap-req 17: the connect-time empty-frames dispatch for server-speaks-first guests regressed)" >&2; exit 1; }
-          grep -q 'SESSION PROMOTE LIVE OK' tcp-listener-live.log \
-            || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
 
   # cap-req #24 WS3 DNS-PUBLISH LIVE GATE (marker `DNS-PUBLISH LIVE OK`). The guest-facing DNS WRITE
   # capability's end-to-end proof: serves a REAL compiled guest component (`dns-publish-writer.wasm`,
