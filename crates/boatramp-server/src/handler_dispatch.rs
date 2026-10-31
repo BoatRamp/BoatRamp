@@ -549,6 +549,8 @@ pub(super) async fn dispatch_handler(
         &handler.blobstore_containers,
         // Per-handler outbound-TCP allowlist for the gated `wasi:sockets` capability: empty ⇒ deny-all.
         &handler.egress_allowlist,
+        // Per-handler `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
+        &handler.dns_publish_zones,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // Ask B-3 (B): `no_secrets` ⇒ resolve ZERO site secrets for this handler (a blob/image route
@@ -2252,6 +2254,15 @@ pub(super) async fn build_bindings(
     // `wasi:sockets` is granted (declared import + site allow); the engine's `socket_addr_check` then
     // enforces it connect-only + SSRF-floored, and ONLY when the node posture allows TCP egress.
     egress_allowlist: &[String],
+    // Per-component writable-zone allowlist for the gated `dns-publish` capability (cap-req #24 WS3):
+    // the authorized zone-suffix globs this component may WRITE DNS records under (own name only,
+    // never the rdata target). Empty ⇒ deny-all (least-privilege). The binding is attached ONLY when
+    // `dns-publish` is granted AND the operator installed a provider source for this `(project, site)`;
+    // the host then enforces the posture + this allowlist + the publish budget + the central guardrail.
+    // Consumed only under the `dns-publish` feature (the attach below); allow it to be unused in a
+    // `handlers`-on/`dns-publish`-off build.
+    #[cfg_attr(not(feature = "dns-publish"), allow(unused_variables))]
+    dns_publish_zones: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -3095,6 +3106,23 @@ pub(super) async fn build_bindings(
     if granted("dns-resolve") {
         bindings = bindings.with_dns_resolve(crate::dns_resolve::shared_resolver());
     }
+    // Host-side DNS PUBLISH (write) capability (cap-req #24 WS3): attach the host-held writer ONLY when
+    // the component is granted `dns-publish` AND the operator installed a provider source for this
+    // `(project, site)`. Deny-by-default/fail-closed at every layer: no grant / no source ⇒ no binding
+    // ⇒ the host returns `access-denied`; and even when attached, every call is still gated by the node
+    // posture `allow_guest_dns_publish`, the per-grant `dns_publish_zones` allowlist (own name only),
+    // the publish budget, and the central `validate_writable` guardrail (all enforced in the host
+    // binding). The writer's credential is host-held and never crosses to the guest.
+    #[cfg(feature = "dns-publish")]
+    {
+        bindings = crate::dns_publish::maybe_attach(
+            bindings,
+            granted("dns-publish"),
+            project.as_str(),
+            site,
+            dns_publish_zones,
+        );
+    }
     Ok(bindings)
 }
 
@@ -3537,6 +3565,9 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component outbound-TCP `egress_allowlist` for the gated `wasi:sockets`
     /// capability. Empty ⇒ deny-all. Threaded so a per-message rebuild gates socket egress identically.
     pub egress_allowlist: &'a [String],
+    /// The consumer's per-component `dns-publish` writable-zone allowlist (cap-req #24 WS3). Empty ⇒
+    /// deny-all. Threaded so a per-message rebuild gates DNS writes identically to the once-per-tick build.
+    pub dns_publish_zones: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -3568,6 +3599,7 @@ impl ConsumerRebuild<'_> {
             self.upload_containers,
             self.blobstore_containers,
             self.egress_allowlist,
+            self.dns_publish_zones,
             self.secret_allowlist,
             // Consumers resolve their secrets as before (no `no_secrets` opt-out on the async lane).
             false,
@@ -4863,6 +4895,8 @@ mod consumer_dns_resolve_tests {
             &[],
             &[],
             &allow,
+            // dns_publish_zones (cap-req #24 WS3): empty ⇒ deny-all (this test exercises egress only).
+            &[],
             &[],
             false,
             0,

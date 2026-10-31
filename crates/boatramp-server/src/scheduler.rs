@@ -1020,6 +1020,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.blobstore_containers,
                                 // The consumer's outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                                 &consumer.egress_allowlist,
+                                // The consumer's `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
+                                &consumer.dns_publish_zones,
                                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                                 &consumer.secrets,
                                 // Consumers resolve their secrets as before (no `no_secrets` opt-out).
@@ -1088,6 +1090,7 @@ pub(super) async fn run_scheduler_tick(
                                     upload_containers: &consumer.upload_containers,
                                     blobstore_containers: &consumer.blobstore_containers,
                                     egress_allowlist: &consumer.egress_allowlist,
+                                    dns_publish_zones: &consumer.dns_publish_zones,
                                     secret_allowlist: &consumer.secrets,
                                 });
                             // Dispatch ONCE per matching concrete topic (v0.7.1 fan-in). For a
@@ -1516,6 +1519,8 @@ async fn fire_cron(
         &handler.blobstore_containers,
         // A cron-triggered handler inherits the matched handler's outbound-TCP `egress_allowlist`.
         &handler.egress_allowlist,
+        // …and its `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
+        &handler.dns_publish_zones,
         // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
         &handler.secrets,
         // …and its `no_secrets` opt-out (Ask B-3 B).

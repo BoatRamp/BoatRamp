@@ -223,6 +223,11 @@ pub async fn build_handler_runtime(
     // multi-tenant; when off the engine refuses every listener dispatch. INDEPENDENT of
     // `allow_guest_tcp_egress` (inbound ≠ outbound) and NEVER grants the guest `wasi:sockets`.
     allow_guest_tcp_listener: bool,
+    // Posture: whether a guest's `dns-publish` capability may WRITE DNS records through a host-held
+    // provider credential (cap-req #24 WS3). OFF in every built-in profile; when off the engine makes
+    // the `DnsPublishHost` binding fail-closed to `access-denied` for every call. INDEPENDENT of the
+    // egress knobs (DNS write is a distinct authority).
+    allow_guest_dns_publish: bool,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
     // Dev-posture guest-egress extra CA(s), DER-encoded (empty ⇒ stock webpki-only egress trust).
@@ -497,6 +502,9 @@ pub async fn build_handler_runtime(
     .with_private_egress(allow_guest_private_egress)
     .with_tcp_egress(allow_guest_tcp_egress)
     .with_tcp_listener(allow_guest_tcp_listener)
+    // Posture gate for the guest `dns-publish` write capability (cap-req #24 WS3). OFF by default ⇒
+    // fail-closed `access-denied`. INDEPENDENT of the egress knobs.
+    .with_dns_publish(allow_guest_dns_publish)
     .with_self_egress(self_egress_addrs)
     .with_guest_egress_extra_roots(guest_egress_extra_roots)
     .with_streaming_idle_ms(
@@ -1005,6 +1013,10 @@ pub async fn build_handler_runtime(
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest listener to dispatch, so it is ignored.
     _allow_guest_tcp_listener: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
+    // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
+    // gate, so it is ignored.
+    _allow_guest_dns_publish: bool,
     _self_egress_addrs: Vec<std::net::SocketAddr>,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean

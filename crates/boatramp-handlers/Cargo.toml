@@ -176,9 +176,22 @@ tcp-listener = ["engine"]
 # (experimental); the shipped binary turns it on via batteries-included.
 # `dep:async-trait` for the object-safe `DnsResolver` seam the `dns-resolve` binding injects (#20).
 tcp-egress = ["engine", "dep:async-trait"]
+# The `dns-publish` capability (host-side DNS WRITE, cap-req #24 WS3): the WRITE counterpart to
+# `dns-resolve`. A granted guest names a zone/record and the host performs the mutation through an
+# operator-configured, host-held `boatramp_acme::dns::DnsProvider` (the guest never holds a zone-write
+# token). This gates the WIT `dns-publish-host` world + the `DnsPublishHost` binding + linker. Consumes
+# the always-compiled `boatramp-acme::dns` model (RecordKind / DnsProvider / validate_writable) — which
+# itself pulls no provider-client deps (acme's `default = []`), so this stays lean. Off by default;
+# provided ONLY when the node posture `allow_guest_dns_publish` is on. The shipped binary turns it on
+# via batteries-included. `dep:async-trait` for the object-safe `DnsProvider`/audit-sink seams.
+dns-publish = ["engine", "dep:boatramp-acme", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true
+# The always-compiled `boatramp-acme::dns` model (RecordKind / DnsProvider / validate_writable),
+# consumed by the `dns-publish` binding (WS3). Optional + feature-gated so a build without `dns-publish`
+# never pulls it; acme's own `default = []` keeps it to its light base deps (no provider HTTP clients).
+boatramp-acme = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true }
 # CIDR matching for the gated `wasi:sockets` outbound-TCP allowlist (PLAN-handler-tcp-egress):

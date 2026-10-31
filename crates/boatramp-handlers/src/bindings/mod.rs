@@ -31,6 +31,13 @@ pub mod blob_upload;
 pub mod blobstore;
 #[cfg(feature = "capability")]
 pub mod capability;
+/// The host-side DNS **publish** (write) binding (`boatramp:handlers/dns-publish`, cap-req #24 WS3):
+/// the WRITE counterpart to `dns-resolve`. A granted guest names a zone/record and the host performs
+/// the mutation through a host-held `boatramp_acme::dns::DnsProvider` (the guest holds no zone-write
+/// token). Three-layer gate (posture + per-grant writable-zone allowlist + rate budget/audit), with
+/// the central `validate_writable` guardrail — its own off-by-default `dns-publish` feature.
+#[cfg(feature = "dns-publish")]
+pub mod dns_publish;
 /// The host-side DNS resolver binding (`boatramp:handlers/dns-resolve`, mailroom cap-req #20): a
 /// guest resolves a domain's MX records / a host's addresses via a host-held resolver (never holding
 /// `wasi:sockets`), gated by the egress posture + SSRF-floored. The resolver half of the egress
@@ -197,6 +204,13 @@ pub struct Bindings {
     /// invocation's `HostState`, not carried here.
     #[cfg(feature = "tcp-egress")]
     dns_resolve: Option<dns_resolve::DnsResolveBinding>,
+    /// The `dns-publish` grant (cap-req #24 WS3): the host-held DNS writer + its authoritative zone
+    /// root + the per-grant writable-zone allowlist + the redacted audit sink. `None` ⇒ not granted
+    /// (every publish ⇒ `access-denied`). The node posture (`allow_guest_dns_publish`) and the
+    /// store-resident publish budget are applied by the binding from the invocation's `HostState`, not
+    /// carried here. The guest never sees the provider credential.
+    #[cfg(feature = "dns-publish")]
+    dns_publish: Option<dns_publish::DnsPublishBinding>,
     /// HOST-MEDIATED egress only (mailroom cap-req #19): when set, a non-empty `egress_allowlist`
     /// feeds ONLY the host-mediated `tcp-egress` binding (the host dials + terminates TLS), and
     /// `new_store` does NOT install the permissive GUEST `socket_addr_check` — so the guest's own
@@ -412,6 +426,35 @@ impl Bindings {
         resolver: std::sync::Arc<dyn dns_resolve::DnsResolver>,
     ) -> Self {
         self.dns_resolve = Some(dns_resolve::DnsResolveBinding::new(resolver));
+        self
+    }
+
+    /// This invocation's `dns-publish` grant (`None` ⇒ not granted). Read by the engine's
+    /// `build_linker` closure to build the per-invocation `DnsPublishHost`.
+    #[cfg(feature = "dns-publish")]
+    pub fn dns_publish(&self) -> Option<&dns_publish::DnsPublishBinding> {
+        self.dns_publish.as_ref()
+    }
+
+    /// Grant the `dns-publish` capability (cap-req #24 WS3), backed by the host-held `provider` writer
+    /// authoritative over `zone_root`. `writable_zones` is the per-grant allowlist constraining the
+    /// record's OWN name (empty ⇒ deny-all); `audit` is the redacted mutation sink. The posture gate +
+    /// the store-resident publish budget are enforced by the binding at use. The guest never sees the
+    /// provider credential.
+    #[cfg(feature = "dns-publish")]
+    pub fn with_dns_publish(
+        mut self,
+        provider: std::sync::Arc<dyn boatramp_acme::dns::DnsProvider>,
+        zone_root: impl Into<String>,
+        writable_zones: Vec<String>,
+        audit: std::sync::Arc<dyn dns_publish::DnsPublishAuditSink>,
+    ) -> Self {
+        self.dns_publish = Some(dns_publish::DnsPublishBinding::new(
+            provider,
+            zone_root,
+            writable_zones,
+            audit,
+        ));
         self
     }
 

@@ -110,6 +110,7 @@ impl SecurityProfile {
                 allow_guest_egress_extra_ca: false,
                 allow_guest_tcp_egress: false,
                 allow_guest_tcp_listener: false,
+                allow_guest_dns_publish: false,
                 max_handler_blob_bytes: MT_MAX_BLOB,
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -144,6 +145,9 @@ impl SecurityProfile {
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
                 allow_guest_tcp_listener: true,
+                // A new, security-sensitive zone-write surface: OFF even on single-tenant until the
+                // operator opts in explicitly (its Security review gates the broader default).
+                allow_guest_dns_publish: false,
                 max_handler_blob_bytes: ST_MAX_BLOB,
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -178,6 +182,9 @@ impl SecurityProfile {
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
                 allow_guest_tcp_listener: true,
+                // Off even under dev — a guest `dns-publish` would mutate REAL external DNS (the
+                // provider credential is real); an operator opts in explicitly.
+                allow_guest_dns_publish: false,
                 max_handler_blob_bytes: 0,
                 max_component_bytes: 0,
                 oidc_require_audience: false,
@@ -244,6 +251,11 @@ pub struct PostureOverrides {
     /// `allow_guest_tcp_egress` (inbound ≠ outbound). See
     /// [`SecurityPosture::allow_guest_tcp_listener`].
     pub allow_guest_tcp_listener: Option<bool>,
+    /// Permit a **guest**'s `dns-publish` capability to WRITE DNS records through a host-held provider
+    /// credential (cap-req #24). **Off** in every built-in profile — a new, security-sensitive
+    /// zone-write surface; an operator opts in explicitly. Independent of the egress knobs (DNS write
+    /// is a distinct authority). See [`SecurityPosture::allow_guest_dns_publish`].
+    pub allow_guest_dns_publish: Option<bool>,
     /// Cap on handler blobstore host reads/ranges/copies in bytes (`0` = unlimited).
     pub max_handler_blob_bytes: Option<u64>,
     /// Cap on a Wasm component blob in bytes (`0` = unlimited).
@@ -469,6 +481,11 @@ impl SecurityConfig {
             o.allow_guest_tcp_listener.is_some(),
         );
         row(
+            "allow_guest_dns_publish",
+            p.allow_guest_dns_publish.to_string(),
+            o.allow_guest_dns_publish.is_some(),
+        );
+        row(
             "max_handler_blob_bytes",
             fmt_cap(p.max_handler_blob_bytes),
             o.max_handler_blob_bytes.is_some(),
@@ -643,6 +660,17 @@ pub struct SecurityPosture {
     /// serve accept loop never binds AND [`dispatch_tcp_connection`] refuses; any single wiring
     /// omission fails CLOSED.
     pub allow_guest_tcp_listener: bool,
+    /// Permit a **guest**'s `dns-publish` capability to WRITE DNS records (cap-req #24): the guest
+    /// NAMES a zone/record and the host performs the mutation through an operator-configured, host-held
+    /// `DnsProvider` credential (the guest never holds a zone-write token). `false` (the default in
+    /// EVERY built-in profile) makes the `DnsPublishHost` binding fail-closed to `access-denied` for
+    /// every call, regardless of grant or per-grant writable-zone allowlist. `true` lets a granted
+    /// component mutate within its allowlist (own-name only, never the rdata target), still bounded by
+    /// the per-invocation publish budget and the central `validate_writable` guardrail (apex-NS /
+    /// supported-kind / malformed-rdata refusal). A new, security-sensitive write surface, so OFF by
+    /// default even on `single-tenant`/`dev` — an operator opts in explicitly. INDEPENDENT of every
+    /// egress knob (DNS write is a distinct authority). Any single wiring omission fails CLOSED.
+    pub allow_guest_dns_publish: bool,
     /// Cap on handler blobstore host reads/ranges/copies, `0` = unlimited.
     pub max_handler_blob_bytes: u64,
     /// Cap on a Wasm component blob, `0` = unlimited.
@@ -810,6 +838,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_tcp_listener {
         base.allow_guest_tcp_listener = v;
+    }
+    if let Some(v) = o.allow_guest_dns_publish {
+        base.allow_guest_dns_publish = v;
     }
     if let Some(v) = o.max_handler_blob_bytes {
         base.max_handler_blob_bytes = v;

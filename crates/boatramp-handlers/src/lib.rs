@@ -62,6 +62,14 @@ pub use bindings::blobstore::read_object_through_guest_binding;
 pub use bindings::blobstore::{BlobBinding, BlobRefDenied};
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
+/// The host-side DNS **publish** (write) capability (cap-req #24 WS3): the binding + the redacted audit
+/// sink seam. The `DnsProvider` writer model is re-exported from `boatramp-acme` so a host (boatramp-
+/// server) can name the injected provider type without depending on `boatramp-acme` directly.
+#[cfg(feature = "dns-publish")]
+pub use bindings::dns_publish::{
+    DnsPublishAuditEntry, DnsPublishAuditSink, DnsPublishBinding, DnsPublishOp, DnsPublishOutcome,
+    TracingDnsPublishSink,
+};
 /// The host-side DNS resolver capability (mailroom cap-req #20): the injected [`DnsResolver`] backend
 /// (implemented in boatramp-server with hickory) + its host-facing value types.
 #[cfg(feature = "tcp-egress")]
@@ -100,6 +108,10 @@ pub use bindings::tcp_egress::{DialTls, EgressDialer, EgressError};
 pub use bindings::tenancy::{ProducerContextSource, SealedPrincipal};
 #[cfg(feature = "tenant-secrets")]
 pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
+#[cfg(feature = "dns-publish")]
+pub use boatramp_acme::dns::{
+    DnsProvider, DnsRecord as DnsPublishRecord, RecordKind as DnsPublishRecordKind,
+};
 #[cfg(feature = "session")]
 pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
