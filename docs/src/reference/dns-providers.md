@@ -19,7 +19,7 @@ and `boatramp domain add --provider <name>`.
 | `route53` | — | AWS Route 53 | `ROUTE53_HOSTED_ZONE_ID` + the standard AWS chain |
 | `oci` | — | Oracle Cloud DNS | `OCI_REGION`, `OCI_ZONE`, `OCI_KEY_ID`, `OCI_PRIVATE_KEY_FILE` |
 | `digitalocean` | `do` | DigitalOcean | `DIGITALOCEAN_DOMAIN`, `DIGITALOCEAN_TOKEN` |
-| `hetzner` | — | Hetzner DNS | `HETZNER_ZONE_ID`, `HETZNER_ZONE`, `HETZNER_DNS_TOKEN` |
+| `hetzner` | — | Hetzner Cloud DNS | `HETZNER_ZONE`, `HETZNER_DNS_TOKEN` |
 | `ns1` | — | NS1 (IBM) | `NS1_ZONE`, `NS1_API_KEY` |
 | `dnsimple` | — | DNSimple | `DNSIMPLE_ACCOUNT_ID`, `DNSIMPLE_ZONE`, `DNSIMPLE_TOKEN` |
 | `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_PROJECT`, `GCP_DNS_ZONE`, `GCP_ACCESS_TOKEN` |
@@ -35,6 +35,14 @@ and `boatramp domain add --provider <name>`.
 - `route53` reads `ROUTE53_HOSTED_ZONE_ID` for the zone and resolves credentials
   through the standard AWS provider chain (environment, shared config, instance
   role).
+- `hetzner` targets the **Hetzner Cloud** DNS API (`api.hetzner.cloud`). The zone
+  is addressed by its name, so no numeric zone id is needed (the former
+  `HETZNER_ZONE_ID` is no longer read). **Breaking change:** `HETZNER_DNS_TOKEN`
+  must now be a Hetzner **Cloud** API token (Bearer auth); the old classic DNS
+  API token (`dns.hetzner.com`, `Auth-API-Token`) is decommissioned and no longer
+  works. Mint a Cloud API token in the Hetzner Cloud Console
+  (project → Security → API tokens). Supported record types include A, AAAA,
+  CNAME, TXT, MX, SRV, CAA, NS, PTR, and HTTPS/SVCB.
 
 ## See also
 
