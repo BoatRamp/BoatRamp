@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://dns.hetzner.com/api/v1";
 const AUTH_HEADER: &str = "Auth-API-Token";
@@ -69,13 +69,40 @@ impl HetznerDns {
             .unwrap_or_else(|| fqdn.to_string())
     }
 
-    /// `CNAME` values are FQDNs with a trailing dot; other kinds take the raw value.
-    fn record_value(record: &DnsRecord) -> String {
-        let value = record.kind.flat_value();
-        if matches!(record.kind, RecordKind::Cname(_)) && !value.ends_with('.') {
-            format!("{value}.")
+    /// A target name as an FQDN with the trailing dot Hetzner's convention wants
+    /// for name-valued rdata (`CNAME`, and now `MX`/`SRV`/`NS`'s name fields).
+    fn dotted(name: &str) -> String {
+        if name.ends_with('.') {
+            name.to_string()
         } else {
-            value
+            format!("{name}.")
+        }
+    }
+
+    /// The record `value`: `CNAME`/`NS` targets and `MX`/`SRV`'s name fields are
+    /// FQDNs with a trailing dot; `CAA`/`TLSA` are RFC 1035 presentation-format
+    /// strings; other kinds take the raw value (unchanged from WS1).
+    fn record_value(record: &DnsRecord) -> String {
+        match &record.kind {
+            RecordKind::Cname(target) | RecordKind::Ns(target) => Self::dotted(target),
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => format!("{preference} {}", Self::dotted(exchange)),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("{priority} {weight} {port} {}", Self::dotted(target)),
+            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => format!("{usage} {selector} {matching} {data}"),
+            _ => record.kind.flat_value(),
         }
     }
 
@@ -187,6 +214,23 @@ impl DnsProvider for HetznerDns {
         Ok(())
     }
 
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // Hetzner's console/API record types: A, AAAA, NS, MX, CNAME, SOA, HINFO,
+        // SRV, TXT, DANE (TLSA), DS, CAA. No PTR (reverse DNS is configured via
+        // the Cloud API, not a zone record) and no HTTPS/SVCB.
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Tlsa,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "hetzner"
     }
@@ -277,5 +321,86 @@ mod tests {
             p.record_body(&rec(RecordKind::Txt(vec!["tok".into()]), "example.com", 60)),
             serde_json::json!({"zone_id": "zone123", "type": "TXT", "name": "@", "value": "tok", "ttl": 60})
         );
+    }
+
+    /// Golden: the WS2 record types Hetzner declares support for.
+    #[test]
+    fn record_body_golden_for_ws2_kinds() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "MX", "name": "@", "value": "10 mx.example.com.", "ttl": 300})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "SRV", "name": "_svc._tcp", "value": "1 5 443 svc.example.com.", "ttl": 300})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "CAA", "name": "@", "value": "0 issue \"letsencrypt.org\"", "ttl": 300})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "NS", "name": "sub", "value": "ns1.example.net.", "ttl": 3600})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                "_443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "TLSA", "name": "_443._tcp", "value": "3 1 1 abcdef", "ttl": 300})
+        );
+    }
+
+    /// Hetzner does not declare PTR or HTTPS/SVCB support.
+    #[test]
+    fn supported_kinds_excludes_ptr_and_svcb_family() {
+        let p = provider();
+        for tag in [
+            crate::dns::RecordKindTag::Ptr,
+            crate::dns::RecordKindTag::Https,
+            crate::dns::RecordKindTag::Svcb,
+        ] {
+            assert!(!p.supports_kind(tag), "hetzner should NOT support {tag}");
+        }
     }
 }

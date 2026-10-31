@@ -520,9 +520,91 @@ pub enum DnsOp {
     Delete,
 }
 
+/// Every [`RecordKindTag`] that has a writable [`RecordKind`] variant (Tier 1 +
+/// Tier 2 — everything except the Tier-3 provider-managed family, which has no
+/// constructible variant at all). [`ManualDnsProvider::supported_kinds`] returns
+/// exactly this set: it emits zone-file lines, so it trivially encodes any rdata
+/// — there is no wire format to get wrong.
+const ALL_WRITABLE_KINDS: &[RecordKindTag] = &[
+    RecordKindTag::A,
+    RecordKindTag::Aaaa,
+    RecordKindTag::Cname,
+    RecordKindTag::Txt,
+    RecordKindTag::Mx,
+    RecordKindTag::Srv,
+    RecordKindTag::Caa,
+    RecordKindTag::Https,
+    RecordKindTag::Svcb,
+    RecordKindTag::Ns,
+    RecordKindTag::Ptr,
+    RecordKindTag::Tlsa,
+];
+
+/// A human-readable, zone-file-style rendering of any [`RecordKind`]'s rdata, for
+/// [`ManualDnsProvider`]'s operator-facing log line. Unlike
+/// [`RecordKind::flat_value`] (which is deliberately empty for the WS1 types —
+/// adapters refuse them before ever formatting one), this covers every writable
+/// kind: a manual operator needs to see the real value to apply it by hand.
+fn manual_rdata_display(kind: &RecordKind) -> String {
+    match kind {
+        RecordKind::A(_) | RecordKind::Aaaa(_) | RecordKind::Cname(_) | RecordKind::Txt(_) => {
+            kind.flat_value()
+        }
+        RecordKind::Mx {
+            preference,
+            exchange,
+        } => format!("{preference} {exchange}"),
+        RecordKind::Srv {
+            priority,
+            weight,
+            port,
+            target,
+        } => format!("{priority} {weight} {port} {target}"),
+        RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+        RecordKind::Https {
+            priority,
+            target,
+            params,
+        }
+        | RecordKind::Svcb {
+            priority,
+            target,
+            params,
+        } => {
+            let rendered_params = params
+                .iter()
+                .map(|p| {
+                    if p.value.is_empty() {
+                        p.key.clone()
+                    } else {
+                        format!("{}={}", p.key, p.value)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if rendered_params.is_empty() {
+                format!("{priority} {target}")
+            } else {
+                format!("{priority} {target} {rendered_params}")
+            }
+        }
+        RecordKind::Ns(target) | RecordKind::Ptr(target) => target.clone(),
+        RecordKind::Tlsa {
+            usage,
+            selector,
+            matching,
+            data,
+        } => format!("{usage} {selector} {matching} {data}"),
+    }
+}
+
 /// A [`DnsProvider`] that performs no network calls — it logs and records the
 /// changes the operator must apply themselves. The universal fallback when no
 /// cloud provider is configured, and the test double for the ACME flow.
+///
+/// Supports every writable [`RecordKindTag`] ([`ALL_WRITABLE_KINDS`]): it emits
+/// zone-file lines rather than calling a provider API, so there is no per-type
+/// wire format to get wrong — an operator can apply any record by hand.
 #[derive(Default)]
 pub struct ManualDnsProvider {
     ops: Mutex<Vec<(DnsOp, DnsRecord)>>,
@@ -545,7 +627,7 @@ impl DnsProvider for ManualDnsProvider {
         tracing::info!(
             target: "boatramp::dns",
             op = "upsert", kind = record.kind.as_str(), name = %record.name,
-            value = %record.kind.flat_value(), ttl = record.ttl,
+            value = %manual_rdata_display(&record.kind), ttl = record.ttl,
             "manual DNS: create this record"
         );
         self.ops
@@ -566,6 +648,10 @@ impl DnsProvider for ManualDnsProvider {
             .unwrap()
             .push((DnsOp::Delete, record.clone()));
         Ok(())
+    }
+
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        ALL_WRITABLE_KINDS
     }
 
     fn name(&self) -> &'static str {
@@ -789,6 +875,22 @@ mod tests {
         // (There is no `RecordKind::Soa` etc.; absence is enforced at compile time.)
     }
 
+    /// A provider that accepts every `DnsProvider` method's **default**
+    /// implementation (`supported_kinds` = the original WS1 `{A, AAAA, CNAME,
+    /// TXT}`, `name` = `"dns"`). Stands in for "an adapter that hasn't declared
+    /// any capability" in tests, now that [`ManualDnsProvider`] itself declares
+    /// every writable kind and can no longer play that role.
+    struct DefaultOnly;
+    #[async_trait]
+    impl DnsProvider for DefaultOnly {
+        async fn upsert(&self, _record: &DnsRecord) -> Result<(), DnsError> {
+            Ok(())
+        }
+        async fn delete(&self, _record: &DnsRecord) -> Result<(), DnsError> {
+            Ok(())
+        }
+    }
+
     /// A test provider that declares it can write every tag, used to prove the
     /// apex-NS guardrail is independent of the capability check.
     struct AllKinds;
@@ -842,7 +944,7 @@ mod tests {
     #[test]
     fn guardrail_refuses_unsupported_kind() {
         // The default adapter capability is {A, AAAA, CNAME, TXT}; MX is refused.
-        let p = ManualDnsProvider::new();
+        let p = DefaultOnly;
         let rec = DnsRecord {
             kind: RecordKind::Mx {
                 preference: 10,
@@ -854,7 +956,7 @@ mod tests {
         let err = validate_writable(&p, &rec, "example.com").unwrap_err();
         match err {
             DnsError::UnsupportedRecordType { provider, kind } => {
-                assert_eq!(provider, "manual");
+                assert_eq!(provider, "dns");
                 assert_eq!(kind, RecordKindTag::Mx);
             }
             other => panic!("expected UnsupportedRecordType, got {other:?}"),
@@ -899,7 +1001,7 @@ mod tests {
     fn guardrail_on_default_adapter_refuses_subzone_ns_as_unsupported() {
         // On a WS1 adapter (NS not yet supported), even a valid sub-zone NS is
         // refused — but as UnsupportedRecordType, not the apex rule.
-        let p = ManualDnsProvider::new();
+        let p = DefaultOnly;
         let subzone = DnsRecord {
             kind: RecordKind::Ns("ns1.example.net".into()),
             name: "sub.example.com".into(),
@@ -968,5 +1070,184 @@ mod tests {
         caa.validate_rdata().unwrap();
         assert_eq!(CaaTag::IssueWild.as_str(), "issuewild");
         assert_eq!(CaaTag::Iodef.as_str(), "iodef");
+    }
+
+    // ---- WS2: ManualDnsProvider supports every writable kind -------------
+
+    /// `ManualDnsProvider` declares every Tier-1/Tier-2 tag — it emits zone-file
+    /// text, so there is no wire format a type could fail to encode.
+    #[test]
+    fn manual_provider_supports_every_writable_kind() {
+        let p = ManualDnsProvider::new();
+        for tag in ALL_WRITABLE_KINDS {
+            assert!(p.supports_kind(*tag), "manual should support {tag}");
+        }
+        assert_eq!(p.supported_kinds().len(), 12);
+    }
+
+    /// Golden: `manual_rdata_display` renders a correct zone-file-style value
+    /// for every newly-writable (WS1) kind, so the operator-facing upsert log
+    /// line is actually usable — not the empty string `flat_value()` returns for
+    /// these types by design.
+    #[test]
+    fn manual_rdata_display_golden_for_every_new_kind() {
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Mx {
+                preference: 10,
+                exchange: "mx.example.com".into(),
+            }),
+            "10 mx.example.com"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Srv {
+                priority: 1,
+                weight: 5,
+                port: 443,
+                target: "svc.example.com".into(),
+            }),
+            "1 5 443 svc.example.com"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Caa {
+                flags: 0,
+                tag: CaaTag::Issue,
+                value: "letsencrypt.org".into(),
+            }),
+            "0 issue \"letsencrypt.org\""
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Https {
+                priority: 1,
+                target: ".".into(),
+                params: vec![
+                    SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    },
+                    SvcParam {
+                        key: "no-default-alpn".into(),
+                        value: String::new(),
+                    },
+                ],
+            }),
+            "1 . alpn=h2,h3 no-default-alpn"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Svcb {
+                priority: 0,
+                target: "svc.example.net".into(),
+                params: vec![],
+            }),
+            "0 svc.example.net"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Ns("ns1.example.net".into())),
+            "ns1.example.net"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Ptr("host.example.com".into())),
+            "host.example.com"
+        );
+        assert_eq!(
+            manual_rdata_display(&RecordKind::Tlsa {
+                usage: 3,
+                selector: 1,
+                matching: 1,
+                data: "abcdef".into(),
+            }),
+            "3 1 1 abcdef"
+        );
+    }
+
+    /// Every newly-writable kind round-trips through `ManualDnsProvider`'s
+    /// upsert/delete (the (adapter, type) golden for `ManualDnsProvider` itself —
+    /// the recorded `DnsRecord` carries the exact typed rdata, since Manual's
+    /// "wire format" is just storing the record verbatim).
+    #[tokio::test]
+    async fn manual_provider_round_trips_every_new_kind() {
+        let provider = ManualDnsProvider::new();
+        let records = [
+            DnsRecord {
+                kind: RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            },
+            DnsRecord {
+                kind: RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                name: "_svc._tcp.example.com".into(),
+                ttl: 300,
+            },
+            DnsRecord {
+                kind: RecordKind::Caa {
+                    flags: 0,
+                    tag: CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            },
+            DnsRecord {
+                kind: RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            },
+            DnsRecord {
+                kind: RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                name: "svc.example.com".into(),
+                ttl: 300,
+            },
+            DnsRecord {
+                kind: RecordKind::Ns("ns1.example.net".into()),
+                name: "sub.example.com".into(),
+                ttl: 3600,
+            },
+            DnsRecord {
+                kind: RecordKind::Ptr("host.example.com".into()),
+                name: "7.113.0.203.in-addr.arpa".into(),
+                ttl: 3600,
+            },
+            DnsRecord {
+                kind: RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                name: "_443._tcp.example.com".into(),
+                ttl: 300,
+            },
+        ];
+        for record in &records {
+            // The capability guardrail allows every one of these on Manual.
+            validate_writable(&provider, record, "example.com").unwrap();
+            provider.upsert(record).await.unwrap();
+            provider.delete(record).await.unwrap();
+        }
+        let ops = provider.recorded();
+        assert_eq!(ops.len(), records.len() * 2);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(ops[i * 2].0, DnsOp::Upsert);
+            assert_eq!(ops[i * 2].1.kind, record.kind);
+            assert_eq!(ops[i * 2 + 1].0, DnsOp::Delete);
+        }
     }
 }

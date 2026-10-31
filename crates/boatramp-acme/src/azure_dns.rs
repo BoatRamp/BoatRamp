@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://management.azure.com";
 const API_VERSION: &str = "2018-05-01";
@@ -76,9 +76,12 @@ impl AzureDns {
     }
 
     /// The per-type `PUT` body (`properties` with the TTL + the type's record
-    /// array). WS1: only the original writable set maps; a newly-modeled type is
-    /// refused (the central [`crate::dns::validate_writable`] guardrail catches it
-    /// first, but this keeps the adapter honest if called directly).
+    /// array). **WS2:** the original four plus MX/SRV/CAA/NS/PTR — Azure DNS's
+    /// documented supported record types (A, AAAA, CAA, CNAME, MX, NS, PTR, SOA,
+    /// SRV, TXT). TLSA and HTTPS/SVCB are not in that list, so they fall to the
+    /// `UnsupportedRecordType` arm (the central
+    /// [`crate::dns::validate_writable`] guardrail catches it first, but this
+    /// keeps the adapter honest if called directly).
     fn body(record: &DnsRecord) -> Result<serde_json::Value, DnsError> {
         let mut properties = serde_json::Map::new();
         properties.insert("TTL".to_string(), serde_json::json!(record.ttl));
@@ -93,6 +96,28 @@ impl AzureDns {
                 serde_json::json!([{ "ipv6Address": ip.to_string() }]),
             ),
             RecordKind::Cname(target) => ("CNAMERecord", serde_json::json!({ "cname": target })),
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => (
+                "MXRecords",
+                serde_json::json!([{ "preference": preference, "exchange": exchange }]),
+            ),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => (
+                "SRVRecords",
+                serde_json::json!([{ "priority": priority, "weight": weight, "port": port, "target": target }]),
+            ),
+            RecordKind::Caa { flags, tag, value } => (
+                "CAARecords",
+                serde_json::json!([{ "flags": flags, "tag": tag.as_str(), "value": value }]),
+            ),
+            RecordKind::Ns(target) => ("NSRecords", serde_json::json!([{ "nsdname": target }])),
+            RecordKind::Ptr(target) => ("PTRRecords", serde_json::json!([{ "ptrdname": target }])),
             other => {
                 return Err(DnsError::UnsupportedRecordType {
                     provider: "azure",
@@ -135,6 +160,22 @@ impl DnsProvider for AzureDns {
         resp.error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // Azure DNS's documented supported record types: A, AAAA, CAA, CNAME,
+        // MX, NS, PTR, SOA, SRV, TXT. No TLSA, no HTTPS/SVCB.
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+        ]
     }
 
     fn name(&self) -> &'static str {
@@ -236,5 +277,63 @@ mod tests {
             provider().relative_name("_acme-challenge.deploy.example.com"),
             "_acme-challenge.deploy"
         );
+    }
+
+    /// Golden: the WS2 record types Azure declares support for.
+    #[test]
+    fn body_golden_for_ws2_kinds() {
+        let rec = |kind| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            ttl: 60,
+        };
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Mx {
+                preference: 10,
+                exchange: "mx.example.com".into(),
+            }))
+            .unwrap(),
+            serde_json::json!({"properties": {"TTL": 60, "MXRecords": [{"preference": 10, "exchange": "mx.example.com"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Srv {
+                priority: 1,
+                weight: 5,
+                port: 443,
+                target: "svc.example.com".into(),
+            }))
+            .unwrap(),
+            serde_json::json!({"properties": {"TTL": 60, "SRVRecords": [{"priority": 1, "weight": 5, "port": 443, "target": "svc.example.com"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Caa {
+                flags: 0,
+                tag: crate::dns::CaaTag::Issue,
+                value: "letsencrypt.org".into(),
+            }))
+            .unwrap(),
+            serde_json::json!({"properties": {"TTL": 60, "CAARecords": [{"flags": 0, "tag": "issue", "value": "letsencrypt.org"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Ns("ns1.example.net".into()))).unwrap(),
+            serde_json::json!({"properties": {"TTL": 60, "NSRecords": [{"nsdname": "ns1.example.net"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Ptr("host.example.com".into()))).unwrap(),
+            serde_json::json!({"properties": {"TTL": 60, "PTRRecords": [{"ptrdname": "host.example.com"}]}})
+        );
+        // TLSA and HTTPS/SVCB are not declared for Azure.
+        assert!(matches!(
+            AzureDns::body(&rec(RecordKind::Tlsa {
+                usage: 3,
+                selector: 1,
+                matching: 1,
+                data: "abcdef".into(),
+            })),
+            Err(DnsError::UnsupportedRecordType {
+                kind: crate::dns::RecordKindTag::Tlsa,
+                ..
+            })
+        ));
     }
 }

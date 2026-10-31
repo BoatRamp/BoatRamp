@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://dns.googleapis.com/dns/v1";
 
@@ -57,14 +57,34 @@ impl GcpDns {
         }
     }
 
-    /// The single-element rrdata list for `record`: TXT is double-quoted, CNAME is
-    /// a trailing-dot FQDN, A/AAAA are the raw address.
+    /// The single-element rrdata list for `record`, in the RFC 1035 master-file
+    /// presentation format Cloud DNS expects: TXT is double-quoted, CNAME/NS/PTR
+    /// targets and MX/SRV's name fields are trailing-dot FQDNs, CAA/TLSA are
+    /// space-joined field strings, A/AAAA are the raw address.
     fn rrdatas(record: &DnsRecord) -> Vec<String> {
-        let raw = record.kind.flat_value();
-        let value = match record.kind {
-            RecordKind::Txt(_) => format!("\"{raw}\""),
-            RecordKind::Cname(_) => Self::fqdn(&raw),
-            _ => raw,
+        let value = match &record.kind {
+            RecordKind::Txt(_) => format!("\"{}\"", record.kind.flat_value()),
+            RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
+                Self::fqdn(target)
+            }
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => format!("{preference} {}", Self::fqdn(exchange)),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("{priority} {weight} {port} {}", Self::fqdn(target)),
+            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => format!("{usage} {selector} {matching} {data}"),
+            _ => record.kind.flat_value(),
         };
         vec![value]
     }
@@ -166,6 +186,24 @@ impl DnsProvider for GcpDns {
             .await
     }
 
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // Google Cloud DNS's documented supported record types include MX, SRV,
+        // CAA, NS, PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire
+        // encoding not pinned with confidence).
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "gcp"
     }
@@ -262,6 +300,82 @@ mod tests {
                 60
             )),
             serde_json::json!({"name": "_acme-challenge.example.com.", "type": "TXT", "ttl": 60, "rrdatas": ["\"tok\""]})
+        );
+    }
+
+    /// Golden: the WS2 record types GCP declares support for.
+    #[test]
+    fn rrset_golden_for_ws2_kinds() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"name": "example.com.", "type": "MX", "ttl": 300, "rrdatas": ["10 mx.example.com."]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_svc._tcp.example.com.", "type": "SRV", "ttl": 300, "rrdatas": ["1 5 443 svc.example.com."]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"name": "example.com.", "type": "CAA", "ttl": 300, "rrdatas": ["0 issue \"letsencrypt.org\""]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"name": "sub.example.com.", "type": "NS", "ttl": 3600, "rrdatas": ["ns1.example.net."]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Ptr("host.example.com".into()),
+                "7.113.0.203.in-addr.arpa",
+                3600
+            )),
+            serde_json::json!({"name": "7.113.0.203.in-addr.arpa.", "type": "PTR", "ttl": 3600, "rrdatas": ["host.example.com."]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                "_443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_443._tcp.example.com.", "type": "TLSA", "ttl": 300, "rrdatas": ["3 1 1 abcdef"]})
         );
     }
 }

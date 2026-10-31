@@ -16,7 +16,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -63,13 +63,44 @@ impl AkamaiDns {
         )
     }
 
-    /// The rdata value: TXT is double-quoted, CNAME is a trailing-dot FQDN, others raw.
+    /// A target name as an FQDN with the trailing dot Akamai's rdata presentation
+    /// form wants.
+    fn dotted(name: &str) -> String {
+        if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        }
+    }
+
+    /// The rdata value, in Akamai Edge DNS's RFC 1035 master-file presentation
+    /// format: TXT is double-quoted, CNAME/NS/PTR targets and MX/SRV's name
+    /// fields are trailing-dot FQDNs, CAA's string value is double-quoted, others
+    /// raw (unchanged from WS1).
     fn rdata_value(record: &DnsRecord) -> String {
-        let value = record.kind.flat_value();
-        match record.kind {
-            RecordKind::Txt(_) => format!("\"{value}\""),
-            RecordKind::Cname(_) if !value.ends_with('.') => format!("{value}."),
-            _ => value,
+        match &record.kind {
+            RecordKind::Txt(_) => format!("\"{}\"", record.kind.flat_value()),
+            RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
+                Self::dotted(target)
+            }
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => format!("{preference} {}", Self::dotted(exchange)),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("{priority} {weight} {port} {}", Self::dotted(target)),
+            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => format!("{usage} {selector} {matching} {data}"),
+            _ => record.kind.flat_value(),
         }
     }
 
@@ -252,6 +283,24 @@ impl DnsProvider for AkamaiDns {
         }
     }
 
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // Akamai Edge DNS's documented supported record types include MX, SRV,
+        // CAA, NS, PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire
+        // encoding not pinned with confidence).
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "akamai"
     }
@@ -396,6 +445,81 @@ mod tests {
                 60
             )),
             serde_json::json!({"name": "_acme-challenge.example.com", "type": "TXT", "ttl": 60, "rdata": ["\"tok\""]})
+        );
+    }
+
+    /// Golden: the WS2 record types Akamai declares support for.
+    #[test]
+    fn record_body_golden_for_ws2_kinds() {
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"name": "example.com", "type": "MX", "ttl": 300, "rdata": ["10 mx.example.com."]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_svc._tcp.example.com", "type": "SRV", "ttl": 300, "rdata": ["1 5 443 svc.example.com."]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"name": "example.com", "type": "CAA", "ttl": 300, "rdata": ["0 issue \"letsencrypt.org\""]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"name": "sub.example.com", "type": "NS", "ttl": 3600, "rdata": ["ns1.example.net."]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Ptr("host.example.com".into()),
+                "7.113.0.203.in-addr.arpa",
+                3600
+            )),
+            serde_json::json!({"name": "7.113.0.203.in-addr.arpa", "type": "PTR", "ttl": 3600, "rdata": ["host.example.com."]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                "_443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_443._tcp.example.com", "type": "TLSA", "ttl": 300, "rdata": ["3 1 1 abcdef"]})
         );
     }
 }

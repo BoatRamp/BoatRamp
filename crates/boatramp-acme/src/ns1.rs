@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://api.nsone.net/v1";
 const AUTH_HEADER: &str = "X-NSONE-Key";
@@ -62,6 +62,62 @@ impl Ns1Dns {
         }
     }
 
+    /// A target name as an FQDN with the trailing dot NS1's convention wants.
+    fn dotted(name: &str) -> String {
+        if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        }
+    }
+
+    /// The `answer` array's elements: NS1 represents a multi-field RDATA (MX,
+    /// SRV, CAA, TLSA) as the fields **positionally**, each its own array
+    /// element (not one presentation-format string) — distinct from the
+    /// single-value shape the original four kinds use.
+    fn answer_fields(record: &DnsRecord) -> Vec<serde_json::Value> {
+        match &record.kind {
+            RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
+                vec![serde_json::json!(Self::dotted(target))]
+            }
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => vec![
+                serde_json::json!(preference),
+                serde_json::json!(Self::dotted(exchange)),
+            ],
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => vec![
+                serde_json::json!(priority),
+                serde_json::json!(weight),
+                serde_json::json!(port),
+                serde_json::json!(Self::dotted(target)),
+            ],
+            RecordKind::Caa { flags, tag, value } => vec![
+                serde_json::json!(flags),
+                serde_json::json!(tag.as_str()),
+                serde_json::json!(value),
+            ],
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => vec![
+                serde_json::json!(usage),
+                serde_json::json!(selector),
+                serde_json::json!(matching),
+                serde_json::json!(data),
+            ],
+            _ => vec![serde_json::json!(Self::answer_value(record))],
+        }
+    }
+
     /// The JSON body for a create/update of `record` (one answer).
     fn record_body(&self, record: &DnsRecord) -> serde_json::Value {
         serde_json::json!({
@@ -69,7 +125,7 @@ impl Ns1Dns {
             "domain": record.name,
             "type": record.kind.as_str(),
             "ttl": record.ttl,
-            "answers": [ { "answer": [ Self::answer_value(record) ] } ],
+            "answers": [ { "answer": Self::answer_fields(record) } ],
         })
     }
 
@@ -130,6 +186,24 @@ impl DnsProvider for Ns1Dns {
         resp.error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // NS1's documented record types include MX, SRV, CAA, NS, PTR, and TLSA.
+        // HTTPS/SVCB are not declared (SvcParams wire encoding not pinned with
+        // confidence).
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ]
     }
 
     fn name(&self) -> &'static str {
@@ -223,6 +297,83 @@ mod tests {
                 60
             )),
             serde_json::json!({"zone": "example.com", "domain": "_acme-challenge.example.com", "type": "TXT", "ttl": 60, "answers": [{"answer": ["tok"]}]})
+        );
+    }
+
+    /// Golden: the WS2 record types NS1 declares support for — multi-field
+    /// RDATA (MX/SRV/CAA/TLSA) is each field as its own `answer` array element.
+    #[test]
+    fn record_body_golden_for_ws2_kinds() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "MX", "ttl": 300, "answers": [{"answer": [10, "mx.example.com."]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_svc._tcp.example.com", "type": "SRV", "ttl": 300, "answers": [{"answer": [1, 5, 443, "svc.example.com."]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "CAA", "ttl": 300, "answers": [{"answer": [0, "issue", "letsencrypt.org"]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "sub.example.com", "type": "NS", "ttl": 3600, "answers": [{"answer": ["ns1.example.net."]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Ptr("host.example.com".into()),
+                "7.113.0.203.in-addr.arpa",
+                3600
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "7.113.0.203.in-addr.arpa", "type": "PTR", "ttl": 3600, "answers": [{"answer": ["host.example.com."]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                "_443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_443._tcp.example.com", "type": "TLSA", "ttl": 300, "answers": [{"answer": [3, 1, 1, "abcdef"]}]})
         );
     }
 }

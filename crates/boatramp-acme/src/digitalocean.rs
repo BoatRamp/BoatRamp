@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://api.digitalocean.com/v2";
 
@@ -61,25 +61,61 @@ impl DigitalOceanDns {
             .unwrap_or_else(|| fqdn.to_string())
     }
 
-    /// The record `data`: `CNAME` targets are FQDNs with a trailing dot; every
-    /// other kind takes the raw value (TXT unquoted, A/AAAA the address).
-    fn record_data(record: &DnsRecord) -> String {
-        let value = record.kind.flat_value();
-        if matches!(record.kind, RecordKind::Cname(_)) && !value.ends_with('.') {
-            format!("{value}.")
+    /// A target name as an FQDN with the trailing dot DigitalOcean's convention
+    /// wants.
+    fn dotted(name: &str) -> String {
+        if name.ends_with('.') {
+            name.to_string()
         } else {
-            value
+            format!("{name}.")
         }
     }
 
-    /// The JSON body for a create/replace of `record`.
+    /// The record `data`: `CNAME`/`NS` targets and `MX`/`SRV`'s name fields are
+    /// FQDNs with a trailing dot; every other kind takes the raw value (TXT
+    /// unquoted, A/AAAA the address, CAA's value verbatim).
+    fn record_data(record: &DnsRecord) -> String {
+        match &record.kind {
+            RecordKind::Cname(target) | RecordKind::Ns(target) => Self::dotted(target),
+            RecordKind::Mx { exchange, .. } => Self::dotted(exchange),
+            RecordKind::Srv { target, .. } => Self::dotted(target),
+            RecordKind::Caa { value, .. } => value.clone(),
+            _ => record.kind.flat_value(),
+        }
+    }
+
+    /// The JSON body for a create/replace of `record`. DigitalOcean's API takes
+    /// `priority`/`weight`/`port` (MX/SRV) and `flags`/`tag` (CAA) as additional
+    /// **top-level** fields alongside `data` — not nested, unlike Cloudflare's
+    /// `data` sub-object.
     fn record_body(&self, record: &DnsRecord) -> serde_json::Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "type": record.kind.as_str(),
             "name": self.relative_name(&record.name),
             "data": Self::record_data(record),
             "ttl": record.ttl,
-        })
+        });
+        match &record.kind {
+            RecordKind::Mx { preference, .. } => {
+                body["priority"] = serde_json::json!(preference);
+            }
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                ..
+            } => {
+                body["priority"] = serde_json::json!(priority);
+                body["weight"] = serde_json::json!(weight);
+                body["port"] = serde_json::json!(port);
+            }
+            RecordKind::Caa { flags, tag, .. } => {
+                body["flags"] = serde_json::json!(flags);
+                body["tag"] = serde_json::json!(tag.as_str());
+            }
+            _ => {}
+        }
+        body
     }
 
     /// Find the id of an existing `(type, name)` record (the first match), or
@@ -172,6 +208,21 @@ impl DnsProvider for DigitalOceanDns {
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // DigitalOcean's documented record types: A, AAAA, CAA, CNAME, MX, NS,
+        // SRV, TXT. No PTR, no TLSA, no HTTPS/SVCB.
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+        ]
     }
 
     fn name(&self) -> &'static str {
@@ -278,5 +329,79 @@ mod tests {
             p.record_body(&rec(RecordKind::Txt(vec!["tok".into()]), "example.com", 60)),
             serde_json::json!({"type": "TXT", "name": "@", "data": "tok", "ttl": 60})
         );
+    }
+
+    /// Golden: the WS2 record types DigitalOcean declares support for —
+    /// `priority`/`weight`/`port` (MX/SRV) and `flags`/`tag` (CAA) as additional
+    /// top-level fields alongside `data`.
+    #[test]
+    fn record_body_golden_for_ws2_kinds() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"type": "MX", "name": "@", "data": "mx.example.com.", "ttl": 300, "priority": 10})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"type": "SRV", "name": "_svc._tcp", "data": "svc.example.com.", "ttl": 300, "priority": 1, "weight": 5, "port": 443})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"type": "CAA", "name": "@", "data": "letsencrypt.org", "ttl": 300, "flags": 0, "tag": "issue"})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"type": "NS", "name": "sub", "data": "ns1.example.net.", "ttl": 3600})
+        );
+    }
+
+    /// DigitalOcean does not declare PTR, TLSA, or HTTPS/SVCB support.
+    #[test]
+    fn supported_kinds_excludes_ptr_tlsa_and_svcb_family() {
+        let p = provider();
+        for tag in [
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
+        ] {
+            assert!(
+                !p.supports_kind(tag),
+                "digitalocean should NOT support {tag}"
+            );
+        }
     }
 }

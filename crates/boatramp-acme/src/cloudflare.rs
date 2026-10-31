@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
@@ -121,13 +121,89 @@ impl CloudflareDns {
     /// The JSON body for a create/replace of `record`. When this instance is
     /// `proxied`, address/CNAME records get `proxied: true` (and the automatic
     /// TTL Cloudflare requires for proxied records); TXT is never proxied.
+    ///
+    /// Cloudflare's API v4 body shape varies by type: A/AAAA/CNAME/TXT/NS/PTR/MX
+    /// take a flat `content` string (MX adds a top-level `priority`); SRV/CAA/TLSA
+    /// take a structured `data` object. HTTPS/SVCB are not in
+    /// [`supported_kinds`](DnsProvider::supported_kinds) yet (their `data.value`
+    /// SvcParams wire encoding isn't pinned with confidence) — they fall back to
+    /// the pre-WS2 empty-`content` shape, which `validate_writable` refuses
+    /// before this is ever called in practice.
     fn record_body(&self, record: &DnsRecord) -> serde_json::Value {
-        let mut body = serde_json::json!({
-            "type": record.kind.as_str(),
-            "name": record.name,
-            "content": record.kind.flat_value(),
-            "ttl": record.ttl,
-        });
+        let mut body = match &record.kind {
+            RecordKind::A(_) | RecordKind::Aaaa(_) | RecordKind::Cname(_) | RecordKind::Txt(_) => {
+                serde_json::json!({
+                    "type": record.kind.as_str(),
+                    "name": record.name,
+                    "content": record.kind.flat_value(),
+                    "ttl": record.ttl,
+                })
+            }
+            RecordKind::Ns(target) | RecordKind::Ptr(target) => serde_json::json!({
+                "type": record.kind.as_str(),
+                "name": record.name,
+                "content": target,
+                "ttl": record.ttl,
+            }),
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => serde_json::json!({
+                "type": "MX",
+                "name": record.name,
+                "content": exchange,
+                "priority": preference,
+                "ttl": record.ttl,
+            }),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => serde_json::json!({
+                "type": "SRV",
+                "name": record.name,
+                "data": {
+                    "priority": priority,
+                    "weight": weight,
+                    "port": port,
+                    "target": target,
+                },
+                "ttl": record.ttl,
+            }),
+            RecordKind::Caa { flags, tag, value } => serde_json::json!({
+                "type": "CAA",
+                "name": record.name,
+                "data": {
+                    "flags": flags,
+                    "tag": tag.as_str(),
+                    "value": value,
+                },
+                "ttl": record.ttl,
+            }),
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => serde_json::json!({
+                "type": "TLSA",
+                "name": record.name,
+                "data": {
+                    "usage": usage,
+                    "selector": selector,
+                    "matching_type": matching,
+                    "certificate": data,
+                },
+                "ttl": record.ttl,
+            }),
+            other @ (RecordKind::Https { .. } | RecordKind::Svcb { .. }) => serde_json::json!({
+                "type": other.as_str(),
+                "name": record.name,
+                "content": other.flat_value(),
+                "ttl": record.ttl,
+            }),
+        };
         if self.proxied
             && matches!(
                 record.kind,
@@ -237,6 +313,21 @@ impl DnsProvider for CloudflareDns {
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ]
     }
 
     fn name(&self) -> &'static str {
@@ -360,5 +451,109 @@ mod tests {
             )),
             serde_json::json!({"type": "TXT", "name": "_acme-challenge.example.com", "content": "tok", "ttl": 60})
         );
+    }
+
+    /// Golden: the WS2 record types Cloudflare declares support for — `content` +
+    /// top-level `priority` for MX, structured `data` objects for SRV/CAA/TLSA.
+    #[test]
+    fn record_body_golden_for_ws2_kinds() {
+        let cf = CloudflareDns::new("z", "t");
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Mx {
+                    preference: 10,
+                    exchange: "mx.example.com".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"type": "MX", "name": "example.com", "content": "mx.example.com", "priority": 10, "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Srv {
+                    priority: 1,
+                    weight: 5,
+                    port: 443,
+                    target: "svc.example.com".into(),
+                },
+                "_svc._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"type": "SRV", "name": "_svc._tcp.example.com", "data": {"priority": 1, "weight": 5, "port": 443, "target": "svc.example.com"}, "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Issue,
+                    value: "letsencrypt.org".into(),
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"type": "CAA", "name": "example.com", "data": {"flags": 0, "tag": "issue", "value": "letsencrypt.org"}, "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Ns("ns1.example.net".into()),
+                "sub.example.com",
+                3600
+            )),
+            serde_json::json!({"type": "NS", "name": "sub.example.com", "content": "ns1.example.net", "ttl": 3600})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Ptr("host.example.com".into()),
+                "7.113.0.203.in-addr.arpa",
+                3600
+            )),
+            serde_json::json!({"type": "PTR", "name": "7.113.0.203.in-addr.arpa", "content": "host.example.com", "ttl": 3600})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Tlsa {
+                    usage: 3,
+                    selector: 1,
+                    matching: 1,
+                    data: "abcdef".into(),
+                },
+                "_443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"type": "TLSA", "name": "_443._tcp.example.com", "data": {"usage": 3, "selector": 1, "matching_type": 1, "certificate": "abcdef"}, "ttl": 300})
+        );
+    }
+
+    /// Cloudflare declares exactly the WS2-widened set; HTTPS/SVCB remain
+    /// unsupported (SvcParams wire encoding not pinned with confidence).
+    #[test]
+    fn supported_kinds_is_the_ws2_widened_set() {
+        let cf = CloudflareDns::new("z", "t");
+        for tag in [
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ] {
+            assert!(cf.supports_kind(tag), "cloudflare should support {tag}");
+        }
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(
+                !cf.supports_kind(tag),
+                "cloudflare should NOT support {tag}"
+            );
+        }
     }
 }

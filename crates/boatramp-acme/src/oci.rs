@@ -17,7 +17,7 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord};
+use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 /// The OCI DNS API version path segment.
 const API_VERSION: &str = "20180115";
@@ -63,13 +63,42 @@ impl OciDns {
         )
     }
 
+    /// The rdata field, in the RFC 1035 master-file presentation format OCI's
+    /// `rdata` takes for every type. Unlike most adapters, OCI normalizes TXT
+    /// quoting and CNAME trailing-dots **server-side** (see the module doc), so
+    /// — consistent with that — name-bearing fields (NS/PTR targets, MX's
+    /// exchange, SRV's target) are passed raw, with no client-side dot.
+    fn rdata(record: &DnsRecord) -> String {
+        match &record.kind {
+            RecordKind::Mx {
+                preference,
+                exchange,
+            } => format!("{preference} {exchange}"),
+            RecordKind::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("{priority} {weight} {port} {target}"),
+            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Ns(target) | RecordKind::Ptr(target) => target.clone(),
+            RecordKind::Tlsa {
+                usage,
+                selector,
+                matching,
+                data,
+            } => format!("{usage} {selector} {matching} {data}"),
+            _ => record.kind.flat_value(),
+        }
+    }
+
     /// The RRSet replacement body for an upsert.
     fn rrset_body(record: &DnsRecord) -> serde_json::Value {
         serde_json::json!({
             "items": [{
                 "domain": record.name,
                 "rtype": record.kind.as_str(),
-                "rdata": record.kind.flat_value(),
+                "rdata": Self::rdata(record),
                 "ttl": record.ttl,
             }]
         })
@@ -220,6 +249,24 @@ impl DnsProvider for OciDns {
         }
     }
 
+    fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // OCI's documented supported record types include MX, SRV, CAA, NS,
+        // PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire encoding
+        // not pinned with confidence).
+        &[
+            RecordKindTag::A,
+            RecordKindTag::Aaaa,
+            RecordKindTag::Cname,
+            RecordKindTag::Txt,
+            RecordKindTag::Mx,
+            RecordKindTag::Srv,
+            RecordKindTag::Caa,
+            RecordKindTag::Ns,
+            RecordKindTag::Ptr,
+            RecordKindTag::Tlsa,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "oci"
     }
@@ -228,7 +275,6 @@ impl DnsProvider for OciDns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::RecordKind;
 
     #[test]
     fn get_signing_string_covers_minimal_headers() {
@@ -324,6 +370,58 @@ mod tests {
         assert_eq!(
             OciDns::rrset_body(&rec(RecordKind::Txt(vec!["tok".into()]))),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "TXT", "rdata": "tok", "ttl": 60}]})
+        );
+    }
+
+    /// Golden: the WS2 record types OCI declares support for — again raw
+    /// presentation-format `rdata`, no client-side dotting.
+    #[test]
+    fn rrset_body_golden_for_ws2_kinds() {
+        let rec = |kind| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            ttl: 60,
+        };
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Mx {
+                preference: 10,
+                exchange: "mx.example.com".into(),
+            })),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "MX", "rdata": "10 mx.example.com", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Srv {
+                priority: 1,
+                weight: 5,
+                port: 443,
+                target: "svc.example.com".into(),
+            })),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "SRV", "rdata": "1 5 443 svc.example.com", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Caa {
+                flags: 0,
+                tag: crate::dns::CaaTag::Issue,
+                value: "letsencrypt.org".into(),
+            })),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "CAA", "rdata": "0 issue \"letsencrypt.org\"", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Ns("ns1.example.net".into()))),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "NS", "rdata": "ns1.example.net", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Ptr("host.example.com".into()))),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "PTR", "rdata": "host.example.com", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Tlsa {
+                usage: 3,
+                selector: 1,
+                matching: 1,
+                data: "abcdef".into(),
+            })),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "TLSA", "rdata": "3 1 1 abcdef", "ttl": 60}]})
         );
     }
 }
