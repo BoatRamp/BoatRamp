@@ -269,11 +269,19 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     let mut f: Vec<CapabilityFeature> = boatramp_core::config::known_imports()
         .iter()
         // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress), `tcp-listener` (host-owned
-        // inbound-TCP listeners, PLAN-handler-tcp-inbound), and `dns-resolve` (the resolver half of the
-        // egress story, #20) are KNOWN_IMPORTS so a deploy may DECLARE them offline, but all are
-        // advertised as Experimental below (not Stable) — new, posture-gated, off-by-default surfaces.
-        // Filtered here so none is ALSO advertised Stable.
-        .filter(|&&name| name != "wasi:sockets" && name != "tcp-listener" && name != "dns-resolve")
+        // inbound-TCP listeners, PLAN-handler-tcp-inbound), `dns-resolve` (the resolver half of the
+        // egress story, #20), and `dns-publish` (the zone-WRITE capability, cap-req #24) are
+        // KNOWN_IMPORTS so a deploy may DECLARE them offline, but all are advertised as Experimental
+        // below (not Stable) — new, posture-gated, off-by-default surfaces. `dns-publish` is ALSO
+        // cargo-gated below (advertised iff the `dns-publish` feature is on), so a lean host that cannot
+        // serve it does not advertise it and a `requires = ["dns-publish"]` deploy fails loud. Filtered
+        // here so none is ALSO advertised Stable (and, for `dns-publish`, unconditionally).
+        .filter(|&&name| {
+            name != "wasi:sockets"
+                && name != "tcp-listener"
+                && name != "dns-resolve"
+                && name != "dns-publish"
+        })
         .map(|&name| CapabilityFeature {
             name,
             lifecycle: Stable,
@@ -438,6 +446,25 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         // guest declaring `requires = ["dns-resolve"]` is refused cleanly on a pre-#20 host.
         f.push(CapabilityFeature {
             name: "dns-resolve",
+            lifecycle: Experimental,
+        });
+    }
+    // The host-side DNS **publish** (write) capability (cap-req #24, the WRITE counterpart to
+    // `dns-resolve`): a granted guest NAMES a zone/record and the host performs the mutation through a
+    // host-held provider credential (the guest never holds a zone-write token). Cargo-gated on
+    // `dns-publish` (which pulls the `boatramp-handlers/dns-publish` host binding + the provider-source
+    // wiring); deny-by-default at every layer at RUNTIME — the node posture `allow_guest_dns_publish`
+    // (OFF by default) AND a per-handler `dns_publish_zones` writable-zone allowlist (empty ⇒ deny-all).
+    // Its OWN grant token (`dns-publish`, a KNOWN_IMPORT — declarable offline like `dns-resolve`), but
+    // advertised ONLY when the feature is compiled: a guest declares `requires = ["dns-publish"]` so a
+    // deploy against a host that cannot serve it (feature off, or predating #24) is refused cleanly
+    // instead of failing to instantiate. Registering it here is what makes it appear in `boatramp
+    // capabilities` and pass `capabilities --check`/`sync` admission — its absence (WS3 wired only the
+    // runtime host gate) left the capability unreachable end-to-end. Experimental until the shape
+    // settles.
+    if cfg!(feature = "dns-publish") {
+        f.push(CapabilityFeature {
+            name: "dns-publish",
             lifecycle: Experimental,
         });
     }
@@ -990,6 +1017,13 @@ mod tests {
         // enabled it, so `boatramp capabilities` lists it and the `requires` ABI gate is meaningful.
         // (Its absence in the released image was a presigned-blob-upload gap — GATE.)
         assert_eq!(host.contains(&"blob-upload"), cfg!(feature = "blob-upload"));
+        // The `dns-publish` (host-mediated zone-write, cap-req #24) capability is cargo-gated:
+        // advertised iff this build enabled the `dns-publish` feature. A lean host that cannot serve it
+        // must NOT advertise it, so a guest's `requires = ["dns-publish"]` fails loud on a pre-feature
+        // host (and is admitted on a supporting one) instead of being falsely accepted then failing to
+        // instantiate. Its ABSENCE from the advertisement (it was auto-mapped Stable+always off
+        // KNOWN_IMPORTS before WS3b) was a fail-OPEN admission gap — GATE.
+        assert_eq!(host.contains(&"dns-publish"), cfg!(feature = "dns-publish"));
         // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress) is advertised
         // whenever handlers are compiled (the socket host is always linked), so a guest's
         // `requires = ["wasi:sockets"]` is admitted on a supporting host and refused cleanly on one
@@ -1024,6 +1058,13 @@ mod tests {
         assert_eq!(
             lifecycle("wasi:sockets"),
             Some(super::Lifecycle::Experimental)
+        );
+        // `dns-publish` is a KNOWN_IMPORT but, when advertised (feature on), it is Experimental — NOT
+        // the blanket-Stable auto-map lifecycle. Feature off ⇒ absent (`None`). So a regression that
+        // re-admits it to the Stable auto-map (or drops the cargo gate) is caught here.
+        assert_eq!(
+            lifecycle("dns-publish"),
+            cfg!(feature = "dns-publish").then_some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.
         let unmet: Vec<&str> = ["sql", "streaming", "quantum-teleport", "warp-drive"]
