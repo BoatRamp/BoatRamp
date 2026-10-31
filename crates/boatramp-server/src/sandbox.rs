@@ -699,8 +699,17 @@ pub struct SandboxDerivationInputs {
     /// `backend.blob`/… state dirs under `data_dir`). WS-B supplies this map; [`derive_profile`]
     /// refuses (fail-closed) any grant that overlaps a subtree whose owning authority this
     /// instance does NOT hold — the non-key analogue of the crown-jewel key leak check
-    /// (Security-review Finding 3). Empty ⇒ no cross-authority state check (the Phase-1
-    /// default until WS-C wires the real per-authority layout).
+    /// (Security-review Finding 3).
+    ///
+    /// **WS-C LOAD-BEARING CONTRACT (Security re-review residual #2):** empty ⇒ the
+    /// cross-authority check is INERT, and the `OverbroadStateGrant` floor alone does NOT stop a
+    /// narrow sibling-subtree leak (a frontend granted `/data/kv` is not refused while this map
+    /// is empty). So WS-C MUST populate this with EVERY backend authority's state subtree before
+    /// wiring real grants, and the composition layer (which alone sees all instances) MUST
+    /// additionally enforce that the per-instance grants are mutually disjoint and the map
+    /// covers every hosted backend authority — a check `derive_profile` cannot make from a
+    /// single instance's view. Phase-1-as-merged is safe only because serving is not wired
+    /// (`run_instance` fail-closes before any derivation/install and WS-B supplies no grants).
     pub authority_state_dirs: BTreeMap<HostAuthority, Vec<PathBuf>>,
 }
 
@@ -806,9 +815,17 @@ pub enum ProfileDerivationError {
     },
 }
 
-/// `ancestor` contains (or equals) `descendant` lexically. Paths are compared as given, so WS-B
-/// passes canonical absolute paths (documented on [`KeyInputPaths`]); `..`/symlinks are not
-/// resolved here (the live install's Landlock is fd-based and authoritative).
+/// `ancestor` contains (or equals) `descendant` LEXICALLY (`Path::starts_with` is component-wise,
+/// so `/data/kv` does not match `/data/kv-frontend`). `..`/symlinks are not resolved here.
+///
+/// **WS-C LOAD-BEARING CONTRACT (Security re-review residual #1):** all THREE fail-closed FS
+/// checks in [`derive_profile`] (`CrownJewelKeyLeak`, `OverbroadStateGrant`,
+/// `CrossAuthorityStateLeak`) are lexical, so a non-canonical input (`/weird/../data/kv`, a
+/// symlink, a relative path) could pass the lexical check while the fd-based Landlock install
+/// grants the real, sensitive path. WS-C MUST normalize/canonicalize `data_dir`, every grant,
+/// every key path, and every `authority_state_dirs` entry BEFORE calling [`derive_profile`]
+/// (note `std::fs::canonicalize` needs the path to exist, so a first-run node needs lexical
+/// normalization — resolve `..`, collapse separators/trailing slashes — or dir pre-creation).
 fn path_contains(ancestor: &Path, descendant: &Path) -> bool {
     descendant == ancestor || descendant.starts_with(ancestor)
 }
@@ -865,6 +882,20 @@ pub fn derive_profile(
                     });
                 }
             }
+        }
+    }
+
+    // Fail-closed (Security re-review residual #3): `data_dir` must not be placed UNDER a
+    // declared `shared_temp` dir — a `data_dir=/tmp/…` with `shared_temp=[/tmp]` would expose
+    // the whole state root to every instance through the (exempt) world-writable temp grant.
+    // Refused regardless of posture (the layout is categorically wrong; `Strict` happens to
+    // drop shared_temp, but a sibling `Derived` instance in the same composition would not).
+    for tmp in &inputs.shared_temp {
+        if path_contains(tmp, &inputs.data_dir) {
+            return Err(ProfileDerivationError::OverbroadStateGrant {
+                via: tmp.clone(),
+                data_dir: inputs.data_dir.clone(),
+            });
         }
     }
 
@@ -1814,6 +1845,28 @@ mod privsep_derivation_tests {
             ),
             "a grant that is an ancestor of data_dir is over-broad"
         );
+    }
+
+    #[test]
+    fn a_data_dir_placed_under_a_shared_temp_dir_is_fail_closed() {
+        // Security re-review residual #3: data_dir UNDER a declared shared_temp dir would be
+        // exposed to every instance via the (exempt) world-writable temp grant — refused for
+        // any instance, regardless of posture.
+        let mut inp = SandboxDerivationInputs::for_instance("/tmp/boatramp", None);
+        inp.shared_temp = vec![PathBuf::from("/tmp")];
+        for posture in [SandboxPosture::Derived, SandboxPosture::Strict] {
+            assert!(
+                matches!(
+                    derive_profile(&frontend(), posture, &inp),
+                    Err(ProfileDerivationError::OverbroadStateGrant { .. })
+                ),
+                "data_dir under a shared_temp dir must be refused (posture {posture:?})"
+            );
+        }
+        // A data_dir NOT under shared_temp is fine.
+        let ok = SandboxDerivationInputs::for_instance("/var/lib/boatramp", None);
+        derive_profile(&frontend(), SandboxPosture::Derived, &ok)
+            .expect("a data_dir outside the temp dirs derives cleanly");
     }
 
     #[test]

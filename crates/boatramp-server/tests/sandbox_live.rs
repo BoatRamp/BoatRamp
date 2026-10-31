@@ -220,7 +220,9 @@ fn probe_derived_bind(install: bool) -> i32 {
     .into_iter()
     .collect();
     // System read roots + temp only (no listener, no key paths) — a clean no-listener profile.
-    let inputs = sandbox::SandboxDerivationInputs::for_instance("/tmp", None);
+    // data_dir is a non-temp path: derive_profile refuses a data_dir placed under a shared_temp
+    // dir (Security re-review residual #3), and shared_temp defaults include /tmp.
+    let inputs = sandbox::SandboxDerivationInputs::for_instance("/var/lib/boatramp-livetest", None);
     let profile = if install {
         Some(
             sandbox::derive_profile(&caps, SandboxPosture::Derived, &inputs)
