@@ -160,6 +160,9 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
         } => {
             let provider = build_provider(provider).await?;
             let record = preview_record(&host, &parse_target(&target), ttl);
+            // Fail-closed: refuse up front if this provider can't write the
+            // record's type, before ever dispatching to it.
+            boatramp_acme::validate_writable(provider.as_ref(), &record, &host)?;
             provider.upsert(&record).await?;
             DnsOutput::Configured {
                 kind: record.kind.as_str().to_string(),
@@ -186,6 +189,11 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
             }
             let provider = build_provider_opts(provider, proxied).await?;
             let record = domain_record(&host, &parse_target(&target), ttl);
+            // Fail-closed: refuse up front if this provider can't write the
+            // record's type, before ever dispatching to it. `host` stands in for
+            // the zone root: these commands only ever build an A/AAAA/CNAME, so
+            // the apex-NS check this also performs never applies here.
+            boatramp_acme::validate_writable(provider.as_ref(), &record, &host)?;
             provider.upsert(&record).await?;
             DnsOutput::Pointed {
                 kind: record.kind.as_str().to_string(),

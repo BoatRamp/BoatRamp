@@ -606,6 +606,10 @@ async fn add_via_provider(
         name: verification.dns_record_name(),
         ttl: 60,
     };
+    // Fail-closed: refuse up front if this provider can't write the record's
+    // type (never — TXT is universally supported — but every write entrypoint
+    // goes through the same guardrail, not just the ones where it could matter).
+    boatramp_acme::validate_writable(provider.as_ref(), &record, host)?;
     provider.upsert(&record).await?;
     tracing::info!(
         "published {} TXT for {host}; waiting for it to resolve...",
