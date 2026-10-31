@@ -253,7 +253,7 @@ impl DnsProvider for Ns1Dns {
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
         // WS2b: NS1 (IBM NS1 Connect) added HTTPS/SVCB support in 2023 — see
-        // `answer_fields`'s doc comment for the pinned 3-element answer
+        // `answer_fields`'s doc comment for the pinned 2-/3-element answer
         // shape + sources.
         &[
             RecordKindTag::A,
