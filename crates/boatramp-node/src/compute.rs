@@ -154,6 +154,71 @@ fn sysctl_string(name: &str) -> Option<String> {
 /// native `container` backend; Linux + `/dev/kvm` ⇒ the in-process
 /// `vmm-embedded` microVM backend (strongest isolation). Absent config ⇒ an empty
 /// registry + a node advertising nothing, so the reconcile loop stays a no-op.
+/// Does this node run a compute backend that launches workers by **re-execing the boatramp binary**
+/// (the native `container` / embedded-`vmm` / macOS-`vz` backends)? Such a backend CANNOT coexist with
+/// the serving-process OS sandbox (privsep Phase 0 WS1): the inherited seccomp/Landlock domain would
+/// kill the re-exec'd worker (it needs `unshare`/`mount`/`pivot_root`), and the parent itself needs
+/// `setns(CLONE_NEWNET)` to wire the worker's netns — both denied by the filter. So a node offering any
+/// such backend must SKIP the sandbox (or, under `posture = strict`, refuse to start).
+///
+/// Resolved **synchronously** from `[compute]` + sync host checks, because the sandbox installs BEFORE
+/// the Tokio runtime starts (so every worker thread inherits it via `clone`) — i.e. before the async
+/// [`build_compute`] capability probes run. It mirrors `build_compute`'s own gates for the
+/// privileged-spawn backends: the native `container` backend registers on any Linux node with
+/// `[compute]`; the macOS `vz` backend on Apple-silicon macOS. The structural truth per backend lives
+/// on [`Capabilities::requires_host_privileged_spawn`](boatramp_core::compute::Capabilities); this
+/// sync resolver is its before-the-runtime counterpart.
+///
+/// Returns `Some(label)` when such a backend will register. This OVER-approximates SAFELY: it may skip
+/// the sandbox on a `[compute]` Linux node whose container backend ultimately fails to register
+/// (missing `CAP_NET_ADMIN` — compute is then degraded anyway), a conservative miss that never breaks
+/// compute. The dangerous inverse — installing the sandbox on a node that DOES re-exec — cannot occur,
+/// since every Linux `[compute]` node is treated as native-spawn.
+pub fn host_privileged_spawn_backend(
+    cfg: Option<&crate::config::ComputeConfig>,
+) -> Option<&'static str> {
+    // No `[compute]` ⇒ no compute backend on this node ⇒ keep the sandbox.
+    let _cfg = cfg?;
+    #[cfg(target_os = "linux")]
+    {
+        Some("container")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if macos_supports_vz() {
+            Some("vmm (macOS Virtualization.framework)")
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod presandbox_tests {
+    use super::host_privileged_spawn_backend;
+
+    #[test]
+    fn no_compute_keeps_the_sandbox() {
+        // A pure serving/gateway node (no `[compute]`) has no native-spawn backend, so the sandbox is
+        // kept (the helper returns None ⇒ `install_presandbox` installs).
+        assert!(host_privileged_spawn_backend(None).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_compute_node_is_native_spawn() {
+        // Any Linux node with `[compute]` registers the native `container` backend, which re-execs the
+        // boatramp binary — so the sandbox is skipped there (matching the container backend's
+        // `Capabilities::requires_host_privileged_spawn = true`).
+        let cfg = crate::config::ComputeConfig::default();
+        assert_eq!(host_privileged_spawn_backend(Some(&cfg)), Some("container"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_compute(
     cfg: Option<&crate::config::ComputeConfig>,
@@ -1347,6 +1412,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
@@ -1514,6 +1580,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(
@@ -1681,6 +1748,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                requires_host_privileged_spawn: false,
             }
         }
         async fn materialize(

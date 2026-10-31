@@ -58,7 +58,8 @@ brew install boatramp/tap/boatramp
 
 ## Container image
 
-The image is multi-arch and runs as a non-root user:
+The image is multi-arch (`linux/amd64` + `linux/arm64` — Docker/Kubernetes pulls the
+right one automatically) and runs as a non-root user:
 
 ```sh
 docker run ghcr.io/boatramp/boatramp:latest --version

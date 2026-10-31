@@ -47,6 +47,13 @@ pub mod aot;
 mod blob_ref;
 pub mod blob_shim;
 pub mod messaging_shim;
+/// The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
+/// allow-list (`exec*` + the kernel-escape surface KILLED, other misses `EPERM`) + a Landlock
+/// filesystem confinement. Installed BEFORE the Tokio runtime starts so every worker thread
+/// inherits it via `clone` (plus TSYNC for the seccomp layer). Always compiled; the real Linux
+/// enforcement is gated on `cfg(all(target_os = "linux", feature = "sandbox"))` and everything
+/// else is a logged no-op.
+pub mod sandbox;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
@@ -107,7 +114,11 @@ pub(crate) use store_migrate::{
 pub mod blob_upload_minter;
 #[cfg(feature = "console")]
 pub mod console;
-mod content;
+// `pub` (not the former private `mod`) only so the privsep fuzz harness
+// (`fuzz/fuzz_targets/fuzz_byte_range.rs`) can reach `content::parse_ranges` — the HTTP
+// `Range:` header parser — as an external dependency; every other item here stays
+// `pub(super)`/private and gains no new external surface.
+pub mod content;
 mod control_api;
 /// The node-side email delivery spool (best-effort + durable) backing the `email`
 /// guest capability.

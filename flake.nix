@@ -880,6 +880,32 @@
             '';
           };
 
+          # A nightly rust toolchain is below the pinned stable one (`rust-toolchain.toml`) the
+          # rest of the workspace builds with, so it lives in its own shell rather than
+          # `devShells.default` — the privsep untrusted-byte-parser fuzz harnesses
+          # (`crates/*/fuzz/`) are the one thing in this repo that needs `cargo-fuzz`, which in
+          # turn needs an active nightly `cargo`/`rustc` (it shells out to the ambient
+          # toolchain, not via `rustup +nightly`, since there is no rustup here — nix puts
+          # exactly one toolchain on PATH). `nix develop .#fuzz -- cargo fuzz run <target>` (see
+          # .github/workflows/nightly.yml).
+          devShells.fuzz = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.cmake
+            ];
+            buildInputs = [ pkgs.openssl ];
+            packages = [
+              (pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default))
+              pkgs.cargo-fuzz
+            ];
+            # libclang for bindgen (aws-lc-rs, pulled in by boatramp-overlay-proto /
+            # boatramp-rpktls, which the overlay-proto + server fuzz targets depend on).
+            LIBCLANG_PATH = lib.makeLibraryPath [ pkgs.llvmPackages.libclang.lib ];
+            shellHook = ''
+              echo "boatramp fuzz dev shell ready (nightly rust + cargo-fuzz) — e.g. 'cargo fuzz run fuzz_frame --fuzz-dir crates/boatramp-http/fuzz'."
+            '';
+          };
+
           # ---- Formatter (`nix fmt`) ----------------------------------------
           formatter = pkgs.nixfmt;
 

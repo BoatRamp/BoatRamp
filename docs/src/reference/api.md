@@ -314,6 +314,8 @@ single JSON report (not NDJSON — a reconcile is a bounded one-pass operation):
 | `GET`/`POST`/`DELETE` | `/api/sites/:site/domains/:host/verification` | Manage a domain-ownership challenge. |
 | `POST` | `/api/sites/:site/domains/:host/verification/check` | Check the challenge. |
 | `GET` | `/api/sites/:site/domain-verifications` | List pending verifications. |
+| `POST` | `/api/sites/:site/domains/:host/attach-unverified` | **`system·admin` only.** Attach a host WITHOUT an ownership proof (`domain add --unverified`). |
+| `POST` | `/api/sites/:site/domains/:host/verify-records` | **`system·admin` only.** Verify a set of DNS records resolve as expected (read-only diagnostic; `domain verify-records`). |
 
 ## Tokens
 
@@ -724,6 +726,9 @@ when a `[secrets]` key envelope is configured (else a clear `501`). Secrets sinc
 | `PUT` | `/api/projects/:project/email/profiles/:name` | Set / partial-update an SMTP profile (sealed password); returns the redacted profile. |
 | `GET` | `/api/projects/:project/email/profiles[/:name]` | List / show email profiles (redacted). |
 | `DELETE` | `/api/projects/:project/email/profiles/:name` | Delete an email profile. |
+| `PUT` | `/api/projects/:project/tenant-secrets/:tenant/:name` | Seal a **per-tenant** secret (e.g. a firm's own third-party OAuth `client_secret`); returns metadata, never the value. |
+| `GET` | `/api/projects/:project/tenant-secrets/:tenant` | List one tenant's secret names + metadata (never project-wide — no cross-tenant name oracle). |
+| `DELETE` | `/api/projects/:project/tenant-secrets/:tenant/:name` | Delete a tenant's secret. |
 
 See [Store secrets](../how-to/secrets.md) and [Send email](../how-to/send-email.md).
 
@@ -751,9 +756,10 @@ project-owned surface. Top-level paths target the `default` project;
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `PUT`/`DELETE` | `/api/graphql/subgraphs/:name` | Register (SDL body) / unregister a subgraph; a publish recomposes and is rejected if it doesn't compose. |
+| `PUT`/`DELETE` | `/api/graphql/subgraphs/:name` | Register (SDL body) / unregister a subgraph; a publish recomposes and is rejected if it doesn't compose — unless `?compose=defer` **stages** it (writes the SDL without composing). |
 | `PUT` | `/api/graphql/subgraphs/:name/sql` | Register a SQL-backed subgraph by introspecting a site's managed database. |
 | `PUT` | `/api/graphql/subgraphs/:name/function` | Register a function-backed subgraph by introspecting its `_service { sdl }`. |
+| `POST` | `/api/graphql/compose` | Batch-compose every **staged** (`?compose=defer`) subgraph: validates the whole set once and promotes it live in a single version bump — for an `apply` that deploys several subgraphs together without an intermediate broken-compose state. |
 | `GET` | `/api/graphql/supergraph` | The composed supergraph (subgraphs, `@key` entities, root fields). |
 | `POST`/`GET` | `/api/graphql/safelist` | Register a trusted operation (returns its hash) / list the safelist. |
 | `DELETE` | `/api/graphql/safelist/:hash` | Remove an operation from the safelist. |
@@ -807,3 +813,6 @@ limit) is applied per-site inside the serving handlers.
 | any | `/` (host-routed) | Serve site content, selected by `Host` — see [How a request reaches your site](../explanation/addressing.md). |
 | any | `/_sites/<name>/*` | Serve a site by name (admin/testing). |
 | `GET` | `/_deploy/*` | Serve a deployment by id (an unguessable content-hash capability). |
+| `GET` | `/.well-known/boatramp-domain-verification/:token` | Serve a pending HTTP domain-ownership challenge token, ahead of host routing, so an unattached host can verify itself. See [Attach a custom domain](../how-to/custom-domain.md). |
+| `GET` | `/.well-known/boatramp-bootstrap-identity` | The root-key-signed attestation of this node's `--tls rpk` control-plane TLS key (`404` when none is set). See [Reach the control plane on day zero](../how-to/bootstrap-tls.md). |
+| `POST` | `/_webhooks/:name` | Signed inbound-webhook ingress for a function (`handlers` feature) — **signature-gated, not token-gated**: the request's own signature is verified before the function runs. See [Functions](../how-to/functions.md). |

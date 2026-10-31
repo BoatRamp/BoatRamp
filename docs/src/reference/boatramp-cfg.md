@@ -64,6 +64,7 @@ Top-level sections, all optional:
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
 | `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
 | `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
+| `sandbox` | table | — | The whole-process OS sandbox (seccomp-bpf + Landlock; privsep Phase 0). See [`serve.sandbox`](#servesandbox). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -448,6 +449,65 @@ private webhook address).
 
 `email`: `project` (default `default`), `profile` (the email-profile name; the channel is off
 when absent), `to` (list of recipient addresses; the channel is off when empty).
+
+### `serve.sandbox`
+
+**The whole-process OS sandbox** (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
+allow-list plus a Landlock filesystem restriction, installed on the `boatramp serve` process
+**before it starts serving** (before the Tokio runtime's worker threads spawn, so every thread
+inherits the same filter). **Linux-only** — on another platform, or a build without the
+`sandbox` cargo feature (on by default), this is a documented no-op that logs a warning and
+never fails startup on its own (whether an unsupported platform is fatal depends on `posture`,
+below). Best-effort on an older kernel: a Landlock ABI the kernel doesn't fully support degrades
+to a partial filesystem restriction (logged) rather than a hard failure.
+
+Once installed, the exec family (`execve`/`execveat`) plus the sharpest kernel-escape surface
+(`ptrace`, `mount`, `setns`, `unshare`, `bpf`, `kexec_load`, `init_module`, `keyctl`, …) are
+killed outright (`SIGSYS`) rather than merely refused — an RCE that lands in the server can't
+spawn a shell or a new binary. Every other syscall not on the allow-list returns `EPERM`
+(a benign allow-list gap degrades softly). Landlock confines writes to `data_dir` (+ the system
+temp dirs + the ACME certificate cache, `--acme-cache`, where renewals are written) and reads to
+the config file's directory, the custom-TLS/ACME-CA certificate paths, and a conservative set of
+system roots (`/usr`, `/lib*`, `/etc`, `/proc`, `/sys`, `/dev`, `/run`) — everything else is
+denied filesystem access entirely.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `posture` | `auto` \| `strict` \| `permissive` \| `off` | `auto` | How aggressively to sandbox. See below. |
+| `extra_read_paths` | list of paths | `[]` | Extra filesystem roots to allow **reading** under Landlock, beyond the auto-derived set. Non-existent paths are skipped at install time. |
+| `extra_write_paths` | list of paths | `[]` | Extra filesystem roots to allow **reading and writing** under Landlock, beyond `data_dir` + the system temp dirs. Non-existent paths are skipped at install time. |
+
+`posture`:
+
+- **`auto`** (default) — full sandbox on a platform that supports it, **unless** this node runs
+  a compute backend that launches workers by re-execing the `boatramp` binary (the native Linux
+  `container` backend, or the embedded/Firecracker microVM backends, or macOS's `vz` backend —
+  any node with a `[compute]` section that resolves to one of these). Such a backend cannot
+  coexist with the sandbox: the inherited seccomp/Landlock domain would kill the re-exec'd
+  worker, and the parent itself needs `setns` to wire the worker's network namespace, which the
+  filter denies. On a native-compute node, `auto` **skips both layers** and logs a loud,
+  one-time notice naming the backend — there is no serving-process hardening on that node (see
+  the honest-scope note below). A genuine install error under `auto` fails **open** (a warning;
+  `serve` continues unsandboxed) so a turnkey node stays up.
+- **`strict`** — full sandbox always. If a native-spawn compute backend is present, `serve`
+  **refuses to start** instead of skipping (the two are structurally incompatible — there is no
+  degraded middle ground). An install that can't be fully enforced (an old kernel landing only
+  `Partial` Landlock, or an unsupported platform/build) **also refuses to start** — `strict` is
+  a promise, not a best effort.
+- **`permissive`** — skip both layers even with no native-spawn compute backend present. For an
+  operator who shells out their own sidecar/helper from the serving process and needs `exec`.
+- **`off`** — disabled; no sandbox is installed regardless of the platform or `[compute]`.
+
+`posture` is restart-class, surfaced under `[serve]` by `boatramp config describe sandbox` —
+like the rest of `[serve.sandbox]`, it is a file setting, not a `boatramp config set` dynamic key.
+
+> **Honest scope note:** Phase 0 reduces the RCE / memory-disclosure blast radius on the
+> **sandboxed, no-native-compute** serving tier. It is not a tenancy or logic-level defense (a
+> site that can already reach data it shouldn't via the application layer is unaffected), and —
+> crucially — **a node running the native container/microVM compute backend is NOT hardened by
+> this sandbox** under the default `auto` posture (it is structurally skipped, as described
+> above). Containing what a compute workload's own exec surface can reach is a later "launch
+> broker" phase, not Phase 0.
 
 ## `security`
 

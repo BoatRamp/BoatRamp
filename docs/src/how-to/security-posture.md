@@ -10,6 +10,11 @@ is operator-only — it is never part of site config,
 so a `site-write` principal cannot relax it. For why the model exists, see
 [The security posture model](../explanation/security-posture.md).
 
+> This is the **application-trust** posture (`[security]`). It is a separate knob from the
+> OS-level `[serve.sandbox].posture` (`auto`/`strict`/`permissive`/`off`), which governs whether
+> the `boatramp serve` *process itself* runs inside a seccomp/Landlock sandbox — see
+> [`serve.sandbox`](../reference/boatramp-cfg.md#servesandbox).
+
 ## Pick a profile
 
 Set `security.profile` in `boatramp.cfg`:

@@ -84,7 +84,12 @@ pub struct StarttlsGrammar {
 /// for a match with a captured leading tag. The command is compared **ASCII-case-insensitively** (per
 /// RFC 5321 / 3501 command grammar); a captured tag is kept **verbatim** (IMAP tags are case-sensitive
 /// and the client expects its own tag echoed). Generic line-protocol primitives only — no mail tokens.
-fn match_trigger(line: &[u8], g: &StarttlsGrammar) -> Option<Option<String>> {
+///
+/// `pub` (not the module-private default): this is the one client-controlled line parser on the
+/// SMTP/IMAP/POP3 STARTTLS upgrade path (the guest owns the rest of the dialog — see the module
+/// doc), and the privsep fuzz harness (`fuzz/fuzz_targets/fuzz_starttls_trigger.rs`) needs it as an
+/// external entry point.
+pub fn match_trigger(line: &[u8], g: &StarttlsGrammar) -> Option<Option<String>> {
     // Strip a trailing `\n`, then an optional preceding `\r`.
     let mut s = line;
     if s.last() == Some(&b'\n') {

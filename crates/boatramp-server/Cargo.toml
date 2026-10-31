@@ -284,6 +284,15 @@ console = ["dep:include_dir"]
 # tool layer + rmcp + tower's `oneshot`.
 mcp = ["dep:boatramp-mcp", "dep:rmcp", "dep:tower"]
 
+# The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny
+# syscall allow-list (`exec*` DENIED) + a Landlock filesystem confinement, installed
+# on the serving process after startup. Pulls the Linux-only `seccompiler` (Firecracker's
+# seccomp compiler) + `syscalls` (name→number) + `landlock` crates — all behind the
+# `cfg(target_os = "linux")` dep table, so enabling this feature on a non-Linux build
+# compiles only the logged no-op path (no extra deps). Batteries-included; a lean build
+# can drop it (the `[serve.sandbox]` block then no-ops with a warning).
+sandbox = ["dep:seccompiler", "dep:syscalls", "dep:landlock"]
+
 [dependencies]
 # The embedded console's built assets (feature `console`), baked in at compile
 # time from `../boatramp-console/dist`.
@@ -336,6 +345,10 @@ aws-lc-rs = "1.17"
 # Argon2id KDF for the project-export identity transport container (passphrase ->
 # 32-byte AES key; the PKCS#12-pattern wrapper around the exported KEK).
 argon2.workspace = true
+# Key-material hygiene for the secrets-at-rest envelope (privsep Phase 0, WS2): zeroize the Vault
+# bearer token + transient derived keys on drop. (The raw local KEK is held in
+# `boatramp_core::keyguard::MlockedKey`, which also mlocks it.)
+zeroize = "1"
 # Implementing the core `DomainProbe` trait (domain ownership verification).
 async-trait.workspace = true
 
@@ -477,8 +490,23 @@ chrono = { version = "0.4", default-features = false, features = [
   "clock",
 ], optional = true }
 
+# The whole-process OS sandbox (`sandbox` feature): Linux-only crates, so they live in the
+# `cfg(target_os = "linux")` table and are `optional` (pulled in by the `sandbox` feature). On a
+# non-Linux build the feature compiles only the no-op path, and none of these are needed.
+#   - `seccompiler` (Firecracker's seccomp compiler) + `syscalls` (name→number): the SAME pair the
+#     container backend uses, so the two seccomp paths share proven crates.
+#   - `landlock`: the kernel filesystem-confinement LSM, with ABI best-effort downgrade on old kernels.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { version = "0.4", optional = true }
+syscalls = { version = "0.6", optional = true }
+landlock = { version = "0.4", optional = true }
+
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# The `sandbox_live` gate (feature `sandbox`, Linux) forks children that install the seccomp + Landlock
+# sandbox and probe exec/filesystem access with raw syscalls — needs `libc` as an integration-test extern
+# (`libc` is also a normal dep for the splice fast-path; listing it here makes it available to tests/).
+libc = "0.2"
 # Self-signed cert minting for the per-listener host-TLS live gate (cap-req 06):
 # `tcp_listener_tls_live` builds a `rustls::ServerConfig` from an rcgen cert + a
 # `tokio_rustls` client to prove the handshake terminates host-side.

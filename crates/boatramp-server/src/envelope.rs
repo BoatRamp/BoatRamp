@@ -18,7 +18,9 @@ use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKe
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::Engine as _;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+use boatramp_core::keyguard::MlockedKey;
 use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Wire-format tag: `b"BRK1"`. A wrapped blob is `MAGIC || nonce(12) ||
 /// ciphertext+tag`, so `unwrap` fail-closes on a foreign or truncated blob.
@@ -38,14 +40,24 @@ const KEK_LEN: usize = 32;
 /// sealed-state (domain-tag `BRSS1\0`) blobs outright, or bound previous-key acceptance to strictly
 /// LESS than `MAX_STATE_TTL_SECS` — otherwise rotation would widen the replay window the TTL exists to
 /// cap. When such a fallback lands, add the asserting test (an old-KEK state fails closed post-rotation).
+///
+/// **Memory hygiene (privsep Phase 0, WS2).** The raw AES-256-GCM KEK is the crown jewel: it lives
+/// for the whole process lifetime (behind an `Arc<dyn KeyEnvelope>`). It is held in an
+/// [`MlockedKey`] — the pages are best-effort `mlock`ed so the key never swaps to disk, the bytes are
+/// zeroized when the envelope drops, and `Debug` is redacted (so it can never reach a log). Every
+/// transient copy made while loading/generating the key is zeroized here too.
+#[derive(Debug)]
 pub struct LocalKek {
-    kek: [u8; KEK_LEN],
+    kek: MlockedKey,
 }
 
 impl LocalKek {
-    /// Build from a raw 32-byte KEK.
-    pub fn from_bytes(kek: [u8; KEK_LEN]) -> Self {
-        Self { kek }
+    /// Build from a raw 32-byte KEK. The caller's `kek` array is a transient copy and is zeroized
+    /// here once the locked buffer owns the bytes.
+    pub fn from_bytes(mut kek: [u8; KEK_LEN]) -> Self {
+        let locked = MlockedKey::from_slice(&kek);
+        kek.zeroize();
+        Self { kek: locked }
     }
 
     /// Load the KEK from `path` (raw 32 bytes), generating + persisting one
@@ -54,6 +66,9 @@ impl LocalKek {
     pub fn load_or_generate(path: &Path) -> Result<Self, EnvelopeError> {
         match std::fs::read(path) {
             Ok(bytes) => {
+                // The file bytes are the raw KEK; hold the intermediate read buffer zeroizing so it
+                // is wiped once the bytes are copied into the locked `LocalKek`.
+                let bytes = Zeroizing::new(bytes);
                 let kek: [u8; KEK_LEN] = bytes
                     .as_slice()
                     .try_into()
@@ -68,7 +83,11 @@ impl LocalKek {
                 write_private_file(path, &kek).map_err(|e| {
                     EnvelopeError::new(format!("writing KEK {}: {e}", path.display()))
                 })?;
-                Ok(Self::from_bytes(kek))
+                // `from_bytes` copies into the locked buffer and zeroizes its own argument; wipe this
+                // generated copy too (it had to outlive the `write_private_file` call above).
+                let out = Self::from_bytes(kek);
+                kek.zeroize();
+                Ok(out)
             }
             Err(e) => Err(EnvelopeError::new(format!(
                 "reading KEK {}: {e}",
@@ -78,7 +97,7 @@ impl LocalKek {
     }
 
     fn key(&self) -> Result<LessSafeKey, EnvelopeError> {
-        let unbound = UnboundKey::new(&AES_256_GCM, &self.kek)
+        let unbound = UnboundKey::new(&AES_256_GCM, self.kek.as_slice())
             .map_err(|_| EnvelopeError::new("invalid KEK"))?;
         Ok(LessSafeKey::new(unbound))
     }
@@ -131,7 +150,11 @@ pub struct VaultEnvelope {
     client: reqwest::Client,
     encrypt_url: String,
     decrypt_url: String,
-    token: String,
+    /// The Vault bearer token — a long-lived secret held for the envelope's lifetime. Zeroized on
+    /// drop so it does not linger in freed heap. (It is not `mlock`ed: a `String` can reallocate as
+    /// it is built, and the token is a bearer credential sent over TLS, not a swap-persisted key —
+    /// zeroize-on-drop is the proportionate hardening. See the audit doc.)
+    token: Zeroizing<String>,
 }
 
 impl VaultEnvelope {
@@ -143,7 +166,7 @@ impl VaultEnvelope {
             client: reqwest::Client::new(),
             encrypt_url: format!("{base}/v1/transit/encrypt/{key}"),
             decrypt_url: format!("{base}/v1/transit/decrypt/{key}"),
-            token,
+            token: Zeroizing::new(token),
         }
     }
 }
@@ -168,7 +191,7 @@ impl KeyEnvelope for VaultEnvelope {
         let resp: VaultData<VaultCiphertext> = self
             .client
             .post(&self.encrypt_url)
-            .header("X-Vault-Token", &self.token)
+            .header("X-Vault-Token", self.token.as_str())
             .json(&serde_json::json!({ "plaintext": b64 }))
             .send()
             .await
@@ -188,7 +211,7 @@ impl KeyEnvelope for VaultEnvelope {
         let resp: VaultData<VaultPlaintext> = self
             .client
             .post(&self.decrypt_url)
-            .header("X-Vault-Token", &self.token)
+            .header("X-Vault-Token", self.token.as_str())
             .json(&serde_json::json!({ "ciphertext": ciphertext }))
             .send()
             .await
@@ -328,8 +351,12 @@ pub fn transport_wrap(payload: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, Enve
     header.extend_from_slice(&TK_T_COST.to_be_bytes());
     header.extend_from_slice(&TK_P_COST.to_be_bytes());
 
-    let dk = transport_kdf(passphrase, &salt, TK_M_COST, TK_T_COST, TK_P_COST)?;
-    let unbound = UnboundKey::new(&AES_256_GCM, &dk)
+    // The Argon2-derived key is sensitive; hold it zeroizing so it is wiped once `LessSafeKey` owns
+    // its own internal copy.
+    let dk = Zeroizing::new(transport_kdf(
+        passphrase, &salt, TK_M_COST, TK_T_COST, TK_P_COST,
+    )?);
+    let unbound = UnboundKey::new(&AES_256_GCM, dk.as_slice())
         .map_err(|_| EnvelopeError::new("invalid derived key"))?;
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
@@ -371,8 +398,8 @@ pub fn transport_unwrap(container: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, 
         ));
     }
 
-    let dk = transport_kdf(passphrase, salt, m, t, p)?;
-    let unbound = UnboundKey::new(&AES_256_GCM, &dk)
+    let dk = Zeroizing::new(transport_kdf(passphrase, salt, m, t, p)?);
+    let unbound = UnboundKey::new(&AES_256_GCM, dk.as_slice())
         .map_err(|_| EnvelopeError::new("invalid derived key"))?;
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
@@ -530,6 +557,29 @@ mod tests {
             samples[samples.len() / 2],
             samples[samples.len() * 99 / 100],
         );
+    }
+
+    #[test]
+    fn local_kek_debug_never_renders_the_key() {
+        // The KEK is the crown jewel; a `{:?}` render of the envelope (via `MlockedKey`'s redacting
+        // Debug) must never expose the raw bytes. A distinctive byte would be obvious if it leaked.
+        let e = LocalKek::from_bytes([0xAB; KEK_LEN]);
+        let d = format!("{e:?}");
+        assert!(!d.contains("171"), "decimal KEK byte leaked: {d}"); // 0xAB
+        assert!(!d.contains("abababab"), "hex KEK leaked: {d}");
+        assert!(d.contains("<redacted>"), "expected redaction marker: {d}");
+    }
+
+    #[tokio::test]
+    async fn local_kek_round_trips_through_the_mlocked_buffer() {
+        // The KEK now lives in an mlocked, zeroize-on-drop buffer; wrap/unwrap must still round-trip
+        // (the memory hygiene must not change the crypto).
+        let e = kek();
+        let wrapped = e.wrap(b"state-or-secret").await.unwrap();
+        assert_eq!(e.unwrap(&wrapped).await.unwrap(), b"state-or-secret");
+        // A distinct KEK cannot open it (the bytes really are the key, not a constant).
+        let other = LocalKek::from_bytes([9u8; KEK_LEN]);
+        assert!(other.unwrap(&wrapped).await.is_err());
     }
 
     #[tokio::test]

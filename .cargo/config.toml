@@ -1,0 +1,100 @@
+# Hardening linker/codegen flags for the SHIPPED release binaries (privsep Phase 0, WS4).
+#
+# This file is read by every real build path that produces a release binary for the
+# corresponding target triple:
+#   - a plain `cargo build --release --target <triple>` — the macOS and Windows
+#     legs of the release matrix (.github/workflows/release.yml `build` job,
+#     `kind != linux` branch), which invoke cargo directly with no Nix involved;
+#   - `cargo zigbuild --release --target <triple>` inside the Nix musl
+#     derivation (nix/package-musl.nix) — cargo-zigbuild is a thin cargo
+#     subcommand wrapper and resolves the SAME cargo config discovery (walking
+#     up from the invocation dir, which is the full workspace root the Nix
+#     derivation copies in as `src`) that a bare `cargo build` would. Verified
+#     empirically — see docs/privsep-build-hardening.md.
+#
+# `aarch64-apple-darwin` / `x86_64-apple-darwin` have no `[target.*]` section
+# here: PIE is mandatory/unconditional on modern Apple platforms (enforced by
+# the OS loader, not a linker or rustc flag) and there is no Mach-O equivalent
+# of ELF RELRO/BIND_NOW. See docs/privsep-build-hardening.md for the full
+# per-target posture, including what is a verified rustc *default* vs. a flag
+# added here.
+
+# musl release targets (x86_64 + aarch64): the fully-static Linux binaries
+# behind `nix build .#boatramp-static` / the OCI images / the Linux release
+# archives.
+#
+# IMPORTANT, found by testing rather than trusting the target-spec metadata
+# (as instructed): `rustc -Z unstable-options --print target-spec-json`
+# reports `position-independent-executables: true` for this target, which
+# reads like "PIE is already the default" — but it is NOT what the real
+# `cargo zigbuild --release --target x86_64-unknown-linux-musl` invocation
+# (the exact nix/package-musl.nix command) actually produces: verified with
+# `readelf -h` on the linked binary, it comes out `Type: EXEC`, not `DYN`,
+# with rustc's crt-static default (`+crt-static`, which statically embeds
+# musl libc — the reason this target is used at all) in effect. Adding
+# `-C relocation-model=pic` alone (as the "make the default explicit" theory
+# would suggest) does NOT change this — confirmed on a minimal crate.
+#
+# What DOES work, confirmed on a minimal crate AND on the real `boatramp`
+# binary: `-C target-feature=-crt-static` lets rustc's musl linker driver
+# choose PIE, and — checked with `readelf -d`/`-l` — the result is genuine
+# **static-pie**: `Type: DYN`, `FLAGS_1: NOW PIE` (BIND_NOW + PIE both set in
+# the dynamic section), a `GNU_RELRO` segment, and critically **zero
+# `DT_NEEDED` entries and no `PT_INTERP` segment** — i.e. it is still fully
+# self-contained (no runtime musl `.so`, no dynamic loader needed), which is
+# the entire reason this project builds against musl in the first place (see
+# the "why musl + jemalloc" note at the top of `nix/package-musl.nix`). Turning
+# `crt-static` off sounds like it should reintroduce a dynamic-libc
+# dependency; empirically, on this target/toolchain, it does not — zig's musl
+# sysroot resolves the non-"-static"-forced link to static-PIE instead of to
+# a dynamically-linked `ld-musl-*.so.1` binary.
+#
+# `-C relro-level=full` is kept explicit even though it's visibly already
+# active once PIE is in play (confirmed via the `FLAGS_1: NOW` entry above).
+# `-Wl,-z,noexecstack` is NOT a rustc default and is added for the same
+# reason noted on the Windows section below: it forces a non-executable stack
+# (NX) even if a vendored C dependency's object file (aws-lc-sys, ring,
+# libsql-ffi/sqlite — all built by their own C build systems, not rustc) omits
+# the `.note.GNU-stack` marker that tells the linker the stack doesn't need to
+# be executable.
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+  "-C",
+  "target-feature=-crt-static",
+  "-C",
+  "relocation-model=pic",
+  "-C",
+  "relro-level=full",
+  "-C",
+  "link-args=-Wl,-z,noexecstack",
+]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+  "-C",
+  "target-feature=-crt-static",
+  "-C",
+  "relocation-model=pic",
+  "-C",
+  "relro-level=full",
+  "-C",
+  "link-args=-Wl,-z,noexecstack",
+]
+
+# Windows release target: ASLR (`/DYNAMICBASE`) and DEP (`/NXCOMPAT`) are
+# link.exe defaults already for a modern toolset and rustc does not disable
+# them, but they are passed explicitly so the posture is visible here rather
+# than resting on an external linker default. `/HIGHENTROPYVA` widens ASLR
+# entropy for the 64-bit address space (requires `/DYNAMICBASE`, which is also
+# passed). `-C control-flow-guard=yes` is rustc's STABLE forward-edge
+# control-flow-integrity mechanism for *-windows-msvc — the genuine "CFI" this
+# toolchain can ship on a stable compiler (see docs/privsep-build-hardening.md
+# for why LLVM/Clang-style `-Z sanitizer=cfi` is NOT used: it needs nightly
+# rust + fat LTO, and boatramp is pinned to stable).
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C",
+  "control-flow-guard=yes",
+  "-C",
+  "link-args=/DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA",
+]

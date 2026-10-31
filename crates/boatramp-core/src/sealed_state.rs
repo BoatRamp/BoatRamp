@@ -41,6 +41,7 @@
 //! seam (the concrete AES/Vault backend lives in `boatramp-server`), `serde_json`, and `base64`.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::envelope::KeyEnvelope;
 
@@ -74,7 +75,7 @@ const CLOCK_SKEW_SECS: u64 = 120;
 /// (the guest never supplies them); `pkce`/`nonce`/`iat`/`exp` are the app/login fields (the guest
 /// supplies the pkce/nonce and an exp hint; the host stamps `iat` and clamps `exp`). The whole
 /// struct is AEAD-sealed, so every field is confidential AND integrity-protected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedStateClaims {
     /// The minting project (host-bound). Re-checked at unseal against the resolving request's
     /// project — a seal from another project never resolves.
@@ -99,6 +100,25 @@ pub struct SealedStateClaims {
     pub iat: u64,
     /// Expiry, unix seconds (host-clamped to `iat + min(requested_ttl, MAX_STATE_TTL_SECS)`).
     pub exp: u64,
+}
+
+impl std::fmt::Debug for SealedStateClaims {
+    /// Redacts the confidential claims. The whole token is AEAD-sealed precisely so the browser
+    /// never sees the `tenant`/`pkce`/`nonce`; they must not leak through a `Debug` / `tracing`
+    /// event either. The non-secret binding fields (`project`/`site`) and the timestamps are shown
+    /// so a diagnostic still carries useful shape. (No raw-byte field here; `pkce`/`nonce` are the
+    /// app's login secrets and `tenant` is the confidential routing fact.)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedStateClaims")
+            .field("project", &self.project)
+            .field("site", &self.site)
+            .field("tenant", &"<redacted>")
+            .field("pkce", &self.pkce.as_ref().map(|_| "<redacted>"))
+            .field("nonce", &self.nonce.as_ref().map(|_| "<redacted>"))
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .finish()
+    }
 }
 
 /// Why a seal or unseal failed. Every variant maps, at the tenancy source, to **no tenant resolved**
@@ -200,8 +220,11 @@ pub async fn seal_state(
     if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_STATE_TTL_SECS {
         return Err(SealedStateError::BadLifetime);
     }
-    let json = serde_json::to_vec(claims).map_err(|_| SealedStateError::Codec)?;
-    let mut plaintext = Vec::with_capacity(MAGIC.len() + json.len());
+    // The serialized claims and the magic-tagged plaintext are the cleartext tenant/pkce/nonce.
+    // Hold them in zeroizing buffers so they are wiped as soon as the seal completes — the shortest
+    // in-memory window for the plaintext this function constructs.
+    let json = Zeroizing::new(serde_json::to_vec(claims).map_err(|_| SealedStateError::Codec)?);
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(MAGIC.len() + json.len()));
     plaintext.extend_from_slice(MAGIC);
     plaintext.extend_from_slice(&json);
     let wrapped = env
@@ -239,15 +262,18 @@ pub async fn unseal_state(
         .decode(token)
         .map_err(|_| SealedStateError::Codec)?;
     // AEAD open: a wrong key, a tampered byte, or a foreign blob fails here (the dominant forged /
-    // tampered path). No partial output.
-    let plaintext = env
-        .unwrap(&wrapped)
-        .await
-        .map_err(|_| SealedStateError::Unseal)?;
+    // tampered path). No partial output. The decrypted plaintext is the cleartext tenant/pkce/nonce;
+    // hold it zeroizing so it is wiped the moment this function returns (the plaintext window is the
+    // parse below, nothing longer).
+    let plaintext = Zeroizing::new(
+        env.unwrap(&wrapped)
+            .await
+            .map_err(|_| SealedStateError::Unseal)?,
+    );
     // Domain separation: strip + check the sealed-state tag.
-    let rest = match plaintext.strip_prefix(MAGIC) {
+    let rest: &[u8] = match plaintext.as_slice().strip_prefix(MAGIC) {
         Some(rest) => rest,
-        None if mutation_skips("skip_magic") => &plaintext,
+        None if mutation_skips("skip_magic") => plaintext.as_slice(),
         None => return Err(SealedStateError::BadMagic),
     };
     let claims: SealedStateClaims =
@@ -392,6 +418,29 @@ mod tests {
             Err(SealedStateError::TooLong),
             "a token at exactly the cap is admitted past the length gate"
         );
+    }
+
+    #[test]
+    fn claims_debug_redacts_the_confidential_fields() {
+        // The sealed claims carry confidential material (tenant, pkce verifier, oidc nonce). A
+        // `{:?}` render (a careless log / tracing event / assert-failure print) must not leak them,
+        // while the non-secret binding fields stay visible for diagnostics.
+        let c = mint_claims(
+            "acme",
+            "console",
+            "firm-secret-tenant",
+            Some("pkce-verifier-secret".into()),
+            Some("oidc-nonce-secret".into()),
+            300,
+            1_000_000,
+        );
+        let d = format!("{c:?}");
+        assert!(!d.contains("firm-secret-tenant"), "tenant leaked: {d}");
+        assert!(!d.contains("pkce-verifier-secret"), "pkce leaked: {d}");
+        assert!(!d.contains("oidc-nonce-secret"), "nonce leaked: {d}");
+        assert!(d.contains("<redacted>"), "expected redaction marker: {d}");
+        // Non-secret binding fields remain for diagnostics.
+        assert!(d.contains("acme") && d.contains("console"), "{d}");
     }
 
     #[tokio::test]

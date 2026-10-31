@@ -1576,6 +1576,40 @@ jobs:
           grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
             || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
 
+  # privsep Phase 0 WS1 WHOLE-PROCESS SANDBOX LIVE GATE (marker `SANDBOX LIVE OK`). Proves the
+  # seccomp-bpf + Landlock process sandbox against the REAL kernel, FROM A NON-INSTALLING THREAD (the
+  # whole-process coverage property): a forked child installs the sandbox on its main thread, spawns a
+  # second thread, and that thread finds `execve` KILLED (SIGSYS) + a write OUTSIDE the data_dir REFUSED
+  # by Landlock — while a child that does NOT install it has BOTH succeed (the in-test mutation that
+  # proves the gate detects a real difference, not a no-op). Its own light job (the live-gate pattern,
+  # alongside live-gate-tcp-listener / live-gate-dns-publish), on the shipped musl target; the test is
+  # `#[ignore]`d (it forks + installs a whole-process filter) so `--include-ignored` runs it. Greps the
+  # marker + pass count so a silent skip/compile-out fails the merge.
+  live-gate-sandbox:
+    name: live gate (sandbox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-sandbox-musl
+      - name: "whole-process sandbox live gate (seccomp exec-deny + Landlock data_dir confinement; mutation-verified)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features sandbox --test sandbox_live -- --include-ignored --nocapture 2>&1 | tee sandbox-live.log
+          grep -qE 'test result: ok\. 1 passed' sandbox-live.log \
+            || { echo "::error::sandbox live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SANDBOX LIVE OK' sandbox-live.log \
+            || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
+
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
   # dispatch paths, incl. the legible terminal-outcome taxonomy) ran ONLY in the nightly

@@ -13,6 +13,7 @@ binary:
 | `boatramp-cluster` | openraft integration: `RaftKv`, `RaftMessaging`, persistence, membership. |
 | `boatramp-firecracker` | The microVM compute backend: an embedded rust-vmm VMM and an external-Firecracker driver, with snapshot/restore. |
 | `boatramp-container` | The container compute backend: a jailed worker with namespaces, cgroups, and a seccomp filter. |
+| `boatramp-vz` | The macOS-native microVM compute backend (Apple-silicon, macOS 15+): boots each replica as a Linux VM via Virtualization.framework. |
 | `boatramp-docker` | The remote-Docker compute backend. |
 | `boatramp-cloudflare` | The Cloudflare Containers compute backend + edge-Worker generator. |
 | `boatramp` | The CLI (`serve`, `sync`, `domain`, …) and deploy generators. |

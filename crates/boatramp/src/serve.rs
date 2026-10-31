@@ -183,6 +183,24 @@ pub enum Error {
     /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
     #[error("{0}")]
     ContradictoryCoordination(String),
+    /// `[serve.sandbox] posture = strict` on a node that runs a compute backend which re-execs the
+    /// boatramp binary to launch workers (privsep Phase 0 WS1): the strict serving-process sandbox
+    /// cannot coexist with it (the inherited seccomp/Landlock domain would kill the worker, and the
+    /// parent needs `setns`, which the filter denies). Fail-closed.
+    #[error(
+        "[serve.sandbox] posture=strict can't coexist with compute backend '{0}', which needs host \
+         re-exec to launch workers; use a docker/cloudflare backend, remove [compute], or set \
+         posture=auto (which skips the sandbox on this node)"
+    )]
+    SandboxPostureConflict(&'static str),
+    /// `posture = strict` but the process sandbox could not be FULLY installed (Landlock only partially
+    /// enforced on this kernel, or the platform/build cannot sandbox at all). The owner's explicit
+    /// strict request cannot be met, so startup is refused rather than silently serving unsandboxed.
+    #[error(
+        "[serve.sandbox] posture=strict could not be fully enforced ({0}); refusing to serve \
+         unsandboxed — upgrade the kernel/build, or set posture=auto"
+    )]
+    SandboxStrictNotEnforced(String),
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -1355,6 +1373,120 @@ async fn spawn_overlay_roles(
             .with_expose_relay(expose_relay),
         enroll,
     ))
+}
+
+/// Install the **whole-process OS sandbox** (privsep Phase 0 WS1) BEFORE the Tokio runtime starts
+/// (called from `main::run` on the single main thread, so every runtime worker thread the builder
+/// spawns inherits the seccomp filter + Landlock domain via `clone`). A late install (on one worker
+/// thread) would leave the sibling request-handler threads unsandboxed.
+///
+/// Resolves `[serve.sandbox] posture` against whether this node runs a compute backend that re-execs
+/// the boatramp binary (container / embedded-VMM / macOS-VZ — resolved SYNCHRONOUSLY from `[compute]`
+/// since the async `build_compute` has not run yet):
+///   - `off` / `permissive` ⇒ no install.
+///   - `auto` (default): full sandbox, UNLESS a native-spawn backend is present ⇒ SKIP BOTH (a loud
+///     INFO naming the backend) — the sandbox can't coexist with ongoing worker re-exec + `setns`.
+///   - `strict`: full sandbox ALWAYS; a native-spawn backend ⇒ FAIL-CLOSED ([`Error::SandboxPostureConflict`]).
+///
+/// Fail policy (owner decision): `auto` + a genuine install error ⇒ fail-OPEN (warn, serve on); `strict`
+/// + an install error / only-Partial Landlock / an unsupported platform-or-build ⇒ FAIL-CLOSED.
+pub fn install_presandbox(
+    config: &ServerConfig,
+    config_path: &Path,
+    args: &ServeArgs,
+) -> Result<()> {
+    use boatramp_node::config::SandboxPosture as P;
+    let serve_cfg = config.serve.clone().unwrap_or_default();
+    let sb = serve_cfg.sandbox.clone().unwrap_or_default();
+    let native_spawn =
+        boatramp_node::compute::host_privileged_spawn_backend(config.compute.as_ref());
+
+    let strict = match sb.posture {
+        P::Off => {
+            tracing::info!("process sandbox disabled ([serve.sandbox] posture = off)");
+            return Ok(());
+        }
+        P::Permissive => {
+            tracing::info!(
+                "process sandbox disabled ([serve.sandbox] posture = permissive — the operator \
+                 opts out of serving-process hardening)"
+            );
+            return Ok(());
+        }
+        P::Auto => {
+            if let Some(backend) = native_spawn {
+                tracing::info!(
+                    backend,
+                    "process sandbox SKIPPED on a native-compute node ([serve.sandbox] posture = \
+                     auto): the compute backend re-execs the boatramp binary to launch workers, \
+                     which a seccomp/Landlock domain would kill; NO serving-process hardening on \
+                     this node — see privsep Phase 1"
+                );
+                return Ok(());
+            }
+            false
+        }
+        P::Strict => {
+            if let Some(backend) = native_spawn {
+                return Err(Error::SandboxPostureConflict(backend));
+            }
+            true
+        }
+    };
+
+    let data_dir = serve_cfg
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    let mut policy = boatramp_server::sandbox::SandboxPolicy::for_server(&data_dir);
+    if let Some(dir) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        policy = policy.allow_read(dir);
+    }
+    // TLS material the serve loop reads (`--tls custom`/`acme`): confine to the containing dirs
+    // (Landlock grants are per-directory-subtree).
+    for cert in [
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+        args.acme_ca_cert.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(dir) = cert.parent().filter(|p| !p.as_os_str().is_empty()) {
+            policy = policy.allow_read(dir);
+        }
+    }
+    // The ACME cert cache is WRITTEN during serving (certificate renewal).
+    policy = policy.allow_write(args.acme_cache.clone());
+    for p in &sb.extra_read_paths {
+        policy = policy.allow_read(p.clone());
+    }
+    for p in &sb.extra_write_paths {
+        policy = policy.allow_write(p.clone());
+    }
+
+    use boatramp_server::sandbox::SandboxStatus as S;
+    match boatramp_server::sandbox::install(&policy) {
+        Ok(S::Enforced) => Ok(()),
+        Ok(S::Partial) if strict => Err(Error::SandboxStrictNotEnforced(
+            "Landlock only partially enforced on this kernel".to_string(),
+        )),
+        Ok(S::Partial) => Ok(()), // auto best-effort: seccomp on, Landlock partial — serve on
+        Ok(S::Unsupported) if strict => Err(Error::SandboxStrictNotEnforced(
+            "the platform or build has no seccomp/Landlock sandbox".to_string(),
+        )),
+        Ok(S::Unsupported) => Ok(()), // auto on a non-Linux / no-feature build: documented no-op
+        Ok(S::Disabled) => Ok(()),
+        Err(e) if strict => Err(Error::SandboxStrictNotEnforced(e.to_string())),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "process sandbox install failed; continuing WITHOUT a sandbox (posture=auto, \
+                 best-effort) — set posture=strict to fail closed, or posture=off to silence"
+            );
+            Ok(())
+        }
+    }
 }
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {

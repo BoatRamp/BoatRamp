@@ -188,6 +188,8 @@ impl ComputeBackend for FakeComputeBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Mock backend — it does not actually re-exec the host binary to launch workers.
+            requires_host_privileged_spawn: false,
         }
     }
 
