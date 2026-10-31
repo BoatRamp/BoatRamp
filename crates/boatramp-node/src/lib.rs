@@ -66,6 +66,13 @@ pub mod node;
 /// Pure builders for the Postgres export/import client invocation (argv + `PG*` env);
 /// the credential non-leak rule (password in env, never argv) lives here.
 pub mod pg_client;
+/// Secret-blind root config resolution + the spawn-environment contract (privsep
+/// Phase 1 WS-B, SECURITY-CRITICAL): the root resolves TOPOLOGY + non-secret shapes
+/// only (an inline / env-valued §1.2 authority key input is a fail-closed load
+/// refusal, design F1/F11-A), and builds an explicitly-minimal, secret-scrubbed
+/// per-instance environment on spawn (the no-courier rule, design F11-B). Pure +
+/// exhaustively tested; the OS-level supervisor in the `boatramp` binary wraps it.
+pub mod privsep_resolve;
 /// The BRPROJ project export/import bundle format (tar + JSON MANIFEST + per-member
 /// SHA-256). Dependency-light + testable in every build; the driver that fills it is
 /// feature-gated.

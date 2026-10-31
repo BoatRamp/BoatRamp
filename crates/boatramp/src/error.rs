@@ -205,6 +205,10 @@ pub enum CliError {
     #[cfg(target_os = "linux")]
     #[error("sandbox worker: {0}")]
     SandboxWorker(#[source] boatramp_container::worker::WorkerError),
+    /// The privsep root supervisor / feature-instance path (`__root` / `__instance`,
+    /// privsep Phase 1 WS-B). Fail-closed throughout — the root is the TCB floor.
+    #[error(transparent)]
+    Privsep(#[from] crate::privsep::PrivsepError),
     /// `__vmm-run`: the config JSON argument was missing.
     #[cfg(target_os = "linux")]
     #[error("__vmm-run: missing config argument")]

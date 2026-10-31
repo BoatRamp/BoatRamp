@@ -6454,6 +6454,15 @@ pub(crate) mod figment_resolve {
         "join_token",
     ];
 
+    /// The [`SECRET_FIELDS`] redaction set, exposed for the privsep root-blindness
+    /// drift guard (`crate::privsep_resolve` tests): the screen must cover every name
+    /// here, so a newly-redacted field can never silently escape the secret-blind root
+    /// (privsep Phase 1 WS-B, design F11-A). Test-only (the guard is a unit test).
+    #[cfg(test)]
+    pub(crate) fn secret_field_names() -> &'static [&'static str] {
+        SECRET_FIELDS
+    }
+
     fn redact(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(map) => {
