@@ -24,7 +24,10 @@ name: CI
 #                       count tripwire), live-gate-tcp-listener (the real inbound-TCP byte
 #                       path over loopback sockets — split into its own job so the heavy
 #                       feature-union compile + test run above doesn't starve its timing
-#                       assertions of runner CPU), test-cluster (raft consensus + messaging DLQ
+#                       assertions of runner CPU), live-gate-dns-publish (a real wasm guest
+#                       publishing DNS through the host `dns-publish` gate into a credential-free
+#                       ManualDnsProvider — the #24 fail-closed proof at the serve seam),
+#                       test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
 #                       containers, per-dialect — now also the raw-SQL own/session
@@ -1531,6 +1534,43 @@ jobs:
             || { echo "::error::session connect-greeting live gate never reached its marker (cap-req 17: the connect-time empty-frames dispatch for server-speaks-first guests regressed)" >&2; exit 1; }
           grep -q 'SESSION PROMOTE LIVE OK' tcp-listener-live.log \
             || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
+
+  # cap-req #24 WS3 DNS-PUBLISH LIVE GATE (marker `DNS-PUBLISH LIVE OK`). The guest-facing DNS WRITE
+  # capability's end-to-end proof: serves a REAL compiled guest component (`dns-publish-writer.wasm`,
+  # built from examples/handlers/dns-publish-writer) that imports `boatramp:handlers/dns-publish` through
+  # the engine's REAL `add_to_linker` seam, with a credential-free `ManualDnsProvider` installed as the
+  # host-held writer + capture sink (so this runs in CI with NO secrets — the capture is the
+  # publish-through-the-gate proof). Asserts the whole-capability fail-closed contract at the real serve
+  # seam, not just the host-unit seam: (1) a granted in-zone A + apex MX are APPLIED and captured; (2) an
+  # out-of-zone own name is `not-authorized`; (3) an apex NS is `apex-refused` by the central guardrail;
+  # (4) posture OFF (`allow_guest_dns_publish` off) ⇒ `access-denied` even when granted, nothing captured;
+  # (5) a sub-zone NS delegation is published ONLY to an allowlisted target (Security review MEDIUM-3).
+  # The fixture is `include_bytes!`-embedded (prebuilt + committed), so this compiles + runs on musl with
+  # NO wasm toolchain. A fast serve-once+assert (no sockets, no timing) — it also runs in the general
+  # `test-handlers --all-features` lane; this dedicated job greps the success marker + the pass count, so
+  # a silent skip / compile-out fails the merge (the `ignore-gated-tests-not-evidence` discipline).
+  live-gate-dns-publish:
+    name: live gate (dns-publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-dns-publish-musl
+
+      - name: "dns-publish live gate (in-zone publish / out-of-zone / apex-NS / posture-off / NS-delegation)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features dns-publish --test dns_publish_live -- --nocapture 2>&1 | tee dns-publish-live.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-live.log \
+            || { echo "::error::dns-publish live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
+            || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
