@@ -21,7 +21,10 @@ name: CI
 #   • the live-run gates — EXECUTE the security/correctness invariants on real engines
 #                       (compile of them is already covered by shipped-clippy):
 #                       test-server-features (handlers/oidc/mcp/compression/dns-verify +
-#                       count tripwire), test-cluster (raft consensus + messaging DLQ
+#                       count tripwire), live-gate-tcp-listener (the real inbound-TCP byte
+#                       path over loopback sockets — split into its own job so the heavy
+#                       feature-union compile + test run above doesn't starve its timing
+#                       assertions of runner CPU), test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
 #                       containers, per-dialect — now also the raw-SQL own/session
@@ -810,34 +813,6 @@ jobs:
             fi
           done
 
-      # PLAN-handler-tcp-inbound TCP-LISTENER LIVE GATE (marker `TCP-LISTENER LIVE OK`). Dynamically
-      # proves the REAL inbound-TCP byte path against REAL compiled guest components (tcp-echo.wasm /
-      # tcp-spin.wasm) over REAL loopback sockets: (a) echo round-trip, (b) idle-timeout teardown,
-      # (c) MAX-DURATION preemption of a NON-YIELDING compute-bound guest (THE HIGH-fix proof — the
-      # conn-lane epoch-yield is what lets the host watchdog drop a spinning fiber; without it this
-      # HANGS), (d) peer-drop cleanup. Each scenario asserts within a bounded wall-clock, so a
-      # regression turns the test RED rather than hanging CI. The gate greps the success marker + the
-      # pass count, so a silent skip/compile-out fails the job.
-      - name: "tcp-listener live gate (echo / idle / spin-preempt / peer-drop + TLS + STARTTLS + session + connect-greeting + promote-splice)"
-        run: |
-          set -eo pipefail
-          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
-            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --include-ignored --nocapture 2>&1 | tee tcp-listener-live.log
-          grep -qE 'test result: ok\. 6 passed' tcp-listener-live.log \
-            || { echo "::error::tcp-listener live gate did not run all six cases (silent skip or a failure)" >&2; exit 1; }
-          grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
-            || { echo "::error::tcp-listener live gate never reached its marker (an inbound-TCP serve-path regression — likely the conn-lane epoch-yield/teardown)" >&2; exit 1; }
-          grep -q 'TCP-LISTENER-TLS LIVE OK' tcp-listener-live.log \
-            || { echo "::error::tcp-listener TLS live gate never reached its marker (cap-req 06: host-TLS termination regression)" >&2; exit 1; }
-          grep -q 'TCP-LISTENER-STARTTLS LIVE OK' tcp-listener-live.log \
-            || { echo "::error::tcp-listener STARTTLS live gate never reached its marker (cap-req 06 Stage B: STARTTLS upgrade / injection-safety regression)" >&2; exit 1; }
-          grep -q 'SESSION-LISTENER LIVE OK' tcp-listener-live.log \
-            || { echo "::error::session-listener live gate never reached its marker (cap-req 08: the session-over-listener instance-release / checkpoint-resume regression)" >&2; exit 1; }
-          grep -q 'SESSION CONNECT GREETING OK' tcp-listener-live.log \
-            || { echo "::error::session connect-greeting live gate never reached its marker (cap-req 17: the connect-time empty-frames dispatch for server-speaks-first guests regressed)" >&2; exit 1; }
-          grep -q 'SESSION PROMOTE LIVE OK' tcp-listener-live.log \
-            || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
-
       # EXT-METHOD ROUTING gate (mailroom #4, marker `EXT-METHOD ROUTING OK`). Edge routing accepts
       # extension / WebDAV verbs (PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL, MOVE, COPY — CalDAV
       # RFC 4791 / CardDAV RFC 6352) and an explicit per-route `methods: ["*"]` catch-all, while STILL
@@ -1499,6 +1474,63 @@ jobs:
           else
             echo "deploy-class mutation verified: deploy_class_any_is_system turns the gate RED → the exact System·Admin predicate is load-bearing."
           fi
+
+  # DEDICATED tcp-listener live gate (split out of `test-server-features`). That job compiles the
+  # whole server feature union + runs ~100s of other tests on the SAME runner, starving the live
+  # loopback sockets this gate depends on of CPU — under load the real byte path is still correct
+  # but the bounded wall-clock assertions below flake on timing, not on a regression. Running it as
+  # its own job gives the live sockets a runner to themselves.
+  live-gate-tcp-listener:
+    name: live gate (tcp-listener)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # This job compiles the tcp-listener/session/tcp-egress feature set + the live-gate test
+      # binary on the cramped runner root disk; reclaim the preinstalled toolchains we don't use
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom (else the later gate binaries hit
+      # `No space left on device`).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-tcp-listener-musl
+
+      # PLAN-handler-tcp-inbound TCP-LISTENER LIVE GATE (marker `TCP-LISTENER LIVE OK`). Dynamically
+      # proves the REAL inbound-TCP byte path against REAL compiled guest components (tcp-echo.wasm /
+      # tcp-spin.wasm) over REAL loopback sockets: (a) echo round-trip, (b) idle-timeout teardown,
+      # (c) MAX-DURATION preemption of a NON-YIELDING compute-bound guest (THE HIGH-fix proof — the
+      # conn-lane epoch-yield is what lets the host watchdog drop a spinning fiber; without it this
+      # HANGS), (d) peer-drop cleanup. Each scenario asserts within a bounded wall-clock, so a
+      # regression turns the test RED rather than hanging CI. The gate greps the success marker + the
+      # pass count, so a silent skip/compile-out fails the job.
+      - name: "tcp-listener live gate (echo / idle / spin-preempt / peer-drop + TLS + STARTTLS + session + connect-greeting + promote-splice)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features tcp-listener,session,tcp-egress --test tcp_listener_live -- --include-ignored --nocapture 2>&1 | tee tcp-listener-live.log
+          grep -qE 'test result: ok\. 6 passed' tcp-listener-live.log \
+            || { echo "::error::tcp-listener live gate did not run all six cases (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
+            || { echo "::error::tcp-listener live gate never reached its marker (an inbound-TCP serve-path regression — likely the conn-lane epoch-yield/teardown)" >&2; exit 1; }
+          grep -q 'TCP-LISTENER-TLS LIVE OK' tcp-listener-live.log \
+            || { echo "::error::tcp-listener TLS live gate never reached its marker (cap-req 06: host-TLS termination regression)" >&2; exit 1; }
+          grep -q 'TCP-LISTENER-STARTTLS LIVE OK' tcp-listener-live.log \
+            || { echo "::error::tcp-listener STARTTLS live gate never reached its marker (cap-req 06 Stage B: STARTTLS upgrade / injection-safety regression)" >&2; exit 1; }
+          grep -q 'SESSION-LISTENER LIVE OK' tcp-listener-live.log \
+            || { echo "::error::session-listener live gate never reached its marker (cap-req 08: the session-over-listener instance-release / checkpoint-resume regression)" >&2; exit 1; }
+          grep -q 'SESSION CONNECT GREETING OK' tcp-listener-live.log \
+            || { echo "::error::session connect-greeting live gate never reached its marker (cap-req 17: the connect-time empty-frames dispatch for server-speaks-first guests regressed)" >&2; exit 1; }
+          grep -q 'SESSION PROMOTE LIVE OK' tcp-listener-live.log \
+            || { echo "::error::session promote live gate never reached its marker (cap-req 22: the session->connection escalation / persistent duplex splice — egress-gated, lane-isolated, fail-closed — regressed)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
