@@ -47,6 +47,11 @@ const SERVE_OK: i32 = 31; // sendfile file-body + splice reverse-proxy relay bot
 const SERVE_SENDFILE_FAILED: i32 = 32; // sendfile EPERM'd / short (H1 missing `sendfile`)
 const SERVE_SPLICE_FAILED: i32 = 33; // splice EPERM'd / short (H1 missing `splice`)
 const SERVE_SETUP_FAILED: i32 = 34; // socket/pipe/file plumbing failed (not a filter verdict)
+// Per-capability DERIVED profile (privsep Phase 1 WS-D): a no-listener (storage) profile must EPERM
+// `bind` while still allowing `socket` (it has outbound). Mutation-verified with the sandbox OFF.
+const DERIVED_BIND_REFUSED: i32 = 41; // derived profile ON: socket allowed, bind EPERM'd (expected)
+const DERIVED_BIND_ALLOWED: i32 = 42; // OFF or a hole: bind succeeded
+const DERIVED_BIND_SETUP_FAILED: i32 = 43; // socket() itself failed (not the bind verdict)
 const SELFTEST_INSTALL_FAILED: i32 = 99; // the sandbox install itself errored in the child
 
 fn cstr(s: &str) -> CString {
@@ -193,6 +198,81 @@ fn probe_fs(install: bool, data_dir: &str, inside: &CString, outside: &CString) 
         });
         let _ = handle.join();
         unsafe { libc::_exit(FS_UNEXPECTED) };
+    }
+    wait_code(pid)
+}
+
+/// Fork a child that (optionally) installs a DERIVED per-capability profile (privsep Phase 1 WS-D) for
+/// a no-listener (storage: `backend.*`) instance on its MAIN thread, then on a SECOND (spawned) thread
+/// creates a socket (which the derived profile ALLOWS — storage dials outbound) and tries to `bind` it
+/// (which the derived profile DENIES — no `listen.*` capability). Proves the derivation's load-bearing
+/// denial against the REAL kernel, from a non-installing thread.
+fn probe_derived_bind(install: bool) -> i32 {
+    use boatramp_core::privsep::{HostAuthority, SandboxPosture};
+    use std::collections::BTreeSet;
+
+    let caps: BTreeSet<HostAuthority> = [
+        HostAuthority::BackendKv,
+        HostAuthority::BackendSql,
+        HostAuthority::BackendBlob,
+        HostAuthority::BackendMessaging,
+    ]
+    .into_iter()
+    .collect();
+    // System read roots + temp only (no listener, no key paths) — a clean no-listener profile.
+    let inputs = sandbox::SandboxDerivationInputs::for_instance("/tmp", None);
+    let profile = if install {
+        Some(
+            sandbox::derive_profile(&caps, SandboxPosture::Derived, &inputs)
+                .expect("derive a no-listener storage profile"),
+        )
+    } else {
+        None
+    };
+
+    // SAFETY: see `probe_exec` — single-test binary, no concurrent harness allocation at fork.
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        if let Some(p) = profile.as_ref()
+            && sandbox::linux::install_derived(p).is_err()
+        {
+            unsafe { libc::_exit(SELFTEST_INSTALL_FAILED) };
+        }
+        let handle = std::thread::spawn(move || {
+            // `socket` is ALLOWED for a backend instance (it dials its pools outbound).
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                unsafe { libc::_exit(DERIVED_BIND_SETUP_FAILED) };
+            }
+            // `bind` must be DENIED (no `listen.*`). Bind to an ephemeral loopback port.
+            // SAFETY: a zeroed sockaddr_in, filled for AF_INET loopback:0, passed by value size.
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_port = 0; // ephemeral
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let r = unsafe {
+                libc::bind(
+                    fd,
+                    &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            let bind_ok = r == 0;
+            unsafe { libc::close(fd) };
+            let code = if bind_ok {
+                DERIVED_BIND_ALLOWED
+            } else {
+                DERIVED_BIND_REFUSED
+            };
+            unsafe { libc::_exit(code) };
+        });
+        let _ = handle.join();
+        unsafe { libc::_exit(DERIVED_BIND_SETUP_FAILED) };
     }
     wait_code(pid)
 }
@@ -438,13 +518,31 @@ fn sandbox_live_blocks_exec_and_out_of_data_dir_writes() {
         "serve-smoke plumbing sanity WITHOUT the filter; child exit was {serve_off}"
     );
 
+    // ---- DERIVED per-capability profile (privsep Phase 1 WS-D): a no-listener instance's profile -----
+    // DENIES `bind` while still ALLOWING `socket`. Proves the per-capability derivation's load-bearing
+    // denial against the real kernel, mutation-verified with the profile OFF.
+    let bind_on = probe_derived_bind(true);
+    assert_eq!(
+        bind_on, DERIVED_BIND_REFUSED,
+        "derived profile ON (no-listener storage caps): on a NON-installing thread, `socket` is allowed \
+         but `bind` must be EPERM'd; child exit was {bind_on} ({DERIVED_BIND_ALLOWED}=bind was NOT \
+         denied, {DERIVED_BIND_SETUP_FAILED}=socket() failed)"
+    );
+    let bind_off = probe_derived_bind(false);
+    assert_eq!(
+        bind_off, DERIVED_BIND_ALLOWED,
+        "derived profile OFF: `bind` must SUCCEED, proving the ON denial is real; child exit was \
+         {bind_off}"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 
     // The single marker the CI gate greps for — printed ONLY after all probes held.
     println!(
         "SANDBOX LIVE OK: on a NON-installing thread, seccomp-bpf KILLED exec* (SIGSYS) and Landlock \
          refused a write outside data_dir; under the REAL combined filter, sendfile (file body) + \
-         splice (reverse-proxy relay) both served in full (H1); and with the sandbox OFF the deny ops \
-         both succeeded (mutation-verified)."
+         splice (reverse-proxy relay) both served in full (H1); a DERIVED no-listener profile EPERM'd \
+         `bind` while allowing `socket` (WS-D); and with the sandbox OFF the deny ops all succeeded \
+         (mutation-verified)."
     );
 }
