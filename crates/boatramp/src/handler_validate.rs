@@ -155,6 +155,19 @@ mod imp {
             // OWN declarable grant token (distinct from the dial), posture-gated by
             // `allow_guest_tcp_egress` at runtime + SSRF-floored.
             ("boatramp:handlers", "dns-resolve") => Some("dns-resolve"),
+            // The host-side DNS **publish** (write) capability (cap-req #24, the WRITE counterpart to
+            // `dns-resolve`): a guest NAMES a zone/record and the host performs the mutation through a
+            // host-held provider credential (the guest never holds a zone-write token). Its OWN
+            // declarable grant token `dns-publish` (distinct from the read-half `dns-resolve`), matching
+            // `KNOWN_IMPORTS` + the per-handler `dns_publish_zones` writable-zone allowlist. The typed
+            // record model lives INSIDE the single `dns-publish` interface (no `-types` sibling), so this
+            // one arm covers it. Before this arm the interface mapped to `None` → "disallowed interface",
+            // so `capabilities --check`/`sync` refused any component using it even when granted — the
+            // capability was unreachable end-to-end (WS3 wired the runtime host gate but missed this
+            // deploy-admission seam). Posture-gated by `allow_guest_dns_publish` (off by default) at
+            // runtime; the host advertises the feature only under the `dns-publish` cargo feature, so a
+            // guest `requires = ["dns-publish"]` fails loud on a pre-feature host.
+            ("boatramp:handlers", "dns-publish") => Some("dns-publish"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -238,7 +251,17 @@ mod imp {
     /// splice). It rides the EXISTING `session` import/grant (no new grant kind), so a
     /// pre-#22 host that lacks the host-side splice simply rejects the unknown func at
     /// link — the loud-fail the surface bump makes visible.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 11, 0);
+    ///
+    /// `0.12.0` (cap-req #24): a NEW `dns-publish` write capability — the host-mediated
+    /// zone-write counterpart to `dns-resolve`. A granted guest NAMES a zone/record and the
+    /// host performs the mutation through a host-held provider credential (the guest never
+    /// holds a zone-write token). Its OWN declarable grant token (`dns-publish`), gated
+    /// deny-by-default at every layer: the node posture `allow_guest_dns_publish` is OFF by
+    /// default, and a per-handler `dns_publish_zones` allowlist constrains each record's OWN
+    /// name (empty ⇒ deny-all). Unlike #22 this IS a new grant kind + interface, so the host
+    /// advertises the feature only under the `dns-publish` cargo feature and a pre-#24 host
+    /// refuses a `requires = ["dns-publish"]` deploy loudly (rather than failing to link).
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 12, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
@@ -680,6 +703,93 @@ mod imp {
                     .is_err(),
                 "the `wasi:blobstore` token must NOT satisfy blob-upload"
             );
+        }
+
+        #[test]
+        fn policy_gates_dns_publish_by_its_declarable_token() {
+            // cap-req #24 (WS3b): a guest importing the single `dns-publish` interface (the
+            // host-mediated zone-WRITE capability) must deploy via `sync` when it declares the
+            // `dns-publish` token. All the typed record model lives INSIDE that one interface (there is
+            // no `-types` sibling), so the single arm covers it. Before the `capability_token` arm
+            // existed the interface mapped to `None` → "disallowed interface", so `capabilities
+            // --check`/`sync` refused ANY component using it even when granted — the capability was
+            // unreachable end-to-end (WS3 wired only the runtime host gate, not this deploy seam).
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let dp = [lbl("boatramp:handlers", "dns-publish")];
+            assert!(
+                check_interface_policy(&dp, &exports, &["dns-publish".into()], Role::Handler)
+                    .is_ok(),
+                "declaring `dns-publish` must satisfy the dns-publish import"
+            );
+            // Undeclared → refused, message names the `dns-publish` token.
+            let err = check_interface_policy(&dp, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`dns-publish`"), "{err}");
+            // The READ half (`dns-resolve`) is a DISTINCT grant — it must NOT satisfy the write import.
+            assert!(
+                check_interface_policy(&dp, &exports, &["dns-resolve".into()], Role::Handler)
+                    .is_err(),
+                "the `dns-resolve` token must NOT satisfy dns-publish"
+            );
+        }
+
+        #[test]
+        fn every_known_import_token_has_a_capability_token_arm() {
+            // The defense that would have caught the WS3 gap: every grantable token in KNOWN_IMPORTS
+            // must be REACHABLE — some imported interface must map to it via `capability_token`, or a
+            // guest granted the token could never actually IMPORT the capability (and a guest importing
+            // the obvious interface would be refused as a "disallowed interface", exactly as a
+            // `dns-publish`-importing guest was before WS3b added the arm). `capability_token` is keyed
+            // on the WIT `(pkg, iface)`, not the grant token, so for each non-baseline token we feed it
+            // the representative interface a guest imports and assert it returns that token. A future
+            // KNOWN_IMPORTS addition with no `capability_token` arm (and no baseline classification)
+            // fails the exhaustiveness check below.
+            //
+            // `(grant token, pkg, representative imported iface)`.
+            let reps: &[(&str, &str, &str)] = &[
+                ("sql", "boatramp:handlers", "sql-query"),
+                ("invoke", "boatramp:handlers", "invoke"),
+                ("graphql", "boatramp:handlers", "graphql"),
+                ("email", "boatramp:handlers", "email-sender"),
+                ("capability", "boatramp:handlers", "capability-minter"),
+                ("wasi:keyvalue", "wasi:keyvalue", "store"),
+                ("wasi:blobstore", "wasi:blobstore", "blobstore"),
+                ("wasi:messaging", "boatramp:handlers", "messaging-producer"),
+                ("wasi:sockets", "wasi:sockets", "tcp"),
+                // A listener guest's guest-visible IMPORT is `tcp-connection-context` (the types are
+                // `use`d and the handler is EXPORTED); it maps to the same `tcp-listener` grant.
+                (
+                    "tcp-listener",
+                    "boatramp:handlers",
+                    "tcp-connection-context",
+                ),
+                ("dns-resolve", "boatramp:handlers", "dns-resolve"),
+                ("dns-publish", "boatramp:handlers", "dns-publish"),
+            ];
+            // Each representative interface maps to exactly its grant token.
+            for &(token, pkg, iface) in reps {
+                assert_eq!(
+                    capability_token(pkg, iface),
+                    Some(token),
+                    "{pkg}/{iface} must map to the `{token}` grant token"
+                );
+            }
+            // Exhaustiveness: every KNOWN_IMPORTS entry is EITHER a foundational baseline package
+            // (allowed without declaration — BASELINE_PKGS short-circuits before `capability_token` is
+            // ever consulted, so these intentionally have no arm: `wasi:http`/`wasi:io`/`wasi:clocks`/
+            // `wasi:random`/`wasi:logging`) OR covered by a `reps` entry. A new grantable token added to
+            // KNOWN_IMPORTS without a `capability_token` arm trips this — add the arm + a `reps` entry
+            // (or, for a foundational interface, add it to BASELINE_PKGS).
+            for &imp in boatramp_core::config::known_imports() {
+                let is_baseline = BASELINE_PKGS.contains(&imp);
+                let is_mapped = reps.iter().any(|&(token, _, _)| token == imp);
+                assert!(
+                    is_baseline || is_mapped,
+                    "KNOWN_IMPORTS entry `{imp}` has no `capability_token` arm and is not a baseline \
+                     package — a guest granted it could never import the capability. Add a \
+                     `capability_token` arm + a `reps` entry here (or add it to BASELINE_PKGS if it is \
+                     a foundational interface)."
+                );
+            }
         }
 
         #[test]
