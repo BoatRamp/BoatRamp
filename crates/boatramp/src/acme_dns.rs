@@ -69,7 +69,10 @@ pub enum DnsProviderKind {
     /// DigitalOcean (`DIGITALOCEAN_DOMAIN`, `DIGITALOCEAN_TOKEN`).
     #[value(name = "digitalocean", alias = "do")]
     DigitalOcean,
-    /// Hetzner DNS (`HETZNER_ZONE_ID`, `HETZNER_ZONE`, `HETZNER_DNS_TOKEN`).
+    /// Hetzner Cloud DNS (`HETZNER_ZONE`, `HETZNER_DNS_TOKEN`). The zone is
+    /// addressed by name (no numeric id needed), and the token is now a Hetzner
+    /// **Cloud** API token (Bearer auth) — the decommissioned classic DNS token
+    /// no longer works. `HETZNER_ZONE_ID` is no longer read.
     Hetzner,
     /// NS1 / IBM (`NS1_ZONE`, `NS1_API_KEY`).
     Ns1,
@@ -142,7 +145,6 @@ pub async fn build_provider_opts(
             ))
         }
         DnsProviderKind::Hetzner => Box::new(boatramp_acme::hetzner::HetznerDns::new(
-            env("HETZNER_ZONE_ID")?,
             env("HETZNER_ZONE")?,
             env("HETZNER_DNS_TOKEN")?,
         )),
