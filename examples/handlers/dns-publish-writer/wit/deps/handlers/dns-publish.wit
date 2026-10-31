@@ -1,0 +1,90 @@
+// The boatramp `dns-publish` capability interface, vendored for the guest. This
+// MUST match the host's definition in boatramp-handlers
+// (crates/boatramp-handlers/wit/world.wit, `interface dns-publish`) exactly so
+// the component links against the engine's `dns-publish-host` binding.
+//
+// A granted guest NAMES a zone/record; the HOST performs the mutation through an
+// operator-configured, host-held DnsProvider credential. The guest never holds a
+// zone-write token — only the ability to invoke upsert/delete/upsert-set within
+// its authorized zones.
+package boatramp:handlers;
+
+interface dns-publish {
+  /// One HTTPS/SVCB SvcParam (RFC 9460): a key and its presentation-form value.
+  record svc-param {
+    key: string,
+    value: string,
+  }
+
+  /// A CAA record's property tag (RFC 8659).
+  enum caa-tag {
+    issue,
+    issue-wild,
+    iodef,
+  }
+
+  /// Mail-exchange rdata: a delivery preference (lower tried first) and the mail host.
+  record mx-data { preference: u16, exchange: string }
+
+  /// Service-location rdata (RFC 2782).
+  record srv-data { priority: u16, weight: u16, port: u16, target: string }
+
+  /// Certification-Authority-Authorization rdata (RFC 8659).
+  record caa-data { %flags: u8, tag: caa-tag, value: string }
+
+  /// HTTPS/SVCB service-binding rdata (RFC 9460).
+  record svcb-data { priority: u16, target: string, params: list<svc-param> }
+
+  /// DANE TLSA rdata (Tier 2).
+  record tlsa-data { usage: u8, selector: u8, matching: u8, data: string }
+
+  /// The typed rdata of a writable DNS record. Tier-3 provider-managed types (SOA,
+  /// apex NS, the DNSSEC family) have NO variant here — they are unrepresentable.
+  variant rdata {
+    a(string),
+    aaaa(string),
+    cname(string),
+    txt(list<string>),
+    mx(mx-data),
+    srv(srv-data),
+    caa(caa-data),
+    https(svcb-data),
+    svcb(svcb-data),
+    /// Sub-zone delegation only — an `ns` at the zone apex is refused by the guardrail.
+    ns(string),
+    ptr(string),
+    tlsa(tlsa-data),
+  }
+
+  /// A single DNS record to upsert or delete.
+  record dns-record {
+    name: string,
+    ttl: u32,
+    data: rdata,
+  }
+
+  /// Why a publish was refused. Every refusal is explicit — never a silent drop.
+  variant publish-error {
+    access-denied,
+    not-authorized(string),
+    unsupported(string),
+    apex-refused(string),
+    invalid-record(string),
+    rate-limited,
+    backend(string),
+  }
+
+  /// Create-or-replace one record (idempotent).
+  upsert: func(rec: dns-record) -> result<_, publish-error>;
+
+  /// Remove one record. An already-absent record is success.
+  delete: func(rec: dns-record) -> result<_, publish-error>;
+
+  /// Upsert a whole record set, fail-closed + all-or-nothing on validation.
+  upsert-set: func(records: list<dns-record>) -> result<_, publish-error>;
+}
+
+/// Import-only world for the `dns-publish` host binding (the DnsPublishHost Host impl).
+world dns-publish-host {
+  import dns-publish;
+}

@@ -50,6 +50,7 @@ exclude = [
   "examples/handlers/graphql-agent",
   "examples/handlers/graphql-scope-probe",
   "examples/handlers/migrate-fn",
+  "examples/handlers/dns-publish-writer",
   "examples/handlers/tcp-echo",
   "examples/handlers/tcp-spin",
   "examples/compose/edge",
