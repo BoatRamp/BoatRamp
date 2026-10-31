@@ -250,9 +250,13 @@ impl DnsProvider for OciDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // OCI's documented supported record types include MX, SRV, CAA, NS,
-        // PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire encoding
-        // not pinned with confidence).
+        // WS2b: OCI's own "Supported DNS Resource Record Types" reference
+        // (https://docs.oracle.com/iaas/Content/DNS/Reference/supporteddnsresource.htm)
+        // enumerates every `rtype` the service accepts — A, AAAA, ALIAS, CAA,
+        // CERT, CNAME, DHCID, DNAME, DNSKEY, DS, IPSECKEY, KEY, KX, LOC, MX,
+        // NAPTR, NS, NSAP, PTR, PX, RP, SOA, SPF, SRV, SSHFP, TLSA, TXT — and
+        // HTTPS/SVCB are absent from that list. This is a genuine provider
+        // limitation (not a wire-encoding gap), so they stay refused.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -423,5 +427,38 @@ mod tests {
             })),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "TLSA", "rdata": "3 1 1 abcdef", "ttl": 60}]})
         );
+    }
+
+    /// A syntactically-valid (tiny, test-only) PKCS8 RSA key — enough to build an
+    /// `OciDns` so `supported_kinds`/`supports_kind` can be exercised; never used
+    /// to sign a real request.
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA5SrFVYD26w2NArwi\n\
+6uNqb0rEKalyCAaSLeURe7sWG6FSMY1SoZ0klwDoVzTw83Sg6UWOlP7ZULzP43F1\n\
+dfBy5QIDAQABAkEA4t+KBxEq4h9DN67r3qCP8WgSdbBjzOA8faUmvtjDlUsrcPrr\n\
+97v9jcBeflXcw/uG8pQ1p+tWJDOKA+UN3oECzQIhAPe0thijPyMLOQEX2K3LFLtK\n\
+Z0oHkKqFyXt7kZmDUlMvAiEA7Ncl7GYtqI5ZjalxU/SB5a7sL+6KqJcK1lXgvnKU\n\
+pisCIAF7SzuKfm4vOwAOrHUdqdoU79k5glwCwNnEO3K3nl5xAiBSLNgwrMc8y59Q\n\
+4rC6k4Saf9XdT6P2mOmeso9XJQRknwIgG689c5E5fvq9T4eam9dBCNJup4IgI6VT\n\
+sAmaXlKwnv8=\n\
+-----END PRIVATE KEY-----\n";
+
+    /// OCI does not declare HTTPS/SVCB support — they're absent from OCI's own
+    /// "Supported DNS Resource Record Types" list (see `supported_kinds`'s doc
+    /// comment), a genuine provider gap rather than an unpinned encoding.
+    #[test]
+    fn supported_kinds_excludes_https_svcb_family() {
+        let p = OciDns::new(
+            "us-ashburn-1",
+            "example.com",
+            "tenancy/user/fingerprint",
+            TEST_KEY_PEM,
+        )
+        .unwrap();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(!p.supports_kind(tag), "oci should NOT support {tag}");
+        }
+        // Sanity: the previously-declared set is untouched.
+        assert!(p.supports_kind(RecordKindTag::Tlsa));
     }
 }

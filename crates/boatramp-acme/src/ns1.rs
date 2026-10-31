@@ -71,10 +71,50 @@ impl Ns1Dns {
         }
     }
 
+    /// A SvcParam list rendered as RFC 9460 presentation-form tokens
+    /// (`key=value`, or a bare `key` when the value is empty), space-joined —
+    /// the same convention this crate uses everywhere else (route53, GCP,
+    /// Akamai, DNSimple); see `answer_fields`'s doc comment for why NS1 gets
+    /// the same unquoted convention rather than a guessed quoting rule.
+    fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+        params
+            .iter()
+            .map(|p| {
+                if p.value.is_empty() {
+                    p.key.clone()
+                } else {
+                    format!("{}={}", p.key, p.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The `answer` array's elements: NS1 represents a multi-field RDATA (MX,
     /// SRV, CAA, TLSA) as the fields **positionally**, each its own array
     /// element (not one presentation-format string) — distinct from the
     /// single-value shape the original four kinds use.
+    ///
+    /// **WS2b:** NS1 (IBM NS1 Connect) added SVCB/HTTPS support in 2023:
+    /// <https://community.ibm.com/community/user/aiops/blogs/shane-kerr/2023/09/27/ibmns1-announces-support-for-svcb-and-https-record>.
+    /// IBM's own "Types of DNS records" reference page
+    /// (`ibm.com/docs/en/ns1-connect?topic=answers-types-dns-records`) 403s
+    /// every automated fetch attempted for this change (a WAF block, not a
+    /// missing page), so the exact `answer` shape is pinned instead from a
+    /// second, independent, currently-maintained integration against NS1's
+    /// real production REST API: DNSControl's NS1 provider
+    /// (`providers/ns1/records.go`), whose `dnsv2.TypeSVCB`/`TypeHTTPS` cases
+    /// build `Rdata: []string{strconv.Itoa(int(f.Priority)), f.Target,
+    /// models.Svcbv2ValueToString(f.Value)}` — i.e. a **3-element**
+    /// `[priority, target, joined-SvcParams]` array — using that file's own
+    /// `dns.Answer` type, imported from NS1's **own official Go SDK**
+    /// (`gopkg.in/ns1/ns1-go.v2/rest/model/dns`, confirmed from that file's
+    /// import block), not a third-party model. This adapter always emits the
+    /// 3-element form (empty SvcParams become an empty third-element string)
+    /// for uniformity with every other multi-field type here, and keeps the
+    /// unquoted SvcParams convention (no evidence NS1 requires quoting, unlike
+    /// Cloudflare):
+    /// <https://github.com/DNSControl/dnscontrol/blob/main/providers/ns1/records.go>.
     fn answer_fields(record: &DnsRecord) -> Vec<serde_json::Value> {
         match &record.kind {
             RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
@@ -113,6 +153,20 @@ impl Ns1Dns {
                 serde_json::json!(selector),
                 serde_json::json!(matching),
                 serde_json::json!(data),
+            ],
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => vec![
+                serde_json::json!(priority),
+                serde_json::json!(Self::dotted(target)),
+                serde_json::json!(Self::svcparams_presentation(params)),
             ],
             _ => vec![serde_json::json!(Self::answer_value(record))],
         }
@@ -189,9 +243,9 @@ impl DnsProvider for Ns1Dns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // NS1's documented record types include MX, SRV, CAA, NS, PTR, and TLSA.
-        // HTTPS/SVCB are not declared (SvcParams wire encoding not pinned with
-        // confidence).
+        // WS2b: NS1 (IBM NS1 Connect) added HTTPS/SVCB support in 2023 — see
+        // `answer_fields`'s doc comment for the pinned 3-element answer
+        // shape + sources.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -203,6 +257,8 @@ impl DnsProvider for Ns1Dns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -375,5 +431,56 @@ mod tests {
             )),
             serde_json::json!({"zone": "example.com", "domain": "_443._tcp.example.com", "type": "TLSA", "ttl": 300, "answers": [{"answer": [3, 1, 1, "abcdef"]}]})
         );
+    }
+
+    /// Golden (WS2b): NS1's HTTPS/SVCB `answer` — a 3-element positional array
+    /// `[priority, dotted target, SvcParams-string]` (empty SvcParams become
+    /// an empty third element), unquoted like every other adapter's SvcParams
+    /// rendering except Cloudflare's. Pinned against the sources cited in
+    /// `answer_fields`'s doc comment.
+    #[test]
+    fn record_body_golden_for_https_svcb() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "HTTPS", "ttl": 3600, "answers": [{"answer": [1, ".", "alpn=h2,h3"]}]})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, "svc.example.net.", ""]}]})
+        );
+    }
+
+    /// NS1 now declares HTTPS/SVCB support (WS2b).
+    #[test]
+    fn supported_kinds_includes_https_svcb() {
+        let p = provider();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(p.supports_kind(tag), "ns1 should support {tag}");
+        }
     }
 }

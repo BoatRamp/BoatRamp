@@ -211,8 +211,15 @@ impl DnsProvider for DigitalOceanDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // DigitalOcean's documented record types: A, AAAA, CAA, CNAME, MX, NS,
-        // SRV, TXT. No PTR, no TLSA, no HTTPS/SVCB.
+        // WS2b re-confirmed: DigitalOcean's "Domain Records" API reference
+        // (<https://docs.digitalocean.com/reference/api/reference/domain-records/>)
+        // and its own public OpenAPI spec's `domains_create_record` discriminator
+        // mapping
+        // (<https://github.com/digitalocean/openapi/blob/main/specification/resources/domains/domains_create_record.yml>)
+        // enumerate its accepted record 'type' values as exactly A, AAAA, CAA,
+        // CNAME, MX, NS, TXT, SRV, SOA; SOA is provider-managed (Tier 3, not a
+        // writable `RecordKind`). No PTR, no TLSA, no HTTPS/SVCB — a genuine
+        // provider gap, not an unpinned encoding.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,

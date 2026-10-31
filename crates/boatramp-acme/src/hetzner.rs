@@ -1,4 +1,5 @@
-//! Hetzner DNS provider (public DNS API v1).
+//! Hetzner DNS provider (**classic** public DNS API v1 — `dns.hetzner.com/api/v1`
+//! with the `Auth-API-Token` header).
 //!
 //! Two Hetzner specifics the helpers encode:
 //!   * auth is the `Auth-API-Token` header, not bearer;
@@ -11,6 +12,31 @@
 //! zone's records and matches `(type, name)` in memory, then `PUT`s the match or
 //! `POST`s a new one. Construction is pure + unit-tested; the round-trip is a
 //! live seam.
+//!
+//! **WS2b note on HTTPS/SVCB/PTR:** Hetzner's newer Cloud-console DNS surface
+//! documents HTTPS and SVCB zone records (e.g.
+//! <https://docs.hetzner.com/networking/dns/record-types/svcb-record>,
+//! <https://docs.hetzner.com/networking/dns/record-types/https-record/>), but
+//! that is a **different** API from the one this adapter targets. Ansible's
+//! `community.dns` collection — which supports both — documents the split
+//! explicitly: "the old API (`hetzner_token`) does not support `HTTPS`, `PTR`,
+//! and `SVCB` records[;] the new API (`hetzner_api_token`) does not support
+//! `DANE` records"
+//! (<https://docs.ansible.com/projects/ansible/14/collections/community/dns/hetzner_dns_record_module.html>).
+//! This adapter is the classic `Auth-API-Token` ("old") API, so HTTPS/PTR/SVCB
+//! stay genuinely unsupported here — not an unpinned encoding, but the wrong
+//! API surface for those three types.
+//!
+//! **Flag for owner review (bigger than WS2b):** `DEFAULT_API_BASE` below
+//! (`dns.hetzner.com/api/v1`) appears to be **decommissioned**, not merely
+//! legacy: every request to it — any path, with or without an `Auth-API-Token`
+//! header, `GET` or otherwise — 301-redirects to `console.hetzner.com` instead
+//! of returning a 401/404 JSON error (verified live, 2026-10-31). That is host
+//! retirement, not an auth failure, so this adapter may not work for ANY record
+//! type right now, not just HTTPS/SVCB. Migrating to Hetzner's current API
+//! (`api.hetzner.cloud` Zones/RRSets — bearer auth, a structured value/params
+//! record shape) is a separate, larger workstream than WS2b's HTTPS/SVCB-only
+//! remit, so it is flagged here rather than attempted as a drive-by fix.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -215,9 +241,10 @@ impl DnsProvider for HetznerDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // Hetzner's console/API record types: A, AAAA, NS, MX, CNAME, SOA, HINFO,
-        // SRV, TXT, DANE (TLSA), DS, CAA. No PTR (reverse DNS is configured via
-        // the Cloud API, not a zone record) and no HTTPS/SVCB.
+        // Hetzner's classic-API record types: A, AAAA, NS, MX, CNAME, SOA,
+        // HINFO, SRV, TXT, DANE (TLSA), DS, CAA. No PTR and no HTTPS/SVCB on
+        // THIS (old/`Auth-API-Token`) API — see the module doc comment for the
+        // old-vs-new API citation.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -391,7 +418,10 @@ mod tests {
         );
     }
 
-    /// Hetzner does not declare PTR or HTTPS/SVCB support.
+    /// WS2b re-confirmed: this adapter targets Hetzner's classic
+    /// `Auth-API-Token` DNS API, which — per Ansible's `community.dns`
+    /// collection (see the module doc comment) — does not support PTR,
+    /// HTTPS, or SVCB; only Hetzner's newer API does.
     #[test]
     fn supported_kinds_excludes_ptr_and_svcb_family() {
         let p = provider();

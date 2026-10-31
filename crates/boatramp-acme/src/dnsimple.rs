@@ -74,10 +74,34 @@ impl DnsimpleDns {
         }
     }
 
+    /// A SvcParam list rendered as RFC 9460 presentation-form tokens
+    /// (`key=value`, or a bare `key` when the value is empty), space-joined —
+    /// DNSimple documents the HTTPS/SVCB `content` as exactly this zone-file
+    /// presentation form (see `record_content`'s doc comment).
+    fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+        params
+            .iter()
+            .map(|p| {
+                if p.value.is_empty() {
+                    p.key.clone()
+                } else {
+                    format!("{}={}", p.key, p.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The record `content`, in DNSimple's RFC 1035 master-file presentation
     /// format: `CNAME`/`NS`/`PTR` targets and `MX`/`SRV`'s name fields are
-    /// trailing-dot FQDNs, `CAA`/`TLSA` are space-joined field strings, other
-    /// kinds take the raw value (unchanged from WS1).
+    /// trailing-dot FQDNs, `CAA`/`TLSA` are space-joined field strings,
+    /// `HTTPS`/`SVCB` are `<priority> <dotted target> <SvcParams...>` (DNSimple's
+    /// own announcement confirms `content` uses "the same presentation format as
+    /// in zone files" for these two types:
+    /// <https://blog.dnsimple.com/2026/02/svcb-https-record-support/>, with the
+    /// target-dotting convention documented at
+    /// <https://support.dnsimple.com/articles/manage-service-binding-records/>),
+    /// other kinds take the raw value (unchanged from WS1).
     fn record_content(record: &DnsRecord) -> String {
         match &record.kind {
             RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
@@ -100,6 +124,24 @@ impl DnsimpleDns {
                 matching,
                 data,
             } => format!("{usage} {selector} {matching} {data}"),
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => {
+                let svcparams = Self::svcparams_presentation(params);
+                let target = Self::dotted(target);
+                if svcparams.is_empty() {
+                    format!("{priority} {target}")
+                } else {
+                    format!("{priority} {target} {svcparams}")
+                }
+            }
             _ => record.kind.flat_value(),
         }
     }
@@ -209,9 +251,11 @@ impl DnsProvider for DnsimpleDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // DNSimple's documented record types include MX, SRV, CAA, NS, PTR, and
-        // TLSA. HTTPS/SVCB are not declared (SvcParams wire encoding not pinned
-        // with confidence).
+        // WS2b: DNSimple added HTTPS/SVCB support
+        // (https://blog.dnsimple.com/2026/02/svcb-https-record-support/) with
+        // `content` in the same zone-file presentation form as every other
+        // DNSimple record type — see `record_content`'s doc comment for the
+        // pinned encoding.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -223,6 +267,8 @@ impl DnsProvider for DnsimpleDns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -395,5 +441,58 @@ mod tests {
             )),
             serde_json::json!({"name": "_443._tcp", "type": "TLSA", "content": "3 1 1 abcdef", "ttl": 300})
         );
+    }
+
+    /// Golden (WS2b): DNSimple's HTTPS/SVCB `content` — RFC 9460 presentation
+    /// form, target dotted like every other name-bearing field. Values mirror
+    /// DNSimple's own worked examples
+    /// (<https://blog.dnsimple.com/2026/02/svcb-https-record-support/>,
+    /// <https://support.dnsimple.com/articles/manage-service-binding-records/>).
+    #[test]
+    fn record_body_golden_for_https_svcb() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        // ServiceMode, self-target (AliasMode-style "."), one SvcParam.
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                300
+            )),
+            serde_json::json!({"name": "", "type": "HTTPS", "content": "1 . alpn=h2,h3", "ttl": 300})
+        );
+        // AliasMode (priority 0), real target, no params.
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_8443._tcp", "type": "SVCB", "content": "0 svc.example.net.", "ttl": 300})
+        );
+    }
+
+    /// DNSimple now declares HTTPS/SVCB support (WS2b).
+    #[test]
+    fn supported_kinds_includes_https_svcb() {
+        let p = provider();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(p.supports_kind(tag), "dnsimple should support {tag}");
+        }
     }
 }
