@@ -105,6 +105,10 @@ mod operator;
 mod output;
 #[cfg(feature = "overlay")]
 mod overlay;
+// The privsep root supervisor + feature-instance boot + the `__root`/`__instance`
+// pre-runtime argv dispatch (privsep Phase 1 WS-B). Always compiled (like the Phase-0
+// sandbox); engaged only when a resolved `[privsep]` section is present.
+mod privsep;
 mod project;
 mod project_migrate;
 mod project_repair;
@@ -350,6 +354,25 @@ fn run() -> Result<(), CliError> {
     if std::env::args().nth(1).as_deref() == Some(boatramp_vz::VZ_RUN_SUBCOMMAND) {
         return run_vz_worker(std::env::args().nth(2));
     }
+    // A re-exec'd `boatramp __root` / `boatramp __instance <label>` is the privsep
+    // Phase-1 root supervisor / feature-instance (design F10). Handled HERE, in the same
+    // pre-runtime single-threaded window as the workers above (so a per-instance profile
+    // can install on the main thread before the runtime), matching `argv[1]` EXACTLY and
+    // staying OUT of the clap `Command` enum. Both load the config and REFUSE a node with
+    // no `[privsep]` section; a default (absent-`[privsep]`) boot never takes this path
+    // and is byte-for-byte the unchanged monolith.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        match privsep::classify_argv(&argv) {
+            privsep::ArgvEntry::Root => {
+                return privsep::run_root(&privsep::config_path_from_argv(&argv));
+            }
+            privsep::ArgvEntry::Instance(label) => {
+                return privsep::run_instance(&label, &privsep::config_path_from_argv(&argv));
+            }
+            privsep::ArgvEntry::Normal => {}
+        }
+    }
     // Initialise logging + parse the CLI HERE (still single-threaded, before the Tokio runtime is
     // built), so the whole-process OS sandbox can install before any worker thread exists and its
     // logs are captured. The raw `__*` worker checks above run FIRST (clap doesn't know them).
@@ -370,6 +393,16 @@ fn run() -> Result<(), CliError> {
             .unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
         match config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))
         {
+            // A resolved `[privsep]` composition re-routes `serve` to the root supervisor
+            // (design §4.1, "the implicit entry when [privsep] is present"), HERE in the
+            // pre-runtime window so the root engages before the Tokio runtime — and so
+            // `[privsep]` is never silently ignored (running the monolith when the operator
+            // asked for separation would be a security footgun). The root screens + lints
+            // fail-closed and never falls back to the monolith. Absent `[privsep]` ⇒ the
+            // unchanged monolith: install the Phase-0 pre-sandbox and fall through.
+            Ok(config) if config.privsep.is_some() => {
+                return privsep::run_root_with_config(config, &path);
+            }
             Ok(config) => serve::install_presandbox(&config, &path, args)?,
             // A config that won't load means we can't know the posture; skip the pre-install and let
             // `async_main`'s own load (below) surface the real error + abort. A broken-config node
