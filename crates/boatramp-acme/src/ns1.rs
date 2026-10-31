@@ -71,17 +71,19 @@ impl Ns1Dns {
         }
     }
 
-    /// A SvcParam list rendered as RFC 9460 presentation-form tokens
-    /// (`key=value`, or a bare `key` when the value is empty), space-joined —
-    /// the same convention this crate uses everywhere else (route53, GCP,
-    /// Akamai, DNSimple); see `answer_fields`'s doc comment for why NS1 gets
-    /// the same unquoted convention rather than a guessed quoting rule.
+    /// A SvcParam list rendered as NS1's own official docs show it: RFC 9460
+    /// presentation-form tokens, space-joined, each value double-quoted when
+    /// it contains a comma (matching IBM's `alpn="h3,h2"` example) and left
+    /// bare otherwise (matching IBM's `port=8888` example) — see
+    /// `answer_fields`'s doc comment for the primary source.
     fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
         params
             .iter()
             .map(|p| {
                 if p.value.is_empty() {
                     p.key.clone()
+                } else if p.value.contains(',') {
+                    format!("{}=\"{}\"", p.key, p.value)
                 } else {
                     format!("{}={}", p.key, p.value)
                 }
@@ -95,25 +97,27 @@ impl Ns1Dns {
     /// element (not one presentation-format string) — distinct from the
     /// single-value shape the original four kinds use.
     ///
-    /// **WS2b:** NS1 (IBM NS1 Connect) added SVCB/HTTPS support in 2023:
-    /// <https://community.ibm.com/community/user/aiops/blogs/shane-kerr/2023/09/27/ibmns1-announces-support-for-svcb-and-https-record>.
-    /// IBM's own "Types of DNS records" reference page
-    /// (`ibm.com/docs/en/ns1-connect?topic=answers-types-dns-records`) 403s
-    /// every automated fetch attempted for this change (a WAF block, not a
-    /// missing page), so the exact `answer` shape is pinned instead from a
-    /// second, independent, currently-maintained integration against NS1's
-    /// real production REST API: DNSControl's NS1 provider
-    /// (`providers/ns1/records.go`), whose `dnsv2.TypeSVCB`/`TypeHTTPS` cases
-    /// build `Rdata: []string{strconv.Itoa(int(f.Priority)), f.Target,
-    /// models.Svcbv2ValueToString(f.Value)}` — i.e. a **3-element**
-    /// `[priority, target, joined-SvcParams]` array — using that file's own
-    /// `dns.Answer` type, imported from NS1's **own official Go SDK**
-    /// (`gopkg.in/ns1/ns1-go.v2/rest/model/dns`, confirmed from that file's
-    /// import block), not a third-party model. This adapter always emits the
-    /// 3-element form (empty SvcParams become an empty third-element string)
-    /// for uniformity with every other multi-field type here, and keeps the
-    /// unquoted SvcParams convention (no evidence NS1 requires quoting, unlike
-    /// Cloudflare):
+    /// **WS2b:** HTTPS/SVCB follow the same positional convention, pinned
+    /// against IBM's official NS1 docs' worked `answer` examples for both
+    /// types in AliasMode and ServiceMode
+    /// (<https://www.ibm.com/docs/en/SSSYGZ/resource_management/guide_to_dns_record_types.html>,
+    /// fetched directly and independently re-verified twice in this change):
+    /// AliasMode (no SvcParams) is `[priority, target]` (2 elements, e.g.
+    /// `[0, "example.net."]`); ServiceMode (SvcParams present) is `[priority,
+    /// target, svcparams]` (3 elements, e.g. `[1, ".", "alpn=\"h3,h2\""]`) —
+    /// the whole SvcParams set collapsed into that one combined
+    /// presentation-form string, never split per-key. This adapter switches on
+    /// whether `params` is empty (matching every doc example, including one
+    /// where NS1's own ServiceMode example pairs priority `0` with a
+    /// SvcParams string — so the element count tracks `params`, not priority).
+    ///
+    /// Cross-checked against a second, independent, currently-maintained
+    /// integration against NS1's production API: DNSControl's NS1 provider
+    /// (`providers/ns1/records.go`'s `dnsv2.TypeSVCB`/`TypeHTTPS` cases) builds
+    /// the same `[priority, target, joined-SvcParams]` field order (that
+    /// library always emits 3 elements and never quotes — a design choice of
+    /// its own record model, not a documented requirement of NS1's API; IBM's
+    /// own docs are followed here for both the element count and quoting):
     /// <https://github.com/DNSControl/dnscontrol/blob/main/providers/ns1/records.go>.
     fn answer_fields(record: &DnsRecord) -> Vec<serde_json::Value> {
         match &record.kind {
@@ -163,11 +167,16 @@ impl Ns1Dns {
                 priority,
                 target,
                 params,
-            } => vec![
-                serde_json::json!(priority),
-                serde_json::json!(Self::dotted(target)),
-                serde_json::json!(Self::svcparams_presentation(params)),
-            ],
+            } => {
+                let mut fields = vec![
+                    serde_json::json!(priority),
+                    serde_json::json!(Self::dotted(target)),
+                ];
+                if !params.is_empty() {
+                    fields.push(serde_json::json!(Self::svcparams_presentation(params)));
+                }
+                fields
+            }
             _ => vec![serde_json::json!(Self::answer_value(record))],
         }
     }
@@ -433,10 +442,11 @@ mod tests {
         );
     }
 
-    /// Golden (WS2b): NS1's HTTPS/SVCB `answer` — a 3-element positional array
-    /// `[priority, dotted target, SvcParams-string]` (empty SvcParams become
-    /// an empty third element), unquoted like every other adapter's SvcParams
-    /// rendering except Cloudflare's. Pinned against the sources cited in
+    /// Golden (WS2b): NS1's HTTPS/SVCB `answer` — IBM's own worked examples:
+    /// AliasMode (no SvcParams) is a 2-element `[priority, dotted target]`
+    /// answer; ServiceMode (SvcParams present) is 3-element `[priority, dotted
+    /// target, SvcParams-string]`, with a param value quoted only when it
+    /// contains a comma. Pinned against the sources cited in
     /// `answer_fields`'s doc comment.
     #[test]
     fn record_body_golden_for_https_svcb() {
@@ -446,6 +456,7 @@ mod tests {
             name: name.into(),
             ttl,
         };
+        // ServiceMode: a comma-bearing SvcParam value gets quoted.
         assert_eq!(
             p.record_body(&rec(
                 RecordKind::Https {
@@ -459,8 +470,25 @@ mod tests {
                 "example.com",
                 3600
             )),
-            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "HTTPS", "ttl": 3600, "answers": [{"answer": [1, ".", "alpn=h2,h3"]}]})
+            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "HTTPS", "ttl": 3600, "answers": [{"answer": [1, ".", "alpn=\"h2,h3\""]}]})
         );
+        // ServiceMode: a comma-free SvcParam value stays bare (IBM's `port=8888`).
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "port".into(),
+                        value: "8888".into(),
+                    }],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, ".", "port=8888"]}]})
+        );
+        // AliasMode: no SvcParams → a 2-element answer, no trailing empty string.
         assert_eq!(
             p.record_body(&rec(
                 RecordKind::Svcb {
@@ -471,7 +499,7 @@ mod tests {
                 "_8443._tcp.example.com",
                 300
             )),
-            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, "svc.example.net.", ""]}]})
+            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, "svc.example.net."]}]})
         );
     }
 
