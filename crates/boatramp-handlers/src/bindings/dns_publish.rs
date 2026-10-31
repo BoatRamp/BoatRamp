@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicU32;
 
 use boatramp_acme::dns::{
     DnsError, DnsProvider, DnsRecord as AcmeRecord, RecordKind, RecordKindTag, SvcParam,
-    validate_writable,
+    canonicalize_owner_name, validate_writable,
 };
 
 mod generated {
@@ -158,13 +158,21 @@ impl DnsPublishBinding {
     }
 }
 
-/// Whether `name` matches a writable-zone glob. Semantics match
-/// [`boatramp_types::gateway::gateway_host_matches`] (case-insensitive; trailing dot ignored; `*.sfx`
-/// is a single label, `**.sfx` any depth incl. the apex, bare `**` anything). Re-implemented here
-/// because `boatramp-handlers` does not depend on `boatramp-types`.
+/// Whether the **already-canonical** owner `name` matches a writable-zone glob.
+/// Semantics match [`boatramp_types::gateway::gateway_host_matches`]
+/// (case-insensitive; trailing dot ignored; `*.sfx` is a single label, `**.sfx`
+/// any depth incl. the apex, bare `**` anything). Re-implemented here because
+/// `boatramp-handlers` does not depend on `boatramp-types`.
+///
+/// **Security invariant (CRITICAL-1 / MEDIUM-2):** `name` MUST be the output of
+/// [`canonicalize_owner_name`] (lowercased, no trailing dot, syntactically
+/// validated). The matcher does **not** re-normalize `name`, so the string
+/// authorized here is byte-identical to the string later dispatched to the
+/// adapter — it never authorizes a normalized *copy* of a different raw name.
+/// Only the operator-configured `glob` is normalized (case + surrounding
+/// whitespace).
 fn zone_glob_matches(glob: &str, name: &str) -> bool {
     let glob = glob.trim().to_ascii_lowercase();
-    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     if name.is_empty() {
         return false;
     }
@@ -266,8 +274,10 @@ fn build_kind(data: dns_publish::Rdata) -> Result<RecordKind, dns_publish::Publi
 fn map_guardrail_err(e: DnsError) -> dns_publish::PublishError {
     use dns_publish::PublishError as P;
     match e {
-        DnsError::UnsupportedRecordType { provider, kind } => {
-            P::Unsupported(format!("provider '{provider}' cannot write {kind} records"))
+        // INFORMATIONAL-6: do NOT disclose the operator's DNS provider name to the guest — a generic
+        // message only (the provider name is not the guest's to know).
+        DnsError::UnsupportedRecordType { .. } => {
+            P::Unsupported("unsupported record type for this zone".into())
         }
         DnsError::ApexNsRefused { zone, name } => P::ApexRefused(format!(
             "refusing apex NS for zone '{zone}' (name '{name}')"
@@ -347,22 +357,36 @@ impl<'a> DnsPublishHost<'a> {
         }
     }
 
-    /// Layer 2 + the central guardrail, with NO write and NO budget spend: check the record's OWN name
-    /// against the writable-zone allowlist (the rdata target is deliberately NOT checked), build the
-    /// typed record, then run [`validate_writable`] (apex-NS / supported-kind / malformed-rdata). A
-    /// failure here means NOTHING is written.
+    /// Layer 2 + the central guardrail, with NO write and NO budget spend. A failure here means
+    /// NOTHING is written.
+    ///
+    /// **CRITICAL-1 / MEDIUM-2 — one canonical string for authorize AND dispatch.** The guest-supplied
+    /// owner `name` is [`canonicalize_owner_name`]'d FIRST: a syntactically-illegal name (path
+    /// traversal, whitespace, `/`, `..`, an overlong/empty label, …) is refused as `invalid-record`
+    /// BEFORE the allowlist is even consulted. The resulting canonical string is then used for BOTH
+    /// (a) the writable-zone allowlist check and (b) the [`AcmeRecord::name`] dispatched to the adapter
+    /// — they are byte-identical, so a name can never be authorized as a normalized copy of a different
+    /// raw string that then escapes to another zone in the provider URL path. The rdata TARGET
+    /// (CNAME/MX/SRV/NS exchange/target) is deliberately NOT canonicalized or constrained — it
+    /// legitimately points elsewhere.
+    ///
+    /// Then build the typed record and run [`validate_writable`] (apex-NS / supported-kind /
+    /// malformed-rdata) on that same canonical name.
     fn prepare(
         b: &DnsPublishBinding,
         wit: dns_publish::DnsRecord,
     ) -> Result<AcmeRecord, dns_publish::PublishError> {
-        // Layer 2: own-name allowlist (deny-empty). The TARGET in the rdata is never constrained.
-        if !zone_authorized(&b.writable_zones, &wit.name) {
-            return Err(dns_publish::PublishError::NotAuthorized(wit.name));
+        // Canonicalize the guest name up front — invalid ⇒ invalid-record, before the allowlist.
+        let name = canonicalize_owner_name(&wit.name).map_err(map_guardrail_err)?;
+        // Layer 2: own-name allowlist (deny-empty), on the canonical name. The rdata TARGET is never
+        // passed here.
+        if !zone_authorized(&b.writable_zones, &name) {
+            return Err(dns_publish::PublishError::NotAuthorized(name));
         }
         let kind = build_kind(wit.data)?;
         let record = AcmeRecord {
             kind,
-            name: wit.name,
+            name,
             ttl: wit.ttl,
         };
         validate_writable(b.provider.as_ref(), &record, &b.zone_root).map_err(map_guardrail_err)?;
@@ -439,6 +463,15 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         records: Vec<dns_publish::DnsRecord>,
     ) -> Result<(), dns_publish::PublishError> {
         let b = self.admit()?;
+        // LOW-4: fast-fail an over-budget set BEFORE the O(N) canonicalize/validate/alloc loop, so a
+        // guest cannot force the host to do per-record work for a set it could never afford to write
+        // (a cheap pre-write amplifier). This is only an early-out; `spend` below is still the
+        // authoritative all-or-nothing reservation (its CAS handles any concurrent drain). Compared as
+        // u64 so a huge `records.len()` (usize) can never wrap when measured against the u32 budget.
+        let remaining = self.budget.load(std::sync::atomic::Ordering::Relaxed);
+        if records.len() as u64 > u64::from(remaining) {
+            return Err(dns_publish::PublishError::RateLimited);
+        }
         // Validate + gate EVERY record BEFORE writing any (fail-closed, all-or-nothing on validation):
         // one bad record refuses the whole set and nothing is written.
         let mut prepared = Vec::with_capacity(records.len());
@@ -971,5 +1004,110 @@ mod tests {
         for e in entries.iter() {
             assert!(!e.1.contains("secret-token"), "name never carries rdata");
         }
+    }
+
+    // ---- CRITICAL-1 / MEDIUM-2: owner-name canonicalization gate ----------
+
+    /// The cross-tenant zone-escape proof. Every attack owner name — notably the
+    /// `../../zones/victim.com/evil.example.com` traversal that the raw dispatch
+    /// would have normalized into another zone's URL path, plus whitespace and the
+    /// URL-structural bytes — is refused as `invalid-record` and NEVER reaches the
+    /// provider. Each name ENDS with `.example.com`, so the `**.example.com`
+    /// allowlist WOULD have authorized it had canonicalization not refused it
+    /// first.
+    #[tokio::test]
+    async fn attack_names_are_invalid_record_and_never_dispatched() {
+        let p = Arc::new(StubProvider::new(BASIC));
+        let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
+        let bud = budget(64);
+        let attacks = [
+            "../../zones/victim.com/evil.example.com",
+            "evil/../example.com",
+            " example.com",
+            "example.com ",
+            "evil?x.example.com",
+            "evil#x.example.com",
+            "evil%2e.example.com",
+            "evil@x.example.com",
+            "evil:8080.example.com",
+            "evil..example.com",
+            ".example.com",
+        ];
+        for a in attacks {
+            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let err = host
+                .upsert(a_record(a, "203.0.113.7"))
+                .await
+                .expect_err("attack name must be refused");
+            assert!(
+                matches!(err, dns_publish::PublishError::InvalidRecord(_)),
+                "attack {a:?} must be invalid-record, got {err:?}"
+            );
+        }
+        // An overlong label is likewise invalid-record.
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let overlong = format!("{}.example.com", "a".repeat(64));
+            assert!(matches!(
+                host.upsert(a_record(&overlong, "203.0.113.7")).await,
+                Err(dns_publish::PublishError::InvalidRecord(_))
+            ));
+        }
+        assert_eq!(p.count(), 0, "no attack name ever reached the provider");
+        assert_eq!(
+            bud.load(Ordering::Relaxed),
+            64,
+            "a refused (pre-write) call burns no budget"
+        );
+    }
+
+    /// The authorized string is byte-identical to the dispatched string: a
+    /// legitimate-but-non-canonical name (uppercase + trailing dot) is authorized
+    /// and the provider is handed the SAME canonical form the allowlist matched —
+    /// never the raw `wit.name`. This is the invariant that closes the
+    /// authorize-a-copy / dispatch-the-raw split.
+    #[tokio::test]
+    async fn authorized_name_is_byte_identical_to_dispatched_name() {
+        let p = Arc::new(StubProvider::new(BASIC));
+        let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
+        let bud = budget(16);
+        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        host.upsert(a_record("WWW.Example.COM.", "203.0.113.7"))
+            .await
+            .expect("legit non-canonical name is authorized");
+        let ops = p.ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        // The dispatched record carries the canonical name — not "WWW.Example.COM.".
+        assert_eq!(ops[0].1.name, "www.example.com");
+    }
+
+    /// Legitimate names across the real shapes still pass end-to-end: an ACME
+    /// challenge owner (underscore labels), a wildcard, and a trailing-dot apex-ish
+    /// name are each authorized and dispatched in canonical form.
+    #[tokio::test]
+    async fn legitimate_names_still_pass() {
+        let p = Arc::new(StubProvider::new(BASIC));
+        let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
+        let bud = budget(16);
+        for (raw, want) in [
+            (
+                "_acme-challenge.deploy.example.com",
+                "_acme-challenge.deploy.example.com",
+            ),
+            ("*.example.com", "*.example.com"),
+            ("mail.example.com.", "mail.example.com"),
+        ] {
+            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            host.upsert(a_record(raw, "203.0.113.7"))
+                .await
+                .unwrap_or_else(|e| panic!("legit name {raw:?} should pass: {e:?}"));
+            let ops = p.ops.lock().unwrap();
+            assert_eq!(
+                ops.last().unwrap().1.name,
+                want,
+                "dispatched name for {raw:?}"
+            );
+        }
+        assert_eq!(p.count(), 3);
     }
 }
