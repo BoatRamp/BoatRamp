@@ -71,9 +71,11 @@ impl HetznerDns {
 
     /// `CNAME` values are FQDNs with a trailing dot; other kinds take the raw value.
     fn record_value(record: &DnsRecord) -> String {
-        match record.kind {
-            RecordKind::Cname if !record.value.ends_with('.') => format!("{}.", record.value),
-            _ => record.value.clone(),
+        let value = record.kind.flat_value();
+        if matches!(record.kind, RecordKind::Cname(_)) && !value.ends_with('.') {
+            format!("{value}.")
+        } else {
+            value
         }
     }
 
@@ -169,7 +171,7 @@ impl DnsProvider for HetznerDns {
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
         let match_content = matches!(
             record.kind,
-            RecordKind::Txt | RecordKind::A | RecordKind::Aaaa
+            RecordKind::Txt(_) | RecordKind::A(_) | RecordKind::Aaaa(_)
         );
         let Some(id) = self.find_record_id(record, match_content).await? else {
             return Ok(()); // already gone
@@ -183,6 +185,10 @@ impl DnsProvider for HetznerDns {
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "hetzner"
     }
 }
 
@@ -212,9 +218,8 @@ mod tests {
     #[test]
     fn body_carries_zone_id_and_relative_name() {
         let body = provider().record_body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(body["zone_id"], "zone123");
@@ -227,9 +232,8 @@ mod tests {
     #[test]
     fn cname_value_gets_a_trailing_dot() {
         let body = provider().record_body(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("lb.example.net".into()),
             name: "*.deploy.example.com".into(),
-            value: "lb.example.net".into(),
             ttl: 120,
         });
         assert_eq!(body["value"], "lb.example.net.");
@@ -240,36 +244,37 @@ mod tests {
     #[test]
     fn record_body_golden_for_every_kind() {
         let p = provider();
-        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+        let rec = |kind, name: &str, ttl| DnsRecord {
             kind,
             name: name.into(),
-            value: value.into(),
             ttl,
         };
         assert_eq!(
-            p.record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            p.record_body(&rec(
+                RecordKind::A("203.0.113.7".parse().unwrap()),
+                "deploy.example.com",
+                60
+            )),
             serde_json::json!({"zone_id": "zone123", "type": "A", "name": "deploy", "value": "203.0.113.7", "ttl": 60})
         );
         assert_eq!(
             p.record_body(&rec(
-                RecordKind::Aaaa,
+                RecordKind::Aaaa("2001:db8::1".parse().unwrap()),
                 "deploy.example.com",
-                "2001:db8::1",
                 60
             )),
             serde_json::json!({"zone_id": "zone123", "type": "AAAA", "name": "deploy", "value": "2001:db8::1", "ttl": 60})
         );
         assert_eq!(
             p.record_body(&rec(
-                RecordKind::Cname,
+                RecordKind::Cname("lb.example.net".into()),
                 "www.example.com",
-                "lb.example.net",
                 300
             )),
             serde_json::json!({"zone_id": "zone123", "type": "CNAME", "name": "www", "value": "lb.example.net.", "ttl": 300})
         );
         assert_eq!(
-            p.record_body(&rec(RecordKind::Txt, "example.com", "tok", 60)),
+            p.record_body(&rec(RecordKind::Txt(vec!["tok".into()]), "example.com", 60)),
             serde_json::json!({"zone_id": "zone123", "type": "TXT", "name": "@", "value": "tok", "ttl": 60})
         );
     }

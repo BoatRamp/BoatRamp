@@ -65,10 +65,11 @@ impl AkamaiDns {
 
     /// The rdata value: TXT is double-quoted, CNAME is a trailing-dot FQDN, others raw.
     fn rdata_value(record: &DnsRecord) -> String {
+        let value = record.kind.flat_value();
         match record.kind {
-            RecordKind::Txt => format!("\"{}\"", record.value),
-            RecordKind::Cname if !record.value.ends_with('.') => format!("{}.", record.value),
-            _ => record.value.clone(),
+            RecordKind::Txt(_) => format!("\"{value}\""),
+            RecordKind::Cname(_) if !value.ends_with('.') => format!("{value}."),
+            _ => value,
         }
     }
 
@@ -250,6 +251,10 @@ impl DnsProvider for AkamaiDns {
             s => Err(DnsError::Backend(format!("akamai delete record: HTTP {s}"))),
         }
     }
+
+    fn name(&self) -> &'static str {
+        "akamai"
+    }
 }
 
 #[cfg(test)]
@@ -269,9 +274,8 @@ mod tests {
     #[test]
     fn record_path_is_fqdn_typed() {
         let p = provider().record_path(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(
@@ -283,9 +287,8 @@ mod tests {
     #[test]
     fn txt_rdata_is_quoted_cname_is_dotted() {
         let txt = AkamaiDns::record_body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(txt["rdata"][0], "\"abc\"");
@@ -293,9 +296,8 @@ mod tests {
         assert_eq!(txt["name"], "_acme-challenge.deploy.example.com");
 
         let cname = AkamaiDns::record_body(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("lb.example.net".into()),
             name: "*.deploy.example.com".into(),
-            value: "lb.example.net".into(),
             ttl: 120,
         });
         assert_eq!(cname["rdata"][0], "lb.example.net.");
@@ -358,39 +360,39 @@ mod tests {
     /// DNS's `rdata` array with full-FQDN names, quoted TXT, and dotted CNAME.
     #[test]
     fn record_body_golden_for_every_kind() {
-        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+        let rec = |kind, name: &str, ttl| DnsRecord {
             kind,
             name: name.into(),
-            value: value.into(),
             ttl,
         };
         assert_eq!(
-            AkamaiDns::record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            AkamaiDns::record_body(&rec(
+                RecordKind::A("203.0.113.7".parse().unwrap()),
+                "deploy.example.com",
+                60
+            )),
             serde_json::json!({"name": "deploy.example.com", "type": "A", "ttl": 60, "rdata": ["203.0.113.7"]})
         );
         assert_eq!(
             AkamaiDns::record_body(&rec(
-                RecordKind::Aaaa,
+                RecordKind::Aaaa("2001:db8::1".parse().unwrap()),
                 "deploy.example.com",
-                "2001:db8::1",
                 60
             )),
             serde_json::json!({"name": "deploy.example.com", "type": "AAAA", "ttl": 60, "rdata": ["2001:db8::1"]})
         );
         assert_eq!(
             AkamaiDns::record_body(&rec(
-                RecordKind::Cname,
+                RecordKind::Cname("lb.example.net".into()),
                 "www.example.com",
-                "lb.example.net",
                 300
             )),
             serde_json::json!({"name": "www.example.com", "type": "CNAME", "ttl": 300, "rdata": ["lb.example.net."]})
         );
         assert_eq!(
             AkamaiDns::record_body(&rec(
-                RecordKind::Txt,
+                RecordKind::Txt(vec!["tok".into()]),
                 "_acme-challenge.example.com",
-                "tok",
                 60
             )),
             serde_json::json!({"name": "_acme-challenge.example.com", "type": "TXT", "ttl": 60, "rdata": ["\"tok\""]})

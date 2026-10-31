@@ -63,7 +63,7 @@ impl DnsProvider for ChallTestSrv {
             .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
             .json(&serde_json::json!({
                 "host": format!("{}.", record.name),
-                "value": record.value,
+                "value": record.kind.flat_value(),
             }))
             .send()
             .await

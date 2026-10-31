@@ -333,7 +333,8 @@ async fn txt_record_visible(
     record: &DnsRecord,
 ) -> Result<Propagation, AcmeError> {
     let values = resolver.lookup_txt(&record.name).await?;
-    Ok(if values.iter().any(|v| v == &record.value) {
+    let want = record.kind.flat_value();
+    Ok(if values.iter().any(|v| v == &want) {
         Propagation::Ready
     } else {
         Propagation::Pending
@@ -571,9 +572,8 @@ impl ChallengeSolver for Dns01Solver<'_> {
         key_auth: &KeyAuthorization,
     ) -> Result<(), AcmeError> {
         let record = DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec![key_auth.dns_value()]),
             name: acme_challenge_name(identifier),
-            value: key_auth.dns_value(),
             ttl: self.ttl,
         };
         self.provider.upsert(&record).await?;
@@ -909,15 +909,14 @@ mod tests {
     #[tokio::test]
     async fn txt_record_visible_waits_for_the_exact_value() {
         let record = DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["the-unique-challenge-value".into()]),
             name: "_acme-challenge.deploy.test".into(),
-            value: "the-unique-challenge-value".into(),
             ttl: 1,
         };
         // Becomes visible on the 3rd lookup.
         let resolver = FakeResolver {
             name: record.name.clone(),
-            value: record.value.clone(),
+            value: record.kind.flat_value(),
             visible_after: 3,
             lookups: AtomicUsize::new(0),
         };

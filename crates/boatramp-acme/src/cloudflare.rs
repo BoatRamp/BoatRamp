@@ -125,13 +125,13 @@ impl CloudflareDns {
         let mut body = serde_json::json!({
             "type": record.kind.as_str(),
             "name": record.name,
-            "content": record.value,
+            "content": record.kind.flat_value(),
             "ttl": record.ttl,
         });
         if self.proxied
             && matches!(
                 record.kind,
-                RecordKind::A | RecordKind::Aaaa | RecordKind::Cname
+                RecordKind::A(_) | RecordKind::Aaaa(_) | RecordKind::Cname(_)
             )
         {
             body["proxied"] = serde_json::json!(true);
@@ -155,8 +155,9 @@ impl CloudflareDns {
                 ("type", record.kind.as_str()),
                 ("name", record.name.as_str()),
             ]);
+        let content = record.kind.flat_value();
         if match_content {
-            request = request.query(&[("content", record.value.as_str())]);
+            request = request.query(&[("content", content.as_str())]);
         }
         let resp = request
             .send()
@@ -222,7 +223,7 @@ impl DnsProvider for CloudflareDns {
         // For TXT/A several records can share a name, so match content too.
         let match_content = matches!(
             record.kind,
-            RecordKind::Txt | RecordKind::A | RecordKind::Aaaa
+            RecordKind::Txt(_) | RecordKind::A(_) | RecordKind::Aaaa(_)
         );
         let Some(id) = self.find_record_id(record, match_content).await? else {
             return Ok(()); // already gone
@@ -236,6 +237,10 @@ impl DnsProvider for CloudflareDns {
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "cloudflare"
     }
 }
 
@@ -278,9 +283,8 @@ mod tests {
     #[test]
     fn record_body_shape() {
         let body = CloudflareDns::new("z", "t").record_body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(body["type"], "TXT");
@@ -297,9 +301,8 @@ mod tests {
 
         // A CNAME gets proxied + automatic TTL.
         let cname = cf.record_body(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("app.fly.dev".into()),
             name: "docs.example.com".into(),
-            value: "app.fly.dev".into(),
             ttl: 300,
         });
         assert_eq!(cname["proxied"], true);
@@ -307,9 +310,8 @@ mod tests {
 
         // A TXT is never proxied, even on a proxied instance.
         let txt = cf.record_body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert!(txt.get("proxied").is_none());
@@ -321,44 +323,39 @@ mod tests {
     #[test]
     fn record_body_golden_for_every_kind() {
         let cf = CloudflareDns::new("z", "t");
-        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+        let rec = |kind, name: &str, ttl| DnsRecord {
             kind,
             name: name.into(),
-            value: value.into(),
             ttl,
         };
         assert_eq!(
             cf.record_body(&rec(
-                RecordKind::A,
+                RecordKind::A("203.0.113.7".parse().unwrap()),
                 "deploy.example.com",
-                "203.0.113.7",
                 300
             )),
             serde_json::json!({"type": "A", "name": "deploy.example.com", "content": "203.0.113.7", "ttl": 300})
         );
         assert_eq!(
             cf.record_body(&rec(
-                RecordKind::Aaaa,
+                RecordKind::Aaaa("2001:db8::1".parse().unwrap()),
                 "deploy.example.com",
-                "2001:db8::1",
                 300
             )),
             serde_json::json!({"type": "AAAA", "name": "deploy.example.com", "content": "2001:db8::1", "ttl": 300})
         );
         assert_eq!(
             cf.record_body(&rec(
-                RecordKind::Cname,
+                RecordKind::Cname("app.fly.dev".into()),
                 "www.example.com",
-                "app.fly.dev",
                 300
             )),
             serde_json::json!({"type": "CNAME", "name": "www.example.com", "content": "app.fly.dev", "ttl": 300})
         );
         assert_eq!(
             cf.record_body(&rec(
-                RecordKind::Txt,
+                RecordKind::Txt(vec!["tok".into()]),
                 "_acme-challenge.example.com",
-                "tok",
                 60
             )),
             serde_json::json!({"type": "TXT", "name": "_acme-challenge.example.com", "content": "tok", "ttl": 60})

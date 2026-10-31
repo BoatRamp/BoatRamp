@@ -602,9 +602,8 @@ async fn add_via_provider(
 
     let provider = build_provider(kind).await?;
     let record = DnsRecord {
-        kind: RecordKind::Txt,
+        kind: RecordKind::Txt(vec![verification.token.clone()]),
         name: verification.dns_record_name(),
-        value: verification.token.clone(),
         ttl: 60,
     };
     provider.upsert(&record).await?;

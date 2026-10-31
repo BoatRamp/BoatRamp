@@ -46,7 +46,7 @@ impl Route53Dns {
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         let rrset = ResourceRecordSet::builder()
             .name(&record.name)
-            .r#type(rr_type(record.kind))
+            .r#type(rr_type(&record.kind)?)
             .ttl(record.ttl as i64)
             .resource_records(rr)
             .build()
@@ -82,22 +82,33 @@ impl Route53Dns {
     }
 }
 
-/// Map a [`RecordKind`] to the Route 53 record type.
-fn rr_type(kind: RecordKind) -> RrType {
-    match kind {
-        RecordKind::A => RrType::A,
-        RecordKind::Aaaa => RrType::Aaaa,
-        RecordKind::Cname => RrType::Cname,
-        RecordKind::Txt => RrType::Txt,
-    }
+/// Map a [`RecordKind`] to the Route 53 record type. WS1: only the original
+/// writable set maps; a newly-modeled type is refused (the central
+/// [`crate::dns::validate_writable`] guardrail catches it first, but this keeps
+/// the adapter honest if called directly).
+fn rr_type(kind: &RecordKind) -> Result<RrType, DnsError> {
+    Ok(match kind {
+        RecordKind::A(_) => RrType::A,
+        RecordKind::Aaaa(_) => RrType::Aaaa,
+        RecordKind::Cname(_) => RrType::Cname,
+        RecordKind::Txt(_) => RrType::Txt,
+        other => {
+            return Err(DnsError::UnsupportedRecordType {
+                provider: "route53",
+                kind: other.tag(),
+            });
+        }
+    })
 }
 
 /// The resource-record value. Route 53 requires `TXT` values be enclosed in
 /// double quotes; address/CNAME values are passed verbatim.
 fn rr_value(record: &DnsRecord) -> String {
-    match record.kind {
-        RecordKind::Txt => format!("\"{}\"", record.value.replace('"', "\\\"")),
-        _ => record.value.clone(),
+    let value = record.kind.flat_value();
+    if matches!(record.kind, RecordKind::Txt(_)) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value
     }
 }
 
@@ -114,6 +125,10 @@ impl DnsProvider for Route53Dns {
             Err(err) => Err(err),
         }
     }
+
+    fn name(&self) -> &'static str {
+        "route53"
+    }
 }
 
 #[cfg(test)]
@@ -123,17 +138,15 @@ mod tests {
     #[test]
     fn txt_values_are_quoted_others_verbatim() {
         let txt = DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         };
         assert_eq!(rr_value(&txt), "\"abc\"");
 
         let a = DnsRecord {
-            kind: RecordKind::A,
+            kind: RecordKind::A("203.0.113.7".parse().unwrap()),
             name: "*.deploy.example.com".into(),
-            value: "203.0.113.7".into(),
             ttl: 120,
         };
         assert_eq!(rr_value(&a), "203.0.113.7");
@@ -141,10 +154,33 @@ mod tests {
 
     #[test]
     fn record_kind_maps_to_rr_type() {
-        assert_eq!(rr_type(RecordKind::A), RrType::A);
-        assert_eq!(rr_type(RecordKind::Aaaa), RrType::Aaaa);
-        assert_eq!(rr_type(RecordKind::Cname), RrType::Cname);
-        assert_eq!(rr_type(RecordKind::Txt), RrType::Txt);
+        assert_eq!(
+            rr_type(&RecordKind::A("203.0.113.7".parse().unwrap())).unwrap(),
+            RrType::A
+        );
+        assert_eq!(
+            rr_type(&RecordKind::Aaaa("2001:db8::1".parse().unwrap())).unwrap(),
+            RrType::Aaaa
+        );
+        assert_eq!(
+            rr_type(&RecordKind::Cname("app.fly.dev".into())).unwrap(),
+            RrType::Cname
+        );
+        assert_eq!(
+            rr_type(&RecordKind::Txt(vec!["tok".into()])).unwrap(),
+            RrType::Txt
+        );
+        // A newly-modeled type is refused by the adapter's type mapping.
+        assert!(matches!(
+            rr_type(&RecordKind::Mx {
+                preference: 10,
+                exchange: "mx.example.com".into()
+            }),
+            Err(DnsError::UnsupportedRecordType {
+                kind: crate::dns::RecordKindTag::Mx,
+                ..
+            })
+        ));
     }
 
     /// Golden: the exact resource-record value for every kind. Route 53 passes
@@ -152,23 +188,31 @@ mod tests {
     /// embedded quote) — the one Route 53-specific transform, pinned here.
     #[test]
     fn rr_value_golden_for_every_kind() {
-        let rec = |kind, value: &str| DnsRecord {
+        let rec = |kind| DnsRecord {
             kind,
             name: "x.example.com".into(),
-            value: value.into(),
             ttl: 60,
         };
-        assert_eq!(rr_value(&rec(RecordKind::A, "203.0.113.7")), "203.0.113.7");
         assert_eq!(
-            rr_value(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            rr_value(&rec(RecordKind::A("203.0.113.7".parse().unwrap()))),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            rr_value(&rec(RecordKind::Aaaa("2001:db8::1".parse().unwrap()))),
             "2001:db8::1"
         );
         assert_eq!(
-            rr_value(&rec(RecordKind::Cname, "app.fly.dev")),
+            rr_value(&rec(RecordKind::Cname("app.fly.dev".into()))),
             "app.fly.dev"
         );
-        assert_eq!(rr_value(&rec(RecordKind::Txt, "tok")), "\"tok\"");
+        assert_eq!(
+            rr_value(&rec(RecordKind::Txt(vec!["tok".into()]))),
+            "\"tok\""
+        );
         // An embedded quote is backslash-escaped inside the Route 53 quoting.
-        assert_eq!(rr_value(&rec(RecordKind::Txt, "a\"b")), "\"a\\\"b\"");
+        assert_eq!(
+            rr_value(&rec(RecordKind::Txt(vec!["a\"b".into()]))),
+            "\"a\\\"b\""
+        );
     }
 }

@@ -54,9 +54,11 @@ impl Ns1Dns {
 
     /// `CNAME` answers are FQDNs with a trailing dot; other kinds take the raw value.
     fn answer_value(record: &DnsRecord) -> String {
-        match record.kind {
-            RecordKind::Cname if !record.value.ends_with('.') => format!("{}.", record.value),
-            _ => record.value.clone(),
+        let value = record.kind.flat_value();
+        if matches!(record.kind, RecordKind::Cname(_)) && !value.ends_with('.') {
+            format!("{value}.")
+        } else {
+            value
         }
     }
 
@@ -129,6 +131,10 @@ impl DnsProvider for Ns1Dns {
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "ns1"
+    }
 }
 
 #[cfg(test)]
@@ -142,9 +148,8 @@ mod tests {
     #[test]
     fn record_url_is_zone_fqdn_type() {
         let url = provider().record_url(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(
@@ -156,9 +161,8 @@ mod tests {
     #[test]
     fn body_wraps_the_value_in_an_answers_array() {
         let body = provider().record_body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(body["zone"], "example.com");
@@ -171,9 +175,8 @@ mod tests {
     #[test]
     fn cname_answer_gets_a_trailing_dot() {
         let body = provider().record_body(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("lb.example.net".into()),
             name: "*.deploy.example.com".into(),
-            value: "lb.example.net".into(),
             ttl: 120,
         });
         assert_eq!(body["answers"][0]["answer"][0], "lb.example.net.");
@@ -184,39 +187,39 @@ mod tests {
     #[test]
     fn record_body_golden_for_every_kind() {
         let p = provider();
-        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+        let rec = |kind, name: &str, ttl| DnsRecord {
             kind,
             name: name.into(),
-            value: value.into(),
             ttl,
         };
         assert_eq!(
-            p.record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            p.record_body(&rec(
+                RecordKind::A("203.0.113.7".parse().unwrap()),
+                "deploy.example.com",
+                60
+            )),
             serde_json::json!({"zone": "example.com", "domain": "deploy.example.com", "type": "A", "ttl": 60, "answers": [{"answer": ["203.0.113.7"]}]})
         );
         assert_eq!(
             p.record_body(&rec(
-                RecordKind::Aaaa,
+                RecordKind::Aaaa("2001:db8::1".parse().unwrap()),
                 "deploy.example.com",
-                "2001:db8::1",
                 60
             )),
             serde_json::json!({"zone": "example.com", "domain": "deploy.example.com", "type": "AAAA", "ttl": 60, "answers": [{"answer": ["2001:db8::1"]}]})
         );
         assert_eq!(
             p.record_body(&rec(
-                RecordKind::Cname,
+                RecordKind::Cname("lb.example.net".into()),
                 "www.example.com",
-                "lb.example.net",
                 300
             )),
             serde_json::json!({"zone": "example.com", "domain": "www.example.com", "type": "CNAME", "ttl": 300, "answers": [{"answer": ["lb.example.net."]}]})
         );
         assert_eq!(
             p.record_body(&rec(
-                RecordKind::Txt,
+                RecordKind::Txt(vec!["tok".into()]),
                 "_acme-challenge.example.com",
-                "tok",
                 60
             )),
             serde_json::json!({"zone": "example.com", "domain": "_acme-challenge.example.com", "type": "TXT", "ttl": 60, "answers": [{"answer": ["tok"]}]})

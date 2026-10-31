@@ -1474,7 +1474,7 @@ mod tests {
             async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
                 self.client
                     .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
-                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.value }))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.kind.flat_value() }))
                     .send()
                     .await
                     .and_then(reqwest::Response::error_for_status)

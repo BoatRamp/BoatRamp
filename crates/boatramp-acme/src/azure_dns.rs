@@ -75,27 +75,33 @@ impl AzureDns {
         )
     }
 
-    /// The per-type `PUT` body (`properties` with the TTL + the type's record array).
-    fn body(record: &DnsRecord) -> serde_json::Value {
+    /// The per-type `PUT` body (`properties` with the TTL + the type's record
+    /// array). WS1: only the original writable set maps; a newly-modeled type is
+    /// refused (the central [`crate::dns::validate_writable`] guardrail catches it
+    /// first, but this keeps the adapter honest if called directly).
+    fn body(record: &DnsRecord) -> Result<serde_json::Value, DnsError> {
         let mut properties = serde_json::Map::new();
         properties.insert("TTL".to_string(), serde_json::json!(record.ttl));
-        let (key, value) = match record.kind {
-            RecordKind::Txt => (
-                "TXTRecords",
-                serde_json::json!([{ "value": [record.value] }]),
-            ),
-            RecordKind::A => (
+        let (key, value) = match &record.kind {
+            RecordKind::Txt(strings) => ("TXTRecords", serde_json::json!([{ "value": strings }])),
+            RecordKind::A(ip) => (
                 "ARecords",
-                serde_json::json!([{ "ipv4Address": record.value }]),
+                serde_json::json!([{ "ipv4Address": ip.to_string() }]),
             ),
-            RecordKind::Aaaa => (
+            RecordKind::Aaaa(ip) => (
                 "AAAARecords",
-                serde_json::json!([{ "ipv6Address": record.value }]),
+                serde_json::json!([{ "ipv6Address": ip.to_string() }]),
             ),
-            RecordKind::Cname => ("CNAMERecord", serde_json::json!({ "cname": record.value })),
+            RecordKind::Cname(target) => ("CNAMERecord", serde_json::json!({ "cname": target })),
+            other => {
+                return Err(DnsError::UnsupportedRecordType {
+                    provider: "azure",
+                    kind: other.tag(),
+                });
+            }
         };
         properties.insert(key.to_string(), value);
-        serde_json::json!({ "properties": serde_json::Value::Object(properties) })
+        Ok(serde_json::json!({ "properties": serde_json::Value::Object(properties) }))
     }
 }
 
@@ -106,7 +112,7 @@ impl DnsProvider for AzureDns {
         self.client
             .put(self.record_url(record))
             .bearer_auth(&self.token)
-            .json(&Self::body(record))
+            .json(&Self::body(record)?)
             .send()
             .await
             .map_err(|e| DnsError::Backend(e.to_string()))?
@@ -130,6 +136,10 @@ impl DnsProvider for AzureDns {
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "azure"
+    }
 }
 
 #[cfg(test)]
@@ -143,9 +153,8 @@ mod tests {
     #[test]
     fn record_url_is_zone_type_relative() {
         let url = provider().record_url(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(
@@ -157,9 +166,8 @@ mod tests {
     #[test]
     fn apex_name_is_at_sign() {
         let url = provider().record_url(&DnsRecord {
-            kind: RecordKind::A,
+            kind: RecordKind::A("203.0.113.7".parse().unwrap()),
             name: "example.com".into(),
-            value: "203.0.113.7".into(),
             ttl: 60,
         });
         assert!(url.contains("/A/@?api-version="));
@@ -168,11 +176,11 @@ mod tests {
     #[test]
     fn txt_body_wraps_value_in_txtrecords() {
         let body = AzureDns::body(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
-        });
+        })
+        .unwrap();
         assert_eq!(body["properties"]["TTL"], 60);
         assert_eq!(body["properties"]["TXTRecords"][0]["value"][0], "abc");
     }
@@ -180,19 +188,19 @@ mod tests {
     #[test]
     fn typed_bodies_use_the_right_shape() {
         let a = AzureDns::body(&DnsRecord {
-            kind: RecordKind::A,
+            kind: RecordKind::A("203.0.113.7".parse().unwrap()),
             name: "deploy.example.com".into(),
-            value: "203.0.113.7".into(),
             ttl: 60,
-        });
+        })
+        .unwrap();
         assert_eq!(a["properties"]["ARecords"][0]["ipv4Address"], "203.0.113.7");
 
         let c = AzureDns::body(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("lb.example.net".into()),
             name: "*.deploy.example.com".into(),
-            value: "lb.example.net".into(),
             ttl: 120,
-        });
+        })
+        .unwrap();
         assert_eq!(c["properties"]["CNAMERecord"]["cname"], "lb.example.net");
     }
 
@@ -201,26 +209,25 @@ mod tests {
     /// encoding — Azure's DNS record-set wire shape, pinned against drift.
     #[test]
     fn body_and_relative_name_golden_for_every_kind() {
-        let rec = |kind, value: &str| DnsRecord {
+        let rec = |kind| DnsRecord {
             kind,
             name: "x.example.com".into(),
-            value: value.into(),
             ttl: 60,
         };
         assert_eq!(
-            AzureDns::body(&rec(RecordKind::A, "203.0.113.7")),
+            AzureDns::body(&rec(RecordKind::A("203.0.113.7".parse().unwrap()))).unwrap(),
             serde_json::json!({"properties": {"TTL": 60, "ARecords": [{"ipv4Address": "203.0.113.7"}]}})
         );
         assert_eq!(
-            AzureDns::body(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            AzureDns::body(&rec(RecordKind::Aaaa("2001:db8::1".parse().unwrap()))).unwrap(),
             serde_json::json!({"properties": {"TTL": 60, "AAAARecords": [{"ipv6Address": "2001:db8::1"}]}})
         );
         assert_eq!(
-            AzureDns::body(&rec(RecordKind::Cname, "lb.example.net")),
+            AzureDns::body(&rec(RecordKind::Cname("lb.example.net".into()))).unwrap(),
             serde_json::json!({"properties": {"TTL": 60, "CNAMERecord": {"cname": "lb.example.net"}}})
         );
         assert_eq!(
-            AzureDns::body(&rec(RecordKind::Txt, "tok")),
+            AzureDns::body(&rec(RecordKind::Txt(vec!["tok".into()]))).unwrap(),
             serde_json::json!({"properties": {"TTL": 60, "TXTRecords": [{"value": ["tok"]}]}})
         );
         // The apex resolves to `@`; a subdomain drops the zone suffix.

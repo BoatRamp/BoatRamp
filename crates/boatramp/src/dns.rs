@@ -163,8 +163,8 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
             provider.upsert(&record).await?;
             DnsOutput::Configured {
                 kind: record.kind.as_str().to_string(),
+                value: record.kind.flat_value(),
                 name: record.name,
-                value: record.value,
             }
         }
         DnsCommand::ConfigureDomain {
@@ -189,8 +189,8 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
             provider.upsert(&record).await?;
             DnsOutput::Pointed {
                 kind: record.kind.as_str().to_string(),
+                value: record.kind.flat_value(),
                 name: record.name,
-                value: record.value,
                 proxied,
             }
         }

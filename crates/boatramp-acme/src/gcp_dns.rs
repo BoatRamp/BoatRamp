@@ -60,10 +60,11 @@ impl GcpDns {
     /// The single-element rrdata list for `record`: TXT is double-quoted, CNAME is
     /// a trailing-dot FQDN, A/AAAA are the raw address.
     fn rrdatas(record: &DnsRecord) -> Vec<String> {
+        let raw = record.kind.flat_value();
         let value = match record.kind {
-            RecordKind::Txt => format!("\"{}\"", record.value),
-            RecordKind::Cname => Self::fqdn(&record.value),
-            _ => record.value.clone(),
+            RecordKind::Txt(_) => format!("\"{raw}\""),
+            RecordKind::Cname(_) => Self::fqdn(&raw),
+            _ => raw,
         };
         vec![value]
     }
@@ -164,6 +165,10 @@ impl DnsProvider for GcpDns {
         self.post_change(serde_json::json!({ "deletions": [current] }))
             .await
     }
+
+    fn name(&self) -> &'static str {
+        "gcp"
+    }
 }
 
 #[cfg(test)]
@@ -185,9 +190,8 @@ mod tests {
     #[test]
     fn txt_rrset_is_dotted_and_quoted() {
         let rr = provider().rrset(&DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.deploy.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         });
         assert_eq!(rr["name"], "_acme-challenge.deploy.example.com.");
@@ -199,9 +203,8 @@ mod tests {
     #[test]
     fn cname_rrdata_is_a_dotted_fqdn() {
         let rr = provider().rrset(&DnsRecord {
-            kind: RecordKind::Cname,
+            kind: RecordKind::Cname("lb.example.net".into()),
             name: "*.deploy.example.com".into(),
-            value: "lb.example.net".into(),
             ttl: 120,
         });
         assert_eq!(rr["name"], "*.deploy.example.com.");
@@ -211,9 +214,8 @@ mod tests {
     #[test]
     fn address_rrdata_is_raw() {
         let rr = provider().rrset(&DnsRecord {
-            kind: RecordKind::A,
+            kind: RecordKind::A("203.0.113.7".parse().unwrap()),
             name: "deploy.example.com".into(),
-            value: "203.0.113.7".into(),
             ttl: 60,
         });
         assert_eq!(rr["rrdatas"][0], "203.0.113.7");
@@ -224,39 +226,39 @@ mod tests {
     #[test]
     fn rrset_golden_for_every_kind() {
         let p = provider();
-        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+        let rec = |kind, name: &str, ttl| DnsRecord {
             kind,
             name: name.into(),
-            value: value.into(),
             ttl,
         };
         assert_eq!(
-            p.rrset(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            p.rrset(&rec(
+                RecordKind::A("203.0.113.7".parse().unwrap()),
+                "deploy.example.com",
+                60
+            )),
             serde_json::json!({"name": "deploy.example.com.", "type": "A", "ttl": 60, "rrdatas": ["203.0.113.7"]})
         );
         assert_eq!(
             p.rrset(&rec(
-                RecordKind::Aaaa,
+                RecordKind::Aaaa("2001:db8::1".parse().unwrap()),
                 "deploy.example.com",
-                "2001:db8::1",
                 60
             )),
             serde_json::json!({"name": "deploy.example.com.", "type": "AAAA", "ttl": 60, "rrdatas": ["2001:db8::1"]})
         );
         assert_eq!(
             p.rrset(&rec(
-                RecordKind::Cname,
+                RecordKind::Cname("lb.example.net".into()),
                 "www.example.com",
-                "lb.example.net",
                 300
             )),
             serde_json::json!({"name": "www.example.com.", "type": "CNAME", "ttl": 300, "rrdatas": ["lb.example.net."]})
         );
         assert_eq!(
             p.rrset(&rec(
-                RecordKind::Txt,
+                RecordKind::Txt(vec!["tok".into()]),
                 "_acme-challenge.example.com",
-                "tok",
                 60
             )),
             serde_json::json!({"name": "_acme-challenge.example.com.", "type": "TXT", "ttl": 60, "rrdatas": ["\"tok\""]})

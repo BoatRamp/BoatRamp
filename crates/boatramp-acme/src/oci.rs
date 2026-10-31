@@ -69,7 +69,7 @@ impl OciDns {
             "items": [{
                 "domain": record.name,
                 "rtype": record.kind.as_str(),
-                "rdata": record.value,
+                "rdata": record.kind.flat_value(),
                 "ttl": record.ttl,
             }]
         })
@@ -219,6 +219,10 @@ impl DnsProvider for OciDns {
             Err(err) => Err(err),
         }
     }
+
+    fn name(&self) -> &'static str {
+        "oci"
+    }
 }
 
 #[cfg(test)]
@@ -281,9 +285,8 @@ mod tests {
     #[test]
     fn rrset_path_and_body() {
         let record = DnsRecord {
-            kind: RecordKind::Txt,
+            kind: RecordKind::Txt(vec!["abc".into()]),
             name: "_acme-challenge.example.com".into(),
-            value: "abc".into(),
             ttl: 60,
         };
         // (build a provider only to exercise rrset_path; key parsing is separate)
@@ -301,26 +304,25 @@ mod tests {
     /// that would confirm the server accepts these unadorned values.
     #[test]
     fn rrset_body_golden_for_every_kind() {
-        let rec = |kind, value: &str| DnsRecord {
+        let rec = |kind| DnsRecord {
             kind,
             name: "x.example.com".into(),
-            value: value.into(),
             ttl: 60,
         };
         assert_eq!(
-            OciDns::rrset_body(&rec(RecordKind::A, "203.0.113.7")),
+            OciDns::rrset_body(&rec(RecordKind::A("203.0.113.7".parse().unwrap()))),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "A", "rdata": "203.0.113.7", "ttl": 60}]})
         );
         assert_eq!(
-            OciDns::rrset_body(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            OciDns::rrset_body(&rec(RecordKind::Aaaa("2001:db8::1".parse().unwrap()))),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "AAAA", "rdata": "2001:db8::1", "ttl": 60}]})
         );
         assert_eq!(
-            OciDns::rrset_body(&rec(RecordKind::Cname, "lb.example.net")),
+            OciDns::rrset_body(&rec(RecordKind::Cname("lb.example.net".into()))),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "CNAME", "rdata": "lb.example.net", "ttl": 60}]})
         );
         assert_eq!(
-            OciDns::rrset_body(&rec(RecordKind::Txt, "tok")),
+            OciDns::rrset_body(&rec(RecordKind::Txt(vec!["tok".into()]))),
             serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "TXT", "rdata": "tok", "ttl": 60}]})
         );
     }
