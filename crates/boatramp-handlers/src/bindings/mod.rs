@@ -438,8 +438,11 @@ impl Bindings {
 
     /// Grant the `dns-publish` capability (cap-req #24 WS3), backed by the host-held `provider` writer
     /// authoritative over `zone_root`. `writable_zones` is the per-grant allowlist constraining the
-    /// record's OWN name (empty ⇒ deny-all); `audit` is the redacted mutation sink. The posture gate +
-    /// the store-resident publish budget are enforced by the binding at use. The guest never sees the
+    /// record's OWN name (empty ⇒ deny-all); `ns_targets` is the per-grant NS-target allowlist for a
+    /// sub-zone `NS` delegation (Security review MEDIUM-3), consulted only under the `allowlist` NS
+    /// posture (empty ⇒ deny-all there); `audit` is the redacted mutation sink. The posture gates (the
+    /// whole-capability `allow_guest_dns_publish` + the NS-delegation `guest_dns_publish_ns`) and the
+    /// store-resident publish budget are enforced by the binding at use. The guest never sees the
     /// provider credential.
     #[cfg(feature = "dns-publish")]
     pub fn with_dns_publish(
@@ -447,12 +450,14 @@ impl Bindings {
         provider: std::sync::Arc<dyn boatramp_acme::dns::DnsProvider>,
         zone_root: impl Into<String>,
         writable_zones: Vec<String>,
+        ns_targets: Vec<String>,
         audit: std::sync::Arc<dyn dns_publish::DnsPublishAuditSink>,
     ) -> Self {
         self.dns_publish = Some(dns_publish::DnsPublishBinding::new(
             provider,
             zone_root,
             writable_zones,
+            ns_targets,
             audit,
         ));
         self

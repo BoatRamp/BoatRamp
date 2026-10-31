@@ -77,6 +77,7 @@ pub(crate) fn maybe_attach(
     project: &str,
     site: &str,
     writable_zones: &[String],
+    ns_targets: &[String],
 ) -> boatramp_handlers::Bindings {
     if !granted {
         return bindings;
@@ -91,6 +92,9 @@ pub(crate) fn maybe_attach(
         grant.provider,
         grant.zone_root,
         writable_zones.to_vec(),
+        // The per-grant NS-target allowlist for a sub-zone NS delegation (MEDIUM-3). Deploy-record
+        // config, mirrored from the handler/function/consumer config exactly like `writable_zones`.
+        ns_targets.to_vec(),
         default_audit_sink(),
     )
 }

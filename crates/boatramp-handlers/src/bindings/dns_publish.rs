@@ -40,6 +40,8 @@ use boatramp_acme::dns::{
     canonicalize_owner_name, validate_writable,
 };
 
+use crate::engine::GuestDnsPublishNs;
+
 mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
@@ -135,24 +137,33 @@ pub struct DnsPublishBinding {
     /// The authorized writable-zone suffixes (globs). Empty ⇒ deny-all. Matched against the record's
     /// OWN name only.
     writable_zones: Arc<[String]>,
+    /// The authorized **NS-target** suffixes (globs) for a sub-zone `NS` delegation (Security review
+    /// MEDIUM-3). Consulted ONLY under the `Allowlist` NS posture, and matched against the NS record's
+    /// rdata TARGET nameserver (NOT its own name). **Empty ⇒ deny-all** under `Allowlist` (fail-closed).
+    /// This is the DNS analog of `writable_zones` but for the one rdata target that is constrained; the
+    /// own-name allowlist above is unchanged (still own-name-only) and governs every record type.
+    ns_targets: Arc<[String]>,
     /// Where each mutation is audited (redacted).
     audit: Arc<dyn DnsPublishAuditSink>,
 }
 
 impl DnsPublishBinding {
     /// Build the grant. `zone_root` is the provider's authoritative zone apex; `writable_zones` is the
-    /// per-grant allowlist (empty ⇒ deny-all); `audit` is the redacted sink (use
-    /// [`TracingDnsPublishSink`] for the default).
+    /// per-grant own-name allowlist (empty ⇒ deny-all); `ns_targets` is the per-grant NS-target
+    /// allowlist for a sub-zone NS delegation (empty ⇒ deny-all under the `Allowlist` posture);
+    /// `audit` is the redacted sink (use [`TracingDnsPublishSink`] for the default).
     pub fn new(
         provider: Arc<dyn DnsProvider>,
         zone_root: impl Into<String>,
         writable_zones: Vec<String>,
+        ns_targets: Vec<String>,
         audit: Arc<dyn DnsPublishAuditSink>,
     ) -> Self {
         Self {
             provider,
             zone_root: zone_root.into(),
             writable_zones: Arc::from(writable_zones),
+            ns_targets: Arc::from(ns_targets),
             audit,
         }
     }
@@ -197,6 +208,46 @@ fn zone_glob_matches(glob: &str, name: &str) -> bool {
 /// target is never passed here.
 fn zone_authorized(allowlist: &[String], name: &str) -> bool {
     !allowlist.is_empty() && allowlist.iter().any(|g| zone_glob_matches(g, name))
+}
+
+/// The sub-zone `NS` delegation gate (Security review MEDIUM-3, cap-req #24), applied ONLY to a
+/// **non-apex `NS`** record (the apex NS is already refused by [`validate_writable`] before this runs).
+/// A sub-zone NS delegates that subtree to an arbitrary nameserver — a persistent, post-revocation,
+/// unaudited authority handoff — so its rdata TARGET is constrained here. This is the ONE place an
+/// rdata target is ever constrained; the own-name writable-zone allowlist (checked separately in
+/// [`DnsPublishHost::prepare`]) is unchanged and still own-name-only.
+///
+/// - [`GuestDnsPublishNs::None`]  ⇒ refuse every sub-zone NS (`not-authorized`).
+/// - [`GuestDnsPublishNs::Allowlist`] ⇒ the NS `target` (canonicalized with the SAME
+///   [`canonicalize_owner_name`] used for the owner name, so a syntactically-illegal target is
+///   `invalid-record`) must match the per-grant `ns_targets` allowlist; **empty ⇒ deny-all**.
+/// - [`GuestDnsPublishNs::Any`] ⇒ allow (today's behavior); the target is neither canonicalized nor
+///   constrained.
+fn ns_delegation_authorized(
+    posture: GuestDnsPublishNs,
+    ns_targets: &[String],
+    target: &str,
+) -> Result<(), dns_publish::PublishError> {
+    match posture {
+        GuestDnsPublishNs::Any => Ok(()),
+        GuestDnsPublishNs::None => Err(dns_publish::PublishError::NotAuthorized(format!(
+            "sub-zone NS delegation is disabled by node posture (guest_dns_publish_ns = none); \
+             NS target '{target}'"
+        ))),
+        GuestDnsPublishNs::Allowlist => {
+            // Canonicalize the NS target with the SAME validator used for the owner name, so the string
+            // matched against the allowlist is syntactically valid + normalized (an illegal target is
+            // `invalid-record`, never silently authorized as a normalized copy).
+            let canonical = canonicalize_owner_name(target).map_err(map_guardrail_err)?;
+            if zone_authorized(ns_targets, &canonical) {
+                Ok(())
+            } else {
+                Err(dns_publish::PublishError::NotAuthorized(format!(
+                    "NS target '{canonical}' is not in the dns_publish_ns_targets allowlist"
+                )))
+            }
+        }
+    }
 }
 
 /// Map a WIT CAA tag to the acme model.
@@ -306,6 +357,9 @@ fn map_write_err(e: &DnsError) -> dns_publish::PublishError {
 pub struct DnsPublishHost<'a> {
     binding: Option<&'a DnsPublishBinding>,
     posture_enabled: bool,
+    /// The sub-zone `NS` delegation posture (Security review MEDIUM-3), carried from the store-resident
+    /// `HostState` exactly like `posture_enabled`. Applied by [`Self::prepare`] ONLY to a non-apex NS.
+    ns_posture: GuestDnsPublishNs,
     budget: &'a AtomicU32,
 }
 
@@ -313,11 +367,13 @@ impl<'a> DnsPublishHost<'a> {
     pub fn new(
         binding: Option<&'a DnsPublishBinding>,
         posture_enabled: bool,
+        ns_posture: GuestDnsPublishNs,
         budget: &'a AtomicU32,
     ) -> Self {
         Self {
             binding,
             posture_enabled,
+            ns_posture,
             budget,
         }
     }
@@ -372,8 +428,16 @@ impl<'a> DnsPublishHost<'a> {
     ///
     /// Then build the typed record and run [`validate_writable`] (apex-NS / supported-kind /
     /// malformed-rdata) on that same canonical name.
+    ///
+    /// **Sub-zone NS delegation posture (Security review MEDIUM-3).** After the guardrail (which has
+    /// already refused an apex NS), a surviving non-apex `NS` is additionally held to `ns_posture`
+    /// ([`ns_delegation_authorized`]): `None` refuses it, `Allowlist` holds the NS record's rdata
+    /// TARGET to the per-grant `ns_targets` allowlist, `Any` allows it (today's behavior). This is the
+    /// ONLY place the rdata target is constrained and it is NS-SPECIFIC — the own-name allowlist above
+    /// is unchanged (still own-name-only) and every non-NS record is unaffected by this posture.
     fn prepare(
         b: &DnsPublishBinding,
+        ns_posture: GuestDnsPublishNs,
         wit: dns_publish::DnsRecord,
     ) -> Result<AcmeRecord, dns_publish::PublishError> {
         // Canonicalize the guest name up front — invalid ⇒ invalid-record, before the allowlist.
@@ -390,6 +454,11 @@ impl<'a> DnsPublishHost<'a> {
             ttl: wit.ttl,
         };
         validate_writable(b.provider.as_ref(), &record, &b.zone_root).map_err(map_guardrail_err)?;
+        // MEDIUM-3: a surviving (non-apex) NS is gated by the operator's sub-zone-delegation posture.
+        // The apex NS was already refused by `validate_writable`, so this only ever sees a sub-zone NS.
+        if let RecordKind::Ns(ref target) = record.kind {
+            ns_delegation_authorized(ns_posture, &b.ns_targets, target)?;
+        }
         Ok(record)
     }
 }
@@ -443,7 +512,7 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         record: dns_publish::DnsRecord,
     ) -> Result<(), dns_publish::PublishError> {
         let b = self.admit()?;
-        let prepared = Self::prepare(b, record)?;
+        let prepared = Self::prepare(b, self.ns_posture, record)?;
         self.spend(1)?;
         write_one(b, &prepared, DnsPublishOp::Upsert).await
     }
@@ -453,7 +522,7 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         record: dns_publish::DnsRecord,
     ) -> Result<(), dns_publish::PublishError> {
         let b = self.admit()?;
-        let prepared = Self::prepare(b, record)?;
+        let prepared = Self::prepare(b, self.ns_posture, record)?;
         self.spend(1)?;
         write_one(b, &prepared, DnsPublishOp::Delete).await
     }
@@ -476,7 +545,7 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         // one bad record refuses the whole set and nothing is written.
         let mut prepared = Vec::with_capacity(records.len());
         for r in records {
-            prepared.push(Self::prepare(b, r)?);
+            prepared.push(Self::prepare(b, self.ns_posture, r)?);
         }
         // Reserve the whole set's budget up front — a set that cannot fit the budget writes NOTHING.
         self.spend(prepared.len() as u32)?;
@@ -610,10 +679,24 @@ mod tests {
         zone_root: &str,
         zones: &[&str],
     ) -> DnsPublishBinding {
+        // No NS-target allowlist by default (the non-NS tests + the `Any`-posture NS test don't need
+        // one; `Any` ignores it and `None` refuses regardless).
+        binding_with_ns(provider, zone_root, zones, &[])
+    }
+
+    /// Like [`binding_with`] but with an explicit NS-target allowlist, for the MEDIUM-3 sub-zone-NS
+    /// delegation tests under the `Allowlist` posture.
+    fn binding_with_ns(
+        provider: Arc<StubProvider>,
+        zone_root: &str,
+        zones: &[&str],
+        ns_targets: &[&str],
+    ) -> DnsPublishBinding {
         DnsPublishBinding::new(
             provider,
             zone_root,
             zones.iter().map(|s| (*s).to_string()).collect(),
+            ns_targets.iter().map(|s| (*s).to_string()).collect(),
             Arc::new(TracingDnsPublishSink),
         )
     }
@@ -637,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn ungranted_is_access_denied() {
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(None, true, &bud);
+        let mut host = DnsPublishHost::new(None, true, GuestDnsPublishNs::Any, &bud);
         assert!(matches!(
             host.upsert(a_record("x.example.com", "203.0.113.7")).await,
             Err(dns_publish::PublishError::AccessDenied)
@@ -652,7 +735,7 @@ mod tests {
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(16);
         // granted (Some) but posture OFF ⇒ denied, fail-closed.
-        let mut host = DnsPublishHost::new(Some(&b), false, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), false, GuestDnsPublishNs::Any, &bud);
         assert!(matches!(
             host.upsert(a_record("x.example.com", "203.0.113.7")).await,
             Err(dns_publish::PublishError::AccessDenied)
@@ -668,7 +751,7 @@ mod tests {
         let bud = budget(16);
         // In-zone own name is allowed and written.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(a_record("www.example.com", "203.0.113.7"))
                 .await
                 .expect("in-zone upsert ok");
@@ -676,7 +759,7 @@ mod tests {
         assert_eq!(p.count(), 1);
         // An out-of-zone own name is refused (and nothing more is written).
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             let err = host
                 .upsert(a_record("www.evil.com", "203.0.113.7"))
                 .await
@@ -698,7 +781,7 @@ mod tests {
         let bud = budget(16);
         // CNAME at an in-zone name pointing to an out-of-zone target.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(rec(
                 "www.example.com",
                 dns_publish::Rdata::Cname("lb.other-domain.net".into()),
@@ -708,7 +791,7 @@ mod tests {
         }
         // MX at the apex pointing to another domain's mail host (the direct-MX relay shape).
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(rec(
                 "example.com",
                 dns_publish::Rdata::Mx(dns_publish::MxData {
@@ -727,7 +810,7 @@ mod tests {
         let p = Arc::new(StubProvider::new(BASIC));
         let b = binding_with(p.clone(), "example.com", &[]); // empty ⇒ deny-all
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         assert!(matches!(
             host.upsert(a_record("www.example.com", "203.0.113.7"))
                 .await,
@@ -742,7 +825,7 @@ mod tests {
         let p = Arc::new(StubProvider::new(BASIC));
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         let err = host
             .upsert(rec(
                 "example.com",
@@ -772,7 +855,7 @@ mod tests {
         let bud = budget(16);
         // Apex NS (name == zone_root) is refused.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             let err = host
                 .upsert(rec(
                     "example.com",
@@ -787,7 +870,7 @@ mod tests {
         }
         // Sub-zone NS delegation is allowed.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(rec(
                 "sub.example.com",
                 dns_publish::Rdata::Ns("ns1.example.net".into()),
@@ -798,6 +881,186 @@ mod tests {
         assert_eq!(p.count(), 1, "only the subzone NS was written");
     }
 
+    // ---- MEDIUM-3: sub-zone NS delegation posture --------------------------
+
+    /// Posture `None`: a sub-zone NS is refused even though the grant is present, the posture is on,
+    /// and the record's OWN name is squarely inside the writable-zone allowlist. Nothing is written and
+    /// no budget is spent (the refusal is pre-write). An NS is a persistent delegation handoff, so a
+    /// multi-tenant guest may not create one at all.
+    #[tokio::test]
+    async fn ns_posture_none_refuses_subzone_ns() {
+        let p = Arc::new(StubProvider::new(FIRST_CLASS)); // provider supports NS — only the posture can refuse
+        let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
+        let bud = budget(16);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::None, &bud);
+        let err = host
+            .upsert(rec(
+                "sub.example.com", // own name IS in the zone allowlist
+                dns_publish::Rdata::Ns("ns1.example.net".into()),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, dns_publish::PublishError::NotAuthorized(ref m) if m.contains("none")),
+            "sub-zone NS refused under posture none: {err:?}"
+        );
+        assert_eq!(p.count(), 0, "no NS written under posture none");
+        assert_eq!(
+            bud.load(Ordering::Relaxed),
+            16,
+            "a pre-write NS refusal burns no budget"
+        );
+    }
+
+    /// Posture `Allowlist`: a sub-zone NS whose rdata TARGET is on the per-grant `dns_publish_ns_targets`
+    /// allowlist is written; one whose target is outside it is refused (nothing written). The OWN name
+    /// is in the writable-zone allowlist in BOTH cases — only the NS TARGET differs — so this isolates
+    /// the new NS-target constraint from the unchanged own-name allowlist.
+    #[tokio::test]
+    async fn ns_posture_allowlist_gates_the_ns_target() {
+        let p = Arc::new(StubProvider::new(FIRST_CLASS));
+        // The operator sanctions only its own nameservers (any depth under example.net).
+        let b = binding_with_ns(
+            p.clone(),
+            "example.com",
+            &["**.example.com"],
+            &["**.example.net"],
+        );
+        let bud = budget(16);
+        // In-allowlist NS target ⇒ delegation written.
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Allowlist, &bud);
+            host.upsert(rec(
+                "sub.example.com",
+                dns_publish::Rdata::Ns("ns1.example.net".into()),
+            ))
+            .await
+            .expect("NS to an allowlisted target is written");
+        }
+        assert_eq!(p.count(), 1);
+        // Out-of-allowlist NS target ⇒ refused, nothing further written.
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Allowlist, &bud);
+            let err = host
+                .upsert(rec(
+                    "sub.example.com", // same (allowed) own name
+                    dns_publish::Rdata::Ns("ns1.attacker.test".into()),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, dns_publish::PublishError::NotAuthorized(ref m) if m.contains("attacker.test")),
+                "NS to a non-allowlisted target refused: {err:?}"
+            );
+        }
+        assert_eq!(
+            p.count(),
+            1,
+            "the out-of-allowlist NS never reached the provider"
+        );
+    }
+
+    /// Posture `Allowlist` with an EMPTY `dns_publish_ns_targets` ⇒ deny-all for sub-zone NS
+    /// (fail-closed), even when the record's own name is in the writable-zone allowlist. A grant that
+    /// names no NS targets can delegate to none.
+    #[tokio::test]
+    async fn ns_posture_allowlist_empty_denies_all_ns() {
+        let p = Arc::new(StubProvider::new(FIRST_CLASS));
+        let b = binding_with_ns(p.clone(), "example.com", &["**.example.com"], &[]); // empty NS allowlist
+        let bud = budget(16);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Allowlist, &bud);
+        let err = host
+            .upsert(rec(
+                "sub.example.com",
+                dns_publish::Rdata::Ns("ns1.example.net".into()),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, dns_publish::PublishError::NotAuthorized(_)),
+            "empty NS allowlist + posture allowlist ⇒ deny-all: {err:?}"
+        );
+        assert_eq!(p.count(), 0);
+    }
+
+    /// Non-NS records (A/MX/CNAME/…) are UNAFFECTED by the NS posture: even under the strictest NS
+    /// posture (`None`) they are gated solely by the own-name writable-zone allowlist, exactly as
+    /// before. An A record and a CNAME whose target points outside the zone both still pass.
+    #[tokio::test]
+    async fn ns_posture_does_not_affect_non_ns_records() {
+        let p = Arc::new(StubProvider::new(FIRST_CLASS));
+        let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
+        let bud = budget(16);
+        // An A record at an in-zone name — allowed under posture None (NS posture is irrelevant to A).
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::None, &bud);
+            host.upsert(a_record("www.example.com", "203.0.113.7"))
+                .await
+                .expect("A record unaffected by the NS posture");
+        }
+        // A CNAME whose TARGET points outside the zone — still allowed under posture None (the NS
+        // posture gates only NS targets, never a CNAME target).
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::None, &bud);
+            host.upsert(rec(
+                "www.example.com",
+                dns_publish::Rdata::Cname("lb.other-domain.net".into()),
+            ))
+            .await
+            .expect("CNAME to a foreign target unaffected by the NS posture");
+        }
+        assert_eq!(
+            p.count(),
+            2,
+            "both non-NS records were written under posture none"
+        );
+    }
+
+    /// The NS target is canonicalized with the SAME validator used for the owner name before matching,
+    /// so a legitimate-but-non-canonical target (uppercase + trailing dot) matches the allowlist, while
+    /// a syntactically-illegal target is `invalid-record` (never silently authorized).
+    #[tokio::test]
+    async fn ns_posture_allowlist_canonicalizes_the_target() {
+        let p = Arc::new(StubProvider::new(FIRST_CLASS));
+        let b = binding_with_ns(
+            p.clone(),
+            "example.com",
+            &["**.example.com"],
+            &["**.example.net"],
+        );
+        let bud = budget(16);
+        // Uppercase + trailing dot canonicalizes to `ns1.example.net`, which the allowlist matches.
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Allowlist, &bud);
+            host.upsert(rec(
+                "sub.example.com",
+                dns_publish::Rdata::Ns("NS1.Example.NET.".into()),
+            ))
+            .await
+            .expect("non-canonical allowlisted NS target is authorized");
+        }
+        // A syntactically-illegal target is invalid-record (before any allowlist decision).
+        {
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Allowlist, &bud);
+            let err = host
+                .upsert(rec(
+                    "sub.example.com",
+                    dns_publish::Rdata::Ns("../../evil.example.net".into()),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, dns_publish::PublishError::InvalidRecord(_)),
+                "an illegal NS target is invalid-record: {err:?}"
+            );
+        }
+        assert_eq!(
+            p.count(),
+            1,
+            "only the canonical, allowlisted NS was written"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_rdata_is_refused() {
         let p = Arc::new(StubProvider::new(BASIC));
@@ -805,7 +1068,7 @@ mod tests {
         let bud = budget(16);
         // A bad IPv4 literal → invalid-record (build fails).
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             assert!(matches!(
                 host.upsert(a_record("www.example.com", "not-an-ip")).await,
                 Err(dns_publish::PublishError::InvalidRecord(_))
@@ -813,7 +1076,7 @@ mod tests {
         }
         // An over-long TXT character-string → invalid-record (validate_writable).
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             assert!(matches!(
                 host.upsert(rec(
                     "www.example.com",
@@ -837,14 +1100,14 @@ mod tests {
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(N); // the store-resident cell, shared across rebuilt views
         for i in 0..N {
-            let mut view = DnsPublishHost::new(Some(&b), true, &bud); // rebuilt per call
+            let mut view = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud); // rebuilt per call
             view.upsert(a_record(&format!("r{i}.example.com"), "203.0.113.7"))
                 .await
                 .unwrap_or_else(|e| panic!("call {i} within budget: {e:?}"));
         }
         // A FRESH view on the SAME cell is now exhausted — proves the counter is store-resident (and the
         // allowlist, held in the shared binding, kept authorizing every one of the ≥2 calls).
-        let mut view = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut view = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         assert!(matches!(
             view.upsert(a_record("over.example.com", "203.0.113.7"))
                 .await,
@@ -857,7 +1120,7 @@ mod tests {
         );
         // A DIFFERENT cell (a new invocation) gets a fresh budget.
         let bud2 = budget(N);
-        let mut other = DnsPublishHost::new(Some(&b), true, &bud2);
+        let mut other = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud2);
         other
             .upsert(a_record("fresh.example.com", "203.0.113.7"))
             .await
@@ -870,7 +1133,7 @@ mod tests {
         let p = Arc::new(StubProvider::new(BASIC));
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(2);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         let set = vec![
             a_record("a.example.com", "203.0.113.1"),
             a_record("b.example.com", "203.0.113.2"),
@@ -894,7 +1157,7 @@ mod tests {
         let p = Arc::new(StubProvider::new(BASIC)); // no MX
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         let set = vec![
             a_record("a.example.com", "203.0.113.1"),
             rec(
@@ -924,7 +1187,7 @@ mod tests {
         let p = Arc::new(provider);
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         host.delete(a_record("gone.example.com", "203.0.113.7"))
             .await
             .expect("delete of absent record converges to ok");
@@ -940,10 +1203,11 @@ mod tests {
             p.clone(),
             "example.com",
             vec!["**.example.com".into()],
+            Vec::new(),
             sink.clone(),
         );
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         let err = host
             .upsert(a_record("www.example.com", "203.0.113.7"))
             .await
@@ -968,12 +1232,13 @@ mod tests {
             p.clone(),
             "example.com",
             vec!["**.example.com".into()],
+            Vec::new(),
             sink.clone(),
         );
         let bud = budget(16);
         // Two calls through two REBUILT views sharing the one store-resident binding + sink.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(rec(
                 "_dmarc.example.com",
                 // A TXT whose VALUE must never appear in the audit log (redaction proof).
@@ -983,7 +1248,7 @@ mod tests {
             .unwrap();
         }
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.delete(a_record("old.example.com", "203.0.113.9"))
                 .await
                 .unwrap();
@@ -1034,7 +1299,7 @@ mod tests {
             ".example.com",
         ];
         for a in attacks {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             let err = host
                 .upsert(a_record(a, "203.0.113.7"))
                 .await
@@ -1046,7 +1311,7 @@ mod tests {
         }
         // An overlong label is likewise invalid-record.
         {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             let overlong = format!("{}.example.com", "a".repeat(64));
             assert!(matches!(
                 host.upsert(a_record(&overlong, "203.0.113.7")).await,
@@ -1071,7 +1336,7 @@ mod tests {
         let p = Arc::new(StubProvider::new(BASIC));
         let b = binding_with(p.clone(), "example.com", &["**.example.com"]);
         let bud = budget(16);
-        let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+        let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
         host.upsert(a_record("WWW.Example.COM.", "203.0.113.7"))
             .await
             .expect("legit non-canonical name is authorized");
@@ -1097,7 +1362,7 @@ mod tests {
             ("*.example.com", "*.example.com"),
             ("mail.example.com.", "mail.example.com"),
         ] {
-            let mut host = DnsPublishHost::new(Some(&b), true, &bud);
+            let mut host = DnsPublishHost::new(Some(&b), true, GuestDnsPublishNs::Any, &bud);
             host.upsert(a_record(raw, "203.0.113.7"))
                 .await
                 .unwrap_or_else(|e| panic!("legit name {raw:?} should pass: {e:?}"));

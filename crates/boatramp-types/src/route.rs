@@ -813,6 +813,7 @@ mod tests {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         };
         let handlers = vec![
             handler("/api/orders/*", &["GET", "POST"]),
@@ -856,6 +857,7 @@ mod tests {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         }
     }
 

@@ -759,6 +759,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER",
     "BOATRAMP_SECURITY_ALLOW_GUEST_DNS_PUBLISH",
+    "BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
     "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
     "BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE",
@@ -4056,6 +4057,45 @@ mod tests {
         assert!(posture.allow_cross_tenant_db);
         assert!(posture.allow_guest_mint_capability);
         assert_eq!(posture.max_guest_capability_ttl_secs, 1800);
+    }
+
+    #[test]
+    fn env_wires_the_guest_dns_publish_ns_posture() {
+        // MEDIUM-3: the sub-zone NS delegation posture is an ENUM knob set via env (the string value
+        // deserializes into `GuestDnsPublishNs`), not a bool — so prove the figment enum path works
+        // end-to-end and that `security explain` attributes it to the override source.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SECURITY_PROFILE", "multi-tenant"),
+            ("BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS", "allowlist"),
+        ]))
+        .expect("the enum posture value parses from env");
+        let security = cfg.security.expect("security materialised from env");
+        assert_eq!(
+            security.resolve().expect("resolves").guest_dns_publish_ns,
+            boatramp_core::security::GuestDnsPublishNs::Allowlist,
+            "env flips the NS posture over the multi-tenant default (none)"
+        );
+        assert!(
+            security
+                .explain()
+                .expect("explains")
+                .lines()
+                .any(|l| l.contains("guest_dns_publish_ns")
+                    && l.contains("allowlist")
+                    && l.contains("(override)")),
+            "explain shows guest_dns_publish_ns = allowlist (override)"
+        );
+        // An unknown variant is rejected LOUDLY (never silently defaulted).
+        let mut bad = ServerConfig::default();
+        assert!(
+            bad.apply_env_overrides(&env(&[(
+                "BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS",
+                "sometimes",
+            )]))
+            .is_err(),
+            "an unknown NS posture variant must fail loudly"
+        );
     }
 
     #[test]

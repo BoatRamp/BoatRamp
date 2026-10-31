@@ -228,6 +228,11 @@ pub async fn build_handler_runtime(
     // the `DnsPublishHost` binding fail-closed to `access-denied` for every call. INDEPENDENT of the
     // egress knobs (DNS write is a distinct authority).
     allow_guest_dns_publish: bool,
+    // Posture: the sub-zone `NS` delegation setting for a guest's `dns-publish` (Security review
+    // MEDIUM-3). `none` refuses all sub-zone NS, `allowlist` holds the NS target to the per-grant
+    // allowlist, `any` is today's behavior. Typed as the `boatramp-core` posture enum (always
+    // available); mapped onto the handler-engine enum below. INDEPENDENT of `allow_guest_dns_publish`.
+    guest_dns_publish_ns: boatramp_core::security::GuestDnsPublishNs,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
     // Dev-posture guest-egress extra CA(s), DER-encoded (empty ⇒ stock webpki-only egress trust).
@@ -505,6 +510,19 @@ pub async fn build_handler_runtime(
     // Posture gate for the guest `dns-publish` write capability (cap-req #24 WS3). OFF by default ⇒
     // fail-closed `access-denied`. INDEPENDENT of the egress knobs.
     .with_dns_publish(allow_guest_dns_publish)
+    // Sub-zone `NS` delegation posture (Security review MEDIUM-3): map the `boatramp-core` posture
+    // enum onto the handler-engine mirror (this layer owns both; the engine crate can't see types).
+    .with_dns_publish_ns(match guest_dns_publish_ns {
+        boatramp_core::security::GuestDnsPublishNs::Any => {
+            boatramp_handlers::GuestDnsPublishNs::Any
+        }
+        boatramp_core::security::GuestDnsPublishNs::None => {
+            boatramp_handlers::GuestDnsPublishNs::None
+        }
+        boatramp_core::security::GuestDnsPublishNs::Allowlist => {
+            boatramp_handlers::GuestDnsPublishNs::Allowlist
+        }
+    })
     .with_self_egress(self_egress_addrs)
     .with_guest_egress_extra_roots(guest_egress_extra_roots)
     .with_streaming_idle_ms(
@@ -1017,6 +1035,10 @@ pub async fn build_handler_runtime(
     // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
     // gate, so it is ignored.
     _allow_guest_dns_publish: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
+    // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
+    // gate, so the sub-zone-NS posture is ignored (MEDIUM-3).
+    _guest_dns_publish_ns: boatramp_core::security::GuestDnsPublishNs,
     _self_egress_addrs: Vec<std::net::SocketAddr>,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean

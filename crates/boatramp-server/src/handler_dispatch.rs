@@ -551,6 +551,8 @@ pub(super) async fn dispatch_handler(
         &handler.egress_allowlist,
         // Per-handler `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
         &handler.dns_publish_zones,
+        // Per-handler `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
+        &handler.dns_publish_ns_targets,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // Ask B-3 (B): `no_secrets` ⇒ resolve ZERO site secrets for this handler (a blob/image route
@@ -2263,6 +2265,13 @@ pub(super) async fn build_bindings(
     // `handlers`-on/`dns-publish`-off build.
     #[cfg_attr(not(feature = "dns-publish"), allow(unused_variables))]
     dns_publish_zones: &[String],
+    // Per-component approved NS-target allowlist for a sub-zone `NS` delegation (Security review
+    // MEDIUM-3, cap-req #24): the authorized nameserver targets this component's sub-zone NS may
+    // delegate to, consulted by the host ONLY under the `allowlist` NS posture (`guest_dns_publish_ns`).
+    // Empty ⇒ deny-all under that posture. The DNS analog of `dns_publish_zones` but for the NS rdata
+    // TARGET; does not affect any non-NS record. Consumed only under the `dns-publish` feature.
+    #[cfg_attr(not(feature = "dns-publish"), allow(unused_variables))]
+    dns_publish_ns_targets: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -3121,6 +3130,7 @@ pub(super) async fn build_bindings(
             project.as_str(),
             site,
             dns_publish_zones,
+            dns_publish_ns_targets,
         );
     }
     Ok(bindings)
@@ -3568,6 +3578,10 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component `dns-publish` writable-zone allowlist (cap-req #24 WS3). Empty ⇒
     /// deny-all. Threaded so a per-message rebuild gates DNS writes identically to the once-per-tick build.
     pub dns_publish_zones: &'a [String],
+    /// The consumer's per-component `dns-publish` NS-target allowlist (Security review MEDIUM-3). Empty
+    /// ⇒ deny-all under the `allowlist` NS posture. Threaded so a per-message rebuild gates a sub-zone
+    /// NS delegation identically to the once-per-tick build.
+    pub dns_publish_ns_targets: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -3600,6 +3614,7 @@ impl ConsumerRebuild<'_> {
             self.blobstore_containers,
             self.egress_allowlist,
             self.dns_publish_zones,
+            self.dns_publish_ns_targets,
             self.secret_allowlist,
             // Consumers resolve their secrets as before (no `no_secrets` opt-out on the async lane).
             false,
@@ -4896,6 +4911,8 @@ mod consumer_dns_resolve_tests {
             &[],
             &allow,
             // dns_publish_zones (cap-req #24 WS3): empty ⇒ deny-all (this test exercises egress only).
+            &[],
+            // dns_publish_ns_targets (MEDIUM-3): empty ⇒ deny-all under the `allowlist` NS posture.
             &[],
             &[],
             false,

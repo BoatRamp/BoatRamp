@@ -1022,6 +1022,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.egress_allowlist,
                                 // The consumer's `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                                 &consumer.dns_publish_zones,
+                                // The consumer's `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
+                                &consumer.dns_publish_ns_targets,
                                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                                 &consumer.secrets,
                                 // Consumers resolve their secrets as before (no `no_secrets` opt-out).
@@ -1091,6 +1093,7 @@ pub(super) async fn run_scheduler_tick(
                                     blobstore_containers: &consumer.blobstore_containers,
                                     egress_allowlist: &consumer.egress_allowlist,
                                     dns_publish_zones: &consumer.dns_publish_zones,
+                                    dns_publish_ns_targets: &consumer.dns_publish_ns_targets,
                                     secret_allowlist: &consumer.secrets,
                                 });
                             // Dispatch ONCE per matching concrete topic (v0.7.1 fan-in). For a
@@ -1521,6 +1524,8 @@ async fn fire_cron(
         &handler.egress_allowlist,
         // …and its `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
         &handler.dns_publish_zones,
+        // …and its `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
+        &handler.dns_publish_ns_targets,
         // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
         &handler.secrets,
         // …and its `no_secrets` opt-out (Ask B-3 B).

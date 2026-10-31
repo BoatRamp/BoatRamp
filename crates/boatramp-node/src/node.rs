@@ -189,6 +189,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let allow_guest_tcp_egress = options.posture.allow_guest_tcp_egress;
     let allow_guest_tcp_listener = options.posture.allow_guest_tcp_listener;
     let allow_guest_dns_publish = options.posture.allow_guest_dns_publish;
+    // Sub-zone `NS` delegation posture (Security review MEDIUM-3); mapped onto the handler-engine enum
+    // inside `build_handler_runtime` (which owns both crates).
+    let guest_dns_publish_ns = options.posture.guest_dns_publish_ns;
     let allow_env_secret_refs = options.posture.allow_env_secret_refs;
     let allow_guest_email = options.posture.allow_guest_email;
     // The instance's own serve socket(s) a guest self-call may reach, when the posture allows
@@ -299,6 +302,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         allow_guest_tcp_egress,
         allow_guest_tcp_listener,
         allow_guest_dns_publish,
+        guest_dns_publish_ns,
         self_egress_addrs,
         guest_egress_extra_roots,
         allow_env_secret_refs,

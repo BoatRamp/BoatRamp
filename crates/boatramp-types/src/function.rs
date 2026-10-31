@@ -164,6 +164,14 @@ pub struct FunctionConfig {
     /// `allow_guest_dns_publish` is on (fail-closed otherwise).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-component approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
+    /// [`crate::config::HandlerConfig::dns_publish_ns_targets`], Security review MEDIUM-3): the
+    /// authorized nameserver targets a sub-zone NS this function writes may delegate to, consulted only
+    /// under the `allowlist` NS posture (`guest_dns_publish_ns`). **Empty ⇒ deny-all.** The DNS analog
+    /// of `dns_publish_zones` but for the NS record's rdata TARGET; it does NOT affect any non-NS record
+    /// (those stay gated solely by the own-name `dns_publish_zones`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_ns_targets: Vec<String>,
     /// The site a **standalone top-level function** mints blob-upload credentials for
     /// (`boatramp:handlers/blob-upload`, S3 external ingress). A site handler mints for its own
     /// host-routed site, but a standalone function has no single resolved site — so it names one here,
@@ -289,6 +297,8 @@ impl FunctionConfig {
             egress_allowlist: h.egress_allowlist.clone(),
             // Carry the handler's `dns-publish` writable-zone allowlist likewise (grant surface parity).
             dns_publish_zones: h.dns_publish_zones.clone(),
+            // Carry the handler's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
+            dns_publish_ns_targets: h.dns_publish_ns_targets.clone(),
             // A desugared handler-function runs on the site-handler dispatch path, where the site is
             // host-ROUTED (not config-declared) — so it has no `blob_upload_site` of its own. The
             // `blob_upload_site` field is exclusively the STANDALONE top-level function's way to name
@@ -322,6 +332,8 @@ impl FunctionConfig {
             egress_allowlist: c.egress_allowlist.clone(),
             // Carry the consumer's `dns-publish` writable-zone allowlist likewise.
             dns_publish_zones: c.dns_publish_zones.clone(),
+            // Carry the consumer's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
+            dns_publish_ns_targets: c.dns_publish_ns_targets.clone(),
             ..Default::default()
         }
     }
@@ -1162,6 +1174,7 @@ mod tests {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         }
     }
 
@@ -1205,6 +1218,7 @@ mod tests {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

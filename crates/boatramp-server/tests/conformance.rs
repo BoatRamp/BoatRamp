@@ -1578,6 +1578,7 @@ async fn handler_route_dispatches_through_engine() {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1742,6 +1743,7 @@ async fn perf_host_await_overlap_repro() {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1967,6 +1969,7 @@ async fn serve_admission_gate_bounds_concurrency() {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -2187,6 +2190,7 @@ async fn latency_floor_repro() {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -2400,6 +2404,7 @@ async fn secret_resolution_floor_gate() {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -2553,6 +2558,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dns_publish_ns_targets: Vec::new(),
         }],
         ..Default::default()
     };
@@ -4176,6 +4182,7 @@ async fn activation_during_traffic_drops_no_requests() {
         blobstore_containers: Vec::new(),
         egress_allowlist: Vec::new(),
         dns_publish_zones: Vec::new(),
+        dns_publish_ns_targets: Vec::new(),
     };
     // Two distinct deployments serving the same handler. B adds a (non-matching)
     // redirect so its manifest hashes differently — a real `current` flip.
@@ -4347,6 +4354,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4481,6 +4489,7 @@ async fn activation_refuses_broken_component() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4595,6 +4604,7 @@ async fn activation_refuses_a_non_consumer_component() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -4726,6 +4736,7 @@ async fn activation_refuses_disallowed_import() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4836,6 +4847,7 @@ async fn activation_refuses_oversized_component() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4949,6 +4961,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5087,6 +5100,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5221,6 +5235,7 @@ async fn per_site_timeout_cap_applies() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5599,6 +5614,7 @@ async fn graphql_subscription_scope_is_project_qualified_and_isolates_foreign_te
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6073,6 +6089,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
                 max_concurrency: None,
@@ -6087,6 +6104,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
@@ -6246,6 +6264,7 @@ async fn guest_logs_captured_and_served() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6387,6 +6406,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6590,6 +6610,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6721,6 +6742,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -8280,6 +8302,7 @@ async fn mesh_dispatch(
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8473,6 +8496,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8664,6 +8688,7 @@ async fn gateway_admission_gate_bounds_concurrency() {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -8817,6 +8842,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8954,6 +8980,7 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
         blobstore_containers: Vec::new(),
         egress_allowlist: Vec::new(),
         dns_publish_zones: Vec::new(),
+        dns_publish_ns_targets: Vec::new(),
     };
     let manifest = Manifest {
         files,
@@ -9195,6 +9222,7 @@ async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -9418,6 +9446,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -9673,6 +9702,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -9827,6 +9857,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -10050,6 +10081,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -10208,6 +10240,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -10465,6 +10498,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         },

@@ -1744,6 +1744,9 @@ pub(super) async fn build_function_bindings(
             project.as_str(),
             sql_site,
             &config.dns_publish_zones,
+            // The function's NS-target allowlist for a sub-zone NS delegation (MEDIUM-3): empty ⇒
+            // deny-all under the `allowlist` NS posture.
+            &config.dns_publish_ns_targets,
         );
     }
     Ok(bindings)
@@ -4197,6 +4200,7 @@ mod blobstore_dimension0_tests {
             blobstore_containers: &containers,
             egress_allowlist: &[],
             dns_publish_zones: &[],
+            dns_publish_ns_targets: &[],
             secret_allowlist: &[],
         };
         let bindings = rebuild

@@ -317,6 +317,25 @@ pub enum Lane {
     Streaming,
 }
 
+/// The operator posture governing whether a granted guest may WRITE a **(non-apex) sub-zone `NS`**
+/// record through `dns-publish` (Security review MEDIUM-3, cap-req #24). A sub-zone NS delegates that
+/// subtree to an arbitrary nameserver — a persistent, post-revocation, unaudited authority handoff —
+/// so it is gated SEPARATELY from the own-name writable-zone allowlist. This is the handler-crate
+/// mirror of `boatramp_core::security::GuestDnsPublishNs` (this crate does not depend on
+/// `boatramp-types`); the node maps one onto the other, exactly as it does the boolean posture knobs.
+/// [`Default`] is the fail-closed [`None`](Self::None).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestDnsPublishNs {
+    /// Delegate a sub-zone to ANY nameserver target (today's behavior).
+    Any,
+    /// NEVER delegate a sub-zone `NS` — refuse every one (the fail-closed default).
+    #[default]
+    None,
+    /// Delegate only to a nameserver target on the per-grant `dns_publish_ns_targets` allowlist
+    /// (**empty ⇒ deny-all**, fail-closed).
+    Allowlist,
+}
+
 /// Per-serve cost returned by [`Engine::serve_lane`], so the server can attribute per-invocation
 /// latency (a latency-observability ask): `cold` is whether this serve paid a cranelift (re)compile vs reused a
 /// warm component; `instantiate_us` is the per-invocation `instantiate_async` cost (distinct from the
@@ -528,6 +547,12 @@ struct HostState {
     /// under its egress posture (cap-req #24 WS3).
     #[cfg(feature = "dns-publish")]
     dns_publish_enabled: bool,
+    /// The sub-zone `NS` delegation posture for this invocation (Security review MEDIUM-3), copied from
+    /// the engine's `dns_publish_ns` — the `guest_dns_publish_ns` knob. Gates a (non-apex) `NS` write
+    /// only: `None` refuses it, `Allowlist` holds the NS target to the per-grant `dns_publish_ns_targets`
+    /// allowlist (empty ⇒ deny-all), `Any` is today's behavior. Non-NS records are unaffected.
+    #[cfg(feature = "dns-publish")]
+    dns_publish_ns: GuestDnsPublishNs,
     /// This invocation's remaining `dns-publish` budget (cap-req #24 WS3). STORE-RESIDENT so it
     /// persists across the per-call rebuild of `DnsPublishHost` — the binding borrows this counter and
     /// `spend()` decrements it, so the per-invocation mutation cap is actually enforced (a view-local
@@ -1756,6 +1781,14 @@ pub struct HandlerEngine {
     /// knobs — DNS write is a distinct authority gated separately.
     #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
     allow_dns_publish: bool,
+    /// The node posture governing a guest's **sub-zone `NS` delegation** via `dns-publish` (Security
+    /// review MEDIUM-3, cap-req #24): `None` (refuse all sub-zone NS — the fail-closed default),
+    /// `Allowlist` (only an NS target on the per-grant `dns_publish_ns_targets` allowlist, empty ⇒
+    /// deny-all), or `Any` (today's behavior). INDEPENDENT of `allow_dns_publish` (which gates the
+    /// whole capability) and of the own-name writable-zone allowlist (which is unchanged). Seeded into
+    /// each new store and read by the `DnsPublishHost` gate, applied ONLY to a non-apex NS record.
+    #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
+    dns_publish_ns: GuestDnsPublishNs,
     /// Default per-INVOCATION `dns-publish` budget seeded into each new store (cap-req #24 WS3).
     /// Operator-configurable via [`with_dns_publish_budget`](Self::with_dns_publish_budget); defaults to
     /// [`DEFAULT_DNS_PUBLISH_BUDGET`].
@@ -1983,6 +2016,9 @@ impl HandlerEngine {
             // Deny-by-default: DNS write is off until an operator opts the posture in via
             // `with_dns_publish`. A node that never calls it can never let a guest mutate DNS.
             allow_dns_publish: false,
+            // Fail-closed default: no sub-zone NS delegation until an operator sets the posture via
+            // `with_dns_publish_ns` (MEDIUM-3).
+            dns_publish_ns: GuestDnsPublishNs::None,
             dns_publish_budget_default: DEFAULT_DNS_PUBLISH_BUDGET,
             limits,
             epoch_ticker,
@@ -2312,6 +2348,18 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_dns_publish(mut self, allow: bool) -> Self {
         self.allow_dns_publish = allow;
+        self
+    }
+
+    /// Set the operator posture governing a guest's **sub-zone `NS` delegation** via `dns-publish`
+    /// (Security review MEDIUM-3, cap-req #24): [`GuestDnsPublishNs::None`] refuses every sub-zone NS,
+    /// [`GuestDnsPublishNs::Allowlist`] permits only an NS whose rdata TARGET is on the per-grant
+    /// `dns_publish_ns_targets` allowlist (empty ⇒ deny-all), [`GuestDnsPublishNs::Any`] is today's
+    /// behavior. Defaults to the fail-closed `None` when never called. Applies ONLY to a non-apex NS
+    /// (the apex NS is always refused by the central guardrail) and never to any other record type.
+    #[must_use]
+    pub fn with_dns_publish_ns(mut self, posture: GuestDnsPublishNs) -> Self {
+        self.dns_publish_ns = posture;
         self
     }
 
@@ -3426,6 +3474,7 @@ impl HandlerEngine {
             bindings::dns_publish::DnsPublishHost::new(
                 state.bindings.dns_publish(),
                 state.dns_publish_enabled,
+                state.dns_publish_ns,
                 state.dns_publish_budget.as_ref(),
             )
         })?;
@@ -3573,6 +3622,8 @@ impl HandlerEngine {
             )),
             #[cfg(feature = "dns-publish")]
             dns_publish_enabled: self.allow_dns_publish,
+            #[cfg(feature = "dns-publish")]
+            dns_publish_ns: self.dns_publish_ns,
             #[cfg(feature = "dns-publish")]
             dns_publish_budget: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 self.dns_publish_budget_default,

@@ -906,6 +906,19 @@ pub struct HandlerConfig {
     /// record, never guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-handler **approved NS-target allowlist** for the gated `dns-publish` capability (Security
+    /// review MEDIUM-3, cap-req #24): the authorized nameserver targets (globs) a **sub-zone `NS`**
+    /// record this handler writes may delegate to. This is the DNS analog of
+    /// [`dns_publish_zones`](Self::dns_publish_zones) but for the NS record's rdata TARGET rather than
+    /// its OWN name — the ONE place an rdata target is constrained. Consulted ONLY when the node
+    /// posture [`guest_dns_publish_ns`](crate::security::SecurityPosture::guest_dns_publish_ns) is
+    /// `allowlist` AND the record is a non-apex `NS`: the NS target must match an entry here, **empty
+    /// ⇒ deny-all** (fail-closed). Irrelevant under `none` (all sub-zone NS refused) or `any` (all
+    /// permitted). Does NOT affect any other record type — A/MX/CNAME/… stay gated solely by the
+    /// own-name `dns_publish_zones`. Matched case-insensitively (same globbing as `dns_publish_zones`).
+    /// Host config on the deploy record, never guest-supplied at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_ns_targets: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -1091,6 +1104,12 @@ pub struct ConsumerConfig {
     /// Posture-gated (`allow_guest_dns_publish`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-consumer approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
+    /// [`HandlerConfig::dns_publish_ns_targets`]): the authorized nameserver targets a sub-zone NS may
+    /// point to, consulted only under the `allowlist` NS posture. **Empty ⇒ deny-all.** Does not affect
+    /// any non-NS record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_ns_targets: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1344,6 +1363,12 @@ pub struct SessionConfig {
     /// (`allow_guest_dns_publish`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-session approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
+    /// [`HandlerConfig::dns_publish_ns_targets`]): the authorized nameserver targets a sub-zone NS this
+    /// session writes may point to, consulted only under the `allowlist` NS posture. **Empty ⇒
+    /// deny-all.** Does not affect any non-NS record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_ns_targets: Vec<String>,
     /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
     /// **open** from the verified source and carried across every re-entry, so a frame-triggered
     /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
@@ -2454,6 +2479,7 @@ mod tests {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()
         };
