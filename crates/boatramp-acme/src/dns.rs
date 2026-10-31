@@ -387,6 +387,111 @@ fn names_equal(a: &str, b: &str) -> bool {
         .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
 
+/// Validate and **canonicalize** a caller-or-guest-supplied DNS **owner name** into
+/// the single string that must be used for BOTH the writable-zone authorization
+/// decision AND the value dispatched to a provider adapter. This is the
+/// [[never-mark-or-parse-sql-text-for-a-tenancy-decision]] principle applied to
+/// DNS: authorize and act on ONE canonical string, never authorize a *normalized
+/// copy* of a different raw string that then gets dispatched (the cross-tenant
+/// zone-escape that motivated this function).
+///
+/// Returns the canonical form on success: ASCII-lowercased, with at most one
+/// trailing dot (the FQDN root dot) stripped.
+///
+/// Rejects (→ [`DnsError::InvalidRecord`]) anything that is not a
+/// syntactically-legal DNS owner name:
+/// - an empty name, or an empty label (`a..b`, a leading dot, or a second trailing
+///   dot);
+/// - a label longer than 63 bytes, or a total name longer than 253 bytes;
+/// - any byte that is not an LDH letter/digit/hyphen or `_` (underscore labels —
+///   `_acme-challenge`, `_dmarc`, `_submission._tcp`), except a single leading `*`
+///   wildcard label;
+/// - therefore any whitespace, control char, `/`, `?`, `#`, `%`, `@`, `:`, or
+///   non-ASCII byte — none of which can appear in a legal owner name — is refused,
+///   so none can survive into a provider URL path or dodge the apex guard.
+pub fn canonicalize_owner_name(raw: &str) -> Result<String, DnsError> {
+    let reject = |why: &str| {
+        Err(DnsError::InvalidRecord(format!(
+            "dns owner name {why}: {raw:?}"
+        )))
+    };
+    // The LDH model is ASCII-only; an internationalized name must arrive as its
+    // A-label (punycode) form. A non-ASCII byte is refused rather than silently
+    // lowercased (`to_ascii_lowercase` leaves it untouched, which could smuggle a
+    // homoglyph past a later comparison).
+    if !raw.is_ascii() {
+        return reject("must be ASCII");
+    }
+    let lowered = raw.to_ascii_lowercase();
+    // Strip at most ONE trailing dot. A second trailing dot leaves a trailing empty
+    // label, caught by the per-label loop below.
+    let name = lowered.strip_suffix('.').unwrap_or(lowered.as_str());
+    if name.is_empty() {
+        return reject("must not be empty");
+    }
+    if name.len() > 253 {
+        return reject("exceeds the 253-byte DNS name limit");
+    }
+    for (i, label) in name.split('.').enumerate() {
+        if label.is_empty() {
+            return reject("has an empty label");
+        }
+        if label.len() > 63 {
+            return reject("has a label over the 63-byte DNS label limit");
+        }
+        // A bare `*` is allowed ONLY as the leading label (a single wildcard label).
+        if label == "*" {
+            if i == 0 {
+                continue;
+            }
+            return reject("has a '*' outside the leading wildcard label");
+        }
+        // Every other label: LDH (letters/digits/hyphen) + `_`. This is what
+        // forbids `/ ? # % @ :`, whitespace, control chars, and stray `*`.
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return reject("has an illegal character in a label");
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// Percent-encode a DNS owner name (or an adapter's zone-relative form of one) for
+/// safe interpolation into a **single URL path segment**. Defense-in-depth: the
+/// central [`canonicalize_owner_name`] validator already refuses every byte this
+/// would encode, so for a validated name this is a no-op — it exists so that a name
+/// reaching an adapter by any path still cannot break out of its path segment and
+/// retarget another zone.
+///
+/// Bytes legal AND meaningful in an owner-name path segment are preserved:
+/// unreserved (RFC 3986 §2.3 — `A-Za-z0-9-._~`), the `*` wildcard label, and `@`
+/// (the apex marker that several provider adapters pass as a relative name). Every
+/// other byte — notably `/ ? # % :` and whitespace — is percent-encoded, so it can
+/// never introduce a new path segment, a `..` traversal, or a query/fragment.
+#[cfg(any(
+    feature = "ns1",
+    feature = "azure-dns",
+    feature = "akamai",
+    feature = "oci",
+    feature = "hetzner"
+))]
+pub(crate) fn encode_name_segment(name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(name.len());
+    for &b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'*' | b'@') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 /// The central write guardrail: refuse a record `provider` must not (or cannot)
 /// write, **before** any adapter is dispatched. The native and (future) guest
 /// write entrypoints call this first; it never silently drops a record.
@@ -405,6 +510,14 @@ fn names_equal(a: &str, b: &str) -> bool {
 /// SOA and the DNSSEC family (DNSKEY/DS/RRSIG/NSEC/NSEC3) need no check here:
 /// they are not variants of the writable [`RecordKind`] sum, so a caller cannot
 /// construct one — they are refused by construction.
+///
+/// The owner `name` is first run through [`canonicalize_owner_name`]: a
+/// syntactically-illegal name (whitespace, `/`, `..`, an overlong/empty label, …)
+/// is refused as [`DnsError::InvalidRecord`] before any zone decision, and the
+/// apex-NS guard runs on the **canonical** form so a case/whitespace/trailing-dot
+/// variant can never dodge it. The guest write-gate has already canonicalized and
+/// authorized on this same string (re-canonicalizing here is idempotent); this call
+/// also covers the native write entrypoints, which pass this function directly.
 pub fn validate_writable(
     provider: &dyn DnsProvider,
     record: &DnsRecord,
@@ -412,7 +525,9 @@ pub fn validate_writable(
 ) -> Result<(), DnsError> {
     record.kind.validate_rdata()?;
 
-    if matches!(record.kind, RecordKind::Ns(_)) && names_equal(&record.name, zone_root) {
+    let canonical = canonicalize_owner_name(&record.name)?;
+
+    if matches!(record.kind, RecordKind::Ns(_)) && names_equal(&canonical, zone_root) {
         return Err(DnsError::ApexNsRefused {
             zone: zone_root.to_string(),
             name: record.name.clone(),
@@ -1070,6 +1185,149 @@ mod tests {
         caa.validate_rdata().unwrap();
         assert_eq!(CaaTag::IssueWild.as_str(), "issuewild");
         assert_eq!(CaaTag::Iodef.as_str(), "iodef");
+    }
+
+    // ---- Owner-name canonicalization (CRITICAL-1 / MEDIUM-2) -------------
+
+    /// Legitimate owner names canonicalize to their expected form: underscore
+    /// labels, a single leading wildcard, PTR/`in-addr.arpa`, and
+    /// case/trailing-dot normalization all pass.
+    #[test]
+    fn canonicalize_owner_name_accepts_legitimate_names() {
+        for (raw, want) in [
+            (
+                "_acme-challenge.deploy.example.com",
+                "_acme-challenge.deploy.example.com",
+            ),
+            ("*.example.com", "*.example.com"),
+            ("*.deploy.example.com", "*.deploy.example.com"),
+            ("mail.example.com.", "mail.example.com"), // one trailing dot stripped
+            ("WWW.Example.COM", "www.example.com"),    // lowercased
+            ("_dmarc.example.com", "_dmarc.example.com"),
+            (
+                "_submission._tcp.example.com",
+                "_submission._tcp.example.com",
+            ),
+            ("7.113.0.203.in-addr.arpa", "7.113.0.203.in-addr.arpa"),
+            ("example.com", "example.com"),
+        ] {
+            assert_eq!(
+                canonicalize_owner_name(raw).unwrap(),
+                want,
+                "canonicalize({raw:?})"
+            );
+        }
+    }
+
+    /// The security proof: every attack owner name — path traversal, whitespace,
+    /// the URL-structural bytes `? # % @ :`, an embedded `/`, an overlong label,
+    /// and an empty label — is refused as `InvalidRecord`, so it can never reach
+    /// an adapter, dodge the apex guard, or be authorized as a normalized copy of
+    /// a different dispatched string. Note each would END with `.example.com` and
+    /// so would be AUTHORIZED by a `**.example.com` allowlist if it survived — the
+    /// refusal must come from canonicalization, first.
+    #[test]
+    fn canonicalize_owner_name_rejects_attacks() {
+        let attacks = [
+            "../../zones/victim.com/evil.example.com", // path traversal (embedded `/`)
+            "evil/../example.com",                     // traversal variant
+            " example.com",                            // leading whitespace (apex-guard dodge)
+            "example.com ",                            // trailing whitespace
+            "ev il.example.com",                       // interior whitespace
+            "evil?x.example.com",                      // query delimiter
+            "evil#x.example.com",                      // fragment delimiter
+            "evil%2e.example.com",                     // percent (pre-encoded dot)
+            "evil@x.example.com",                      // userinfo delimiter
+            "evil:8080.example.com",                   // port/scheme delimiter
+            "evil..example.com",                       // empty label
+            ".example.com",                            // leading empty label
+            "example.com..",                           // second trailing dot → empty label
+            "",                                        // empty name
+            "exámple.com",                             // non-ASCII (homoglyph)
+        ];
+        for a in attacks {
+            assert!(
+                matches!(canonicalize_owner_name(a), Err(DnsError::InvalidRecord(_))),
+                "attack name must be refused: {a:?}"
+            );
+        }
+        // An overlong label (64 bytes > 63) and an overlong total name (> 253).
+        let overlong_label = format!("{}.example.com", "a".repeat(64));
+        assert!(matches!(
+            canonicalize_owner_name(&overlong_label),
+            Err(DnsError::InvalidRecord(_))
+        ));
+        let overlong_total = format!("{}.example.com", vec!["abcdefghij"; 26].join("."));
+        assert!(
+            overlong_total.len() > 253,
+            "fixture must exceed the 253-byte limit"
+        );
+        assert!(matches!(
+            canonicalize_owner_name(&overlong_total),
+            Err(DnsError::InvalidRecord(_))
+        ));
+    }
+
+    /// `validate_writable` canonicalizes the owner name: an attack name is refused
+    /// as `InvalidRecord` (never reaching the capability/apex checks), and the
+    /// apex-NS guard fires on the canonical form even when the raw name is dressed
+    /// up with case + a trailing dot (the whitespace variant is simply refused, so
+    /// it cannot dodge the apex guard the way the old whitespace-trimming matcher
+    /// let it).
+    #[test]
+    fn validate_writable_canonicalizes_owner_name() {
+        let p = AllKinds;
+        // A `/`-bearing traversal owner name is refused up front as invalid-record,
+        // not matched/authorized as a normalized copy.
+        let traversal = DnsRecord {
+            kind: RecordKind::Txt(vec!["x".into()]),
+            name: "../../zones/victim.com/evil.example.com".into(),
+            ttl: 60,
+        };
+        assert!(matches!(
+            validate_writable(&p, &traversal, "example.com").unwrap_err(),
+            DnsError::InvalidRecord(_)
+        ));
+        // Apex NS with case + trailing dot still refused (guard on canonical form).
+        let apex_fancy = DnsRecord {
+            kind: RecordKind::Ns("ns1.example.net".into()),
+            name: "Example.COM.".into(),
+            ttl: 3600,
+        };
+        assert!(matches!(
+            validate_writable(&p, &apex_fancy, "example.com").unwrap_err(),
+            DnsError::ApexNsRefused { .. }
+        ));
+    }
+
+    /// Defense-in-depth path encoding: a validated name is passed through
+    /// unchanged (incl. the `@` apex marker and a `*` wildcard label), while every
+    /// URL-structural byte is percent-encoded so it cannot escape its path segment.
+    #[cfg(any(
+        feature = "ns1",
+        feature = "azure-dns",
+        feature = "akamai",
+        feature = "oci",
+        feature = "hetzner"
+    ))]
+    #[test]
+    fn encode_name_segment_preserves_valid_encodes_dangerous() {
+        // No-ops for every shape an adapter legitimately builds a path from.
+        for ok in ["_acme-challenge.deploy", "*.deploy", "@", "www.example.com"] {
+            assert_eq!(encode_name_segment(ok), ok, "must be a no-op: {ok:?}");
+        }
+        // The structural bytes are encoded — none can introduce a new segment,
+        // a traversal, or a query/fragment.
+        assert_eq!(encode_name_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_name_segment("a b"), "a%20b");
+        assert_eq!(encode_name_segment("a?b"), "a%3Fb");
+        assert_eq!(encode_name_segment("a#b"), "a%23b");
+        assert_eq!(encode_name_segment("a%b"), "a%25b");
+        assert_eq!(encode_name_segment("a:b"), "a%3Ab");
+        assert_eq!(
+            encode_name_segment("../../zones/victim.com"),
+            "..%2F..%2Fzones%2Fvictim.com"
+        );
     }
 
     // ---- WS2: ManualDnsProvider supports every writable kind -------------

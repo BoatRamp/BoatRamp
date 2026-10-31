@@ -10,7 +10,9 @@
 
 use async_trait::async_trait;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
+use crate::dns::{
+    DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, encode_name_segment,
+};
 
 const DEFAULT_API_BASE: &str = "https://api.nsone.net/v1";
 const AUTH_HEADER: &str = "X-NSONE-Key";
@@ -41,13 +43,16 @@ impl Ns1Dns {
         self
     }
 
-    /// `…/zones/{zone}/{fqdn}/{type}` — NS1's per-record endpoint.
+    /// `…/zones/{zone}/{fqdn}/{type}` — NS1's per-record endpoint. The owner name
+    /// is a single path segment, percent-encoded as defense-in-depth so it can
+    /// never escape its segment (the central `canonicalize_owner_name` already
+    /// refuses every byte this would encode, making it a no-op for a valid name).
     fn record_url(&self, record: &DnsRecord) -> String {
         format!(
             "{}/zones/{}/{}/{}",
             self.api_base,
             self.zone,
-            record.name,
+            encode_name_segment(&record.name),
             record.kind.as_str()
         )
     }

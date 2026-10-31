@@ -49,7 +49,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, SvcParam};
+use crate::dns::{
+    DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, SvcParam, encode_name_segment,
+};
 
 const DEFAULT_API_BASE: &str = "https://api.hetzner.cloud/v1";
 
@@ -90,13 +92,18 @@ impl HetznerDns {
 
     /// `…/zones/{zone}/rrsets/{name}/{type}` — a single RRSet (GET/DELETE, and
     /// the base for its `/actions/*` sub-resources). `name` is the zone-relative
-    /// owner (`@` for the apex); both segments are passed literally (the apex
-    /// `@`, the `_acme-challenge.*` underscore labels, and a `*` wildcard label
-    /// are all valid URL path chars).
+    /// owner (`@` for the apex). The owner segment is percent-encoded as
+    /// defense-in-depth so it can never escape its segment (the central
+    /// `canonicalize_owner_name` already refuses every byte this would encode; the
+    /// apex `@`, the `_acme-challenge.*` underscore labels, and a `*` wildcard
+    /// label are all preserved as valid URL path chars).
     fn rrset_url(&self, name: &str, record_type: &str) -> String {
         format!(
             "{}/zones/{}/rrsets/{}/{}",
-            self.api_base, self.zone, name, record_type
+            self.api_base,
+            self.zone,
+            encode_name_segment(name),
+            record_type
         )
     }
 

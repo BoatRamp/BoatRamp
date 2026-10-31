@@ -10,7 +10,9 @@
 
 use async_trait::async_trait;
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
+use crate::dns::{
+    DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, encode_name_segment,
+};
 
 const DEFAULT_API_BASE: &str = "https://management.azure.com";
 const API_VERSION: &str = "2018-05-01";
@@ -61,7 +63,11 @@ impl AzureDns {
             .unwrap_or_else(|| fqdn.to_string())
     }
 
-    /// The record-set URL: `…/dnsZones/{zone}/{TYPE}/{relative}?api-version=…`.
+    /// The record-set URL: `…/dnsZones/{zone}/{TYPE}/{relative}?api-version=…`. The
+    /// zone-relative owner name is a single path segment, percent-encoded as
+    /// defense-in-depth so it can never escape its segment (the central
+    /// `canonicalize_owner_name` already refuses every byte this would encode, and
+    /// the apex marker `@` is preserved).
     fn record_url(&self, record: &DnsRecord) -> String {
         format!(
             "{}/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Network/dnsZones/{}/{}/{}?api-version={}",
@@ -70,7 +76,7 @@ impl AzureDns {
             self.resource_group,
             self.zone,
             record.kind.as_str(),
-            self.relative_name(&record.name),
+            encode_name_segment(&self.relative_name(&record.name)),
             API_VERSION,
         )
     }

@@ -17,7 +17,9 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
+use crate::dns::{
+    DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, encode_name_segment,
+};
 
 /// The OCI DNS API version path segment.
 const API_VERSION: &str = "20180115";
@@ -53,12 +55,16 @@ impl OciDns {
         })
     }
 
-    /// `/20180115/zones/{zone}/records/{domain}/{rtype}` — the RRSet path.
+    /// `/20180115/zones/{zone}/records/{domain}/{rtype}` — the RRSet path. The
+    /// owner name is a single path segment, percent-encoded as defense-in-depth so
+    /// it can never escape its segment (the central `canonicalize_owner_name`
+    /// already refuses every byte this would encode). The encoded path is both sent
+    /// and signed, so the request signature stays consistent.
     fn rrset_path(&self, record: &DnsRecord) -> String {
         format!(
             "/{API_VERSION}/zones/{}/records/{}/{}",
             self.zone,
-            record.name,
+            encode_name_segment(&record.name),
             record.kind.as_str()
         )
     }
@@ -80,7 +86,12 @@ impl OciDns {
                 port,
                 target,
             } => format!("{priority} {weight} {port} {target}"),
-            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Caa { flags, tag, value } => {
+                // LOW-5: escape embedded `\` and `"` in the quoted value, consistent with
+                // Route53/Hetzner (correctness — serde escapes it in transport regardless).
+                let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{flags} {tag} \"{value}\"")
+            }
             RecordKind::Ns(target) | RecordKind::Ptr(target) => target.clone(),
             RecordKind::Tlsa {
                 usage,
@@ -442,6 +453,24 @@ pisCIAF7SzuKfm4vOwAOrHUdqdoU79k5glwCwNnEO3K3nl5xAiBSLNgwrMc8y59Q\n\
 4rC6k4Saf9XdT6P2mOmeso9XJQRknwIgG689c5E5fvq9T4eam9dBCNJup4IgI6VT\n\
 sAmaXlKwnv8=\n\
 -----END PRIVATE KEY-----\n";
+
+    /// LOW-5: a CAA value with an embedded `"`/`\` is escaped in the quoted
+    /// rdata string (consistent with Route53/Hetzner).
+    #[test]
+    fn caa_rdata_escapes_embedded_quote_and_backslash() {
+        assert_eq!(
+            OciDns::rdata(&DnsRecord {
+                kind: RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Iodef,
+                    value: "mailto:a\"b\\c".into(),
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            }),
+            "0 iodef \"mailto:a\\\"b\\\\c\""
+        );
+    }
 
     /// OCI does not declare HTTPS/SVCB support — they're absent from OCI's own
     /// "Supported DNS Resource Record Types" list (see `supported_kinds`'s doc

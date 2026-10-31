@@ -100,7 +100,12 @@ impl GcpDns {
                 port,
                 target,
             } => format!("{priority} {weight} {port} {}", Self::fqdn(target)),
-            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Caa { flags, tag, value } => {
+                // LOW-5: escape embedded `\` and `"` in the quoted value, consistent with
+                // Route53/Hetzner (correctness — serde escapes it in transport regardless).
+                let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{flags} {tag} \"{value}\"")
+            }
             RecordKind::Tlsa {
                 usage,
                 selector,
@@ -461,6 +466,24 @@ mod tests {
                 300
             )),
             serde_json::json!({"name": "_8443._tcp.example.com.", "type": "SVCB", "ttl": 300, "rrdatas": ["0 svc.example.net."]})
+        );
+    }
+
+    /// LOW-5: a CAA value with an embedded `"`/`\` is escaped in the quoted
+    /// rrdata string (consistent with Route53/Hetzner).
+    #[test]
+    fn caa_rrdata_escapes_embedded_quote_and_backslash() {
+        assert_eq!(
+            GcpDns::rrdatas(&DnsRecord {
+                kind: RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Iodef,
+                    value: "mailto:a\"b\\c".into(),
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            }),
+            vec!["0 iodef \"mailto:a\\\"b\\\\c\"".to_string()]
         );
     }
 

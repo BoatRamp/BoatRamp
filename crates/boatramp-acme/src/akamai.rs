@@ -16,7 +16,9 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
+use crate::dns::{
+    DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag, encode_name_segment,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -54,11 +56,14 @@ impl AkamaiDns {
     }
 
     /// `/config-dns/v2/zones/{zone}/names/{fqdn}/types/{type}` — the record path.
+    /// The owner name is a single path segment, percent-encoded as
+    /// defense-in-depth so it can never escape its segment (the central
+    /// `canonicalize_owner_name` already refuses every byte this would encode).
     fn record_path(&self, record: &DnsRecord) -> String {
         format!(
             "{API_PREFIX}/zones/{}/names/{}/types/{}",
             self.zone,
-            record.name,
+            encode_name_segment(&record.name),
             record.kind.as_str()
         )
     }
@@ -125,7 +130,12 @@ impl AkamaiDns {
                 port,
                 target,
             } => format!("{priority} {weight} {port} {}", Self::dotted(target)),
-            RecordKind::Caa { flags, tag, value } => format!("{flags} {tag} \"{value}\""),
+            RecordKind::Caa { flags, tag, value } => {
+                // LOW-5: escape embedded `\` and `"` in the quoted value, consistent with
+                // Route53/Hetzner (correctness — serde escapes it in transport regardless).
+                let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{flags} {tag} \"{value}\"")
+            }
             RecordKind::Tlsa {
                 usage,
                 selector,
@@ -612,6 +622,24 @@ mod tests {
                 300
             )),
             serde_json::json!({"name": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "rdata": ["0 svc.example.net."]})
+        );
+    }
+
+    /// LOW-5: a CAA value with an embedded `"`/`\` is escaped in the quoted
+    /// rdata string (consistent with Route53/Hetzner).
+    #[test]
+    fn caa_rdata_escapes_embedded_quote_and_backslash() {
+        assert_eq!(
+            AkamaiDns::rdata_value(&DnsRecord {
+                kind: RecordKind::Caa {
+                    flags: 0,
+                    tag: crate::dns::CaaTag::Iodef,
+                    value: "mailto:a\"b\\c".into(),
+                },
+                name: "example.com".into(),
+                ttl: 300,
+            }),
+            "0 iodef \"mailto:a\\\"b\\\\c\""
         );
     }
 
