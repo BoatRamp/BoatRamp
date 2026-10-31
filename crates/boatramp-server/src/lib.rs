@@ -290,6 +290,11 @@ pub(crate) use scheduler::{
     CronNow, acquire_component_admission, acquire_site_permit, effective_limits,
     handler_error_response, handler_unavailable, sql_starting_response,
 };
+/// The server-side wiring seam for the guest `dns-publish` (write) capability (cap-req #24 WS3): the
+/// provider-source install hook (`install_provider_source`, populated by the top-level crate) + the
+/// per-grant binding attach. Fail-closed by default (no source ⇒ no binding ⇒ `access-denied`).
+#[cfg(feature = "dns-publish")]
+pub mod dns_publish;
 /// The hickory-backed DNS resolver for the guest-facing `dns-resolve` capability (mailroom cap-req
 /// #20); the resolver half of the egress story, built once + cached. Rides the `tcp-egress` feature.
 #[cfg(feature = "tcp-egress")]
@@ -5846,6 +5851,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -6020,6 +6026,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -6463,6 +6470,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -8727,6 +8735,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -8914,6 +8923,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -9078,6 +9088,8 @@ mod tests {
                     &[],
                     // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                     &[],
+                    // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
+                    &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
                     // no_secrets (Ask B-3 B): false ⇒ unchanged.
@@ -9225,6 +9237,8 @@ mod tests {
                 // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
                 &[],
                 // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
+                &[],
+                // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],

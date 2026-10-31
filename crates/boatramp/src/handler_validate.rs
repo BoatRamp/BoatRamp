@@ -773,6 +773,7 @@ mod imp {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dns_publish_zones: Vec::new(),
                 }],
                 ..Default::default()
             };

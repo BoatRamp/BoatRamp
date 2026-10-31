@@ -1730,6 +1730,22 @@ pub(super) async fn build_function_bindings(
     if granted("dns-resolve") {
         bindings = bindings.with_dns_resolve(crate::dns_resolve::shared_resolver());
     }
+    // Host-side DNS PUBLISH (write) capability (cap-req #24 WS3): attach the host-held writer ONLY when
+    // this function is granted `dns-publish` AND the operator installed a provider source for this
+    // `(project, site)`. Fail-closed at every layer — no grant / no source ⇒ no binding ⇒ the host
+    // returns `access-denied`; and even attached, every call is gated by the posture
+    // `allow_guest_dns_publish`, the function's `dns_publish_zones` allowlist (own name only), the
+    // publish budget, and the central `validate_writable` guardrail. The credential is host-held.
+    #[cfg(feature = "dns-publish")]
+    {
+        bindings = crate::dns_publish::maybe_attach(
+            bindings,
+            granted("dns-publish"),
+            project.as_str(),
+            sql_site,
+            &config.dns_publish_zones,
+        );
+    }
     Ok(bindings)
 }
 

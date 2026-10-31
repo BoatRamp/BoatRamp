@@ -67,6 +67,7 @@ default = [
   "session",
   "tcp-listener",
   "tcp-egress",
+  "dns-publish",
   "cluster",
   "operator",
   "mcp",
@@ -295,6 +296,14 @@ tcp-listener = ["handlers", "boatramp-server/tcp-listener"]
 # Experimental; batteries-included in the default build (runtime-opt-in via the posture +
 # a non-empty per-handler `egress_allowlist`, so compiling it in grants nothing by itself).
 tcp-egress = ["handlers", "boatramp-server/tcp-egress"]
+# Host-side DNS PUBLISH (write) capability (`boatramp:handlers/dns-publish`, cap-req #24 WS3): the
+# WRITE counterpart to `dns-resolve` — a granted guest NAMES a zone/record and the host performs the
+# mutation through a host-held `boatramp-acme` provider credential (the guest never holds a zone-write
+# token). Forwards to `boatramp-server/dns-publish`. Implies `handlers`. Experimental; batteries-
+# included in the default build, but OFF for every guest until the operator opts in (the node posture
+# `allow_guest_dns_publish` is off by default AND a per-handler `dns_publish_zones` allowlist + an
+# installed provider source are required), so compiling it in grants nothing by itself.
+dns-publish = ["handlers", "boatramp-server/dns-publish"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

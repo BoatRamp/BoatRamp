@@ -232,6 +232,13 @@ tcp-egress = [
   "dep:hickory-resolver",
 ]
 
+# Host-side DNS PUBLISH (write) capability (`boatramp:handlers/dns-publish`, cap-req #24 WS3): the WRITE
+# counterpart to `dns-resolve`. Gates the `dns_publish` wiring seam (provider-source install hook + the
+# per-grant binding attach) + the `boatramp-handlers/dns-publish` host binding. Fail-closed by default:
+# the provider source is installed by the top-level crate, so without it every guest call is
+# `access-denied`. Implies `handlers`. Experimental.
+dns-publish = ["handlers", "boatramp-handlers/dns-publish"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

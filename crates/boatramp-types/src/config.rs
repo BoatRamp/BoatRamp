@@ -400,6 +400,13 @@ const KNOWN_IMPORTS: &[&str] = &[
     // posture as a dial (`allow_guest_tcp_egress`); `resolve-addr` results are SSRF-floored.
     // Deny-by-default. Advertised Experimental.
     "dns-resolve",
+    // Host-side DNS **publish** (write) capability (cap-req #24 WS3, the write counterpart to
+    // `dns-resolve`). A guest NAMES a zone/record and the host performs the mutation through a
+    // host-held provider credential (the guest never holds a zone-write token); granting it here only
+    // lets a component DECLARE it. Reaching anything additionally needs the node posture
+    // `allow_guest_dns_publish` (OFF by default) AND a non-empty per-handler `dns_publish_zones`
+    // writable-zone allowlist — deny-by-default at every layer. Advertised Experimental.
+    "dns-publish",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI
@@ -886,6 +893,19 @@ pub struct HandlerConfig {
     /// guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-handler **writable-zone allowlist** for the gated `dns-publish` capability (cap-req #24 WS3):
+    /// the authorized zone suffixes (globs) this handler may WRITE DNS records under. The DNS analog of
+    /// [`egress_allowlist`](Self::egress_allowlist) and least-privilege the same way: **empty ⇒
+    /// deny-all** (a handler that imports `dns-publish` but names no zones can write nothing). The
+    /// allowlist constrains a record's OWN name/owner ONLY — an rdata TARGET (a CNAME/MX/SRV/NS
+    /// exchange/target) may legitimately point at another domain and is NEVER constrained. Matched
+    /// case-insensitively (same globbing as [`crate::gateway::gateway_host_matches`]: exact, `*.suffix`
+    /// one label, `**.suffix` any depth). Only consulted when `imports` contains `dns-publish` AND the
+    /// node posture [`allow_guest_dns_publish`](crate::security::SecurityPosture::allow_guest_dns_publish)
+    /// is on — with the posture off the runtime denies all (fail-closed). Host config on the deploy
+    /// record, never guest-supplied at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_zones: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -1065,6 +1085,12 @@ pub struct ConsumerConfig {
     /// (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
+    /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this consumer may
+    /// WRITE DNS records under (own name only, never the rdata target). **Empty ⇒ deny-all.**
+    /// Posture-gated (`allow_guest_dns_publish`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_zones: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1312,6 +1338,12 @@ pub struct SessionConfig {
     /// posture-gated (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
+    /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this session's
+    /// component may WRITE DNS records under (own name only). **Empty ⇒ deny-all.** Posture-gated
+    /// (`allow_guest_dns_publish`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_publish_zones: Vec<String>,
     /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
     /// **open** from the verified source and carried across every re-entry, so a frame-triggered
     /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
@@ -2421,6 +2453,7 @@ mod tests {
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
+                dns_publish_zones: Vec::new(),
             }],
             ..Default::default()
         };
