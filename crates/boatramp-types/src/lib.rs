@@ -29,6 +29,10 @@ pub mod logs;
 pub mod manifest;
 pub mod matcher;
 pub mod predicate;
+/// Privilege-separation composition substrate (privsep Phase 1 — WS-A): the
+/// host-internal `HostAuthority` capability vocabulary, the `[privsep]` config model,
+/// and the fail-closed composition-closure lint.
+pub mod privsep;
 pub mod project;
 pub mod record_verify;
 pub mod route;

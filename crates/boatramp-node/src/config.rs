@@ -233,6 +233,25 @@ pub struct ServerConfig {
     /// relay/ingress and/or egress/terminator so a remote `boatramp forward` can reach in-cluster
     /// services over the relay-blind overlay. Absent ⇒ this node serves no overlay roles.
     pub overlay: Option<OverlayServeConfig>,
+    /// **Privilege-separation composition** (privsep Phase 1, design `PLAN-privsep-phase1.md`
+    /// §1.3). A map of least-authority instances the one binary is composed into, each holding a
+    /// fine-grained subset of host-internal [`HostAuthority`](boatramp_core::privsep::HostAuthority)
+    /// authorities, wired over feature-links.
+    ///
+    /// **ABSENT ⇒ the monolith, byte-for-byte unchanged** — one process holding every authority
+    /// (today's turnkey default; the implicit all-capability instance). This section is
+    /// **restart-class**: it lives ONLY in the on-disk config (never the KV / dynamic daemon
+    /// config), is file-only in the figment pipeline (no `BOATRAMP_*` env surface, like
+    /// `[overlay]`), and a supervised restart re-reads the SAME on-disk topology (design §4,
+    /// §5 F4). Carried + lintable in this WS; the root supervisor that spawns/wires the instances
+    /// is a later workstream.
+    ///
+    /// TODO(privsep WS-B): the root resolves this slice, runs
+    /// [`check_composition_closure`](boatramp_core::privsep::check_composition_closure)
+    /// fail-closed BEFORE any spawn (it is the authorization gate), then spawns one
+    /// `boatramp __instance <name>` per entry (beside the `__sandbox`/`__vmm-run`/`__vz-run`
+    /// re-exec workers in `boatramp/src/main.rs::run`) and wires the links.
+    pub privsep: Option<boatramp_core::privsep::PrivsepConfig>,
 }
 
 /// `[overlay]` — the forward-flow **serve roles** this node runs (the server side of
@@ -3272,6 +3291,128 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    /// Write `text` to a unique temp `.cfg` and return its path (leaked into the temp dir;
+    /// fine for a test process).
+    fn privsep_temp_cfg(text: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "brtest-privsep-{}-{}.cfg",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, text).expect("write temp cfg");
+        path
+    }
+
+    #[test]
+    fn privsep_absent_is_the_monolith_byte_for_byte() {
+        // The default config has no [privsep] — the turnkey monolith.
+        assert!(ServerConfig::default().privsep.is_none());
+
+        // A real config WITHOUT [privsep] resolves `privsep: None` through the figment
+        // pipeline, and every other section is untouched (no behaviour change).
+        let path = privsep_temp_cfg(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        let cfg = figment_resolve::load_with_figment(
+            &path,
+            None,
+            &env(&[]),
+            figment_resolve::flag_overlay_dict(&BTreeMap::new()),
+        )
+        .expect("resolve a non-privsep config");
+        assert!(cfg.privsep.is_none(), "absent [privsep] ⇒ monolith (None)");
+        assert_eq!(
+            cfg.serve.expect("serve preserved").addr,
+            Some("0.0.0.0:8080".parse().unwrap()),
+            "a non-privsep node is unchanged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn privsep_multi_instance_parses_and_passes_the_closure_lint() {
+        use boatramp_core::privsep::{
+            CrownJewelCrashPolicy, HostAuthority, LinkTransport, SandboxPosture,
+            check_composition_closure,
+        };
+        // A valid least-authority composition whose union == the full `all` set: an edge
+        // (listeners + exec + control), a data instance (backends), a signer (the six crown
+        // jewels, isolated). Carried through the REAL figment file → resolve pipeline.
+        let path = privsep_temp_cfg(
+            r#"(
+                privsep: (
+                    instances: {
+                        "edge": (
+                            capabilities: [
+                                "listen.public-tls", "listen.http-parse", "listen.mail",
+                                "listen.overlay", "listen.s3ingress", "listen.inbound-tcp",
+                                "listen.gateway", "exec.wasmtime", "exec.compute",
+                                "control.admin-api", "acme.dns-control",
+                            ],
+                            sandbox: Derived,
+                            links: ["to-signer"],
+                        ),
+                        "data": (
+                            capabilities: ["backend.kv", "backend.sql", "backend.blob", "backend.messaging"],
+                        ),
+                        "signer": (
+                            capabilities: [
+                                "secrets.sealer", "token.signer", "image.signer",
+                                "overlay.dial-signer", "s3ingress.root", "cluster.join-signer",
+                            ],
+                            links: [],
+                        ),
+                    },
+                    links: {
+                        "to-signer": (from: "edge", to: "signer", transport: Local),
+                    },
+                    supervisor: (bind_public_listeners: true, crown_jewel_crash: FailNodeClosed),
+                ),
+            )"#,
+        );
+        let cfg = figment_resolve::load_with_figment(
+            &path,
+            None,
+            &env(&[]),
+            figment_resolve::flag_overlay_dict(&BTreeMap::new()),
+        )
+        .expect("resolve a multi-instance [privsep] config");
+        let _ = std::fs::remove_file(&path);
+
+        let privsep = cfg.privsep.expect("[privsep] materialised");
+        assert_eq!(privsep.instances.len(), 3);
+        assert_eq!(
+            privsep.instances["signer"].capabilities,
+            vec![
+                HostAuthority::SecretsSealer,
+                HostAuthority::TokenSigner,
+                HostAuthority::ImageSigner,
+                HostAuthority::OverlayDialSigner,
+                HostAuthority::S3IngressRoot,
+                HostAuthority::ClusterJoinSigner,
+            ]
+        );
+        // `data` omits `sandbox` ⇒ Derived default; `edge` references the `to-signer` link.
+        assert_eq!(privsep.instances["data"].sandbox, SandboxPosture::Derived);
+        assert_eq!(
+            privsep.instances["edge"].links,
+            vec!["to-signer".to_string()]
+        );
+        assert_eq!(privsep.links["to-signer"].transport, LinkTransport::Local);
+        assert_eq!(
+            privsep.supervisor.as_ref().unwrap().crown_jewel_crash,
+            CrownJewelCrashPolicy::FailNodeClosed
+        );
+
+        // The fail-closed authorization gate PASSES this least-authority composition cleanly.
+        let report = check_composition_closure(&privsep).expect("valid composition authorized");
+        assert!(
+            report.warnings.is_empty(),
+            "no flags: {:?}",
+            report.warnings
+        );
     }
 
     #[test]
