@@ -25,16 +25,25 @@
 //!   key unsealed, no pool opened, no listener bound). The full boot path consults
 //!   this before building each authority object.
 //!
+//! WS-C scope (the runtime wiring — this workstream): the root supervisor's
+//! [`supervise`] loop (a `socketpair(2)` per `local` link, the privileged public-listener bind +
+//! fd-pass, `fork`+`exec` of each `__instance` with its scrubbed env + wired fds, and fail-closed
+//! `FailNodeClosed` supervision), and the feature-instance's [`instance_serve`] splice (install the
+//! per-capability profile fail-closed `Enforced`, receive the root-wired fds, then accept + splice
+//! client fds frontend→backend / receive + serve them). The two HARD WS-C contracts are honored:
+//! every path is lexically normalized before derivation
+//! ([`boatramp_server::sandbox::lexically_normalize`]), and the composition-layer grant
+//! disjointness/coverage is enforced in the root
+//! ([`boatramp_server::sandbox::check_grant_disjointness`]).
+//!
 //! Clean seams for later workstreams (fail-closed — never a silent monolith fallback):
-//! - **WS-C** — the feature-link transport (`local` socketpair + `SCM_RIGHTS` fd-pass,
-//!   `tcp`, `overlay`), the privileged listener-fd bind + pass, and the supervise loop
-//!   (restart / health / shutdown). The root logs the AUTHORIZED plan and stops at
-//!   this seam; the instance builds its gate and stops at its serving seam.
-//! - **WS-D** — the per-capability seccomp/Landlock profile derivation + fail-closed
-//!   `Enforced` install (this module does NOT touch `sandbox.rs` or the `SandboxPosture`
-//!   types; it only reads WS-A's per-instance `SandboxPosture`).
-//! - **WS-E** — the per-capability authority-API grammar + the re-validated
-//!   end-principal context.
+//! - **WS-C follow-on** — `tcp`/`overlay` link transports (only `local` is wired here); the other
+//!   `listen.*` fd binds beyond the public listener; the root's OWN tightest self-profile (design
+//!   §4.3); and the authority-scoped app router (the minimal backend serve stands in for it).
+//! - **WS-D** — the per-capability seccomp/Landlock profile derivation (owned by `sandbox.rs`;
+//!   this module CONSUMES it via `derive_profile` + `install_derived` + `enforce_privsep_status`).
+//! - **WS-E** — the per-capability authority-API grammar + the re-validated end-principal context
+//!   (the link is a BYTE transport here; the grammar layers on [`PrivsepChildFds`]-wired links).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +52,7 @@ use boatramp_core::privsep::{
     CompositionReport, HostAuthority, PrivsepInstanceConfig, check_composition_closure,
 };
 use boatramp_node::privsep_resolve::{self, SecretBlindReport};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ServerConfig};
 use crate::error::CliError;
@@ -76,30 +86,33 @@ pub enum PrivsepError {
     /// the node closed and spawns NOTHING.
     #[error(transparent)]
     Composition(#[from] boatramp_core::privsep::CompositionError),
-    /// WS-C seam: the composition is AUTHORIZED, but the feature-link transport +
-    /// supervise loop are the next workstream. Fail-closed (never a monolith fallback).
+    /// The composition-layer grant check (WS-C CONTRACT #2) refused: two instances' backend-state
+    /// grants overlap, or a hosted backend authority has no state-dir layout entry. Run IN THE
+    /// ROOT, fail-closed, before any spawn (what [`boatramp_server::sandbox::derive_profile`]
+    /// cannot see from a single instance).
+    #[error(transparent)]
+    CompositionGrant(#[from] boatramp_server::sandbox::CompositionGrantError),
+    /// privsep requires an ENFORCED per-instance sandbox (Linux + the `sandbox` feature). On any
+    /// other platform/build the wall cannot be installed, so the root refuses the node closed
+    /// rather than spawning instances that would serve without it (design §2 F6).
     #[error(
-        "privsep root: composition authorized ({instances} instance(s)) — the feature-link \
-         transport (socketpair/fd-pass) + listener-fd bind + supervise loop land in WS-C; the \
-         root does not yet serve"
+        "privsep requires a Linux node built with the `sandbox` feature (the per-instance \
+         seccomp/Landlock wall is load-bearing + fail-closed) — refusing on this platform/build"
     )]
-    RootSupervisionNotWired {
-        /// The count of authorized instances in the stood-up plan.
-        instances: usize,
-    },
-    /// WS-C seam: the instance resolved its slice + built its materialization gate, but
-    /// link-open + the serving splice are the next workstream. Fail-closed.
-    #[error(
-        "privsep instance {label:?}: gate built ({held} of {total} authorities held) — link-open \
-         + the serving splice land in WS-C; the instance does not yet serve"
-    )]
-    InstanceServingNotWired {
+    UnsupportedPlatform,
+    /// A root-supervisor runtime failure (socketpair/link wiring, listener bind, fork+exec, fd
+    /// pass, or a supervised child exiting — `FailNodeClosed`). Fail-closed: the root tears the
+    /// node down rather than serving degraded.
+    #[error("privsep root supervisor: {0}")]
+    Supervise(String),
+    /// A feature-instance runtime failure (sandbox derive/install, fd receive, or serve). The
+    /// instance refuses to serve rather than degrade.
+    #[error("privsep instance {label:?}: {reason}")]
+    InstanceServe {
         /// The instance label.
         label: String,
-        /// Authorities this instance holds.
-        held: usize,
-        /// The total authority count (for the operator log).
-        total: usize,
+        /// What failed.
+        reason: String,
     },
 }
 
@@ -317,6 +330,9 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
     // `plan_root` clones the parent env once per instance to build each minimal child env.
     let parent_env: Vec<(String, String)> = std::env::vars().collect();
     let plan = plan_root(&config, config_path, parent_env)?;
+    // Present by construction (`plan_root` refused an absent `[privsep]`); re-borrowed for the
+    // composition-layer grant check + the supervise wiring below.
+    let privsep = config.privsep.as_ref().ok_or(PrivsepError::NotComposed)?;
 
     // The composition is AUTHORIZED. Log the non-fatal composition flags so an operator
     // sees them (crown-jewel duplication; the F8 backend/exposed co-residency).
@@ -338,15 +354,44 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
         );
     }
 
-    // WS-C: create the socketpair(2) link fds + bind + pass the privileged listener fds,
-    // `.spawn()` each `spec.to_command(current_exe)`, then run the supervise loop
-    // (restart / health / crown-jewel FailNodeClosed / shutdown fan-out). The spawn
-    // SPEC above (argv + the minimal scrubbed env) is the WS-B primitive WS-C drives.
-    // TODO(privsep WS-C): wire the transport + supervision here.
-    Err(PrivsepError::RootSupervisionNotWired {
-        instances: plan.instances.len(),
+    // Composition-layer grant check (WS-C CONTRACT #2), run IN THE ROOT, fail-closed, BEFORE any
+    // spawn — the companion to the closure lint that `derive_profile` cannot make from a single
+    // instance's view: every instance's backend-state grants must be mutually disjoint and the
+    // state-dir map must cover every hosted backend authority. Keyed off the SAME normalized
+    // data_dir the instances will derive against (both resolve `current_dir()` identically — the
+    // children inherit the root's CWD across fork+exec).
+    let cwd = std::env::current_dir().map_err(|e| PrivsepError::Supervise(format!("cwd: {e}")))?;
+    let data_dir = normalized_data_dir(&config, &cwd);
+    let caps_by_instance: BTreeMap<String, BTreeSet<HostAuthority>> = privsep
+        .instances
+        .iter()
+        .map(|(label, inst)| (label.clone(), inst.capabilities.iter().copied().collect()))
+        .collect();
+    boatramp_server::sandbox::check_grant_disjointness(&caps_by_instance, &data_dir)
+        .map_err(PrivsepError::from)?;
+
+    // The composition is fully AUTHORIZED. Create the socketpair(2) link fds, bind + pass the
+    // privileged listener fds, fork+exec each `__instance`, and run the supervise loop
+    // (crown-jewel FailNodeClosed). The whole live path requires the load-bearing sandbox wall, so
+    // it refuses the node closed on any non-Linux / non-`sandbox` build (the children could not
+    // install an `Enforced` profile there).
+    if !cfg!(all(target_os = "linux", feature = "sandbox")) {
+        return Err(PrivsepError::UnsupportedPlatform.into());
     }
-    .into())
+    supervise::run(&config, &plan).map_err(Into::into)
+}
+
+/// The node data dir, made absolute against `cwd` + lexically normalized — the SAME transform
+/// [`privsep_resolve::build_instance_sandbox_inputs`] applies, so the root's grant check and each
+/// instance's derivation key off an identical path.
+fn normalized_data_dir(config: &ServerConfig, cwd: &Path) -> PathBuf {
+    let raw = privsep_resolve::resolve_data_dir(config);
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
+    boatramp_server::sandbox::lexically_normalize(&abs)
 }
 
 // =============================================================================
@@ -474,21 +519,549 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
          never constructed)"
     );
 
-    // Step 3 (design §2.1): install the per-capability seccomp/Landlock profile BEFORE
-    // the runtime, fail-closed `Enforced` fleetwide.
-    // TODO(privsep WS-D): derive + install the per-capability profile (do NOT touch
-    // `sandbox.rs` here — WS-D owns the derivation + the `SandboxPosture` handling).
-
-    // Steps 5-6 (design §2.1): open the instance's links over the inherited socketpair
-    // fds, build the Tokio runtime, and serve its slice (materializing ONLY its held
-    // authorities, each resolving its own secret inputs behind its own Landlock grant).
-    // TODO(privsep WS-C): link-open + the serving splice.
-    Err(PrivsepError::InstanceServingNotWired {
+    let fail = |reason: String| PrivsepError::InstanceServe {
         label: label.to_string(),
-        held: inst.capabilities.len(),
-        total: HostAuthority::ALL.len(),
+        reason,
+    };
+
+    // Step 3 (design §2.1): install the per-capability seccomp/Landlock profile BEFORE the
+    // runtime, fail-closed `Enforced` fleetwide. Done on THIS single main thread so every Tokio
+    // worker thread later inherits the domain via `clone`.
+    let cwd = std::env::current_dir().map_err(|e| fail(format!("cwd: {e}")))?;
+    let data_dir = normalized_data_dir(&config, &cwd);
+    // Pre-create this instance's OWN state subtrees so the derivation's `fs::canonicalize` resolves
+    // them (Contract #1): a holder's grant canonicalizes through any symlink before the Landlock
+    // wall (which this instance has not yet installed) goes up. Best-effort — a path that cannot be
+    // created stays lexical and is still leak-checked lexically.
+    let held_set: BTreeSet<HostAuthority> = inst.capabilities.iter().copied().collect();
+    for dir in boatramp_server::sandbox::instance_backend_state_grants(&held_set, &data_dir) {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::debug!(?dir, error = %e, "[privsep] could not pre-create own state dir (will stay lexical)");
+        }
     }
-    .into())
+    let inputs = privsep_resolve::build_instance_sandbox_inputs(
+        &config,
+        &inst.capabilities,
+        config_path,
+        &cwd,
+    );
+
+    let node_allows_unsandboxed = matches!(
+        config
+            .serve
+            .as_ref()
+            .and_then(|s| s.sandbox.as_ref())
+            .map(|sb| sb.posture)
+            .unwrap_or_default(),
+        config::SandboxPosture::Off | config::SandboxPosture::Permissive
+    );
+    let install_plan =
+        boatramp_server::sandbox::privsep_install_plan(inst.sandbox, node_allows_unsandboxed)
+            .map_err(|e| fail(e.to_string()))?;
+    match install_plan {
+        boatramp_server::sandbox::PrivsepInstallPlan::InstallEnforced(posture) => {
+            let profile = boatramp_server::sandbox::derive_profile(&held_set, posture, &inputs)
+                .map_err(|e| fail(e.to_string()))?;
+            let status = boatramp_server::sandbox::install_derived(&profile);
+            // Fail-closed FLEETWIDE: anything less than `Enforced` refuses (design §2 F6 / inv7).
+            let status = boatramp_server::sandbox::enforce_privsep_status(status)
+                .map_err(|e| fail(e.to_string()))?;
+            tracing::info!(
+                instance = %label,
+                ?status,
+                seccomp_allow = profile.seccomp_allow.len(),
+                ro = profile.policy.read_only_paths.len(),
+                rw = profile.policy.read_write_paths.len(),
+                "[privsep] instance: per-capability profile installed + ENFORCED (the load-bearing wall)"
+            );
+        }
+        boatramp_server::sandbox::PrivsepInstallPlan::SkipDevOff => {
+            tracing::warn!(
+                instance = %label,
+                "[privsep] instance: sandbox posture Off on a dev node — serving WITHOUT a \
+                 per-instance profile (dev-only; refused on a non-dev node)"
+            );
+        }
+    }
+
+    // Steps 5-6 (design §2.1): open the instance's links over the inherited socketpair fds, then
+    // serve its slice. The materialization gate (above) is the construction wall; the link
+    // mediation + the profile are the other two defence-in-depth layers.
+    let fds = PrivsepChildFds::from_env().map_err(&fail)?;
+    instance_serve::run(label, &gate, &fds).map_err(|e| fail(e).into())
+}
+
+// =============================================================================
+// The root→instance fd-pass contract (WS-C): which inherited fd is which link / listener
+// =============================================================================
+
+/// The env var the root sets on each spawned `__instance` to say which inherited fd NUMBER carries
+/// which feature-link and (for a `listen.*` instance) its pre-bound listener. The values are fd
+/// numbers, NOT secrets — the local-link authority is the root-wired fd TOPOLOGY itself (design
+/// §3.3), not any token in the environment — so this var is non-secret and passes the spawn-env
+/// allowlist (`BOATRAMP_*`).
+pub const PRIVSEP_FDS_ENV: &str = "BOATRAMP_PRIVSEP_FDS";
+
+/// The fd map the root hands ONE instance (serialized into [`PRIVSEP_FDS_ENV`]): each feature-link
+/// name → the inherited fd number of this instance's socketpair end, plus the optional pre-bound
+/// listener fd. The root `dup2`s each end / listener onto these fixed numbers in the child's
+/// `pre_exec` (clearing `CLOEXEC` so they survive the exec); the instance reconstructs its
+/// endpoints from them. An absent var ⇒ an empty map (an instance the root wired no fds to).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivsepChildFds {
+    /// link name → inherited fd number (this instance's socketpair end).
+    pub links: BTreeMap<String, i32>,
+    /// The pre-bound listener fd number (a `listen.*` instance only).
+    pub listener: Option<i32>,
+}
+
+impl PrivsepChildFds {
+    /// Serialize for the [`PRIVSEP_FDS_ENV`] value.
+    pub fn to_env_value(&self) -> String {
+        serde_json::to_string(self).expect("the fd map is always serializable")
+    }
+
+    /// Parse the fd map from the process environment (an absent var ⇒ an empty map).
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(PRIVSEP_FDS_ENV) {
+            Ok(v) => {
+                serde_json::from_str(&v).map_err(|e| format!("parsing {PRIVSEP_FDS_ENV}: {e}"))
+            }
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(e) => Err(format!("reading {PRIVSEP_FDS_ENV}: {e}")),
+        }
+    }
+}
+
+/// The public listener address an instance binds, from its capability set + the resolved config
+/// (design §4.1: the root binds the privileged listener + passes the fd, so the frontend's profile
+/// can deny `bind`). Phase 1 wires the PUBLIC listener (`serve.addr`) for a
+/// `listen.public-tls`/`listen.http-parse` holder; the other `listen.*` fd binds (mail / overlay /
+/// s3ingress / inbound-tcp / gateway) are a documented follow-on. Pure (host-testable).
+fn instance_listener_addr(
+    caps: &[HostAuthority],
+    config: &ServerConfig,
+) -> Option<std::net::SocketAddr> {
+    let binds_public = caps.iter().any(|a| {
+        matches!(
+            a,
+            HostAuthority::ListenPublicTls | HostAuthority::ListenHttpParse
+        )
+    });
+    if !binds_public {
+        return None;
+    }
+    config.serve.as_ref().and_then(|s| s.addr)
+}
+
+// =============================================================================
+// The root supervisor: socketpair wiring + privileged listener bind + fork/exec + supervise
+// =============================================================================
+
+#[cfg(unix)]
+mod supervise {
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
+
+    use boatramp_core::privsep::LinkTransport;
+    use boatramp_server::privsep_link::LinkEndpoint;
+
+    use super::{PrivsepChildFds, PrivsepError, RootPlan, ServerConfig};
+
+    /// Run the root supervisor over the AUTHORIZED `plan` (design §4): create a `socketpair(2)` per
+    /// `local` link, bind the privileged public listeners, `fork`+`exec` one `__instance` per
+    /// authorized instance passing it only its own link ends + listener fd, then supervise
+    /// fail-closed (`FailNodeClosed` — any child exit tears the node down). The root holds bootstrap
+    /// authority only: it parses no bytes, opens no pool, unseals no key.
+    pub(super) fn run(config: &ServerConfig, plan: &RootPlan) -> Result<(), PrivsepError> {
+        let err = |m: String| PrivsepError::Supervise(m);
+        let privsep = config
+            .privsep
+            .as_ref()
+            .ok_or_else(|| err("no [privsep] section at supervise time".to_string()))?;
+        let current_exe =
+            std::env::current_exe().map_err(|e| err(format!("resolving current exe: {e}")))?;
+
+        // 1. A root-created socketpair(2) per `local` link; one end to each endpoint instance.
+        //    `tcp`/`overlay` carry their own endpoint arrangement — not wired in the Phase-1 cut
+        //    (design §6: local + tcp first; this WS lands the `local` default). Refuse, fail-closed.
+        let mut links_by_instance: std::collections::BTreeMap<String, Vec<(String, LinkEndpoint)>> =
+            std::collections::BTreeMap::new();
+        for (lname, link) in &privsep.links {
+            match &link.transport {
+                LinkTransport::Local => {
+                    let (a, b) = LinkEndpoint::socketpair()
+                        .map_err(|e| err(format!("socketpair for link {lname:?}: {e}")))?;
+                    links_by_instance
+                        .entry(link.from.clone())
+                        .or_default()
+                        .push((lname.clone(), a));
+                    links_by_instance
+                        .entry(link.to.clone())
+                        .or_default()
+                        .push((lname.clone(), b));
+                }
+                other => {
+                    return Err(err(format!(
+                        "link {lname:?} transport {other:?} is not wired in the Phase-1 cut \
+                         (the `local` socketpair transport is; `tcp`/`overlay` are a follow-on)"
+                    )));
+                }
+            }
+        }
+
+        // 2. Bind the privileged public listener for each `listen.*` holder (the root binds; the
+        //    frontend's profile denies `bind`). Kept owned so the fd stays open across all forks.
+        let mut listener_by_instance: std::collections::BTreeMap<String, std::net::TcpListener> =
+            std::collections::BTreeMap::new();
+        for (label, inst) in &privsep.instances {
+            if let Some(addr) = super::instance_listener_addr(&inst.capabilities, config) {
+                let listener = std::net::TcpListener::bind(addr)
+                    .map_err(|e| err(format!("binding {addr} for instance {label:?}: {e}")))?;
+                listener_by_instance.insert(label.clone(), listener);
+            }
+        }
+
+        // 3. Assign each inherited end/listener a GLOBALLY-UNIQUE target fd number ABOVE every
+        //    source fd, so a `pre_exec` `dup2(src → tgt)` can never clobber a not-yet-processed
+        //    source (in this child or another's inherited copy). Build each instance's fd map + its
+        //    (source, target) dup list.
+        let mut sources: Vec<RawFd> = Vec::new();
+        for eps in links_by_instance.values() {
+            sources.extend(eps.iter().map(|(_, ep)| ep.as_raw_fd()));
+        }
+        sources.extend(listener_by_instance.values().map(AsRawFd::as_raw_fd));
+        let mut next_target = sources.iter().copied().max().unwrap_or(2).max(2) + 1;
+
+        struct ChildWiring {
+            label: String,
+            fds: PrivsepChildFds,
+            dups: Vec<(RawFd, RawFd)>, // (source fd in the parent, target fd in the child)
+        }
+        let mut wirings: Vec<ChildWiring> = Vec::new();
+        for label in privsep.instances.keys() {
+            let mut fds = PrivsepChildFds::default();
+            let mut dups = Vec::new();
+            if let Some(eps) = links_by_instance.get(label) {
+                for (lname, ep) in eps {
+                    let target = next_target;
+                    next_target += 1;
+                    fds.links.insert(lname.clone(), target);
+                    dups.push((ep.as_raw_fd(), target));
+                }
+            }
+            if let Some(listener) = listener_by_instance.get(label) {
+                let target = next_target;
+                next_target += 1;
+                fds.listener = Some(target);
+                dups.push((listener.as_raw_fd(), target));
+            }
+            wirings.push(ChildWiring {
+                label: label.clone(),
+                fds,
+                dups,
+            });
+        }
+
+        // 4. `fork`+`exec` each `__instance` with its scrubbed env (already built, F11-B) + the fd
+        //    map, duping its ends onto the fixed targets in `pre_exec`.
+        let mut children: Vec<(String, std::process::Child)> = Vec::new();
+        for spec in &plan.instances {
+            let Some(wiring) = wirings.iter().find(|w| w.label == spec.label) else {
+                continue;
+            };
+            let mut cmd = spec.to_command(&current_exe);
+            cmd.env(super::PRIVSEP_FDS_ENV, wiring.fds.to_env_value());
+            let dups = wiring.dups.clone();
+            // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are
+            // async-signal-safe and touch only this child's fd table + death-signal. The target
+            // fds are above every source, so no `dup2` clobbers a not-yet-processed source.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for (src, tgt) in &dups {
+                        if *src != *tgt && libc::dup2(*src, *tgt) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        // Clear CLOEXEC on the target so it survives the exec (dup2 already clears
+                        // it for a distinct target; this also covers the src == tgt no-op case).
+                        let flags = libc::fcntl(*tgt, libc::F_GETFD);
+                        if flags < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::fcntl(*tgt, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    // FailNodeClosed robustness: if the root dies, the kernel kills this instance
+                    // (so a crashed root never leaves authority-holding instances orphaned). Linux
+                    // only; a best-effort hardening, not the containment itself.
+                    #[cfg(target_os = "linux")]
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            match cmd.spawn() {
+                Ok(child) => {
+                    tracing::info!(instance = %spec.label, pid = child.id(), "[privsep] root: spawned __instance (fds wired, scrubbed env)");
+                    children.push((spec.label.clone(), child));
+                }
+                Err(e) => {
+                    kill_all(&mut children);
+                    return Err(err(format!("spawning instance {:?}: {e}", spec.label)));
+                }
+            }
+        }
+
+        // Close the parent's copies of the ends it handed out — only the children (via the
+        // inherited, dup'd fds) hold them now. (The children have already forked, so their fd
+        // tables captured the open sources.)
+        drop(links_by_instance);
+        drop(listener_by_instance);
+
+        // 5. Supervise, fail-closed: any child exit tears the whole node down (crown-jewel
+        //    `FailNodeClosed`, the Phase-1 policy — serving with a hole is worse than not serving).
+        tracing::info!(
+            instances = children.len(),
+            "[privsep] root: all instances spawned + wired; supervising (any exit ⇒ FailNodeClosed)"
+        );
+        loop {
+            // Detect the first child that exited (or a wait error) WITHOUT holding a borrow of
+            // `children` across the teardown (which also borrows it mutably).
+            let mut outcome: Result<Option<String>, (String, String)> = Ok(None);
+            for (label, child) in &mut children {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        outcome = Ok(Some(format!("instance {label:?} exited ({status})")));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        outcome = Err((label.clone(), e.to_string()));
+                        break;
+                    }
+                }
+            }
+            match outcome {
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Ok(Some(reason)) => {
+                    kill_all(&mut children);
+                    return Err(err(format!(
+                        "{reason} — FailNodeClosed: tearing the node down rather than serving with \
+                         a hole"
+                    )));
+                }
+                Err((label, e)) => {
+                    kill_all(&mut children);
+                    return Err(err(format!("waiting on instance {label:?}: {e}")));
+                }
+            }
+        }
+    }
+
+    /// SIGKILL + reap every supervised child (fail-closed teardown).
+    fn kill_all(children: &mut [(String, std::process::Child)]) {
+        for (_, child) in children.iter_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod supervise {
+    use super::{PrivsepError, RootPlan, ServerConfig};
+
+    pub(super) fn run(_config: &ServerConfig, _plan: &RootPlan) -> Result<(), PrivsepError> {
+        // The root wiring needs `socketpair`/`fork`/`SCM_RIGHTS` (Unix); privsep is Linux-only in
+        // Phase 1, and the caller already refused a non-Linux/`sandbox`-less build before reaching
+        // here. This stub keeps the crate building on non-Unix.
+        Err(PrivsepError::UnsupportedPlatform)
+    }
+}
+
+// =============================================================================
+// The feature-instance serving splice (WS-C): accept + fd-pass (frontend) / recv + serve (backend)
+// =============================================================================
+
+#[cfg(unix)]
+mod instance_serve {
+    use std::net::SocketAddr;
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+    use boatramp_server::privsep_link::LinkEndpoint;
+
+    use super::{MaterializationGate, PrivsepChildFds};
+
+    /// Serve one instance's slice over its root-wired fds (design §2.1 steps 5-6). The Phase-1
+    /// minimal-but-real path demonstrating a 2-instance composition end-to-end:
+    /// - a `listen.*` instance (has a listener fd) ACCEPTS on the inherited listener and splices
+    ///   each accepted CLIENT connection fd to the backend over the local link (`SCM_RIGHTS`);
+    /// - a backend instance (has a link, no listener) RECEIVES those client fds and serves each
+    ///   with the hand-rolled HTTP stack (`boatramp_http::serve_connection`) — the SAME serving
+    ///   machinery the monolith uses, with a minimal handler (the full authority-scoped app router
+    ///   is the authority-serve follow-on);
+    /// - any other instance (e.g. a signer awaiting authority calls) holds its authorities inert
+    ///   and parks (the per-capability authority-API grammar over the link is WS-E).
+    pub(super) fn run(
+        label: &str,
+        gate: &MaterializationGate,
+        fds: &PrivsepChildFds,
+    ) -> Result<(), String> {
+        tracing::info!(
+            instance = %label,
+            held = gate.held().count(),
+            links = fds.links.len(),
+            listener = fds.listener.is_some(),
+            "[privsep] instance: opening its root-wired links + serving its slice"
+        );
+        if let Some(listener_fd) = fds.listener {
+            let link_fd = *fds.links.values().next().ok_or_else(|| {
+                "a listener instance has no feature-link to forward client connections over \
+                 (the composition must link it to a backend)"
+                    .to_string()
+            })?;
+            run_frontend(label, listener_fd, link_fd)
+        } else if let Some((lname, link_fd)) = fds.links.iter().next() {
+            run_backend(label, lname, *link_fd)
+        } else {
+            tracing::info!(
+                instance = %label,
+                "[privsep] instance: no listener/link to serve in the Phase-1 cut — holding its \
+                 authorities inert (its authority-API grammar over the link is WS-E)"
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    }
+
+    /// A `listen.*` frontend: accept on the inherited listener fd and splice each accepted client
+    /// connection fd to the backend over the local link. Phase-1 raw-splice ⇒ an EMPTY parsed head
+    /// (the frontend forwards the raw accepted socket; request-head parsing + the typed grammar are
+    /// WS-E). Blocking — the frontend needs no Tokio runtime (it forwards fds, never serves bytes).
+    fn run_frontend(label: &str, listener_fd: i32, link_fd: i32) -> Result<(), String> {
+        // SAFETY: `listener_fd`/`link_fd` are the fds the root dup'd into this child + named in the
+        // fd map; this instance owns them exclusively.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+        let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+        tracing::info!(
+            instance = %label,
+            "[privsep] frontend: accepting on the inherited listener fd; splicing client fds to the \
+             backend over the local link (SCM_RIGHTS, unidirectional)"
+        );
+        loop {
+            let (conn, _peer) = listener
+                .accept()
+                .map_err(|e| format!("accepting on the listener: {e}"))?;
+            // Pass the ACCEPTED CLIENT fd to the backend — the ONLY fd that ever crosses a link
+            // (never a link/listener/key fd; design F5).
+            link.send_client_conn(conn.as_fd(), &[])
+                .map_err(|e| format!("splicing a client connection over the link: {e}"))?;
+            // Drop our copy (SCM_RIGHTS duplicated the fd) so ONLY the backend serves it.
+            drop(conn);
+        }
+    }
+
+    /// A backend: receive the frontend's spliced client fds over the local link and serve each with
+    /// the hand-rolled HTTP stack. The received fd is treated as opaque CLIENT bytes conferring no
+    /// authority (design F5). A dedicated blocking thread drains the link (the link I/O is
+    /// blocking) and feeds a Tokio consumer that serves each connection.
+    fn run_backend(label: &str, link_name: &str, link_fd: i32) -> Result<(), String> {
+        // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+        let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("building the Tokio runtime: {e}"))?;
+        tracing::info!(
+            instance = %label,
+            link = %link_name,
+            "[privsep] backend: receiving client fds over the local link; serving each with the \
+             hand-rolled HTTP stack"
+        );
+        rt.block_on(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<OwnedFd>(64);
+            // Blocking link-drain on a dedicated thread (recv is blocking); it hands each received
+            // client fd to the async consumer. EOF/err ends the loop (the frontend went away).
+            let drain = std::thread::spawn(move || {
+                loop {
+                    match link.recv_client_conn() {
+                        Ok((fd, _head)) => {
+                            if tx.blocking_send(fd).is_err() {
+                                break; // the consumer is gone
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "[privsep] backend: link recv ended");
+                            break;
+                        }
+                    }
+                }
+            });
+            while let Some(fd) = rx.recv().await {
+                tokio::spawn(serve_client_fd(fd));
+            }
+            let _ = drain.join();
+        });
+        Ok(())
+    }
+
+    /// Serve one received client connection with the hand-rolled HTTP/1+2 stack (the same
+    /// `boatramp_http::serve_connection` the monolith's `serve_router_conn` wraps) + a minimal
+    /// handler. The full authority-scoped app router is the authority-serve follow-on.
+    async fn serve_client_fd(fd: OwnedFd) {
+        let std_stream = std::net::TcpStream::from(fd);
+        if let Err(e) = std_stream.set_nonblocking(true) {
+            tracing::debug!(error = %e, "[privsep] backend: set_nonblocking on a client fd");
+            return;
+        }
+        let peer = std_stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let stream = match tokio::net::TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "[privsep] backend: adopting a client fd into Tokio");
+                return;
+            }
+        };
+        if let Err(e) = boatramp_http::serve_connection(stream, MinimalHandler).await {
+            tracing::debug!(%peer, error = %e, "[privsep] backend: connection served with error");
+        }
+    }
+
+    /// The Phase-1 minimal backend handler: a fixed 200. It proves the end-to-end byte path
+    /// (client → frontend listener fd → SCM_RIGHTS splice → backend → hand-rolled HTTP → response)
+    /// with the sandbox enforced in both instances. The authority-scoped app router is a follow-on.
+    struct MinimalHandler;
+
+    impl boatramp_http::Handler for MinimalHandler {
+        async fn handle(&self, _req: boatramp_http::Request) -> boatramp_http::Response {
+            boatramp_http::response(
+                200,
+                b"boatramp privsep backend instance (Phase 1 minimal serve)\n".to_vec(),
+            )
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod instance_serve {
+    use super::{MaterializationGate, PrivsepChildFds};
+
+    pub(super) fn run(
+        _label: &str,
+        _gate: &MaterializationGate,
+        _fds: &PrivsepChildFds,
+    ) -> Result<(), String> {
+        Err(
+            "privsep instance serving (socketpair/SCM_RIGHTS) is Unix-only; privsep is Linux-only \
+             in Phase 1"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -784,5 +1357,57 @@ mod tests {
         assert!(dropped.contains(&HostAuthority::SecretsSealer));
         assert!(!dropped.contains(&HostAuthority::ListenHttpParse));
         assert_eq!(dropped.len(), HostAuthority::ALL.len() - 2);
+    }
+
+    // ---- WS-C: the root→instance fd-pass contract ----
+
+    #[test]
+    fn privsep_child_fds_round_trips_through_env_value() {
+        let mut fds = PrivsepChildFds::default();
+        fds.links.insert("to-core".to_string(), 3);
+        fds.links.insert("to-signer".to_string(), 4);
+        fds.listener = Some(5);
+        let value = fds.to_env_value();
+        let back: PrivsepChildFds = serde_json::from_str(&value).unwrap();
+        assert_eq!(back, fds);
+        // An empty map (an instance wired no fds) round-trips as the default.
+        let empty = PrivsepChildFds::default();
+        assert_eq!(
+            serde_json::from_str::<PrivsepChildFds>(&empty.to_env_value()).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn instance_listener_addr_only_for_public_listener_holders() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let mut cfg = cfg_with(Some(clean_privsep()));
+        cfg.serve.as_mut().unwrap().addr = Some(addr);
+
+        // A public-listener holder (public-tls / http-parse) binds serve.addr.
+        assert_eq!(
+            instance_listener_addr(&[HostAuthority::ListenHttpParse], &cfg),
+            Some(addr)
+        );
+        assert_eq!(
+            instance_listener_addr(&[HostAuthority::ListenPublicTls], &cfg),
+            Some(addr)
+        );
+        // A backend / signer / non-public-listener instance binds nothing here (Phase 1).
+        assert_eq!(
+            instance_listener_addr(&[HostAuthority::BackendKv], &cfg),
+            None
+        );
+        assert_eq!(
+            instance_listener_addr(&[HostAuthority::ListenMail], &cfg),
+            None,
+            "only the PUBLIC listener is wired in the Phase-1 cut"
+        );
+        // A public holder with no serve.addr configured binds nothing (nothing to pass).
+        cfg.serve.as_mut().unwrap().addr = None;
+        assert_eq!(
+            instance_listener_addr(&[HostAuthority::ListenHttpParse], &cfg),
+            None
+        );
     }
 }

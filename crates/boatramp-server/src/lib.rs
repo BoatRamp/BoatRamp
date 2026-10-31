@@ -47,6 +47,11 @@ pub mod aot;
 mod blob_ref;
 pub mod blob_shim;
 pub mod messaging_shim;
+/// The privsep feature-link `local` transport (privsep Phase 1 — WS-C): a root-wired
+/// `socketpair(2)` carrying length-delimited control frames + `SCM_RIGHTS` client-fd passing.
+/// Always compiled; the real implementation is `cfg(unix)` (the mechanism is POSIX) and a non-Unix
+/// build fails-closed (privsep is Linux-only in Phase 1, gated by the fail-closed sandbox install).
+pub mod privsep_link;
 /// The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
 /// allow-list (`exec*` + the kernel-escape surface KILLED, other misses `EPERM`) + a Landlock
 /// filesystem confinement. Installed BEFORE the Tokio runtime starts so every worker thread

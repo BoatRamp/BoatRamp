@@ -379,6 +379,14 @@ tikv-jemallocator = { version = "0.6", optional = true }
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
+# The hand-rolled HTTP/1+2 serving stack (`serve_connection` + the `Handler` trait). Used directly
+# by the privsep feature-instance's minimal backend serve (WS-C) — the same machinery
+# `boatramp-server` drives, but with a minimal handler (no axum/full-router coupling, which is
+# feature-gated). Always compiled (the privsep path is always compiled, like the Phase-0 sandbox).
+boatramp-http.workspace = true
+# The privsep root supervisor's fd-pass + fork/exec wiring (WS-C): `dup2`/`fcntl`/`prctl` in the
+# child's `pre_exec`. Only referenced under `cfg(unix)` (the supervise/instance-serve path).
+libc = "0.2"
 # The overlay network fabric — backs the `boatramp forward` client-edge (behind
 # the `overlay` feature; pulls quinn, so a lean build can opt out).
 boatramp-overlay = { workspace = true, optional = true }

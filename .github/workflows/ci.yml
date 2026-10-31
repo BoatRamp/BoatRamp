@@ -1610,6 +1610,40 @@ jobs:
           grep -q 'SANDBOX LIVE OK' sandbox-live.log \
             || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
 
+  # privsep Phase 1 WS-C 2-INSTANCE COMPOSITION LIVE GATE (marker `PRIVSEP LIVE OK`). Forks the real
+  # `boatramp __root` against a minimal 2-instance `[privsep]` config (a `listen.*` FRONTEND + a
+  # backend/crown-jewel CORE wired by one `local` socketpair link), proving the WHOLE WS-C runtime:
+  # the root screens + lints fail-closed, binds the privileged listener, fork+execs each instance
+  # with its scrubbed env + wired fds; each instance DERIVES + installs its per-capability
+  # seccomp/Landlock profile and refuses unless `Enforced`; the frontend splices an accepted client
+  # fd to the core over SCM_RIGHTS; the core serves a real 200 over the hand-rolled HTTP stack. The
+  # test is `#[ignore]`d (it forks + sandboxes against the live kernel) so `--include-ignored` runs
+  # it. Greps the marker + pass count so a silent skip / compile-out fails the merge.
+  live-gate-privsep:
+    name: live gate (privsep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-privsep-musl
+      - name: "privsep 2-instance composition live gate (socketpair link + SCM_RIGHTS splice + per-instance Enforced sandbox; end-to-end 200)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
+          grep -qE 'test result: ok\. 1 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'PRIVSEP LIVE OK' privsep-live.log \
+            || { echo "::error::privsep live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
+
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
   # dispatch paths, incl. the legible terminal-outcome taxonomy) ran ONLY in the nightly

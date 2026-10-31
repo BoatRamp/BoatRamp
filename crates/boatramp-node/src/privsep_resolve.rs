@@ -653,6 +653,121 @@ pub fn needed_secret_env_vars(_caps: &[HostAuthority]) -> std::collections::BTre
     std::collections::BTreeSet::new()
 }
 
+// =============================================================================
+// 3. Per-instance sandbox-derivation inputs (WS-C — honoring BOTH hard contracts)
+// =============================================================================
+
+use std::path::{Path, PathBuf};
+
+use boatramp_server::sandbox::{
+    KeyInputPaths, SandboxDerivationInputs, backend_authority_state_dirs,
+    instance_backend_state_grants,
+};
+
+/// The node data directory (`serve.data_dir`, default `./data`) — the single source of truth the
+/// sandbox-input builder + the composition grant-disjointness check both key off (matching the
+/// monolith serve path, `boatramp::serve`). NOT yet normalized — the caller normalizes via
+/// [`SandboxDerivationInputs::into_normalized`] / `lexically_normalize`.
+#[must_use]
+pub fn resolve_data_dir(cfg: &ServerConfig) -> PathBuf {
+    cfg.serve
+        .as_ref()
+        .and_then(|s| s.data_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("./data"))
+}
+
+/// Resolve the on-disk PATHS of every §1.2 crown-jewel key input from the resolved config — the
+/// PATH references only (never a dereferenced value; the config is already secret-blind by
+/// [`screen_secret_blind`], so each is a path/KMS ref, not a secret). EVERY instance is given this
+/// FULL map (not just its own keys): [`boatramp_server::sandbox::derive_profile`] grants ONLY the
+/// instance's own held key paths, and uses the NON-held entries to run its fail-closed leak check
+/// (a non-holder's grant must not transitively expose a sibling's key path). Passing a sibling's
+/// key PATH is not a secret leak — the path is a string, the instance holds no grant to the file.
+///
+/// Phase-1 scope: `kek_file` (default `<data_dir>/secrets/kek`), the overlay seed
+/// (`overlay.identity`, a path once the inline-seed screen has passed), `s3_ingress_secret_file`,
+/// and the cluster mesh `key_file` (default `<data_dir>/mesh/identity.key`) are the path-shaped
+/// inputs. `token.signer` / `image.signer` keys are `None` in Phase 1 — a privsep signer uses an
+/// `AwsKms` ambient signer (no key file) or the sealed-credential source (owner decision; the
+/// sealer-unseals-to-signer path is the documented follow-on), so no plaintext key file exists to
+/// grant here.
+#[must_use]
+pub fn resolve_key_input_paths(cfg: &ServerConfig, data_dir: &Path) -> KeyInputPaths {
+    let kek_file = cfg
+        .secrets
+        .as_ref()
+        .and_then(|s| s.kek_file.clone())
+        .or_else(|| Some(data_dir.join("secrets/kek")));
+    let overlay_seed = cfg
+        .overlay
+        .as_ref()
+        .and_then(|o| o.identity.clone())
+        .map(PathBuf::from);
+    let s3_ingress_secret = cfg
+        .serve
+        .as_ref()
+        .and_then(|s| s.s3_ingress_secret_file.clone());
+    let cluster_root_key = cfg.cluster.as_ref().map(|c| {
+        c.mesh
+            .as_ref()
+            .and_then(|m| m.key_file.clone())
+            .unwrap_or_else(|| data_dir.join("mesh/identity.key"))
+    });
+    KeyInputPaths {
+        kek_file,
+        // AwsKms-ambient / sealed-cred in Phase 1 (no plaintext key file to grant). Follow-on.
+        token_signer_key: None,
+        image_signer_key: None,
+        overlay_seed,
+        s3_ingress_secret,
+        cluster_root_key,
+    }
+}
+
+/// Build the fully-formed, NORMALIZED [`SandboxDerivationInputs`] for one instance holding `caps`
+/// — honoring BOTH WS-C hard contracts, so the caller can hand the result straight to
+/// [`boatramp_server::sandbox::derive_profile`]:
+///
+/// - **Contract #1 (canonicalize):** every path — `data_dir`, the config-dir read grant, the
+///   instance's own backend-state read-write grants, the system temp dirs, and every key path —
+///   is made absolute + lexically normalized (and `fs::canonicalize`d when it already exists) by
+///   [`SandboxDerivationInputs::into_normalized`], so `derive_profile`'s lexical FS checks match
+///   the fd-based Landlock install. `cwd` is the process working directory a relative grant
+///   resolves against (the same CWD the install's `PathFd` uses); the instance's OWN state dirs are
+///   pre-created first so a holder's grant canonicalizes through symlinks.
+/// - **Contract #2 (populate `authority_state_dirs`):** the FULL per-backend-authority state map
+///   ([`backend_authority_state_dirs`]) is attached, so `derive_profile`'s cross-authority leak
+///   check is not inert; this instance's `base_read_write` is ONLY its OWN backend authorities'
+///   state subtrees (never `data_dir` itself — refused). The composition-layer disjointness of
+///   those grants is enforced separately in the root
+///   ([`boatramp_server::sandbox::check_grant_disjointness`]).
+#[must_use]
+pub fn build_instance_sandbox_inputs(
+    cfg: &ServerConfig,
+    caps: &[HostAuthority],
+    config_path: &Path,
+    cwd: &Path,
+) -> SandboxDerivationInputs {
+    let data_dir = resolve_data_dir(cfg);
+    let config_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+    let mut inputs = SandboxDerivationInputs::for_instance(data_dir.clone(), config_dir);
+
+    let held: std::collections::BTreeSet<HostAuthority> = caps.iter().copied().collect();
+    // This instance's OWN backend state subtrees (its narrow read-write grant). NEVER data_dir
+    // itself — `derive_profile` refuses that (OverbroadStateGrant).
+    inputs.base_read_write = instance_backend_state_grants(&held, &data_dir);
+    // The FULL per-backend-authority state map, so the cross-authority leak check is live.
+    inputs.authority_state_dirs = backend_authority_state_dirs(&data_dir);
+    // The FULL crown-jewel key-path set (holder-only granting + non-holder leak-checking happen in
+    // `derive_profile`).
+    inputs.keys = resolve_key_input_paths(cfg, &data_dir);
+
+    inputs.into_normalized(cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1092,5 +1207,141 @@ mod tests {
         assert!(is_secret_bearing_env_var("BOATRAMP_AUTH_ROOT_PRIVATE_KEY"));
         assert!(is_secret_bearing_env_var("ANYTHING_SECRET"));
         assert!(is_secret_bearing_env_var("DB_PASSWORD"));
+    }
+
+    // ---- WS-C: per-instance sandbox-derivation inputs (both hard contracts) ----
+
+    #[test]
+    fn resolve_key_input_paths_resolves_configured_paths_and_defaults() {
+        let data_dir = PathBuf::from("/data");
+        // Bare config: kek + cluster-root fall back to their data_dir defaults; no overlay/s3.
+        let bare = resolve_key_input_paths(&serve_only(), &data_dir);
+        assert_eq!(bare.kek_file, Some(PathBuf::from("/data/secrets/kek")));
+        assert_eq!(bare.overlay_seed, None);
+        assert_eq!(bare.s3_ingress_secret, None);
+        // A cluster block is absent in serve_only ⇒ no cluster root key.
+        assert_eq!(bare.cluster_root_key, None);
+        // Phase-1: no plaintext signer key files (AwsKms ambient / sealed-cred follow-on).
+        assert_eq!(bare.token_signer_key, None);
+        assert_eq!(bare.image_signer_key, None);
+
+        // Explicit paths resolve verbatim.
+        let mut cfg = serve_only();
+        cfg.secrets = Some(SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: Some(PathBuf::from("/keys/kek")),
+            vault: None,
+        });
+        cfg.overlay = Some(OverlayServeConfig {
+            identity: Some("/keys/overlay.seed".to_string()),
+            ..Default::default()
+        });
+        cfg.serve.as_mut().unwrap().s3_ingress_secret_file = Some(PathBuf::from("/keys/s3.root"));
+        cfg.cluster = Some(ClusterConfig {
+            listen: "127.0.0.1:7000".parse().unwrap(),
+            root_pubkeys: Vec::new(),
+            seeds: Vec::new(),
+            join_token: Some("path:/etc/join.tok".to_string()),
+            store_dir: None,
+            mesh: None,
+        });
+        let keys = resolve_key_input_paths(&cfg, &data_dir);
+        assert_eq!(keys.kek_file, Some(PathBuf::from("/keys/kek")));
+        assert_eq!(keys.overlay_seed, Some(PathBuf::from("/keys/overlay.seed")));
+        assert_eq!(keys.s3_ingress_secret, Some(PathBuf::from("/keys/s3.root")));
+        // No mesh.key_file ⇒ cluster root defaults under data_dir.
+        assert_eq!(
+            keys.cluster_root_key,
+            Some(PathBuf::from("/data/mesh/identity.key"))
+        );
+    }
+
+    #[test]
+    fn build_instance_sandbox_inputs_honors_both_contracts_and_derives() {
+        use boatramp_core::privsep::SandboxPosture;
+        use boatramp_server::sandbox;
+
+        // A storage instance (the four backends) on an explicit absolute data_dir.
+        let mut cfg = serve_only();
+        cfg.serve.as_mut().unwrap().data_dir = Some(PathBuf::from("/srv/node"));
+        let caps = [
+            HostAuthority::BackendKv,
+            HostAuthority::BackendSql,
+            HostAuthority::BackendBlob,
+            HostAuthority::BackendMessaging,
+        ];
+        let inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+        );
+
+        // Contract #2: the FULL backend state map is populated (never inert).
+        for a in [
+            HostAuthority::BackendKv,
+            HostAuthority::BackendSql,
+            HostAuthority::BackendBlob,
+            HostAuthority::BackendMessaging,
+        ] {
+            assert!(inputs.authority_state_dirs.contains_key(&a), "{}", a.tag());
+        }
+        // This instance's own grants are its backend subtrees — NOT data_dir itself.
+        assert!(
+            inputs
+                .base_read_write
+                .contains(&PathBuf::from("/srv/node/kv"))
+        );
+        assert!(!inputs.base_read_write.contains(&PathBuf::from("/srv/node")));
+        // Contract #1: data_dir is absolute + normalized; the config dir is a read grant.
+        assert_eq!(inputs.data_dir, PathBuf::from("/srv/node"));
+        assert!(
+            inputs
+                .base_read_only
+                .contains(&PathBuf::from("/etc/boatramp"))
+        );
+
+        // The assembled inputs derive cleanly for the holder (a storage instance legitimately
+        // reaches its own backend state; it holds no crown-jewel key, so no key grant leaks).
+        let held: std::collections::BTreeSet<HostAuthority> = caps.iter().copied().collect();
+        sandbox::derive_profile(&held, SandboxPosture::Derived, &inputs)
+            .expect("storage instance inputs derive a clean profile");
+
+        // A frontend (no backends) given the SAME full map but no backend grant also derives
+        // clean — and crucially would be REFUSED if it were granted a sibling's state subtree
+        // (proven by the sandbox crate's cross-authority leak tests).
+        let fe = [HostAuthority::ListenHttpParse];
+        let fe_inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &fe,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+        );
+        assert!(
+            fe_inputs.base_read_write.is_empty(),
+            "a frontend holds no backend state grant"
+        );
+        let fe_held: std::collections::BTreeSet<HostAuthority> = fe.iter().copied().collect();
+        sandbox::derive_profile(&fe_held, SandboxPosture::Derived, &fe_inputs)
+            .expect("frontend inputs derive a clean profile (no backend/key grants)");
+    }
+
+    #[test]
+    fn relative_data_dir_is_made_absolute_against_cwd() {
+        // The `./data` default must become absolute (against the CWD the Landlock PathFd uses) so
+        // the derivation's lexical checks match the fd-based install (Contract #1).
+        let cfg = serve_only(); // no data_dir ⇒ ./data
+        let inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &[HostAuthority::BackendKv],
+            Path::new("boatramp.cfg"),
+            Path::new("/srv/app"),
+        );
+        assert_eq!(inputs.data_dir, PathBuf::from("/srv/app/data"));
+        assert!(
+            inputs
+                .base_read_write
+                .contains(&PathBuf::from("/srv/app/data/kv"))
+        );
     }
 }

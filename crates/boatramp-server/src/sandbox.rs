@@ -739,6 +739,52 @@ impl SandboxDerivationInputs {
             authority_state_dirs: BTreeMap::new(),
         }
     }
+
+    /// Normalize every path this carries so [`derive_profile`]'s LEXICAL FS checks match what
+    /// the fd-based Landlock install will actually grant (**WS-C LOAD-BEARING CONTRACT #1**; see
+    /// [`lexically_normalize`] + [`path_contains`]). For each path: make it absolute (a relative
+    /// path is joined onto `cwd` — the install resolves a relative `PathFd` against the same
+    /// process CWD) and run it through [`lexically_normalize`] to resolve `..`/`.`/separators;
+    /// then, if the resulting path already EXISTS on disk, replace it with its
+    /// [`std::fs::canonicalize`]d form (which additionally resolves symlinks). A path that does
+    /// not exist yet (a first-run state dir) keeps its lexical form — WS-C pre-creates an
+    /// instance's OWN state dirs before deriving, so a holder's own grant canonicalizes through
+    /// symlinks, while a non-holder's never-created sibling path stays lexical (and is still
+    /// leak-checked lexically). The caller MUST invoke this before [`derive_profile`].
+    #[must_use]
+    pub fn into_normalized(self, cwd: &Path) -> Self {
+        let norm = |p: &Path| -> PathBuf {
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+            let lexical = lexically_normalize(&abs);
+            // Resolve symlinks for a path that already exists; keep the lexical form otherwise.
+            std::fs::canonicalize(&lexical).unwrap_or(lexical)
+        };
+        let norm_vec = |v: &[PathBuf]| -> Vec<PathBuf> { v.iter().map(|p| norm(p)).collect() };
+        let norm_key = |o: &Option<PathBuf>| -> Option<PathBuf> { o.as_deref().map(norm) };
+        SandboxDerivationInputs {
+            data_dir: norm(&self.data_dir),
+            base_read_only: norm_vec(&self.base_read_only),
+            base_read_write: norm_vec(&self.base_read_write),
+            shared_temp: norm_vec(&self.shared_temp),
+            keys: KeyInputPaths {
+                kek_file: norm_key(&self.keys.kek_file),
+                token_signer_key: norm_key(&self.keys.token_signer_key),
+                image_signer_key: norm_key(&self.keys.image_signer_key),
+                overlay_seed: norm_key(&self.keys.overlay_seed),
+                s3_ingress_secret: norm_key(&self.keys.s3_ingress_secret),
+                cluster_root_key: norm_key(&self.keys.cluster_root_key),
+            },
+            authority_state_dirs: self
+                .authority_state_dirs
+                .iter()
+                .map(|(a, dirs)| (*a, norm_vec(dirs)))
+                .collect(),
+        }
+    }
 }
 
 /// A fully-derived per-instance profile: the seccomp allow/kill lists + the Landlock policy,
@@ -828,6 +874,59 @@ pub enum ProfileDerivationError {
 /// normalization — resolve `..`, collapse separators/trailing slashes — or dir pre-creation).
 fn path_contains(ancestor: &Path, descendant: &Path) -> bool {
     descendant == ancestor || descendant.starts_with(ancestor)
+}
+
+/// Lexically normalize `path` — resolve `.`/`..`, collapse repeated + trailing separators —
+/// PURELY, without touching the filesystem (so it works for a first-run node whose state dirs
+/// do not exist yet, unlike [`std::fs::canonicalize`], which requires the path to exist). The
+/// absolute/relative character is preserved; a leading `..` on a relative path is kept (there
+/// is no known root to resolve it against), while a `..` at the root of an absolute path is
+/// dropped (root's parent is root).
+///
+/// This is the lexical FLOOR of **WS-C LOAD-BEARING CONTRACT #1** (the doc on [`path_contains`]):
+/// every path handed to [`derive_profile`] (`data_dir`, grants, key paths, `authority_state_dirs`
+/// entries) MUST be run through [`SandboxDerivationInputs::into_normalized`] first, so the three
+/// LEXICAL FS checks can never be evaded by a `..`/relative spelling that the fd-based Landlock
+/// install would resolve to a different, sensitive path. It does NOT resolve symlinks (that needs
+/// existence); [`SandboxDerivationInputs::into_normalized`] additionally `fs::canonicalize`s a
+/// path that already exists, which does resolve symlinks, and the Landlock install is fd-based.
+pub fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    let mut root: Option<std::ffi::OsString> = None; // the Prefix/RootDir prefix, if absolute
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => root = Some(p.as_os_str().to_os_string()),
+            Component::RootDir => {
+                // Preserve any Windows prefix already captured, then mark absolute.
+                let mut r = root.take().unwrap_or_default();
+                r.push(std::path::MAIN_SEPARATOR_STR);
+                root = Some(r);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last().map(|s| s.as_os_str()) {
+                // Pop a real component.
+                Some(last) if last != ".." => {
+                    stack.pop();
+                }
+                // A leading `..` on a relative path is kept; at an absolute root it is dropped.
+                _ if root.is_none() => stack.push(std::ffi::OsString::from("..")),
+                _ => {}
+            },
+            Component::Normal(seg) => stack.push(seg.to_os_string()),
+        }
+    }
+    let mut out = PathBuf::new();
+    if let Some(r) = root {
+        out.push(r);
+    }
+    for seg in stack {
+        out.push(seg);
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
 }
 
 /// DERIVE the per-capability profile for an instance holding `caps`, under `posture`, from
@@ -937,6 +1036,148 @@ pub fn derive_profile(
             read_write_paths: read_write,
         },
     })
+}
+
+// =============================================================================
+// Backend-authority state layout + the composition-layer grant check (WS-C CONTRACT #2)
+// =============================================================================
+//
+// **WS-C LOAD-BEARING CONTRACT #2** (the doc on [`SandboxDerivationInputs::authority_state_dirs`]):
+// `authority_state_dirs` must be POPULATED with every backend authority's state subtree (else the
+// cross-authority leak check in [`derive_profile`] is INERT), AND the composition layer — which
+// alone sees ALL instances, unlike a single-instance [`derive_profile`] call — must enforce that
+// the per-instance state grants are mutually DISJOINT and that the map COVERS every hosted backend
+// authority. These functions are the single source of truth for the backend-state layout + that
+// composition-layer check; WS-B/WS-C call them in the root before any spawn, and each instance
+// builds its own `authority_state_dirs` from [`backend_authority_state_dirs`].
+
+/// The narrow state subdirectory (under `data_dir`) a backend authority (group B) owns. Each
+/// backend authority gets its OWN disjoint subtree so a composition can wall one backend's data
+/// from another's. Non-backend authorities return `None` (crown-jewel keys are handled separately
+/// by [`KeyInputPaths`]; listeners/exec/control hold no node-base state subtree here).
+///
+/// Phase-1 canonical layout. `backend.kv` maps to `<data_dir>/kv`, matching the control-plane KV
+/// store's real on-disk location; `sql`/`blob`/`messaging` are the canonical privsep names whose
+/// reconciliation with each monolith backend's exact open path is part of the authority-serve
+/// follow-on (the SECURITY property — a non-inert, disjoint cross-authority map — holds regardless
+/// of the exact leaf names, because every backend authority maps to a distinct subtree).
+pub const fn backend_state_subdir(authority: HostAuthority) -> Option<&'static str> {
+    match authority {
+        HostAuthority::BackendKv => Some("kv"),
+        HostAuthority::BackendSql => Some("sql"),
+        HostAuthority::BackendBlob => Some("blob"),
+        HostAuthority::BackendMessaging => Some("messaging"),
+        _ => None,
+    }
+}
+
+/// The full per-backend-authority state map under `data_dir` — EVERY group-B authority's state
+/// subtree. This is what an instance passes as [`SandboxDerivationInputs::authority_state_dirs`]
+/// so [`derive_profile`]'s cross-authority leak check is not inert (Contract #2). `data_dir` must
+/// already be normalized ([`SandboxDerivationInputs::into_normalized`]).
+pub fn backend_authority_state_dirs(data_dir: &Path) -> BTreeMap<HostAuthority, Vec<PathBuf>> {
+    HostAuthority::ALL
+        .iter()
+        .copied()
+        .filter_map(|a| backend_state_subdir(a).map(|sub| (a, vec![data_dir.join(sub)])))
+        .collect()
+}
+
+/// The backend-state subtrees ONE instance legitimately writes — its OWN group-B authorities'
+/// state dirs under `data_dir` (the narrow [`SandboxDerivationInputs::base_read_write`] grant WS-C
+/// hands a backend instance). A non-backend instance gets an empty set. `data_dir` must already be
+/// normalized.
+pub fn instance_backend_state_grants(
+    caps: &BTreeSet<HostAuthority>,
+    data_dir: &Path,
+) -> Vec<PathBuf> {
+    caps.iter()
+        .filter_map(|a| backend_state_subdir(*a).map(|sub| data_dir.join(sub)))
+        .collect()
+}
+
+/// A fail-closed composition-layer grant violation (**WS-C CONTRACT #2**). The root refuses the
+/// node closed and spawns nothing on any of these — each is a hole a single-instance
+/// [`derive_profile`] cannot see.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompositionGrantError {
+    /// Two instances' backend-state grants OVERLAP (the same authority is on both, or one's
+    /// subtree contains the other's) — a shared state root across a privsep boundary, which the
+    /// wall is meant to prevent. Hold each backend authority on exactly ONE instance.
+    #[error(
+        "privsep composition refused: instances {a:?} and {b:?} have overlapping backend-state \
+         grants ({a_dir:?} vs {b_dir:?}) — each backend authority's state subtree must belong to \
+         exactly one instance (a shared state root defeats the isolation wall)"
+    )]
+    OverlappingGrants {
+        /// One instance label.
+        a: String,
+        /// The other instance label.
+        b: String,
+        /// `a`'s overlapping grant.
+        a_dir: PathBuf,
+        /// `b`'s overlapping grant.
+        b_dir: PathBuf,
+    },
+    /// A hosted backend authority has no entry in the state-dir layout — the cross-authority leak
+    /// check would be INERT for it (a non-holder's grant could overlap its state undetected). A
+    /// guard against a new backend authority being added without a [`backend_state_subdir`] entry.
+    #[error(
+        "privsep composition refused: hosted backend authority {authority} has no state-dir layout \
+         entry — the cross-authority leak check would be inert for it (add a backend_state_subdir mapping)"
+    )]
+    UncoveredBackendAuthority {
+        /// The hosted backend authority missing from the layout.
+        authority: HostAuthority,
+    },
+}
+
+/// The composition-layer grant check (**WS-C CONTRACT #2**), run IN THE ROOT, fail-closed, BEFORE
+/// any spawn — the companion to [`boatramp_core::privsep::check_composition_closure`] that
+/// [`derive_profile`] cannot make from a single instance's view. `instances` maps each label to
+/// its capability set; `data_dir` is the normalized node data dir. Refuses if any two instances'
+/// backend-state grants overlap, or if any hosted backend authority lacks a layout entry.
+///
+/// This GUARANTEES the premise [`derive_profile`]'s per-instance cross-authority check relies on:
+/// that a backend authority's state subtree belongs to exactly one instance, so passing every
+/// instance the full [`backend_authority_state_dirs`] map and granting each only its OWN subtree
+/// yields real, mutually-disjoint isolation.
+pub fn check_grant_disjointness(
+    instances: &BTreeMap<String, BTreeSet<HostAuthority>>,
+    data_dir: &Path,
+) -> Result<(), CompositionGrantError> {
+    // Coverage: every hosted backend authority must have a layout entry (else the map is inert).
+    for caps in instances.values() {
+        for a in caps.iter().copied().filter(|a| a.is_backend()) {
+            if backend_state_subdir(a).is_none() {
+                return Err(CompositionGrantError::UncoveredBackendAuthority { authority: a });
+            }
+        }
+    }
+    // Disjointness: no two instances' backend-state grants may overlap (either direction).
+    let grants: Vec<(&String, Vec<PathBuf>)> = instances
+        .iter()
+        .map(|(label, caps)| (label, instance_backend_state_grants(caps, data_dir)))
+        .collect();
+    for i in 0..grants.len() {
+        for j in (i + 1)..grants.len() {
+            let (a_label, a_dirs) = &grants[i];
+            let (b_label, b_dirs) = &grants[j];
+            for a_dir in a_dirs {
+                for b_dir in b_dirs {
+                    if path_contains(a_dir, b_dir) || path_contains(b_dir, a_dir) {
+                        return Err(CompositionGrantError::OverlappingGrants {
+                            a: (*a_label).clone(),
+                            b: (*b_label).clone(),
+                            a_dir: a_dir.clone(),
+                            b_dir: b_dir.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -1066,6 +1307,25 @@ pub fn install(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
             "process sandbox requested but this build lacks the `sandbox` feature; continuing \
              WITHOUT a process sandbox"
         );
+        Ok(SandboxStatus::Unsupported)
+    }
+}
+
+/// Install a DERIVED per-instance privsep profile (WS-C), the cross-platform entry mirroring
+/// [`install`]: on Linux with the `sandbox` feature it drives [`linux::install_derived`]; on any
+/// other platform/build it is a no-op returning [`SandboxStatus::Unsupported`]. Under `[privsep]`
+/// the caller MUST pass the result through [`enforce_privsep_status`], which refuses anything less
+/// than `Enforced` — so a non-Linux / non-`sandbox` instance fails CLOSED (privsep never serves
+/// without the load-bearing wall). MUST be called on the single main thread of the `__instance`
+/// worker BEFORE the Tokio runtime is built.
+pub fn install_derived(profile: &DerivedProfile) -> Result<SandboxStatus, SandboxError> {
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    {
+        linux::install_derived(profile)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "sandbox")))]
+    {
+        let _ = profile;
         Ok(SandboxStatus::Unsupported)
     }
 }
@@ -1991,5 +2251,113 @@ mod privsep_derivation_tests {
             Err(PrivsepSandboxError::InstallFailed(msg)) => assert!(msg.contains("boom")),
             other => panic!("expected InstallFailed, got {other:?}"),
         }
+    }
+
+    // ---- WS-C CONTRACT #1: lexical path normalization (evasion cases) ----
+
+    #[test]
+    fn lexically_normalize_resolves_dotdot_dot_and_separators() {
+        // `..` is resolved against the preceding real component.
+        assert_eq!(
+            lexically_normalize(Path::new("/weird/../data/kv")),
+            PathBuf::from("/data/kv")
+        );
+        // `.` and repeated/trailing separators collapse.
+        assert_eq!(
+            lexically_normalize(Path::new("/data/./kv/")),
+            PathBuf::from("/data/kv")
+        );
+        assert_eq!(
+            lexically_normalize(Path::new("/data//kv///")),
+            PathBuf::from("/data/kv")
+        );
+        // A `..` at the absolute root is dropped (root's parent is root).
+        assert_eq!(
+            lexically_normalize(Path::new("/../../etc")),
+            PathBuf::from("/etc")
+        );
+        // A relative path keeps a leading `..` (no known root), but resolves interior `..`.
+        assert_eq!(
+            lexically_normalize(Path::new("../a/../b")),
+            PathBuf::from("../b")
+        );
+        // The crux: a `..` escape that would land on data_dir is normalized to data_dir, so the
+        // lexical leak check in derive_profile can no longer be dodged by a non-canonical spelling.
+        assert_eq!(
+            lexically_normalize(Path::new("/data/kv/../../data/kv")),
+            PathBuf::from("/data/kv")
+        );
+    }
+
+    #[test]
+    fn into_normalized_makes_grants_absolute_and_canonical_before_derive() {
+        // A relative data_dir (the `./data` default) + a `..`-spelled grant both normalize so the
+        // OverbroadStateGrant floor fires: without normalization the lexical `starts_with` check
+        // would miss `/srv/data/../data` ⊇ `/srv/data`.
+        let cwd = Path::new("/srv");
+        let mut inp = SandboxDerivationInputs::for_instance("data", None); // relative → /srv/data
+        inp.base_read_write = vec![PathBuf::from("/srv/data/../data")]; // == /srv/data (the root!)
+        let normalized = inp.into_normalized(cwd);
+        assert_eq!(normalized.data_dir, PathBuf::from("/srv/data"));
+        assert_eq!(
+            normalized.base_read_write,
+            vec![PathBuf::from("/srv/data")],
+            "the `..` spelling must normalize to the data_dir root"
+        );
+        let err = derive_profile(&frontend(), SandboxPosture::Derived, &normalized)
+            .expect_err("a `..`-spelled data_dir-root grant must be caught after normalization");
+        assert!(matches!(
+            err,
+            ProfileDerivationError::OverbroadStateGrant { .. }
+        ));
+    }
+
+    // ---- WS-C CONTRACT #2: backend-state layout + composition-layer grant check ----
+
+    #[test]
+    fn backend_state_layout_is_total_and_disjoint() {
+        let dirs = backend_authority_state_dirs(Path::new("/data"));
+        // Every backend authority (and ONLY backend authorities) has a state subtree.
+        for a in HostAuthority::ALL.iter().copied() {
+            assert_eq!(
+                dirs.contains_key(&a),
+                a.is_backend(),
+                "{} coverage mismatch",
+                a.tag()
+            );
+        }
+        // The subtrees are pairwise disjoint.
+        let all: Vec<&PathBuf> = dirs.values().flatten().collect();
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert!(
+                    !path_contains(all[i], all[j]) && !path_contains(all[j], all[i]),
+                    "backend state dirs must be disjoint: {:?} vs {:?}",
+                    all[i],
+                    all[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grant_disjointness_passes_a_clean_split_and_refuses_a_duplicated_backend() {
+        let data = Path::new("/data");
+        // Clean: edge (listeners/exec/control, no backends), storage (all four backends), signer.
+        let mut clean = BTreeMap::new();
+        clean.insert("edge".to_string(), frontend());
+        clean.insert("storage".to_string(), storage());
+        clean.insert("signer".to_string(), signer());
+        check_grant_disjointness(&clean, data).expect("a clean least-authority split is disjoint");
+
+        // A backend held by TWO instances ⇒ their state grants collide ⇒ fail-closed.
+        let mut dup = BTreeMap::new();
+        dup.insert("a".to_string(), caps(&[HostAuthority::BackendKv]));
+        dup.insert("b".to_string(), caps(&[HostAuthority::BackendKv]));
+        let err = check_grant_disjointness(&dup, data).unwrap_err();
+        assert!(matches!(
+            err,
+            CompositionGrantError::OverlappingGrants { .. }
+        ));
     }
 }
