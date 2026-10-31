@@ -50,7 +50,7 @@
 //! called from `main::run` before the runtime is built) — this module is the pure
 //! mechanism.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use boatramp_core::privsep::{HostAuthority, ProfileEnforcement, SandboxPosture};
@@ -695,6 +695,13 @@ pub struct SandboxDerivationInputs {
     pub shared_temp: Vec<PathBuf>,
     /// The crown-jewel key inputs (holder-only, leak-checked).
     pub keys: KeyInputPaths,
+    /// Per-authority backend STATE subtrees (the non-crown-jewel `backend.kv`/`backend.sql`/
+    /// `backend.blob`/… state dirs under `data_dir`). WS-B supplies this map; [`derive_profile`]
+    /// refuses (fail-closed) any grant that overlaps a subtree whose owning authority this
+    /// instance does NOT hold — the non-key analogue of the crown-jewel key leak check
+    /// (Security-review Finding 3). Empty ⇒ no cross-authority state check (the Phase-1
+    /// default until WS-C wires the real per-authority layout).
+    pub authority_state_dirs: BTreeMap<HostAuthority, Vec<PathBuf>>,
 }
 
 impl SandboxDerivationInputs {
@@ -720,6 +727,7 @@ impl SandboxDerivationInputs {
             base_read_write: Vec::new(),
             shared_temp,
             keys: KeyInputPaths::default(),
+            authority_state_dirs: BTreeMap::new(),
         }
     }
 }
@@ -739,23 +747,63 @@ pub struct DerivedProfile {
     pub policy: SandboxPolicy,
 }
 
-/// A fail-closed refusal from [`derive_profile`]: a non-holder instance's granted FS subtree
-/// would transitively expose a crown-jewel key path (design §2 step 3 — "the path is not in
-/// the FS view at all"). The derivation spawns NOTHING; WS-B must narrow the grant (give the
-/// instance its own state subtree, not a parent that contains a sibling's key).
+/// A fail-closed refusal from [`derive_profile`] — in every case the derivation spawns
+/// NOTHING; WS-B must narrow the grant so a non-holder's FS view never reaches another
+/// authority's secrets or state (design §2 step 3 / §5 inv7).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "privsep sandbox derivation refused: a granted FS subtree {via:?} would expose the \
-     {authority} key path {key_path:?}, which this instance does not hold — narrow the grant \
-     so a non-holder's FS view never contains a crown-jewel key path"
-)]
-pub struct ProfileDerivationError {
-    /// The crown-jewel authority whose key path would leak.
-    pub authority: HostAuthority,
-    /// The leaking key path.
-    pub key_path: PathBuf,
-    /// The granted subtree that is an ancestor of (or equal to) `key_path`.
-    pub via: PathBuf,
+pub enum ProfileDerivationError {
+    /// A granted FS subtree would transitively expose a crown-jewel KEY path the instance
+    /// does not hold (design §1.2 A) — "the path is not in the FS view at all". Narrow the
+    /// grant to the instance's own subtree, not a parent containing a sibling's key.
+    #[error(
+        "privsep sandbox derivation refused: a granted FS subtree {via:?} would expose the \
+         {authority} key path {key_path:?}, which this instance does not hold — narrow the \
+         grant so a non-holder's FS view never contains a crown-jewel key path"
+    )]
+    CrownJewelKeyLeak {
+        /// The crown-jewel authority whose key path would leak.
+        authority: HostAuthority,
+        /// The leaking key path.
+        key_path: PathBuf,
+        /// The granted subtree that is an ancestor of (or equal to) `key_path`.
+        via: PathBuf,
+    },
+    /// A granted state/config subtree is the node `data_dir` itself or an ANCESTOR of it —
+    /// an over-broad grant that exposes EVERY authority's backend state (KV tokens-at-rest,
+    /// sealed-cred ciphertext, SQL files, deploy manifests), not just this instance's
+    /// (Security-review Finding 3 / flag #6). An instance must be granted its OWN narrow
+    /// subtree UNDER `data_dir`, never `data_dir` or a parent (shared system temp is exempt
+    /// — it is the declared shared set, checked separately).
+    #[error(
+        "privsep sandbox derivation refused: granted subtree {via:?} is the node data_dir \
+         {data_dir:?} or an ancestor of it — an instance must be granted its own narrow \
+         subtree under data_dir, never the shared state root (it would expose every \
+         authority's backend state)"
+    )]
+    OverbroadStateGrant {
+        /// The over-broad granted subtree.
+        via: PathBuf,
+        /// The node data dir it contains (or equals).
+        data_dir: PathBuf,
+    },
+    /// A granted subtree OVERLAPS a non-held authority's declared state subtree (one
+    /// contains the other) — the instance would reach another authority's backend data
+    /// without holding it. The non-key analogue of [`Self::CrownJewelKeyLeak`]
+    /// (Security-review Finding 3); the per-authority state map is supplied by WS-B via
+    /// [`SandboxDerivationInputs::authority_state_dirs`].
+    #[error(
+        "privsep sandbox derivation refused: granted subtree {via:?} overlaps the {authority} \
+         state subtree {state_dir:?}, which this instance does not hold — a non-holder's FS \
+         view must not reach another authority's backend state"
+    )]
+    CrossAuthorityStateLeak {
+        /// The non-held authority whose state would be exposed.
+        authority: HostAuthority,
+        /// That authority's state subtree.
+        state_dir: PathBuf,
+        /// The overlapping granted subtree.
+        via: PathBuf,
+    },
 }
 
 /// `ancestor` contains (or equals) `descendant` lexically. Paths are compared as given, so WS-B
@@ -785,6 +833,41 @@ pub fn derive_profile(
         read_write.extend(inputs.shared_temp.iter().cloned());
     }
 
+    // Fail-closed Finding-3 checks over the instance's STATE/CONFIG grants (`base_read_only` +
+    // `base_read_write` — NOT `shared_temp`, the declared shared world-writable set, which is
+    // exempt): no grant may be the `data_dir` root or an ancestor of it (an over-broad grant
+    // exposing every authority's state), and no grant may overlap a non-held authority's
+    // declared state subtree. WS-B must give each instance its OWN narrow subtree under
+    // `data_dir`; a config dir that is an ancestor of `data_dir` is likewise refused here.
+    for granted in inputs
+        .base_read_only
+        .iter()
+        .chain(inputs.base_read_write.iter())
+    {
+        if path_contains(granted, &inputs.data_dir) {
+            return Err(ProfileDerivationError::OverbroadStateGrant {
+                via: granted.clone(),
+                data_dir: inputs.data_dir.clone(),
+            });
+        }
+        for (authority, dirs) in &inputs.authority_state_dirs {
+            if caps.contains(authority) {
+                continue; // the holder legitimately reaches its own state
+            }
+            for state_dir in dirs {
+                // Overlap in EITHER direction leaks: the grant contains the state subtree, OR
+                // the grant lies INSIDE another authority's state subtree.
+                if path_contains(granted, state_dir) || path_contains(state_dir, granted) {
+                    return Err(ProfileDerivationError::CrossAuthorityStateLeak {
+                        authority: *authority,
+                        state_dir: state_dir.clone(),
+                        via: granted.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     // Fail-closed leak check: every subtree granted to this instance (the NON-key grants) must
     // not be an ancestor of a crown-jewel key path whose capability the instance does NOT hold.
     for (authority, key_path, _access) in inputs.keys.entries() {
@@ -793,7 +876,7 @@ pub fn derive_profile(
         }
         for granted in read_only.iter().chain(read_write.iter()) {
             if path_contains(granted, key_path) {
-                return Err(ProfileDerivationError {
+                return Err(ProfileDerivationError::CrownJewelKeyLeak {
                     authority,
                     key_path: key_path.to_path_buf(),
                     via: granted.clone(),
@@ -1673,22 +1756,94 @@ mod privsep_derivation_tests {
 
     #[test]
     fn a_granted_subtree_that_would_expose_a_non_held_key_is_fail_closed() {
-        // A frontend granted `/data` write while a sibling's KEK lives UNDER `/data` would
-        // transitively expose it — the derivation REFUSES (design §2 step 3), spawning nothing.
+        // A frontend granted `/data/shared` (a narrow subtree under data_dir) while a sibling's
+        // KEK lives UNDER it would transitively expose it — the derivation REFUSES (design §2
+        // step 3), spawning nothing. (The grant is a subtree of data_dir, NOT data_dir itself,
+        // so this isolates the crown-jewel-key check from the OverbroadStateGrant check below.)
         let mut inp = SandboxDerivationInputs::for_instance("/data", None);
-        inp.base_read_write = vec![PathBuf::from("/data")];
-        inp.keys.kek_file = Some(PathBuf::from("/data/secrets/kek"));
+        inp.base_read_write = vec![PathBuf::from("/data/shared")];
+        inp.keys.kek_file = Some(PathBuf::from("/data/shared/kek"));
         let err = derive_profile(&frontend(), SandboxPosture::Derived, &inp)
             .expect_err("a non-holder's grant must not transitively expose a key path");
-        assert_eq!(err.authority, HostAuthority::SecretsSealer);
-        assert_eq!(err.key_path, PathBuf::from("/data/secrets/kek"));
-        assert_eq!(err.via, PathBuf::from("/data"));
+        match err {
+            ProfileDerivationError::CrownJewelKeyLeak {
+                authority,
+                key_path,
+                via,
+            } => {
+                assert_eq!(authority, HostAuthority::SecretsSealer);
+                assert_eq!(key_path, PathBuf::from("/data/shared/kek"));
+                assert_eq!(via, PathBuf::from("/data/shared"));
+            }
+            other => panic!("expected CrownJewelKeyLeak, got {other:?}"),
+        }
 
         // The HOLDER (a sealer) with the SAME overlapping grant is fine — it legitimately
         // reaches its own key.
         let sealer = caps(&[HostAuthority::SecretsSealer]);
         derive_profile(&sealer, SandboxPosture::Derived, &inp)
             .expect("the key's own holder may be granted a subtree containing it");
+    }
+
+    #[test]
+    fn an_overbroad_grant_of_the_data_dir_root_is_fail_closed_for_everyone() {
+        // Finding 3 / flag #6: granting the whole data_dir exposes EVERY authority's backend
+        // state — refused for a non-holder AND even for a crown-jewel holder (nobody gets the
+        // shared state root; each instance gets its own narrow subtree under it).
+        let mut inp = SandboxDerivationInputs::for_instance("/data", None);
+        inp.base_read_write = vec![PathBuf::from("/data")];
+        for who in [frontend(), caps(&[HostAuthority::SecretsSealer]), storage()] {
+            let err = derive_profile(&who, SandboxPosture::Derived, &inp)
+                .expect_err("granting the data_dir root is over-broad for any instance");
+            match err {
+                ProfileDerivationError::OverbroadStateGrant { via, data_dir } => {
+                    assert_eq!(via, PathBuf::from("/data"));
+                    assert_eq!(data_dir, PathBuf::from("/data"));
+                }
+                other => panic!("expected OverbroadStateGrant, got {other:?}"),
+            }
+        }
+
+        // An ANCESTOR of data_dir is equally refused.
+        let mut ancestor = SandboxDerivationInputs::for_instance("/data/node", None);
+        ancestor.base_read_only.push(PathBuf::from("/data"));
+        assert!(
+            matches!(
+                derive_profile(&frontend(), SandboxPosture::Derived, &ancestor),
+                Err(ProfileDerivationError::OverbroadStateGrant { .. })
+            ),
+            "a grant that is an ancestor of data_dir is over-broad"
+        );
+    }
+
+    #[test]
+    fn a_grant_overlapping_a_non_held_authority_state_subtree_is_fail_closed() {
+        // Finding 3 (non-key data subtrees): a frontend (no backend.kv) granted a subtree that
+        // overlaps the declared backend.kv state dir must be refused; the backend.kv HOLDER is
+        // fine. Overlap is checked in BOTH directions (grant ⊇ state, and grant ⊆ state).
+        let mut inp = SandboxDerivationInputs::for_instance("/data", None);
+        inp.authority_state_dirs
+            .insert(HostAuthority::BackendKv, vec![PathBuf::from("/data/kv")]);
+
+        // (a) grant equals the kv state dir.
+        inp.base_read_write = vec![PathBuf::from("/data/kv")];
+        let err = derive_profile(&frontend(), SandboxPosture::Derived, &inp)
+            .expect_err("a non-holder must not reach the backend.kv state");
+        assert!(matches!(
+            err,
+            ProfileDerivationError::CrossAuthorityStateLeak { authority, .. }
+                if authority == HostAuthority::BackendKv
+        ));
+        // The kv holder (storage) legitimately reaches it.
+        derive_profile(&storage(), SandboxPosture::Derived, &inp)
+            .expect("the backend.kv holder may be granted its own state subtree");
+
+        // (b) grant lies INSIDE the kv state dir (a sub-path) — still a leak for a non-holder.
+        inp.base_read_write = vec![PathBuf::from("/data/kv/tenant-a")];
+        assert!(matches!(
+            derive_profile(&frontend(), SandboxPosture::Derived, &inp),
+            Err(ProfileDerivationError::CrossAuthorityStateLeak { .. })
+        ));
     }
 
     #[test]

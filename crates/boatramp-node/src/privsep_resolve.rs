@@ -99,6 +99,22 @@ pub enum SecretBlindViolation {
     /// A Phase-2 follow-on; the Phase-1 cut supports the file-based local KEK (design
     /// §4.1).
     EnvTokenSecretsEnvelope,
+    /// A REFERENCE-SHAPED secret field ([`REFERENCE_SHAPED_SECRET_FIELDS`] — e.g.
+    /// `serve.s3_credential.secret_access_key`, `serve.alerts.webhook.url_secret`) holds a
+    /// value the secret-blind root cannot carry: either a RAW inline secret, or an `env:`
+    /// live reference the root would have to courier (Phase-1 no-courier). Only a sealed
+    /// `boatramp:<name>` or a `path:` reference is permitted — the holding instance
+    /// resolves it itself (design F1/F11-A). These fields are reference-by-design, so a
+    /// present value is NOT automatically a fault (unlike [`Self::RawSecretValue`]); only a
+    /// raw/`env:` value is.
+    UncourierableSecretReference {
+        /// The dotted config path to the offending field.
+        json_path: String,
+        /// The reference-shaped secret field name (`secret_access_key` / `url_secret`).
+        field: String,
+        /// The offending form — scheme/shape only, never the value.
+        form: &'static str,
+    },
 }
 
 impl std::fmt::Display for SecretBlindViolation {
@@ -134,6 +150,17 @@ impl std::fmt::Display for SecretBlindViolation {
                 "[secrets].envelope = \"vault\" reads VAULT_TOKEN (a live token) from the env — \
                  unsupported under [privsep] in Phase 1 (the root must not courier it). Use the \
                  file-based local KEK; env-token Vault Transit is a documented Phase-2 follow-on"
+            ),
+            Self::UncourierableSecretReference {
+                json_path,
+                field,
+                form,
+            } => write!(
+                f,
+                "config field `{json_path}` ({field}) is {form} — under [privsep] a \
+                 reference-shaped secret must be a sealed `boatramp:<name>` or a `path:` \
+                 reference the holding instance resolves itself, never a raw inline value nor \
+                 an `env:` live reference (the root must neither carry nor courier it)"
             ),
         }
     }
@@ -176,21 +203,54 @@ pub struct SecretBlindReport {
     pub opaque_reference_count: usize,
 }
 
-/// The raw-secret `SECRET_FIELDS` field names that are ALWAYS a raw value (never a
-/// reference) — a present, non-empty one anywhere in the resolved config is a refusal.
+/// Config field names that ALWAYS hold a raw secret value (never a reference) — a
+/// present, non-empty one anywhere in the resolved config is a refusal.
 ///
-/// This is the `SECRET_FIELDS` redaction constant (`config.rs`) MINUS the two
-/// reference-shaped names handled specially below:
-/// - `join_token` (`env:`/`path:`/inline — [`check_cluster_join_token`] allows only `path:`);
-/// - `secret_access_key` (a `boatramp:`/`env:` reference by design — never a raw value).
+/// This is the raw-value subset of the `SECRET_FIELDS` redaction constant (`config.rs`)
+/// MINUS the reference-shaped names handled specially:
+/// - [`REFERENCE_SHAPED_SECRET_FIELDS`] (`secret_access_key`, `url_secret`) — permitted
+///   only as a `boatramp:`/`path:` reference; [`walk_raw_secret_values`] flags a raw or
+///   `env:` value for these (a plain `boatramp:`/`path:` value is fine);
+/// - `join_token` ([`check_cluster_join_token`] — `env:`/`path:`/inline, allows only `path:`).
 ///
-/// A drift guard test asserts this set ∪ {those two} ⊇ `SECRET_FIELDS`, so a new
-/// redacted field can never silently escape the root-blindness screen.
+/// A drift guard test asserts this set ∪ [`REFERENCE_SHAPED_SECRET_FIELDS`] ∪ {`join_token`}
+/// ⊇ `SECRET_FIELDS`, so a newly-redacted field can never silently escape the screen.
 const RAW_SECRET_VALUE_FIELDS: &[&str] = &[
     "auth_root_private_key",
     "bootstrap_secret",
     "azure_access_key",
     "private_key",
+];
+
+/// Reference-shaped secret fields: reference-BY-DESIGN, so a present value is not itself a
+/// fault — but under `[privsep]` only a sealed `boatramp:<name>` or a `path:` reference the
+/// holding instance resolves itself is permitted. A raw inline value, or an `env:` live
+/// reference the root cannot courier (Phase-1 no-courier), is a refusal
+/// ([`SecretBlindViolation::UncourierableSecretReference`]). These are the Security-review
+/// Finding 2 gaps: `secret_access_key` was declared "specially handled" but checked by
+/// nothing, and `url_secret` was absent from the screen entirely.
+const REFERENCE_SHAPED_SECRET_FIELDS: &[&str] = &["secret_access_key", "url_secret"];
+
+/// Config field names whose VALUE is the NAME of an env var carrying a live secret (a
+/// bring-your-own DB connection URL/password, a KMS/admin/signer token, a PKCS#11 PIN).
+/// The root carries the NAME opaquely, but the pointed-to env var's VALUE is a live
+/// credential that must be SCRUBBED from every spawned instance's environment in Phase 1
+/// (no courier — design §4.1(c)/F11-B; Security-review Finding 1).
+/// [`declared_secret_env_var_names`] collects these VALUES from the resolved config so the
+/// scrub is CONFIG-DRIVEN, not name-pattern-guessed — the robust fix for the F11-A footgun
+/// that a suffix denylist is inherently incomplete (a `..._DB_URL` matches no secret suffix
+/// yet carries a password). The booleans `*_resolve_from_env` / `figment_env` /
+/// `serve_from_env` and the PUBLIC `jwks_env` are deliberately excluded — they name no
+/// secret value.
+const SECRET_ENV_NAME_FIELDS: &[&str] = &[
+    "url_env",
+    "read_url_env",
+    "migration_url_env",
+    "password_env",
+    "token_env",
+    "admin_token_env",
+    "access_token_env",
+    "pin_env",
 ];
 
 /// Screen the resolved [`ServerConfig`] for the root's secret-blindness (design §4.1,
@@ -277,12 +337,28 @@ fn walk_raw_secret_values(
                 } else {
                     format!("{prefix}.{k}")
                 };
-                let is_present_raw_secret = RAW_SECRET_VALUE_FIELDS.contains(&k.as_str())
-                    && matches!(v, serde_json::Value::String(s) if !s.is_empty());
-                if is_present_raw_secret {
+                if RAW_SECRET_VALUE_FIELDS.contains(&k.as_str())
+                    && matches!(v, serde_json::Value::String(s) if !s.is_empty())
+                {
                     out.push(SecretBlindViolation::RawSecretValue {
                         json_path: path,
                         field: k.clone(),
+                    });
+                } else if REFERENCE_SHAPED_SECRET_FIELDS.contains(&k.as_str())
+                    && let serde_json::Value::String(s) = v
+                    && !s.is_empty()
+                    && !is_privsep_safe_reference(s)
+                {
+                    // Reference-by-design, but a raw inline value — or an `env:` reference
+                    // the root cannot courier in Phase 1 — defeats the root's blindness.
+                    out.push(SecretBlindViolation::UncourierableSecretReference {
+                        json_path: path,
+                        field: k.clone(),
+                        form: if s.starts_with("env:") {
+                            "an `env:` live reference"
+                        } else {
+                            "a raw inline value"
+                        },
                     });
                 } else {
                     walk_raw_secret_values(v, &path, out);
@@ -296,6 +372,14 @@ fn walk_raw_secret_values(
         }
         _ => {}
     }
+}
+
+/// Whether a reference-shaped secret value is one the secret-blind root can safely carry:
+/// a sealed `boatramp:<name>` reference (resolved from the holding instance's sealed store)
+/// or a `path:<file>` reference (read behind the instance's Landlock grant). A raw inline
+/// value, or an `env:` reference the root cannot courier in Phase 1, is NOT safe.
+fn is_privsep_safe_reference(value: &str) -> bool {
+    value.starts_with("boatramp:") || value.starts_with("path:")
 }
 
 /// Classify a `[cluster].join_token` value. `None` ⇒ an acceptable `path:` reference;
@@ -354,6 +438,54 @@ fn count_opaque_references(cfg: &ServerConfig) -> usize {
 // =============================================================================
 // 2. The spawn-environment contract (F11-B)
 // =============================================================================
+
+/// Collect the env-var NAMES the resolved config declares as secret-bearing references
+/// (the [`SECRET_ENV_NAME_FIELDS`] field VALUES anywhere in the tree). This is the
+/// config-driven secret-env set [`build_instance_env`] scrubs from every spawned instance
+/// — the robust, non-guessed catch for Security-review Finding 1 (a BYO-DB connection URL
+/// in a var like `BOATRAMP_MAIN_DB_URL` matches no name suffix yet is a live credential).
+/// Walking the serialized config by field name is the SAME discipline as
+/// [`walk_raw_secret_values`]: it reaches nested handler/database entries without
+/// hand-reaching into every struct, and it is config-DECLARED rather than name-pattern
+/// guessed. (On a serialization failure it returns empty — but [`screen_secret_blind`]
+/// runs first in `plan_root` and fail-closes on that same failure, so the config is
+/// serializable by the time this is reached.)
+#[must_use]
+pub fn declared_secret_env_var_names(cfg: &ServerConfig) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Ok(value) = serde_json::to_value(cfg) {
+        collect_secret_env_names(&value, &mut out);
+    }
+    out
+}
+
+/// Recurse a serialized config value, inserting the VALUE of every [`SECRET_ENV_NAME_FIELDS`]
+/// key that is a non-empty string (the declared secret-env var name).
+fn collect_secret_env_names(
+    value: &serde_json::Value,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if SECRET_ENV_NAME_FIELDS.contains(&k.as_str())
+                    && let serde_json::Value::String(s) = v
+                    && !s.is_empty()
+                {
+                    out.insert(s.clone());
+                } else {
+                    collect_secret_env_names(v, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_secret_env_names(item, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// The explicitly-minimal env-var ALLOWLIST (exact names). Everything else an
 /// instance's process does not need is dropped (no default full-environment
@@ -446,6 +578,16 @@ fn env_name_looks_secret(name: &str) -> bool {
         "_ACCESS_KEY",
         "_PIN",
         "_KEK",
+        // Defense-in-depth beyond the config-driven [`declared_secret_env_var_names`] set
+        // (Finding 1): these name-tails are unambiguously credential-bearing. `_URL` is
+        // deliberately NOT here — a public base URL an instance legitimately needs ends
+        // `_URL` too; a SECRET connection URL is caught structurally by its `url_env`
+        // declaration instead.
+        "_SEED",
+        "_DSN",
+        "_PASSPHRASE",
+        "_CREDENTIAL",
+        "_CREDENTIALS",
     ];
     if SECRET_SUFFIXES.iter().any(|s| name.ends_with(s)) {
         return true;
@@ -466,7 +608,17 @@ fn env_name_looks_secret(name: &str) -> bool {
 /// token), so every secret-bearing var is scrubbed from every instance. Capability-aware
 /// RETENTION of a specifically-needed secret env var is the Phase-2 env-token
 /// follow-on; [`needed_secret_env_vars`] is the extension seam.
-pub fn build_instance_env<I>(parent: I, caps: &[HostAuthority]) -> BTreeMap<String, String>
+///
+/// `declared_secret_env` is the config-driven secret-env set from
+/// [`declared_secret_env_var_names`] — env-var names the config itself declared as
+/// secret-bearing references (`url_env` / `password_env` / `token_env` / …). A var in that
+/// set is scrubbed even when its NAME matches no secret suffix (Security-review Finding 1:
+/// a BYO-DB `BOATRAMP_MAIN_DB_URL` is a live credential a name-only denylist misses).
+pub fn build_instance_env<I>(
+    parent: I,
+    caps: &[HostAuthority],
+    declared_secret_env: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -477,7 +629,10 @@ where
             if !env_name_allowed(name) {
                 return false;
             }
-            if is_secret_bearing_env_var(name) {
+            // Secret-bearing = the name pattern/explicit list says so, OR the resolved
+            // config DECLARED this var as a secret-env reference. The config-declared set
+            // is the robust, non-guessed catch (design F11-A; Finding 1).
+            if is_secret_bearing_env_var(name) || declared_secret_env.contains(name.as_str()) {
                 // TODO(privsep WS-C / Phase-2): a file/fd token-source lets an instance
                 // resolve its own credential; until then, no secret env var is couriered.
                 return needed.contains(&name.as_str());
@@ -725,19 +880,68 @@ mod tests {
 
     #[test]
     fn every_secret_field_is_screened() {
-        // The raw-value walk ∪ the two specially-handled names must cover the ENTIRE
-        // SECRET_FIELDS redaction constant, so a newly-redacted field can never slip
-        // past the root-blindness screen unnoticed.
-        let specially_handled = ["join_token", "secret_access_key"];
+        // The raw-value walk ∪ the reference-shaped set ∪ the typed join_token check must
+        // cover the ENTIRE SECRET_FIELDS redaction constant, so a newly-redacted field can
+        // never slip past the root-blindness screen unnoticed. (Finding 2: `secret_access_key`
+        // is now ACTUALLY covered — by [`REFERENCE_SHAPED_SECRET_FIELDS`] with a behavioral
+        // test below — not merely declared "specially handled" by a comment.)
         for name in crate::config::figment_resolve::secret_field_names() {
-            let covered =
-                RAW_SECRET_VALUE_FIELDS.contains(name) || specially_handled.contains(name);
+            let covered = RAW_SECRET_VALUE_FIELDS.contains(name)
+                || REFERENCE_SHAPED_SECRET_FIELDS.contains(name)
+                || *name == "join_token";
             assert!(
                 covered,
-                "SECRET_FIELDS name {name:?} is neither in the raw-value walk nor specially \
-                 handled — the root-blindness screen would miss it"
+                "SECRET_FIELDS name {name:?} is neither in the raw-value walk, the \
+                 reference-shaped set, nor the typed join_token check — the root-blindness \
+                 screen would miss it"
             );
         }
+    }
+
+    // ---- Finding 2: reference-shaped secret fields (raw / env: refused) ----
+
+    #[test]
+    fn refuses_raw_or_env_secret_access_key_but_accepts_sealed_reference() {
+        // `serve.s3_credential.secret_access_key` is a `boatramp:`/`env:` reference by
+        // design; a raw inline value (or an `env:` reference the root cannot courier) must
+        // be refused. url_secret shares this exact walk branch + const set.
+        let mk = |val: &str| {
+            let cfg = serve_only();
+            let mut v = serde_json::to_value(&cfg).unwrap();
+            v["serve"]["s3_credential"] =
+                serde_json::json!({ "access_key_id": "AKIAEXAMPLE", "secret_access_key": val });
+            serde_json::from_value::<ServerConfig>(v).expect("s3_credential round-trips")
+        };
+        let raw_err =
+            screen_secret_blind(&mk("RAWSECRETKEY40CHARSxxxxxxxxxxxxxxxxxxxxx")).unwrap_err();
+        assert!(
+            raw_err.violations.iter().any(|v| matches!(
+                v,
+                SecretBlindViolation::UncourierableSecretReference { field, .. }
+                    if field == "secret_access_key"
+            )),
+            "a raw secret_access_key is refused: {raw_err}"
+        );
+        assert!(
+            screen_secret_blind(&mk("env:AWS_SECRET")).is_err(),
+            "an env: secret_access_key is uncourierable under [privsep]"
+        );
+        screen_secret_blind(&mk("boatramp:s3cred"))
+            .expect("a sealed boatramp: reference is accepted");
+        screen_secret_blind(&mk("path:/var/lib/boatramp/s3.key"))
+            .expect("a path: reference is accepted");
+    }
+
+    #[test]
+    fn url_secret_is_a_reference_shaped_screened_field() {
+        // url_secret is wired into the SAME reference-shaped mechanism (const set + walk
+        // branch, proven by the secret_access_key behavioral test) and into SECRET_FIELDS
+        // (so the drift guard enforces its coverage). Assert the wiring directly.
+        assert!(REFERENCE_SHAPED_SECRET_FIELDS.contains(&"url_secret"));
+        assert!(
+            crate::config::figment_resolve::secret_field_names().contains(&"url_secret"),
+            "url_secret must be in SECRET_FIELDS so it is redacted AND drift-guarded"
+        );
     }
 
     // ---- spawn-environment contract (F11-B) ----
@@ -775,7 +979,11 @@ mod tests {
             // arbitrary non-allowlisted var — dropped (explicitly minimal):
             ("SOME_RANDOM_VAR".to_string(), "x".to_string()),
         ];
-        let env = build_instance_env(parent, &[HostAuthority::ListenHttpParse]);
+        let env = build_instance_env(
+            parent,
+            &[HostAuthority::ListenHttpParse],
+            &std::collections::BTreeSet::new(),
+        );
 
         // Allowlisted non-secrets kept.
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
@@ -820,10 +1028,55 @@ mod tests {
                 HostAuthority::TokenSigner,
                 HostAuthority::ImageSigner,
             ],
+            &std::collections::BTreeSet::new(),
         );
         assert!(!env.contains_key("VAULT_TOKEN"));
         assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn config_declared_secret_env_var_is_scrubbed_even_without_a_secret_suffix() {
+        // Finding 1: a BYO-DB connection URL lives in BOATRAMP_MAIN_DB_URL (ends `_URL`,
+        // matches no secret suffix) — it would leak to EVERY instance under a name-only
+        // denylist. The config declares it via `url_env`, so the config-driven set scrubs it.
+        let mut declared = std::collections::BTreeSet::new();
+        declared.insert("BOATRAMP_MAIN_DB_URL".to_string());
+        let parent = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                "BOATRAMP_MAIN_DB_URL".to_string(),
+                "postgres://u:PASSWORD@h/db".to_string(),
+            ),
+        ];
+        let env = build_instance_env(parent, &[HostAuthority::ListenHttpParse], &declared);
+        assert!(
+            !env.contains_key("BOATRAMP_MAIN_DB_URL"),
+            "a config-declared secret env var must be scrubbed from every instance"
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn declared_secret_env_var_names_collects_config_url_env() {
+        // The config-driven collector walks nested handler/database entries for the
+        // SECRET_ENV_NAME_FIELDS and returns the declared env-var NAMES.
+        let cfg = serve_only();
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        v["handlers"] = serde_json::json!({
+            "databases": { "main": { "url_env": "BOATRAMP_MAIN_DB_URL", "password_env": "BOATRAMP_MAIN_DB_PW" } }
+        });
+        // Deserialize-tolerant: if the handlers shape round-trips, assert collection; the
+        // collector operates on the serialized tree regardless.
+        let names = collect_names_from_value(&v);
+        assert!(names.contains("BOATRAMP_MAIN_DB_URL"));
+        assert!(names.contains("BOATRAMP_MAIN_DB_PW"));
+    }
+
+    fn collect_names_from_value(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        super::collect_secret_env_names(v, &mut out);
+        out
     }
 
     #[test]

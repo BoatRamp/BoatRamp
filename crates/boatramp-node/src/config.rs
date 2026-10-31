@@ -6452,6 +6452,11 @@ pub(crate) mod figment_resolve {
         // `[cluster] join_token` is a secret REFERENCE by convention (`env:`/`path:`), but the
         // schema allows a raw-inlined token, so mask it to be safe (Security MEDIUM).
         "join_token",
+        // `[serve.alerts.webhook] url_secret` is a `boatramp:<name>` sealed REFERENCE by
+        // design, but the schema allows a raw-inlined URL (itself a capability secret), so
+        // mask it — and this membership drives the privsep root-blindness drift guard to
+        // enforce its reference-shaped screen (privsep Finding 2).
+        "url_secret",
     ];
 
     /// The [`SECRET_FIELDS`] redaction set, exposed for the privsep root-blindness

@@ -234,6 +234,9 @@ where
     // 3. The per-instance re-exec spawn spec (F11-B minimal env). Reached ONLY after
     //    both gates pass — so a refused composition yields no spawn spec at all.
     let path_str = config_path.to_string_lossy().into_owned();
+    // The config-driven secret-env set (Finding 1): env-var names the config declares as
+    // secret references (`url_env`/`password_env`/…), scrubbed from every instance's env.
+    let declared_secret_env = privsep_resolve::declared_secret_env_var_names(cfg);
     let instances = privsep
         .instances
         .iter()
@@ -244,7 +247,11 @@ where
                 "--config".to_string(),
                 path_str.clone(),
             ];
-            let env = privsep_resolve::build_instance_env(parent_env.clone(), &inst.capabilities);
+            let env = privsep_resolve::build_instance_env(
+                parent_env.clone(),
+                &inst.capabilities,
+                &declared_secret_env,
+            );
             InstanceSpawnSpec {
                 label: label.clone(),
                 capabilities: inst.capabilities.clone(),
