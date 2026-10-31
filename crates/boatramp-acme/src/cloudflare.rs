@@ -13,6 +13,28 @@ use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
+/// A SvcParam list rendered as Cloudflare's `data.value` wants it: space-joined
+/// `key="value"` tokens (value **double-quoted**), or a bare `key` when the
+/// value is empty. Unlike route53's unquoted convention, Cloudflare's own
+/// OpenAPI schema example quotes every param value —
+/// `alpn="h3,h2" ipv4hint="127.0.0.1" ipv6hint="::1"` (`dns-records_HTTPSRecord`
+/// / `dns-records_SVCBRecord` in
+/// <https://github.com/cloudflare/api-schemas/blob/main/openapi.json>) — see
+/// `record_body`'s doc comment for the full reference.
+fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+    params
+        .iter()
+        .map(|p| {
+            if p.value.is_empty() {
+                p.key.clone()
+            } else {
+                format!("{}=\"{}\"", p.key, p.value)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A Cloudflare zone editor scoped to one zone.
 pub struct CloudflareDns {
     client: reqwest::Client,
@@ -124,11 +146,18 @@ impl CloudflareDns {
     ///
     /// Cloudflare's API v4 body shape varies by type: A/AAAA/CNAME/TXT/NS/PTR/MX
     /// take a flat `content` string (MX adds a top-level `priority`); SRV/CAA/TLSA
-    /// take a structured `data` object. HTTPS/SVCB are not in
-    /// [`supported_kinds`](DnsProvider::supported_kinds) yet (their `data.value`
-    /// SvcParams wire encoding isn't pinned with confidence) — they fall back to
-    /// the pre-WS2 empty-`content` shape, which `validate_writable` refuses
-    /// before this is ever called in practice.
+    /// take a structured `data` object. **WS2b:** HTTPS/SVCB also take a
+    /// structured `data` object — `{priority, target, value}`, where `value` is
+    /// the whole SvcParams set, presentation-form with **each param's value
+    /// double-quoted** (e.g. `"alpn=\"h2,h3\""`) — confirmed directly from
+    /// Cloudflare's own OpenAPI schema (`dns-records_HTTPSRecord` /
+    /// `dns-records_SVCBRecord` in
+    /// <https://github.com/cloudflare/api-schemas/blob/main/openapi.json>, whose
+    /// documented example is `alpn="h3,h2" ipv4hint="127.0.0.1"
+    /// ipv6hint="::1"`), mirrored at
+    /// <https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/>
+    /// and the conceptual overview at
+    /// <https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/>.
     fn record_body(&self, record: &DnsRecord) -> serde_json::Value {
         let mut body = match &record.kind {
             RecordKind::A(_) | RecordKind::Aaaa(_) | RecordKind::Cname(_) | RecordKind::Txt(_) => {
@@ -197,10 +226,23 @@ impl CloudflareDns {
                 },
                 "ttl": record.ttl,
             }),
-            other @ (RecordKind::Https { .. } | RecordKind::Svcb { .. }) => serde_json::json!({
-                "type": other.as_str(),
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => serde_json::json!({
+                "type": record.kind.as_str(),
                 "name": record.name,
-                "content": other.flat_value(),
+                "data": {
+                    "priority": priority,
+                    "target": target,
+                    "value": svcparams_presentation(params),
+                },
                 "ttl": record.ttl,
             }),
         };
@@ -316,6 +358,8 @@ impl DnsProvider for CloudflareDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
+        // WS2b: Cloudflare's DNS Records API supports HTTPS/SVCB (see
+        // `record_body`'s doc comment for the pinned `data` shape + API ref).
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -327,6 +371,8 @@ impl DnsProvider for CloudflareDns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -530,10 +576,9 @@ mod tests {
         );
     }
 
-    /// Cloudflare declares exactly the WS2-widened set; HTTPS/SVCB remain
-    /// unsupported (SvcParams wire encoding not pinned with confidence).
+    /// Cloudflare declares the WS2-widened set plus (WS2b) HTTPS/SVCB.
     #[test]
-    fn supported_kinds_is_the_ws2_widened_set() {
+    fn supported_kinds_is_the_ws2b_widened_set() {
         let cf = CloudflareDns::new("z", "t");
         for tag in [
             RecordKindTag::A,
@@ -546,14 +591,79 @@ mod tests {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ] {
             assert!(cf.supports_kind(tag), "cloudflare should support {tag}");
         }
-        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
-            assert!(
-                !cf.supports_kind(tag),
-                "cloudflare should NOT support {tag}"
-            );
-        }
+    }
+
+    /// Golden (WS2b): Cloudflare's HTTPS/SVCB `data` object — `{priority,
+    /// target, value}`, `value` holding the whole SvcParams set with each
+    /// param's value double-quoted. The multi-param case reproduces
+    /// Cloudflare's own OpenAPI schema example verbatim
+    /// (`alpn="h3,h2" ipv4hint="127.0.0.1" ipv6hint="::1"`) — see
+    /// `record_body`'s doc comment for the reference.
+    #[test]
+    fn record_body_golden_for_https_svcb() {
+        let cf = CloudflareDns::new("z", "t");
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"type": "HTTPS", "name": "example.com", "data": {"priority": 1, "target": ".", "value": "alpn=\"h2,h3\""}, "ttl": 3600})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"type": "SVCB", "name": "_8443._tcp.example.com", "data": {"priority": 0, "target": "svc.example.net", "value": ""}, "ttl": 300})
+        );
+        // Cloudflare's own documented example, verbatim.
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![
+                        crate::dns::SvcParam {
+                            key: "alpn".into(),
+                            value: "h3,h2".into(),
+                        },
+                        crate::dns::SvcParam {
+                            key: "ipv4hint".into(),
+                            value: "127.0.0.1".into(),
+                        },
+                        crate::dns::SvcParam {
+                            key: "ipv6hint".into(),
+                            value: "::1".into(),
+                        },
+                    ],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"type": "HTTPS", "name": "example.com", "data": {"priority": 1, "target": ".", "value": "alpn=\"h3,h2\" ipv4hint=\"127.0.0.1\" ipv6hint=\"::1\""}, "ttl": 3600})
+        );
     }
 }

@@ -71,10 +71,54 @@ impl Ns1Dns {
         }
     }
 
+    /// A SvcParam list rendered as NS1's own official docs show it: RFC 9460
+    /// presentation-form tokens, space-joined, each value double-quoted when
+    /// it contains a comma (matching IBM's `alpn="h3,h2"` example) and left
+    /// bare otherwise (matching IBM's `port=8888` example) — see
+    /// `answer_fields`'s doc comment for the primary source.
+    fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+        params
+            .iter()
+            .map(|p| {
+                if p.value.is_empty() {
+                    p.key.clone()
+                } else if p.value.contains(',') {
+                    format!("{}=\"{}\"", p.key, p.value)
+                } else {
+                    format!("{}={}", p.key, p.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The `answer` array's elements: NS1 represents a multi-field RDATA (MX,
     /// SRV, CAA, TLSA) as the fields **positionally**, each its own array
     /// element (not one presentation-format string) — distinct from the
     /// single-value shape the original four kinds use.
+    ///
+    /// **WS2b:** HTTPS/SVCB follow the same positional convention, pinned
+    /// against IBM's official NS1 docs' worked `answer` examples for both
+    /// types in AliasMode and ServiceMode
+    /// (<https://www.ibm.com/docs/en/SSSYGZ/resource_management/guide_to_dns_record_types.html>,
+    /// fetched directly and independently re-verified twice in this change):
+    /// AliasMode (no SvcParams) is `[priority, target]` (2 elements, e.g.
+    /// `[0, "example.net."]`); ServiceMode (SvcParams present) is `[priority,
+    /// target, svcparams]` (3 elements, e.g. `[1, ".", "alpn=\"h3,h2\""]`) —
+    /// the whole SvcParams set collapsed into that one combined
+    /// presentation-form string, never split per-key. This adapter switches on
+    /// whether `params` is empty (matching every doc example, including one
+    /// where NS1's own ServiceMode example pairs priority `0` with a
+    /// SvcParams string — so the element count tracks `params`, not priority).
+    ///
+    /// Cross-checked against a second, independent, currently-maintained
+    /// integration against NS1's production API: DNSControl's NS1 provider
+    /// (`providers/ns1/records.go`'s `dnsv2.TypeSVCB`/`TypeHTTPS` cases) builds
+    /// the same `[priority, target, joined-SvcParams]` field order (that
+    /// library always emits 3 elements and never quotes — a design choice of
+    /// its own record model, not a documented requirement of NS1's API; IBM's
+    /// own docs are followed here for both the element count and quoting):
+    /// <https://github.com/DNSControl/dnscontrol/blob/main/providers/ns1/records.go>.
     fn answer_fields(record: &DnsRecord) -> Vec<serde_json::Value> {
         match &record.kind {
             RecordKind::Cname(target) | RecordKind::Ns(target) | RecordKind::Ptr(target) => {
@@ -114,6 +158,25 @@ impl Ns1Dns {
                 serde_json::json!(matching),
                 serde_json::json!(data),
             ],
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => {
+                let mut fields = vec![
+                    serde_json::json!(priority),
+                    serde_json::json!(Self::dotted(target)),
+                ];
+                if !params.is_empty() {
+                    fields.push(serde_json::json!(Self::svcparams_presentation(params)));
+                }
+                fields
+            }
             _ => vec![serde_json::json!(Self::answer_value(record))],
         }
     }
@@ -189,9 +252,9 @@ impl DnsProvider for Ns1Dns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // NS1's documented record types include MX, SRV, CAA, NS, PTR, and TLSA.
-        // HTTPS/SVCB are not declared (SvcParams wire encoding not pinned with
-        // confidence).
+        // WS2b: NS1 (IBM NS1 Connect) added HTTPS/SVCB support in 2023 — see
+        // `answer_fields`'s doc comment for the pinned 2-/3-element answer
+        // shape + sources.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -203,6 +266,8 @@ impl DnsProvider for Ns1Dns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -375,5 +440,75 @@ mod tests {
             )),
             serde_json::json!({"zone": "example.com", "domain": "_443._tcp.example.com", "type": "TLSA", "ttl": 300, "answers": [{"answer": [3, 1, 1, "abcdef"]}]})
         );
+    }
+
+    /// Golden (WS2b): NS1's HTTPS/SVCB `answer` — IBM's own worked examples:
+    /// AliasMode (no SvcParams) is a 2-element `[priority, dotted target]`
+    /// answer; ServiceMode (SvcParams present) is 3-element `[priority, dotted
+    /// target, SvcParams-string]`, with a param value quoted only when it
+    /// contains a comma. Pinned against the sources cited in
+    /// `answer_fields`'s doc comment.
+    #[test]
+    fn record_body_golden_for_https_svcb() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        // ServiceMode: a comma-bearing SvcParam value gets quoted.
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "example.com", "type": "HTTPS", "ttl": 3600, "answers": [{"answer": [1, ".", "alpn=\"h2,h3\""]}]})
+        );
+        // ServiceMode: a comma-free SvcParam value stays bare (IBM's `port=8888`).
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "port".into(),
+                        value: "8888".into(),
+                    }],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, ".", "port=8888"]}]})
+        );
+        // AliasMode: no SvcParams → a 2-element answer, no trailing empty string.
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"zone": "example.com", "domain": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "answers": [{"answer": [0, "svc.example.net."]}]})
+        );
+    }
+
+    /// NS1 now declares HTTPS/SVCB support (WS2b).
+    #[test]
+    fn supported_kinds_includes_https_svcb() {
+        let p = provider();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(p.supports_kind(tag), "ns1 should support {tag}");
+        }
     }
 }

@@ -73,10 +73,42 @@ impl AkamaiDns {
         }
     }
 
+    /// A SvcParam list rendered as RFC 9460 presentation-form tokens
+    /// (`key=value`, or a bare `key` when the value is empty), space-joined —
+    /// Akamai's HTTPS/SVCB rdata takes the whole SvcParams set this way (see
+    /// `rdata_value`'s doc comment for the reference).
+    fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+        params
+            .iter()
+            .map(|p| {
+                if p.value.is_empty() {
+                    p.key.clone()
+                } else {
+                    format!("{}={}", p.key, p.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The rdata value, in Akamai Edge DNS's RFC 1035 master-file presentation
     /// format: TXT is double-quoted, CNAME/NS/PTR targets and MX/SRV's name
     /// fields are trailing-dot FQDNs, CAA's string value is double-quoted, others
-    /// raw (unchanged from WS1).
+    /// raw (unchanged from WS1). **WS2b:** HTTPS/SVCB are `"<priority> <dotted
+    /// target> SvcParams..."` — Akamai's "Supported DNS resource record types"
+    /// reference lists both, and its Zone Management API reference states every
+    /// type's `rdata` is master-file-format text (so RFC 9460's own
+    /// presentation form applies, same as every other name-bearing rdata in this
+    /// adapter):
+    /// <https://techdocs.akamai.com/edge-dns/reference/supported-dns-resource-record-types>,
+    /// <https://techdocs.akamai.com/edge-dns/reference/put-zones-zone-names-name-types-type>.
+    /// The exact single-element `rdata` shape (dotted target, space-joined
+    /// SvcParams) is additionally confirmed by Akamai's own Go SDK's unit-test
+    /// fixtures, which decode real API rdata strings for both types —
+    /// `"0 svc4.example.com."` (SVCB) and `"3 https.example.com. alpn=bar
+    /// port=8080"` (HTTPS) — in
+    /// `pkg/dns/record_lookup_test.go` of
+    /// <https://github.com/akamai/AkamaiOPEN-edgegrid-golang>.
     fn rdata_value(record: &DnsRecord) -> String {
         match &record.kind {
             RecordKind::Txt(_) => format!("\"{}\"", record.kind.flat_value()),
@@ -100,6 +132,24 @@ impl AkamaiDns {
                 matching,
                 data,
             } => format!("{usage} {selector} {matching} {data}"),
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => {
+                let svcparams = Self::svcparams_presentation(params);
+                let target = Self::dotted(target);
+                if svcparams.is_empty() {
+                    format!("{priority} {target}")
+                } else {
+                    format!("{priority} {target} {svcparams}")
+                }
+            }
             _ => record.kind.flat_value(),
         }
     }
@@ -284,9 +334,9 @@ impl DnsProvider for AkamaiDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // Akamai Edge DNS's documented supported record types include MX, SRV,
-        // CAA, NS, PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire
-        // encoding not pinned with confidence).
+        // WS2b: Akamai Edge DNS's "Supported DNS resource record types"
+        // reference lists HTTPS and SVCB alongside MX/SRV/CAA/NS/PTR/TLSA — see
+        // `rdata_value`'s doc comment for the pinned encoding + API refs.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -298,6 +348,8 @@ impl DnsProvider for AkamaiDns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -521,5 +573,54 @@ mod tests {
             )),
             serde_json::json!({"name": "_443._tcp.example.com", "type": "TLSA", "ttl": 300, "rdata": ["3 1 1 abcdef"]})
         );
+    }
+
+    /// Golden (WS2b): Akamai's HTTPS/SVCB rdata — `"<priority> <dotted target>
+    /// SvcParams..."`, one master-file-format string, matching this adapter's
+    /// other name-bearing rdata. Pinned against the API references cited in
+    /// `rdata_value`'s doc comment.
+    #[test]
+    fn record_body_golden_for_https_svcb() {
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"name": "example.com", "type": "HTTPS", "ttl": 3600, "rdata": ["1 . alpn=h2,h3"]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_8443._tcp.example.com", "type": "SVCB", "ttl": 300, "rdata": ["0 svc.example.net."]})
+        );
+    }
+
+    /// Akamai now declares HTTPS/SVCB support (WS2b).
+    #[test]
+    fn supported_kinds_includes_https_svcb() {
+        let p = provider();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(p.supports_kind(tag), "akamai should support {tag}");
+        }
     }
 }

@@ -78,8 +78,15 @@ impl AzureDns {
     /// The per-type `PUT` body (`properties` with the TTL + the type's record
     /// array). **WS2:** the original four plus MX/SRV/CAA/NS/PTR — Azure DNS's
     /// documented supported record types (A, AAAA, CAA, CNAME, MX, NS, PTR, SOA,
-    /// SRV, TXT). TLSA and HTTPS/SVCB are not in that list, so they fall to the
-    /// `UnsupportedRecordType` arm (the central
+    /// SRV, TXT). **WS2b re-confirmed (doc updated 2026-09-14):** Azure's own
+    /// "DNS zones and records overview" still enumerates exactly that set —
+    /// "Azure DNS supports all common DNS record types: A, AAAA, CAA, CNAME,
+    /// MX, NS, PTR, SOA, SRV, and TXT" — with DS/TLSA gated behind a
+    /// DNSSEC-signed zone (a zone-level feature this crate doesn't model) and no
+    /// mention of HTTPS/SVCB anywhere on the page:
+    /// <https://learn.microsoft.com/azure/dns/dns-zones-records>. TLSA and
+    /// HTTPS/SVCB stay refused — a genuine provider gap, not an unpinned
+    /// encoding — so they fall to the `UnsupportedRecordType` arm (the central
     /// [`crate::dns::validate_writable`] guardrail catches it first, but this
     /// keeps the adapter honest if called directly).
     fn body(record: &DnsRecord) -> Result<serde_json::Value, DnsError> {
@@ -164,7 +171,8 @@ impl DnsProvider for AzureDns {
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
         // Azure DNS's documented supported record types: A, AAAA, CAA, CNAME,
-        // MX, NS, PTR, SOA, SRV, TXT. No TLSA, no HTTPS/SVCB.
+        // MX, NS, PTR, SOA, SRV, TXT. No TLSA, no HTTPS/SVCB — see `body`'s doc
+        // comment for the WS2b re-confirmation + doc URL.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -335,5 +343,43 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// WS2b: re-confirmed against Azure's current "DNS zones and records
+    /// overview" (doc updated 2026-09-14) — HTTPS/SVCB are still absent from
+    /// Azure's supported-type list, so `body` refuses both directly (not just
+    /// via the central guardrail) and `supported_kinds` excludes them.
+    #[test]
+    fn https_svcb_stay_unsupported() {
+        let rec = |kind| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            ttl: 60,
+        };
+        assert!(matches!(
+            AzureDns::body(&rec(RecordKind::Https {
+                priority: 1,
+                target: ".".into(),
+                params: vec![],
+            })),
+            Err(DnsError::UnsupportedRecordType {
+                kind: crate::dns::RecordKindTag::Https,
+                provider: "azure",
+            })
+        ));
+        assert!(matches!(
+            AzureDns::body(&rec(RecordKind::Svcb {
+                priority: 0,
+                target: "svc.example.net".into(),
+                params: vec![],
+            })),
+            Err(DnsError::UnsupportedRecordType {
+                kind: crate::dns::RecordKindTag::Svcb,
+                provider: "azure",
+            })
+        ));
+        let p = provider();
+        assert!(!p.supports_kind(RecordKindTag::Https));
+        assert!(!p.supports_kind(RecordKindTag::Svcb));
     }
 }

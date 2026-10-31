@@ -57,10 +57,33 @@ impl GcpDns {
         }
     }
 
+    /// A SvcParam list rendered as RFC 9460 presentation-form tokens
+    /// (`key=value`, or a bare `key` when the value is empty), space-joined —
+    /// Cloud DNS's HTTPS/SVCB rrdata takes the whole SvcParams set this way (see
+    /// `rrdatas`'s doc comment for the reference).
+    fn svcparams_presentation(params: &[crate::dns::SvcParam]) -> String {
+        params
+            .iter()
+            .map(|p| {
+                if p.value.is_empty() {
+                    p.key.clone()
+                } else {
+                    format!("{}={}", p.key, p.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The single-element rrdata list for `record`, in the RFC 1035 master-file
     /// presentation format Cloud DNS expects: TXT is double-quoted, CNAME/NS/PTR
     /// targets and MX/SRV's name fields are trailing-dot FQDNs, CAA/TLSA are
-    /// space-joined field strings, A/AAAA are the raw address.
+    /// space-joined field strings, A/AAAA are the raw address. **WS2b:**
+    /// HTTPS/SVCB are `"<priority> <dotted target> SvcParams..."` — Cloud DNS's
+    /// "Supported DNS record types" reference confirms HTTPS "is based on the
+    /// more general SVCB record type and uses the same value format," both
+    /// rendered as `SvcPriority TargetName SvcParams`:
+    /// <https://cloud.google.com/dns/docs/records-overview>.
     fn rrdatas(record: &DnsRecord) -> Vec<String> {
         let value = match &record.kind {
             RecordKind::Txt(_) => format!("\"{}\"", record.kind.flat_value()),
@@ -84,6 +107,24 @@ impl GcpDns {
                 matching,
                 data,
             } => format!("{usage} {selector} {matching} {data}"),
+            RecordKind::Https {
+                priority,
+                target,
+                params,
+            }
+            | RecordKind::Svcb {
+                priority,
+                target,
+                params,
+            } => {
+                let svcparams = Self::svcparams_presentation(params);
+                let target = Self::fqdn(target);
+                if svcparams.is_empty() {
+                    format!("{priority} {target}")
+                } else {
+                    format!("{priority} {target} {svcparams}")
+                }
+            }
             _ => record.kind.flat_value(),
         };
         vec![value]
@@ -187,9 +228,10 @@ impl DnsProvider for GcpDns {
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
-        // Google Cloud DNS's documented supported record types include MX, SRV,
-        // CAA, NS, PTR, and TLSA. HTTPS/SVCB are not declared (SvcParams wire
-        // encoding not pinned with confidence).
+        // WS2b: Cloud DNS's "Supported DNS record types" reference
+        // (https://cloud.google.com/dns/docs/records-overview) lists HTTPS and
+        // SVCB alongside MX/SRV/CAA/NS/PTR/TLSA — see `rrdatas`'s doc comment
+        // for the pinned rrdata encoding.
         &[
             RecordKindTag::A,
             RecordKindTag::Aaaa,
@@ -201,6 +243,8 @@ impl DnsProvider for GcpDns {
             RecordKindTag::Ns,
             RecordKindTag::Ptr,
             RecordKindTag::Tlsa,
+            RecordKindTag::Https,
+            RecordKindTag::Svcb,
         ]
     }
 
@@ -377,5 +421,55 @@ mod tests {
             )),
             serde_json::json!({"name": "_443._tcp.example.com.", "type": "TLSA", "ttl": 300, "rrdatas": ["3 1 1 abcdef"]})
         );
+    }
+
+    /// Golden (WS2b): Cloud DNS's HTTPS/SVCB rrdata — `"<priority> <dotted
+    /// target> SvcParams..."`, the same presentation form as every other
+    /// name-bearing rrdata in this adapter. Pinned against the API reference
+    /// cited in `rrdatas`'s doc comment.
+    #[test]
+    fn rrset_golden_for_https_svcb() {
+        let p = provider();
+        let rec = |kind, name: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Https {
+                    priority: 1,
+                    target: ".".into(),
+                    params: vec![crate::dns::SvcParam {
+                        key: "alpn".into(),
+                        value: "h2,h3".into(),
+                    }],
+                },
+                "example.com",
+                3600
+            )),
+            serde_json::json!({"name": "example.com.", "type": "HTTPS", "ttl": 3600, "rrdatas": ["1 . alpn=h2,h3"]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Svcb {
+                    priority: 0,
+                    target: "svc.example.net".into(),
+                    params: vec![],
+                },
+                "_8443._tcp.example.com",
+                300
+            )),
+            serde_json::json!({"name": "_8443._tcp.example.com.", "type": "SVCB", "ttl": 300, "rrdatas": ["0 svc.example.net."]})
+        );
+    }
+
+    /// Cloud DNS now declares HTTPS/SVCB support (WS2b).
+    #[test]
+    fn supported_kinds_includes_https_svcb() {
+        let p = provider();
+        for tag in [RecordKindTag::Https, RecordKindTag::Svcb] {
+            assert!(p.supports_kind(tag), "gcp should support {tag}");
+        }
     }
 }
