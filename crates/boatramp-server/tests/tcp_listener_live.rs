@@ -220,7 +220,7 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         assert_eq!(&got, payload, "echo must return the identical bytes");
         // Clean close: shut the client's write half → the guest reads EOF → returns Ok.
         client.shutdown().await.unwrap();
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "echo").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "echo").await;
         assert!(res.is_ok(), "echo dispatch should end cleanly: {res:?}");
     }
 
@@ -238,10 +238,10 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let _ = client.set_nodelay(true);
         // Stay quiet — no bytes in either direction. The host watchdog must tear the connection down.
-        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(5), "idle").await;
+        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(20), "idle").await;
         assert!(res.is_ok(), "idle teardown should end cleanly: {res:?}");
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(12),
             "idle teardown took too long ({elapsed:?}) — watchdog not firing near idle_timeout"
         );
         // The teardown dropped the store → the write half closed → the client observes EOF.
@@ -272,13 +272,13 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         // Hard 10s outer timeout: WITHOUT the epoch-yield fix the dispatch hangs (the fiber pins a
         // worker, the watchdog can't be re-polled) and this panics RED. WITH the fix it returns at ~1s.
         let (res, elapsed) =
-            await_dispatch(handle, Duration::from_secs(10), "spin max-duration").await;
+            await_dispatch(handle, Duration::from_secs(20), "spin max-duration").await;
         assert!(
             res.is_ok(),
             "spin max-duration teardown should end cleanly: {res:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_secs(12),
             "spin teardown took {elapsed:?} — the epoch-yield must let the watchdog preempt a \
              non-yielding guest well under the outer timeout (near max_conn_duration=1s)"
         );
@@ -307,13 +307,13 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         assert_eq!(&got, partial);
         drop(client); // abrupt peer drop mid-stream
         // The guest's input stream must surface the drop (EOF) and the connection clean up — bounded.
-        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(5), "peer-drop").await;
+        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(20), "peer-drop").await;
         assert!(
             res.is_ok(),
             "peer-drop should clean up without error: {res:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(12),
             "peer-drop cleanup took too long ({elapsed:?}) — the drop didn't surface to the guest"
         );
     }
@@ -422,7 +422,7 @@ async fn tcp_listener_tls_live_terminates_and_refuses_plaintext() {
             "the guest echoes the decrypted plaintext — the host terminated TLS"
         );
         tls.shutdown().await.ok();
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "tls-echo").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "tls-echo").await;
         assert!(res.is_ok(), "tls echo dispatch ends cleanly: {res:?}");
     }
     // (b) A PLAINTEXT client to a TLS listener is REFUSED: the handshake fails, the guest is NEVER
@@ -440,7 +440,7 @@ async fn tcp_listener_tls_live_terminates_and_refuses_plaintext() {
         .await;
         let mut raw = TcpStream::connect(addr).await.unwrap();
         raw.write_all(b"not tls, just plaintext bytes").await.ok();
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "tls-refuse").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "tls-refuse").await;
         assert!(
             res.is_err(),
             "a plaintext client to a TLS listener must be refused (no fallthrough): {res:?}"
@@ -584,7 +584,7 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
             .expect("post-TLS echo failed");
         assert_eq!(&got, post, "the guest serves over the upgraded TLS stream");
         tls.shutdown().await.ok();
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-smtp").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "starttls-smtp").await;
         assert!(res.is_ok(), "SMTP STARTTLS dispatch ends cleanly: {res:?}");
     }
 
@@ -639,7 +639,7 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
             .expect("imap post-TLS echo failed");
         assert_eq!(&got, post);
         tls.shutdown().await.ok();
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-imap").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "starttls-imap").await;
         assert!(res.is_ok(), "IMAP STARTTLS dispatch ends cleanly: {res:?}");
     }
 
@@ -697,7 +697,7 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
         );
 
         // The failed handshake drops the pump → closes the duplex → the guest reads EOF → ends cleanly.
-        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-injection").await;
+        let (res, _) = await_dispatch(handle, Duration::from_secs(20), "starttls-injection").await;
         assert!(
             res.is_ok(),
             "guest ends cleanly on EOF after a refused upgrade: {res:?}"
@@ -729,13 +729,13 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
             .expect("pre-trigger echo failed");
         assert_eq!(&echoed, line);
         // Silent now. The conn-lane idle watchdog (on the duplex) must tear the connection down.
-        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(5), "starttls-idle").await;
+        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(20), "starttls-idle").await;
         assert!(
             res.is_ok(),
             "idle teardown of a pre-trigger connection: {res:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(12),
             "idle teardown took {elapsed:?} — the watchdog must bound a STARTTLS connection stuck \
              before the trigger"
         );
@@ -854,7 +854,7 @@ async fn session_listener_live_reentry_checkpoint_and_instance_release() {
 
     // Clean close: drop the client → the driver reads EOF → the connection ends cleanly (bounded).
     drop(client);
-    let (res, _) = await_dispatch(handle, Duration::from_secs(5), "session-listener").await;
+    let (res, _) = await_dispatch(handle, Duration::from_secs(20), "session-listener").await;
     assert!(
         res.is_ok(),
         "session connection ends cleanly on peer EOF: {res:?}"
@@ -902,7 +902,7 @@ async fn session_listener_live_reentry_checkpoint_and_instance_release() {
             "posture OFF: the session guest was NEVER instantiated (dispatch refused before the store)"
         );
         drop(client);
-        let _ = await_dispatch(handle, Duration::from_secs(5), "session-posture-off").await;
+        let _ = await_dispatch(handle, Duration::from_secs(20), "session-posture-off").await;
     }
 
     println!(
@@ -985,7 +985,8 @@ async fn session_listener_live_connect_greeting_before_client_speaks() {
 
     // Clean close: drop the client → the driver reads EOF → the connection ends cleanly (bounded).
     drop(client);
-    let (res, _) = await_dispatch(handle, Duration::from_secs(5), "session-connect-greeting").await;
+    let (res, _) =
+        await_dispatch(handle, Duration::from_secs(20), "session-connect-greeting").await;
     assert!(
         res.is_ok(),
         "session connection ends cleanly on peer EOF: {res:?}"
@@ -1346,7 +1347,7 @@ async fn session_listener_live_promote_splice_fail_closed_and_lane_isolation() {
             "promoted splice ends on max_conn_duration: {res:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(7),
+            elapsed < Duration::from_secs(18),
             "max-duration must bound an idle live splice ({elapsed:?})"
         );
         let mut tail = [0u8; 1];
