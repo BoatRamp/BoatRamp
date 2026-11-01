@@ -104,6 +104,7 @@ fn boot_firecracker(cfg: &FirecrackerConfig, idx: usize) -> io::Result<Firecrack
     "initrd_path": "{initrd}",
     "boot_args": "console=ttyS0 reboot=k panic=1 pci=off ro rdinit=/init"
   }},
+  "drives": [],
   "machine-config": {{ "vcpu_count": {vcpus}, "mem_size_mib": {mem} }},
   "vsock": {{ "guest_cid": {cid}, "uds_path": "{uds}" }}
 }}"#,
