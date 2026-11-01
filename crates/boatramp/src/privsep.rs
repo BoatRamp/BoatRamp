@@ -934,10 +934,21 @@ mod supervise {
         let exe_norm = normalize_for_landlock(&current_exe, &cwd);
         let config_norm = normalize_for_landlock(config_path, &cwd);
         let profile = boatramp_server::sandbox::derive_root_profile(&exe_norm, &config_norm);
-        let status = boatramp_server::sandbox::enforce_privsep_status(
+        let status = match boatramp_server::sandbox::enforce_privsep_status(
             boatramp_server::sandbox::install_derived(&profile),
-        )
-        .map_err(|e| err(format!("installing the root self-profile: {e}")))?;
+        ) {
+            Ok(status) => status,
+            Err(e) => {
+                // Fail closed EXPLICITLY. The instances are already spawned and hold
+                // crown-jewel authority; if the root cannot install its OWN confinement
+                // (e.g. a kernel below `MIN_LANDLOCK_ABI` ⇒ `NotEnforced`) we tear them
+                // down here rather than lean on each child's `PR_SET_PDEATHSIG` — a
+                // best-effort hardening, not the containment — as the sole teardown for
+                // this path. Mirrors the step-4 spawn-failure + step-6 supervise paths.
+                kill_all(&mut children);
+                return Err(err(format!("installing the root self-profile: {e}")));
+            }
+        };
         tracing::info!(
             ?status,
             seccomp_allow = profile.seccomp_allow.len(),
