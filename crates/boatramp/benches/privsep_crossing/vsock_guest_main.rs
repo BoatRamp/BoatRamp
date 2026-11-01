@@ -22,6 +22,13 @@ const GUEST_PORT: u32 = 5201;
 /// The byte the guest fills every served response with (content is irrelevant to the benchmark —
 /// only the volume crossing is measured).
 const FILL: u8 = 0xAB;
+/// The one-shot marker frame the guest sends the instant it has accepted a connection, BEFORE
+/// serving — the host's `exchange_runner::measure` reads exactly one frame after connect and
+/// treats the time-to-that-frame as the substrate's spawn/setup cost. Every other backend
+/// (`worker::run_*`) sends this; the firecracker guest must match the SAME contract or the host
+/// blocks forever waiting for a frame that never comes. Content is irrelevant (the host discards
+/// it); it just has to be one framed message.
+const READY: &[u8] = b"READY";
 
 fn main() {
     println!("privsep-vsock-guest: booting (pid 1)");
@@ -40,7 +47,12 @@ fn run() -> std::io::Result<()> {
     loop {
         match vsock_raw::accept_vsock(listener) {
             Ok(conn) => {
-                if let Err(e) = wire::server_loop(conn, FILL) {
+                // Send the READY marker FIRST (the host's measure() reads one frame after
+                // connect as the spawn-cost signal), then serve the steady-state loop — matching
+                // every `worker::run_*` backend's contract.
+                let served =
+                    wire::write_frame(conn, READY).and_then(|()| wire::server_loop(conn, FILL));
+                if let Err(e) = served {
                     eprintln!("privsep-vsock-guest: connection error: {e}");
                 }
                 vsock_raw::close_fd(conn);
