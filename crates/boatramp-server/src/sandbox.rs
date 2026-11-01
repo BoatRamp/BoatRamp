@@ -1360,10 +1360,17 @@ pub mod linux {
     #[cfg(target_arch = "aarch64")]
     const ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
 
-    /// The Landlock ABI the ruleset handles. `V1` is the universally-available floor
-    /// (Linux 5.13+); `CompatLevel::BestEffort` upgrades confinement on newer kernels
-    /// and downgrades gracefully on older ones.
-    const LANDLOCK_ABI: landlock::ABI = landlock::ABI::V1;
+    /// The Landlock ABI the ruleset handles: the HIGHEST FS ABI this landlock crate
+    /// (0.4.7) knows — `V5` (Linux 6.10, adds `IoctlDev`; ABI 6's additions are scope, not
+    /// FS). We MUST handle the kernel's full FS-ABI, not the `V1` floor: `restrict_self`
+    /// reports `PartiallyEnforced` whenever the ruleset governs FEWER rights than the running
+    /// kernel supports (the newer FS rights would otherwise go UNgoverned — both a real
+    /// confinement gap and, under `[privsep]`'s fail-closed `Enforced` gate, a hard refusal).
+    /// `CompatLevel::BestEffort` then downgrades gracefully on an OLDER kernel (reporting
+    /// `PartiallyEnforced`, which Phase-0 `auto` tolerates but privsep refuses — correctly, an
+    /// old kernel cannot fully enforce the wall). Handling the full set also makes each grant's
+    /// `from_all`/`from_read` govern the newer rights (REFER/TRUNCATE/IOCTL_DEV) — tighter.
+    const LANDLOCK_ABI: landlock::ABI = landlock::ABI::V5;
 
     /// Set `PR_SET_NO_NEW_PRIVS` on the calling process — required so an unprivileged
     /// process can install a seccomp filter + a Landlock ruleset without `CAP_SYS_ADMIN`.
@@ -1460,9 +1467,39 @@ pub mod linux {
         Ok(created)
     }
 
+    /// Map the landlock crate's `RulesetStatus` to our coarse [`SandboxStatus`], correcting for a
+    /// crucial landlock-crate behavior: `restrict_self` returns `PartiallyEnforced` whenever the
+    /// running kernel's ABI is NEWER than the highest ABI this crate version knows
+    /// ([`LANDLOCK_ABI`]) — it conservatively declines to claim coverage of rights it does not
+    /// know (landlock-0.4.7 `compat.rs`). That makes `FullyEnforced` UNREACHABLE on any kernel
+    /// newer than the crate's max ABI, which would make privsep (fail-closed on non-`Enforced`)
+    /// unbootable on every modern kernel.
+    ///
+    /// **Security argument for accepting that case as `Enforced`:** when `kernel_abi >=
+    /// LANDLOCK_ABI`, `CompatLevel::BestEffort` dropped NOTHING — every FS access right we govern
+    /// (`AccessFs::from_all(LANDLOCK_ABI)`, i.e. ALL FS rights through V5: read/write/exec/readdir/
+    /// remove/make*/refer/truncate/ioctl-dev) IS enforced by the kernel, so the FS wall is fully
+    /// up. The ABI additions BEYOND what we handle that trigger the crate's `PartiallyEnforced`
+    /// are `LANDLOCK_SCOPE` (abstract-unix/signal, ABI 6) — a SCOPE access type, not an FS right —
+    /// so not governing them does not weaken FS confinement. A kernel OLDER than `LANDLOCK_ABI`,
+    /// by contrast, means `BestEffort` genuinely DROPPED a handled FS right (a real hole) → that
+    /// stays `Partial` (privsep refuses it). Maintenance note: if a FUTURE Landlock ABI adds a new
+    /// AccessFs right, bump the `landlock` crate + [`LANDLOCK_ABI`] so it is handled — else a kernel
+    /// with that right would be accepted here while leaving it ungoverned.
     fn status_of(ruleset: RulesetStatus) -> SandboxStatus {
         match ruleset {
             RulesetStatus::FullyEnforced => SandboxStatus::Enforced,
+            RulesetStatus::PartiallyEnforced if landlock_kernel_abi() >= LANDLOCK_ABI as i64 => {
+                // Partial ONLY because the kernel is newer than this crate's max ABI; all FS
+                // rights we handle are enforced (see the security argument above).
+                tracing::info!(
+                    kernel_abi = landlock_kernel_abi(),
+                    handled_abi = ?LANDLOCK_ABI,
+                    "landlock: kernel ABI newer than the crate's max; all handled FS rights \
+                     enforced — treating as fully enforced"
+                );
+                SandboxStatus::Enforced
+            }
             RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => SandboxStatus::Partial,
         }
     }

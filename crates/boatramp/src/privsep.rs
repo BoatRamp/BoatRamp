@@ -597,7 +597,7 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     // Steps 5-6 (design §2.1): open the instance's links over the inherited socketpair fds, then
     // serve its slice. The materialization gate (above) is the construction wall; the link
     // mediation + the profile are the other two defence-in-depth layers.
-    let fds = PrivsepChildFds::from_env().map_err(&fail)?;
+    let fds = PrivsepChildFds::from_env().map_err(fail)?;
     instance_serve::run(label, &gate, &fds).map_err(|e| fail(e).into())
 }
 
