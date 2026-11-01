@@ -27,6 +27,9 @@ name: CI
 #                       assertions of runner CPU), live-gate-dns-publish (a real wasm guest
 #                       publishing DNS through the host `dns-publish` gate into a credential-free
 #                       ManualDnsProvider — the #24 fail-closed proof at the serve seam),
+#                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
+#                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
+#                       that must never compression-mangle a framed body),
 #                       test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
@@ -1575,6 +1578,47 @@ jobs:
             || { echo "::error::dns-publish live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
             || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §9 IU-1 CONNECT-UNARY LIVE GATE (marker `CONNECT UNARY LIVE OK`). The
+  # Connect / gRPC-web transport's milestone-1 end-to-end proof: a REAL compiled guest component
+  # (`connect-greeter.wasm`, built from the shim repo's `examples/connect-greeter` on the
+  # `boatramp-connect` serving shim) serves one unary RPC `POST /connect.greeter.v1.Greeter/SayHello`
+  # via `serve_unary`, deployed through a real DeployStore + `router`, and is driven with a
+  # hand-written HTTP/1.1 Connect-unary request over a loopback `TcpStream` — the ACTUAL hand-rolled
+  # HTTP stack (`boatramp_http::serve_connection` via `serve_plaintext_listener`), not an in-process
+  # oneshot. It asserts: (1) a bare `application/proto` unary round-trips and the bare reply message
+  # decodes; (2) an `application/grpc-web+proto` unary WITH on-the-fly compression ON + `Accept-Encoding:
+  # gzip` comes back UNCOMPRESSED (no `content-encoding`) and still decodes as [data frame][grpc-status:0
+  # trailers frame] — exercising the host residual (commit `2f5aa2d0`) that must NEVER HTTP-compress a
+  # framed Connect/gRPC-web body (it would mangle the length-prefixed envelope framing). The fixture is
+  # `include_bytes!`-embedded (prebuilt + committed), so this compiles + runs on musl with NO wasm
+  # toolchain. `#[ignore]`d (real loopback sockets, timing-sensitive like the other socket live gates)
+  # and run here with `--include-ignored` as its OWN job (NOT folded into the general `--all-features`
+  # suite, per the v0.49.0 timing-flake lesson); the gate greps the success marker + the pass count, so
+  # a silent skip / compile-out fails the merge (the `ignore-gated-tests-not-evidence` discipline).
+  live-gate-connect-unary:
+    name: live gate (connect-unary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-unary-musl
+
+      - name: "connect-unary live gate (bare application/proto + gRPC-web framed-body never-compressed)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_unary_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-unary-live.log
+          grep -qE 'test result: ok\. 1 passed' connect-unary-live.log \
+            || { echo "::error::connect-unary live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT UNARY LIVE OK' connect-unary-live.log \
+            || { echo "::error::connect-unary live gate never reached its marker (a Connect/gRPC-web serve-path regression — likely the host residual that must not compression-mangle a framed body, PLAN-connect-grpc §5 / IU-1)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
