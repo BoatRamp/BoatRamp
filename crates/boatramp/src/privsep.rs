@@ -1076,7 +1076,9 @@ mod instance_serve {
             .unwrap_or_else(|| data_dir.join("secrets/kek"));
         build_envelope(EnvelopeSpec::Local { kek_file })
             .map_err(|e| format!("building the [secrets] KEK envelope: {e}"))?
-            .ok_or_else(|| "the [secrets] KEK envelope resolved to none (expected a local KEK)".to_string())
+            .ok_or_else(|| {
+                "the [secrets] KEK envelope resolved to none (expected a local KEK)".to_string()
+            })
     }
 
     /// Build the sealer's [`SealedKeyResolver`] for `key_ref`. Phase-1 cut: a `path:<file>` KEK-sealed
@@ -1121,35 +1123,39 @@ mod instance_serve {
 
         // Obtain the plaintext key spec (`"<alg>:<hex>"`), held zeroizing (both arms return the
         // `Zeroizing<Vec<u8>>` from the resolver / the unseal client).
-        let spec_bytes =
-            if gate.may_materialize(HostAuthority::SecretsSealer) {
-                // Co-resident signer+sealer: resolve in-process (it holds the KEK) — no link.
-                tracing::info!(instance = %label, "[privsep] signer: co-resident with the sealer — resolving its key in-process");
-                let resolver = build_sealer_resolver(config, key_ref)?;
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("building a runtime for in-process unseal: {e}"))?;
-                rt.block_on(resolver.resolve(key_ref))?
-            } else {
-                // Split signer: ask the sealer over its single feature-link.
-                let (lname, link_fd) = fds.links.iter().next().ok_or_else(|| {
-                    "a sealed-key signer instance has no feature-link to a secrets.sealer (the \
+        let spec_bytes = if gate.may_materialize(HostAuthority::SecretsSealer) {
+            // Co-resident signer+sealer: resolve in-process (it holds the KEK) — no link.
+            tracing::info!(instance = %label, "[privsep] signer: co-resident with the sealer — resolving its key in-process");
+            let resolver = build_sealer_resolver(config, key_ref)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("building a runtime for in-process unseal: {e}"))?;
+            rt.block_on(resolver.resolve(key_ref))?
+        } else {
+            // Split signer: ask the sealer over its single feature-link.
+            let (lname, link_fd) = fds.links.iter().next().ok_or_else(|| {
+                "a sealed-key signer instance has no feature-link to a secrets.sealer (the \
                      composition-closure lint requires one)"
-                        .to_string()
-                })?;
-                tracing::info!(instance = %label, link = %lname, "[privsep] signer: asking the sealer to unseal its signing key over the link");
-                // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
-                let link = unsafe { LinkEndpoint::from_inherited_fd(*link_fd) };
-                boatramp_server::privsep_unseal::request_unseal(&link, key_ref)
-                    .map_err(|e| format!("unsealing the signing key over the link: {e}"))?
-            };
+                    .to_string()
+            })?;
+            tracing::info!(instance = %label, link = %lname, "[privsep] signer: asking the sealer to unseal its signing key over the link");
+            // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+            let link = unsafe { LinkEndpoint::from_inherited_fd(*link_fd) };
+            boatramp_server::privsep_unseal::request_unseal(&link, key_ref)
+                .map_err(|e| format!("unsealing the signing key over the link: {e}"))?
+        };
 
         // The unsealed bytes are a `"<alg>:<hex>"` signer spec.
-        let spec = std::str::from_utf8(&spec_bytes)
-            .map_err(|_| "the unsealed signer key is not valid UTF-8 (expected `<alg>:<hex>`)".to_string())?;
-        let signer = LocalSigner::from_private_hex(spec)
-            .map_err(|e| format!("loading the unsealed signing key: {e}"))?;
+        let spec = std::str::from_utf8(&spec_bytes).map_err(|_| {
+            "the unsealed signer key is not valid UTF-8 (expected `<alg>:<hex>`)".to_string()
+        })?;
+        // Generic parse error — never interpolate the parser's message: on a malformed-but-
+        // KEK-unsealed key (operator error) `from_private_hex`/`split_tagged` can echo a tag or
+        // hex fragment of the plaintext key, which must not reach the node log (Security INFO).
+        let signer = LocalSigner::from_private_hex(spec).map_err(|_| {
+            "the unsealed signing key failed to parse (expected `<alg>:<hex>`)".to_string()
+        })?;
 
         // Self-test: sign + verify a fixed message so a bad/wrong key fails NOW (fail-closed), not at
         // first mint. Proves the unlocked key is live and usable end-to-end.
@@ -1161,10 +1167,9 @@ mod instance_serve {
         let sig = rt
             .block_on(signer.sign(SELF_TEST))
             .map_err(|e| format!("signing the self-test with the unlocked key: {e}"))?;
-        signer
-            .public_key()
-            .verify(SELF_TEST, &sig)
-            .map_err(|e| format!("verifying the self-test signature (the unlocked key is bad): {e}"))?;
+        signer.public_key().verify(SELF_TEST, &sig).map_err(|e| {
+            format!("verifying the self-test signature (the unlocked key is bad): {e}")
+        })?;
 
         // The marker the live gate greps: only reached after a real unseal + a live sign/verify.
         tracing::info!(instance = %label, "[privsep] PRIVSEP SIGNER UNSEAL OK");

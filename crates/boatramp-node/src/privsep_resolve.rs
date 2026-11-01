@@ -1043,7 +1043,10 @@ mod tests {
         cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::Sealed {
             key_ref: "path:/keys/signer.sealed".to_string(),
         });
-        assert_eq!(sealed_signer_key_ref(&cfg), Some("path:/keys/signer.sealed"));
+        assert_eq!(
+            sealed_signer_key_ref(&cfg),
+            Some("path:/keys/signer.sealed")
+        );
         assert_eq!(
             sealed_signer_key_file(&cfg),
             Some(PathBuf::from("/keys/signer.sealed"))

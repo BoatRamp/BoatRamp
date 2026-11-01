@@ -290,7 +290,10 @@ fn send_response(link: &LinkEndpoint, resp: &UnsealResponse) -> Result<(), Strin
 /// calls this before building its [`boatramp_core::cose::LocalSigner`]. Fail-closed: a refusal or a
 /// failure is an error, never a partial/empty key.
 #[cfg(unix)]
-pub fn request_unseal(link: &LinkEndpoint, key_ref: &str) -> Result<Zeroizing<Vec<u8>>, UnsealError> {
+pub fn request_unseal(
+    link: &LinkEndpoint,
+    key_ref: &str,
+) -> Result<Zeroizing<Vec<u8>>, UnsealError> {
     let req = UnsealRequest {
         key_ref: key_ref.to_string(),
     };
@@ -370,10 +373,7 @@ pub struct SecretStoreResolver {
 impl SecretStoreResolver {
     /// Build from the sealer's control-plane KV + its `[secrets]` KEK envelope.
     #[must_use]
-    pub fn new(
-        kv: Arc<dyn boatramp_core::kv::KvStore>,
-        envelope: Arc<dyn KeyEnvelope>,
-    ) -> Self {
+    pub fn new(kv: Arc<dyn boatramp_core::kv::KvStore>, envelope: Arc<dyn KeyEnvelope>) -> Self {
         Self {
             store: boatramp_core::secret_store::SecretStore::new(kv, envelope),
         }
@@ -393,7 +393,9 @@ impl SealedKeyResolver for SecretStoreResolver {
             .await
         {
             Ok(Some(bytes)) => Ok(Zeroizing::new(bytes)),
-            Ok(None) => Err(format!("sealed signer key boatramp:{name} is not in the store")),
+            Ok(None) => Err(format!(
+                "sealed signer key boatramp:{name} is not in the store"
+            )),
             Err(e) => Err(format!("sealed store get boatramp:{name}: {e}")),
         }
     }
@@ -482,7 +484,10 @@ mod tests {
             let key = request_unseal(&signer_end, "boatramp:auth-root").expect("unseal succeeds");
             assert_eq!(&key[..], b"es256:deadbeef");
             drop(signer_end); // EOF → the sealer loop returns Ok
-            sealer.join().unwrap().expect("sealer serve ends cleanly on EOF");
+            sealer
+                .join()
+                .unwrap()
+                .expect("sealer serve ends cleanly on EOF");
         }
 
         /// A NON-allowlisted name is refused fail-closed: no bytes, and the sealer keeps serving.

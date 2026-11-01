@@ -1530,10 +1530,7 @@ mod tests {
             ]),
         );
         // The SIGNER: token.signer alone.
-        instances.insert(
-            "signer".to_string(),
-            inst(&[HostAuthority::TokenSigner]),
-        );
+        instances.insert("signer".to_string(), inst(&[HostAuthority::TokenSigner]));
         let mut links = BTreeMap::new();
         links.insert(
             "to-signer".to_string(),
