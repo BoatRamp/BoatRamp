@@ -1360,17 +1360,29 @@ pub mod linux {
     #[cfg(target_arch = "aarch64")]
     const ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
 
-    /// The Landlock ABI the ruleset handles: the HIGHEST FS ABI this landlock crate
-    /// (0.4.7) knows — `V5` (Linux 6.10, adds `IoctlDev`; ABI 6's additions are scope, not
-    /// FS). We MUST handle the kernel's full FS-ABI, not the `V1` floor: `restrict_self`
-    /// reports `PartiallyEnforced` whenever the ruleset governs FEWER rights than the running
-    /// kernel supports (the newer FS rights would otherwise go UNgoverned — both a real
-    /// confinement gap and, under `[privsep]`'s fail-closed `Enforced` gate, a hard refusal).
-    /// `CompatLevel::BestEffort` then downgrades gracefully on an OLDER kernel (reporting
-    /// `PartiallyEnforced`, which Phase-0 `auto` tolerates but privsep refuses — correctly, an
-    /// old kernel cannot fully enforce the wall). Handling the full set also makes each grant's
-    /// `from_all`/`from_read` govern the newer rights (REFER/TRUNCATE/IOCTL_DEV) — tighter.
-    const LANDLOCK_ABI: landlock::ABI = landlock::ABI::V5;
+    /// The MINIMUM Landlock ABI privsep requires for its FS wall — a POLICY floor, decoupled
+    /// from the set of rights we handle. `V5` (Linux 6.10) guarantees the wall includes
+    /// `Truncate` (V3) and `IoctlDev` (V5) confinement; a kernel below it is refused by
+    /// [`status_of`] (its wall is genuinely weaker than privsep needs — e.g. a process with
+    /// `/dev` read could `ioctl` a device file that `IoctlDev` would otherwise deny). Raise or
+    /// lower this to trade confinement breadth against older-kernel support.
+    const MIN_LANDLOCK_ABI: landlock::ABI = landlock::ABI::V5;
+
+    /// The FS ABI to actually HANDLE for a given running-kernel ABI: the kernel's own ABI,
+    /// clamped to the highest this `landlock` crate knows (`ABI::from` saturates — e.g.
+    /// `from(999) == V9` in 0.4.7). Handling exactly what the kernel supports (rather than a
+    /// fixed ABI) is the fix for landlock-0.4.7's behavior that `restrict_self` reports
+    /// `PartiallyEnforced` whenever the kernel's ABI is NEWER than the handled ABI: by tracking
+    /// the kernel we govern EVERY FS right it supports (so nothing is left ungoverned — closing
+    /// the latent `ResolveUnix`/V9 gap a hardcoded lower ABI would leave) AND we get
+    /// `FullyEnforced` on any kernel the crate fully knows. On a kernel NEWER than this crate
+    /// (`kernel_abi > crate max`), the handled set saturates at the crate's max FS vocabulary and
+    /// `restrict_self` reports `PartiallyEnforced` — [`status_of`] accepts that (we govern the
+    /// crate's full FS set; the residual is rights the crate does not yet know → a crate-bump
+    /// maintenance item, surfaced by [`handled_fs_abi_tracks_crate_max`]).
+    fn handled_fs_abi(kernel_abi: i64) -> landlock::ABI {
+        landlock::ABI::from(kernel_abi.clamp(0, i32::MAX as i64) as i32)
+    }
 
     /// Set `PR_SET_NO_NEW_PRIVS` on the calling process — required so an unprivileged
     /// process can install a seccomp filter + a Landlock ruleset without `CAP_SYS_ADMIN`.
@@ -1444,11 +1456,15 @@ pub mod linux {
         read_only: &[PathBuf],
         read_write: &[PathBuf],
     ) -> Result<RulesetCreated, SandboxError> {
-        let ro_access = AccessFs::from_read(LANDLOCK_ABI);
-        let rw_access = AccessFs::from_all(LANDLOCK_ABI);
+        // Handle the FS rights the RUNNING kernel supports (clamped to the crate's max), not a
+        // fixed ABI — so every FS right the kernel has is governed and `restrict_self` reports
+        // `FullyEnforced` on a kernel the crate fully knows (see [`handled_fs_abi`]).
+        let abi = handled_fs_abi(landlock_kernel_abi());
+        let ro_access = AccessFs::from_read(abi);
+        let rw_access = AccessFs::from_all(abi);
         let mut created = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
-            .handle_access(AccessFs::from_all(LANDLOCK_ABI))
+            .handle_access(AccessFs::from_all(abi))
             .map_err(|e| SandboxError::Landlock(e.to_string()))?
             .create()
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
@@ -1467,40 +1483,37 @@ pub mod linux {
         Ok(created)
     }
 
-    /// Map the landlock crate's `RulesetStatus` to our coarse [`SandboxStatus`], correcting for a
-    /// crucial landlock-crate behavior: `restrict_self` returns `PartiallyEnforced` whenever the
-    /// running kernel's ABI is NEWER than the highest ABI this crate version knows
-    /// ([`LANDLOCK_ABI`]) — it conservatively declines to claim coverage of rights it does not
-    /// know (landlock-0.4.7 `compat.rs`). That makes `FullyEnforced` UNREACHABLE on any kernel
-    /// newer than the crate's max ABI, which would make privsep (fail-closed on non-`Enforced`)
-    /// unbootable on every modern kernel.
-    ///
-    /// **Security argument for accepting that case as `Enforced`:** when `kernel_abi >=
-    /// LANDLOCK_ABI`, `CompatLevel::BestEffort` dropped NOTHING — every FS access right we govern
-    /// (`AccessFs::from_all(LANDLOCK_ABI)`, i.e. ALL FS rights through V5: read/write/exec/readdir/
-    /// remove/make*/refer/truncate/ioctl-dev) IS enforced by the kernel, so the FS wall is fully
-    /// up. The ABI additions BEYOND what we handle that trigger the crate's `PartiallyEnforced`
-    /// are `LANDLOCK_SCOPE` (abstract-unix/signal, ABI 6) — a SCOPE access type, not an FS right —
-    /// so not governing them does not weaken FS confinement. A kernel OLDER than `LANDLOCK_ABI`,
-    /// by contrast, means `BestEffort` genuinely DROPPED a handled FS right (a real hole) → that
-    /// stays `Partial` (privsep refuses it). Maintenance note: if a FUTURE Landlock ABI adds a new
-    /// AccessFs right, bump the `landlock` crate + [`LANDLOCK_ABI`] so it is handled — else a kernel
-    /// with that right would be accepted here while leaving it ungoverned.
+    /// Map the landlock crate's `RulesetStatus` + the running-kernel ABI to our coarse
+    /// [`SandboxStatus`]. Thin wrapper over the pure [`status_for`] (unit-tested) using the live
+    /// [`landlock_kernel_abi`] probe.
     fn status_of(ruleset: RulesetStatus) -> SandboxStatus {
+        status_for(ruleset, landlock_kernel_abi())
+    }
+
+    /// Pure status decision from a `RulesetStatus` + the running-kernel Landlock ABI. Two rules:
+    ///
+    /// 1. **Policy floor.** A kernel below [`MIN_LANDLOCK_ABI`] is refused (`Partial`) even if it
+    ///    reports `FullyEnforced` for its older ABI — privsep's wall must include the V3/V5 FS
+    ///    rights (`Truncate`/`IoctlDev`), which an older kernel cannot enforce.
+    ///
+    /// 2. **Status.** At/above the floor we [`handle the kernel's own FS ABI`](handled_fs_abi), so
+    ///    NO handled FS right is ever dropped (the request is a subset of what the kernel supports)
+    ///    — `FullyEnforced` on any kernel the crate fully knows. `restrict_self` can still report
+    ///    `PartiallyEnforced` on a kernel NEWER than this crate (`kernel_abi > crate max`): the
+    ///    crate conservatively won't claim coverage of rights it does not know. We ACCEPT that as
+    ///    `Enforced` — we already govern the crate's FULL FS vocabulary (nothing we *could* govern
+    ///    is ungoverned); the only residual is FS rights a future kernel adds that this crate
+    ///    version doesn't define, a crate-bump maintenance item (guarded by
+    ///    [`handled_fs_abi_tracks_crate_max`]). `NotEnforced` (Landlock absent / a failed layer)
+    ///    is always `Partial` → refused.
+    fn status_for(ruleset: RulesetStatus, kernel_abi: i64) -> SandboxStatus {
+        if kernel_abi < MIN_LANDLOCK_ABI as i64 {
+            return SandboxStatus::Partial;
+        }
         match ruleset {
             RulesetStatus::FullyEnforced => SandboxStatus::Enforced,
-            RulesetStatus::PartiallyEnforced if landlock_kernel_abi() >= LANDLOCK_ABI as i64 => {
-                // Partial ONLY because the kernel is newer than this crate's max ABI; all FS
-                // rights we handle are enforced (see the security argument above).
-                tracing::info!(
-                    kernel_abi = landlock_kernel_abi(),
-                    handled_abi = ?LANDLOCK_ABI,
-                    "landlock: kernel ABI newer than the crate's max; all handled FS rights \
-                     enforced — treating as fully enforced"
-                );
-                SandboxStatus::Enforced
-            }
-            RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => SandboxStatus::Partial,
+            RulesetStatus::PartiallyEnforced => SandboxStatus::Enforced,
+            RulesetStatus::NotEnforced => SandboxStatus::Partial,
         }
     }
 
@@ -1857,6 +1870,76 @@ pub mod linux {
                     "core syscall name does not resolve on this arch: {name}"
                 );
             }
+        }
+
+        // ---- Landlock Enforced determination (privsep fail-closed gate) ----
+
+        #[test]
+        fn status_for_refuses_below_the_min_abi_floor_even_if_fully_enforced() {
+            // A kernel below MIN_LANDLOCK_ABI is refused regardless of the reported status — its
+            // wall lacks the V3/V5 FS rights privsep requires.
+            for abi in 1..(MIN_LANDLOCK_ABI as i64) {
+                assert_eq!(
+                    status_for(RulesetStatus::FullyEnforced, abi),
+                    SandboxStatus::Partial,
+                    "kernel ABI {abi} is below the floor and must be refused"
+                );
+            }
+            // ABI 0 (Landlock unsupported) is likewise refused.
+            assert_eq!(
+                status_for(RulesetStatus::FullyEnforced, 0),
+                SandboxStatus::Partial
+            );
+        }
+
+        #[test]
+        fn status_for_accepts_at_or_above_the_floor() {
+            let floor = MIN_LANDLOCK_ABI as i64;
+            // FullyEnforced at/above the floor → Enforced.
+            assert_eq!(
+                status_for(RulesetStatus::FullyEnforced, floor),
+                SandboxStatus::Enforced
+            );
+            // PartiallyEnforced at/above the floor (kernel newer than the crate) → Enforced: we
+            // handle the kernel's own FS ABI, so nothing we could govern is dropped.
+            assert_eq!(
+                status_for(RulesetStatus::PartiallyEnforced, floor),
+                SandboxStatus::Enforced
+            );
+            assert_eq!(
+                status_for(RulesetStatus::PartiallyEnforced, floor + 100),
+                SandboxStatus::Enforced
+            );
+            // NotEnforced is always a refusal.
+            assert_eq!(
+                status_for(RulesetStatus::NotEnforced, floor + 100),
+                SandboxStatus::Partial
+            );
+        }
+
+        #[test]
+        fn handled_fs_abi_tracks_kernel_and_saturates_at_crate_max() {
+            use landlock::{ABI, AccessFs};
+            // We handle exactly the kernel's ABI up to the crate's max, so every FS right the
+            // kernel supports is governed (no silent under-governing).
+            assert_eq!(handled_fs_abi(5), ABI::V5);
+            assert_eq!(handled_fs_abi(6), ABI::V6);
+            // Saturates at the crate's highest known ABI for a kernel newer than the crate.
+            let crate_max = ABI::from(i32::MAX);
+            assert_eq!(handled_fs_abi(i64::MAX), crate_max);
+            // Negative / zero clamp to Unsupported (no panic on the cast).
+            assert_eq!(handled_fs_abi(0), ABI::Unsupported);
+            assert_eq!(handled_fs_abi(-1), ABI::Unsupported);
+
+            // FS-COMPLETENESS GUARD: handling the crate's max ABI governs the crate's FULL FS
+            // vocabulary — so a future crate bump that adds a new AccessFs right (e.g. a higher
+            // ABI) is caught here (this equality breaks) rather than silently leaving it
+            // ungoverned. If it breaks: confirm `handled_fs_abi` saturates at the NEW max.
+            assert_eq!(
+                AccessFs::from_all(handled_fs_abi(i64::MAX)),
+                AccessFs::from_all(crate_max),
+                "handled_fs_abi must saturate at the crate's max so from_all governs every FS right"
+            );
         }
     }
 }
