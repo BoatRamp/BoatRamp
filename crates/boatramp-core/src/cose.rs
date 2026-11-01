@@ -610,6 +610,12 @@ pub struct VerifiedToken {
     pub kind: String,
     /// The revocation id (hex of `cti`) — looked up in the KV revocation store.
     pub cti: String,
+    /// The issued-at time (`iat`, Unix seconds), if present. Every token `mint`ed by
+    /// this crate stamps it; it is surfaced so a freshness-sensitive consumer (e.g. the
+    /// privsep authority-API's anti-replay bound) can reject a token older than a short
+    /// max-age even when `exp` is further out. A token with no `iat` is unusual (all
+    /// `mint*` paths stamp one); a freshness-bounding caller treats absence as fail-closed.
+    pub iat: Option<u64>,
     /// The expiry (Unix seconds), if any.
     pub exp: Option<u64>,
     /// The holder key `"<alg>:<hex>"` (RFC 8747 `cnf`), when this token is
@@ -906,6 +912,7 @@ fn role_token(claims: &ClaimsSet, exp: Option<u64>) -> Result<VerifiedToken, Tok
         roles,
         kind,
         cti,
+        iat: claim_iat(claims),
         exp,
         cnf: claim_cnf(claims),
     })
@@ -2567,6 +2574,16 @@ fn text_claim<'a>(claims: &'a ClaimsSet, name: &str) -> Option<&'a CborValue> {
         coset::cwt::ClaimName::Text(t) if t == name => Some(v),
         _ => None,
     })
+}
+
+/// The token's issued-at (`iat`, Unix seconds), if present. Read from the standard CWT
+/// `iat` claim (stamped by every `mint*` path). Surfaced on [`VerifiedToken`] for a
+/// freshness-sensitive consumer; a negative/absent timestamp yields `None`.
+fn claim_iat(claims: &ClaimsSet) -> Option<u64> {
+    match claims.issued_at {
+        Some(Timestamp::WholeSeconds(s)) if s >= 0 => Some(s as u64),
+        _ => None,
+    }
 }
 
 /// The token's revocation id (`cti`, hex). A token with no `cti` is malformed.

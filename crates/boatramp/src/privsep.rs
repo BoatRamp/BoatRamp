@@ -627,6 +627,25 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
 /// allowlist (`BOATRAMP_*`).
 pub const PRIVSEP_FDS_ENV: &str = "BOATRAMP_PRIVSEP_FDS";
 
+/// The env var the root sets on a crown-jewel (`secrets.sealer` / `token.signer`) instance naming the
+/// feature-links on which it should serve the WS-E **authority-API grammar** (seal/unseal/mint_token)
+/// to a relayed end principal. The value is a JSON array of link names — NON-SECRET (names only, like
+/// the fd map + the unseal allowlist), so it passes the `BOATRAMP_*` spawn-env allowlist. An absent var
+/// ⇒ no authority-serve links ⇒ the crown jewel holds its grammar inert (parks), exactly as before this
+/// wave. The root derives the set with [`compute_authority_serve_links`] (secret-blind — names only).
+pub const PRIVSEP_AUTHORITY_LINKS_ENV: &str = "BOATRAMP_PRIVSEP_AUTHORITY_LINKS";
+
+/// Parse the WS-E authority-serve link set from the process environment (an absent var ⇒ empty, so a
+/// crown jewel serves no grammar unless the root designated links — the pre-this-wave behavior).
+fn authority_serve_links_from_env() -> Result<BTreeSet<String>, String> {
+    match std::env::var(PRIVSEP_AUTHORITY_LINKS_ENV) {
+        Ok(v) => serde_json::from_str(&v)
+            .map_err(|e| format!("parsing {PRIVSEP_AUTHORITY_LINKS_ENV}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(BTreeSet::new()),
+        Err(e) => Err(format!("reading {PRIVSEP_AUTHORITY_LINKS_ENV}: {e}")),
+    }
+}
+
 /// The fd map the root hands ONE instance (serialized into [`PRIVSEP_FDS_ENV`]): each feature-link
 /// name → the inherited fd number of this instance's socketpair end, plus the optional pre-bound
 /// listener fd. The root `dup2`s each end / listener onto these fixed numbers in the child's
@@ -730,6 +749,61 @@ fn compute_unseal_allowlists(
     out
 }
 
+/// Compute the per-instance WS-E **authority-serve link** designation the root wires onto each
+/// crown-jewel (`secrets.sealer` / `token.signer`) instance: the feature-links on which that instance
+/// should serve the seal/unseal/mint_token grammar to a relayed end principal. Secret-blind (link
+/// names only), handed in via [`PRIVSEP_AUTHORITY_LINKS_ENV`].
+///
+/// **The designation rule (conservative + unambiguous, so it NEVER collides with the single-purpose
+/// Phase-1 links).** A link designates WS-E serve on its crown-jewel endpoint `E` iff:
+/// - EXACTLY ONE endpoint holds a crown jewel (so a crown↔crown link — the bootstrap-unseal shape — is
+///   excluded; that path is [`compute_unseal_allowlists`]); AND
+/// - the PEER holds NO `listen.*` authority (so a listener-frontend link — the client-fd SPLICE shape,
+///   AND the design's own frontend→signer authority-call shape — is excluded).
+///
+/// The listener exclusion is why this never fires for the Phase-1 live-gate compositions (both have a
+/// listener frontend as the relay). **FLAGGED for the lead:** the design's primary WS-E case is a
+/// listener FRONTEND relaying authority calls to an isolated signer — which is link-shape-identical to
+/// a client-fd splice and so needs an explicit per-link PURPOSE marker in the composition model to
+/// disambiguate (a follow-on). This wave designates only the unambiguous crown↔(non-listener relay)
+/// shape (e.g. a `control.admin-api` / `exec.*` relay → an isolated signer). Pure (host-testable).
+fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return out;
+    };
+    let caps = |label: &str| -> &[HostAuthority] {
+        privsep
+            .instances
+            .get(label)
+            .map_or(&[][..], |i| i.capabilities.as_slice())
+    };
+    let any_crown = |label: &str| caps(label).iter().any(|a| a.is_crown_jewel());
+    let any_listener = |label: &str| caps(label).iter().any(|a| a.is_listener());
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to {
+            continue;
+        }
+        let from_cj = any_crown(&link.from);
+        let to_cj = any_crown(&link.to);
+        // Exactly one crown-jewel endpoint (XOR) — a crown↔crown link is bootstrap, excluded.
+        let (holder, peer) = match (from_cj, to_cj) {
+            (true, false) => (&link.from, &link.to),
+            (false, true) => (&link.to, &link.from),
+            _ => continue,
+        };
+        // A listener peer is a frontend — its link is a client-fd SPLICE (or the frontend→signer
+        // authority shape that needs the purpose marker). Excluded here (fail-safe, never a collision).
+        if any_listener(peer) {
+            continue;
+        }
+        out.entry(holder.clone())
+            .or_default()
+            .insert(link_name.clone());
+    }
+    out
+}
+
 // =============================================================================
 // The root supervisor: socketpair wiring + privileged listener bind + fork/exec + supervise
 // =============================================================================
@@ -767,6 +841,9 @@ mod supervise {
         // `secrets.sealer` instance the exact names each of its links' peers may unseal. NON-SECRET
         // (names only), handed in via an env var alongside the fd map.
         let unseal_allowlists = super::compute_unseal_allowlists(config);
+        // The per-crown-jewel WS-E authority-serve link designation (seal/unseal/mint_token grammar).
+        // NON-SECRET (link names only); empty for every Phase-1 composition (see the rule).
+        let authority_serve_links = super::compute_authority_serve_links(config);
 
         // 1. A root-created socketpair(2) per `local` link; one end to each endpoint instance.
         //    `tcp`/`overlay` carry their own endpoint arrangement — not wired in the Phase-1 cut
@@ -863,6 +940,15 @@ mod supervise {
                 cmd.env(
                     boatramp_server::privsep_unseal::PRIVSEP_UNSEAL_ALLOW_ENV,
                     allow.to_env_value(),
+                );
+            }
+            // A crown-jewel instance with designated WS-E authority-serve links gets them (names only).
+            if let Some(links) = authority_serve_links.get(&spec.label)
+                && !links.is_empty()
+            {
+                cmd.env(
+                    super::PRIVSEP_AUTHORITY_LINKS_ENV,
+                    serde_json::to_string(links).expect("authority-serve link set serializes"),
                 );
             }
             let dups = wiring.dups.clone();
@@ -1052,13 +1138,21 @@ mod instance_serve {
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
 
+    use boatramp_core::cose::{Signer, TokenPublicKey};
     use boatramp_core::privsep::HostAuthority;
+    use boatramp_server::privsep_authority::{
+        AuthorityRegistry, AuthorityServe, ContextVerifier, DEFAULT_LINK_READ_DEADLINE,
+        DEFAULT_MAX_IN_FLIGHT, ReplayCache, SealerHandler, SignerHandler, TracingAudit, Unlimited,
+    };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_unseal::{
         EnvelopeSealedFileResolver, SealedKeyResolver, UnsealAllowlist,
     };
 
-    use super::{MaterializationGate, PrivsepChildFds, ServerConfig, privsep_resolve};
+    use super::{
+        MaterializationGate, PrivsepChildFds, ServerConfig, authority_serve_links_from_env,
+        privsep_resolve,
+    };
 
     /// Serve one instance's slice over its root-wired fds (design §2.1 steps 5-6). The Phase-1
     /// minimal-but-real path. Roles, dispatched from the instance's capability set + its wired fds:
@@ -1081,6 +1175,7 @@ mod instance_serve {
         config: &ServerConfig,
     ) -> Result<(), String> {
         let allowlist = UnsealAllowlist::from_env()?;
+        let authority_links = authority_serve_links_from_env()?;
         let signer_key_ref = privsep_resolve::sealed_signer_key_ref(config);
         tracing::info!(
             instance = %label,
@@ -1090,19 +1185,46 @@ mod instance_serve {
             sealer = gate.may_materialize(HostAuthority::SecretsSealer),
             signer = gate.may_materialize(HostAuthority::TokenSigner),
             unseal_allowlist_links = allowlist.by_link.len(),
+            authority_serve_links = authority_links.len(),
             "[privsep] instance: opening its root-wired links + serving its slice"
         );
 
         // SIGNER-key unlock FIRST (fail-closed): a `token.signer` instance with a sealed source must
         // obtain + verify its key before anything serves. A failure here exits the instance → the
-        // root's FailNodeClosed tears the node down rather than serving with a dead signer.
-        if gate.may_materialize(HostAuthority::TokenSigner)
+        // root's FailNodeClosed tears the node down rather than serving with a dead signer. The
+        // unlocked signer is KEPT if this instance will serve the WS-E mint grammar (below); otherwise
+        // it is dropped and the signer holds its authority inert.
+        let unlocked_signer: Option<Arc<dyn Signer>> = if gate
+            .may_materialize(HostAuthority::TokenSigner)
             && let Some(key_ref) = signer_key_ref
         {
-            run_signer_unlock(label, gate, fds, config, key_ref)?;
-            // The signer holds its (now-unlocked) authority inert in Phase 1 (its mint grammar over
-            // the link is WS-E) — park after a successful unlock + self-test.
-            tracing::info!(instance = %label, "[privsep] signer: key unlocked + verified; holding it inert (mint grammar is WS-E)");
+            Some(run_signer_unlock(label, gate, fds, config, key_ref)?)
+        } else {
+            None
+        };
+
+        // WS-E AUTHORITY-API GRAMMAR SERVE (this wave): a crown-jewel instance the root designated
+        // authority-serve links for serves seal/unseal (sealer) + mint_token (signer) over those links,
+        // re-validating each call's end-principal context. Empty designation (every Phase-1
+        // composition) ⇒ this is skipped and the crown jewel holds its grammar inert (parks), exactly
+        // as before this wave — so the Phase-1 live tests are unchanged.
+        let is_crown = gate.may_materialize(HostAuthority::SecretsSealer)
+            || gate.may_materialize(HostAuthority::TokenSigner);
+        if is_crown && !authority_links.is_empty() {
+            return run_authority_serve(
+                label,
+                gate,
+                fds,
+                config,
+                &allowlist,
+                &authority_links,
+                unlocked_signer,
+            );
+        }
+
+        // A signer that unlocked but serves no WS-E grammar holds its (unlocked) authority inert.
+        if unlocked_signer.is_some() {
+            tracing::info!(instance = %label, "[privsep] signer: key unlocked + verified; holding it inert (no authority-serve link designated)");
             park();
         }
 
@@ -1191,15 +1313,17 @@ mod instance_serve {
     /// also holds `secrets.sealer` (co-resident), resolve the key IN-PROCESS (it holds the KEK); else
     /// ask the sealer to unseal it over the single feature-link (`request_unseal`). Then build a
     /// [`boatramp_core::cose::LocalSigner`] and run a sign+verify self-test (the key is live + usable).
-    /// Fail-closed: any error returns `Err` → the instance exits → FailNodeClosed.
+    /// Returns the unlocked [`Signer`] so a WS-E `mint_token` grammar can be served off it (the signing
+    /// key stays in this instance — it is NEVER representable in any authority response). Fail-closed:
+    /// any error returns `Err` → the instance exits → FailNodeClosed.
     fn run_signer_unlock(
         label: &str,
         gate: &MaterializationGate,
         fds: &PrivsepChildFds,
         config: &ServerConfig,
         key_ref: &str,
-    ) -> Result<(), String> {
-        use boatramp_core::cose::{LocalSigner, Signer};
+    ) -> Result<Arc<dyn Signer>, String> {
+        use boatramp_core::cose::LocalSigner;
 
         // Obtain the plaintext key spec (`"<alg>:<hex>"`), held zeroizing (both arms return the
         // `Zeroizing<Vec<u8>>` from the resolver / the unseal client).
@@ -1253,7 +1377,225 @@ mod instance_serve {
 
         // The marker the live gate greps: only reached after a real unseal + a live sign/verify.
         tracing::info!(instance = %label, "[privsep] PRIVSEP SIGNER UNSEAL OK");
-        Ok(())
+        Ok(Arc::new(signer))
+    }
+
+    /// Resolve the PUBLIC control-plane trust root used to re-validate relayed end-principal contexts
+    /// (design §3.4 F3 / clarification 4 — a public verifying key, never a secret). Prefers the
+    /// explicit `serve.auth_root_public_key`; falls back to the unlocked signer's own public key (a
+    /// `token.signer` IS the control-plane auth root, so its public half is the trust anchor). A split
+    /// `secrets.sealer` that holds no signer MUST have `auth_root_public_key` configured — else it
+    /// cannot verify contexts and refuses to serve the grammar (fail-closed).
+    fn resolve_trust_root(
+        config: &ServerConfig,
+        unlocked_signer: Option<&Arc<dyn Signer>>,
+    ) -> Result<TokenPublicKey, String> {
+        if let Some(hex) = config
+            .serve
+            .as_ref()
+            .and_then(|s| s.auth_root_public_key.as_ref())
+        {
+            return TokenPublicKey::from_hex(hex).map_err(|e| {
+                format!("parsing serve.auth_root_public_key for the WS-E verifier: {e}")
+            });
+        }
+        if let Some(signer) = unlocked_signer {
+            return Ok(signer.public_key());
+        }
+        Err("no public trust root to re-validate authority-call contexts: set \
+             serve.auth_root_public_key (a split secrets.sealer that holds no token.signer needs it)"
+            .to_string())
+    }
+
+    /// The receiver's wall-clock (Unix seconds) for context freshness + minted-token stamping.
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Serve the WS-E **authority-API grammar** for a crown-jewel instance on each root-designated
+    /// authority-serve link (design §2.1 steps 5-6 / §3.4). Builds the per-capability registry
+    /// (`secrets.sealer` ⇒ [`SealerHandler`] over its `[secrets]` KEK envelope; `token.signer` ⇒
+    /// [`SignerHandler`] over the unlocked signer), the context verifier (re-validating every relayed
+    /// end-principal credential against the public trust root, with the tightened freshness bound), a
+    /// shared anti-replay cache + a global in-flight concurrency cap, and serves [`AuthorityServe`] on
+    /// one blocking thread per link (the link I/O is blocking). A co-resident `secrets.sealer` that
+    /// ALSO has a bootstrap-unseal allowlist serves that too (the two grammars are distinct links/code
+    /// paths — the bootstrap unseal is instance-authorized by the root-wired allowlist, the WS-E
+    /// grammar is end-principal-authorized by the verified context; both fail-closed). After the serve
+    /// threads end (peers gone) the instance parks (its remaining authorities inert). Fail-closed: a
+    /// missing trust root / handler / link fd returns `Err` → the instance exits → FailNodeClosed.
+    fn run_authority_serve(
+        label: &str,
+        gate: &MaterializationGate,
+        fds: &PrivsepChildFds,
+        config: &ServerConfig,
+        allowlist: &UnsealAllowlist,
+        authority_links: &std::collections::BTreeSet<String>,
+        unlocked_signer: Option<Arc<dyn Signer>>,
+    ) -> Result<(), String> {
+        let trust_root = resolve_trust_root(config, unlocked_signer.as_ref())?;
+
+        // Build the per-capability registry from the held crown jewels.
+        let mut registry = AuthorityRegistry::new();
+        if gate.may_materialize(HostAuthority::SecretsSealer) {
+            let envelope = build_secrets_envelope(config)?;
+            registry.register(
+                HostAuthority::SecretsSealer,
+                Arc::new(SealerHandler::new(envelope)),
+            );
+        }
+        if gate.may_materialize(HostAuthority::TokenSigner) {
+            let signer = unlocked_signer.ok_or_else(|| {
+                "a token.signer WS-E serve needs its unlocked signing key, but none was unlocked \
+                 (expected a `[serve.signer] = Sealed` source)"
+                    .to_string()
+            })?;
+            registry.register(
+                HostAuthority::TokenSigner,
+                Arc::new(SignerHandler::new(signer)),
+            );
+        }
+        if registry.is_empty() {
+            return Err(
+                "a crown-jewel instance was designated WS-E authority-serve links but registered no \
+                 handler (no secrets.sealer / token.signer held)"
+                    .to_string(),
+            );
+        }
+        let registry = Arc::new(registry);
+        let verifier = ContextVerifier::new(trust_root);
+        let replay = Arc::new(ReplayCache::with_defaults());
+        let max_in_flight = Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_IN_FLIGHT));
+        tracing::info!(
+            instance = %label,
+            served = ?registry.served().iter().map(|a| a.tag()).collect::<Vec<_>>(),
+            links = authority_links.len(),
+            "[privsep] crown jewel: serving the WS-E authority-API grammar (context-re-validated, fail-closed)"
+        );
+
+        let mut threads = Vec::new();
+
+        // (a) A co-resident sealer with a bootstrap-unseal allowlist also serves that (distinct links).
+        if gate.may_materialize(HostAuthority::SecretsSealer) && !allowlist.is_empty() {
+            let any_name = allowlist
+                .by_link
+                .values()
+                .flat_map(|s| s.iter())
+                .next()
+                .cloned();
+            if let Some(any_name) = any_name {
+                let resolver = build_sealer_resolver(config, &any_name)?;
+                for (link_name, allowed) in &allowlist.by_link {
+                    if allowed.is_empty() {
+                        continue;
+                    }
+                    let Some(link_fd) = fds.links.get(link_name).copied() else {
+                        return Err(format!(
+                            "the unseal allowlist names link {link_name:?}, but the root wired no \
+                             such link fd to this instance"
+                        ));
+                    };
+                    let (link_name, allowed, resolver, label) = (
+                        link_name.clone(),
+                        allowed.clone(),
+                        resolver.clone(),
+                        label.to_string(),
+                    );
+                    threads.push(std::thread::spawn(move || {
+                        // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the map.
+                        let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+                        serve_blocking_unseal(
+                            &label,
+                            &link_name,
+                            &link,
+                            &allowed,
+                            resolver.as_ref(),
+                        );
+                    }));
+                }
+            }
+        }
+
+        // (b) The WS-E grammar on each designated authority-serve link (one blocking thread per link).
+        for link_name in authority_links {
+            let Some(link_fd) = fds.links.get(link_name).copied() else {
+                return Err(format!(
+                    "the WS-E authority-serve designation names link {link_name:?}, but the root \
+                     wired no such link fd to this instance"
+                ));
+            };
+            let (link_name, label) = (link_name.clone(), label.to_string());
+            let registry = registry.clone();
+            let verifier = verifier.clone();
+            let replay = replay.clone();
+            let max_in_flight = max_in_flight.clone();
+            threads.push(std::thread::spawn(move || {
+                // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+                let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] authority serve: runtime build failed");
+                        return;
+                    }
+                };
+                // Phase-2 Wave 1 uses the default limiter + the tracing audit sink; a hardened
+                // composition swaps in a token-bucket limiter + a durable append-only sink (the seams
+                // are unchanged — a flagged follow-on).
+                let limiter = Unlimited;
+                let audit = TracingAudit;
+                let serve = AuthorityServe {
+                    verifier: &verifier,
+                    replay: &replay,
+                    limiter: &limiter,
+                    audit: &audit,
+                    handler: registry.as_ref(),
+                    max_in_flight: &max_in_flight,
+                    read_deadline: DEFAULT_LINK_READ_DEADLINE,
+                };
+                if let Err(e) = rt.block_on(serve.serve(&link_name, &link, now_unix)) {
+                    tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] authority serve ended with an error");
+                }
+            }));
+        }
+
+        for t in threads {
+            let _ = t.join();
+        }
+        park()
+    }
+
+    /// Drive one bootstrap-unseal serve loop to completion on a current-thread runtime (the helper the
+    /// WS-E crown-jewel serve reuses for a co-resident sealer's allowlisted links).
+    fn serve_blocking_unseal(
+        label: &str,
+        link_name: &str,
+        link: &LinkEndpoint,
+        allowed: &std::collections::BTreeSet<String>,
+        resolver: &dyn SealedKeyResolver,
+    ) {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] sealer: runtime build failed");
+                return;
+            }
+        };
+        tracing::info!(instance = %label, link = %link_name, "[privsep] sealer: serving bootstrap unseal (fail-closed allowlist) alongside the WS-E grammar");
+        if let Err(e) = rt.block_on(boatramp_server::privsep_unseal::serve_unseal(
+            link_name, link, allowed, resolver,
+        )) {
+            tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] sealer: unseal serve ended with an error");
+        }
     }
 
     /// A `secrets.sealer` instance: serve unseal requests on each root-wired allowlisted link,
@@ -1869,6 +2211,65 @@ mod tests {
         assert_eq!(
             instance_listener_addr(&[HostAuthority::ListenHttpParse], &cfg),
             None
+        );
+    }
+
+    // ---- WS-E: the authority-serve link designation (Phase 2 Wave 1) ----
+
+    #[test]
+    fn authority_serve_links_empty_for_the_phase1_compositions() {
+        // clean_privsep: the `to-signer` link is edge (a LISTENER frontend) → signer (crown). The
+        // listener-peer exclusion drops it (that frontend→signer shape needs the purpose marker —
+        // the flagged follow-on), so no WS-E serve is designated — the live test is unchanged.
+        assert!(
+            compute_authority_serve_links(&cfg_with(Some(clean_privsep()))).is_empty(),
+            "a listener-frontend → crown link must not be auto-designated for WS-E"
+        );
+        // split_signer_privsep: the `to-signer` link is sealer ↔ signer — crown ↔ crown (bootstrap
+        // unseal), excluded (not exactly-one crown).
+        assert!(
+            compute_authority_serve_links(&cfg_with(Some(split_signer_privsep()))).is_empty(),
+            "a crown ↔ crown bootstrap link must not be designated for WS-E"
+        );
+    }
+
+    #[test]
+    fn authority_serve_links_designate_a_crown_to_nonlistener_relay() {
+        // A crown jewel linked to a NON-listener relay (a control-plane client) is the unambiguous
+        // WS-E shape: the crown jewel serves its grammar; the relay is the client.
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "ctl".to_string(),
+            inst(&[HostAuthority::ControlAdminApi], &["to-sign"]),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["to-sign"]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-sign".to_string(),
+            PrivsepLink {
+                from: "ctl".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+            },
+        );
+        let p = PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+        };
+        let out = compute_authority_serve_links(&cfg_with(Some(p)));
+        // The crown-jewel SIGNER end is designated to serve WS-E on `to-sign`.
+        assert!(
+            out.get("signer").is_some_and(|s| s.contains("to-sign")),
+            "the crown jewel must serve WS-E on the link to the relay: {out:?}"
+        );
+        // The relay is the CLIENT — it serves nothing.
+        assert!(
+            !out.contains_key("ctl"),
+            "the relay must not serve: {out:?}"
         );
     }
 }

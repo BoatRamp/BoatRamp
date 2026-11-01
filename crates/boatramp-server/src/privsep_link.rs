@@ -59,6 +59,20 @@ mod unix_impl {
     /// byte). Its value is irrelevant — the receiver reads the ancillary fd, not this byte.
     const SPLICE_CARRIER: u8 = 0xF5;
 
+    /// Map a `SO_RCVTIMEO` timeout (surfaced by the kernel as `EAGAIN`/`EWOULDBLOCK` ⇒
+    /// [`io::ErrorKind::WouldBlock`]) to a clear fail-closed [`io::ErrorKind::TimedOut`]; pass any
+    /// other error through unchanged.
+    fn map_timeout(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "privsep link: read deadline exceeded mid-frame (fail-closed)",
+            )
+        } else {
+            e
+        }
+    }
+
     /// Set `FD_CLOEXEC` on `fd` (one portable path in place of the Linux-only `SOCK_CLOEXEC` /
     /// `MSG_CMSG_CLOEXEC`), fail-closed on error.
     fn set_cloexec(fd: RawFd) -> io::Result<()> {
@@ -164,6 +178,67 @@ mod unix_impl {
             let mut buf = vec![0u8; len];
             self.read_exact(&mut buf)?;
             Ok(buf)
+        }
+
+        /// Set (or clear) a receive deadline on this endpoint (`SO_RCVTIMEO`). `Some(d)` makes a
+        /// blocking `read` that stalls for longer than `d` fail with [`io::ErrorKind::WouldBlock`];
+        /// `None` (or a zero duration) restores indefinite blocking. Used by
+        /// [`recv_frame_within`](Self::recv_frame_within) to bound an in-progress frame read
+        /// (slowloris defense) without bounding the idle wait between calls.
+        pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+            let d = dur.filter(|d| !d.is_zero());
+            let tv = libc::timeval {
+                // A zeroed timeval means "no timeout" to SO_RCVTIMEO, so `None` clears it.
+                tv_sec: d.map_or(0, |d| d.as_secs().min(i64::MAX as u64) as libc::time_t),
+                tv_usec: d.map_or(0, |d| d.subsec_micros() as libc::suseconds_t),
+            };
+            // SAFETY: `&tv` points at a live, fully-initialized `timeval` of the passed length; the
+            // fd is a live owned socket.
+            let rc = unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&tv as *const libc::timeval).cast(),
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Receive one length-delimited frame like [`recv_frame`](Self::recv_frame), but bound the
+        /// time to read an IN-PROGRESS frame by `timeout` (fail-closed `TimedOut`). The idle wait for
+        /// the FIRST byte of the next call is deliberately UNBOUNDED — an authority link may sit idle
+        /// between infrequent control calls (design §3.1) — so the deadline only fires once a peer has
+        /// started sending a frame and then stalls (a slowloris / partial-frame peer cannot pin the
+        /// serve thread). The [`MAX_FRAME_LEN`] bound is enforced before any allocation, exactly as in
+        /// [`recv_frame`](Self::recv_frame). On any outcome the endpoint is restored to blocking mode.
+        pub fn recv_frame_within(&self, timeout: std::time::Duration) -> io::Result<Vec<u8>> {
+            let mut len_buf = [0u8; 4];
+            // Idle-tolerant: block (no deadline) for the first length byte.
+            self.set_read_timeout(None)?;
+            self.read_exact(&mut len_buf[..1])?;
+            // A call has started arriving — bound the remainder.
+            self.set_read_timeout(Some(timeout))?;
+            let result = (|| {
+                self.read_exact(&mut len_buf[1..]).map_err(map_timeout)?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                if len > MAX_FRAME_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "privsep link frame length exceeds MAX_FRAME_LEN — refusing (fail-closed)",
+                    ));
+                }
+                let mut buf = vec![0u8; len];
+                self.read_exact(&mut buf).map_err(map_timeout)?;
+                Ok(buf)
+            })();
+            // Restore indefinite blocking regardless of the outcome (best-effort on the error path).
+            let _ = self.set_read_timeout(None);
+            result
         }
 
         // ---- serving splice: SCM_RIGHTS fd-passing (UNIDIRECTIONAL, F5) ----
@@ -443,6 +518,33 @@ mod unix_impl {
             a.write_all(&bogus).unwrap();
             let err = b.recv_frame().unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        #[test]
+        fn recv_frame_within_times_out_on_a_stalled_partial_frame() {
+            // A peer that sends a partial length prefix then stalls must not pin the receiver: the
+            // in-progress read is bounded, surfacing a fail-closed TimedOut (slowloris defense).
+            let (a, b) = LinkEndpoint::socketpair().expect("socketpair");
+            // Send ONE length byte, then stall (never send the rest).
+            a.write_all(&[0x00]).unwrap();
+            let err = b
+                .recv_frame_within(std::time::Duration::from_millis(150))
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        }
+
+        #[test]
+        fn recv_frame_within_reads_a_complete_frame() {
+            // A frame that fully arrives is returned, and the endpoint is restored to blocking mode
+            // (a following ordinary recv_frame still works).
+            let (a, b) = LinkEndpoint::socketpair().expect("socketpair");
+            a.send_frame(b"authority call under a deadline").unwrap();
+            let got = b
+                .recv_frame_within(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(got, b"authority call under a deadline");
+            a.send_frame(b"second").unwrap();
+            assert_eq!(b.recv_frame().unwrap(), b"second");
         }
 
         #[test]
