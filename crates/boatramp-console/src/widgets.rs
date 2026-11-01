@@ -152,6 +152,132 @@ pub fn text_field(props: &TextFieldProps) -> Html {
     }
 }
 
+/// A labeled numeric input for an **optional** integer cap (`Option<u64>`): an
+/// empty field means "unset" (`None` ⇒ the server/engine default), a filled one
+/// is `Some(n)`. Unlike the `parse().unwrap_or(0)` idiom, it never conflates
+/// "unset" with the real value `0` — a blank emits `None`, so a cap is only ever
+/// `Some` when the operator actually typed a number. Renders as `type="number"`
+/// (numeric keypad + steppers + browser range constraint) with `min`/`max`
+/// advisory bounds; the server re-validates on save.
+#[derive(Properties, PartialEq)]
+pub struct NumberFieldProps {
+    /// Field label.
+    pub label: AttrValue,
+    /// Current value, or `None` when unset.
+    pub value: Option<u64>,
+    /// Optional helper text under the field.
+    #[prop_or_default]
+    pub hint: Option<AttrValue>,
+    /// Advisory minimum (rendered as the input's `min`).
+    #[prop_or_default]
+    pub min: Option<u64>,
+    /// Advisory maximum (rendered as the input's `max`).
+    #[prop_or_default]
+    pub max: Option<u64>,
+    /// Placeholder (e.g. a default-value hint like "server default").
+    #[prop_or_default]
+    pub placeholder: AttrValue,
+    /// Emits the new optional value: `None` for a blank field, `Some(n)` for a
+    /// parseable number. A non-blank, non-parseable value emits nothing (the
+    /// previous value is kept rather than clobbered — `type="number"` makes this
+    /// path rare).
+    pub on_change: Callback<Option<u64>>,
+}
+
+#[function_component(NumberField)]
+pub fn number_field(props: &NumberFieldProps) -> Html {
+    let on_input = {
+        let on_change = props.on_change.clone();
+        Callback::from(move |e: InputEvent| {
+            let raw = input_value(&e);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                on_change.emit(None);
+            } else if let Ok(n) = trimmed.parse::<u64>() {
+                on_change.emit(Some(n));
+            }
+            // else: unparseable (e.g. a mid-edit "-") — leave the value unchanged.
+        })
+    };
+    let value = props.value.map(|n| n.to_string()).unwrap_or_default();
+    html! {
+        <label class="block">
+            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+            <input type="number" inputmode="numeric" value={value}
+                   placeholder={props.placeholder.clone()}
+                   min={props.min.map(|n| n.to_string())}
+                   max={props.max.map(|n| n.to_string())}
+                   oninput={on_input}
+                   class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
+                          shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 \
+                          focus:ring-sky-600" />
+            if let Some(hint) = &props.hint {
+                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+            }
+        </label>
+    }
+}
+
+/// A three-way choice for a **tri-state** `Option<bool>` where each state carries
+/// distinct meaning: `None` (inherit the posture default), `Some(true)` (force
+/// on), `Some(false)` (force off). A plain checkbox can't represent this — it
+/// would erase the `None` "default" state — so this renders a real radio group
+/// (a `<fieldset>`/`<legend>` with three native radios, keyboard-navigable with
+/// arrow keys and announced as a group by assistive tech).
+#[derive(Properties, PartialEq)]
+pub struct TriStateFieldProps {
+    /// The group's visible legend.
+    pub label: AttrValue,
+    /// Current value: `None`, `Some(true)`, or `Some(false)`.
+    pub value: Option<bool>,
+    /// The label for the `None` (default/inherit) option, e.g.
+    /// "Server default (off, multi-tenant)".
+    pub default_label: AttrValue,
+    /// The label for the `Some(true)` option, e.g. "On".
+    pub on_label: AttrValue,
+    /// The label for the `Some(false)` option, e.g. "Off".
+    pub off_label: AttrValue,
+    /// A stable radio-group `name` (radios in a group must share one, and it must
+    /// be unique on the page so two tri-states don't cross-wire).
+    pub name: AttrValue,
+    /// Optional helper text under the group.
+    #[prop_or_default]
+    pub hint: Option<AttrValue>,
+    /// Emits the chosen value.
+    pub on_change: Callback<Option<bool>>,
+}
+
+#[function_component(TriStateField)]
+pub fn tri_state_field(props: &TriStateFieldProps) -> Html {
+    let option = |selected: bool, choice: Option<bool>, text: &AttrValue| -> Html {
+        let on_change = {
+            let cb = props.on_change.clone();
+            Callback::from(move |_: Event| cb.emit(choice))
+        };
+        html! {
+            <label class="flex items-center gap-2">
+                <input type="radio" name={props.name.clone()} checked={selected}
+                       onchange={on_change}
+                       class="h-4 w-4 border-slate-300 text-sky-600 focus:ring-2 focus:ring-sky-600" />
+                <span class="text-sm text-slate-700">{ text }</span>
+            </label>
+        }
+    };
+    html! {
+        <fieldset>
+            <legend class="text-sm font-medium text-slate-700">{ &props.label }</legend>
+            <div class="mt-1 flex flex-wrap gap-x-5 gap-y-1.5">
+                { option(props.value.is_none(), None, &props.default_label) }
+                { option(props.value == Some(true), Some(true), &props.on_label) }
+                { option(props.value == Some(false), Some(false), &props.off_label) }
+            </div>
+            if let Some(hint) = &props.hint {
+                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+            }
+        </fieldset>
+    }
+}
+
 /// A labeled multi-line textarea (used for newline-separated lists). Value
 /// changes emit `on_change`.
 #[derive(Properties, PartialEq)]
