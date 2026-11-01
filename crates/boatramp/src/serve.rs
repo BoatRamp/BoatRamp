@@ -559,6 +559,28 @@ pub struct ServeArgs {
     )]
     acme_propagation_poll_interval_secs: u64,
 
+    /// `--tls acme-dns` only: point every site's **verified custom domains**
+    /// (`domain add`/`domain verify`-attached hosts; never the `*.deploy.<host>`
+    /// preview wildcard, which is managed by the ACME-DNS setup above) at this
+    /// address, kept converged by a leader-gated background reconcile
+    /// (capability #24 Stage 6). An IPv4/IPv6 literal becomes an A/AAAA record;
+    /// anything else a CNAME (e.g. a load balancer hostname) — the same
+    /// convention as `dns configure-domain --target`. Unset (the default)
+    /// disables the loop entirely; `dns configure-domain` remains the manual,
+    /// one-shot path.
+    #[arg(long, env = "BOATRAMP_DNS_TARGET")]
+    dns_target: Option<String>,
+
+    /// How often the `--dns-target` reconcile loop re-sweeps every site's
+    /// verified custom domains (seconds). Ignored when `--dns-target` is unset.
+    #[arg(long, env = "BOATRAMP_DNS_RECONCILE_TICK", default_value_t = 300)]
+    dns_reconcile_tick_secs: u64,
+
+    /// TTL (seconds) for the A/AAAA/CNAME records the `--dns-target` reconcile
+    /// loop writes. Ignored when `--dns-target` is unset.
+    #[arg(long, env = "BOATRAMP_DNS_RECONCILE_TTL", default_value_t = 300)]
+    dns_reconcile_ttl: u32,
+
     /// Reject blob uploads larger than this many bytes (default: unlimited).
     /// Flag/env > `serve.max_upload_bytes`.
     #[arg(long, env = "BOATRAMP_MAX_UPLOAD_BYTES")]
@@ -4689,6 +4711,24 @@ async fn serve_cluster_acme_dns(
         });
     }
 
+    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
+    // "unwired core": `plan_reconcile` existed with zero live callers). Leader-gated
+    // with the SAME `is_leader` + provider as the cert renewal above, so only the
+    // Raft leader ever writes a zone — no split-brain double-writes. Opt-in via
+    // `--dns-target`; unset leaves this inert and `dns configure-domain` remains the
+    // manual, one-shot path.
+    if let Some(target) = args.dns_target.as_deref() {
+        crate::acme_dns::spawn_dns_reconcile(
+            deploy.clone(),
+            provider.clone(),
+            args.acme_dns_provider.clone(),
+            crate::dns::parse_target(target),
+            args.dns_reconcile_ttl,
+            is_leader.clone(),
+            Duration::from_secs(args.dns_reconcile_tick_secs),
+        );
+    }
+
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
     #[cfg(feature = "handlers")]
     let scheduler = handlers.spawn_scheduler(deploy.clone());
@@ -4878,6 +4918,26 @@ async fn serve_acme_dns(
                 }
             }
         });
+    }
+
+    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
+    // "unwired core": `plan_reconcile` existed with zero live callers). Single-node
+    // is always the sole writer (no cluster, no leader lease to race), so the gate
+    // here is simply `|| true` — the same shape `serve_cluster_acme_dns` gates on its
+    // real `is_leader`. Opt-in via `--dns-target`; unset leaves this inert and `dns
+    // configure-domain` remains the manual, one-shot path.
+    if let Some(target) = args.dns_target.as_deref() {
+        let dns_provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
+            crate::acme_dns::build_provider(kind).await?.into();
+        crate::acme_dns::spawn_dns_reconcile(
+            deploy.clone(),
+            dns_provider,
+            args.acme_dns_provider.clone(),
+            crate::dns::parse_target(target),
+            args.dns_reconcile_ttl,
+            || true,
+            Duration::from_secs(args.dns_reconcile_tick_secs),
+        );
     }
 
     tracing::info!(%addr, domains = ?domains, "serving HTTPS (ACME DNS-01)");

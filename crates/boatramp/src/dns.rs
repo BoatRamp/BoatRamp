@@ -282,7 +282,11 @@ async fn cloudflare_wildcard_ssl_preflight(disable: bool) {
 }
 
 /// An IPv4/IPv6 literal becomes an address record; anything else a `CNAME`.
-fn parse_target(target: &str) -> PreviewTarget {
+/// `pub(crate)`: also reused by `serve`'s `--dns-target` reconcile loop
+/// (`crate::acme_dns::spawn_dns_reconcile`) so both the one-shot
+/// `configure-domain` command and the automatic reconcile parse a target
+/// identically.
+pub(crate) fn parse_target(target: &str) -> PreviewTarget {
     if let Ok(v4) = target.parse::<Ipv4Addr>() {
         PreviewTarget::Ipv4(v4)
     } else if let Ok(v6) = target.parse::<Ipv6Addr>() {
