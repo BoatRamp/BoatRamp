@@ -66,7 +66,7 @@ pub(crate) use admin_api::{
     migrate_dry_run, migrate_status, project_export, project_import, prune_delete, prune_report,
     put_blob, put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
     repair_apply, repair_dry_run, restart_database, rollback_daemon_config, scrub_blobs, set_alias,
-    set_operator_registry_auth, sql_exec, sql_move, sql_ping, sql_query,
+    set_operator_registry_auth, sql_exec, sql_move, sql_ping, sql_query, sql_status,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{

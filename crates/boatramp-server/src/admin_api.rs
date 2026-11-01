@@ -1162,20 +1162,111 @@ pub(super) async fn put_compute(
     }
 }
 
-/// Delete a workload (the scheduler then stops its replicas).
+/// WS5 drain grace window (PLAN-managed-dependency-readiness): how long `delete_compute`
+/// waits, after marking a managed-SQL dependency's replicas unhealthy, before actually
+/// removing the workload — long enough for in-flight work on an already-open connection to
+/// finish, short enough it never meaningfully delays an explicit operator delete. The GATE
+/// (flipping `healthy: false` first, so `build_bindings` stops granting new connections
+/// immediately) is what protects a new request; this wait only gives existing ones a
+/// window, so it stays small on purpose.
+const MANAGED_DEP_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Delete a workload (the scheduler then stops its replicas). When `name` backs a managed
+/// SQL dependency this project still declares — EITHER a node-static OR a project-declared
+/// binding — it is first **drained** (PLAN-managed-dependency-readiness WS5: "drain
+/// dependents before tearing down the DB"): every one of its replicas is marked unhealthy,
+/// so the WS2 serve-time gate immediately starts shielding NEW requests on those bindings
+/// with a retryable 503 instead of racing the delete into a raw connection failure, and a
+/// short bounded grace window ([`MANAGED_DEP_DRAIN_GRACE`]) lets in-flight work on an
+/// already-open (pooled) connection finish — THEN the workload is actually removed. This is
+/// the reverse edge of WS2's forward gate: the same "starting/not-ready ⇒ retryable 503,
+/// never a confusing hard error" contract, now also honored on the way DOWN.
+///
+/// Best-effort and never blocks the delete: no `OperatorSql` wired (no managed-SQL feature
+/// compiled in), the dependents lookup erroring, or a replica-state write failing all just
+/// skip straight to the teardown — this is a kindness to live traffic, not a safety gate (an
+/// operator's explicit delete always proceeds). An ordinary (non-managed-SQL) compute
+/// workload sees NO added latency: the dependents lookup is empty and the grace wait is
+/// skipped entirely. The response reports which binding(s), if any, were drained.
 pub(super) async fn delete_compute(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
     Path(name): Path<String>,
 ) -> Response {
+    let drained = drain_managed_dependents(&deploy, op.as_deref(), project.as_ref(), &name).await;
     match deploy
         .delete_compute_workload(project.as_ref(), &name)
         .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            if drained.is_empty() {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "drained_dependents": drained })),
+                )
+                    .into_response()
+            }
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+/// The WS5 drain step (see [`delete_compute`]). Returns the dependent managed-SQL binding
+/// NAMEs that were drained — empty ⇒ nothing to do (not a managed dependency, or no
+/// `OperatorSql` wired), in which case the caller adds no latency at all.
+async fn drain_managed_dependents(
+    deploy: &DeployStore,
+    op: Option<&dyn boatramp_core::sql::OperatorSql>,
+    project: boatramp_core::project::ProjectRef<'_>,
+    workload: &str,
+) -> Vec<String> {
+    let Some(op) = op else {
+        return Vec::new();
+    };
+    let dependents = match op.dependents_of_workload(project.as_str(), workload).await {
+        Ok(d) => d,
+        Err(err) => {
+            tracing::warn!(
+                workload, project = project.as_str(), %err,
+                "WS5 drain: could not determine managed-SQL dependents; proceeding straight \
+                 to the compute-workload delete"
+            );
+            return Vec::new();
+        }
+    };
+    if dependents.is_empty() {
+        return Vec::new();
+    }
+    tracing::info!(
+        workload, project = project.as_str(), dependents = ?dependents,
+        "draining managed-SQL dependent binding(s) before a compute-workload teardown"
+    );
+    // Flip every stored replica unhealthy FIRST — so the gate in `build_bindings` (the WS2
+    // serve-time managed-dependency check) stops granting NEW connections right away —
+    // before the bounded grace wait lets any in-flight work on an already-open connection
+    // finish.
+    match deploy.list_replica_states(project, workload).await {
+        Ok(states) => {
+            for mut state in states {
+                state.healthy = false;
+                if let Err(err) = deploy.set_replica_state(project, &state).await {
+                    tracing::warn!(
+                        workload, replica = state.handle.replica, %err,
+                        "WS5 drain: failed to mark a replica unhealthy"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(workload, %err, "WS5 drain: failed to list replica states");
+        }
+    }
+    tokio::time::sleep(MANAGED_DEP_DRAIN_GRACE).await;
+    dependents
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,6 +1445,69 @@ pub(super) async fn sql_ping(
         }
         Err(e) => (StatusCode::BAD_REQUEST, format!("sql ping failed: {e}\n")).into_response(),
     }
+}
+
+/// `GET /api/sql/{db}/status` — the single authoritative **readiness** signal
+/// (PLAN-managed-dependency-readiness WS4) for a managed database binding, covering
+/// EITHER a node-static (`[handlers].bindings.sql.databases`) OR a project-declared
+/// (`db declare`) binding — the same source merge [`sql_ping`] uses — so an operator
+/// or a migration probe has ONE place to poll "starting" vs "ready" vs "misconfigured"
+/// regardless of which config surface declared the binding. Reports the SAME
+/// `state`/`reason` vocabulary as `boatramp db status` (`database_status`): `pending`,
+/// `starting`, `service_ready`, `provisioned`, `provision_failed` (+ `reason`); a
+/// bring-your-own (`url_env`) binding reports `external` (`managed: false` — WS2 never
+/// hard-gates it, so there is nothing to wait on). A not-ready state carries
+/// `retry_after_secs`, the same hint the WS2 serve-time 503 advertises. Never opens a
+/// connection or runs a query. Same project-owned `sql`-family right as `sql_ping`/
+/// `sql_exec` (`/api/sql/*` → `Project·Deploy`). `501` if no managed SQL is wired on
+/// this node.
+pub(super) async fn sql_status(
+    Extension(project): Extension<ProjectContext>,
+    Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
+    Path(db): Path<String>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
+    let Some(op) = op else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "operator SQL is not available on this node (no managed database configured)\n",
+        )
+            .into_response();
+    };
+    match op.readiness(project.as_ref().as_str(), &db).await {
+        Ok(readiness) => {
+            (StatusCode::OK, Json(sql_readiness_view(&db, &readiness))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("sql status failed: {e}\n")).into_response(),
+    }
+}
+
+/// Render [`OperatorSql::readiness`](boatramp_core::sql::OperatorSql::readiness)'s result as
+/// `sql_status`'s JSON body: the shared `readiness_to_json` vocabulary (`database_status`
+/// uses the identical one), plus `database`/`managed`, plus a `retry_after_secs` hint on any
+/// not-yet-usable state (mirrors the WS2 serve-time `sql_starting_response`).
+fn sql_readiness_view(db: &str, readiness: &boatramp_core::sql::SqlReadiness) -> serde_json::Value {
+    use boatramp_core::sql::SqlReadiness;
+    let mut body = match readiness {
+        SqlReadiness::NotManaged => serde_json::json!({ "managed": false, "state": "external" }),
+        SqlReadiness::Managed(r) => {
+            let mut v = readiness_to_json(r.as_ref());
+            v["managed"] = serde_json::Value::Bool(true);
+            v
+        }
+    };
+    body["database"] = serde_json::Value::String(db.to_string());
+    let usable = matches!(
+        body["state"].as_str(),
+        Some("provisioned") | Some("external")
+    );
+    if !usable {
+        body["retry_after_secs"] =
+            serde_json::Value::from(crate::handler_dispatch::SQL_NOT_READY_RETRY_AFTER_SECS);
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -2206,34 +2360,30 @@ pub(super) async fn database_status(
     Json(body).into_response()
 }
 
-/// Reduce a managed workload's replica states to one readiness signal for `db status`.
-/// Most-informative-wins so an operator sees the actionable state: a `provision_failed`
-/// (with its reason) is surfaced over a sibling that is merely `starting`; `provisioned`
-/// means at least one replica is usable. No replicas ⇒ `pending` (not launched, or
-/// registered under another scope this view does not track).
+/// Reduce a managed workload's replica states to one readiness signal for `db status`, via
+/// the shared [`boatramp_core::compute::reduce_readiness`] primitive (PLAN-managed-dependency-
+/// readiness WS4) — so this JSON view and `OperatorSql::readiness` (the `/api/sql/{db}/status`
+/// surface, which covers a node-static binding too) report the IDENTICAL, once-tested
+/// semantics. `pending` = no RUNNING replica recorded (not launched, or registered under
+/// another scope this view does not track).
 fn summarize_readiness(states: &[boatramp_core::compute::ObservedInstance]) -> serde_json::Value {
-    use boatramp_core::compute::{Readiness, ReplicaPhase};
-    let running: Vec<&Readiness> = states
-        .iter()
-        .filter(|s| s.phase == ReplicaPhase::Running)
-        .map(|s| &s.readiness)
-        .collect();
-    if running.is_empty() {
-        return serde_json::json!({ "state": "pending" });
+    readiness_to_json(boatramp_core::compute::reduce_readiness(states).as_ref())
+}
+
+/// Render a reduced [`Readiness`](boatramp_core::compute::Readiness) (or `None` = "pending")
+/// as the JSON shape every readiness-polling surface shares: `database_status`'s
+/// `summarize_readiness` and `sql_status`'s `OperatorSql::readiness` view.
+fn readiness_to_json(readiness: Option<&boatramp_core::compute::Readiness>) -> serde_json::Value {
+    use boatramp_core::compute::Readiness;
+    match readiness {
+        None => serde_json::json!({ "state": "pending" }),
+        Some(Readiness::ProvisionFailed { reason }) => {
+            serde_json::json!({ "state": "provision_failed", "reason": reason })
+        }
+        Some(Readiness::Provisioned) => serde_json::json!({ "state": "provisioned" }),
+        Some(Readiness::ServiceReady) => serde_json::json!({ "state": "service_ready" }),
+        Some(Readiness::Starting) => serde_json::json!({ "state": "starting" }),
     }
-    if let Some(reason) = running.iter().find_map(|r| match r {
-        Readiness::ProvisionFailed { reason } => Some(reason.clone()),
-        _ => None,
-    }) {
-        return serde_json::json!({ "state": "provision_failed", "reason": reason });
-    }
-    if running.iter().any(|r| r.is_provisioned()) {
-        return serde_json::json!({ "state": "provisioned" });
-    }
-    if running.iter().any(|r| r.is_service_ready()) {
-        return serde_json::json!({ "state": "service_ready" });
-    }
-    serde_json::json!({ "state": "starting" })
 }
 
 /// Surface the most actionable data-dir-ownership observation across a managed workload's
@@ -5269,6 +5419,62 @@ mod tests {
         serde_json::from_slice(&bytes).expect("body is json")
     }
 
+    /// `summarize_readiness` (the `database_status`/`db status` JSON view) — now a thin
+    /// wrapper over the shared `boatramp_core::compute::reduce_readiness` (WS4). Exercises
+    /// every branch so the refactor is behavior-preserving: no prior test covered this
+    /// function directly.
+    #[test]
+    fn summarize_readiness_reports_every_state() {
+        // No replicas at all → pending.
+        assert_eq!(
+            summarize_readiness(&[]),
+            serde_json::json!({ "state": "pending" })
+        );
+
+        // A `Zero`-phase (parked) replica doesn't count, even with a stale `Provisioned`.
+        let mut parked = obs("acme", "pg", 0, "10.0.0.2", true, None);
+        parked.phase = boatramp_core::compute::ReplicaPhase::Zero;
+        assert_eq!(
+            summarize_readiness(&[parked]),
+            serde_json::json!({ "state": "pending" })
+        );
+
+        // Starting.
+        let mut starting = obs("acme", "pg", 0, "10.0.0.2", false, None);
+        starting.readiness = boatramp_core::compute::Readiness::Starting;
+        assert_eq!(
+            summarize_readiness(&[starting]),
+            serde_json::json!({ "state": "starting" })
+        );
+
+        // Service-ready (probed, post-launch actions not yet done).
+        let mut service_ready = obs("acme", "pg", 0, "10.0.0.2", false, None);
+        service_ready.readiness = boatramp_core::compute::Readiness::ServiceReady;
+        assert_eq!(
+            summarize_readiness(&[service_ready]),
+            serde_json::json!({ "state": "service_ready" })
+        );
+
+        // Provisioned (usable).
+        let provisioned = obs("acme", "pg", 0, "10.0.0.2", true, None);
+        assert_eq!(
+            summarize_readiness(&[provisioned]),
+            serde_json::json!({ "state": "provisioned" })
+        );
+
+        // Provision-failed carries its reason, and wins over a `Starting` sibling.
+        let mut starting_sib = obs("acme", "pg", 0, "10.0.0.2", false, None);
+        starting_sib.readiness = boatramp_core::compute::Readiness::Starting;
+        let mut failed = obs("acme", "pg", 1, "10.0.0.3", false, None);
+        failed.readiness = boatramp_core::compute::Readiness::ProvisionFailed {
+            reason: "disk full".into(),
+        };
+        assert_eq!(
+            summarize_readiness(&[starting_sib, failed]),
+            serde_json::json!({ "state": "provision_failed", "reason": "disk full" })
+        );
+    }
+
     #[tokio::test]
     async fn compute_status_surfaces_the_stored_health_of_every_tenant() {
         let deploy = store();
@@ -5799,6 +6005,370 @@ mod tests {
         ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, boatramp_core::sql::SqlError> {
             Ok(self.0.clone())
         }
+        async fn readiness(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlReadiness, boatramp_core::sql::SqlError> {
+            // Unused by this fake's own tests (which only exercise `ping`); a neutral
+            // default so the trait stays complete.
+            Ok(boatramp_core::sql::SqlReadiness::NotManaged)
+        }
+        async fn dependents_of_workload(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, boatramp_core::sql::SqlError> {
+            // Unused by this fake's own tests; a neutral default so the trait stays complete.
+            Ok(vec![])
+        }
+    }
+
+    /// An `OperatorSql` whose `readiness` returns a canned verdict — so `sql_status`'s
+    /// handler + JSON mapping are testable without a live database (PLAN-managed-
+    /// dependency-readiness WS4).
+    struct FakeReadinessSql(
+        std::sync::Mutex<Result<boatramp_core::sql::SqlReadiness, boatramp_core::sql::SqlError>>,
+    );
+
+    #[async_trait::async_trait]
+    impl boatramp_core::sql::OperatorSql for FakeReadinessSql {
+        async fn exec_script(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), boatramp_core::sql::SqlError> {
+            Ok(())
+        }
+        async fn query(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlRows, boatramp_core::sql::SqlError> {
+            Ok(boatramp_core::sql::SqlRows {
+                columns: vec![],
+                rows: vec![],
+            })
+        }
+        async fn ping(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, boatramp_core::sql::SqlError> {
+            Ok(vec![])
+        }
+        async fn readiness(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlReadiness, boatramp_core::sql::SqlError> {
+            // Clone out of the mutex: `SqlError`/`SqlReadiness` aren't `Clone`-cheap in
+            // general, but the test fixture values here are small and this fake is
+            // test-only, so a lock-and-clone keeps the fake `&self`-callable.
+            let guard = self.0.lock().unwrap();
+            match &*guard {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(boatramp_core::sql::SqlError::other(e.to_string())),
+            }
+        }
+        async fn dependents_of_workload(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, boatramp_core::sql::SqlError> {
+            // Unused by this fake's own tests (which only exercise `readiness`); a neutral
+            // default so the trait stays complete.
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_status_reports_the_readiness_vocabulary() {
+        use boatramp_core::compute::Readiness;
+        use boatramp_core::sql::SqlReadiness;
+
+        // Starting: `managed: true, state: "starting"`.
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeReadinessSql(
+            std::sync::Mutex::new(Ok(SqlReadiness::Managed(Some(Readiness::Starting)))),
+        ));
+        let resp = sql_status(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(Some(op)),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["database"], "default");
+        assert_eq!(body["managed"], true);
+        assert_eq!(body["state"], "starting");
+
+        // Provisioned: ready.
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeReadinessSql(
+            std::sync::Mutex::new(Ok(SqlReadiness::Managed(Some(Readiness::Provisioned)))),
+        ));
+        let resp = sql_status(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(Some(op)),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["state"], "provisioned");
+
+        // Pending: compute-backed, declared, but no running replica recorded yet.
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeReadinessSql(
+            std::sync::Mutex::new(Ok(SqlReadiness::Managed(None))),
+        ));
+        let resp = sql_status(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(Some(op)),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["state"], "pending");
+
+        // Bring-your-own URL: not a managed dependency — never hard-gated, never
+        // reported as "starting".
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeReadinessSql(
+            std::sync::Mutex::new(Ok(SqlReadiness::NotManaged)),
+        ));
+        let resp = sql_status(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(Some(op)),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["managed"], false);
+        assert_eq!(body["state"], "external");
+
+        // No managed SQL wired on this node → 501, same as `sql_ping`/`sql_exec`.
+        let resp = sql_status(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(None),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// An `OperatorSql` whose `dependents_of_workload` returns a canned list — so the WS5
+    /// drain step (`drain_managed_dependents`/`delete_compute`) is testable without a real
+    /// managed-SQL stack. Every other method is unused by these tests.
+    struct FakeDependentsSql(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl boatramp_core::sql::OperatorSql for FakeDependentsSql {
+        async fn exec_script(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), boatramp_core::sql::SqlError> {
+            Ok(())
+        }
+        async fn query(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlRows, boatramp_core::sql::SqlError> {
+            Ok(boatramp_core::sql::SqlRows {
+                columns: vec![],
+                rows: vec![],
+            })
+        }
+        async fn ping(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, boatramp_core::sql::SqlError> {
+            Ok(vec![])
+        }
+        async fn readiness(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlReadiness, boatramp_core::sql::SqlError> {
+            Ok(boatramp_core::sql::SqlReadiness::NotManaged)
+        }
+        async fn dependents_of_workload(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, boatramp_core::sql::SqlError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// **WS5 (PLAN-managed-dependency-readiness): drain dependents before teardown.**
+    /// `drain_managed_dependents` — no dependents (an ordinary, non-managed-SQL compute
+    /// workload) is a pure no-op: no replica mutated, nothing returned, and (implicitly) no
+    /// grace wait, since the function returns before ever reaching the sleep.
+    #[tokio::test]
+    async fn drain_managed_dependents_is_a_noop_without_dependents() {
+        let deploy = store();
+        deploy
+            .set_replica_state(
+                boatramp_core::project::ProjectRef::new("acme"),
+                &obs("acme", "pg", 0, "10.0.0.2", true, None),
+            )
+            .await
+            .unwrap();
+
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeDependentsSql(vec![]));
+        let drained = drain_managed_dependents(
+            &deploy,
+            Some(op.as_ref()),
+            boatramp_core::project::ProjectRef::new("acme"),
+            "pg",
+        )
+        .await;
+        assert!(drained.is_empty());
+
+        // The replica is untouched — still healthy.
+        let states = deploy
+            .list_replica_states(boatramp_core::project::ProjectRef::new("acme"), "pg")
+            .await
+            .unwrap();
+        assert!(states[0].healthy, "no dependents ⇒ nothing is drained");
+    }
+
+    /// With no `OperatorSql` wired at all (no managed-SQL feature compiled in), the drain
+    /// step is skipped outright — same as "no dependents", and crucially never panics on a
+    /// missing capability.
+    #[tokio::test]
+    async fn drain_managed_dependents_skips_cleanly_with_no_operator_sql_wired() {
+        let deploy = store();
+        let drained = drain_managed_dependents(
+            &deploy,
+            None,
+            boatramp_core::project::ProjectRef::new("acme"),
+            "pg",
+        )
+        .await;
+        assert!(drained.is_empty());
+    }
+
+    /// The load-bearing case: a workload backing a managed SQL dependency is marked
+    /// unhealthy BEFORE the grace wait returns — so a request racing the teardown is gated
+    /// by WS2's retryable-503 check (unhealthy ⇒ no endpoint ⇒ `Unavailable`) instead of
+    /// hitting a raw connection failure. Runs on a paused virtual clock so the real 3s grace
+    /// window costs no wall-clock time in the test suite.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_managed_dependents_marks_replicas_unhealthy_before_returning() {
+        let deploy = store();
+        let project = boatramp_core::project::ProjectRef::new("acme");
+        deploy
+            .set_replica_state(project, &obs("acme", "pg", 0, "10.0.0.2", true, None))
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(project, &obs("acme", "pg", 1, "10.0.0.3", true, None))
+            .await
+            .unwrap();
+
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> =
+            Arc::new(FakeDependentsSql(vec!["default".to_string()]));
+        let drained = drain_managed_dependents(&deploy, Some(op.as_ref()), project, "pg").await;
+        assert_eq!(drained, vec!["default".to_string()]);
+
+        // Both replicas are now unhealthy — the NEXT request's endpoint resolve finds none
+        // and gates with `Unavailable` (WS2), rather than racing the real teardown.
+        let states = deploy.list_replica_states(project, "pg").await.unwrap();
+        assert_eq!(states.len(), 2);
+        assert!(
+            states.iter().all(|s| !s.healthy),
+            "every replica of a drained dependency is marked unhealthy"
+        );
+    }
+
+    /// End-to-end through the actual `delete_compute` handler: a managed-dependency
+    /// teardown reports which binding(s) it drained (`200` + `drained_dependents`), and the
+    /// workload is still deleted afterward (the drain is a courtesy, never a refusal).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delete_compute_drains_then_deletes_a_managed_dependency() {
+        let deploy = store();
+        let project = ProjectContext("acme".to_string());
+        deploy
+            .set_compute_workload(
+                project.as_ref(),
+                &boatramp_core::compute::ComputeWorkload {
+                    version: boatramp_core::SCHEMA_VERSION,
+                    name: "pg".to_string(),
+                    active: "0".repeat(64),
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                project.as_ref(),
+                &obs("acme", "pg", 0, "10.0.0.2", true, None),
+            )
+            .await
+            .unwrap();
+
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> =
+            Arc::new(FakeDependentsSql(vec!["default".to_string()]));
+        let resp = delete_compute(
+            State(deploy.clone()),
+            Extension(project.clone()),
+            Extension(Some(op)),
+            Path("pg".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["drained_dependents"], serde_json::json!(["default"]));
+
+        // The workload is actually gone.
+        assert!(
+            deploy
+                .get_compute_workload(project.as_ref(), "pg")
+                .await
+                .unwrap()
+                .is_none(),
+            "the drain is a courtesy, never a refusal — the delete still proceeds"
+        );
+    }
+
+    /// An ordinary compute delete (no managed-SQL dependents) is UNCHANGED from before WS5:
+    /// a bare `204`, no body.
+    #[tokio::test]
+    async fn delete_compute_is_unchanged_without_dependents() {
+        let deploy = store();
+        let project = ProjectContext("acme".to_string());
+        deploy
+            .set_compute_workload(
+                project.as_ref(),
+                &boatramp_core::compute::ComputeWorkload {
+                    version: boatramp_core::SCHEMA_VERSION,
+                    name: "app".to_string(),
+                    active: "0".repeat(64),
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeDependentsSql(vec![]));
+        let resp = delete_compute(
+            State(deploy.clone()),
+            Extension(project.clone()),
+            Extension(Some(op)),
+            Path("app".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

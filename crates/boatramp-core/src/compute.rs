@@ -1081,6 +1081,39 @@ fn readiness_provisioned_backcompat() -> Readiness {
     Readiness::Provisioned
 }
 
+/// Reduce a managed workload's observed replica states to the single most-informative
+/// readiness signal (PLAN-managed-dependency-readiness WS4) — the shared primitive behind
+/// every readiness-polling surface (`db status`'s `database_status`, `OperatorSql::readiness`)
+/// so they report the identical, once-tested semantics instead of each re-deriving it.
+/// Most-informative-wins: a [`ProvisionFailed`](Readiness::ProvisionFailed) (with its reason)
+/// surfaces over a sibling that is merely [`Starting`](Readiness::Starting);
+/// [`Provisioned`](Readiness::Provisioned) means at least one replica is usable. `None` ⇒ no
+/// RUNNING replica recorded (not launched yet, scaled to zero, or registered under a scope the
+/// caller doesn't track) — "pending", distinct from `Starting` (launched but not yet probed).
+pub fn reduce_readiness(states: &[ObservedInstance]) -> Option<Readiness> {
+    let running: Vec<&Readiness> = states
+        .iter()
+        .filter(|s| s.phase == ReplicaPhase::Running)
+        .map(|s| &s.readiness)
+        .collect();
+    if running.is_empty() {
+        return None;
+    }
+    if let Some(reason) = running.iter().find_map(|r| match r {
+        Readiness::ProvisionFailed { reason } => Some(reason.clone()),
+        _ => None,
+    }) {
+        return Some(Readiness::ProvisionFailed { reason });
+    }
+    if running.iter().any(|r| r.is_provisioned()) {
+        return Some(Readiness::Provisioned);
+    }
+    if running.iter().any(|r| r.is_service_ready()) {
+        return Some(Readiness::ServiceReady);
+    }
+    Some(Readiness::Starting)
+}
+
 /// A **read-only** data-dir-ownership health observation for a volume-backed managed
 /// database replica, surfaced by `boatramp db status`.
 ///
@@ -4373,6 +4406,69 @@ mod tests {
                 Err("boom".into())
             }
         }
+    }
+
+    /// `reduce_readiness` (PLAN-managed-dependency-readiness WS4) — the shared reduction
+    /// behind every readiness-polling surface. No RUNNING replica at all ⇒ `None` ("pending"),
+    /// distinct from an actually-`Starting` one.
+    #[test]
+    fn reduce_readiness_no_running_replica_is_pending() {
+        assert_eq!(reduce_readiness(&[]), None);
+        assert_eq!(reduce_readiness(&[zeroed("pg", 0, 1)]), None);
+    }
+
+    #[test]
+    fn reduce_readiness_starting_replica_reports_starting() {
+        let mut s = observed("pg", 0, 1, false);
+        s.readiness = Readiness::Starting;
+        assert_eq!(reduce_readiness(&[s]), Some(Readiness::Starting));
+    }
+
+    #[test]
+    fn reduce_readiness_provisioned_wins_over_a_starting_sibling() {
+        let mut starting = observed("pg", 0, 1, false);
+        starting.readiness = Readiness::Starting;
+        let mut provisioned = observed("pg", 1, 1, true);
+        provisioned.readiness = Readiness::Provisioned;
+        assert_eq!(
+            reduce_readiness(&[starting, provisioned]),
+            Some(Readiness::Provisioned)
+        );
+    }
+
+    #[test]
+    fn reduce_readiness_service_ready_without_provisioned() {
+        let mut s = observed("pg", 0, 1, false);
+        s.readiness = Readiness::ServiceReady;
+        assert_eq!(reduce_readiness(&[s]), Some(Readiness::ServiceReady));
+    }
+
+    /// A `ProvisionFailed` reason is the most actionable signal, so it surfaces even when a
+    /// sibling replica is merely `Starting` — an operator must see the failure, not a vague
+    /// "still starting" that buries it.
+    #[test]
+    fn reduce_readiness_provision_failed_wins_and_carries_its_reason() {
+        let mut starting = observed("pg", 0, 1, false);
+        starting.readiness = Readiness::Starting;
+        let mut failed = observed("pg", 1, 1, false);
+        failed.readiness = Readiness::ProvisionFailed {
+            reason: "data-dir ownership mismatch".into(),
+        };
+        assert_eq!(
+            reduce_readiness(&[starting, failed]),
+            Some(Readiness::ProvisionFailed {
+                reason: "data-dir ownership mismatch".into()
+            })
+        );
+    }
+
+    /// A `Zero`-phase (scaled-down) replica is not counted even if its stored readiness were
+    /// stale `Provisioned` — only `Running` replicas are consulted.
+    #[test]
+    fn reduce_readiness_ignores_non_running_phases() {
+        let mut parked = zeroed("pg", 0, 1);
+        parked.readiness = Readiness::Provisioned;
+        assert_eq!(reduce_readiness(&[parked]), None);
     }
 
     #[tokio::test]
