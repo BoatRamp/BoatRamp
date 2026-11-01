@@ -1,6 +1,23 @@
 //! Small shared UI widgets (loading, error, empty states) reused across views.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use yew::prelude::*;
+
+/// A process-unique counter so each field instance can mint a collision-free
+/// `id` for its hint / description node (the target of `aria-describedby`).
+static NEXT_FIELD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a stable, instance-unique `id` (e.g. `"hint-7"`) for a widget's
+/// description node. Captured once per mount via [`use_state`], so it survives
+/// re-renders and never collides with another instance's — which keeps a hint's
+/// `aria-describedby` wiring sound even when the same field widget is rendered
+/// many times on a page.
+#[hook]
+fn use_field_id(prefix: &'static str) -> AttrValue {
+    let n = *use_state(|| NEXT_FIELD_ID.fetch_add(1, Ordering::Relaxed));
+    AttrValue::from(format!("{prefix}-{n}"))
+}
 
 /// A centered loading indicator with a label.
 #[derive(Properties, PartialEq)]
@@ -134,21 +151,158 @@ pub fn text_field(props: &TextFieldProps) -> Html {
         .input_type
         .clone()
         .unwrap_or_else(|| AttrValue::from("text"));
+    // The hint lives OUTSIDE the `<label>` (so it isn't folded into the field's
+    // accessible name) and is linked by `aria-describedby` instead.
+    let hint_id = use_field_id("hint");
+    let describedby = props.hint.as_ref().map(|_| hint_id.clone());
     html! {
-        <label class="block">
-            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <input type={input_type} value={props.value.clone()} placeholder={props.placeholder.clone()}
-                   oninput={on_input}
-                   class={classes!(
-                       "mt-1", "w-full", "rounded-md", "border", "border-slate-300",
-                       "px-2.5", "py-1.5", "text-sm", "shadow-sm",
-                       "focus:border-sky-500", "focus:outline-none", "focus:ring-2",
-                       "focus:ring-sky-600", font
-                   )} />
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <input type={input_type} value={props.value.clone()} placeholder={props.placeholder.clone()}
+                       oninput={on_input} aria-describedby={describedby}
+                       class={classes!(
+                           "mt-1", "w-full", "rounded-md", "border", "border-slate-300",
+                           "px-2.5", "py-1.5", "text-sm", "shadow-sm",
+                           "focus:border-sky-500", "focus:outline-none", "focus:ring-2",
+                           "focus:ring-sky-600", font
+                       )} />
+            </label>
+            if let Some(hint) = &props.hint {
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
+            }
+        </div>
+    }
+}
+
+/// A labeled numeric input for an **optional** integer cap (`Option<u64>`): an
+/// empty field means "unset" (`None` ⇒ the server/engine default), a filled one
+/// is `Some(n)`. Unlike the `parse().unwrap_or(0)` idiom, it never conflates
+/// "unset" with the real value `0` — a blank emits `None`, so a cap is only ever
+/// `Some` when the operator actually typed a number. Renders as `type="number"`
+/// (numeric keypad + steppers + browser range constraint) with `min`/`max`
+/// advisory bounds; the server re-validates on save.
+#[derive(Properties, PartialEq)]
+pub struct NumberFieldProps {
+    /// Field label.
+    pub label: AttrValue,
+    /// Current value, or `None` when unset.
+    pub value: Option<u64>,
+    /// Optional helper text under the field.
+    #[prop_or_default]
+    pub hint: Option<AttrValue>,
+    /// Advisory minimum (rendered as the input's `min`).
+    #[prop_or_default]
+    pub min: Option<u64>,
+    /// Advisory maximum (rendered as the input's `max`).
+    #[prop_or_default]
+    pub max: Option<u64>,
+    /// Placeholder (e.g. a default-value hint like "server default").
+    #[prop_or_default]
+    pub placeholder: AttrValue,
+    /// Emits the new optional value: `None` for a blank field, `Some(n)` for a
+    /// parseable number. A non-blank, non-parseable value emits nothing (the
+    /// previous value is kept rather than clobbered — `type="number"` makes this
+    /// path rare).
+    pub on_change: Callback<Option<u64>>,
+}
+
+#[function_component(NumberField)]
+pub fn number_field(props: &NumberFieldProps) -> Html {
+    let on_input = {
+        let on_change = props.on_change.clone();
+        Callback::from(move |e: InputEvent| {
+            let raw = input_value(&e);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                on_change.emit(None);
+            } else if let Ok(n) = trimmed.parse::<u64>() {
+                on_change.emit(Some(n));
+            }
+            // else: unparseable (e.g. a mid-edit "-") — leave the value unchanged.
+        })
+    };
+    let value = props.value.map(|n| n.to_string()).unwrap_or_default();
+    // Hint outside the `<label>`, linked by `aria-describedby` (see [`TextField`]).
+    let hint_id = use_field_id("hint");
+    let describedby = props.hint.as_ref().map(|_| hint_id.clone());
+    html! {
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <input type="number" inputmode="numeric" value={value}
+                       placeholder={props.placeholder.clone()}
+                       min={props.min.map(|n| n.to_string())}
+                       max={props.max.map(|n| n.to_string())}
+                       oninput={on_input} aria-describedby={describedby}
+                       class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
+                              shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 \
+                              focus:ring-sky-600" />
+            </label>
+            if let Some(hint) = &props.hint {
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
+            }
+        </div>
+    }
+}
+
+/// A three-way choice for a **tri-state** `Option<bool>` where each state carries
+/// distinct meaning: `None` (inherit the posture default), `Some(true)` (force
+/// on), `Some(false)` (force off). A plain checkbox can't represent this — it
+/// would erase the `None` "default" state — so this renders a real radio group
+/// (a `<fieldset>`/`<legend>` with three native radios, keyboard-navigable with
+/// arrow keys and announced as a group by assistive tech).
+#[derive(Properties, PartialEq)]
+pub struct TriStateFieldProps {
+    /// The group's visible legend.
+    pub label: AttrValue,
+    /// Current value: `None`, `Some(true)`, or `Some(false)`.
+    pub value: Option<bool>,
+    /// The label for the `None` (default/inherit) option, e.g.
+    /// "Server default (off, multi-tenant)".
+    pub default_label: AttrValue,
+    /// The label for the `Some(true)` option, e.g. "On".
+    pub on_label: AttrValue,
+    /// The label for the `Some(false)` option, e.g. "Off".
+    pub off_label: AttrValue,
+    /// A stable radio-group `name` (radios in a group must share one, and it must
+    /// be unique on the page so two tri-states don't cross-wire).
+    pub name: AttrValue,
+    /// Optional helper text under the group.
+    #[prop_or_default]
+    pub hint: Option<AttrValue>,
+    /// Emits the chosen value.
+    pub on_change: Callback<Option<bool>>,
+}
+
+#[function_component(TriStateField)]
+pub fn tri_state_field(props: &TriStateFieldProps) -> Html {
+    let option = |selected: bool, choice: Option<bool>, text: &AttrValue| -> Html {
+        let on_change = {
+            let cb = props.on_change.clone();
+            Callback::from(move |_: Event| cb.emit(choice))
+        };
+        html! {
+            <label class="flex items-center gap-2">
+                <input type="radio" name={props.name.clone()} checked={selected}
+                       onchange={on_change}
+                       class="h-4 w-4 border-slate-300 text-sky-600 focus:ring-2 focus:ring-sky-600" />
+                <span class="text-sm text-slate-700">{ text }</span>
+            </label>
+        }
+    };
+    html! {
+        <fieldset>
+            <legend class="text-sm font-medium text-slate-700">{ &props.label }</legend>
+            <div class="mt-1 flex flex-wrap gap-x-5 gap-y-1.5">
+                { option(props.value.is_none(), None, &props.default_label) }
+                { option(props.value == Some(true), Some(true), &props.on_label) }
+                { option(props.value == Some(false), Some(false), &props.off_label) }
+            </div>
             if let Some(hint) = &props.hint {
                 <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
-        </label>
+        </fieldset>
     }
 }
 
@@ -183,19 +337,31 @@ pub fn textarea_field(props: &TextAreaFieldProps) -> Html {
         let on_change = props.on_change.clone();
         Callback::from(move |e: InputEvent| on_change.emit(input_value(&e)))
     };
+    // Hint outside the `<label>` (kept out of the accessible name) and pointed at
+    // by `aria-describedby` — alongside any error node, so assistive tech reads
+    // both the guidance and (when invalid) the reason.
+    let hint_id = use_field_id("hint");
+    let describedby = match (&props.describedby, props.hint.is_some()) {
+        (Some(err), true) => Some(AttrValue::from(format!("{err} {hint_id}"))),
+        (Some(err), false) => Some(err.clone()),
+        (None, true) => Some(hint_id.clone()),
+        (None, false) => None,
+    };
     html! {
-        <label class="block">
-            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <textarea value={props.value.clone()} rows={props.rows.to_string()} oninput={on_input}
-                      aria-invalid={props.invalid.to_string()}
-                      aria-describedby={props.describedby.clone()}
-                      class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
-                             font-mono shadow-sm focus:border-sky-500 focus:outline-none \
-                             focus:ring-2 focus:ring-sky-600" />
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <textarea value={props.value.clone()} rows={props.rows.to_string()} oninput={on_input}
+                          aria-invalid={props.invalid.to_string()}
+                          aria-describedby={describedby}
+                          class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
+                                 font-mono shadow-sm focus:border-sky-500 focus:outline-none \
+                                 focus:ring-2 focus:ring-sky-600" />
+            </label>
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
-        </label>
+        </div>
     }
 }
 
@@ -211,6 +377,11 @@ pub struct CheckFieldProps {
     /// Disable the control (dimmed, not toggle-able) — e.g. a mutually-excluded option.
     #[prop_or_default]
     pub disabled: bool,
+    /// The `id` of an element describing this control, wired to `aria-describedby`
+    /// so assistive tech reads the explanation together with the label (e.g. a
+    /// note on why a toggle is forced on).
+    #[prop_or_default]
+    pub describedby: Option<AttrValue>,
 }
 
 #[function_component(CheckField)]
@@ -235,7 +406,7 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
     html! {
         <label class={row}>
             <input type="checkbox" checked={props.checked} disabled={props.disabled}
-                   onchange={on_change}
+                   onchange={on_change} aria-describedby={props.describedby.clone()}
                    class="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-sky-600 focus:ring-2 focus:ring-sky-600" />
             <span class="text-sm text-slate-700">{ &props.label }</span>
         </label>
@@ -296,6 +467,11 @@ pub struct ButtonProps {
     /// Disable regardless of `busy` (e.g. nothing to save).
     #[prop_or_default]
     pub disabled: bool,
+    /// An explicit accessible name, for when the visible `label` is too terse to
+    /// identify the target on its own (e.g. a per-row "Remove" button names the
+    /// item it removes). Falls through to `label` when unset.
+    #[prop_or_default]
+    pub aria_label: Option<AttrValue>,
     /// Click handler.
     #[prop_or_default]
     pub onclick: Callback<MouseEvent>,
@@ -319,6 +495,7 @@ pub fn button(props: &ButtonProps) -> Html {
     html! {
         <button type="button" ref={props.node_ref.clone()} onclick={props.onclick.clone()}
                 disabled={props.busy || props.disabled}
+                aria-label={props.aria_label.clone()}
                 class={classes!(
                     "rounded-md", "px-3", "py-1.5", "text-sm", "font-medium",
                     "focus-visible:outline-none", "focus-visible:ring-2",

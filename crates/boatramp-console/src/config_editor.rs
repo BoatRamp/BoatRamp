@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use boatramp_types::access::{BasicAuth, RateLimit, hash_password};
-use boatramp_types::config::{HandlersSiteConfig, Hsts, SiteConfig};
+use boatramp_types::config::{
+    CookieAuthConfig, HandlerGraphqlConfig, HandlerGraphqlDataConfig, HandlerGraphqlRowTerm,
+    HandlerGraphqlTableConfig, HandlersSiteConfig, Hsts, SiteConfig,
+};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -20,8 +23,8 @@ use crate::auth::use_session;
 use crate::hooks::{Fetch, use_api};
 use crate::verify::DomainVerifications;
 use crate::widgets::{
-    BtnVariant, Button, CheckField, ErrorBanner, Pill, Section, Spinner, TextAreaField, TextField,
-    Tone,
+    BtnVariant, Button, CheckField, ErrorBanner, INPUT, NumberField, Pill, Section, Spinner,
+    TextAreaField, TextField, Tone, TriStateField,
 };
 
 /// The config editor for one site.
@@ -126,8 +129,14 @@ fn config_form(props: &ConfigFormProps) -> Html {
             <DomainsPanel config={config.clone()} />
             <SecurityPanel config={config.clone()} />
             <AccessPanel config={config.clone()} />
+            // Cookie-session auth is a visitor-auth concern, not a wasm-handler one —
+            // its own section, next to Access control.
+            <CookieAuthPanel config={config.clone()} />
             <WafPanel config={config.clone()} />
             <HandlersPanel config={config.clone()} />
+            // The GraphQL edge is the largest per-site subtree and a primary serving
+            // posture — its own top-level section, not buried under Handlers.
+            <GraphqlPanel config={config.clone()} />
             <CompressionPanel config={config.clone()} />
             <DomainVerifications site={site.clone()} />
 
@@ -178,17 +187,26 @@ enum SaveStatus {
 
 /// The save-bar indicator. A pending edit (`dirty`) shows an amber "unsaved
 /// changes" pill, which takes precedence over a stale "saved" so the operator is
-/// never misled into thinking new edits are persisted.
+/// never misled into thinking new edits are persisted. A failure renders its
+/// reason as VISIBLE text inside an assertive `alert`; progress/state live in a
+/// persistent polite `status` region so changes are announced, never buried in a
+/// hover-only `title`.
 fn save_bar_status(status: &SaveStatus, dirty: bool) -> Html {
-    match status {
+    if let SaveStatus::Error(msg) = status {
+        return html! {
+            <span role="alert" class="text-sm font-medium text-rose-700">
+                { format!("Save failed: {msg}") }
+            </span>
+        };
+    }
+    let inner = match status {
         SaveStatus::Saving => html! { <span class="text-sm text-slate-500">{ "Saving…" }</span> },
-        SaveStatus::Error(msg) => html! {
-            <span class="text-sm text-rose-700" title={msg.clone()}>{ "Save failed" }</span>
-        },
         _ if dirty => html! { <Pill text="unsaved changes" tone={Tone::Warn} /> },
         SaveStatus::Saved => html! { <Pill text="saved" tone={Tone::Good} /> },
-        SaveStatus::Idle => Html::default(),
-    }
+        _ => Html::default(),
+    };
+    // Always-present polite region (empty when idle), so its text changes announce.
+    html! { <span role="status" aria-live="polite">{ inner }</span> }
 }
 
 // ---- Lines <-> Vec<String> helpers -----------------------------------------
@@ -805,6 +823,854 @@ fn handlers_panel(props: &PanelProps) -> Html {
                 <p class="ml-6 text-sm text-slate-500">
                     { "A deployment that ships handlers is refused at activation until this is on." }
                 </p>
+            }
+        </Section>
+    }
+}
+
+// ---- GraphQL edge posture (handlers.graphql) --------------------------------
+
+/// Set the `enforce_safelist` flag, preserving the plan invariant that the
+/// safelist is strictly stronger than APQ: enabling enforcement also turns
+/// `persisted_queries` on (a safelist *is* a persisted-query allowlist). Pure +
+/// DOM-free so the invariant is unit-testable (re-exported for the tests).
+pub fn set_enforce_safelist(g: &mut HandlerGraphqlConfig, on: bool) {
+    g.enforce_safelist = on;
+    if on {
+        g.persisted_queries = true;
+    }
+}
+
+/// Whether the site's handler import allowlist grants the guest `graphql`
+/// capability (`graphql::run`). The edge guard / federation / data-connector all
+/// run at the edge regardless, but a guest that calls `graphql::run` needs this —
+/// so the panel surfaces a hint, not a hard lock, when it is absent.
+fn graphql_import_allowed(cfg: &SiteConfig) -> bool {
+    cfg.handlers
+        .as_ref()
+        .is_some_and(|h| h.allow_imports.iter().any(|i| i == "graphql"))
+}
+
+/// The per-site GraphQL edge query-guard + federation + data-connector posture
+/// (`handlers.graphql`), its own top-level section. Presence (the `Option`) is
+/// one toggle; the inner `enabled` is the master edge switch that actually serves
+/// GraphQL at the route — the plan's two-toggle nuance, spelled out under the
+/// presence checkbox. The dangerous production toggles (introspection ON,
+/// GraphiQL ON) carry an inline warning and a modal confirm.
+#[function_component(GraphqlPanel)]
+fn graphql_panel(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    let import_ok = graphql_import_allowed(&props.config);
+    let present = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.clone());
+
+    // Presence toggle: seed a default block / clear to `None`.
+    let on_present = {
+        let update = update.clone();
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| {
+                let h = c.handlers.get_or_insert_with(HandlersSiteConfig::default);
+                h.graphql = v.then(HandlerGraphqlConfig::default);
+            });
+        })
+    };
+
+    html! {
+        <Section title="GraphQL edge"
+                 description="Serve GraphQL at this site: the query-guard, the federation gateway, and the SQL data connector.">
+            <CheckField label="Configure the GraphQL edge (query-guard / federation / data connector)"
+                        checked={present.is_some()} on_change={on_present} />
+            <p class="text-xs text-slate-500">
+                { "Serving is gated by two switches: this one configures the edge, and the \
+                   \u{201c}GraphQL edge enabled\u{201d} switch below actually serves it. Both \
+                   unchecked-here (absent) and \u{201c}configured but off\u{201d} serve nothing \
+                   \u{2014} \u{201c}configured but off\u{201d} keeps the settings saved without serving." }
+            </p>
+            if let Some(g) = present {
+                <div class="ml-6 mt-3 space-y-4 border-l border-slate-100 pl-4">
+                    if !import_ok {
+                        <p class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            { "Note: " }
+                            <code class="rounded bg-amber-100 px-1 py-0.5">{ "graphql" }</code>
+                            { " is not in this site's allowed imports (Handlers section), so a guest \
+                               handler cannot call graphql::run. The edge guard, federation, and data \
+                               connector below still apply at the edge." }
+                        </p>
+                    }
+                    <GraphqlGuard config={props.config.clone()} g={g.clone()} />
+                    // Everything below is served ONLY while the edge is enabled; when it's off,
+                    // dim + annotate so "Connector active" / "Federation gateway" / "GraphiQL is
+                    // served" don't read as live. The controls stay editable (settings are saved).
+                    <div class={if g.enabled { "space-y-4" } else { "space-y-4 opacity-60" }}>
+                        if !g.enabled {
+                            <p class="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-600">
+                                { "The edge is off \u{2014} these settings are saved but inactive \
+                                   until the edge is enabled above." }
+                            </p>
+                        }
+                        // The data connector is a primary serving MODE, not fine-tuning —
+                        // surfaced directly, not inside the Advanced disclosure.
+                        <DataConnectorPanel config={props.config.clone()} />
+                        <details class="rounded-md border border-slate-200 bg-slate-50 p-3">
+                            <summary class="cursor-pointer text-sm font-medium text-slate-700">
+                                { "Advanced: persisted queries, federation, GraphiQL, endpoint path" }
+                            </summary>
+                            <div class="mt-3 space-y-4">
+                                <GraphqlPersisted config={props.config.clone()} g={g.clone()} />
+                                <GraphqlFederation config={props.config.clone()} g={g.clone()} />
+                                <GraphqlGraphiql config={props.config.clone()} g={g.clone()} />
+                                <GraphqlEndpoint config={props.config.clone()} g={g.clone()} />
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            }
+        </Section>
+    }
+}
+
+/// Shared prop for the GraphQL sub-panels: the whole config handle (so each
+/// mutates `handlers.graphql` in place through [`make_update`], never rebuilding
+/// it) plus a snapshot of the current `graphql` block for rendering.
+#[derive(Properties, PartialEq)]
+struct GraphqlProps {
+    config: UseStateHandle<SiteConfig>,
+    g: HandlerGraphqlConfig,
+}
+
+/// Mutate `handlers.graphql` in place (a no-op if the block was cleared since).
+fn with_graphql(update: &Update, f: impl Fn(&mut HandlerGraphqlConfig) + 'static) {
+    update(&move |c: &mut SiteConfig| {
+        if let Some(g) = c.handlers.as_mut().and_then(|h| h.graphql.as_mut()) {
+            f(g);
+        }
+    });
+}
+
+/// Tier 2 (always visible): the query-guard limits + the introspection tri-state.
+#[function_component(GraphqlGuard)]
+fn graphql_guard(props: &GraphqlProps) -> Html {
+    let update = make_update(&props.config);
+    let g = &props.g;
+
+    let on_active = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_graphql(&update, move |g| g.enabled = v))
+    };
+    let on_depth = {
+        let update = update.clone();
+        Callback::from(move |v: Option<u64>| {
+            with_graphql(&update, move |g| g.max_depth = v.map(|n| n as u32))
+        })
+    };
+    let on_complexity = {
+        let update = update.clone();
+        Callback::from(move |v: Option<u64>| {
+            with_graphql(&update, move |g| g.max_complexity = v.map(|n| n as u32))
+        })
+    };
+    let on_introspection = {
+        let update = update.clone();
+        Callback::from(move |v: Option<bool>| {
+            // Turning introspection ON in production can leak a multi-tenant schema;
+            // confirm the dangerous transition before applying it.
+            if v == Some(true)
+                && !gloo_dialogs::confirm(
+                    "Allow schema introspection on this site's GraphQL endpoint? In a \
+                     multi-tenant deployment this exposes the schema to every caller. Keep it \
+                     off unless this endpoint is meant to be publicly explorable.",
+                )
+            {
+                // The native radio already flipped to the new choice; force a re-render so it
+                // reconciles back to the (unchanged) committed value instead of showing a state
+                // the config doesn't hold. `use_state` always re-renders, and Yew re-applies the
+                // radio's `checked` on every render — so a no-op config write reverts the control.
+                update(&|_: &mut SiteConfig| {});
+                return;
+            }
+            with_graphql(&update, move |g| g.introspection = v);
+        })
+    };
+
+    html! {
+        <div class="space-y-3">
+            <CheckField
+                label={if g.enabled {
+                    "GraphQL edge enabled (serve GraphQL at this route)"
+                } else {
+                    "Configured but OFF — nothing is served at this route until enabled"
+                }}
+                checked={g.enabled} on_change={on_active} />
+            <div class="grid gap-3 sm:grid-cols-2">
+                <NumberField label="Max query depth" value={g.max_depth.map(u64::from)}
+                             min={1} max={50} placeholder="server default"
+                             hint="Deepest selection nesting (1–50). Blank = server default."
+                             on_change={on_depth} />
+                <NumberField label="Max complexity (field count)" value={g.max_complexity.map(u64::from)}
+                             min={1} max={100000} placeholder="server default"
+                             hint="Total selected fields (1–100000). Blank = server default."
+                             on_change={on_complexity} />
+            </div>
+            <TriStateField label="Schema introspection" name="graphql-introspection"
+                           value={g.introspection}
+                           default_label="Server default (off under multi-tenant)"
+                           on_label="Allowed" off_label="Blocked"
+                           hint="Introspection lets a client read the schema. The default follows \
+                                 the server's tenancy posture."
+                           on_change={on_introspection} />
+            if g.introspection == Some(true) {
+                <p class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    { "Introspection is forced ON — the schema is readable by any caller of this endpoint." }
+                </p>
+            }
+        </div>
+    }
+}
+
+/// Tier 3: automatic persisted queries + the stronger safelist enforcement.
+#[function_component(GraphqlPersisted)]
+fn graphql_persisted(props: &GraphqlProps) -> Html {
+    let update = make_update(&props.config);
+    let g = &props.g;
+
+    let on_persisted = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_graphql(&update, move |g| g.persisted_queries = v))
+    };
+    let on_safelist = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_graphql(&update, move |g| set_enforce_safelist(g, v)))
+    };
+
+    // The APQ explanation is a persistent node tied to the APQ control by
+    // `aria-describedby`, and a persistent polite live region announces the
+    // implication when enforcement forces APQ on (otherwise the auto-check is silent).
+    let apq_desc_id = "graphql-apq-desc";
+    let implication = if g.enforce_safelist {
+        "Safelist enforcement just turned Automatic persisted queries on; it stays on and locked while enforcement is active."
+    } else {
+        ""
+    };
+    html! {
+        <div class="space-y-2">
+            <h4 class="text-sm font-medium text-slate-600">{ "Persisted queries" }</h4>
+            <CheckField label="Enforce the safelist (only pre-registered operations run)"
+                        checked={g.enforce_safelist} on_change={on_safelist} />
+            <CheckField label="Automatic persisted queries (clients may send a query hash)"
+                        checked={g.persisted_queries} disabled={g.enforce_safelist}
+                        describedby={Some(AttrValue::from(apq_desc_id))}
+                        on_change={on_persisted} />
+            <p id={apq_desc_id} class="text-xs text-slate-500">
+                { "A safelist is a persisted-query allowlist, so enforcing it also enables APQ and \
+                   locks it on. Disabling enforcement leaves APQ on (they are independent) — uncheck \
+                   it here to turn it off. Register operations under the GraphQL section." }
+            </p>
+            <p role="status" aria-live="polite" class="text-xs text-slate-500">{ implication }</p>
+        </div>
+    }
+}
+
+/// Tier 3: federation gateway toggle + the per-site composition / edge-visibility lists.
+#[function_component(GraphqlFederation)]
+fn graphql_federation(props: &GraphqlProps) -> Html {
+    let update = make_update(&props.config);
+    let g = &props.g;
+
+    let on_federated = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_graphql(&update, move |g| g.federated = v))
+    };
+    let on_subgraphs = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            with_graphql(&update, move |g| {
+                // Blank ⇒ `None` (compose ALL registered subgraphs); a non-empty list is an
+                // explicit include-set. The distinction is load-bearing — don't collapse to `[]`.
+                g.subgraphs = if list.is_empty() {
+                    None
+                } else {
+                    Some(list.clone())
+                };
+            });
+        })
+    };
+    let on_hidden_ops = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            with_graphql(&update, move |g| g.edge_hidden_operations = list.clone());
+        })
+    };
+    let on_hidden_subs = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            with_graphql(&update, move |g| g.edge_hidden_subgraphs = list.clone());
+        })
+    };
+
+    html! {
+        <div class="space-y-2">
+            <CheckField label="Federation gateway (compose the project's subgraphs)"
+                        checked={g.federated} on_change={on_federated} />
+            if g.federated {
+                <div class="ml-6 space-y-3 border-l border-slate-100 pl-4">
+                    <TextAreaField label="Composed subgraphs (one per line; blank = all registered)"
+                        value={lines_join(g.subgraphs.as_deref().unwrap_or_default())}
+                        rows={2}
+                        hint="An explicit include-set makes this site's supergraph a distinct subset."
+                        on_change={on_subgraphs} />
+                    <TextAreaField label="Hidden operations (qualified subgraph.rootField, one per line)"
+                        value={lines_join(&g.edge_hidden_operations)} rows={2}
+                        hint="Make these roots unreachable from the external edge (internal paths still reach them)."
+                        on_change={on_hidden_ops} />
+                    <TextAreaField label="Hidden subgraphs (one per line)"
+                        value={lines_join(&g.edge_hidden_subgraphs)} rows={2}
+                        hint="Hide every root field owned by these subgraphs from the external edge."
+                        on_change={on_hidden_subs} />
+                </div>
+            }
+        </div>
+    }
+}
+
+/// Tier 3: the GraphiQL in-browser explorer (a dangerous-in-prod convenience).
+#[function_component(GraphqlGraphiql)]
+fn graphql_graphiql(props: &GraphqlProps) -> Html {
+    let update = make_update(&props.config);
+    let g = &props.g;
+
+    let on_graphiql = {
+        let update = update.clone();
+        Callback::from(move |v: bool| {
+            if v && !gloo_dialogs::confirm(
+                "Serve the GraphiQL explorer on this site? It is a browser IDE for the API — a \
+                 developer convenience that should normally stay off in production.",
+            ) {
+                // The native checkbox already flipped on; force a re-render so Yew re-applies the
+                // committed `checked` and the box visibly reverts (see on_introspection).
+                update(&|_: &mut SiteConfig| {});
+                return;
+            }
+            with_graphql(&update, move |g| g.graphiql = v);
+        })
+    };
+
+    html! {
+        <div class="space-y-1">
+            <CheckField label="Serve the GraphiQL in-browser explorer"
+                        checked={g.graphiql} on_change={on_graphiql} />
+            if g.graphiql {
+                <p class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    { "GraphiQL is served — a browser GET to the endpoint returns the IDE. Pair with \
+                       introspection for schema docs; keep both off in production." }
+                </p>
+            }
+        </div>
+    }
+}
+
+/// Tier 3: the GraphQL endpoint route pattern override.
+#[function_component(GraphqlEndpoint)]
+fn graphql_endpoint(props: &GraphqlProps) -> Html {
+    let update = make_update(&props.config);
+    let g = &props.g;
+
+    let on_route = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let v = v.trim().to_string();
+            with_graphql(&update, move |g| {
+                g.route = if v.is_empty() { None } else { Some(v.clone()) };
+            });
+        })
+    };
+
+    html! {
+        <TextField label="Endpoint path" value={g.route.clone().unwrap_or_default()}
+                   placeholder="/graphql" mono=true
+                   hint="Where the GraphQL edge engages. Blank = /graphql. Set this if your endpoint lives elsewhere."
+                   on_change={on_route} />
+    }
+}
+
+// ---- GraphQL data connector (handlers.graphql.data) -------------------------
+
+/// Mutate `handlers.graphql.data` in place (no-op if cleared since).
+fn with_data(update: &Update, f: impl Fn(&mut HandlerGraphqlDataConfig) + 'static) {
+    update(&move |c: &mut SiteConfig| {
+        if let Some(d) = c
+            .handlers
+            .as_mut()
+            .and_then(|h| h.graphql.as_mut())
+            .and_then(|g| g.data.as_mut())
+        {
+            f(d);
+        }
+    });
+}
+
+/// The deny-by-default GraphQL→SQL data connector (`handlers.graphql.data`). The
+/// common fields (source / tables / columns / row filters) are typed; the two
+/// deepest fields (per-table `resolvers`, connector `claims_from_token`) ship as
+/// a validated JSON escape hatch, as the plan specifies for Phase 1.
+#[function_component(DataConnectorPanel)]
+fn data_connector_panel(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    let data = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .and_then(|g| g.data.clone());
+
+    let on_present = {
+        let update = update.clone();
+        Callback::from(move |v: bool| {
+            with_graphql(&update, move |g| {
+                g.data = v.then(HandlerGraphqlDataConfig::default);
+            });
+        })
+    };
+    let on_enabled = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_data(&update, move |d| d.enabled = v))
+    };
+    let on_source = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let v = v.trim().to_string();
+            with_data(&update, move |d| d.source = v.clone());
+        })
+    };
+    let on_mutations = {
+        let update = update.clone();
+        Callback::from(move |v: bool| with_data(&update, move |d| d.mutations = v))
+    };
+
+    html! {
+        <div class="space-y-2">
+            <CheckField label="Serve GraphQL from a managed database (data connector)"
+                        checked={data.is_some()} on_change={on_present} />
+            if let Some(d) = data {
+                <div class="ml-6 space-y-3 border-l border-slate-100 pl-4">
+                    <CheckField
+                        label={if d.enabled { "Connector active" } else { "Configured but paused" }}
+                        checked={d.enabled} on_change={on_enabled} />
+                    <TextField label="Source database" value={d.source.clone()}
+                               placeholder="site default database" mono=true
+                               hint="The managed SQL database to expose. Blank = the site's default."
+                               on_change={on_source} />
+                    <CheckField label="Allow mutations (insert / update / delete)"
+                                checked={d.mutations} on_change={on_mutations} />
+                    if d.mutations {
+                        <p class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            { "Mutations are ON — the generated API can write to the database. Leave off for a read-only API." }
+                        </p>
+                    }
+                    if d.enabled && d.tables.is_empty() {
+                        <p class="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-600">
+                            { "No tables exposed — the connector is deny-by-default, so nothing is queryable yet. Add a table below." }
+                        </p>
+                    }
+                    <DataTables config={props.config.clone()} />
+                    <ClaimsHatch config={props.config.clone()} />
+                </div>
+            }
+        </div>
+    }
+}
+
+/// The exposed-tables editor: add/remove a table (deny-by-default), and per table
+/// edit its readable columns, row-filter terms, and (via a JSON hatch) resolvers.
+#[function_component(DataTables)]
+fn data_tables(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    let table_ref = use_node_ref();
+    let tables: Vec<String> = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .and_then(|g| g.data.as_ref())
+        .map(|d| d.tables.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let add = {
+        let update = update.clone();
+        let table_ref = table_ref.clone();
+        Callback::from(move |e: SubmitEvent| {
+            e.prevent_default();
+            let name = table_ref
+                .cast::<HtmlInputElement>()
+                .map(|el| el.value().trim().to_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                return;
+            }
+            with_data(&update, move |d| {
+                d.tables
+                    .entry(name.clone())
+                    .or_insert_with(HandlerGraphqlTableConfig::default);
+            });
+            if let Some(el) = table_ref.cast::<HtmlInputElement>() {
+                el.set_value("");
+            }
+        })
+    };
+
+    html! {
+        <div>
+            <h4 class="mb-2 text-sm font-medium text-slate-600">{ "Exposed tables" }</h4>
+            if tables.is_empty() {
+                <p class="text-sm text-slate-500">{ "None — add a table to expose it." }</p>
+            } else {
+                <div class="space-y-3">
+                    { for tables.iter().map(|name| html! {
+                        <DataTableRow key={name.clone()} config={props.config.clone()} table={name.clone()}
+                                      focus_after_remove={table_ref.clone()} />
+                    }) }
+                </div>
+            }
+            <form onsubmit={add} class="mt-2 flex flex-wrap items-end gap-2">
+                <input ref={table_ref} aria-label="New table name"
+                       placeholder="table name" class={classes!("flex-1", INPUT)} />
+                <button type="submit"
+                        class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
+                               text-slate-700 hover:bg-slate-50 focus-visible:outline-none \
+                               focus-visible:ring-2 focus-visible:ring-sky-600 focus-visible:ring-offset-2">
+                    { "Add table" }
+                </button>
+            </form>
+        </div>
+    }
+}
+
+/// One exposed table's editor. `table` is the map key being edited.
+#[derive(Properties, PartialEq)]
+struct DataTableRowProps {
+    config: UseStateHandle<SiteConfig>,
+    table: String,
+    /// The add-table input (owned by the parent list), focused after this row is
+    /// removed so keyboard focus lands on a sensible neighbour, not nowhere.
+    focus_after_remove: NodeRef,
+}
+
+/// Mutate one table's config in place (no-op if the table or connector was cleared since).
+fn with_table(
+    update: &Update,
+    table: String,
+    f: impl Fn(&mut HandlerGraphqlTableConfig) + 'static,
+) {
+    update(&move |c: &mut SiteConfig| {
+        if let Some(t) = c
+            .handlers
+            .as_mut()
+            .and_then(|h| h.graphql.as_mut())
+            .and_then(|g| g.data.as_mut())
+            .and_then(|d| d.tables.get_mut(&table))
+        {
+            f(t);
+        }
+    });
+}
+
+#[function_component(DataTableRow)]
+fn data_table_row(props: &DataTableRowProps) -> Html {
+    let update = make_update(&props.config);
+    let table = props.table.clone();
+    let cfg = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .and_then(|g| g.data.as_ref())
+        .and_then(|d| d.tables.get(&table))
+        .cloned()
+        .unwrap_or_default();
+
+    let col_ref = use_node_ref();
+    let claim_ref = use_node_ref();
+
+    let on_columns = {
+        let update = update.clone();
+        let table = table.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            with_table(&update, table.clone(), move |t| t.columns = list.clone());
+        })
+    };
+    let remove_table = {
+        let update = update.clone();
+        let table = table.clone();
+        let focus_ref = props.focus_after_remove.clone();
+        Callback::from(move |_: MouseEvent| {
+            let table = table.clone();
+            with_data(&update, move |d| {
+                d.tables.remove(&table);
+            });
+            // This row is about to unmount — move focus to the add-table input so it
+            // doesn't fall back to the document body.
+            if let Some(el) = focus_ref.cast::<HtmlInputElement>() {
+                let _ = el.focus();
+            }
+        })
+    };
+    let add_filter = {
+        let update = update.clone();
+        let table = table.clone();
+        let col_ref = col_ref.clone();
+        let claim_ref = claim_ref.clone();
+        Callback::from(move |e: SubmitEvent| {
+            e.prevent_default();
+            let column = col_ref
+                .cast::<HtmlInputElement>()
+                .map(|el| el.value().trim().to_string())
+                .unwrap_or_default();
+            let claim = claim_ref
+                .cast::<HtmlInputElement>()
+                .map(|el| el.value().trim().to_string())
+                .unwrap_or_default();
+            if column.is_empty() || claim.is_empty() {
+                return;
+            }
+            let table = table.clone();
+            with_table(&update, table, move |t| {
+                t.row_filter.push(HandlerGraphqlRowTerm {
+                    column: column.clone(),
+                    claim: claim.clone(),
+                });
+            });
+            if let Some(el) = col_ref.cast::<HtmlInputElement>() {
+                el.set_value("");
+            }
+            if let Some(el) = claim_ref.cast::<HtmlInputElement>() {
+                el.set_value("");
+            }
+        })
+    };
+
+    html! {
+        <div class="rounded-md border border-slate-200 bg-white p-3">
+            <div class="mb-2 flex items-center justify-between">
+                <span class="font-mono text-sm font-medium text-slate-800">{ &props.table }</span>
+                <Button variant={BtnVariant::DangerSubtle} label="Remove table"
+                        aria_label={AttrValue::from(format!("Remove table {}", props.table))}
+                        onclick={remove_table} />
+            </div>
+            <TextAreaField label="Readable columns (one per line; deny-by-default)"
+                value={lines_join(&cfg.columns)} rows={3}
+                hint="Only these columns are visible. A column absent here is invisible to the API."
+                on_change={on_columns} />
+            <div class="mt-3">
+                <h4 class="mb-1 text-sm font-medium text-slate-600">{ "Row filters (tenant isolation)" }</h4>
+                if cfg.row_filter.is_empty() {
+                    <p class="text-xs text-slate-500">{ "No row filters — every row is visible (subject to the host project scope)." }</p>
+                } else {
+                    <ul class="divide-y divide-slate-100">
+                        { for cfg.row_filter.iter().enumerate().map(|(i, term)| {
+                            let remove = {
+                                let update = update.clone();
+                                let table = table.clone();
+                                let col_ref = col_ref.clone();
+                                Callback::from(move |_: MouseEvent| {
+                                    let table = table.clone();
+                                    with_table(&update, table, move |t| {
+                                        if i < t.row_filter.len() { t.row_filter.remove(i); }
+                                    });
+                                    // The removed row's button unmounts — move focus to the
+                                    // add-filter column input (a sensible, persistent neighbour).
+                                    if let Some(el) = col_ref.cast::<HtmlInputElement>() {
+                                        let _ = el.focus();
+                                    }
+                                })
+                            };
+                            let aria = AttrValue::from(format!(
+                                "Remove row filter {} = claim({})", term.column, term.claim
+                            ));
+                            html! {
+                                <li class="flex items-center justify-between py-1.5 text-sm">
+                                    <span class="font-mono text-slate-700">
+                                        { format!("{} = claim({})", term.column, term.claim) }
+                                    </span>
+                                    <button onclick={remove} aria-label={aria}
+                                            class="text-xs font-medium text-rose-700 hover:underline \
+                                                   focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-600">
+                                        { "Remove" }
+                                    </button>
+                                </li>
+                            }
+                        }) }
+                    </ul>
+                }
+                <form onsubmit={add_filter} class="mt-2 flex flex-wrap items-end gap-2">
+                    <input ref={col_ref} aria-label="Filter column" placeholder="column"
+                           class={classes!("flex-1", INPUT)} />
+                    <input ref={claim_ref} aria-label="Token claim" placeholder="claim (e.g. project, tid)"
+                           class={classes!("flex-1", INPUT)} />
+                    <button type="submit"
+                            class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
+                                   text-slate-700 hover:bg-slate-50 focus-visible:outline-none \
+                                   focus-visible:ring-2 focus-visible:ring-sky-600 focus-visible:ring-offset-2">
+                        { "Add filter" }
+                    </button>
+                </form>
+            </div>
+        </div>
+    }
+}
+
+/// The connector `claims_from_token` JSON escape hatch: a draft textarea that is
+/// parsed and validated as `HandlerGraphqlTokenClaims` only on Apply, so a
+/// half-typed value never corrupts the config. Blank ⇒ clears the field.
+#[function_component(ClaimsHatch)]
+fn claims_hatch(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    let current = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .and_then(|g| g.data.as_ref())
+        .and_then(|d| d.claims_from_token.clone());
+
+    // The pretty-printed current value seeds the draft; edits are local until Apply.
+    let seed = current
+        .as_ref()
+        .and_then(|c| serde_json::to_string_pretty(c).ok())
+        .unwrap_or_default();
+    let draft = use_state(|| seed.clone());
+    let error = use_state(|| Option::<String>::None);
+    let err_id = "claims-from-token-error";
+
+    let on_input = {
+        let draft = draft.clone();
+        Callback::from(move |v: String| draft.set(v))
+    };
+    let apply = {
+        let update = update.clone();
+        let draft = draft.clone();
+        let error = error.clone();
+        Callback::from(move |_: MouseEvent| {
+            let text = draft.trim().to_string();
+            if text.is_empty() {
+                with_data(&update, move |d| d.claims_from_token = None);
+                // Normalise the draft so the "unapplied edits" signal clears.
+                draft.set(String::new());
+                error.set(None);
+                return;
+            }
+            match serde_json::from_str::<boatramp_types::config::HandlerGraphqlTokenClaims>(&text) {
+                Ok(parsed) => {
+                    // Re-seed the draft with the canonical pretty form that was just committed, so
+                    // draft == committed and the pending signal clears (a later edit re-raises it).
+                    let pretty =
+                        serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| text.clone());
+                    with_data(&update, move |d| d.claims_from_token = Some(parsed.clone()));
+                    draft.set(pretty);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(format!("Invalid JSON: {e}"))),
+            }
+        })
+    };
+
+    // Draft edits only reach the config on Apply, but global dirty tracking compares
+    // config vs. baseline — so an unapplied draft shows no unsaved signal and a global
+    // Save would persist WITHOUT it. Surface that gap explicitly.
+    let pending = (*draft).trim() != seed.trim();
+
+    html! {
+        <div>
+            <TextAreaField label="claims_from_token (JSON — advanced)"
+                value={(*draft).clone()} rows={5}
+                invalid={error.is_some()}
+                describedby={error.is_some().then(|| AttrValue::from(err_id))}
+                hint="Bind row-filter claims from a verified app token (issuer + JWKS). Blank clears it. A bad/absent token denies — never widens."
+                on_change={on_input} />
+            if let Some(msg) = &*error {
+                <p id={err_id} role="alert" class="mt-1 text-xs text-rose-700">{ msg }</p>
+            }
+            <div class="mt-2 flex flex-wrap items-center gap-3">
+                <Button variant={if pending { BtnVariant::Primary } else { BtnVariant::Secondary }}
+                        label="Apply claims" onclick={apply} />
+                if pending && error.is_none() {
+                    <span role="status" aria-live="polite" class="text-xs font-medium text-amber-700">
+                        { "Unapplied edits — click Apply (a global Save won't include them)." }
+                    </span>
+                }
+            </div>
+        </div>
+    }
+}
+
+// ---- Cookie session auth (handlers.cookie_auth) -----------------------------
+
+/// The browser cookie-session auth block (`handlers.cookie_auth`). boatramp only
+/// *reads* the named cookie as the bearer when no `Authorization` header is
+/// present; the empty `allowed_origins` default (same-origin only) is framed
+/// positively as the common, safe case.
+#[function_component(CookieAuthPanel)]
+fn cookie_auth_panel(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    let ca = props
+        .config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.cookie_auth.clone());
+
+    let on_present = {
+        let update = update.clone();
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| {
+                let h = c.handlers.get_or_insert_with(HandlersSiteConfig::default);
+                h.cookie_auth = v.then(CookieAuthConfig::default);
+            });
+        })
+    };
+    let on_name = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let v = v.trim().to_string();
+            update(&move |c: &mut SiteConfig| {
+                if let Some(ca) = c.handlers.as_mut().and_then(|h| h.cookie_auth.as_mut()) {
+                    ca.cookie_name = v.clone();
+                }
+            });
+        })
+    };
+    let on_origins = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            update(&move |c: &mut SiteConfig| {
+                if let Some(ca) = c.handlers.as_mut().and_then(|h| h.cookie_auth.as_mut()) {
+                    ca.allowed_origins = list.clone();
+                }
+            });
+        })
+    };
+
+    html! {
+        <Section title="Cookie session auth"
+                 description="Let a browser session cookie stand in as the app bearer when a request carries no Authorization header.">
+            <CheckField label="Enable browser cookie session auth" checked={ca.is_some()}
+                        on_change={on_present} />
+            if let Some(ca) = ca {
+                <div class="ml-6 mt-3 space-y-3 border-l border-slate-100 pl-4">
+                    <TextField label="Cookie name" value={ca.cookie_name.clone()} mono=true
+                               placeholder="__Host-session"
+                               hint="The cookie whose value is the app bearer. Set it HttpOnly; Secure; SameSite=Lax with a __Host- prefix."
+                               on_change={on_name} />
+                    <TextAreaField label="Additional allowed origins (one per line)"
+                        value={lines_join(&ca.allowed_origins)} rows={2}
+                        hint="Cross-origin apps allowed to call this API (scheme+host[+port], e.g. https://app.example.com). Empty = same-origin only — the common case."
+                        on_change={on_origins} />
+                </div>
             }
         </Section>
     }
