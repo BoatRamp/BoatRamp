@@ -608,6 +608,14 @@ pub struct VerifiedToken {
     pub roles: Vec<GrantedRole>,
     /// The token kind.
     pub kind: String,
+    /// The standard CWT **subject** (`sub`, claim key 2) — a STABLE per-principal identity, when the
+    /// issuer stamped one. Surfaced so an identity-sensitive consumer (e.g. the privsep sealer's
+    /// per-principal seal scope) can key on a uniquely-identifying claim rather than on the token's
+    /// role-SHAPE (which two distinct principals can share) or its `cti` (which is per-token, not
+    /// per-principal). **`None` for every token the current issuance path mints** (`Claims` carries no
+    /// subject today); a consumer that needs a per-principal identity MUST fail closed when it is
+    /// absent — see the privsep `scope_of`.
+    pub subject: Option<String>,
     /// The revocation id (hex of `cti`) — looked up in the KV revocation store.
     pub cti: String,
     /// The issued-at time (`iat`, Unix seconds), if present. Every token `mint`ed by
@@ -911,6 +919,7 @@ fn role_token(claims: &ClaimsSet, exp: Option<u64>) -> Result<VerifiedToken, Tok
     Ok(VerifiedToken {
         roles,
         kind,
+        subject: claims.subject.clone(),
         cti,
         iat: claim_iat(claims),
         exp,

@@ -487,14 +487,20 @@ impl ContextVerifier {
     /// presented bearer/role token into a verified principal) against the trust root on EVERY call. An
     /// absent, forged, or expired token refuses — no principal, no dispatch, no bytes.
     ///
-    /// **Phase-2 anti-replay watch-item (F3; NOT a Phase-1 blocker).** The Phase-1 primitive is right,
-    /// but a frontend RCE can REPLAY any end-principal token it OBSERVES transiting the frontend to the
-    /// receiver until that token EXPIRES — so the attacker is bounded to the principals whose tokens
-    /// transit the frontend, within each token's lifetime, but not instantly to zero. Phase 1 binds the
-    /// context correctly (a token it never saw it cannot forge); Phase 2's concrete grammar must
-    /// additionally TIGHTEN the observable-token window: short token lifetimes, PoP / `cnf`-binding
-    /// (bind the token to a key the frontend does not hold, defeating bare replay), and/or per-call
-    /// anti-replay nonces. Named here so Phase 2 does not miss it.
+    /// **Anti-replay (Phase-2 Wave 1, §3.4 watch-item).** A frontend RCE can REPLAY any end-principal
+    /// token it OBSERVES transiting the frontend. This verifier TIGHTENS that window with mechanism (a)
+    /// — a freshness bound on `iat` ([`max_age_secs`](Self::with_max_age_secs)) that refuses a token
+    /// older than the bound even when its `exp` is further out — complemented by the per-call
+    /// [`ReplayCache`] (mechanism (b)) in the serve loop. Mechanism (c) (PoP / `cnf`-binding), which
+    /// would also defeat an ACTIVE principal's NEW-call forgery within the window (which (a)+(b) do
+    /// not), is a documented wiring-gate precondition (see [`AuthorityServe`]).
+    ///
+    /// **LOW-1 revocation residual (documented, inherent to the secret-blind split).** This verifier
+    /// checks signature + `exp` + freshness, NOT KV revocation (`cti` lookup) — it is IO-free and the
+    /// isolated crown jewel is deliberately control-plane-KV-blind. So a token REVOKED but still within
+    /// its freshness window is accepted. The freshness bound shrinks that residual to `max_age_secs`;
+    /// closing it fully would require handing the crown jewel a revocation feed (a bigger coupling).
+    /// Named so a reviewer sees it is a conscious bound, not an oversight.
     pub fn verify_context(
         &self,
         context: &AuthorityContext,
@@ -523,6 +529,19 @@ impl ContextVerifier {
             // them fail-closed to Unverifiable rather than leaking a different outcome.
             Err(e) => return Err(ContextRejection::Unverifiable(e.to_string())),
         };
+
+        // KIND PIN (MEDIUM-2): an authority context is an END-PRINCIPAL control-plane ROLE bearer only.
+        // `cose::verify` authenticates ANY trust-root-signed token carrying a roles claim — a join /
+        // cluster-write / mesh-member / overlay / context-family token would otherwise be honored as an
+        // end-principal context. Pin the kind to `KIND_ROLE` and refuse every other family (fail-closed,
+        // domain separation — a non-role token is not an end-principal authority).
+        if token.kind != cose::KIND_ROLE {
+            return Err(ContextRejection::Claims(format!(
+                "authority context must be a '{}' token, got '{}'",
+                cose::KIND_ROLE,
+                token.kind
+            )));
+        }
 
         // TIGHTENED FRESHNESS BOUND (mechanism (a)). The signature + `exp` are good; now bound how OLD
         // the token may be, independent of its (possibly generous) `exp`. A frontend RCE can only
@@ -849,7 +868,12 @@ impl SealerHandler {
     }
 
     async fn seal(&self, principal: &VerifiedPrincipal, plaintext: Vec<u8>) -> AuthorityResponse {
-        let scope = scope_of(principal);
+        // HIGH-1: the seal scope is the principal's STABLE IDENTITY, never role-shape. No
+        // uniquely-identifying claim ⇒ no scope ⇒ seal NOTHING (fail-closed), so a sealed blob can
+        // never be bound to a non-identity and later unsealed by a different principal.
+        let Some(scope) = scope_of(principal) else {
+            return refused_no_identity("seal");
+        };
         let plaintext = Zeroizing::new(plaintext);
         let inner = SealedInner {
             scope: scope.clone(),
@@ -873,7 +897,11 @@ impl SealerHandler {
     }
 
     async fn unseal(&self, principal: &VerifiedPrincipal, sealed: Vec<u8>) -> AuthorityResponse {
-        let scope = scope_of(principal);
+        // HIGH-1: no uniquely-identifying claim ⇒ no scope ⇒ unseal NOTHING (fail-closed). A
+        // targetless/global/role-only token can never unseal — it names no principal.
+        let Some(scope) = scope_of(principal) else {
+            return refused_no_identity("unseal");
+        };
         let blob: SealedBlob = match serde_json::from_slice(&sealed) {
             Ok(b) => b,
             Err(_) => {
@@ -951,13 +979,21 @@ impl AuthorityHandler for SealerHandler {
 pub struct SignerHandler {
     /// The control-plane auth-root signer the `token.signer` holds (never reachable over any link).
     signer: Arc<dyn Signer>,
+    /// The context freshness max-age the serving verifier enforces — the minted token's TTL is bound
+    /// to the context's REMAINING freshness so a short-lived observed context cannot be converted into
+    /// a durable credential (MEDIUM-1). Should match the paired [`ContextVerifier`]'s `max_age_secs`.
+    context_max_age_secs: u64,
 }
 
 impl SignerHandler {
-    /// Build from the signer's unlocked control-plane signer.
+    /// Build from the signer's unlocked control-plane signer + the context freshness max-age (pass the
+    /// paired [`ContextVerifier`]'s `max_age_secs`; the default is [`DEFAULT_CONTEXT_MAX_AGE_SECS`]).
     #[must_use]
-    pub fn new(signer: Arc<dyn Signer>) -> Self {
-        Self { signer }
+    pub fn new(signer: Arc<dyn Signer>, context_max_age_secs: u64) -> Self {
+        Self {
+            signer,
+            context_max_age_secs,
+        }
     }
 
     async fn mint_token(
@@ -982,7 +1018,33 @@ impl SignerHandler {
                     .to_string(),
             };
         }
-        let ttl = ttl_secs.min(MAX_MINTED_TOKEN_TTL_SECS);
+        // MEDIUM-1: bind the minted TTL to the context's REMAINING freshness so an observed short-lived
+        // context cannot be amplified into a durable control-plane token. Remaining freshness =
+        // max_age - age (by iat; verify_context guarantees iat is present on a verified context), also
+        // bounded by the context's own `exp`. A context with no freshness left mints nothing.
+        let remaining = match principal.token().iat {
+            Some(iat) => self
+                .context_max_age_secs
+                .saturating_sub(now_unix.saturating_sub(iat)),
+            // Defensive: a verified context always has iat (verify_context refuses otherwise); treat a
+            // missing one as no freshness (fail-closed).
+            None => 0,
+        };
+        let remaining = match principal.token().exp {
+            Some(exp) => remaining.min(exp.saturating_sub(now_unix)),
+            None => remaining,
+        };
+        let ttl = ttl_secs.min(MAX_MINTED_TOKEN_TTL_SECS).min(remaining);
+        if ttl == 0 {
+            tracing::warn!(
+                principal = %principal.principal_id(),
+                "[privsep] signer REFUSED mint_token: the context has no remaining freshness to bind a usable token (fail-closed)"
+            );
+            return AuthorityResponse::Refused {
+                reason: "mint_token refused: the authority context has no remaining freshness"
+                    .to_string(),
+            };
+        }
         let claims = Claims {
             roles: requested_roles,
             kind: cose::KIND_ROLE.to_string(),
@@ -1020,12 +1082,52 @@ impl AuthorityHandler for SignerHandler {
     }
 }
 
-/// The credential-derived SCOPE a sealed blob / an authorized op is bound to — the verified principal's
-/// [`VerifiedPrincipal::principal_id`] (kind + its sorted roles), read SOLELY from the re-verified
-/// token. A finer per-tenant claim is a Phase-2 refinement seam; the load-bearing invariant is only
-/// that the scope is credential-derived, never caller-asserted.
-fn scope_of(principal: &VerifiedPrincipal) -> String {
-    principal.principal_id()
+/// The per-principal seal/unseal SCOPE — the verified principal's **stable IDENTITY**, read SOLELY
+/// from the re-verified token, or `None` when the token carries no uniquely-identifying claim (**then
+/// the sealer fails closed — seals/unseals NOTHING**). This is the HIGH-1 fix: the scope is keyed on
+/// the credential's stable SUBJECT identity, **NEVER on its role-SHAPE** ([`VerifiedPrincipal::principal_id`],
+/// which two distinct principals sharing a (kind, roles) set collapse into — the original flaw), and
+/// NEVER on the per-TOKEN `cti` (which a re-mint changes, so it is not a per-principal id either).
+///
+/// A uniquely-identifying claim means the standard CWT **subject** (`sub`). The verified principal's
+/// granted `target`s (the tenant/site a scoped role binds to) are folded in so a given subject's scope
+/// is additionally tenant-shaped, but the load-bearing uniqueness is the subject — a token with no
+/// subject (every token the CURRENT issuance path mints — see [`VerifiedToken::subject`]) returns
+/// `None` and seals/unseals nothing.
+///
+/// **SCOPED + STOPPED (reported to the lead).** Making the sealer grammar FUNCTIONAL (not just safe)
+/// requires the issuance path to mint a mandatory per-principal `sub` into end-principal role tokens —
+/// a cross-cutting change AND a seal-GRANULARITY model choice (per-identity `sub` vs per-tenant). Until
+/// the owner settles it + the claim lands, this fails closed (correct + inert; no serve-link is wired).
+fn scope_of(principal: &VerifiedPrincipal) -> Option<String> {
+    let tok = principal.token();
+    // The uniquely-identifying part: the stable CWT subject. Absent (or empty) ⇒ no identity ⇒ None.
+    let subject = tok.subject.as_deref().filter(|s| !s.is_empty())?;
+    // Fold in the granted tenant/target set (defense-in-depth tenant shaping); a targetless (global)
+    // role contributes none, so the scope is the subject alone (still a valid per-principal identity).
+    let mut targets: Vec<&str> = tok
+        .roles
+        .iter()
+        .filter_map(|r| r.target.as_deref())
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    Some(format!("sub={subject}|targets={}", targets.join(",")))
+}
+
+/// A fail-closed refusal when an authority op needs a per-principal identity the context does not carry
+/// (HIGH-1). Non-secret; no bytes.
+fn refused_no_identity(op: &str) -> AuthorityResponse {
+    tracing::warn!(
+        op,
+        "[privsep] sealer REFUSED: the verified context carries no uniquely-identifying principal \
+         subject — no identity, no scope (fail-closed)"
+    );
+    AuthorityResponse::Refused {
+        reason: format!(
+            "{op} refused: the authority context carries no uniquely-identifying principal subject"
+        ),
+    }
 }
 
 /// A non-secret internal-failure refusal (never echoes crypto/key error text to the caller).
@@ -1123,6 +1225,30 @@ impl AuthorityHandler for AuthorityRegistry {
 ///   (a flood cannot run unbounded concurrent crypto);
 /// - `read_deadline` — bounds an IN-PROGRESS frame read (slowloris defense); the idle wait between
 ///   calls stays unbounded.
+///
+/// ## WIRING-GATE PRECONDITIONS (TRACKED — do NOT ship a real frontend→signer serve-link without these)
+///
+/// This serve is inert in every current composition (no serve-link is designated — see
+/// `boatramp::privsep::compute_authority_serve_links`). BEFORE any composition designates a REAL
+/// relay→crown-jewel authority-serve link, ALL of these are HARD preconditions:
+/// 1. **HIGH-1 per-principal identity.** A mandatory per-principal `sub` claim must be minted into
+///    end-principal role tokens (today [`scope_of`] fails closed because none exists), and the owner
+///    must settle the seal-GRANULARITY model (per-identity `sub` vs per-tenant). Until then the sealer
+///    grammar seals/unseals NOTHING.
+/// 2. **(c) PoP / `cnf`-binding.** (a)+(b) tighten the replay window but do NOT stop an ACTIVE
+///    principal's NEW-call forgery within it (the nonce is unsigned); `cnf`-binding closes that
+///    residual. Needs the originating client to sign an authority-call challenge the frontend relays —
+///    a token-format + guest-SDK change.
+/// 3. **Real limiter + durable audit (LOW-3 / INFO).** Swap the default [`Unlimited`] limiter for a
+///    token-bucket and [`TracingAudit`] for a durable append-only sink.
+/// 4. **Per-link PURPOSE marker.** The composition model needs an explicit per-link purpose so a
+///    listener-FRONTEND→signer authority link can be designated WITHOUT colliding with the
+///    link-shape-identical client-fd splice (why `compute_authority_serve_links` conservatively
+///    excludes the listener-peer shape today).
+///
+/// The **LOW-1 revocation residual** (a revoked-but-fresh token is accepted within the freshness
+/// window — inherent to the control-plane-KV-blind crown-jewel split) is documented on
+/// [`ContextVerifier::verify_context`].
 pub struct AuthorityServe<'a> {
     /// The context verifier (public trust root + freshness bound).
     pub verifier: &'a ContextVerifier,
@@ -1589,8 +1715,11 @@ mod tests {
         assert_eq!(Unlimited.check(&id), RateLimitDecision::Allow);
     }
 
-    // ---- the secrets.sealer grammar: context-bound seal/unseal, scope-checked before crypto ----
+    // ---- the secrets.sealer grammar: context-bound seal/unseal, per-IDENTITY scope (HIGH-1) ----
 
+    /// A verified principal built straight from a real minted role token — carries NO subject (the
+    /// current issuance path mints none), so the sealer fails closed for it. Used for the fail-closed
+    /// and kind-gating tests.
     fn principal_for(signer: &LocalSigner, now: u64, roles: Vec<GrantedRole>) -> VerifiedPrincipal {
         let verifier = ContextVerifier::new(signer.public_key());
         verifier
@@ -1601,13 +1730,35 @@ mod tests {
             .expect("verify")
     }
 
+    /// A verified principal with a chosen STABLE subject identity + roles, constructed directly
+    /// (bypassing the wire) to simulate what `verify_context` WILL yield once the issuance path mints a
+    /// `sub` into role tokens — the only way to exercise per-identity seal scoping today, since
+    /// `cose::mint` cannot set a subject. `iat`/`exp` are set generous so freshness is not the subject.
+    fn principal_with_subject(
+        subject: &str,
+        roles: Vec<GrantedRole>,
+        iat: u64,
+        exp: u64,
+    ) -> VerifiedPrincipal {
+        VerifiedPrincipal {
+            token: VerifiedToken {
+                roles,
+                kind: boatramp_core::cose::KIND_ROLE.to_string(),
+                subject: Some(subject.to_string()),
+                cti: "test-cti".to_string(),
+                iat: Some(iat),
+                exp: Some(exp),
+                cnf: None,
+            },
+        }
+    }
+
     #[test]
-    fn seal_then_unseal_round_trips_for_the_same_principal() {
+    fn seal_then_unseal_round_trips_for_the_same_identity() {
         let now = 1_000;
-        let signer = LocalSigner::generate(TokenAlg::Es256);
         let kek = Arc::new(LocalKek::from_bytes([7u8; 32])) as Arc<dyn KeyEnvelope>;
         let handler = SealerHandler::new(kek);
-        let principal = principal_for(&signer, now, vec![role("admin")]);
+        let principal = principal_with_subject("alice", vec![role("admin")], now, now + 1_000_000);
 
         let sealed = runtime().block_on(handler.handle(
             &principal,
@@ -1632,14 +1783,18 @@ mod tests {
         );
     }
 
+    /// HIGH-1 REGRESSION: two principals with IDENTICAL role-shape but DIFFERENT subject identity must
+    /// NOT share a seal scope — B cannot unseal A's blob even though their role-shape (principal_id) is
+    /// identical. This is the exact flaw the review found (scope keyed on role-shape, not identity).
     #[test]
-    fn unseal_is_refused_for_a_different_principal_before_crypto() {
+    fn unseal_refused_across_identities_with_identical_role_shape() {
         let now = 1_000;
-        let signer = LocalSigner::generate(TokenAlg::Es256);
         let kek = Arc::new(LocalKek::from_bytes([7u8; 32])) as Arc<dyn KeyEnvelope>;
         let handler = SealerHandler::new(kek);
-        // A seals under its own scope.
-        let a = principal_for(&signer, now, vec![role("admin")]);
+        let a = principal_with_subject("alice", vec![role("admin")], now, now + 1_000_000);
+        let b = principal_with_subject("bob", vec![role("admin")], now, now + 1_000_000);
+        // Identical role-SHAPE (the old scope key) — yet DIFFERENT principals.
+        assert_eq!(a.principal_id(), b.principal_id());
         let AuthorityResponse::Sealed { sealed } = runtime().block_on(handler.handle(
             &a,
             AuthorityRequest::Seal {
@@ -1649,13 +1804,44 @@ mod tests {
         )) else {
             panic!("seal");
         };
-        // B (a DIFFERENT verified principal — different roles ⇒ different scope) tries to unseal it.
-        let b = principal_for(&signer, now, vec![role("viewer")]);
-        assert_ne!(a.principal_id(), b.principal_id());
         let out = runtime().block_on(handler.handle(&b, AuthorityRequest::Unseal { sealed }, now));
         assert!(
             matches!(out, AuthorityResponse::Refused { .. }),
-            "a cross-principal unseal must be refused, got {out:?}"
+            "B must NOT unseal A's blob despite identical role-shape, got {out:?}"
+        );
+    }
+
+    /// A context with no uniquely-identifying subject (every token the current issuance path mints)
+    /// can seal NOTHING and unseal NOTHING — fail-closed, no identity ⇒ no scope.
+    #[test]
+    fn seal_and_unseal_fail_closed_without_a_subject() {
+        let now = 1_000;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let kek = Arc::new(LocalKek::from_bytes([7u8; 32])) as Arc<dyn KeyEnvelope>;
+        let handler = SealerHandler::new(kek);
+        let p = principal_for(&signer, now, vec![role("admin")]); // real token ⇒ subject None
+        assert!(p.token().subject.is_none());
+        let seal = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::Seal {
+                plaintext: b"x".to_vec(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(seal, AuthorityResponse::Refused { .. }),
+            "seal: {seal:?}"
+        );
+        let unseal = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::Unseal {
+                sealed: b"{}".to_vec(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(unseal, AuthorityResponse::Refused { .. }),
+            "unseal: {unseal:?}"
         );
     }
 
@@ -1681,17 +1867,41 @@ mod tests {
         );
     }
 
+    // ---- MEDIUM-2: the authority context must be a role token ----
+
+    #[test]
+    fn context_pins_kind_to_role() {
+        // A non-KIND_ROLE token (a mesh join token), validly signed by the trust root, is REFUSED as
+        // an authority context (domain separation) — only an end-principal role bearer is accepted.
+        let now = 1_000;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let verifier = ContextVerifier::new(signer.public_key());
+        let join = runtime()
+            .block_on(cose::mint_join(300, now, &signer))
+            .expect("mint a join token");
+        let err = verifier
+            .verify_context(&AuthorityContext::from_token(join), now + 1)
+            .unwrap_err();
+        assert!(matches!(err, ContextRejection::Claims(_)), "got {err:?}");
+    }
+
     // ---- the token.signer grammar: mint ≤ the verified principal's own authority ----
+
+    /// Read the signer handler's public key (test helper — the handler never exposes the key itself).
+    fn handler_signer_public(h: &SignerHandler) -> TokenPublicKey {
+        h.signer.public_key()
+    }
 
     #[test]
     fn mint_token_mints_only_a_subset_of_authorized_roles() {
         let now = 1_000;
         let root = LocalSigner::generate(TokenAlg::Es256);
-        let trust_root = root.public_key();
-        let handler = SignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let handler = SignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
         // The principal holds admin + viewer; it mints a token bearing ONLY viewer (a subset).
         let p = principal_for(&root, now, vec![role("admin"), role("viewer")]);
-        let _ = trust_root;
         let out = runtime().block_on(handler.handle(
             &p,
             AuthorityRequest::MintToken {
@@ -1708,16 +1918,44 @@ mod tests {
         assert_eq!(verified.roles, vec![role("viewer")]);
     }
 
-    /// Read the signer handler's public key (test helper — the handler never exposes the key itself).
-    fn handler_signer_public(h: &SignerHandler) -> TokenPublicKey {
-        h.signer.public_key()
+    /// MEDIUM-1: the minted token's TTL is bound to the context's REMAINING freshness, so an observed
+    /// near-stale context cannot be amplified into a durable 1h credential.
+    #[test]
+    fn mint_token_ttl_clamped_to_remaining_context_freshness() {
+        let max_age = 120;
+        let iat = 1_000;
+        let now = iat + 110; // age 110 ⇒ only 10s of freshness remain
+        let handler = SignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)), max_age);
+        // A subject-bearing principal with a far-off exp, so the freshness bound (not exp) governs.
+        let p = principal_with_subject("alice", vec![role("admin")], iat, iat + 1_000_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintToken {
+                requested_roles: vec![role("admin")],
+                ttl_secs: 3_600, // asks for an hour...
+            },
+            now,
+        ));
+        let AuthorityResponse::Minted { token } = out else {
+            panic!("expected Minted, got {out:?}");
+        };
+        // ...but gets at most the 10s of remaining freshness: exp == now + 10.
+        let verified = cose::verify(&token, &handler_signer_public(&handler), now + 1).unwrap();
+        assert_eq!(
+            verified.exp,
+            Some(now + 10),
+            "TTL must clamp to remaining freshness"
+        );
     }
 
     #[test]
     fn mint_token_refused_when_a_requested_role_exceeds_the_principal() {
         let now = 1_000;
         let root = LocalSigner::generate(TokenAlg::Es256);
-        let handler = SignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let handler = SignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
         // The principal holds ONLY viewer; asking to mint admin (which it does not hold) is Refused.
         let p = principal_for(&root, now, vec![role("viewer")]);
         let out = runtime().block_on(handler.handle(
@@ -1738,7 +1976,10 @@ mod tests {
     fn signer_kind_gates_a_seal_request() {
         let now = 1_000;
         let root = LocalSigner::generate(TokenAlg::Es256);
-        let handler = SignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let handler = SignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
         let p = principal_for(&root, now, vec![role("admin")]);
         let out = runtime().block_on(handler.handle(
             &p,
@@ -1758,8 +1999,8 @@ mod tests {
     #[test]
     fn registry_routes_by_authority_and_refuses_an_unregistered_one() {
         let now = 1_000;
-        let root = LocalSigner::generate(TokenAlg::Es256);
-        let p = principal_for(&root, now, vec![role("admin")]);
+        // A subject-bearing principal so the Seal route actually seals (per-identity scope).
+        let p = principal_with_subject("alice", vec![role("admin")], now, now + 1_000_000);
         // A registry holding ONLY the sealer.
         let kek = Arc::new(LocalKek::from_bytes([7u8; 32])) as Arc<dyn KeyEnvelope>;
         let mut reg = AuthorityRegistry::new();
@@ -1854,9 +2095,10 @@ mod tests {
 
         #[test]
         fn grammar_round_trips_and_a_replayed_call_is_refused() {
-            // The full WS-E grammar over a real socketpair: a sealer+signer registry serves seal →
-            // unseal → mint_token for a verified principal; then a VERBATIM replay of a captured call
-            // frame (same context, same nonce) is refused by the anti-replay cache.
+            // The WS-E grammar over a real socketpair, with a RELAYED real token (which carries no
+            // subject today): the sealer seal FAILS CLOSED (HIGH-1 — no identity ⇒ no scope); the
+            // signer mint_token works (roles-based); then a VERBATIM replay of a captured call frame
+            // (same context, same nonce) is refused by the anti-replay cache.
             let now = 2_000;
             let root = LocalSigner::generate(TokenAlg::Es256);
             let trust_root = root.public_key();
@@ -1870,7 +2112,7 @@ mod tests {
             );
             reg.register(
                 HostAuthority::TokenSigner,
-                Arc::new(SignerHandler::new(signer_key)),
+                Arc::new(SignerHandler::new(signer_key, DEFAULT_CONTEXT_MAX_AGE_SECS)),
             );
 
             let ctx = AuthorityContext::from_token(mint_token_roles(
@@ -1889,30 +2131,22 @@ mod tests {
                 now + 1,
             );
 
-            // seal → unseal round-trips.
-            let AuthorityResponse::Sealed { sealed } = client_end
+            // seal FAILS CLOSED over the wire: a relayed real token carries no subject (HIGH-1).
+            let sealed = client_end
                 .call(
                     &ctx,
                     &AuthorityRequest::Seal {
                         plaintext: b"serving secret".to_vec(),
                     },
                 )
-                .expect("seal call")
-            else {
-                panic!("expected Sealed");
-            };
-            let unsealed = client_end
-                .call(&ctx, &AuthorityRequest::Unseal { sealed })
-                .expect("unseal call");
-            assert_eq!(
-                unsealed,
-                AuthorityResponse::Unsealed {
-                    plaintext: b"serving secret".to_vec()
-                }
+                .expect("seal call carried");
+            assert!(
+                matches!(sealed, AuthorityResponse::Refused { .. }),
+                "a subjectless relayed context must seal nothing (fail-closed), got {sealed:?}"
             );
 
-            // mint_token mints a viewer-scoped token off the admin+viewer principal... principal holds
-            // only admin here, so mint admin (a subset of itself).
+            // mint_token works (roles-based, not identity-scoped): the principal holds admin, mints
+            // admin (a subset of itself), TTL bound to the context's remaining freshness.
             let minted = client_end
                 .call(
                     &ctx,

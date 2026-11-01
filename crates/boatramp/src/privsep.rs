@@ -767,6 +767,13 @@ fn compute_unseal_allowlists(
 /// a client-fd splice and so needs an explicit per-link PURPOSE marker in the composition model to
 /// disambiguate (a follow-on). This wave designates only the unambiguous crown↔(non-listener relay)
 /// shape (e.g. a `control.admin-api` / `exec.*` relay → an isolated signer). Pure (host-testable).
+///
+/// **WIRING-GATE PRECONDITIONS (tracked).** Before ANY composition designates a real
+/// relay→crown-jewel authority-serve link, the hard preconditions in
+/// [`boatramp_server::privsep_authority::AuthorityServe`]'s doc MUST be met — notably the HIGH-1
+/// per-principal `sub` identity claim + the seal-granularity owner decision (the sealer's `scope_of`
+/// fails closed without it today), PoP/`cnf`-binding, a real limiter + durable audit sink, and the
+/// per-link PURPOSE marker named above.
 fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let Some(privsep) = config.privsep.as_ref() else {
@@ -1141,8 +1148,9 @@ mod instance_serve {
     use boatramp_core::cose::{Signer, TokenPublicKey};
     use boatramp_core::privsep::HostAuthority;
     use boatramp_server::privsep_authority::{
-        AuthorityRegistry, AuthorityServe, ContextVerifier, DEFAULT_LINK_READ_DEADLINE,
-        DEFAULT_MAX_IN_FLIGHT, ReplayCache, SealerHandler, SignerHandler, TracingAudit, Unlimited,
+        AuthorityRegistry, AuthorityServe, ContextVerifier, DEFAULT_CONTEXT_MAX_AGE_SECS,
+        DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT, ReplayCache, SealerHandler,
+        SignerHandler, TracingAudit, Unlimited,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_unseal::{
@@ -1453,9 +1461,11 @@ mod instance_serve {
                  (expected a `[serve.signer] = Sealed` source)"
                     .to_string()
             })?;
+            // The handler's context-freshness max-age matches the verifier's default below, so a
+            // minted token's TTL binds to the context's REMAINING freshness (MEDIUM-1).
             registry.register(
                 HostAuthority::TokenSigner,
-                Arc::new(SignerHandler::new(signer)),
+                Arc::new(SignerHandler::new(signer, DEFAULT_CONTEXT_MAX_AGE_SECS)),
             );
         }
         if registry.is_empty() {
