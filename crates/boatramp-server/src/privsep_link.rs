@@ -342,7 +342,7 @@ mod unix_impl {
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg_buf.as_mut_ptr().cast();
             msg.msg_controllen = cmsg_space as _;
-            let n = loop {
+            let rc = loop {
                 // SAFETY: `msg` references live buffers. (`MSG_CMSG_CLOEXEC` is Linux-only; we
                 // pass 0 and set FD_CLOEXEC on the received fd below for one portable path.)
                 let rc = unsafe { libc::recvmsg(fd, &mut msg, 0) };
@@ -353,16 +353,14 @@ mod unix_impl {
                     }
                     return Err(err);
                 }
-                if rc == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "privsep link: peer closed (EOF) before the client-conn message",
-                    ));
-                }
-                break rc as usize;
+                break rc;
             };
-            // Extract exactly one fd; close any surplus (a well-behaved sender passes one).
-            let mut received: Option<OwnedFd> = None;
+            // Own EVERY delivered fd IMMEDIATELY — before any fallible step — so `Drop` guarantees
+            // each is closed on ANY early return below (the EOF path, or a `set_cloexec` error): no
+            // fd can leak. (Today the control buffer is sized for exactly one fd, so the kernel
+            // delivers ≤1 and `MSG_CTRUNC`-closes surplus SENDER fds; owning-first keeps this sound
+            // if that buffer is ever enlarged.)
+            let mut owned_fds: Vec<OwnedFd> = Vec::new();
             // SAFETY: `msg` was populated by recvmsg; CMSG_FIRSTHDR/NXTHDR walk its cmsgs.
             let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
             while !cmsg.is_null() {
@@ -381,24 +379,35 @@ mod unix_impl {
                     // SAFETY: CMSG_DATA points at `count` RawFds inside our cmsg buffer.
                     let data_ptr = unsafe { libc::CMSG_DATA(cmsg).cast::<RawFd>() };
                     for i in 0..count {
-                        // SAFETY: `i < count`, so the read is in bounds of the fd array.
+                        // SAFETY: `i < count`, in bounds; each fd is freshly-owned by this process.
                         let raw = unsafe { data_ptr.add(i).read_unaligned() };
-                        // SAFETY: each received fd is freshly-owned by this process.
-                        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                        if received.is_none() {
-                            // CLOEXEC the accepted client fd (MSG_CMSG_CLOEXEC is Linux-only) so a
-                            // later re-exec cannot leak it; fail-closed if the flag won't set.
-                            set_cloexec(owned.as_raw_fd())?;
-                            received = Some(owned);
-                        } else {
-                            drop(owned); // surplus fd — close it (we accept exactly one)
-                        }
+                        owned_fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
                     }
                 }
                 // SAFETY: walking to the next cmsg of the same recvmsg buffer.
                 cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
             }
-            Ok((n, received))
+            // Orderly EOF: every owned fd drops here (closed) — fail-closed, no leak even if the
+            // kernel ever attached an fd to a zero-length read.
+            if rc == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "privsep link: peer closed (EOF) before the client-conn message",
+                ));
+            }
+            // Accept exactly ONE fd; surplus (if any) drops → closed. CLOEXEC the accepted client
+            // fd (MSG_CMSG_CLOEXEC is Linux-only) so a later re-exec cannot leak it; on a
+            // set_cloexec error the accepted fd AND the surplus iterator both drop → closed.
+            let mut fds = owned_fds.into_iter();
+            let received = match fds.next() {
+                Some(first) => {
+                    set_cloexec(first.as_raw_fd())?;
+                    Some(first)
+                }
+                None => None,
+            };
+            drop(fds); // close any surplus fds explicitly
+            Ok((rc as usize, received))
         }
     }
 

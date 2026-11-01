@@ -498,6 +498,16 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     // root-spawned child this is a no-op; it backstops the explicit `boatramp __instance`
     // entry, which inherits the full parent environ.
     scrub_own_environ();
+
+    // Privsep's load-bearing wall is the per-instance Enforced sandbox; on any non-Linux /
+    // non-`sandbox` build an instance cannot install it, so refuse to serve rather than run
+    // unsandboxed — including the dev-only `Off` posture. The root already refuses off-Linux at
+    // spawn; this backstops a manual `boatramp __instance` invocation for consistency (Security
+    // re-review INFO), so no privsep instance ever serves unsandboxed on a non-Linux Unix host.
+    if !cfg!(all(target_os = "linux", feature = "sandbox")) {
+        return Err(PrivsepError::UnsupportedPlatform.into());
+    }
+
     let config = ServerConfig::load(config_path, None).map_err(PrivsepError::from)?;
 
     // Step 1 (design §2.1): resolve THIS instance's slice — refuse a non-privsep node
