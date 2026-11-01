@@ -24,6 +24,16 @@ pub fn dnsmanaged_site_prefix(project: &str, site: &str) -> String {
     format!("project/{project}/dnsmanaged/{site}/")
 }
 
+/// The KV key prefix for **every** managed-record ledger in a project (every
+/// site). Mirrors `domain_verification_project_prefix`'s role for
+/// [`crate`]'s verification ledger: it lets the reconcile sweep find a ledger
+/// entry whose site has since been fully deleted (so it no longer appears in
+/// `DeployStore::all_sites_all`) and still retract it — the ledger, unlike a
+/// site's config, is never swept by `delete_site`.
+pub fn dnsmanaged_project_prefix(project: &str) -> String {
+    format!("project/{project}/dnsmanaged/")
+}
+
 /// One DNS record boatramp created — a serializable mirror of the acme
 /// `DnsRecord` (kept string-typed to avoid a dependency cycle).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

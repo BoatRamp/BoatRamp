@@ -2625,6 +2625,42 @@ impl DeployStore {
         Ok(out)
     }
 
+    /// Every managed-DNS ledger entry across **all** projects and sites, each
+    /// paired with its owning `(project, site)` — the enumeration behind the
+    /// DNS reconcile sweep's retract pass. Fans out over
+    /// [`discover_projects`](Self::discover_projects) and scans each project's
+    /// `dnsmanaged/` keyspace directly (not `all_sites_all`), so a ledger entry
+    /// whose site has since been fully [`delete_site`](Self::delete_site)d —
+    /// and so no longer appears among known sites — is still found and can be
+    /// retracted; mirrors [`list_all_domain_verifications`](Self::list_all_domain_verifications)'s
+    /// same rationale for its ledger.
+    pub async fn list_all_managed_dns(
+        &self,
+    ) -> Result<Vec<(String, String, crate::dns_managed::ManagedDns)>, DeployError> {
+        let mut out = Vec::new();
+        for project in self.discover_projects().await? {
+            let scan = crate::dns_managed::dnsmanaged_project_prefix(&project);
+            for key in self.kv.list_prefix(&scan).await? {
+                // Key shape: `project/<proj>/dnsmanaged/<site>/<host>`; the site is
+                // the first segment after the scan prefix (no `/` in a site name).
+                let Some((site, _host)) = key
+                    .strip_prefix(&scan)
+                    .and_then(|rest| rest.split_once('/'))
+                else {
+                    continue;
+                };
+                if let Some(bytes) = self.kv.get(&key).await? {
+                    out.push((
+                        project.clone(),
+                        site.to_string(),
+                        crate::dns_managed::ManagedDns::from_json(&bytes)?,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Start (or restart) an ownership challenge for `(site, host)`.
     ///
     /// Returns the existing challenge if one is already pending under the same
@@ -5977,6 +6013,106 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// `list_all_managed_dns` fans out across projects AND sites, and — the
+    /// property the DNS reconcile sweep depends on — finds a ledger entry for a
+    /// site that has **no config at all** (e.g. fully removed via
+    /// [`DeployStore::delete_site`], which never sweeps `dnsmanaged/`). A
+    /// site-scoped `list_managed_dns` can't see this: only the project-wide scan
+    /// does.
+    #[tokio::test]
+    async fn list_all_managed_dns_finds_entries_across_sites_and_projects() {
+        use crate::dns_managed::{ManagedDns, ManagedRecord};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let record = |host: &str| ManagedRecord {
+            kind: "A".into(),
+            name: host.to_string(),
+            value: "203.0.113.7".into(),
+            ttl: 300,
+        };
+
+        store
+            .set_managed_dns(
+                ProjectRef::DEFAULT,
+                &SiteName::new("blog"),
+                &ManagedDns::new(
+                    "blog.example.com",
+                    "manual",
+                    vec![record("blog.example.com")],
+                    1,
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .set_managed_dns(
+                ProjectRef::new("other-project"),
+                &SiteName::new("shop"),
+                &ManagedDns::new(
+                    "shop.example.com",
+                    "manual",
+                    vec![record("shop.example.com")],
+                    1,
+                ),
+            )
+            .await
+            .unwrap();
+        // A site with ZERO config — the `delete_site` edge case: its ledger entry
+        // must still surface, with no `site_pointer`/`current`/`history` key for it.
+        store
+            .set_managed_dns(
+                ProjectRef::DEFAULT,
+                &SiteName::new("deleted-site"),
+                &ManagedDns::new(
+                    "stale.example.com",
+                    "manual",
+                    vec![record("stale.example.com")],
+                    1,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_site_config(ProjectRef::DEFAULT, "deleted-site")
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted-site scenario has no config at all"
+        );
+
+        let mut found: Vec<(String, String, String)> = store
+            .list_all_managed_dns()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(project, site, ledger)| (project, site, ledger.host))
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "default".to_string(),
+                    "blog".to_string(),
+                    "blog.example.com".to_string()
+                ),
+                (
+                    "default".to_string(),
+                    "deleted-site".to_string(),
+                    "stale.example.com".to_string()
+                ),
+                (
+                    "other-project".to_string(),
+                    "shop".to_string(),
+                    "shop.example.com".to_string()
+                ),
+            ]
         );
     }
 

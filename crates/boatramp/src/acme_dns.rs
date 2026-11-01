@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boatramp_acme::dns::DnsProvider;
-use boatramp_acme::{ManualDnsProvider, preview_wildcard};
+use boatramp_acme::{
+    DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind, domain_record, preview_wildcard,
+    validate_writable,
+};
 use clap::ValueEnum;
 
 /// A failure in the ACME DNS-01 TLS path (the CLI `dns` subcommand and the
@@ -175,6 +178,252 @@ pub async fn build_provider_opts(
             env("AKAMAI_ACCESS_TOKEN")?,
             env("AKAMAI_ZONE")?,
         )),
+    })
+}
+
+// ---- custom-domain DNS reconcile (capability #24 Stage 6) ------------------
+//
+// The roadmap's auto-DNS planner (`boatramp_core::dns_managed::plan_reconcile`)
+// landed with the ledger it reads, but nothing in the serve loop ever called
+// it — the planner existed, unreachable from any live task. This section
+// wires it in: a leader-gated background sweep that keeps every site's
+// verified custom domains pointed at `--dns-target`, mirroring the
+// leader-gated-tick shape of `boatramp_server::spawn_domain_verify_reconcile`
+// / `spawn_compute_reconcile` (and this module's own cert-renewal loops in
+// `serve.rs`) — the same `is_leader` gate makes it a single-writer in a
+// cluster, so a follower never double-writes a zone.
+
+/// Outcome of one [`reconcile_dns_once`] pass, for the loop's tracing summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DnsReconcileReport {
+    /// Verified custom domains (re)pointed this pass (idempotent — `upsert`
+    /// re-asserts every verified host every pass, so this counts assertions,
+    /// not just changes).
+    pub pointed: usize,
+    /// Ledger entries retracted because their host is no longer attached.
+    pub retracted: usize,
+    /// Per-host failures (upsert / delete / ledger read-or-write). Each is
+    /// simply retried on the next tick — a failure here never aborts the pass
+    /// or the loop.
+    pub errors: usize,
+}
+
+/// The ledger's serializable mirror of a `DnsRecord` this reconcile pass just
+/// wrote. Always `A`/`AAAA`/`CNAME` — the only kinds [`domain_record`] emits.
+fn managed_record_from_dns(record: &DnsRecord) -> boatramp_core::dns_managed::ManagedRecord {
+    boatramp_core::dns_managed::ManagedRecord {
+        kind: record.kind.as_str().to_string(),
+        name: record.name.clone(),
+        value: record.kind.flat_value(),
+        ttl: record.ttl,
+    }
+}
+
+/// Rebuild the `DnsRecord` a stored [`boatramp_core::dns_managed::ManagedRecord`]
+/// describes, so a retract can call `provider.delete`. `None` for a kind this
+/// loop never writes (the ledger is reconcile-task-owned, so this is
+/// defensive, not expected in practice) — the caller drops such an entry
+/// rather than retrying forever on something no `delete` call could fix.
+fn dns_record_from_managed(rec: &boatramp_core::dns_managed::ManagedRecord) -> Option<DnsRecord> {
+    let kind = match rec.kind.as_str() {
+        "A" => RecordKind::A(rec.value.parse().ok()?),
+        "AAAA" => RecordKind::Aaaa(rec.value.parse().ok()?),
+        "CNAME" => RecordKind::Cname(rec.value.clone()),
+        _ => return None,
+    };
+    Some(DnsRecord {
+        kind,
+        name: rec.name.clone(),
+        ttl: rec.ttl,
+    })
+}
+
+/// One DNS reconcile pass: for every site, point its verified **custom**
+/// domains (`domain add`/`domain verify`-attached hosts — never the
+/// `*.deploy.<host>` preview wildcard, which `--tls acme-dns`/`dns setup`
+/// manage separately) at `target` via `provider` — `upsert` is contractually
+/// idempotent, so a repeat sweep converges rather than duplicating — and
+/// retract any ledger entry (`dnsmanaged/<site>/<host>`) whose host is no
+/// longer attached (`domain rm`, a deleted site). A per-host or per-provider
+/// failure is logged and skipped, never aborts the sweep: one bad zone or a
+/// transient provider outage self-heals on the next tick instead of stalling
+/// every other site.
+pub async fn reconcile_dns_once(
+    deploy: &boatramp_core::deploy::DeployStore,
+    provider: &dyn DnsProvider,
+    provider_name: &str,
+    target: &PreviewTarget,
+    ttl: u32,
+) -> std::result::Result<DnsReconcileReport, boatramp_core::error::DeployError> {
+    use boatramp_core::dns_managed::{ManagedDns, plan_reconcile};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::site::SiteName;
+
+    let mut report = DnsReconcileReport::default();
+    // The site candidate set is the UNION of two enumerations:
+    // - `all_sites_all` (not `list_sites_all`): a site is in scope once it has a
+    //   config/activation history, whether or not it has ever been deployed —
+    //   mirrors why `list_all_domain_verifications` fans out the same way (a
+    //   verified custom domain can exist before the site's first publish).
+    // - `list_all_managed_dns`: a site whose config was later wiped entirely via
+    //   `delete_site` drops out of `all_sites_all`, but `delete_site` never sweeps
+    //   the `dnsmanaged/` ledger — so its stray entries would otherwise become
+    //   permanently unreachable (never retracted, the record left live forever).
+    let mut sites: std::collections::BTreeSet<(String, String)> =
+        deploy.all_sites_all().await?.into_iter().collect();
+    for (project, site, _) in deploy.list_all_managed_dns().await? {
+        sites.insert((project, site));
+    }
+    for (project_str, site_str) in sites {
+        let project = ProjectRef::new(&project_str);
+        let site = SiteName::new(&site_str);
+
+        let verified: Vec<String> = match deploy.get_site_config(project, site.as_str()).await {
+            Ok(Some(cfg)) => cfg
+                .domains
+                .primary
+                .iter()
+                .cloned()
+                .chain(cfg.domains.aliases.iter().cloned())
+                .chain(cfg.domains.wildcards.iter().cloned())
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %err,
+                    "dns reconcile: site config read failed; skipping this tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+        };
+        let managed_entries = match deploy.list_managed_dns(project, &site).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %err,
+                    "dns reconcile: ledger read failed; skipping this tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+        };
+        let managed: Vec<String> = managed_entries.iter().map(|m| m.host.clone()).collect();
+        let plan = plan_reconcile(&verified, &managed);
+
+        for host in &plan.to_point {
+            let record = domain_record(host, target, ttl);
+            if let Err(err) = validate_writable(provider, &record, host) {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %host, %err,
+                    "dns reconcile: record refused by provider capability; will retry next tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+            if let Err(err) = provider.upsert(&record).await {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %host, %err,
+                    "dns reconcile: upsert failed; will retry next tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+            let ledger = ManagedDns::new(
+                host,
+                provider_name,
+                vec![managed_record_from_dns(&record)],
+                now_unix(),
+            );
+            if let Err(err) = deploy.set_managed_dns(project, &site, &ledger).await {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %host, %err,
+                    "dns reconcile: ledger write failed after upsert; will retry next tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+            report.pointed += 1;
+        }
+
+        for host in &plan.to_retract {
+            let Some(entry) = managed_entries.iter().find(|m| &m.host == host) else {
+                continue;
+            };
+            let mut all_deleted = true;
+            for rec in &entry.records {
+                let Some(dns_record) = dns_record_from_managed(rec) else {
+                    tracing::warn!(
+                        project = %project_str, site = %site_str, %host, kind = %rec.kind,
+                        "dns reconcile: stale ledger record has an unrecognized kind; dropping it"
+                    );
+                    continue;
+                };
+                if let Err(err) = provider.delete(&dns_record).await {
+                    tracing::warn!(
+                        project = %project_str, site = %site_str, %host, %err,
+                        "dns reconcile: retract failed; will retry next tick"
+                    );
+                    all_deleted = false;
+                    report.errors += 1;
+                }
+            }
+            if all_deleted {
+                if let Err(err) = deploy.remove_managed_dns(project, &site, host).await {
+                    tracing::warn!(
+                        project = %project_str, site = %site_str, %host, %err,
+                        "dns reconcile: ledger removal failed; will retry next tick"
+                    );
+                    report.errors += 1;
+                } else {
+                    report.retracted += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Spawn the leader-gated custom-domain DNS reconcile loop. Every `tick`,
+/// while `is_leader()`, runs one [`reconcile_dns_once`] pass over every site.
+/// Detached for the server's lifetime (mirrors the cert-renewal loops in
+/// `serve.rs`, which are spawned the same fire-and-forget way); a pass error
+/// is logged and retried next tick, never propagated into — or crashing —
+/// the serve loop.
+pub fn spawn_dns_reconcile(
+    deploy: boatramp_core::deploy::DeployStore,
+    provider: Arc<dyn DnsProvider>,
+    provider_name: String,
+    target: PreviewTarget,
+    ttl: u32,
+    is_leader: impl Fn() -> bool + Send + Sync + 'static,
+    tick: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick);
+        // `interval` fires immediately; skip that first tick so the sweep waits a
+        // full period before its first run (mirrors `spawn_domain_verify_reconcile`;
+        // the server is already up and serving by the time this first fires).
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !is_leader() {
+                continue;
+            }
+            match reconcile_dns_once(&deploy, provider.as_ref(), &provider_name, &target, ttl).await
+            {
+                Ok(report) if report.pointed + report.retracted + report.errors > 0 => {
+                    tracing::info!(
+                        pointed = report.pointed,
+                        retracted = report.retracted,
+                        errors = report.errors,
+                        "dns reconcile",
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "dns reconcile tick failed"),
+            }
+        }
     })
 }
 
@@ -841,5 +1090,386 @@ mod tests {
                 "LISTENER ON-DEMAND TLS COMPOSITE OK: own+cached served, unknown refused, no-SNI default"
             );
         }
+    }
+
+    // ---- custom-domain DNS reconcile (capability #24 Stage 6) -------------
+
+    /// A no-op blob `Storage` — `DeployStore`'s domain/ledger operations are
+    /// KV-only, so this is never touched; it only satisfies `DeployStore::new`'s
+    /// constructor (mirrors `on_demand_tls`'s test double of the same name).
+    struct NullStorage;
+    #[async_trait::async_trait]
+    impl boatramp_core::Storage for NullStorage {
+        async fn get(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::unsupported("null"))
+        }
+        async fn head(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> std::result::Result<(), boatramp_core::StorageError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn fresh_store() -> boatramp_core::deploy::DeployStore {
+        boatramp_core::deploy::DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        )
+    }
+
+    /// A `DnsProvider` whose `upsert` always fails — proves a provider error is
+    /// logged + counted, never panics or aborts the whole pass (the fail-safe
+    /// contract this reconcile loop must uphold).
+    struct FailingUpsertProvider;
+    #[async_trait::async_trait]
+    impl DnsProvider for FailingUpsertProvider {
+        async fn upsert(
+            &self,
+            _record: &DnsRecord,
+        ) -> std::result::Result<(), boatramp_acme::DnsError> {
+            Err(boatramp_acme::DnsError::Backend(
+                "simulated provider outage".to_string(),
+            ))
+        }
+        async fn delete(
+            &self,
+            _record: &DnsRecord,
+        ) -> std::result::Result<(), boatramp_acme::DnsError> {
+            Ok(())
+        }
+    }
+
+    /// The reconcile planner (`plan_reconcile`) existed with zero live callers
+    /// before this change (the roadmap triage's grep-confirmed gap). This test
+    /// exercises the wiring end to end: a verified custom domain gets pointed
+    /// via the provider AND recorded in the ledger, in one pass.
+    #[tokio::test]
+    async fn reconcile_dns_once_points_a_verified_domain_and_writes_the_ledger() {
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        store
+            .start_domain_verification(
+                project,
+                &site,
+                "shop.example.test",
+                VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+
+        let provider = ManualDnsProvider::new();
+        let target = PreviewTarget::Ipv4("203.0.113.9".parse().unwrap());
+        let report = reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pointed, 1, "the one verified domain is pointed");
+        assert_eq!(report.retracted, 0);
+        assert_eq!(report.errors, 0);
+
+        let recorded = provider.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, boatramp_acme::DnsOp::Upsert);
+        assert_eq!(recorded[0].1.name, "shop.example.test");
+
+        let ledger = store
+            .get_managed_dns(project, &site, "shop.example.test")
+            .await
+            .unwrap()
+            .expect("the ledger must record the host this pass just pointed");
+        assert_eq!(ledger.provider, "manual");
+        assert_eq!(ledger.records.len(), 1);
+        assert_eq!(ledger.records[0].kind, "A");
+        assert_eq!(ledger.records[0].value, "203.0.113.9");
+    }
+
+    /// `upsert` is contractually idempotent, so a repeat sweep must converge —
+    /// re-assert the SAME record, not grow the ledger or duplicate the write.
+    /// Anti-hollow: a reconcile that forgot to normalize/dedupe before writing
+    /// the ledger would instead accumulate entries here.
+    #[tokio::test]
+    async fn reconcile_dns_once_is_idempotent_on_repeat() {
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        store
+            .start_domain_verification(
+                project,
+                &site,
+                "shop.example.test",
+                VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+
+        let provider = ManualDnsProvider::new();
+        let target = PreviewTarget::Ipv4("203.0.113.9".parse().unwrap());
+
+        reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+        let second = reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.pointed, 1,
+            "a repeat sweep re-asserts the same verified host"
+        );
+        assert_eq!(
+            provider.recorded().len(),
+            2,
+            "two upserts total — both idempotent creates of the SAME record"
+        );
+        let entries = store.list_managed_dns(project, &site).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the ledger holds exactly one entry, not a duplicate, after a repeat sweep"
+        );
+    }
+
+    /// A ledger entry whose host is no longer attached (e.g. `domain rm` ran, or
+    /// the site's config lost the alias) must be retracted at the provider AND
+    /// dropped from the ledger — the self-heal half of `plan_reconcile`.
+    #[tokio::test]
+    async fn reconcile_dns_once_retracts_an_orphaned_ledger_entry() {
+        use boatramp_core::dns_managed::{ManagedDns, ManagedRecord};
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        // No site domain attached — this ledger entry is already orphaned.
+        let ledger = ManagedDns::new(
+            "old.example.test",
+            "manual",
+            vec![ManagedRecord {
+                kind: "A".to_string(),
+                name: "old.example.test".to_string(),
+                value: "203.0.113.9".to_string(),
+                ttl: 300,
+            }],
+            1,
+        );
+        store
+            .set_managed_dns(project, &site, &ledger)
+            .await
+            .unwrap();
+
+        let provider = ManualDnsProvider::new();
+        let target = PreviewTarget::Ipv4("203.0.113.9".parse().unwrap());
+        let report = reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+
+        assert_eq!(report.retracted, 1);
+        assert_eq!(report.pointed, 0);
+        assert_eq!(report.errors, 0);
+
+        let recorded = provider.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, boatramp_acme::DnsOp::Delete);
+
+        assert!(
+            store
+                .get_managed_dns(project, &site, "old.example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "the ledger entry is dropped once its record is retracted"
+        );
+    }
+
+    /// Fail-safe contract: a provider error on `upsert` is logged + counted,
+    /// never panics or aborts the whole pass, and leaves no ledger entry for
+    /// the failed host (so it is naturally retried on the next tick).
+    #[tokio::test]
+    async fn reconcile_dns_once_is_fail_safe_on_a_provider_error() {
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        store
+            .start_domain_verification(
+                project,
+                &site,
+                "shop.example.test",
+                VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+
+        let provider = FailingUpsertProvider;
+        let target = PreviewTarget::Ipv4("203.0.113.9".parse().unwrap());
+        let report = reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .expect("a provider error must not abort the whole pass — it is logged + counted");
+
+        assert_eq!(report.pointed, 0);
+        assert_eq!(report.errors, 1);
+        assert!(
+            store
+                .get_managed_dns(project, &site, "shop.example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "no ledger entry is written for a host whose upsert failed"
+        );
+    }
+
+    /// The leader-gated **trigger**: `spawn_dns_reconcile` must stay a no-op
+    /// tick after tick while `is_leader()` is false (no split-brain double-
+    /// writes in a cluster), then run the very next time it observes leadership
+    /// — proven end to end via the ledger, not by inspecting the loop's
+    /// internals. Uses the virtual clock (`start_paused`) so the gate is exact,
+    /// not a timing guess.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spawn_dns_reconcile_runs_only_while_leader() {
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        store
+            .start_domain_verification(
+                project,
+                &site,
+                "shop.example.test",
+                VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "shop.example.test")
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn DnsProvider> = Arc::new(ManualDnsProvider::new());
+        let is_leader_flag = Arc::new(AtomicBool::new(false));
+        let gate = {
+            let flag = is_leader_flag.clone();
+            move || flag.load(Ordering::SeqCst)
+        };
+        let tick = std::time::Duration::from_secs(60);
+        let handle = spawn_dns_reconcile(
+            store.clone(),
+            provider,
+            "manual".to_string(),
+            PreviewTarget::Ipv4("203.0.113.9".parse().unwrap()),
+            300,
+            gate,
+            tick,
+        );
+
+        tokio::task::yield_now().await;
+        // Several ticks pass while NOT leader — the gate must keep every pass a no-op.
+        for _ in 0..3 {
+            tokio::time::advance(tick).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store
+                .get_managed_dns(project, &site, "shop.example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "the reconcile loop must write nothing while `is_leader` is false"
+        );
+
+        // Become leader; the NEXT tick must run — and land — the pass.
+        is_leader_flag.store(true, Ordering::SeqCst);
+        tokio::time::advance(tick).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        handle.abort();
+        assert!(
+            store
+                .get_managed_dns(project, &site, "shop.example.test")
+                .await
+                .unwrap()
+                .is_some(),
+            "once leader, the next tick must point the verified domain"
+        );
     }
 }
