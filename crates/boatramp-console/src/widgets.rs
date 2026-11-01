@@ -1,6 +1,23 @@
 //! Small shared UI widgets (loading, error, empty states) reused across views.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use yew::prelude::*;
+
+/// A process-unique counter so each field instance can mint a collision-free
+/// `id` for its hint / description node (the target of `aria-describedby`).
+static NEXT_FIELD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a stable, instance-unique `id` (e.g. `"hint-7"`) for a widget's
+/// description node. Captured once per mount via [`use_state`], so it survives
+/// re-renders and never collides with another instance's — which keeps a hint's
+/// `aria-describedby` wiring sound even when the same field widget is rendered
+/// many times on a page.
+#[hook]
+fn use_field_id(prefix: &'static str) -> AttrValue {
+    let n = *use_state(|| NEXT_FIELD_ID.fetch_add(1, Ordering::Relaxed));
+    AttrValue::from(format!("{prefix}-{n}"))
+}
 
 /// A centered loading indicator with a label.
 #[derive(Properties, PartialEq)]
@@ -134,21 +151,27 @@ pub fn text_field(props: &TextFieldProps) -> Html {
         .input_type
         .clone()
         .unwrap_or_else(|| AttrValue::from("text"));
+    // The hint lives OUTSIDE the `<label>` (so it isn't folded into the field's
+    // accessible name) and is linked by `aria-describedby` instead.
+    let hint_id = use_field_id("hint");
+    let describedby = props.hint.as_ref().map(|_| hint_id.clone());
     html! {
-        <label class="block">
-            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <input type={input_type} value={props.value.clone()} placeholder={props.placeholder.clone()}
-                   oninput={on_input}
-                   class={classes!(
-                       "mt-1", "w-full", "rounded-md", "border", "border-slate-300",
-                       "px-2.5", "py-1.5", "text-sm", "shadow-sm",
-                       "focus:border-sky-500", "focus:outline-none", "focus:ring-2",
-                       "focus:ring-sky-600", font
-                   )} />
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <input type={input_type} value={props.value.clone()} placeholder={props.placeholder.clone()}
+                       oninput={on_input} aria-describedby={describedby}
+                       class={classes!(
+                           "mt-1", "w-full", "rounded-md", "border", "border-slate-300",
+                           "px-2.5", "py-1.5", "text-sm", "shadow-sm",
+                           "focus:border-sky-500", "focus:outline-none", "focus:ring-2",
+                           "focus:ring-sky-600", font
+                       )} />
+            </label>
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
-        </label>
+        </div>
     }
 }
 
@@ -200,21 +223,26 @@ pub fn number_field(props: &NumberFieldProps) -> Html {
         })
     };
     let value = props.value.map(|n| n.to_string()).unwrap_or_default();
+    // Hint outside the `<label>`, linked by `aria-describedby` (see [`TextField`]).
+    let hint_id = use_field_id("hint");
+    let describedby = props.hint.as_ref().map(|_| hint_id.clone());
     html! {
-        <label class="block">
-            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <input type="number" inputmode="numeric" value={value}
-                   placeholder={props.placeholder.clone()}
-                   min={props.min.map(|n| n.to_string())}
-                   max={props.max.map(|n| n.to_string())}
-                   oninput={on_input}
-                   class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
-                          shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 \
-                          focus:ring-sky-600" />
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <input type="number" inputmode="numeric" value={value}
+                       placeholder={props.placeholder.clone()}
+                       min={props.min.map(|n| n.to_string())}
+                       max={props.max.map(|n| n.to_string())}
+                       oninput={on_input} aria-describedby={describedby}
+                       class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
+                              shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 \
+                              focus:ring-sky-600" />
+            </label>
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
-        </label>
+        </div>
     }
 }
 
@@ -309,19 +337,31 @@ pub fn textarea_field(props: &TextAreaFieldProps) -> Html {
         let on_change = props.on_change.clone();
         Callback::from(move |e: InputEvent| on_change.emit(input_value(&e)))
     };
+    // Hint outside the `<label>` (kept out of the accessible name) and pointed at
+    // by `aria-describedby` — alongside any error node, so assistive tech reads
+    // both the guidance and (when invalid) the reason.
+    let hint_id = use_field_id("hint");
+    let describedby = match (&props.describedby, props.hint.is_some()) {
+        (Some(err), true) => Some(AttrValue::from(format!("{err} {hint_id}"))),
+        (Some(err), false) => Some(err.clone()),
+        (None, true) => Some(hint_id.clone()),
+        (None, false) => None,
+    };
     html! {
-        <label class="block">
-            <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
-            <textarea value={props.value.clone()} rows={props.rows.to_string()} oninput={on_input}
-                      aria-invalid={props.invalid.to_string()}
-                      aria-describedby={props.describedby.clone()}
-                      class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
-                             font-mono shadow-sm focus:border-sky-500 focus:outline-none \
-                             focus:ring-2 focus:ring-sky-600" />
+        <div>
+            <label class="block">
+                <span class="block text-sm font-medium text-slate-700">{ &props.label }</span>
+                <textarea value={props.value.clone()} rows={props.rows.to_string()} oninput={on_input}
+                          aria-invalid={props.invalid.to_string()}
+                          aria-describedby={describedby}
+                          class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm \
+                                 font-mono shadow-sm focus:border-sky-500 focus:outline-none \
+                                 focus:ring-2 focus:ring-sky-600" />
+            </label>
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
+                <span id={hint_id} class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
-        </label>
+        </div>
     }
 }
 
@@ -337,6 +377,11 @@ pub struct CheckFieldProps {
     /// Disable the control (dimmed, not toggle-able) — e.g. a mutually-excluded option.
     #[prop_or_default]
     pub disabled: bool,
+    /// The `id` of an element describing this control, wired to `aria-describedby`
+    /// so assistive tech reads the explanation together with the label (e.g. a
+    /// note on why a toggle is forced on).
+    #[prop_or_default]
+    pub describedby: Option<AttrValue>,
 }
 
 #[function_component(CheckField)]
@@ -361,7 +406,7 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
     html! {
         <label class={row}>
             <input type="checkbox" checked={props.checked} disabled={props.disabled}
-                   onchange={on_change}
+                   onchange={on_change} aria-describedby={props.describedby.clone()}
                    class="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-sky-600 focus:ring-2 focus:ring-sky-600" />
             <span class="text-sm text-slate-700">{ &props.label }</span>
         </label>
@@ -422,6 +467,11 @@ pub struct ButtonProps {
     /// Disable regardless of `busy` (e.g. nothing to save).
     #[prop_or_default]
     pub disabled: bool,
+    /// An explicit accessible name, for when the visible `label` is too terse to
+    /// identify the target on its own (e.g. a per-row "Remove" button names the
+    /// item it removes). Falls through to `label` when unset.
+    #[prop_or_default]
+    pub aria_label: Option<AttrValue>,
     /// Click handler.
     #[prop_or_default]
     pub onclick: Callback<MouseEvent>,
@@ -445,6 +495,7 @@ pub fn button(props: &ButtonProps) -> Html {
     html! {
         <button type="button" ref={props.node_ref.clone()} onclick={props.onclick.clone()}
                 disabled={props.busy || props.disabled}
+                aria-label={props.aria_label.clone()}
                 class={classes!(
                     "rounded-md", "px-3", "py-1.5", "text-sm", "font-medium",
                     "focus-visible:outline-none", "focus-visible:ring-2",

@@ -120,7 +120,7 @@ fn render_summary(s: &SupergraphSummary) -> Html {
                         { format!("Entities ({})", s.entities.len()) }
                     </h4>
                     <div class="overflow-x-auto">
-                        <table class="min-w-full text-left text-sm">
+                        <table class="min-w-full text-left text-sm" aria-label="Federated entities">
                             <thead>
                                 <tr class="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
                                     <th scope="col" class="py-1.5 pr-4 font-medium">{ "Type" }</th>
@@ -131,7 +131,7 @@ fn render_summary(s: &SupergraphSummary) -> Html {
                             <tbody class="divide-y divide-slate-100">
                                 { for s.entities.iter().map(|(ty, e)| html! {
                                     <tr>
-                                        <td class="py-1.5 pr-4 font-mono text-slate-800">{ ty }</td>
+                                        <th scope="row" class="py-1.5 pr-4 font-mono font-normal text-slate-800">{ ty }</th>
                                         <td class="py-1.5 pr-4 font-mono text-slate-600">{ &e.key }</td>
                                         <td class="py-1.5 text-slate-600">{ e.subgraphs.join(", ") }</td>
                                     </tr>
@@ -256,7 +256,11 @@ fn safelist_manager() -> Html {
                         </p>
                     } else {
                         <ul class="divide-y divide-slate-100">
-                            { for ops.iter().map(|op| render_op_row(op, &session, &list.reload, &status, &read_only)) }
+                            { for ops.iter().map(|op| html! {
+                                <SafelistRow key={op.hash.clone()} op={op.clone()}
+                                             session={session.clone()} reload={list.reload.clone()}
+                                             status={status.clone()} read_only={read_only.clone()} />
+                            }) }
                         </ul>
                     }
                     { register_form(&draft, on_draft.clone(), register.clone(), &status, *read_only) }
@@ -284,28 +288,48 @@ fn safelist_manager() -> Html {
 }
 
 /// One safelist row: the operation text + its hash, with a Remove button that
-/// degrades on `403` exactly like the register form.
-fn render_op_row(
-    op: &SafelistOp,
-    session: &crate::auth::Session,
-    reload: &Callback<()>,
-    status: &UseStateHandle<Option<(bool, String)>>,
-    read_only: &UseStateHandle<bool>,
-) -> Html {
-    let hash = op.hash.clone();
+/// confirms first (a removal silently stops a safelisted operation running where
+/// enforcement is active), degrades on `403` exactly like the register form, and
+/// surfaces any other failure inline on the row rather than only at the bottom.
+#[derive(Properties, PartialEq)]
+struct SafelistRowProps {
+    op: SafelistOp,
+    session: crate::auth::Session,
+    reload: Callback<()>,
+    status: UseStateHandle<Option<(bool, String)>>,
+    read_only: UseStateHandle<bool>,
+}
+
+#[function_component(SafelistRow)]
+fn safelist_row(props: &SafelistRowProps) -> Html {
+    // A per-row error (distinct from the shared register/forbidden status), so a
+    // single row's Remove failure reads next to the row it happened on.
+    let row_error = use_state(|| Option::<String>::None);
+    let hash = props.op.hash.clone();
+    let short = short_hash(&props.op.hash);
+
     let remove = {
-        let session = session.clone();
-        let reload = reload.clone();
-        let status = status.clone();
-        let read_only = read_only.clone();
+        let session = props.session.clone();
+        let reload = props.reload.clone();
+        let status = props.status.clone();
+        let read_only = props.read_only.clone();
+        let row_error = row_error.clone();
         let hash = hash.clone();
         Callback::from(move |_: MouseEvent| {
-            let client = session.client();
+            if !gloo_dialogs::confirm(
+                "Remove this operation from the safelist? Where safelist enforcement is active for a \
+                 site, this operation will immediately stop running in production.",
+            ) {
+                return;
+            }
             let session = session.clone();
+            let client = session.client();
             let reload = reload.clone();
             let status = status.clone();
             let read_only = read_only.clone();
+            let row_error = row_error.clone();
             let hash = hash.clone();
+            row_error.set(None);
             spawn_local(async move {
                 match client
                     .delete(&format!("/api/graphql/safelist/{hash}"))
@@ -321,7 +345,8 @@ fn render_op_row(
                                 .to_string(),
                         )));
                     }
-                    Err(err) => status.set(Some((true, err.to_string()))),
+                    // Anything else is specific to this row — show it inline.
+                    Err(err) => row_error.set(Some(err.to_string())),
                 }
             });
         })
@@ -331,12 +356,17 @@ fn render_op_row(
         <li class="py-2">
             <div class="flex items-start justify-between gap-3">
                 <pre class="max-h-40 flex-1 overflow-auto rounded bg-slate-50 p-2 text-xs \
-                            leading-relaxed text-slate-700">{ &op.query }</pre>
-                if !**read_only {
-                    <Button variant={BtnVariant::DangerSubtle} label="Remove" onclick={remove} />
+                            leading-relaxed text-slate-700">{ &props.op.query }</pre>
+                if !*props.read_only {
+                    <Button variant={BtnVariant::DangerSubtle} label="Remove"
+                            aria_label={AttrValue::from(format!("Remove operation {short}"))}
+                            onclick={remove} />
                 }
             </div>
-            <p class="mt-1 font-mono text-[11px] text-slate-400">{ short_hash(&op.hash) }</p>
+            <p class="mt-1 font-mono text-[11px] text-slate-500">{ short }</p>
+            if let Some(msg) = &*row_error {
+                <p role="alert" class="mt-1 text-xs text-rose-700">{ msg }</p>
+            }
         </li>
     }
 }
@@ -350,6 +380,26 @@ fn register_form(
     status: &UseStateHandle<Option<(bool, String)>>,
     read_only: bool,
 ) -> Html {
+    // Persistent live regions: the nodes are always in the DOM (empty when idle) so a
+    // screen reader announces the text that lands in them, rather than the region
+    // appearing already-populated (which SRs miss). Errors go to an assertive `alert`;
+    // progress/success to a polite `status`. The text is split out here because `html!`
+    // can't host a statement block as a node.
+    let (err_msg, status_msg) = match &**status {
+        Some((true, m)) => (m.clone(), String::new()),
+        Some((false, m)) => (String::new(), m.clone()),
+        None => (String::new(), String::new()),
+    };
+    let err_class = if err_msg.is_empty() {
+        "text-sm text-rose-700"
+    } else {
+        "mt-2 text-sm text-rose-700"
+    };
+    let status_class = if status_msg.is_empty() {
+        "text-sm text-slate-500"
+    } else {
+        "mt-2 text-sm text-slate-500"
+    };
     html! {
         <div class="border-t border-slate-100 pt-4">
             if read_only {
@@ -367,12 +417,8 @@ fn register_form(
                     </div>
                 </>
             }
-            if let Some((is_error, msg)) = &**status {
-                <p role="status" aria-live="polite"
-                   class={if *is_error { "mt-2 text-sm text-rose-700" } else { "mt-2 text-sm text-slate-500" }}>
-                    { msg }
-                </p>
-            }
+            <p role="alert" aria-live="assertive" class={err_class}>{ err_msg }</p>
+            <p role="status" aria-live="polite" class={status_class}>{ status_msg }</p>
         </div>
     }
 }

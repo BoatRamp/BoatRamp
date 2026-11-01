@@ -269,13 +269,30 @@ fn nav_item(props: &NavItemProps) -> Html {
     let active = use_route::<Route>()
         .as_ref()
         .is_some_and(|r| nav_group(r) == nav_group(&props.to));
+    // yew-router's `Link` forwards no ARIA attributes, so mark the active route for
+    // assistive tech by setting `aria-current="page"` on the rendered anchor itself
+    // (the highlight is otherwise colour-only).
+    let anchor_ref = use_node_ref();
+    {
+        let anchor_ref = anchor_ref.clone();
+        use_effect_with(active, move |active| {
+            if let Some(el) = anchor_ref.cast::<web_sys::Element>() {
+                if *active {
+                    let _ = el.set_attribute("aria-current", "page");
+                } else {
+                    let _ = el.remove_attribute("aria-current");
+                }
+            }
+            || ()
+        });
+    }
     let class = if active {
         "rounded-md bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-900"
     } else {
         "rounded-md px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
     };
     html! {
-        <Link<Route> to={props.to.clone()} classes={classes!(class)}>
+        <Link<Route> to={props.to.clone()} classes={classes!(class)} anchor_ref={anchor_ref}>
             { props.label.clone() }
         </Link<Route>>
     }

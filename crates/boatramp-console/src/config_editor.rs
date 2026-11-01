@@ -23,7 +23,7 @@ use crate::auth::use_session;
 use crate::hooks::{Fetch, use_api};
 use crate::verify::DomainVerifications;
 use crate::widgets::{
-    BtnVariant, Button, CheckField, ErrorBanner, NumberField, Pill, Section, Spinner,
+    BtnVariant, Button, CheckField, ErrorBanner, INPUT, NumberField, Pill, Section, Spinner,
     TextAreaField, TextField, Tone, TriStateField,
 };
 
@@ -129,8 +129,14 @@ fn config_form(props: &ConfigFormProps) -> Html {
             <DomainsPanel config={config.clone()} />
             <SecurityPanel config={config.clone()} />
             <AccessPanel config={config.clone()} />
+            // Cookie-session auth is a visitor-auth concern, not a wasm-handler one —
+            // its own section, next to Access control.
+            <CookieAuthPanel config={config.clone()} />
             <WafPanel config={config.clone()} />
             <HandlersPanel config={config.clone()} />
+            // The GraphQL edge is the largest per-site subtree and a primary serving
+            // posture — its own top-level section, not buried under Handlers.
+            <GraphqlPanel config={config.clone()} />
             <CompressionPanel config={config.clone()} />
             <DomainVerifications site={site.clone()} />
 
@@ -181,17 +187,26 @@ enum SaveStatus {
 
 /// The save-bar indicator. A pending edit (`dirty`) shows an amber "unsaved
 /// changes" pill, which takes precedence over a stale "saved" so the operator is
-/// never misled into thinking new edits are persisted.
+/// never misled into thinking new edits are persisted. A failure renders its
+/// reason as VISIBLE text inside an assertive `alert`; progress/state live in a
+/// persistent polite `status` region so changes are announced, never buried in a
+/// hover-only `title`.
 fn save_bar_status(status: &SaveStatus, dirty: bool) -> Html {
-    match status {
+    if let SaveStatus::Error(msg) = status {
+        return html! {
+            <span role="alert" class="text-sm font-medium text-rose-700">
+                { format!("Save failed: {msg}") }
+            </span>
+        };
+    }
+    let inner = match status {
         SaveStatus::Saving => html! { <span class="text-sm text-slate-500">{ "Saving…" }</span> },
-        SaveStatus::Error(msg) => html! {
-            <span class="text-sm text-rose-700" title={msg.clone()}>{ "Save failed" }</span>
-        },
         _ if dirty => html! { <Pill text="unsaved changes" tone={Tone::Warn} /> },
         SaveStatus::Saved => html! { <Pill text="saved" tone={Tone::Good} /> },
-        SaveStatus::Idle => Html::default(),
-    }
+        _ => Html::default(),
+    };
+    // Always-present polite region (empty when idle), so its text changes announce.
+    html! { <span role="status" aria-live="polite">{ inner }</span> }
 }
 
 // ---- Lines <-> Vec<String> helpers -----------------------------------------
@@ -809,15 +824,6 @@ fn handlers_panel(props: &PanelProps) -> Html {
                     { "A deployment that ships handlers is refused at activation until this is on." }
                 </p>
             }
-            // GraphQL edge posture and cookie-session auth are plain `Option` fields of
-            // `HandlersSiteConfig`, so they nest here under Handlers (and round-trip verbatim
-            // through the same PUT, independent of the `enabled` wasm-handler switch above).
-            <div class="border-t border-slate-100 pt-4">
-                <GraphqlPanel config={props.config.clone()} />
-            </div>
-            <div class="border-t border-slate-100 pt-4">
-                <CookieAuthPanel config={props.config.clone()} />
-            </div>
         </Section>
     }
 }
@@ -846,9 +852,10 @@ fn graphql_import_allowed(cfg: &SiteConfig) -> bool {
 }
 
 /// The per-site GraphQL edge query-guard + federation + data-connector posture
-/// (`handlers.graphql`). Presence (the `Option`) is one toggle; the inner
-/// `enabled` (guard active vs. configured-but-paused) is a second — the plan's
-/// two-toggle nuance. The dangerous production toggles (introspection ON,
+/// (`handlers.graphql`), its own top-level section. Presence (the `Option`) is
+/// one toggle; the inner `enabled` is the master edge switch that actually serves
+/// GraphQL at the route — the plan's two-toggle nuance, spelled out under the
+/// presence checkbox. The dangerous production toggles (introspection ON,
 /// GraphiQL ON) carry an inline warning and a modal confirm.
 #[function_component(GraphqlPanel)]
 fn graphql_panel(props: &PanelProps) -> Html {
@@ -872,36 +879,56 @@ fn graphql_panel(props: &PanelProps) -> Html {
     };
 
     html! {
-        <div>
+        <Section title="GraphQL edge"
+                 description="Serve GraphQL at this site: the query-guard, the federation gateway, and the SQL data connector.">
             <CheckField label="Configure the GraphQL edge (query-guard / federation / data connector)"
                         checked={present.is_some()} on_change={on_present} />
+            <p class="text-xs text-slate-500">
+                { "Serving is gated by two switches: this one configures the edge, and the \
+                   \u{201c}GraphQL edge enabled\u{201d} switch below actually serves it. Both \
+                   unchecked-here (absent) and \u{201c}configured but off\u{201d} serve nothing \
+                   \u{2014} \u{201c}configured but off\u{201d} keeps the settings saved without serving." }
+            </p>
             if let Some(g) = present {
                 <div class="ml-6 mt-3 space-y-4 border-l border-slate-100 pl-4">
                     if !import_ok {
                         <p class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
                             { "Note: " }
                             <code class="rounded bg-amber-100 px-1 py-0.5">{ "graphql" }</code>
-                            { " is not in this site's allowed imports above, so a guest handler \
-                               cannot call graphql::run. The edge guard, federation, and data \
+                            { " is not in this site's allowed imports (Handlers section), so a guest \
+                               handler cannot call graphql::run. The edge guard, federation, and data \
                                connector below still apply at the edge." }
                         </p>
                     }
                     <GraphqlGuard config={props.config.clone()} g={g.clone()} />
-                    <details class="rounded-md border border-slate-200 bg-slate-50 p-3">
-                        <summary class="cursor-pointer text-sm font-medium text-slate-700">
-                            { "Advanced: persisted queries, federation, GraphiQL, data connector" }
-                        </summary>
-                        <div class="mt-3 space-y-4">
-                            <GraphqlPersisted config={props.config.clone()} g={g.clone()} />
-                            <GraphqlFederation config={props.config.clone()} g={g.clone()} />
-                            <GraphqlGraphiql config={props.config.clone()} g={g.clone()} />
-                            <GraphqlEndpoint config={props.config.clone()} g={g.clone()} />
-                            <DataConnectorPanel config={props.config.clone()} />
-                        </div>
-                    </details>
+                    // Everything below is served ONLY while the edge is enabled; when it's off,
+                    // dim + annotate so "Connector active" / "Federation gateway" / "GraphiQL is
+                    // served" don't read as live. The controls stay editable (settings are saved).
+                    <div class={if g.enabled { "space-y-4" } else { "space-y-4 opacity-60" }}>
+                        if !g.enabled {
+                            <p class="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-600">
+                                { "The edge is off \u{2014} these settings are saved but inactive \
+                                   until the edge is enabled above." }
+                            </p>
+                        }
+                        // The data connector is a primary serving MODE, not fine-tuning —
+                        // surfaced directly, not inside the Advanced disclosure.
+                        <DataConnectorPanel config={props.config.clone()} />
+                        <details class="rounded-md border border-slate-200 bg-slate-50 p-3">
+                            <summary class="cursor-pointer text-sm font-medium text-slate-700">
+                                { "Advanced: persisted queries, federation, GraphiQL, endpoint path" }
+                            </summary>
+                            <div class="mt-3 space-y-4">
+                                <GraphqlPersisted config={props.config.clone()} g={g.clone()} />
+                                <GraphqlFederation config={props.config.clone()} g={g.clone()} />
+                                <GraphqlGraphiql config={props.config.clone()} g={g.clone()} />
+                                <GraphqlEndpoint config={props.config.clone()} g={g.clone()} />
+                            </div>
+                        </details>
+                    </div>
                 </div>
             }
-        </div>
+        </Section>
     }
 }
 
@@ -957,6 +984,11 @@ fn graphql_guard(props: &GraphqlProps) -> Html {
                      off unless this endpoint is meant to be publicly explorable.",
                 )
             {
+                // The native radio already flipped to the new choice; force a re-render so it
+                // reconciles back to the (unchanged) committed value instead of showing a state
+                // the config doesn't hold. `use_state` always re-renders, and Yew re-applies the
+                // radio's `checked` on every render — so a no-op config write reverts the control.
+                update(&|_: &mut SiteConfig| {});
                 return;
             }
             with_graphql(&update, move |g| g.introspection = v);
@@ -966,7 +998,11 @@ fn graphql_guard(props: &GraphqlProps) -> Html {
     html! {
         <div class="space-y-3">
             <CheckField
-                label={if g.enabled { "Guard active" } else { "Guard configured but paused (not enforced)" }}
+                label={if g.enabled {
+                    "GraphQL edge enabled (serve GraphQL at this route)"
+                } else {
+                    "Configured but OFF — nothing is served at this route until enabled"
+                }}
                 checked={g.enabled} on_change={on_active} />
             <div class="grid gap-3 sm:grid-cols-2">
                 <NumberField label="Max query depth" value={g.max_depth.map(u64::from)}
@@ -1009,20 +1045,30 @@ fn graphql_persisted(props: &GraphqlProps) -> Html {
         Callback::from(move |v: bool| with_graphql(&update, move |g| set_enforce_safelist(g, v)))
     };
 
+    // The APQ explanation is a persistent node tied to the APQ control by
+    // `aria-describedby`, and a persistent polite live region announces the
+    // implication when enforcement forces APQ on (otherwise the auto-check is silent).
+    let apq_desc_id = "graphql-apq-desc";
+    let implication = if g.enforce_safelist {
+        "Safelist enforcement just turned Automatic persisted queries on; it stays on and locked while enforcement is active."
+    } else {
+        ""
+    };
     html! {
         <div class="space-y-2">
-            <p class="text-sm font-medium text-slate-600">{ "Persisted queries" }</p>
+            <h4 class="text-sm font-medium text-slate-600">{ "Persisted queries" }</h4>
             <CheckField label="Enforce the safelist (only pre-registered operations run)"
                         checked={g.enforce_safelist} on_change={on_safelist} />
             <CheckField label="Automatic persisted queries (clients may send a query hash)"
                         checked={g.persisted_queries} disabled={g.enforce_safelist}
+                        describedby={Some(AttrValue::from(apq_desc_id))}
                         on_change={on_persisted} />
-            if g.enforce_safelist {
-                <p class="text-xs text-slate-500">
-                    { "Safelist enforcement implies — and is stronger than — persisted queries. \
-                       Register operations under the GraphQL section." }
-                </p>
-            }
+            <p id={apq_desc_id} class="text-xs text-slate-500">
+                { "A safelist is a persisted-query allowlist, so enforcing it also enables APQ and \
+                   locks it on. Disabling enforcement leaves APQ on (they are independent) — uncheck \
+                   it here to turn it off. Register operations under the GraphQL section." }
+            </p>
+            <p role="status" aria-live="polite" class="text-xs text-slate-500">{ implication }</p>
         </div>
     }
 }
@@ -1105,6 +1151,9 @@ fn graphql_graphiql(props: &GraphqlProps) -> Html {
                 "Serve the GraphiQL explorer on this site? It is a browser IDE for the API — a \
                  developer convenience that should normally stay off in production.",
             ) {
+                // The native checkbox already flipped on; force a re-render so Yew re-applies the
+                // committed `checked` and the box visibly reverts (see on_introspection).
+                update(&|_: &mut SiteConfig| {});
                 return;
             }
             with_graphql(&update, move |g| g.graphiql = v);
@@ -1276,20 +1325,20 @@ fn data_tables(props: &PanelProps) -> Html {
 
     html! {
         <div>
-            <p class="mb-2 text-sm font-medium text-slate-600">{ "Exposed tables" }</p>
+            <h4 class="mb-2 text-sm font-medium text-slate-600">{ "Exposed tables" }</h4>
             if tables.is_empty() {
                 <p class="text-sm text-slate-500">{ "None — add a table to expose it." }</p>
             } else {
                 <div class="space-y-3">
                     { for tables.iter().map(|name| html! {
-                        <DataTableRow key={name.clone()} config={props.config.clone()} table={name.clone()} />
+                        <DataTableRow key={name.clone()} config={props.config.clone()} table={name.clone()}
+                                      focus_after_remove={table_ref.clone()} />
                     }) }
                 </div>
             }
             <form onsubmit={add} class="mt-2 flex flex-wrap items-end gap-2">
-                <input ref={table_ref} placeholder="table name"
-                       class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
-                              focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-600" />
+                <input ref={table_ref} aria-label="New table name"
+                       placeholder="table name" class={classes!("flex-1", INPUT)} />
                 <button type="submit"
                         class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
                                text-slate-700 hover:bg-slate-50 focus-visible:outline-none \
@@ -1306,6 +1355,9 @@ fn data_tables(props: &PanelProps) -> Html {
 struct DataTableRowProps {
     config: UseStateHandle<SiteConfig>,
     table: String,
+    /// The add-table input (owned by the parent list), focused after this row is
+    /// removed so keyboard focus lands on a sensible neighbour, not nowhere.
+    focus_after_remove: NodeRef,
 }
 
 /// Mutate one table's config in place (no-op if the table or connector was cleared since).
@@ -1355,11 +1407,17 @@ fn data_table_row(props: &DataTableRowProps) -> Html {
     let remove_table = {
         let update = update.clone();
         let table = table.clone();
+        let focus_ref = props.focus_after_remove.clone();
         Callback::from(move |_: MouseEvent| {
             let table = table.clone();
             with_data(&update, move |d| {
                 d.tables.remove(&table);
             });
+            // This row is about to unmount — move focus to the add-table input so it
+            // doesn't fall back to the document body.
+            if let Some(el) = focus_ref.cast::<HtmlInputElement>() {
+                let _ = el.focus();
+            }
         })
     };
     let add_filter = {
@@ -1400,14 +1458,16 @@ fn data_table_row(props: &DataTableRowProps) -> Html {
         <div class="rounded-md border border-slate-200 bg-white p-3">
             <div class="mb-2 flex items-center justify-between">
                 <span class="font-mono text-sm font-medium text-slate-800">{ &props.table }</span>
-                <Button variant={BtnVariant::DangerSubtle} label="Remove table" onclick={remove_table} />
+                <Button variant={BtnVariant::DangerSubtle} label="Remove table"
+                        aria_label={AttrValue::from(format!("Remove table {}", props.table))}
+                        onclick={remove_table} />
             </div>
             <TextAreaField label="Readable columns (one per line; deny-by-default)"
                 value={lines_join(&cfg.columns)} rows={3}
                 hint="Only these columns are visible. A column absent here is invisible to the API."
                 on_change={on_columns} />
             <div class="mt-3">
-                <p class="mb-1 text-sm font-medium text-slate-600">{ "Row filters (tenant isolation)" }</p>
+                <h4 class="mb-1 text-sm font-medium text-slate-600">{ "Row filters (tenant isolation)" }</h4>
                 if cfg.row_filter.is_empty() {
                     <p class="text-xs text-slate-500">{ "No row filters — every row is visible (subject to the host project scope)." }</p>
                 } else {
@@ -1416,19 +1476,28 @@ fn data_table_row(props: &DataTableRowProps) -> Html {
                             let remove = {
                                 let update = update.clone();
                                 let table = table.clone();
+                                let col_ref = col_ref.clone();
                                 Callback::from(move |_: MouseEvent| {
                                     let table = table.clone();
                                     with_table(&update, table, move |t| {
                                         if i < t.row_filter.len() { t.row_filter.remove(i); }
                                     });
+                                    // The removed row's button unmounts — move focus to the
+                                    // add-filter column input (a sensible, persistent neighbour).
+                                    if let Some(el) = col_ref.cast::<HtmlInputElement>() {
+                                        let _ = el.focus();
+                                    }
                                 })
                             };
+                            let aria = AttrValue::from(format!(
+                                "Remove row filter {} = claim({})", term.column, term.claim
+                            ));
                             html! {
                                 <li class="flex items-center justify-between py-1.5 text-sm">
                                     <span class="font-mono text-slate-700">
                                         { format!("{} = claim({})", term.column, term.claim) }
                                     </span>
-                                    <button onclick={remove}
+                                    <button onclick={remove} aria-label={aria}
                                             class="text-xs font-medium text-rose-700 hover:underline \
                                                    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-600">
                                         { "Remove" }
@@ -1439,12 +1508,10 @@ fn data_table_row(props: &DataTableRowProps) -> Html {
                     </ul>
                 }
                 <form onsubmit={add_filter} class="mt-2 flex flex-wrap items-end gap-2">
-                    <input ref={col_ref} placeholder="column"
-                           class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
-                                  focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-600" />
-                    <input ref={claim_ref} placeholder="claim (e.g. project, tid)"
-                           class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
-                                  focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-600" />
+                    <input ref={col_ref} aria-label="Filter column" placeholder="column"
+                           class={classes!("flex-1", INPUT)} />
+                    <input ref={claim_ref} aria-label="Token claim" placeholder="claim (e.g. project, tid)"
+                           class={classes!("flex-1", INPUT)} />
                     <button type="submit"
                             class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
                                    text-slate-700 hover:bg-slate-50 focus-visible:outline-none \
@@ -1492,18 +1559,30 @@ fn claims_hatch(props: &PanelProps) -> Html {
             let text = draft.trim().to_string();
             if text.is_empty() {
                 with_data(&update, move |d| d.claims_from_token = None);
+                // Normalise the draft so the "unapplied edits" signal clears.
+                draft.set(String::new());
                 error.set(None);
                 return;
             }
             match serde_json::from_str::<boatramp_types::config::HandlerGraphqlTokenClaims>(&text) {
                 Ok(parsed) => {
+                    // Re-seed the draft with the canonical pretty form that was just committed, so
+                    // draft == committed and the pending signal clears (a later edit re-raises it).
+                    let pretty =
+                        serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| text.clone());
                     with_data(&update, move |d| d.claims_from_token = Some(parsed.clone()));
+                    draft.set(pretty);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(format!("Invalid JSON: {e}"))),
             }
         })
     };
+
+    // Draft edits only reach the config on Apply, but global dirty tracking compares
+    // config vs. baseline — so an unapplied draft shows no unsaved signal and a global
+    // Save would persist WITHOUT it. Surface that gap explicitly.
+    let pending = (*draft).trim() != seed.trim();
 
     html! {
         <div>
@@ -1516,8 +1595,14 @@ fn claims_hatch(props: &PanelProps) -> Html {
             if let Some(msg) = &*error {
                 <p id={err_id} role="alert" class="mt-1 text-xs text-rose-700">{ msg }</p>
             }
-            <div class="mt-2">
-                <Button variant={BtnVariant::Secondary} label="Apply claims" onclick={apply} />
+            <div class="mt-2 flex flex-wrap items-center gap-3">
+                <Button variant={if pending { BtnVariant::Primary } else { BtnVariant::Secondary }}
+                        label="Apply claims" onclick={apply} />
+                if pending && error.is_none() {
+                    <span role="status" aria-live="polite" class="text-xs font-medium text-amber-700">
+                        { "Unapplied edits — click Apply (a global Save won't include them)." }
+                    </span>
+                }
             </div>
         </div>
     }
@@ -1571,8 +1656,9 @@ fn cookie_auth_panel(props: &PanelProps) -> Html {
     };
 
     html! {
-        <div>
-            <CheckField label="Browser cookie session auth" checked={ca.is_some()}
+        <Section title="Cookie session auth"
+                 description="Let a browser session cookie stand in as the app bearer when a request carries no Authorization header.">
+            <CheckField label="Enable browser cookie session auth" checked={ca.is_some()}
                         on_change={on_present} />
             if let Some(ca) = ca {
                 <div class="ml-6 mt-3 space-y-3 border-l border-slate-100 pl-4">
@@ -1586,7 +1672,7 @@ fn cookie_auth_panel(props: &PanelProps) -> Html {
                         on_change={on_origins} />
                 </div>
             }
-        </div>
+        </Section>
     }
 }
 
