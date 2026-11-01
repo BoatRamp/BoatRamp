@@ -510,6 +510,11 @@ sha2.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+# `start_paused`/the virtual clock, so the WS5 drain-grace tests
+# (PLAN-managed-dependency-readiness) exercise the real bounded `tokio::time::sleep` without
+# costing real wall-clock time in the suite. Dev-only — the shipped binary's `tokio` dep
+# (above) stays unchanged.
+tokio = { workspace = true, features = ["test-util"] }
 # A hyper HTTP/1 *server* for the unix-socket mock upstream in the gateway
 # conformance test (the non-test build only needs the client).
 hyper = { workspace = true, features = ["server", "http1"] }

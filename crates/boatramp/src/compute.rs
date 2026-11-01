@@ -542,8 +542,15 @@ pub enum ComputeOutput {
     Set { name: String, spec: String },
     /// `compute build` — the rootfs was built, uploaded, and the workload set.
     Build { name: String, spec: String },
-    /// `compute rm` — the workload was removed.
-    Rm { name: String },
+    /// `compute rm` — the workload was removed. `drained_dependents` is non-empty only
+    /// when the removed workload backed a managed SQL dependency
+    /// (PLAN-managed-dependency-readiness WS5): the server drained those binding(s) first
+    /// (flipped unhealthy + a short grace wait) before actually removing the workload.
+    Rm {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        drained_dependents: Vec<String>,
+    },
     /// `compute bind-blob` — the injected blob-shim env (as `K=V` pairs).
     BindBlob {
         /// Whether `--export` was requested (prefixes each human line with `export `).
@@ -632,7 +639,20 @@ impl crate::output::Rendered for ComputeOutput {
             Self::Build { name, spec } => {
                 writeln!(w, "workload {name} built + set (spec {spec})")
             }
-            Self::Rm { name } => writeln!(w, "removed {name}"),
+            Self::Rm {
+                name,
+                drained_dependents,
+            } => {
+                writeln!(w, "removed {name}")?;
+                if !drained_dependents.is_empty() {
+                    writeln!(
+                        w,
+                        "  drained managed-SQL dependent(s) first: {}",
+                        drained_dependents.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
             Self::BindBlob { export, env } | Self::BindMessaging { export, env } => {
                 let prefix = if *export { "export " } else { "" };
                 for (k, v) in env {
@@ -1122,11 +1142,28 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             ComputeOutput::Build { name, spec: hash }
         }
         ComputeCommand::Rm { name } => {
-            http.delete(format!("{server}/api/{seg}/{name}"))
+            let resp = http
+                .delete(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?;
-            ComputeOutput::Rm { name }
+            // `200` (vs the plain `204`) carries the WS5 drain report — best-effort parse;
+            // an older server's bare `204` (or any body the shape doesn't match) just means
+            // no dependents to report.
+            let drained_dependents = if resp.status() == reqwest::StatusCode::OK {
+                resp.json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("drained_dependents").cloned())
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            ComputeOutput::Rm {
+                name,
+                drained_dependents,
+            }
         }
         ComputeCommand::Exec { name, stdin, argv } => {
             use base64::Engine;

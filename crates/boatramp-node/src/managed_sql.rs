@@ -1587,6 +1587,96 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
         }
         Ok(out)
     }
+
+    async fn readiness(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<boatramp_core::sql::SqlReadiness, SqlError> {
+        use boatramp_core::sql::SqlReadiness;
+        // Defense-in-depth, matching `ping`/`connect_for`.
+        boatramp_core::project::validate_resource_name("database", db)
+            .map_err(|err| SqlError::other(err.to_string()))?;
+        // Same merge point as `ping` — a node-static binding or an APPLIED (deploy-store)
+        // managed db, daemon-config-wins / fail-closed (PLAN-managed-dependency-readiness
+        // WS4: ONE readiness surface regardless of which config path declared the binding).
+        let resolved =
+            crate::managed_db_declare::resolve_binding(&self.databases, &self.deploy, project, db)
+                .await
+                .map_err(|e| SqlError::other(e.to_string()))?
+                .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let cfg = &resolved;
+        // A bring-your-own-URL binding isn't compute-backed: WS2 never hard-gates it
+        // (per-DB resilience), so there is no replica fleet to reduce a readiness verdict
+        // from.
+        if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
+            return Ok(SqlReadiness::NotManaged);
+        }
+        // Derive the tenant's workload + endpoint project EXACTLY as `ping`/`backend_for`
+        // do, then read the SAME stored replica states the reconcile loop's readiness pass
+        // (and `db status`) maintain — no live connection, no query.
+        let target = operator_target(cfg, project, db)?;
+        let pref = boatramp_core::project::ProjectRef::new(&target.endpoint_project);
+        let states = self
+            .deploy
+            .list_replica_states(pref, &target.workload)
+            .await
+            .map_err(|e| SqlError::other(e.to_string()))?;
+        Ok(SqlReadiness::Managed(
+            boatramp_core::compute::reduce_readiness(&states),
+        ))
+    }
+
+    async fn dependents_of_workload(
+        &self,
+        project: &str,
+        workload: &str,
+    ) -> Result<Vec<String>, SqlError> {
+        use std::collections::BTreeSet;
+        // Every binding NAME this project could resolve: the node-static config keys, plus
+        // whatever it declared through the manifest front door. `resolve_binding` below is
+        // still the single merge choke point for resolving each one — this is just the
+        // candidate set to walk.
+        let mut names: BTreeSet<String> = self.databases.keys().cloned().collect();
+        let declared = self
+            .deploy
+            .list_project_databases(boatramp_core::project::ProjectRef::new(project))
+            .await
+            .map_err(|e| SqlError::other(e.to_string()))?;
+        names.extend(declared.into_iter().map(|d| d.name));
+
+        let mut out = Vec::new();
+        for name in names {
+            // Best-effort: a per-entry resolution conflict/error (e.g. a stale declared name
+            // the daemon config now shadows) never blocks the drain decision for the OTHER
+            // bindings — it only excludes this one name from the dependents list.
+            let Ok(Some(cfg)) = crate::managed_db_declare::resolve_binding(
+                &self.databases,
+                &self.deploy,
+                project,
+                &name,
+            )
+            .await
+            else {
+                continue;
+            };
+            // A bring-your-own URL is never backed by a compute workload — never a dependent
+            // of one.
+            if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
+                continue;
+            }
+            // Derive the ACTUAL resolved workload for this (project, name) exactly as a live
+            // request would (`build_backend`/`operator_target`) — for `Single` tenancy this is
+            // the per-tenant-derived name, not the bare config value, so a bare string compare
+            // against `cfg.compute` would miss it.
+            if let Ok(target) = operator_target(&cfg, project, &name)
+                && target.workload == workload
+            {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// The schema-migration runner (Postgres + MySQL). Owns the ordered `schema_migrations` ledger and
@@ -4188,6 +4278,78 @@ mod tests {
         assert!(
             !dispatch.routes_to_libsql("absent"),
             "an unknown name does not route to libsql (the sqlx path then returns NotConfigured)"
+        );
+    }
+
+    /// **Live gate (PLAN-managed-dependency-readiness WS4):** `NodeOperatorSql::readiness`
+    /// end-to-end through the REAL `resolve_binding` merge + `operator_target` derivation +
+    /// a REAL `DeployStore`'s stored replica states — not a double-mocked fake. Exercises the
+    /// exact `starting → ready` transition an operator/migration probe polls for, PLUS the
+    /// per-DB-resilience invariant (a bring-your-own URL is never gated).
+    #[tokio::test]
+    async fn readiness_reports_the_real_starting_to_ready_transition() {
+        use boatramp_core::sql::OperatorSql as _;
+        let mut databases = BTreeMap::new();
+        // A node-static, compute-backed managed binding (default tenant/scope: Single/Project).
+        databases.insert("app".to_string(), db("postgres", Some("pg"), "", None));
+        // A bring-your-own URL binding — not compute-backed.
+        databases.insert("ext".to_string(), db("postgres", None, "EXT_URL", None));
+
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let op = NodeOperatorSql::new(databases, Arc::new(MemoryKv::new()), None, deploy.clone());
+
+        // Declared but not launched yet (no replica recorded) → `Managed(None)` ("pending").
+        assert_eq!(
+            op.readiness("default", "app").await.unwrap(),
+            boatramp_core::sql::SqlReadiness::Managed(None),
+            "no replica recorded yet is pending, not starting"
+        );
+
+        // Launched, still starting: a `Running`-phase replica whose readiness is `Starting`.
+        deploy
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &replica("pg", 0, "10.0.0.1", 5432, false, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            op.readiness("default", "app").await.unwrap(),
+            boatramp_core::sql::SqlReadiness::Managed(Some(
+                boatramp_core::compute::Readiness::Starting
+            ))
+        );
+
+        // The SAME replica transitions to ready (the reconcile loop's readiness pass having
+        // advanced it) — `readiness()` picks up the update with no code change on this side.
+        deploy
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &replica("pg", 0, "10.0.0.1", 5432, true, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            op.readiness("default", "app").await.unwrap(),
+            boatramp_core::sql::SqlReadiness::Managed(Some(
+                boatramp_core::compute::Readiness::Provisioned
+            ))
+        );
+
+        // A bring-your-own URL binding is never gated (per-DB resilience, WS2 invariant 2):
+        // `NotManaged`, regardless of any replica state.
+        assert_eq!(
+            op.readiness("default", "ext").await.unwrap(),
+            boatramp_core::sql::SqlReadiness::NotManaged
+        );
+
+        // An undeclared name fails closed with a clear error, not a false "pending".
+        assert!(op.readiness("default", "nope").await.is_err());
+
+        println!(
+            "MANAGED-DEP READINESS ENDPOINT OK: `OperatorSql::readiness` reports pending → \
+             starting → provisioned through the REAL resolve_binding merge + operator_target \
+             derivation + stored replica state, and leaves a bring-your-own URL ungated."
         );
     }
 }
