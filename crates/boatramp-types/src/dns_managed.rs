@@ -6,16 +6,29 @@
 //! The record set is stored string-typed (a serializable mirror of the acme
 //! `DnsRecord`) so this crate needn't depend on `boatramp-acme`; the retraction
 //! side rebuilds the provider named here and deletes each record.
+//!
+//! **One entry per RAW host, wildcard preserved.** The ledger is keyed and
+//! identified by [`Host::domain_entry`](crate::host::Host::domain_entry) —
+//! case/dot-folded but, unlike the *verification* key
+//! ([`domain_verify::normalize_host`](crate::domain_verify::normalize_host)),
+//! NEVER stripping a leading `*.`. A wildcard and its apex base **share one
+//! verification record** (control of the zone covers both), but they are
+//! **independently tracked, pointed, and retracted** DNS records here — so
+//! dropping just `*.example.com` from a site's config retracts exactly that
+//! record while `example.com` stays pointed, with no risk of one overwriting
+//! the other out of the ledger while its record stays live untracked.
 
 use serde::{Deserialize, Serialize};
 
 /// KV key for the managed-records ledger of `host` under `site`. The host is
-/// normalized (lowercased, no `*.`/trailing dot), matching the verification key.
-/// `project` is a bare `&str` (this crate is wasm-clean).
+/// case/dot-folded via [`Host::domain_entry`](crate::host::Host::domain_entry)
+/// — **preserving** a leading `*.` (a wildcard and its apex are distinct,
+/// independently-tracked ledger entries; see the module docs). `project` is a
+/// bare `&str` (this crate is wasm-clean).
 pub fn dnsmanaged_key(project: &str, site: &str, host: &str) -> String {
     format!(
         "project/{project}/dnsmanaged/{site}/{}",
-        crate::domain_verify::normalize_host(host)
+        crate::host::Host::new(host).domain_entry()
     )
 }
 
@@ -50,13 +63,16 @@ pub struct ManagedRecord {
 }
 
 /// The records boatramp manages for one host, plus the provider that owns them
-/// (so a retraction rebuilds the same provider). Persisted per `(site, host)`.
+/// (so a retraction rebuilds the same provider). Persisted per `(site, host)` —
+/// one entry per RAW host (wildcard preserved; see the module docs), so a
+/// wildcard and its apex base are tracked, pointed, and retracted separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManagedDns {
     /// Schema version, pinned at [`crate::SCHEMA_VERSION`].
     pub version: u32,
-    /// The host these records point at the server (normalized).
+    /// The host these records point at the server (case/dot-folded, wildcard
+    /// **preserved** — see the module docs).
     pub host: String,
     /// The DNS provider that owns them (the `--provider` spelling, e.g.
     /// `cloudflare`, `digitalocean`).
@@ -81,10 +97,11 @@ impl Default for ManagedDns {
 
 impl ManagedDns {
     /// A ledger entry for `host` managed by `provider`, carrying `records`.
+    /// `host` is case/dot-folded, wildcard **preserved** (see the module docs).
     pub fn new(host: &str, provider: &str, records: Vec<ManagedRecord>, now_unix: u64) -> Self {
         Self {
             version: crate::SCHEMA_VERSION,
-            host: crate::domain_verify::normalize_host(host),
+            host: crate::host::Host::new(host).domain_entry(),
             provider: provider.to_string(),
             records,
             updated_at_unix: now_unix,
@@ -116,18 +133,21 @@ pub struct ReconcilePlan {
 /// hosts currently verified + attached to the site; `managed` is the set of
 /// hosts that already have a ledger entry. Every verified host is (re)pointed
 /// (upsert is idempotent, so this self-heals drift); every managed-but-no-longer-
-/// verified host is retracted. Hosts are compared normalized, so a wildcard and
-/// its base don't churn.
+/// verified host is retracted.
+///
+/// Hosts are compared **per RAW host** — case/dot-folded via
+/// [`Host::domain_entry`](crate::host::Host::domain_entry), but a leading `*.`
+/// is **preserved**, never folded onto its apex. A wildcard and its apex base
+/// are therefore DISTINCT plan entries: dropping only the wildcard from
+/// `verified` (apex still verified+attached) retracts exactly the wildcard's
+/// ledger entry, never silently drops it from tracking while its DNS record
+/// stays live (the collapsed-comparison design this replaced could lose track
+/// of a whole record on a subset shrink — see the ledger's module docs).
 pub fn plan_reconcile(verified: &[String], managed: &[String]) -> ReconcilePlan {
     use std::collections::BTreeSet;
-    let verified: BTreeSet<String> = verified
-        .iter()
-        .map(|h| crate::domain_verify::normalize_host(h))
-        .collect();
-    let managed: BTreeSet<String> = managed
-        .iter()
-        .map(|h| crate::domain_verify::normalize_host(h))
-        .collect();
+    let fold = |h: &String| crate::host::Host::new(h).domain_entry();
+    let verified: BTreeSet<String> = verified.iter().map(fold).collect();
+    let managed: BTreeSet<String> = managed.iter().map(fold).collect();
     ReconcilePlan {
         to_point: verified.iter().cloned().collect(),
         to_retract: managed.difference(&verified).cloned().collect(),
@@ -139,9 +159,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_normalizes_the_host() {
+    fn key_folds_case_and_dots_but_preserves_the_wildcard() {
         assert_eq!(
             dnsmanaged_key("default", "blog", "*.WWW.Example.com."),
+            "project/default/dnsmanaged/blog/*.www.example.com"
+        );
+        // The apex (no `*.`) is a DIFFERENT key from its wildcard.
+        assert_eq!(
+            dnsmanaged_key("default", "blog", "WWW.Example.com."),
             "project/default/dnsmanaged/blog/www.example.com"
         );
         assert_eq!(
@@ -168,9 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn new_normalizes_host_and_pins_version() {
+    fn new_folds_the_host_but_preserves_the_wildcard() {
         let ledger = ManagedDns::new("*.Example.com", "route53", Vec::new(), 1);
-        assert_eq!(ledger.host, "example.com");
+        assert_eq!(ledger.host, "*.example.com");
         assert_eq!(ledger.version, crate::SCHEMA_VERSION);
         assert_eq!(ledger.provider, "route53");
     }
@@ -185,11 +210,29 @@ mod tests {
         assert_eq!(plan.to_retract, vec!["old.example.com"]);
     }
 
+    /// Security-review MEDIUM(2) fix: a wildcard and its apex base are DISTINCT
+    /// plan entries, never collapsed — the design this replaced could silently
+    /// lose track of (while leaving live) a record on a subset shrink.
     #[test]
-    fn plan_normalizes_before_comparing() {
-        // A wildcard verified host and its managed base normalize equal → no churn.
-        let plan = plan_reconcile(&["*.Example.com".into()], &["example.com".into()]);
-        assert_eq!(plan.to_point, vec!["example.com"]);
+    fn plan_treats_wildcard_and_apex_as_distinct() {
+        let plan = plan_reconcile(&["*.Example.com".into(), "example.com".into()], &[]);
+        let mut to_point = plan.to_point.clone();
+        to_point.sort();
+        assert_eq!(to_point, vec!["*.example.com", "example.com"]);
         assert!(plan.to_retract.is_empty());
+    }
+
+    /// The exact subset-shrink scenario: a wildcard is dropped from `verified`
+    /// (e.g. a declarative `apply` that only re-adds the apex alias) while the
+    /// apex stays verified+attached and managed. The wildcard's ledger entry
+    /// must be retracted; the apex must NOT be touched.
+    #[test]
+    fn plan_retracts_only_the_dropped_wildcard_when_the_apex_survives() {
+        let plan = plan_reconcile(
+            &["example.com".into()],
+            &["*.example.com".into(), "example.com".into()],
+        );
+        assert_eq!(plan.to_point, vec!["example.com"]);
+        assert_eq!(plan.to_retract, vec!["*.example.com"]);
     }
 }

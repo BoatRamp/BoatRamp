@@ -244,10 +244,11 @@ fn dns_record_from_managed(rec: &boatramp_core::dns_managed::ManagedRecord) -> O
 /// manage separately) at `target` via `provider` — `upsert` is contractually
 /// idempotent, so a repeat sweep converges rather than duplicating — and
 /// retract any ledger entry (`dnsmanaged/<site>/<host>`) whose host is no
-/// longer attached (`domain rm`, a deleted site). A per-host or per-provider
-/// failure is logged and skipped, never aborts the sweep: one bad zone or a
-/// transient provider outage self-heals on the next tick instead of stalling
-/// every other site.
+/// longer attached (`domain rm`, a deleted site, or just dropping one host
+/// from a verified wildcard+apex pair — see [`plan_reconcile`]'s per-raw-host
+/// comparison). A per-host or per-provider failure is logged and skipped,
+/// never aborts the sweep: one bad zone or a transient provider outage
+/// self-heals on the next tick instead of stalling every other site.
 pub async fn reconcile_dns_once(
     deploy: &boatramp_core::deploy::DeployStore,
     provider: &dyn DnsProvider,
@@ -278,36 +279,15 @@ pub async fn reconcile_dns_once(
         let project = ProjectRef::new(&project_str);
         let site = SiteName::new(&site_str);
 
-        // `raw_by_normalized` keeps the WILDCARD-PRESERVING form(s) behind each
-        // normalized key `plan_reconcile` compares on (`plan_reconcile` —
-        // correctly, for comparison/dedup — runs every host through
-        // `normalize_host`, which STRIPS a leading `*.`; a `to_point` entry is
-        // therefore an apex string even when the attached host was a wildcard).
-        // Writing `to_point`'s normalized string verbatim as the record NAME
-        // would silently clobber the zone apex instead of the wildcard — this
-        // map is what lets the loop below write the ORIGINAL host(s) instead.
-        // A `*.example.com` + `example.com` pair normalizes to the SAME key, so
-        // the map's value is a `Vec` — both raw forms are written distinctly.
-        let mut raw_by_normalized: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
         let verified: Vec<String> = match deploy.get_site_config(project, site.as_str()).await {
-            Ok(Some(cfg)) => {
-                let raws: Vec<String> = cfg
-                    .domains
-                    .primary
-                    .iter()
-                    .cloned()
-                    .chain(cfg.domains.aliases.iter().cloned())
-                    .chain(cfg.domains.wildcards.iter().cloned())
-                    .collect();
-                for raw in &raws {
-                    raw_by_normalized
-                        .entry(boatramp_core::domain_verify::normalize_host(raw))
-                        .or_default()
-                        .push(raw.clone());
-                }
-                raws
-            }
+            Ok(Some(cfg)) => cfg
+                .domains
+                .primary
+                .iter()
+                .cloned()
+                .chain(cfg.domains.aliases.iter().cloned())
+                .chain(cfg.domains.wildcards.iter().cloned())
+                .collect(),
             Ok(None) => Vec::new(),
             Err(err) => {
                 tracing::warn!(
@@ -330,80 +310,74 @@ pub async fn reconcile_dns_once(
             }
         };
         let managed: Vec<String> = managed_entries.iter().map(|m| m.host.clone()).collect();
+        // `plan_reconcile` diffs per RAW host (wildcard preserved, never folded
+        // onto its apex) — a `to_point`/`to_retract` entry IS the exact host to
+        // write/retract, one ledger entry per entry; see its own docs for why a
+        // wildcard and its apex must never be collapsed into one comparison key.
         let plan = plan_reconcile(&verified, &managed);
 
-        for normalized_host in &plan.to_point {
-            let Some(raw_hosts) = raw_by_normalized.get(normalized_host) else {
-                // Can't happen: `to_point` is built strictly by normalizing `verified`,
-                // so every entry has at least one raw form behind it. Defensive only.
+        for host in &plan.to_point {
+            // Fail-closed re-assertion at point of use (parity with the cert path's
+            // `is_host_issuance_authorized`): `cfg.domains` can carry a host whose
+            // verification record was later dropped (verification and attachment are
+            // separate state; only a NEWLY-added host is checked at attach time). A
+            // DNS write has no backstop the way ACME issuance does (the CA's own
+            // challenge), so this reconcile must re-check every tick, not just once.
+            // `is_domain_verified` normalizes internally, so passing the wildcard
+            // form here correctly reads the shared base-domain verification record.
+            match deploy.is_domain_verified(project, &site, host).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        project = %project_str, site = %site_str, %host,
+                        "dns reconcile: host is attached but no longer verified; refusing to point it"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        project = %project_str, site = %site_str, %host, %err,
+                        "dns reconcile: verification check failed; fail-closed, not pointing this tick"
+                    );
+                    report.errors += 1;
+                    continue;
+                }
+            }
+            let record = domain_record(host, target, ttl);
+            if let Err(err) = validate_writable(provider, &record, host) {
                 tracing::warn!(
-                    project = %project_str, site = %site_str, host = %normalized_host,
-                    "dns reconcile: no raw host behind a to_point entry; skipping (invariant violation)"
+                    project = %project_str, site = %site_str, %host, %err,
+                    "dns reconcile: record refused by provider capability; will retry next tick"
                 );
-                continue;
-            };
-            let mut records = Vec::with_capacity(raw_hosts.len());
-            for raw_host in raw_hosts {
-                // Fail-closed re-assertion at point of use (parity with the cert path's
-                // `is_host_issuance_authorized`): `cfg.domains` can carry a host whose
-                // verification record was later dropped (verification and attachment are
-                // separate state; only a NEWLY-added host is checked at attach time). A
-                // DNS write has no backstop the way ACME issuance does (the CA's own
-                // challenge), so this reconcile must re-check every tick, not just once.
-                match deploy.is_domain_verified(project, &site, raw_host).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(
-                            project = %project_str, site = %site_str, host = %raw_host,
-                            "dns reconcile: host is attached but no longer verified; refusing to point it"
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            project = %project_str, site = %site_str, host = %raw_host, %err,
-                            "dns reconcile: verification check failed; fail-closed, not pointing this tick"
-                        );
-                        report.errors += 1;
-                        continue;
-                    }
-                }
-                let record = domain_record(raw_host, target, ttl);
-                if let Err(err) = validate_writable(provider, &record, raw_host) {
-                    tracing::warn!(
-                        project = %project_str, site = %site_str, host = %raw_host, %err,
-                        "dns reconcile: record refused by provider capability; will retry next tick"
-                    );
-                    report.errors += 1;
-                    continue;
-                }
-                if let Err(err) = provider.upsert(&record).await {
-                    tracing::warn!(
-                        project = %project_str, site = %site_str, host = %raw_host, %err,
-                        "dns reconcile: upsert failed; will retry next tick"
-                    );
-                    report.errors += 1;
-                    continue;
-                }
-                records.push(managed_record_from_dns(&record));
-                report.pointed += 1;
-            }
-            if records.is_empty() {
-                // Nothing succeeded for this host this tick (refused/unverified/failed) —
-                // leave the ledger as-is; `to_point` revisits it fresh next tick.
+                report.errors += 1;
                 continue;
             }
-            let ledger = ManagedDns::new(normalized_host, provider_name, records, now_unix());
+            if let Err(err) = provider.upsert(&record).await {
+                tracing::warn!(
+                    project = %project_str, site = %site_str, %host, %err,
+                    "dns reconcile: upsert failed; will retry next tick"
+                );
+                report.errors += 1;
+                continue;
+            }
+            let ledger = ManagedDns::new(
+                host,
+                provider_name,
+                vec![managed_record_from_dns(&record)],
+                now_unix(),
+            );
             // A ledger-write failure here leaves a successfully-upserted record untracked
             // until the next tick re-upserts (idempotent) and retries this write — benign,
             // self-closing, never a double DNS write.
             if let Err(err) = deploy.set_managed_dns(project, &site, &ledger).await {
                 tracing::warn!(
-                    project = %project_str, site = %site_str, host = %normalized_host, %err,
+                    project = %project_str, site = %site_str, %host, %err,
                     "dns reconcile: ledger write failed after upsert; will retry next tick"
                 );
                 report.errors += 1;
+                continue;
             }
+            report.pointed += 1;
         }
 
         for host in &plan.to_retract {
@@ -1515,8 +1489,9 @@ mod tests {
     }
 
     /// Security-review HIGH fix, the collapse case: a verified wildcard AND its
-    /// verified apex normalize to the SAME `plan_reconcile` key, so both must be
-    /// written DISTINCTLY (not collapsed into one write, one silently dropped).
+    /// verified apex share ONE verification record but must be written and
+    /// LEDGERED distinctly (not collapsed into one write/one ledger entry,
+    /// one silently dropped) — each is independently trackable and retractable.
     #[tokio::test]
     async fn reconcile_dns_once_writes_wildcard_and_apex_distinctly_when_both_verified() {
         use boatramp_core::domain_verify::VerificationMethod;
@@ -1567,18 +1542,121 @@ mod tests {
             vec!["*.example.test".to_string(), "example.test".to_string()]
         );
 
-        // Both share ONE ledger entry (they normalize to the same key) carrying BOTH
-        // records — so a later retract of this one entry retracts both correctly.
-        let ledger = store
+        // Each is its OWN ledger entry (per-raw-host keying, wildcard preserved) —
+        // never collapsed into one shared entry, so each is independently
+        // retractable without disturbing the other.
+        let apex_ledger = store
             .get_managed_dns(project, &site, "example.test")
             .await
             .unwrap()
-            .expect("one ledger entry for the shared normalized key");
-        let mut ledger_names: Vec<String> = ledger.records.iter().map(|r| r.name.clone()).collect();
-        ledger_names.sort();
+            .expect("the apex has its own ledger entry");
+        assert_eq!(apex_ledger.records.len(), 1);
+        assert_eq!(apex_ledger.records[0].name, "example.test");
+
+        let wildcard_ledger = store
+            .get_managed_dns(project, &site, "*.example.test")
+            .await
+            .unwrap()
+            .expect("the wildcard has its OWN ledger entry, distinct from the apex");
+        assert_eq!(wildcard_ledger.records.len(), 1);
+        assert_eq!(wildcard_ledger.records[0].name, "*.example.test");
+    }
+
+    /// Security-review (round 2) MEDIUM fix — the subset-removal orphan: the
+    /// ledger is keyed per RAW host, so dropping just `*.example.test` from
+    /// `cfg.domains` (its shared verification record untouched, the apex still
+    /// verified+attached) must RETRACT the wildcard's ledger entry AND delete
+    /// its provider record — never silently drop it from tracking while it
+    /// stays live (a dangling catch-all the operator asked to remove).
+    #[tokio::test]
+    async fn reconcile_dns_once_retracts_a_dropped_wildcard_without_touching_the_surviving_apex() {
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = fresh_store();
+        let project = ProjectRef::DEFAULT;
+        let site = SiteName::new("storefront");
+        store
+            .start_domain_verification(project, &site, "example.test", VerificationMethod::Dns, 100)
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(project, &site, "example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(project, &site, "*.example.test")
+            .await
+            .unwrap();
+
+        let provider = ManualDnsProvider::new();
+        let target = PreviewTarget::Ipv4("203.0.113.9".parse().unwrap());
+        // First pass: both the apex and the wildcard get pointed + ledgered.
+        reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_managed_dns(project, &site, "*.example.test")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Declarative drop: a `set_site_config` that re-writes `domains` with only
+        // the apex alias (the verification store is untouched — `example.test`'s
+        // shared verification record stays verified) — simulates `apply`/`PUT
+        // site-config` re-adding aliases but not wildcards.
+        let mut cfg = store
+            .get_site_config(project, "storefront")
+            .await
+            .unwrap()
+            .unwrap();
+        cfg.domains.wildcards.clear();
+        store
+            .set_site_config(project, "storefront", &cfg)
+            .await
+            .unwrap();
+
+        let report = reconcile_dns_once(&store, &provider, "manual", &target, 300)
+            .await
+            .unwrap();
+
         assert_eq!(
-            ledger_names,
-            vec!["*.example.test".to_string(), "example.test".to_string()]
+            report.retracted, 1,
+            "the dropped wildcard's ledger entry is retracted"
+        );
+        // The wildcard's record is actually DELETED at the provider — not just
+        // dropped from the ledger while staying live.
+        let recorded = provider.recorded();
+        let deletes: Vec<&DnsRecord> = recorded
+            .iter()
+            .filter(|(op, _)| *op == boatramp_acme::DnsOp::Delete)
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].name, "*.example.test");
+        assert!(
+            store
+                .get_managed_dns(project, &site, "*.example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "the wildcard's ledger entry must be gone, not orphaned"
+        );
+        // The apex is untouched: still ledgered, never retracted.
+        assert!(
+            store
+                .get_managed_dns(project, &site, "example.test")
+                .await
+                .unwrap()
+                .is_some(),
+            "the surviving apex must stay pointed and ledgered"
         );
     }
 
