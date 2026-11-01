@@ -1778,7 +1778,7 @@ pub trait OperatorSql: Send + Sync {
     /// connection or runs a query. Backs `GET /api/sql/{db}/status`.
     async fn readiness(&self, project: &str, db: &str) -> Result<SqlReadiness, SqlError>;
 
-    /// Which of `project`'s managed SQL binding NAMEs are backed by compute `workload` —
+    /// Which of `project`'s managed SQL binding names are backed by compute `workload` —
     /// the REVERSE of [`readiness`](Self::readiness) (name → workload), used to gate a
     /// graceful drain before a managed-dependency compute-workload teardown
     /// (PLAN-managed-dependency-readiness WS5: "drain dependents before tearing down the

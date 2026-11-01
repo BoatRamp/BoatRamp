@@ -1216,7 +1216,7 @@ pub(super) async fn delete_compute(
 }
 
 /// The WS5 drain step (see [`delete_compute`]). Returns the dependent managed-SQL binding
-/// NAMEs that were drained — empty ⇒ nothing to do (not a managed dependency, or no
+/// names that were drained — empty ⇒ nothing to do (not a managed dependency, or no
 /// `OperatorSql` wired), in which case the caller adds no latency at all.
 async fn drain_managed_dependents(
     deploy: &DeployStore,
@@ -1484,6 +1484,12 @@ pub(super) async fn sql_status(
     }
 }
 
+/// `Retry-After` (seconds) advertised when a managed database is not yet usable. Shared by the
+/// WS4 `sql_status` readiness view (below, always compiled) and the WS2 serve-time 503 in
+/// `handler_dispatch`/`function_runtime` (which are `handlers`-feature-gated) — so the constant
+/// lives here, un-gated, reachable with or without the `handlers` feature.
+pub(crate) const SQL_NOT_READY_RETRY_AFTER_SECS: u32 = 2;
+
 /// Render [`OperatorSql::readiness`](boatramp_core::sql::OperatorSql::readiness)'s result as
 /// `sql_status`'s JSON body: the shared `readiness_to_json` vocabulary (`database_status`
 /// uses the identical one), plus `database`/`managed`, plus a `retry_after_secs` hint on any
@@ -1504,8 +1510,7 @@ fn sql_readiness_view(db: &str, readiness: &boatramp_core::sql::SqlReadiness) ->
         Some("provisioned") | Some("external")
     );
     if !usable {
-        body["retry_after_secs"] =
-            serde_json::Value::from(crate::handler_dispatch::SQL_NOT_READY_RETRY_AFTER_SECS);
+        body["retry_after_secs"] = serde_json::Value::from(SQL_NOT_READY_RETRY_AFTER_SECS);
     }
     body
 }

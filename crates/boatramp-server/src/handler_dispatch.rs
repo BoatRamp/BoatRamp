@@ -2121,11 +2121,6 @@ impl From<String> for BindingsError {
     }
 }
 
-/// `Retry-After` (seconds) advertised on the readiness-gate `503` — how soon a client / migration
-/// probe should re-poll while a managed database finishes starting. Small: startup is usually a
-/// handful of seconds and the probe is cheap.
-pub(super) const SQL_NOT_READY_RETRY_AFTER_SECS: u32 = 2;
-
 /// Open a granted SQL database for an invocation's bindings, applying a **short bounded readiness
 /// retry**. A host-managed database that is still starting returns
 /// [`SqlError::Unavailable`](boatramp_core::sql::SqlError::Unavailable); a DB that is only a moment
@@ -2359,7 +2354,7 @@ pub(super) async fn build_bindings(
                     );
                     return Err(BindingsError::NotReady {
                         detail: format!("database `{name}`: {err}"),
-                        retry_after_secs: SQL_NOT_READY_RETRY_AFTER_SECS,
+                        retry_after_secs: crate::admin_api::SQL_NOT_READY_RETRY_AFTER_SECS,
                     });
                 }
                 Err(err) => {

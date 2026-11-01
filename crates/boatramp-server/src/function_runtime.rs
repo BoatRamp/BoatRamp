@@ -1206,7 +1206,7 @@ pub(super) async fn build_function_bindings(
                     );
                     return Err(BindingsError::NotReady {
                         detail: format!("database `{name}`: {err}"),
-                        retry_after_secs: super::handler_dispatch::SQL_NOT_READY_RETRY_AFTER_SECS,
+                        retry_after_secs: crate::admin_api::SQL_NOT_READY_RETRY_AFTER_SECS,
                     });
                 }
                 Err(err) => {
