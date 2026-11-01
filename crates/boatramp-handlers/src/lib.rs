@@ -54,6 +54,10 @@ pub use bindings::blob_upload::{
 #[cfg(feature = "engine")]
 #[doc(hidden)]
 pub use bindings::blobstore::read_object_through_guest_binding;
+// PLAN-compute-bindings kv-shim gate helper: read a value back through the REAL guest
+// `wasi:keyvalue` read-path (proves the compute kv-shim's writes are guest-readable at the SAME
+// key). The keyvalue analogue of `read_object_through_guest_binding`. `#[doc(hidden)]` — for the
+// live gate + integration tests only.
 /// The confined blob capability + its zero-copy blob-ref resolver (cold-start cap-req 10):
 /// the serve layer uses `BlobBinding::resolve_blob_ref` to turn a handler-supplied
 /// `(container, key)` into a backend + the confined `hblob/{site}/…` key, reusing the exact
@@ -82,6 +86,9 @@ pub use bindings::graphql::{GraphqlRequest, SupergraphRunError, SupergraphRunner
 pub use bindings::invoke::{
     InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,
 };
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub use bindings::keyvalue::read_value_through_guest_binding;
 #[cfg(feature = "messaging")]
 pub use bindings::messaging::{BUS_TOPIC_SELECTOR, ProducerContext};
 #[cfg(feature = "messaging")]

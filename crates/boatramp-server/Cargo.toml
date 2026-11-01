@@ -184,6 +184,14 @@ compute-blob-shim-gate-mutation = ["handlers"]
 # under this crate's own `cfg(test)`, so the in-crate gate arms them).
 compute-messaging-shim-gate-mutation = []
 
+# TEST-ONLY anti-hollow lane for the compute kv-shim (PLAN-compute-bindings): arms the two
+# `BOATRAMP_COMPUTEKV_MUTATION` seams in `kv_shim.rs` — `allow_cross_bucket` (a bucket-bound token
+# reaches a DIFFERENT bucket), `admit_unmatched` (a missing/unknown bearer token is admitted) — each
+# turning the `COMPUTE KV-SHIM SCOPED OK` gate RED. Needs `handlers` (the shared-namespace positive
+# proof reads back through the real `wasi:keyvalue` host binding). Compiled OUT of every real build
+# (the seams also live under this crate's own `cfg(test)`, so the in-crate gate arms them).
+compute-kv-shim-gate-mutation = ["handlers"]
+
 # The default-scope project-reservation gate lane (v0.31.0 Finding 8, `DEFAULT-SCOPE RESERVE OK`).
 # When ON, `create_project` compiles a `BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT` seam that drops
 # the reserved-name rejection (accepts a `default` project), turning the reservation gate RED —

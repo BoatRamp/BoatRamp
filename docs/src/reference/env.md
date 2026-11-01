@@ -129,6 +129,7 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_SQL_SHIM_URL` | `compute.sql_shim_url` | Guest-reachable base URL of the compute SQL shim (enables a workload's `--bind sql`). |
 | `BOATRAMP_COMPUTE_BLOB_SHIM_URL` | `compute.blob_shim_url` | Guest-reachable base URL of the compute blob shim (enables a workload's `--bind blob`). |
 | `BOATRAMP_COMPUTE_MESSAGING_SHIM_URL` | `compute.messaging_shim_url` | Guest-reachable base URL of the compute messaging shim (enables a workload's `--bind messaging` — both publish and consume: `/publish`, `/claim`, `/ack`, `/nack`). |
+| `BOATRAMP_COMPUTE_KV_SHIM_URL` | `compute.kv_shim_url` | Guest-reachable base URL of the compute kv shim (enables a workload's `--bind kv` — `/{key}` for the default bucket, `/b/{bucket}/{key}` for a named one). |
 | `BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE` | `compute.managed_db_privilege` | How a managed DB image runs on a shared-kernel backend: `rootless` (default) or `caps`. |
 | `BOATRAMP_COMPUTE_DOCKER_ENDPOINT` | `compute.docker_endpoint` | Remote-Docker endpoint mode: `published` (default) or `bridge`. |
 | `BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE` | `compute.docker_volume_mode` | Remote-Docker volume mode: `named` (default) or `bind`. |

@@ -157,15 +157,18 @@ enum ComputeCommand {
         #[arg(long = "region")]
         regions: Vec<String>,
         /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
-        /// `sql` binds the site database, `sql:analytics` a named external DB; `blob`
-        /// binds the site blob store, `blob:assets` one named container; `messaging` binds
-        /// the project bus — BOTH halves, publish AND consume (claim/ack/nack) — `messaging:
-        /// deliver` one topic. The endpoint URL + token are injected into the guest env
-        /// (`BOATRAMP_SQL_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
-        /// `blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY container in
-        /// its site's `hblob/{site}/` space; use `blob:<name>` to confine it. Likewise a bare
-        /// `messaging` is PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish
-        /// and claim); use `messaging:<topic>` to confine it to one topic.
+        /// `sql` binds the site database, `sql:analytics` a named external DB; `kv` binds
+        /// the site key/value store, `kv:cache` one named bucket; `blob` binds the site blob
+        /// store, `blob:assets` one named container; `messaging` binds the project bus — BOTH
+        /// halves, publish AND consume (claim/ack/nack) — `messaging:deliver` one topic. The
+        /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
+        /// `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
+        /// `kv`/`blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY
+        /// bucket/container in its site's `hkv{,blob}/{site}/` space; use `kv:<name>` /
+        /// `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any
+        /// topic under `{project}/bus/`, for both publish and claim); use `messaging:<topic>`
+        /// to confine it to one topic. `invoke` (compute→function) is declared only — no
+        /// shim resolver yet, so it parses but injects no env (Phase 3).
         #[arg(long = "bind")]
         bind: Vec<String>,
         /// Name of a **sealed registry pull credential** in THIS project's secret store
@@ -1742,6 +1745,9 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
                 "kv" => BindingKind::Kv,
                 "blob" => BindingKind::Blob,
                 "messaging" => BindingKind::Messaging,
+                // Declared only (PLAN-compute-bindings Phase 3) — no shim resolver yet, so a
+                // workload naming it gets no env injected until that lands.
+                "invoke" => BindingKind::Invoke,
                 other => return Err(Error::Args(format!("unknown binding kind `{other}`"))),
             };
             Ok(ComputeBinding {
@@ -2014,6 +2020,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);
+    }
+
+    #[test]
+    fn compute_set_bind_kv_and_invoke_parse() {
+        // `--bind kv` (site-wide) and `--bind kv:cache` (named bucket) both parse through the
+        // CLI into the raw `bind` flags, then into typed `ComputeBinding`s — mirroring the
+        // already-wired `sql`/`blob`/`messaging` kinds.
+        match parse(&[
+            "compute",
+            "set",
+            "worker",
+            "--image",
+            "ghcr.io/acme/app:1",
+            "--port",
+            "8080",
+            "--bind",
+            "kv",
+            "--bind",
+            "kv:cache",
+            "--bind",
+            "invoke",
+        ]) {
+            Ok(ComputeCommand::Set { bind, .. }) => {
+                assert_eq!(bind, vec!["kv", "kv:cache", "invoke"]);
+                let bindings = parse_bindings(&bind).expect("every flag parses");
+                assert_eq!(
+                    bindings,
+                    vec![
+                        ComputeBinding {
+                            kind: BindingKind::Kv,
+                            name: String::new(),
+                            url_env: None,
+                        },
+                        ComputeBinding {
+                            kind: BindingKind::Kv,
+                            name: "cache".into(),
+                            url_env: None,
+                        },
+                        // `invoke` parses like every other kind (Phase 3 — no resolver yet).
+                        ComputeBinding {
+                            kind: BindingKind::Invoke,
+                            name: String::new(),
+                            url_env: None,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // An unknown kind fails closed.
+        assert!(parse_bindings(&["nope".to_string()]).is_err());
     }
 
     #[test]

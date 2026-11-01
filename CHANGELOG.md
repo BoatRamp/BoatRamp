@@ -35,6 +35,25 @@ versions.
   shutdown. Guest-facing WIT addition (`session.promote-connection`, off-by-default feature-gated in
   `boatramp-uchron-compat`); `HOST_HANDLERS_VERSION` → `0.11.0`.
 
+- **Compute kv-shim — `boatramp compute set --bind kv` is now backed.** A native compute workload
+  can now read/write the **same** key/value entries a wasm handler sees via `wasi:keyvalue`,
+  completing PLAN-compute-bindings' Phase 2 alongside the existing `--bind blob`/`--bind
+  messaging`. Previously `--bind kv` parsed but was inert (no shim backed it,
+  `BOATRAMP_KV_URL` was never set). The node now spawns a kv-shim (config
+  `[compute].kv_shim_url`) serving the per-site `hkv/{site}/{key}` (default bucket) and
+  `hkv/{site}/{bucket}/{key}` (named bucket) namespace over the SAME control-plane
+  `KvStore` through a small HTTP API (`GET`/`PUT`/`DELETE` on `/{key}` or `/b/{bucket}/{key}`),
+  and `--bind kv[:<bucket>]` injects a live `BOATRAMP_KV_URL` + a scoped `…_AUTH_TOKEN`. The
+  token is a per-node-secret HMAC bound to `(project, workload, name, replica)`; the **site is
+  carried by the token, never a client field**, so cross-site is structural and cross-bucket is
+  rejected for a bucket-pinned token. Unlike the blob-shim, a kv key is an opaque flat string (no
+  filesystem semantics), so there is no traversal screen to replicate — only the bucket-prefix
+  confinement. The shim binds only the host its configured URL names (not all interfaces), PUTs
+  are size-capped (`kv_shim_max_value_bytes`, default 1 MiB), and the bearer token is matched via
+  a salted hash — the identical listener-bind + token-admission hardening as the sql/blob/
+  messaging shims. Also declares the `invoke` binding kind (compute→function, Phase 3) per the
+  plan — it parses and round-trips like every other kind, but has no shim resolver yet.
+
 ## [0.43.0] - 2026-10-22
 
 This release completes the overlay fabric's **enrollment & pairing** program and the **project

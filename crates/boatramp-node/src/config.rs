@@ -733,7 +733,9 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
     "BOATRAMP_COMPUTE_MESSAGING_SHIM_URL",
+    "BOATRAMP_COMPUTE_KV_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES",
+    "BOATRAMP_COMPUTE_KV_SHIM_MAX_VALUE_BYTES",
     "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
     "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
     "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
@@ -1183,6 +1185,17 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub messaging_shim_url: Option<String>,
+    /// Guest-reachable base URL of the compute **kv-shim** (PLAN-compute-bindings) — e.g.
+    /// `http://10.0.0.1:8084` (the compute bridge gateway) or the docker bridge gateway. Set ⇒ a
+    /// workload's `--bind kv` reaches the SAME per-site `hkv/{qualified-site}/…` key/value
+    /// namespace a `wasi:keyvalue` handler sees, through a listener bound on the **host:port this
+    /// URL names** (the bridge-gateway IP / loopback — NOT all interfaces; the token-gated
+    /// `hkv/{site}/` data plane must not be off-node reachable). `None` (default) ⇒ compute kv
+    /// bindings off. The direct analogue of [`Self::sql_shim_url`] / [`Self::blob_shim_url`] /
+    /// [`Self::messaging_shim_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub kv_shim_url: Option<String>,
     /// Per-object PUT ceiling (bytes) for the compute blob-shim — bounds a single write so a
     /// compromised/buggy workload cannot exhaust node/bucket storage with one unbounded PUT (`413`
     /// on an oversize PUT). `None` (default) ⇒ the shim's built-in default (5 GiB, S3's single-PUT
@@ -1190,6 +1203,13 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub blob_shim_max_object_bytes: Option<u64>,
+    /// Per-value PUT ceiling (bytes) for the compute kv-shim — the direct analogue of
+    /// [`Self::blob_shim_max_object_bytes`], sized for [`boatramp_core::kv::KvStore`]'s "small
+    /// values" (`413` on an oversize PUT). `None` (default) ⇒ the shim's built-in default (1 MiB);
+    /// `Some(0)` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub kv_shim_max_value_bytes: Option<u64>,
     /// Privilege strategy for a managed database's stock image on a shared-kernel
     /// backend (see [`ManagedDbPrivilege`]). `rootless` by default.
     #[serde(default)]
@@ -1373,7 +1393,9 @@ impl Default for ComputeConfig {
             sql_shim_url: None,
             blob_shim_url: None,
             messaging_shim_url: None,
+            kv_shim_url: None,
             blob_shim_max_object_bytes: None,
+            kv_shim_max_value_bytes: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),
             dns_upstream: default_dns_upstream(),

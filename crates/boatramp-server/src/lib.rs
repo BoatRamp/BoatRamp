@@ -46,6 +46,7 @@ pub mod aot;
 #[cfg(feature = "handlers")]
 mod blob_ref;
 pub mod blob_shim;
+pub mod kv_shim;
 pub mod messaging_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
@@ -1678,6 +1679,18 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn sql_backends(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
         self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
+    /// The node's single control-plane [`KvStore`](boatramp_core::kv::KvStore), if a handler
+    /// runtime is present. Backs the compute kv-shim (PLAN-compute-bindings) so an opaque
+    /// workload reads/writes the SAME per-site `hkv/{qualified-site}/…` namespace — over the
+    /// SAME store — the `wasi:keyvalue` host binding resolves. Unlike [`Self::sql_backends`] /
+    /// [`Self::blob_backends`], there is no per-project provider to look up: every project
+    /// shares this one store, namespaced entirely by key prefix (`inner.kv` is exactly what
+    /// `handler_dispatch`'s `with_keyvalue` passes).
+    #[cfg(feature = "handlers")]
+    pub fn kv(&self) -> Option<Arc<dyn boatramp_core::kv::KvStore>> {
+        self.inner.as_ref().map(|inner| inner.kv.clone())
     }
 
     /// The per-project blob-backend resolver, if a handler runtime is present. Backs the

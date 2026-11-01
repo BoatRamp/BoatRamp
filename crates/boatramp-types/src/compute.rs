@@ -287,19 +287,25 @@ pub struct ComputeBinding {
     pub url_env: Option<String>,
 }
 
-/// The managed-resource kinds a [`ComputeBinding`] may name. Phase 0 implements `Sql`;
-/// the others are reserved for the shared resolver mechanism.
+/// The managed-resource kinds a [`ComputeBinding`] may name. `Sql`/`Kv`/`Blob`/`Messaging` each
+/// have a live per-node shim resolver (`boatramp-server`'s `sql_shim`/`kv_shim`/`blob_shim`/
+/// `messaging_shim`); `Invoke` (compute→function, Phase 3) is declared here per the plan but has
+/// no resolver yet — a workload may declare it (it round-trips + hashes like any other binding),
+/// but nothing injects its env until the Phase 3 resolver lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BindingKind {
     /// The managed `sql` database (per-site libsql, or a named external DB).
     Sql,
-    /// Per-site key-value store (Phase 2).
+    /// Per-site key-value store.
     Kv,
-    /// Per-site blob store (Phase 2).
+    /// Per-site blob store.
     Blob,
-    /// Per-site pub/sub + queues (Phase 2).
+    /// Per-site pub/sub + queues.
     Messaging,
+    /// Function-to-function invoke (compute→function/compute, Phase 3). Declared only — no
+    /// resolver yet (see the enum doc).
+    Invoke,
 }
 
 impl ComputeBinding {
@@ -323,6 +329,7 @@ impl BindingKind {
             Self::Kv => 2,
             Self::Blob => 3,
             Self::Messaging => 4,
+            Self::Invoke => 5,
         }
     }
 
@@ -333,6 +340,7 @@ impl BindingKind {
             Self::Kv => "BOATRAMP_KV_URL",
             Self::Blob => "BOATRAMP_BLOB_URL",
             Self::Messaging => "BOATRAMP_MESSAGING_URL",
+            Self::Invoke => "BOATRAMP_INVOKE_URL",
         }
     }
 }
@@ -830,6 +838,59 @@ mod tests {
             url_env: Some("ANALYTICS_URL".into()),
         };
         assert_eq!(custom.url_env(), "ANALYTICS_URL");
+    }
+
+    #[test]
+    fn invoke_binding_kind_declares_like_every_other_kind() {
+        // `invoke` (Phase 3, compute→function) parses, round-trips, and defaults its env var
+        // exactly like the already-resolved kinds — only its SHIM is future work, not its
+        // declaration.
+        assert_eq!(
+            serde_json::from_str::<BindingKind>("\"invoke\"").unwrap(),
+            BindingKind::Invoke
+        );
+        assert_eq!(
+            serde_json::to_string(&BindingKind::Invoke).unwrap(),
+            "\"invoke\""
+        );
+        let invoke = ComputeBinding {
+            kind: BindingKind::Invoke,
+            name: String::new(),
+            url_env: None,
+        };
+        assert_eq!(invoke.url_env(), "BOATRAMP_INVOKE_URL");
+        // Every kind's stable tag is distinct (the shim token HMAC relies on this).
+        let tags: Vec<u8> = [
+            BindingKind::Sql,
+            BindingKind::Kv,
+            BindingKind::Blob,
+            BindingKind::Messaging,
+            BindingKind::Invoke,
+        ]
+        .iter()
+        .map(|k| k.stable_tag())
+        .collect();
+        let mut unique = tags.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            tags.len(),
+            "every BindingKind has a distinct stable_tag"
+        );
+    }
+
+    #[test]
+    fn declaring_an_invoke_binding_changes_the_spec_hash() {
+        let a = spec();
+        let mut b = spec();
+        b.bindings = vec![ComputeBinding {
+            kind: BindingKind::Invoke,
+            name: String::new(),
+            url_env: None,
+        }];
+        assert_ne!(a.id(), b.id(), "a declared invoke binding changes the id");
+        assert!(serde_json::to_string(&b).unwrap().contains("invoke"));
     }
 
     #[test]

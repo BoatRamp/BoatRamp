@@ -245,6 +245,41 @@ impl keyvalue::batch::Host for KvHost<'_> {
     }
 }
 
+/// **Test-support / gate helper (PLAN-compute-bindings kv-shim).** Read a value back through the
+/// REAL guest `wasi:keyvalue` read-path (`store.get`) over a [`KvBinding`] confined to `hkv/{site}/`
+/// — the SAME `Bucket::key` composition a handler's `wasi:keyvalue` import uses. Proves a value the
+/// compute kv-shim wrote at `hkv/{site}/{key}` (the default bucket, `bucket == ""`) or
+/// `hkv/{site}/{bucket}/{key}` (a named one) is genuinely guest-readable, not merely present in the
+/// raw store — the keyvalue analogue of
+/// [`crate::read_object_through_guest_binding`](crate::bindings::blobstore::read_object_through_guest_binding).
+///
+/// This drives the actual host binding (`KvHost::open` + `HostBucket::get`, which composes the
+/// `hkv/{site}/{bucket}/` prefix + the key and reads via [`KvStore::get`]), so it exercises the
+/// production read composition — a prefix/isolation regression would break it exactly as it would
+/// break a real guest. `#[doc(hidden)]` — for the live gate + integration tests only.
+#[doc(hidden)]
+pub async fn read_value_through_guest_binding(
+    store: Arc<dyn KvStore>,
+    site: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    use keyvalue::store::{Host as _, HostBucket as _};
+    let binding = KvBinding {
+        store,
+        prefix: format!("hkv/{site}/"),
+    };
+    let mut table = ResourceTable::new();
+    let mut host = KvHost::new(&mut table, Some(&binding));
+    let handle = host
+        .open(bucket.to_string())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    host.get(handle, key.to_string())
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
 /// Add the `wasi:keyvalue` store/atomics/batch interfaces to `linker`, resolving
 /// the per-invocation [`KvHost`] view from the store's host state via `host`.
 struct LinkData;
