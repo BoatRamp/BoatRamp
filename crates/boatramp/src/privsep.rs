@@ -811,6 +811,56 @@ fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTre
     out
 }
 
+/// The CODE-FAIL-CLOSED stand-up gate for a LIVE authority serve (Security re-review). Standing up a
+/// live seal/unseal/**mint_token** grammar on a relay→crown-jewel link is refused unless BOTH Phase-3
+/// wiring-gate preconditions hold:
+/// 1. a **PoP / `cnf` verifier is configured** — so a relayed context is possession-bound, closing the
+///    ACTIVE-principal new-call forgery that the freshness bound + nonce cache (anti-replay (a)+(b)) do
+///    NOT close (`mint_token` has no `sub` dependency, so without this it would serve LIVE and the
+///    re-mint chain would be reachable);
+/// 2. each authority-serve link is **explicitly purpose-marked** as an authority link in the
+///    composition (not inferred).
+///
+/// NEITHER mechanism is representable in the config / composition model until Phase 3, so this ALWAYS
+/// refuses today — making the whole authority API code-inert by code (symmetric with the sealer's
+/// per-identity fail-closed), not merely convention-inert. When Phase 3 lands the PoP-verifier config
+/// and the per-link PURPOSE marker, the two predicates below start returning `true` for a correctly
+/// provisioned composition and the gate opens. Pure (host-testable).
+fn check_authority_serve_preconditions(config: &ServerConfig) -> Result<(), String> {
+    let mut unmet: Vec<&str> = Vec::new();
+    if !pop_cnf_verifier_configured(config) {
+        unmet.push("a PoP/cnf verifier must be configured (none exists until Phase 3)");
+    }
+    if !authority_link_purpose_marked(config) {
+        unmet.push(
+            "the serve-link must be explicitly purpose-marked as an authority link (no per-link \
+             PURPOSE marker exists until Phase 3)",
+        );
+    }
+    if unmet.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unmet wiring-gate preconditions (fail-closed): {}",
+            unmet.join("; ")
+        ))
+    }
+}
+
+/// Whether a PoP / `cnf` verifier is configured for the authority API (wiring-gate precondition 1).
+/// No config surface for one exists until Phase 3, so this is structurally `false` today — the gate
+/// stays closed. Phase 3 flips this when the PoP-verifier config lands.
+fn pop_cnf_verifier_configured(_config: &ServerConfig) -> bool {
+    false
+}
+
+/// Whether the composition explicitly PURPOSE-marks its authority-serve links (wiring-gate
+/// precondition 2). `PrivsepLink` has no purpose field yet, so this is structurally `false` today —
+/// the gate stays closed. Phase 3 flips this when the per-link PURPOSE marker lands.
+fn authority_link_purpose_marked(_config: &ServerConfig) -> bool {
+    false
+}
+
 // =============================================================================
 // The root supervisor: socketpair wiring + privileged listener bind + fork/exec + supervise
 // =============================================================================
@@ -1435,6 +1485,17 @@ mod instance_serve {
     /// grammar is end-principal-authorized by the verified context; both fail-closed). After the serve
     /// threads end (peers gone) the instance parks (its remaining authorities inert). Fail-closed: a
     /// missing trust root / handler / link fd returns `Err` → the instance exits → FailNodeClosed.
+    ///
+    /// **CODE-FAIL-CLOSED STAND-UP GATE (Security re-review).** Before building ANYTHING, this hard-
+    /// refuses to stand up a live authority serve unless the wiring-gate preconditions
+    /// ([`check_authority_serve_preconditions`]) are met — a PoP/`cnf` verifier configured AND the
+    /// link explicitly purpose-marked. Neither mechanism exists until Phase 3, so today this ALWAYS
+    /// refuses: the whole authority API (signer `mint_token` included — it has no `sub` dependency so
+    /// it would otherwise serve LIVE without PoP, leaving the re-mint chain reachable) is CODE-inert,
+    /// symmetric with the sealer's per-identity fail-closed, not merely convention-inert. A composition
+    /// that designates an authority-serve link therefore FAILS THE NODE CLOSED (loud misconfig signal)
+    /// rather than serving a PoP-less live grammar. The two Phase-1 compositions designate no link
+    /// (empty [`compute_authority_serve_links`]) so they never reach this path.
     fn run_authority_serve(
         label: &str,
         gate: &MaterializationGate,
@@ -1444,6 +1505,12 @@ mod instance_serve {
         authority_links: &std::collections::BTreeSet<String>,
         unlocked_signer: Option<Arc<dyn Signer>>,
     ) -> Result<(), String> {
+        // Hard code gate FIRST — fail closed before building the verifier / registry / any serve.
+        super::check_authority_serve_preconditions(config).map_err(|e| {
+            format!(
+                "[privsep] instance {label:?}: refusing to stand up a live authority serve — {e}"
+            )
+        })?;
         let trust_root = resolve_trust_root(config, unlocked_signer.as_ref())?;
 
         // Build the per-capability registry from the held crown jewels.
@@ -2281,5 +2348,56 @@ mod tests {
             !out.contains_key("ctl"),
             "the relay must not serve: {out:?}"
         );
+    }
+
+    /// Security re-review: even a crown↔(control/exec) link that IS designated for WS-E must NOT stand
+    /// up a live serve — the stand-up gate refuses it (code-fail-closed) until the Phase-3 wiring-gate
+    /// preconditions (PoP/cnf verifier + per-link PURPOSE marker) exist. And the two Phase-1
+    /// compositions designate NOTHING, so they never reach the gate (stand up no authority serve).
+    #[test]
+    fn authority_serve_stand_up_is_code_fail_closed_until_preconditions_met() {
+        // A designated crown↔(control relay) composition...
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "ctl".to_string(),
+            inst(&[HostAuthority::ControlAdminApi], &["to-sign"]),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["to-sign"]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-sign".to_string(),
+            PrivsepLink {
+                from: "ctl".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+            },
+        );
+        let cfg = cfg_with(Some(PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+        }));
+        // ...IS designated (so the designation is not what stops it)...
+        assert!(
+            compute_authority_serve_links(&cfg)
+                .get("signer")
+                .is_some_and(|s| s.contains("to-sign")),
+            "the crown↔control link must be designated"
+        );
+        // ...yet the STAND-UP gate refuses it (fail-closed) — no PoP verifier + no purpose marker.
+        assert!(
+            check_authority_serve_preconditions(&cfg).is_err(),
+            "the stand-up gate must refuse until the Phase-3 preconditions are met"
+        );
+
+        // The two Phase-1 compositions designate no authority-serve link at all (never reach the gate).
+        assert!(compute_authority_serve_links(&cfg_with(Some(clean_privsep()))).is_empty());
+        assert!(compute_authority_serve_links(&cfg_with(Some(split_signer_privsep()))).is_empty());
+        // The predicates are structurally false today (the gate is unconditionally closed).
+        assert!(!pop_cnf_verifier_configured(&cfg));
+        assert!(!authority_link_purpose_marked(&cfg));
     }
 }

@@ -1238,7 +1238,10 @@ impl AuthorityHandler for AuthorityRegistry {
 /// 2. **(c) PoP / `cnf`-binding.** (a)+(b) tighten the replay window but do NOT stop an ACTIVE
 ///    principal's NEW-call forgery within it (the nonce is unsigned); `cnf`-binding closes that
 ///    residual. Needs the originating client to sign an authority-call challenge the frontend relays —
-///    a token-format + guest-SDK change.
+///    a token-format + guest-SDK change. **Additionally, a machine-minted token output (`mint_token`)
+///    must itself be PoP-bound AND NOT re-redeemable as a mint context** — this closes the mint→mint
+///    refresh chain (a minted token relayed back as a fresh context to mint again) that the per-call
+///    TTL clamp (MEDIUM-1) alone does not.
 /// 3. **Real limiter + durable audit (LOW-3 / INFO).** Swap the default [`Unlimited`] limiter for a
 ///    token-bucket and [`TracingAudit`] for a durable append-only sink.
 /// 4. **Per-link PURPOSE marker.** The composition model needs an explicit per-link purpose so a
