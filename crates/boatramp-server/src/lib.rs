@@ -47,6 +47,16 @@ pub mod aot;
 mod blob_ref;
 pub mod blob_shim;
 pub mod messaging_shim;
+/// The privsep authority-API grammar framework + the verifiable end-principal CONTEXT primitive (F3)
+/// (privsep Phase 1, WS-E; design §3.2/§3.4 — the mandatory-Security-review deliverable): a typed,
+/// bounded `call(AuthorityRequest) -> AuthorityResponse` over the `privsep_link` frames whose response
+/// type admits NO key-bearing variant (exfiltration foreclosed by the type system), plus the
+/// `AuthorityContext` — the request's own COSE/CWT bearer re-validated against the PUBLIC trust root on
+/// every call — and audit + rate-limit hooks keyed on the VERIFIED principal. Ships the framework + a
+/// no-op round-trip op; the concrete per-capability grammars (seal/unseal/mint_token/sign_image) are
+/// Phase 2. Distinct from `privsep_unseal`: that is the instance-authorized signer bootstrap (root-wired
+/// allowlist); this is end-principal-authorized via the verified context.
+pub mod privsep_authority;
 /// The privsep feature-link `local` transport (privsep Phase 1 — WS-C): a root-wired
 /// `socketpair(2)` carrying length-delimited control frames + `SCM_RIGHTS` client-fd passing.
 /// Always compiled; the real implementation is `cfg(unix)` (the mechanism is POSIX) and a non-Unix
