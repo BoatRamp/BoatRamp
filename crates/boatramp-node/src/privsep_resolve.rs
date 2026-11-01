@@ -749,11 +749,14 @@ pub fn build_instance_sandbox_inputs(
     cwd: &Path,
 ) -> SandboxDerivationInputs {
     let data_dir = resolve_data_dir(cfg);
-    let config_dir = config_path
-        .parent()
+    // Grant the config FILE read-only (a single-file rule), NOT its parent dir: a config dir that
+    // CONTAINS data_dir (the common `/var/lib/boatramp/{boatramp.toml,data/}` layout) would be an
+    // ancestor of data_dir and refused as an OverbroadStateGrant. The instance only re-reads this
+    // one file at boot; its key/state files are granted on their own paths.
+    let config_read = Some(config_path)
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf);
-    let mut inputs = SandboxDerivationInputs::for_instance(data_dir.clone(), config_dir);
+    let mut inputs = SandboxDerivationInputs::for_instance(data_dir.clone(), config_read);
 
     let held: std::collections::BTreeSet<HostAuthority> = caps.iter().copied().collect();
     // This instance's OWN backend state subtrees (its narrow read-write grant). NEVER data_dir
@@ -1293,12 +1296,19 @@ mod tests {
                 .contains(&PathBuf::from("/srv/node/kv"))
         );
         assert!(!inputs.base_read_write.contains(&PathBuf::from("/srv/node")));
-        // Contract #1: data_dir is absolute + normalized; the config dir is a read grant.
+        // Contract #1: data_dir is absolute + normalized; the config FILE (not its parent dir) is
+        // the read grant — a config dir that contains data_dir would be refused as overbroad.
         assert_eq!(inputs.data_dir, PathBuf::from("/srv/node"));
         assert!(
             inputs
                 .base_read_only
-                .contains(&PathBuf::from("/etc/boatramp"))
+                .contains(&PathBuf::from("/etc/boatramp/boatramp.cfg"))
+        );
+        assert!(
+            !inputs
+                .base_read_only
+                .contains(&PathBuf::from("/etc/boatramp")),
+            "the config DIR must not be granted (only the file)"
         );
 
         // The assembled inputs derive cleanly for the holder (a storage instance legitimately

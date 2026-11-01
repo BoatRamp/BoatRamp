@@ -38,7 +38,13 @@ fn free_port() -> u16 {
             --include-ignored in the `live gate (privsep)` job"]
 fn privsep_two_instance_composition_serves_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_boatramp");
-    let tmp = std::env::temp_dir().join(format!("boatramp-privsep-live-{}", std::process::id()));
+    // Root the node dirs under cargo's integration-test temp (`target/tmp`), NOT the system
+    // temp (`/tmp`): a real deployment keeps data_dir on persistent storage, never under a
+    // world-writable temp dir — and `derive_profile` fail-closed-refuses a data_dir placed under
+    // a `shared_temp` entry (/tmp, /var/tmp, $TMPDIR). `CARGO_TARGET_TMPDIR` is under the repo's
+    // target dir, outside those, so the composition stands up as it would in production.
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-live-{}", std::process::id()));
     let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).expect("create the node data dir");
     let port = free_port();

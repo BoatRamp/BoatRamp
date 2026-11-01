@@ -292,8 +292,7 @@ mod unix_impl {
             // SAFETY: msg_control points at a `cmsg_space`-byte buffer, so CMSG_FIRSTHDR is valid.
             let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
             if cmsg.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "privsep link: CMSG_FIRSTHDR returned null",
                 ));
             }

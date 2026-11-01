@@ -714,14 +714,19 @@ pub struct SandboxDerivationInputs {
 }
 
 impl SandboxDerivationInputs {
-    /// Sane defaults for an instance: [`SYSTEM_READ_ROOTS`] + `config_dir` read-only, the
+    /// Sane defaults for an instance: [`SYSTEM_READ_ROOTS`] + the config FILE read-only, the
     /// system temp dirs as `shared_temp`, no state writes and no key paths (WS-B layers those
-    /// on per the instance's capability set).
-    pub fn for_instance(data_dir: impl Into<PathBuf>, config_dir: Option<PathBuf>) -> Self {
+    /// on per the instance's capability set). `config_read` is the config FILE the instance
+    /// re-reads at boot, granted read-only as a single-file Landlock rule (like the crown-jewel
+    /// key files) — NOT its parent DIRECTORY: a config dir that CONTAINS `data_dir` (the common
+    /// `/var/lib/boatramp/{boatramp.toml,data/}` layout) would be an ancestor of `data_dir` and
+    /// so refused by `derive_profile`'s `OverbroadStateGrant` check (it would expose all backend
+    /// state read-only). Granting the file alone is both correct and strictly tighter.
+    pub fn for_instance(data_dir: impl Into<PathBuf>, config_read: Option<PathBuf>) -> Self {
         let mut base_read_only: Vec<PathBuf> =
             SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
-        if let Some(dir) = config_dir.filter(|p| !p.as_os_str().is_empty()) {
-            base_read_only.push(dir);
+        if let Some(file) = config_read.filter(|p| !p.as_os_str().is_empty()) {
+            base_read_only.push(file);
         }
         let mut shared_temp = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
         if let Some(tmp) = std::env::var_os("TMPDIR") {
@@ -765,7 +770,7 @@ impl SandboxDerivationInputs {
         };
         let norm_vec = |v: &[PathBuf]| -> Vec<PathBuf> { v.iter().map(|p| norm(p)).collect() };
         let norm_key = |o: &Option<PathBuf>| -> Option<PathBuf> { o.as_deref().map(norm) };
-        SandboxDerivationInputs {
+        Self {
             data_dir: norm(&self.data_dir),
             base_read_only: norm_vec(&self.base_read_only),
             base_read_write: norm_vec(&self.base_read_write),
@@ -904,7 +909,7 @@ pub fn lexically_normalize(path: &Path) -> PathBuf {
                 root = Some(r);
             }
             Component::CurDir => {}
-            Component::ParentDir => match stack.last().map(|s| s.as_os_str()) {
+            Component::ParentDir => match stack.last().map(std::ffi::OsString::as_os_str) {
                 // Pop a real component.
                 Some(last) if last != ".." => {
                     stack.pop();
