@@ -993,6 +993,41 @@ jobs:
             fi
           done
 
+      # PLAN-compute-bindings COMPUTE KV-SHIM SCOPED GATE (marker `COMPUTE KV-SHIM SCOPED OK`). The
+      # compute kv-shim gives an opaque workload the SAME per-site `hkv/{qualified-site}/{key}`
+      # (default bucket) / `hkv/{qualified-site}/{bucket}/{key}` (named bucket) key/value namespace —
+      # over the SAME `KvStore` — a `wasi:keyvalue` handler sees, scoped by a bearer token the shim
+      # mints (the site is bound by the TOKEN, never a client field). This gate drives the SINGLE
+      # enforced decision `kv_shim::authorize` + `KvShim::authenticate` (the same code every HTTP
+      # method handler calls, so tested == enforced) across the two security dimensions, AND proves
+      # the shared-namespace property by reading a shim PUT back THROUGH the real `wasi:keyvalue`
+      # host binding (and a guest-landed value back through the shim GET). Asserts the marker + pass
+      # count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test re-run under each
+      # `BOATRAMP_COMPUTEKV_MUTATION` neuters ONE check and MUST FAIL — `allow_cross_bucket` (a token
+      # scoped to site A / bucket X reaches a DIFFERENT bucket), `admit_unmatched` (an
+      # unauthenticated/mismatched token is admitted). A pass-under-mutation (a hollow gate) fails
+      # the merge.
+      - name: "compute kv-shim scoped gate (site/bucket-bound, authed; shared namespace)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers compute_kv_shim_scoped_gate -- --nocapture 2>&1 | tee compute-kv-shim.log
+          grep -qE 'test result: ok\. 1 passed' compute-kv-shim.log \
+            || { echo "::error::compute kv-shim gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'COMPUTE KV-SHIM SCOPED OK' compute-kv-shim.log \
+            || { echo "::error::compute kv-shim gate never reached its marker (a token-scope / auth / shared-namespace regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in allow_cross_bucket admit_unmatched; do
+            if BOATRAMP_COMPUTEKV_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server --features handlers compute_kv_shim_scoped_gate \
+              -- --nocapture > "compute-kv-shim-mutation-$mut.log" 2>&1; then
+              echo "::error::compute kv-shim gate is HOLLOW — it passed under mutation '$mut' (a kv-shim scope/auth security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "compute kv-shim mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # DEFAULT-SCOPE DISJOINTNESS gate (v0.31.0 Finding 8): `ProjectRef::qualified` is two-segment
       # for EVERY project INCLUDING the reserved `default` (`default/{base}`), so a default-project
       # workload's client-composed-key keyspace (`hblob/`, `hkv/`, `mq*/`) is prefix-disjoint from

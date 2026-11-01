@@ -47,6 +47,22 @@
 //! data lives in) whose per-replica token is injected into an often-untrusted guest env, so it MUST NOT
 //! be reachable off-node: operators point `kv_shim_url` at the bridge gateway (or loopback), never a
 //! public address. (An explicit `0.0.0.0` in the URL is honored as the operator's own choice.)
+//!
+//! ## Shared data-plane keying (the `default`-project collision is CLOSED, not inherited)
+//!
+//! Like the blob/sql-shims, this shim treats the compute WORKLOAD's name as the site identity:
+//! `qualified_site = ProjectRef::new(project).qualified(workload)`. [`ProjectRef::qualified`] is
+//! unconditionally two-segment (`{project}/{base}`) for EVERY project INCLUDING the reserved
+//! `default` (`default/{base}`) — the pre-`v0.31.0` bare-default branch (`qualified(DEFAULT, x) ==
+//! x`) is gone — and project creation separately refuses the name `default` (both Finding 8 fixes;
+//! see `ProjectRef::qualified`'s own `qualified_is_two_segment_for_every_project_including_default`
+//! test and the `DEFAULT-SCOPE DISJOINTNESS`/`RESERVATION` CI gates). So a `default`-project
+//! workload can never alias a named project's `hkv/` subtree: `default.qualified("acme")` is
+//! `"default/acme"`, never bare `"acme"`, and is prefix-disjoint from the real project `acme`'s own
+//! `"acme/…"` scope. The one sharing this composition DOES imply — by design, not a flaw — is that
+//! a compute workload and a `wasi:keyvalue` handler SITE that happen to share the same name under
+//! the same project see the IDENTICAL `hkv/{project}/{name}/` subtree; that is the shared-namespace
+//! property this shim exists to provide.
 
 use std::collections::HashMap;
 use std::sync::Arc;
