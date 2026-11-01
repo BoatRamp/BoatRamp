@@ -36,10 +36,17 @@
 //! disjointness/coverage is enforced in the root
 //! ([`boatramp_server::sandbox::check_grant_disjointness`]).
 //!
+//! The root's OWN §4.3 self-profile (the TCB floor — the tightest profile on the node) is installed
+//! in [`supervise`] AFTER the fork+exec loop + BEFORE the supervise loop (so a child never inherits
+//! the root's clamped seccomp/Landlock domain — see the comment at the install site), via the
+//! bespoke [`boatramp_server::sandbox::derive_root_profile`] + the shared `install_derived` +
+//! `enforce_privsep_status` gate: no network, no key-lock, FS view = the config file + the root's own
+//! binary only (`execve` Landlock-pinned to it), everything else `EPERM` / the escape surface killed.
+//!
 //! Clean seams for later workstreams (fail-closed — never a silent monolith fallback):
 //! - **WS-C follow-on** — `tcp`/`overlay` link transports (only `local` is wired here); the other
-//!   `listen.*` fd binds beyond the public listener; the root's OWN tightest self-profile (design
-//!   §4.3); and the authority-scoped app router (the minimal backend serve stands in for it).
+//!   `listen.*` fd binds beyond the public listener; and the authority-scoped app router (the minimal
+//!   backend serve stands in for it).
 //! - **WS-D** — the per-capability seccomp/Landlock profile derivation (owned by `sandbox.rs`;
 //!   this module CONSUMES it via `derive_profile` + `install_derived` + `enforce_privsep_status`).
 //! - **WS-E** — the per-capability authority-API grammar + the re-validated end-principal context
@@ -386,7 +393,7 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
     if !cfg!(all(target_os = "linux", feature = "sandbox")) {
         return Err(PrivsepError::UnsupportedPlatform.into());
     }
-    supervise::run(&config, &plan).map_err(Into::into)
+    supervise::run(&config, &plan, config_path).map_err(Into::into)
 }
 
 /// The node data dir, made absolute against `cwd` + lexically normalized — the SAME transform
@@ -731,6 +738,7 @@ fn compute_unseal_allowlists(
 mod supervise {
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::process::CommandExt;
+    use std::path::Path;
 
     use boatramp_core::privsep::LinkTransport;
     use boatramp_server::privsep_link::LinkEndpoint;
@@ -742,7 +750,11 @@ mod supervise {
     /// authorized instance passing it only its own link ends + listener fd, then supervise
     /// fail-closed (`FailNodeClosed` — any child exit tears the node down). The root holds bootstrap
     /// authority only: it parses no bytes, opens no pool, unseals no key.
-    pub(super) fn run(config: &ServerConfig, plan: &RootPlan) -> Result<(), PrivsepError> {
+    pub(super) fn run(
+        config: &ServerConfig,
+        plan: &RootPlan,
+        config_path: &Path,
+    ) -> Result<(), PrivsepError> {
         let err = |m: String| PrivsepError::Supervise(m);
         let privsep = config
             .privsep
@@ -901,7 +913,41 @@ mod supervise {
         drop(links_by_instance);
         drop(listener_by_instance);
 
-        // 5. Supervise, fail-closed: any child exit tears the whole node down (crown-jewel
+        // 5. Install the root's OWN tightest self-profile (design §4.3) — the TCB floor, confining
+        //    the supervisor for the rest of its life. Installed HERE, AFTER every instance has been
+        //    fork+exec'd (each child forked from an UNCONFINED root and installs its own, broader,
+        //    per-capability profile post-exec), because seccomp AND Landlock are both inherited
+        //    across fork+exec and STACK as an INTERSECTION — a child can only ever LOSE access a
+        //    parent layer dropped, never regain it. Installing this (keyless, networkless,
+        //    data_dir-less) profile BEFORE the spawn loop would therefore clamp every child to the
+        //    root's own domain (no `connect` for a backend, no `accept4` for a frontend, no `mlock`
+        //    for a signer, no `kek_file`/`data_dir` in the Landlock view). The spawn loop parses no
+        //    untrusted input, so the one-shot pre-install window carries no attack surface; the
+        //    long-lived supervise loop below runs fully confined. The root RETAINS `execve`
+        //    (Landlock-pinned to its own binary — see `sandbox::root_supervisor_policy`) so the
+        //    re-exec of `boatramp __instance` stays possible; everything else is `EPERM`, and the
+        //    escape surface (ptrace/mount/bpf/keyctl/…) is hard-`SIGSYS`-killed. Fail-closed: the
+        //    root REFUSES to serve unless the profile reports `Enforced` (same gate as the
+        //    instances — `enforce_privsep_status`). The caller already refused a non-Linux/no-
+        //    `sandbox` build before reaching here, so on this path the install is a real Linux one.
+        let cwd = std::env::current_dir().map_err(|e| err(format!("cwd: {e}")))?;
+        let exe_norm = normalize_for_landlock(&current_exe, &cwd);
+        let config_norm = normalize_for_landlock(config_path, &cwd);
+        let profile = boatramp_server::sandbox::derive_root_profile(&exe_norm, &config_norm);
+        let status = boatramp_server::sandbox::enforce_privsep_status(
+            boatramp_server::sandbox::install_derived(&profile),
+        )
+        .map_err(|e| err(format!("installing the root self-profile: {e}")))?;
+        tracing::info!(
+            ?status,
+            seccomp_allow = profile.seccomp_allow.len(),
+            seccomp_kill = profile.seccomp_kill.len(),
+            ro = profile.policy.read_only_paths.len(),
+            "[privsep] root: self-profile installed + ENFORCED (TCB floor — no network, no \
+             key-lock; execve Landlock-pinned to the root's own binary)"
+        );
+
+        // 6. Supervise, fail-closed: any child exit tears the whole node down (crown-jewel
         //    `FailNodeClosed`, the Phase-1 policy — serving with a hole is worse than not serving).
         tracing::info!(
             instances = children.len(),
@@ -948,13 +994,36 @@ mod supervise {
             let _ = child.wait();
         }
     }
+
+    /// Make `raw` absolute (against `cwd`) + lexically normalized, then `fs::canonicalize` it if it
+    /// already exists (resolving symlinks) — the SAME transform
+    /// [`boatramp_server::sandbox::SandboxDerivationInputs::into_normalized`] applies to every
+    /// instance's grants (WS-C contract #1), so the root's fd-based Landlock install grants the
+    /// REAL config-file / own-binary paths and a `..`/symlink/relative spelling cannot slip a
+    /// different path past the (lexical) policy. `current_exe()` is already absolute + canonical;
+    /// the config path may be relative (the serve default `boatramp.cfg`).
+    fn normalize_for_landlock(raw: &Path, cwd: &Path) -> std::path::PathBuf {
+        let abs = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            cwd.join(raw)
+        };
+        let lexical = boatramp_server::sandbox::lexically_normalize(&abs);
+        std::fs::canonicalize(&lexical).unwrap_or(lexical)
+    }
 }
 
 #[cfg(not(unix))]
 mod supervise {
+    use std::path::Path;
+
     use super::{PrivsepError, RootPlan, ServerConfig};
 
-    pub(super) fn run(_config: &ServerConfig, _plan: &RootPlan) -> Result<(), PrivsepError> {
+    pub(super) fn run(
+        _config: &ServerConfig,
+        _plan: &RootPlan,
+        _config_path: &Path,
+    ) -> Result<(), PrivsepError> {
         // The root wiring needs `socketpair`/`fork`/`SCM_RIGHTS` (Unix); privsep is Linux-only in
         // Phase 1, and the caller already refused a non-Linux/`sandbox`-less build before reaching
         // here. This stub keeps the crate building on non-Unix.

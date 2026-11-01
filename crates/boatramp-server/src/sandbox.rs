@@ -594,6 +594,152 @@ pub fn derive_seccomp_killlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     set.into_iter().collect()
 }
 
+// =============================================================================
+// The root supervisor's OWN self-profile (design §4.3 — the TCB floor)
+// =============================================================================
+//
+// The privsep root (design §4) is the irreducible minimal-TCB supervisor: it resolves the
+// topology, binds the privileged listeners, creates the `socketpair(2)` links, fork+execs the
+// instances, then SUPERVISES for the rest of the node's life. It parses no untrusted bytes,
+// opens no pool, unseals no KEK, and materializes no §1.2 key input — so it has no RCE vector
+// TODAY, but its self-profile is load-bearing defence-in-depth the moment the supervisor gains
+// an input surface (a health endpoint, a restart signal path). This is the TIGHTEST profile on
+// the node — tighter than any instance's derived profile.
+//
+// It is BESPOKE (the root is the supervisor, not a `HostAuthority` instance), NOT forced through
+// the per-capability [`derive_profile`]: the root holds no capability set, so its allow-set and
+// Landlock view are derived directly from what the supervise code does.
+//
+// **Installation point (SECURITY-CRITICAL — see `boatramp::privsep::supervise`).** seccomp and
+// Landlock are BOTH inherited across `fork`+`execve` and STACK as an INTERSECTION (a child can
+// only ever LOSE access a parent layer dropped, never regain it). So the root MUST install this
+// profile AFTER it has fork+exec'd every instance (each instance forked from an UNCONFINED root
+// and installs its own, broader, per-capability profile post-exec) — installing it BEFORE the
+// spawn loop would cripple every child (no `connect` for a backend, no `accept4` for a frontend,
+// no `mlock` for a signer, no `data_dir`/`kek_file` in the Landlock view). The spawn loop parses
+// no untrusted input, so the one-shot window before the profile installs carries no attack
+// surface; the long-lived supervise loop — where the security value is — runs fully confined.
+
+/// Networking syscalls stripped from the root supervisor's allow-set. After the root has bound
+/// its listeners and created its `socketpair(2)` links (BOTH before the self-profile installs,
+/// and the fd-pass to children is `dup2`-inheritance in the child's `pre_exec`, NOT an
+/// `SCM_RIGHTS` `sendmsg` from the root), the supervise loop does NO network or socket I/O at all
+/// — it only `wait4`s on and signals its children. So the root needs none of the socket family
+/// (`bind`/`listen`/`accept`/`connect` and the send/recv/sockopt verbs), the tightening design
+/// §4.3 calls for ("no network except the socketpairs/listener fds it created").
+const ROOT_NET_STRIP: &[&str] = &[
+    "socket",
+    "socketpair",
+    "bind",
+    "listen",
+    "accept",
+    "accept4",
+    "connect",
+    "getsockname",
+    "getpeername",
+    "getsockopt",
+    "setsockopt",
+    "shutdown",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "sendmmsg",
+    "recvmmsg",
+];
+
+/// Derive the root supervisor's seccomp ALLOW-set (design §4.3): the Phase-0 [`ALLOWED`] baseline
+/// MINUS all networking ([`ROOT_NET_STRIP`]) MINUS key-locking ([`KEY_LOCK`] — the root unseals /
+/// `mlock`s no key material), PLUS [`EXEC_SPAWN`] (`execve`/`execveat` stay ALLOWED — the root is
+/// the long-lived supervisor whose single retained privileged primitive is re-execing
+/// `boatramp __instance`; it is confined NOT by killing `execve` but by the Landlock EXECUTE-pin
+/// to its own binary, see [`root_supervisor_policy`]). Everything else is `EPERM`. The result is
+/// a STRICT SUBSET of `[`whole_process_allowlist`] ∪ {execve, execveat}` and contains none of
+/// `bind`/`listen`/`accept`/`connect`/`mlock`. Sorted + de-duplicated.
+///
+/// The kept groups (process lifecycle, child wiring `dup2`/`fcntl`/`prctl`, memory, signals,
+/// time/sleep, `futex`, event loops, and file-read I/O for tracing + the Landlock-governed config
+/// re-read) cover the supervise loop (`wait4`/`waitid` + sleep), the fail-closed teardown
+/// (`kill` + `wait4`), tracing, and the `fork`(via `clone`)+`execve`+`dup2` re-exec primitive the
+/// restart path needs. The file-read group is kept because Landlock — not seccomp — is the real
+/// FS wall (it confines WHICH files `open` can reach to the config file + own binary only).
+pub fn root_supervisor_allowlist() -> Vec<String> {
+    let strip: BTreeSet<&str> = ROOT_NET_STRIP
+        .iter()
+        .copied()
+        .chain(KEY_LOCK.iter().copied())
+        .collect();
+    let mut set: BTreeSet<String> = ALLOWED
+        .iter()
+        .copied()
+        .filter(|s| !strip.contains(s))
+        .map(str::to_string)
+        .collect();
+    set.extend(EXEC_SPAWN.iter().copied().map(str::to_string));
+    set.into_iter().collect()
+}
+
+/// Derive the root supervisor's seccomp KILL-set (hard `SECCOMP_RET_KILL_PROCESS`): the Phase-0
+/// [`KILL_SURFACE`] EXCEPT `execve`/`execveat`. The root is the long-lived supervisor that
+/// re-execs `boatramp __instance` (on spawn and, when wired, on restart), so killing `execve`
+/// would break it; instead it is Landlock-pinned to its own binary (see [`root_supervisor_policy`])
+/// — a compromised root can re-exec ONLY its own fixed, trusted path, never a shell or arbitrary
+/// binary. The rest of the escape surface (`ptrace`/`mount`/`pivot_root`/`setns`/`unshare`/`bpf`/
+/// the module-load + `keyctl` + `kexec` primitives, and `fork`/`vfork` — inert on glibc/musl,
+/// which route `fork()` through `clone`, but kept as defence-in-depth) stays hard-killed. Sorted
+/// + de-duplicated.
+pub fn root_supervisor_killlist() -> Vec<String> {
+    let set: BTreeSet<String> = KILL_SURFACE
+        .iter()
+        .copied()
+        .filter(|s| !EXEC_SPAWN.contains(s))
+        .map(str::to_string)
+        .collect();
+    set.into_iter().collect()
+}
+
+/// The root supervisor's Landlock FS policy (design §4.3): READ (which, via
+/// [`landlock::AccessFs::from_read`], includes EXECUTE) on the root's OWN binary — so it can
+/// re-exec `boatramp __instance` — plus READ on the config FILE, and NOTHING else. No §1.2 key
+/// input path (KEK / signer key / overlay seed / s3ingress root / cluster root / cert key), no
+/// `data_dir`, no instance state is in the FS view, so the root cannot open a crown-jewel key
+/// file even by accident (design F1/F11-A). The config FILE is granted (not its parent DIR — the
+/// WS-C config-file-grant lesson: a config dir containing `data_dir` would be an over-broad grant).
+///
+/// Both paths MUST already be made absolute + normalized by the caller (the WS-C contract:
+/// [`lexically_normalize`] / `fs::canonicalize`) so the fd-based install grants the real paths.
+/// `read_write_paths` is empty — the root writes nothing. `data_dir` here is INFORMATIONAL only
+/// (carried on [`SandboxPolicy`]; [`install_derived`] grants only `read_only`/`read_write`), set to
+/// the config file so the log line reflects "the root only reads its own config".
+///
+/// NOTE: the EXECUTE-pin is sufficient for a STATICALLY-linked binary (the musl release build) to
+/// re-exec; a dynamically-linked re-exec would additionally need the loader + shared-library paths,
+/// which this profile deliberately excludes. That matters only for a future restart path (not
+/// wired in Phase 1) — see `boatramp::privsep::supervise`.
+pub fn root_supervisor_policy(current_exe: &Path, config_file: &Path) -> SandboxPolicy {
+    SandboxPolicy {
+        // Informational (not granted by `install_derived`); names the only file the root reads.
+        data_dir: config_file.to_path_buf(),
+        read_only_paths: vec![current_exe.to_path_buf(), config_file.to_path_buf()],
+        read_write_paths: Vec::new(),
+    }
+}
+
+/// Derive the root supervisor's complete bespoke self-profile (design §4.3): the tight seccomp
+/// allow/kill lists ([`root_supervisor_allowlist`] / [`root_supervisor_killlist`]) + the Landlock
+/// policy ([`root_supervisor_policy`]). Carried as a [`DerivedProfile`] so the root installs it
+/// through the SAME [`install_derived`] + [`enforce_privsep_status`] machinery every instance uses
+/// (no second install mechanism); the `posture` is [`SandboxPosture::Strict`] (the root's profile
+/// is categorically the tightest). `current_exe` + `config_file` MUST already be normalized.
+pub fn derive_root_profile(current_exe: &Path, config_file: &Path) -> DerivedProfile {
+    DerivedProfile {
+        posture: SandboxPosture::Strict,
+        seccomp_allow: root_supervisor_allowlist(),
+        seccomp_kill: root_supervisor_killlist(),
+        policy: root_supervisor_policy(current_exe, config_file),
+    }
+}
+
 /// The access an instance's held crown-jewel key path needs under Landlock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAccess {
@@ -2500,5 +2646,174 @@ mod privsep_derivation_tests {
             err,
             CompositionGrantError::OverlappingGrants { .. }
         ));
+    }
+
+    // ---- The root supervisor's bespoke self-profile (design §4.3) ----
+
+    #[test]
+    fn root_allowlist_is_a_tight_subset_with_execve_but_no_net_or_keylock() {
+        let allow = root_supervisor_allowlist();
+
+        // `execve`/`execveat` stay ALLOWED — the re-exec of `boatramp __instance` is the root's
+        // single retained privileged primitive (Landlock-pinned, not killed).
+        assert!(
+            has(&allow, "execve") && has(&allow, "execveat"),
+            "the root must retain execve/execveat (Landlock-pinned re-exec primitive)"
+        );
+
+        // No networking at all (the root binds its listeners + creates its socketpairs BEFORE
+        // the profile installs; the supervise loop does no socket I/O) and no key-locking (the
+        // root unseals/mlocks no key material — it is secret-blind).
+        for s in ROOT_NET_STRIP {
+            assert!(
+                !has(&allow, s),
+                "the root must DENY the networking syscall {s}"
+            );
+        }
+        for s in KEY_LOCK {
+            assert!(
+                !has(&allow, s),
+                "the root must DENY the key-lock syscall {s}"
+            );
+        }
+
+        // The supervise loop + fail-closed teardown + tracing + the re-exec wiring all survive.
+        for s in [
+            "wait4",
+            "waitid", // supervise poll + reap
+            "kill",   // teardown SIGKILL
+            "clone",
+            "clone3", // fork(via clone) for spawn/restart
+            "dup2",
+            "dup3",
+            "fcntl", // child pre_exec wiring
+            "prctl", // PR_SET_PDEATHSIG + no_new_privs
+            "close",
+            "read",
+            "write", // tracing + fd close + config re-read
+            "nanosleep",
+            "clock_nanosleep",
+            "futex",
+            "exit_group",
+        ] {
+            assert!(has(&allow, s), "the root supervise/teardown path needs {s}");
+        }
+
+        // Every allowed name is in the Phase-0 baseline ∪ {execve, execveat} — a STRICT SUBSET,
+        // never a superset (the root adds no syscall the monolith doesn't already have except the
+        // deliberately-retained exec family).
+        let baseline: BTreeSet<String> = whole_process_allowlist()
+            .into_iter()
+            .chain(EXEC_SPAWN.iter().map(|s| (*s).to_string()))
+            .collect();
+        for s in &allow {
+            assert!(
+                baseline.contains(s),
+                "the root allow-set must stay within the Phase-0 baseline ∪ exec: {s} is foreign"
+            );
+        }
+        // And it is strictly SMALLER than the baseline (it drops the whole networking + key-lock
+        // surface), proving it is genuinely tighter than Phase 0.
+        assert!(
+            allow.len() < baseline.len(),
+            "the root allow-set must be strictly tighter than the Phase-0 baseline"
+        );
+    }
+
+    #[test]
+    fn root_killlist_keeps_the_escape_surface_but_not_execve() {
+        let kill = root_supervisor_killlist();
+        // execve/execveat are NOT killed (the root re-execs instances) — the exception design
+        // §4.3 carves out.
+        assert!(
+            !has(&kill, "execve") && !has(&kill, "execveat"),
+            "the root must NOT kill execve/execveat (it would break the re-exec primitive)"
+        );
+        // The rest of the escape / code-injection surface stays hard-SIGSYS.
+        for s in [
+            "ptrace",
+            "mount",
+            "pivot_root",
+            "setns",
+            "unshare",
+            "bpf",
+            "keyctl",
+        ] {
+            assert!(
+                has(&kill, s),
+                "the root must still hard-kill the escape syscall {s}"
+            );
+        }
+        // It is exactly KILL_SURFACE minus the exec family.
+        let expected: BTreeSet<String> = KILL_SURFACE
+            .iter()
+            .copied()
+            .filter(|s| !EXEC_SPAWN.contains(s))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(kill.into_iter().collect::<BTreeSet<_>>(), expected);
+    }
+
+    #[test]
+    fn root_policy_grants_only_config_and_own_binary_no_key_no_data_dir() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let config = PathBuf::from("/etc/boatramp/boatramp.cfg");
+        let policy = root_supervisor_policy(&exe, &config);
+
+        // The FS view is EXACTLY the own binary (RO + execute) + the config FILE (RO). Nothing
+        // is read-write — the root writes nothing.
+        assert_eq!(policy.read_only_paths, vec![exe.clone(), config.clone()]);
+        assert!(policy.read_write_paths.is_empty());
+
+        // No §1.2 key input path, no data_dir, no instance state is anywhere in the view — the
+        // root cannot open a crown-jewel key file even by accident (design F1/F11-A).
+        let forbidden = [
+            PathBuf::from("/srv/node/secrets/kek"),
+            PathBuf::from("/srv/node/secrets/signer.sealed"),
+            PathBuf::from("/srv/node/overlay/seed"),
+            PathBuf::from("/var/lib/boatramp/data"), // a data_dir
+            PathBuf::from("/var/lib/boatramp/data/kv"), // a backend state subtree
+        ];
+        let granted: BTreeSet<&PathBuf> = policy
+            .read_only_paths
+            .iter()
+            .chain(policy.read_write_paths.iter())
+            .collect();
+        for f in &forbidden {
+            assert!(
+                !granted.contains(f),
+                "a key/data_dir path must be ABSENT from the root's FS view: {f:?}"
+            );
+            // And not merely absent as an exact entry — no granted path is an ancestor of it.
+            for g in &granted {
+                assert!(
+                    !path_contains(g, f),
+                    "no root grant {g:?} may be an ancestor of the forbidden path {f:?}"
+                );
+            }
+        }
+
+        // The config file is granted as the FILE, not its parent directory (the WS-C
+        // config-file-grant lesson — a config dir could contain data_dir).
+        assert!(policy.read_only_paths.contains(&config));
+        assert!(
+            !policy
+                .read_only_paths
+                .contains(&config.parent().unwrap().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn derive_root_profile_ties_the_bespoke_lists_and_policy_together() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let config = PathBuf::from("/etc/boatramp/boatramp.cfg");
+        let profile = derive_root_profile(&exe, &config);
+        assert_eq!(profile.posture, SandboxPosture::Strict);
+        assert_eq!(profile.seccomp_allow, root_supervisor_allowlist());
+        assert_eq!(profile.seccomp_kill, root_supervisor_killlist());
+        assert_eq!(profile.policy, root_supervisor_policy(&exe, &config));
+        // The profile install path ([`install_derived`]) grants only read_only/read_write — so the
+        // bespoke policy's two RO paths are the complete FS view.
+        assert_eq!(profile.policy.read_only_paths.len(), 2);
     }
 }
