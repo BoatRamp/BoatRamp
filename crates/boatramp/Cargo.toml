@@ -18,6 +18,31 @@ default-run = "boatramp"
 name = "boatramp"
 path = "src/main.rs"
 
+# privsep Phase-3 decision input (PLAN-privsep-fabric-composition.md decision 1): measures the
+# frontend→backend `local`-shape CROSSING cost across the substrate spectrum (socketpair
+# fd-pass / socketpair byte-relay / namespace-isolated / vsock / wasm linear-memory) on the real
+# hot-path primitives, so the owner can pick the Phase-3 frontend substrate with real numbers.
+# `harness = false`: this is a standalone CLI (substrate + payload selectable at runtime), not a
+# `#[bench]`/criterion suite — see `benches/privsep_crossing/main.rs` for the methodology note.
+# Always compiles (musl/CI included); every substrate that needs a live kernel feature
+# (namespaces, AF_VSOCK, a real firecracker guest) self-checks at RUN time and reports N/A with
+# the reason rather than failing the build — mirroring `tests/privsep_live.rs`'s live-gate pattern.
+[[bench]]
+name = "privsep_crossing"
+path = "benches/privsep_crossing/main.rs"
+harness = false
+
+# The firecracker-guest half of the vsock substrate above: a MINIMAL `AF_VSOCK` accept+echo
+# server that chain-execs as the microVM's PID 1 (`rdinit=`) — no shell, no libc init, nothing
+# but this binary. Built for `x86_64-unknown-linux-musl` (statically linked, no dynamic loader)
+# and packed as the initramfs. Deliberately depends on NOTHING beyond `libc` + `std` (via
+# `#[path]`-included `wire.rs`/`vsock_raw.rs`, shared with the main bench binary) so it stays
+# small enough to boot in well under a second. Compiles everywhere (musl/CI included); only
+# actually BOOTED as a guest by the lighthouse-only `vsock-firecracker` substrate run.
+[[bin]]
+name = "privsep-vsock-guest"
+path = "benches/privsep_crossing/vsock_guest_main.rs"
+
 [features]
 # Batteries-included by policy: the **default build enables every non-conflicting
 # feature**, so a plain `cargo build`, the Nix/OCI images, and the release binaries
@@ -509,6 +534,19 @@ async-trait.workspace = true
 boatramp-server.workspace = true
 boatramp-core = { workspace = true, features = ["authz"] }
 tokio = { workspace = true, features = ["rt"] }
+# Substrate 1 (fd-pass) drives the REAL Phase-1 `local` transport
+# (`boatramp_server::privsep_link::LinkEndpoint`), already a dep via `boatramp-server` above — no
+# new dep. Substrates 3 (namespace) and 4 (`AF_VSOCK`) hand-roll their own raw syscalls
+# (consistent with `privsep_link.rs`'s own style) via the existing unconditional `libc` regular
+# dependency below (also shared with the `privsep-vsock-guest` bin target, which needs `libc` as
+# a REGULAR dep — `dev-dependencies` aren't visible to `[[bin]]` targets).
+# Substrate 5: a minimal classic-module wasmtime copy-in/copy-out crossing, deliberately NOT
+# reusing `boatramp-handlers::engine` (the full wasi-http component-model invoke path) — the
+# decision-relevant number is the LINEAR-MEMORY COPY cost alone. `wasmtime` is already a real
+# (optional) dependency via `boatramp-handlers`'s `engine` feature (forwarded by this crate's
+# `handlers` feature, in `default`), so this adds no new transitive dependency, only a plain
+# (non-optional) dev edge so the bench always links it regardless of which features are active.
+wasmtime.workspace = true
 
 # ---------------------------------------------------------------------------
 # OS-native package metadata. Version / license / description /
