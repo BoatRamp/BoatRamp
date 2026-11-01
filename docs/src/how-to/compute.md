@@ -347,6 +347,37 @@ own exit code. It runs against a live, healthy replica; there is no guarantee of
 which replica for a multi-replica workload, so target a single-replica workload (a
 managed database is one) for state-changing commands.
 
+## Bind a workload to a managed data store (`--bind`)
+
+A native compute workload (container/microVM/docker — not a wasm handler) can reach
+the **same** per-site managed data stores a wasm handler sees through
+`wasi:keyvalue`/`wasi:blobstore`/`wasi:messaging`/`sql`, via `compute set --bind
+<kind>[:<name>]` (repeatable):
+
+```sh
+boatramp compute set app --image myapp:latest --port 8080 \
+  --bind sql --bind kv:cache --bind blob:assets --bind messaging:deliver
+```
+
+| Kind | Reaches | Injected env |
+| --- | --- | --- |
+| `sql` / `sql:<name>` | The site's default database, or a named external one. | `BOATRAMP_SQL_URL` |
+| `kv` / `kv:<bucket>` | The per-site `hkv/{site}/…` key/value store (default bucket, or one named bucket). | `BOATRAMP_KV_URL` |
+| `blob` / `blob:<container>` | The per-site `hblob/{site}/…` blob store (default, or one named container). | `BOATRAMP_BLOB_URL` |
+| `messaging` / `messaging:<topic>` | BOTH halves of the project bus — publish AND consume (claim/ack/nack). | `BOATRAMP_MESSAGING_URL` |
+| `invoke` | Compute → function calls. **Declared only** — it parses and round-trips, but no shim backs it yet, so no env is injected (Phase 3). | — |
+
+A bare `kv`/`blob` (no `:<name>`) is **site-wide** — the workload can read/write
+every bucket/container in the site's namespace; a bare `messaging` is
+**project-bus-wide** (any topic). Name a target (`kv:cache`, `blob:assets`,
+`messaging:deliver`) to confine the credential. Each shim binds only the host its
+`[compute].<kind>_shim_url` names (the bridge gateway / loopback, never all
+interfaces) — unset (the default), the corresponding `--bind` kind parses but
+injects no env, so declaring it grants nothing until the operator configures the
+shim. See [`kv_shim_url`/`blob_shim_url`/`messaging_shim_url`/`sql_shim_url` and
+their `*_max_*_bytes` size caps](../reference/boatramp-cfg.md#compute) in the
+config reference.
+
 ## Reach a sibling workload by name (internal DNS)
 
 A workload can reach another workload **in the same project** — or that project's

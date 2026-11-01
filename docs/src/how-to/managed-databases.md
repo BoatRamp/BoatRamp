@@ -134,6 +134,13 @@ routing, and migrations each wait for a configurable readiness level, defaulting
 yet set up). An operator can relax a given gate to `service-ready` with the external
 database config's `readiness_gate` (`answerability` / `routing` / `migration`).
 
+A script or migration tool that would rather poll a plain HTTP endpoint than shell out
+to the CLI can use `GET /api/sql/:db/status` instead — the same readiness vocabulary
+(`pending`/`starting`/`service_ready`/`provisioned`/`provision_failed`), covering
+either a declared (`db declare`) or node-static binding from one place, with a
+`retry_after_secs` hint on any not-yet-usable state. See [Managed SQL
+(operator)](../reference/api.md#managed-sql-operator).
+
 ### Data-dir ownership (why a managed DB is stuck `starting`)
 
 A managed database runs rootless inside its container (Postgres/MySQL as uid `999`), so

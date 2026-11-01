@@ -73,6 +73,38 @@ boatramp dns configure-domain docs.example.com --provider cloudflare --target ap
 pointed CNAME docs.example.com -> app.fly.dev (proxied)
 ```
 
+## Keep verified domains pointed automatically
+
+`dns configure-domain` is a manual, one-shot point. For `--tls acme-dns`, `serve
+--dns-target <addr>` instead runs a **background reconcile loop** that keeps every
+site's verified custom domains (`domain add`/`domain verify`-attached hosts — never
+the `*.deploy.<host>` preview wildcard, which the ACME-DNS setup manages separately)
+pointed at that address, converging on its own without another `configure-domain`
+run per domain:
+
+```sh
+boatramp serve --tls acme-dns --acme-dns-provider cloudflare \
+  --dns-target lb.example.net --dns-reconcile-tick-secs 300 --dns-reconcile-ttl 300
+```
+
+An IPv4/IPv6 literal `--dns-target` becomes an `A`/`AAAA` record on every verified
+host; anything else becomes a `CNAME` — the same convention as `configure-domain
+--target`. The loop:
+
+- is **unset (disabled) by default** — omitting `--dns-target` leaves
+  `dns configure-domain` as the only path, unchanged;
+- only ever touches a host that is currently **verified and attached**; a host that
+  is attached but has since lost verification is left alone (never pointed), and a
+  ledger entry for a host that is no longer attached is retracted;
+- is **leader-gated** on a cluster: only the Raft leader runs a pass, so a follower
+  never double-writes a zone;
+- re-sweeps every `--dns-reconcile-tick-secs` (default `300`) and writes records with
+  TTL `--dns-reconcile-ttl` (default `300`);
+- tracks what it wrote in a per-site, per-host ledger so it can retract a stale
+  record later without clobbering a record something else manages on the same zone;
+- is idempotent and self-healing — a per-host or per-provider failure is logged and
+  retried next tick, never aborts the pass for every other site.
+
 ## Wildcard on Cloudflare: disable Universal SSL first
 
 If you point a **wildcard** (`*.example.com`) at a Cloudflare **DNS-only** (grey-cloud)

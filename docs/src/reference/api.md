@@ -558,7 +558,7 @@ scopes to another project.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/compute` | List compute workloads. |
-| `GET`/`PUT`/`DELETE` | `/api/compute/:name` | Manage one workload. |
+| `GET`/`PUT`/`DELETE` | `/api/compute/:name` | Manage one workload. `DELETE` on a workload backing a managed-SQL dependency another workload still declares **drains** it first (marks its replicas unhealthy so the serve-time gate shields new requests with a retryable `503`, then waits a short grace window for in-flight work) before removing it (PLAN-managed-dependency-readiness WS5); the response body names the drained binding(s) (`{ "drained_dependents": [...] }`) when any were drained, else `204`. |
 | `POST` | `/api/compute/:name/exec` | Run a command inside a running replica (docker-exec style; posture-gated by `allow_compute_exec`). Since 0.3.9. |
 | `POST` | `/api/compute/dev-bind-blob` | Mint a blob-shim `BOATRAMP_BLOB_URL` + token for a non-managed local process (dev/CI). System·Admin; posture-gated by `allow_dev_blob_bind`. |
 | `POST` | `/api/compute/dev-bind-messaging` | Mint a messaging-shim `BOATRAMP_MESSAGING_URL` + token (publish AND consume) for a non-managed local process (dev/CI). System·Admin; posture-gated by `allow_dev_messaging_bind`. |
@@ -605,6 +605,7 @@ writes are additionally posture-gated. Top-level paths target the `default` proj
 | `POST` | `/api/sql/:db/exec` | Run a migration / statement script against the managed database `:db`. |
 | `POST` | `/api/sql/:db/query` | Run a single query and return its rows. |
 | `POST` | `/api/sql/:db/ping` | Active per-replica reachability probe (bypasses the stored-health gate). |
+| `GET` | `/api/sql/:db/status` | The single authoritative **readiness** signal for a managed-SQL binding, covering EITHER a node-static OR a project-declared binding (the same source merge `ping` uses) — one place to poll `pending` / `starting` / `service_ready` / `provisioned` / `provision_failed` (+ `reason`) regardless of which config surface declared the binding; a bring-your-own (`url_env`) binding reports `external` (`managed: false`). A not-ready state carries `retry_after_secs`, the same hint the serve-time `503` advertises. Never opens a connection or runs a query. `501` if no managed SQL is wired on this node. |
 | `POST` | `/api/sql-move` | Relocate a libsql database to a new binding name, data intact — body `{project, site, from, to}`. Node-level `system` · `admin` (not this table's `project` · `deploy`); local single-node only, a remote/sqld backend is refused `422`. Backs `boatramp sql move`. |
 
 ## Schema migrations (owner-gated)

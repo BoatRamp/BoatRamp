@@ -130,6 +130,8 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_BLOB_SHIM_URL` | `compute.blob_shim_url` | Guest-reachable base URL of the compute blob shim (enables a workload's `--bind blob`). |
 | `BOATRAMP_COMPUTE_MESSAGING_SHIM_URL` | `compute.messaging_shim_url` | Guest-reachable base URL of the compute messaging shim (enables a workload's `--bind messaging` — both publish and consume: `/publish`, `/claim`, `/ack`, `/nack`). |
 | `BOATRAMP_COMPUTE_KV_SHIM_URL` | `compute.kv_shim_url` | Guest-reachable base URL of the compute kv shim (enables a workload's `--bind kv` — `/{key}` for the default bucket, `/b/{bucket}/{key}` for a named one). |
+| `BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES` | `compute.blob_shim_max_object_bytes` | Per-object `PUT` ceiling (bytes) for the compute blob-shim; `413` on an oversize `PUT`. Unset ⇒ the shim's built-in default (5 GiB); `0` ⇒ unlimited. |
+| `BOATRAMP_COMPUTE_KV_SHIM_MAX_VALUE_BYTES` | `compute.kv_shim_max_value_bytes` | Per-value `PUT` ceiling (bytes) for the compute kv-shim; `413` on an oversize `PUT`. Unset ⇒ the shim's built-in default (1 MiB); `0` ⇒ unlimited. |
 | `BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE` | `compute.managed_db_privilege` | How a managed DB image runs on a shared-kernel backend: `rootless` (default) or `caps`. |
 | `BOATRAMP_COMPUTE_DOCKER_ENDPOINT` | `compute.docker_endpoint` | Remote-Docker endpoint mode: `published` (default) or `bridge`. |
 | `BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE` | `compute.docker_volume_mode` | Remote-Docker volume mode: `named` (default) or `bind`. |
@@ -168,6 +170,10 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS` | `overrides.allow_guest_private_egress` | Permit a guest's outbound `wasi:http` to reach private/loopback IPs. |
 | `BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS` | `overrides.allow_guest_self_egress` | Permit a guest's outbound `wasi:http` to reach this instance's own serve socket. |
 | `BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA` | `overrides.allow_guest_egress_extra_ca` | Permit the guest egress TLS client to trust an operator-supplied extra CA (`BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE`) on top of the webpki roots. Widens trust, never bypasses verification. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS` | `overrides.allow_guest_tcp_egress` | Permit a guest's gated `wasi:sockets` to open a host-mediated outbound TCP `connect`, and a guest's `dns-resolve` to resolve MX/addresses. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER` | `overrides.allow_guest_tcp_listener` | Permit a host-owned inbound-TCP listener (`[serve.listeners.<name>]`) to dispatch an accepted connection to a guest. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_DNS_PUBLISH` | `overrides.allow_guest_dns_publish` | Permit a guest's `dns-publish` capability to WRITE DNS records through a host-held provider credential (cap-req #24). **Off in every built-in profile.** |
+| `BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS` | `overrides.guest_dns_publish_ns` | Posture for a guest's sub-zone `NS` delegation via `dns-publish`: `none` (refuse all, `multi-tenant` default), `allowlist` (only a `dns_publish_ns_targets`-listed target, `single-tenant` default), or `any` (`dev` default). |
 | `BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES` | `overrides.max_handler_blob_bytes` | Cap on handler blobstore host reads/ranges/copies (`0` = unlimited). |
 | `BOATRAMP_SECURITY_MAX_COMPONENT_BYTES` | `overrides.max_component_bytes` | Cap on a Wasm component blob (`0` = unlimited). |
 | `BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE` | `overrides.oidc_require_audience` | Require an OIDC audience when OIDC is enabled. |
@@ -323,6 +329,9 @@ only — are env-settable too, so wildcard DNS-01 can be configured with no conf
 | `BOATRAMP_ACME_PROPAGATION_WAIT` | `--acme-propagation-wait-secs` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll, not a blind sleep (default `15`). |
 | `BOATRAMP_ACME_PROPAGATION_POLL_INTERVAL` | `--acme-propagation-poll-interval-secs` | DNS-01 only: how often (seconds) to re-check DNS while waiting for the TXT to propagate (default `2`). |
 | `BOATRAMP_ACME_PROPAGATION_RESOLVER` | — | DNS-01 only: override the resolver used for the propagation pre-check with a comma-separated list of `ip[:port]` recursive resolvers (UDP). Absent ⇒ the host's system resolver. Use it when the container's `/etc/resolv.conf` resolver caches negatives aggressively, or to pin a known-good public resolver (e.g. `1.1.1.1,8.8.8.8`). |
+| `BOATRAMP_DNS_TARGET` | `--dns-target` | `--tls acme-dns` only: point every site's verified **custom** domains (never the `*.deploy.<host>` preview wildcard) at this address via a leader-gated background reconcile loop — an IPv4/IPv6 literal becomes an A/AAAA record, anything else a CNAME. Unset (default) disables the loop entirely; `dns configure-domain` remains the manual, one-shot path. See [Automate DNS with a provider](../how-to/auto-dns.md). |
+| `BOATRAMP_DNS_RECONCILE_TICK` | `--dns-reconcile-tick-secs` | How often (seconds) the `--dns-target` reconcile loop re-sweeps every site's verified custom domains (default `300`). Ignored when `--dns-target` is unset. |
+| `BOATRAMP_DNS_RECONCILE_TTL` | `--dns-reconcile-ttl` | TTL (seconds) for the A/AAAA/CNAME records the `--dns-target` reconcile loop writes (default `300`). Ignored when `--dns-target` is unset. |
 
 An **exact** host (an apex/`www`/`console` site or cert) always wins over a wildcard,
 in both host→site routing and SNI cert selection — so `*.example.com` never shadows a
