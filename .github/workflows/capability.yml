@@ -103,7 +103,7 @@ jobs:
   # image (a test-double, not a private artifact) plus a public pgvector image pulled
   # daemonless for the co-located managed-DB seam. No secrets.
   container:
-    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + mysql rls_session + single-vol isolation + single reconcile stability + CRIU (informational)
+    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + mysql rls_session + single-vol isolation + single reconcile stability + turnkey applied-DB migrate + CRIU (informational)
     # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
     # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
     # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
@@ -425,6 +425,42 @@ jobs:
             || { echo "::error::single-mode reconcile stability test did not pass" >&2; exit 1; }
           grep -q 'SINGLE RECONCILE OK:' single-reconcile.log \
             || { echo "::error::single-mode reconcile stability never reached the success marker (silent skip or a v0.3.12 regression?)" >&2; exit 1; }
+
+      - name: Turnkey APPLIED-DB auto-provision + operator migrate holds live (hard gate — the fresh managed-pg chicken-and-egg)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The load-bearing, end-to-end proof that an operator can `migrate` against a FRESH
+          # managed Postgres on a TURNKEY node — the chicken-and-egg PLAN-managed-pg-operator-
+          # provision-default resolves (post-launch provisioning primitive + the readiness split,
+          # shipped v0.45.0/v0.46.0). With an EMPTY node-static `[handlers.bindings.sql.databases]`
+          # map, a managed DB declared through the deploy-store (`boatramp apply`) is launched as
+          # the derived `bramp-db-<digest>` workload: the PRODUCTION `ManagedDbEnv` injector —
+          # built with the EMPTY static map — resolves it from the deploy store, yields a real
+          # sealed `POSTGRES_USER/PASSWORD/DB`, the container `initdb`s, comes healthy, and
+          # reaches `Provisioned`. Then `NodeOperatorSql` (ALSO empty static map) connects with
+          # the SAME sealed credential and a `SELECT` returns the inserted row (init-cred ==
+          # connection-cred), and a `NodeMigrationRunner` resolves the applied db's ENGINE through
+          # the same `resolve_binding` merge point so `sql migrate` preflights the ledger, applies
+          # one step, and idempotently no-ops on re-run. --test-threads=1 so the launch doesn't
+          # contend on the single test bridge. The `sql-postgres` feature pulls the
+          # tenant_sql/managed_sql/migrate data plane in. (Previously this seam had a committed
+          # `#[ignore]` live test but NO CI gate — exactly the "ignore-gated tests ≠ evidence"
+          # trap; this step makes the chicken-and-egg proof a hard, enforced gate.)
+          timeout -k 30 900 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-node --features sql-postgres \
+            --test applied_db_turnkey_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee applied-db-turnkey.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
+          # trap the project's anti-silent-skip rule guards against. Gate on the success marker
+          # that prints ONLY after the applied db got its sealed credential, initdb'd, became
+          # queryable through the operator path, AND `sql migrate` applied + idempotently re-ran
+          # through the resolve_binding engine gate — so a skip or a regression (the credential
+          # injector, the readiness gate, or the migrate engine gate) fails the job.
+          grep -qE 'test result: ok' applied-db-turnkey.log \
+            || { echo "::error::turnkey applied-DB migrate e2e did not pass" >&2; exit 1; }
+          grep -q 'APPLIED-DB TURNKEY OK' applied-db-turnkey.log \
+            || { echo "::error::turnkey applied-DB migrate never reached the success marker (silent skip or a fresh-managed-pg provisioning/migrate regression?)" >&2; exit 1; }
 
       - name: Project export/import round-trip holds live (hard gate — the env-clone pipeline)
         run: |
