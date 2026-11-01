@@ -56,6 +56,21 @@ pub enum SignerError {
     /// Key material failed to parse/load.
     #[error("key: {0}")]
     Key(String),
+    /// A [`SignerConfig::Sealed`] reached [`build_signer`] directly — a sealed signer key is
+    /// resolved OUT OF BAND (the `token.signer` instance asks a `secrets.sealer` to unseal it over
+    /// the privsep feature-link, then builds a [`SignerConfig::Local`] from the plaintext), so it is
+    /// never buildable here. Fail-closed rather than mint a broken signer: under `[privsep]` the
+    /// signer instance resolves `key_ref` itself; a monolith (non-privsep) node must use an
+    /// in-process / KMS signer (a monolith sealed-signer source is a documented follow-on).
+    #[error(
+        "sealed signer key {key_ref:?} must be unsealed by a secrets.sealer over the privsep \
+         feature-link before building a signer — it is not directly buildable (use an in-process \
+         or KMS signer on a non-privsep node)"
+    )]
+    SealedUnresolved {
+        /// The sealed key reference that cannot be built directly.
+        key_ref: String,
+    },
     /// A transport / API error talking to the backend.
     #[error("backend `{backend}`: {message}")]
     Backend {
@@ -94,6 +109,14 @@ pub enum SignerConfig {
     Local {
         /// The private key spec, `"<alg>:<hex>"` (from `boatramp auth init`).
         private_key: String,
+    },
+    /// A **sealed** key source resolved out of band (the "signer-key unlock" owner decision):
+    /// the plaintext is obtained by asking a privsep `secrets.sealer` to unseal `key_ref` over the
+    /// feature-link, then a [`Self::Local`] is built from it. [`build_signer`] REFUSES this variant
+    /// directly ([`SignerError::SealedUnresolved`]) — it is never a buildable backend on its own.
+    Sealed {
+        /// The sealed key reference (`boatramp:<name>` or `path:<file>`).
+        key_ref: String,
     },
     /// A HashiCorp Vault Transit key. Token from `token_env`.
     Vault {
@@ -160,6 +183,11 @@ pub async fn build_signer(config: &SignerConfig) -> Result<Arc<dyn Signer>, Sign
             LocalSigner::from_private_hex(private_key)
                 .map_err(|e| SignerError::Key(e.to_string()))?,
         )),
+        // A sealed signer key is unsealed out of band (privsep sealer over the feature-link) and
+        // then built as a `Local` from the plaintext — it is never buildable directly. Fail-closed.
+        SignerConfig::Sealed { key_ref } => Err(SignerError::SealedUnresolved {
+            key_ref: key_ref.clone(),
+        }),
         #[cfg(feature = "signer-vault")]
         SignerConfig::Vault {
             address,

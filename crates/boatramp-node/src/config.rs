@@ -2204,6 +2204,21 @@ pub enum AuthSignerConfig {
         /// The private key spec, `"<alg>:<hex>"`.
         private_key: String,
     },
+    /// A **sealed** key source resolved NOT inline (the "signer-key unlock" owner decision):
+    /// the control-plane auth-root key is a `[secrets]`-sealed credential the holder resolves at
+    /// boot, never a plaintext value in the config. `key_ref` is a `boatramp:<name>` sealed-store
+    /// reference or a `path:<file>` KEK-sealed key-blob file — the SAME reference scheme the
+    /// S3/blob credentials already use (`parse_secret_ref`). Under `[privsep]` the `token.signer`
+    /// instance does NOT hold the `[secrets]` KEK (that would collapse the `secrets.sealer` ↔
+    /// `token.signer` split); it asks a `secrets.sealer` instance to unseal `key_ref` over the
+    /// feature-link (root-wired, allowlisted), and the composition-closure lint
+    /// (`check_sealed_signer_closure`) requires a `secrets.sealer` reachable from the signer.
+    /// An inline / `env:` value is refused under `[privsep]` by `screen_secret_blind`.
+    Sealed {
+        /// The sealed key reference: `boatramp:<name>` (sealed store) or `path:<file>`
+        /// (KEK-sealed key-blob file). Resolved by the sealer, never inline.
+        key_ref: String,
+    },
     /// HashiCorp Vault Transit key.
     Vault {
         /// Vault base address.
@@ -2265,6 +2280,9 @@ impl AuthSignerConfig {
         match self {
             Self::Local { private_key } => SignerConfig::Local {
                 private_key: private_key.clone(),
+            },
+            Self::Sealed { key_ref } => SignerConfig::Sealed {
+                key_ref: key_ref.clone(),
             },
             Self::Vault {
                 address,

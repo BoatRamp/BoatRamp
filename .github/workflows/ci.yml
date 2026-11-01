@@ -1610,15 +1610,20 @@ jobs:
           grep -q 'SANDBOX LIVE OK' sandbox-live.log \
             || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
 
-  # privsep Phase 1 WS-C 2-INSTANCE COMPOSITION LIVE GATE (marker `PRIVSEP LIVE OK`). Forks the real
-  # `boatramp __root` against a minimal 2-instance `[privsep]` config (a `listen.*` FRONTEND + a
-  # backend/crown-jewel CORE wired by one `local` socketpair link), proving the WHOLE WS-C runtime:
-  # the root screens + lints fail-closed, binds the privileged listener, fork+execs each instance
-  # with its scrubbed env + wired fds; each instance DERIVES + installs its per-capability
-  # seccomp/Landlock profile and refuses unless `Enforced`; the frontend splices an accepted client
-  # fd to the core over SCM_RIGHTS; the core serves a real 200 over the hand-rolled HTTP stack. The
-  # test is `#[ignore]`d (it forks + sandboxes against the live kernel) so `--include-ignored` runs
-  # it. Greps the marker + pass count so a silent skip / compile-out fails the merge.
+  # privsep Phase 1 LIVE GATE — TWO `#[ignore]`d end-to-end tests in `privsep_live.rs`:
+  #  (1) WS-C 2-INSTANCE COMPOSITION (marker `PRIVSEP LIVE OK`): forks `boatramp __root` against a
+  #      minimal `[privsep]` config (a `listen.*` FRONTEND + a backend/crown-jewel CORE wired by one
+  #      `local` socketpair link), proving the WHOLE WS-C runtime — the root screens + lints
+  #      fail-closed, binds the privileged listener, fork+execs each instance with its scrubbed env +
+  #      wired fds; each instance DERIVES + installs its per-capability seccomp/Landlock profile and
+  #      refuses unless `Enforced`; the frontend splices an accepted client fd to the core over
+  #      SCM_RIGHTS; the core serves a real 200 over the hand-rolled HTTP stack.
+  #  (2) SIGNER-KEY UNLOCK (marker `PRIVSEP SIGNER UNSEAL LIVE OK`): forks a 4-instance composition
+  #      with a SEPARATE `secrets.sealer` + `token.signer`; the signer unseals its KEK-sealed key over
+  #      the feature-link under the sealer's fail-closed allowlist, self-tests it, then the node
+  #      serves 200 (FailNodeClosed ⇒ a failed unlock would tear the node down).
+  # Both are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored` runs
+  # them. Greps both markers + the pass count so a silent skip / compile-out fails the merge.
   live-gate-privsep:
     name: live gate (privsep)
     runs-on: ubuntu-latest
@@ -1634,15 +1639,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-privsep-musl
-      - name: "privsep 2-instance composition live gate (socketpair link + SCM_RIGHTS splice + per-instance Enforced sandbox; end-to-end 200)"
+      - name: "privsep live gate (2-instance composition + signer-key unlock: socketpair link + SCM_RIGHTS splice + per-instance Enforced sandbox + sealer→signer unseal; end-to-end 200)"
         run: |
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 1 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 2 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run both tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
-            || { echo "::error::privsep live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
+            || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
+          grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
+            || { echo "::error::privsep signer-key-unlock live gate never reached its marker (a sealer→signer unseal / allowlist / resolver regression)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql

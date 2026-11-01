@@ -50,6 +50,7 @@ use std::path::{Path, PathBuf};
 
 use boatramp_core::privsep::{
     CompositionReport, HostAuthority, PrivsepInstanceConfig, check_composition_closure,
+    check_sealed_signer_closure,
 };
 use boatramp_node::privsep_resolve::{self, SecretBlindReport};
 use serde::{Deserialize, Serialize};
@@ -243,6 +244,13 @@ where
 
     // 2. Composition-closure (F7) — fail-closed, IN THE ROOT, BEFORE any spawn.
     let composition = check_composition_closure(privsep)?;
+
+    // 2b. Sealed-signer closure (the "signer-key unlock" owner decision): a `[serve.signer]` sealed
+    //     key source REQUIRES a `secrets.sealer` reachable from the `token.signer` instance (it
+    //     cannot hold the KEK itself), else the key could never be unsealed. Fail-closed, same error
+    //     surface as the main lint.
+    let sealed_signer = privsep_resolve::sealed_signer_key_ref(cfg).is_some();
+    check_sealed_signer_closure(privsep, sealed_signer)?;
 
     // 3. The per-instance re-exec spawn spec (F11-B minimal env). Reached ONLY after
     //    both gates pass — so a refused composition yields no spawn spec at all.
@@ -598,7 +606,7 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     // serve its slice. The materialization gate (above) is the construction wall; the link
     // mediation + the profile are the other two defence-in-depth layers.
     let fds = PrivsepChildFds::from_env().map_err(fail)?;
-    instance_serve::run(label, &gate, &fds).map_err(|e| fail(e).into())
+    instance_serve::run(label, &gate, &fds, &config).map_err(|e| fail(e).into())
 }
 
 // =============================================================================
@@ -664,6 +672,57 @@ fn instance_listener_addr(
     config.serve.as_ref().and_then(|s| s.addr)
 }
 
+/// Compute the per-instance unseal ALLOWLIST the root wires onto each `secrets.sealer` instance (the
+/// "signer-key unlock" containment): for every feature-link that connects a `secrets.sealer` instance
+/// to a DIFFERENT `token.signer` instance, the sealer end of that link may unseal ONLY the configured
+/// signer `key_ref` over it. The root alone knows the topology; the result is NON-SECRET (names only)
+/// and handed to the sealer via [`boatramp_server::privsep_unseal::PRIVSEP_UNSEAL_ALLOW_ENV`], which
+/// enforces it fail-closed. Returns a map `instance label → its allowlist` for every sealer instance
+/// that has a separately-linked signer (co-resident signer+sealer resolves in-process, needs none).
+///
+/// Pure (host-testable): derived entirely from the resolved [`ServerConfig`].
+fn compute_unseal_allowlists(
+    config: &ServerConfig,
+) -> BTreeMap<String, boatramp_server::privsep_unseal::UnsealAllowlist> {
+    use boatramp_server::privsep_unseal::UnsealAllowlist;
+    let mut out: BTreeMap<String, UnsealAllowlist> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return out;
+    };
+    // Only a SEALED signer source needs the sealer-over-link unlock; AwsKms/ambient/absent need none.
+    let Some(key_ref) = privsep_resolve::sealed_signer_key_ref(config) else {
+        return out;
+    };
+    let holds = |label: &str, authority: HostAuthority| -> bool {
+        privsep
+            .instances
+            .get(label)
+            .is_some_and(|i| i.capabilities.contains(&authority))
+    };
+    for (link_name, link) in &privsep.links {
+        // A self-link, or a link between two instances that are the same label, wires nothing.
+        if link.from == link.to {
+            continue;
+        }
+        // The SEALER end of a sealer↔(separate)signer link may unseal the signer key ref over it.
+        if holds(&link.from, HostAuthority::SecretsSealer)
+            && holds(&link.to, HostAuthority::TokenSigner)
+        {
+            out.entry(link.from.clone())
+                .or_default()
+                .allow(link_name.clone(), key_ref.to_string());
+        }
+        if holds(&link.to, HostAuthority::SecretsSealer)
+            && holds(&link.from, HostAuthority::TokenSigner)
+        {
+            out.entry(link.to.clone())
+                .or_default()
+                .allow(link_name.clone(), key_ref.to_string());
+        }
+    }
+    out
+}
+
 // =============================================================================
 // The root supervisor: socketpair wiring + privileged listener bind + fork/exec + supervise
 // =============================================================================
@@ -691,6 +750,11 @@ mod supervise {
             .ok_or_else(|| err("no [privsep] section at supervise time".to_string()))?;
         let current_exe =
             std::env::current_exe().map_err(|e| err(format!("resolving current exe: {e}")))?;
+
+        // The per-sealer unseal allowlist (the signer-key-unlock containment): the root wires each
+        // `secrets.sealer` instance the exact names each of its links' peers may unseal. NON-SECRET
+        // (names only), handed in via an env var alongside the fd map.
+        let unseal_allowlists = super::compute_unseal_allowlists(config);
 
         // 1. A root-created socketpair(2) per `local` link; one end to each endpoint instance.
         //    `tcp`/`overlay` carry their own endpoint arrangement — not wired in the Phase-1 cut
@@ -782,6 +846,13 @@ mod supervise {
             };
             let mut cmd = spec.to_command(&current_exe);
             cmd.env(super::PRIVSEP_FDS_ENV, wiring.fds.to_env_value());
+            // A `secrets.sealer` instance also gets its root-wired unseal allowlist (names only).
+            if let Some(allow) = unseal_allowlists.get(&spec.label) {
+                cmd.env(
+                    boatramp_server::privsep_unseal::PRIVSEP_UNSEAL_ALLOW_ENV,
+                    allow.to_env_value(),
+                );
+            }
             let dups = wiring.dups.clone();
             // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are
             // async-signal-safe and touch only this child's fd table + death-signal. The target
@@ -899,33 +970,67 @@ mod supervise {
 mod instance_serve {
     use std::net::SocketAddr;
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::sync::Arc;
 
+    use boatramp_core::privsep::HostAuthority;
     use boatramp_server::privsep_link::LinkEndpoint;
+    use boatramp_server::privsep_unseal::{
+        EnvelopeSealedFileResolver, SealedKeyResolver, UnsealAllowlist,
+    };
 
-    use super::{MaterializationGate, PrivsepChildFds};
+    use super::{MaterializationGate, PrivsepChildFds, ServerConfig, privsep_resolve};
 
     /// Serve one instance's slice over its root-wired fds (design §2.1 steps 5-6). The Phase-1
-    /// minimal-but-real path demonstrating a 2-instance composition end-to-end:
-    /// - a `listen.*` instance (has a listener fd) ACCEPTS on the inherited listener and splices
-    ///   each accepted CLIENT connection fd to the backend over the local link (`SCM_RIGHTS`);
-    /// - a backend instance (has a link, no listener) RECEIVES those client fds and serves each
-    ///   with the hand-rolled HTTP stack (`boatramp_http::serve_connection`) — the SAME serving
-    ///   machinery the monolith uses, with a minimal handler (the full authority-scoped app router
-    ///   is the authority-serve follow-on);
-    /// - any other instance (e.g. a signer awaiting authority calls) holds its authorities inert
-    ///   and parks (the per-capability authority-API grammar over the link is WS-E).
+    /// minimal-but-real path. Roles, dispatched from the instance's capability set + its wired fds:
+    /// - a SIGNER (`token.signer` with a `[serve.signer] = Sealed` source) UNLOCKS its signing key
+    ///   first — it asks the `secrets.sealer` to unseal it over the feature-link (or resolves it
+    ///   in-process if it co-resides the sealer), builds the signer, verifies it works, then holds
+    ///   it inert (its mint grammar is WS-E). A failed unlock EXITS → `FailNodeClosed`;
+    /// - a SEALER (`secrets.sealer` with a root-wired unseal allowlist) SERVES unseal requests on
+    ///   each allowlisted link, enforcing the allowlist fail-closed;
+    /// - a `listen.*` FRONTEND (has a listener fd) ACCEPTS on the inherited listener and splices each
+    ///   accepted CLIENT connection fd to the backend over the local link (`SCM_RIGHTS`);
+    /// - a BACKEND (has a client-fd link, no listener) RECEIVES those client fds and serves each with
+    ///   the hand-rolled HTTP stack (the full authority-scoped app router is the authority-serve
+    ///   follow-on);
+    /// - any other instance holds its authorities inert and parks.
     pub(super) fn run(
         label: &str,
         gate: &MaterializationGate,
         fds: &PrivsepChildFds,
+        config: &ServerConfig,
     ) -> Result<(), String> {
+        let allowlist = UnsealAllowlist::from_env()?;
+        let signer_key_ref = privsep_resolve::sealed_signer_key_ref(config);
         tracing::info!(
             instance = %label,
             held = gate.held().count(),
             links = fds.links.len(),
             listener = fds.listener.is_some(),
+            sealer = gate.may_materialize(HostAuthority::SecretsSealer),
+            signer = gate.may_materialize(HostAuthority::TokenSigner),
+            unseal_allowlist_links = allowlist.by_link.len(),
             "[privsep] instance: opening its root-wired links + serving its slice"
         );
+
+        // SIGNER-key unlock FIRST (fail-closed): a `token.signer` instance with a sealed source must
+        // obtain + verify its key before anything serves. A failure here exits the instance → the
+        // root's FailNodeClosed tears the node down rather than serving with a dead signer.
+        if gate.may_materialize(HostAuthority::TokenSigner)
+            && let Some(key_ref) = signer_key_ref
+        {
+            run_signer_unlock(label, gate, fds, config, key_ref)?;
+            // The signer holds its (now-unlocked) authority inert in Phase 1 (its mint grammar over
+            // the link is WS-E) — park after a successful unlock + self-test.
+            tracing::info!(instance = %label, "[privsep] signer: key unlocked + verified; holding it inert (mint grammar is WS-E)");
+            park();
+        }
+
+        // SEALER: serve unseal requests on each allowlisted link, fail-closed.
+        if gate.may_materialize(HostAuthority::SecretsSealer) && !allowlist.is_empty() {
+            return run_sealer(label, fds, config, &allowlist);
+        }
+
         if let Some(listener_fd) = fds.listener {
             let link_fd = *fds.links.values().next().ok_or_else(|| {
                 "a listener instance has no feature-link to forward client connections over \
@@ -941,10 +1046,193 @@ mod instance_serve {
                 "[privsep] instance: no listener/link to serve in the Phase-1 cut — holding its \
                  authorities inert (its authority-API grammar over the link is WS-E)"
             );
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
-            }
+            park()
         }
+    }
+
+    /// Park forever (an instance whose authorities are held inert in the Phase-1 cut). Never returns.
+    fn park() -> ! {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    /// Build the `secrets.sealer` instance's `[secrets]` KEK envelope (`LocalKek` from `kek_file`, the
+    /// only envelope legal under `[privsep]` — the Vault envelope reads a live token the root may not
+    /// courier, refused by the secret-blind screen). The kek_file is `[secrets].kek_file` or the
+    /// `<data_dir>/secrets/kek` default — in the sealer's Landlock grant (`secrets.sealer` holds it).
+    fn build_secrets_envelope(
+        config: &ServerConfig,
+    ) -> Result<Arc<dyn boatramp_core::envelope::KeyEnvelope>, String> {
+        use boatramp_server::envelope::{EnvelopeSpec, build_envelope};
+        let data_dir = {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            super::normalized_data_dir(config, &cwd)
+        };
+        let kek_file = config
+            .secrets
+            .as_ref()
+            .and_then(|s| s.kek_file.clone())
+            .unwrap_or_else(|| data_dir.join("secrets/kek"));
+        build_envelope(EnvelopeSpec::Local { kek_file })
+            .map_err(|e| format!("building the [secrets] KEK envelope: {e}"))?
+            .ok_or_else(|| "the [secrets] KEK envelope resolved to none (expected a local KEK)".to_string())
+    }
+
+    /// Build the sealer's [`SealedKeyResolver`] for `key_ref`. Phase-1 cut: a `path:<file>` KEK-sealed
+    /// key blob is resolved via the `[secrets]` KEK envelope (the live form). A `boatramp:<name>`
+    /// sealed-STORE ref needs the control-plane KV, whose lifecycle belongs to the authority-scoped
+    /// backend serve (the follow-on) — building it here would double-open the single-writer store —
+    /// so it is refused fail-closed at runtime (the `SecretStoreResolver` is implemented + unit-tested
+    /// and wires in with that follow-on).
+    fn build_sealer_resolver(
+        config: &ServerConfig,
+        key_ref: &str,
+    ) -> Result<Arc<dyn SealedKeyResolver>, String> {
+        if key_ref.starts_with("path:") {
+            let envelope = build_secrets_envelope(config)?;
+            Ok(Arc::new(EnvelopeSealedFileResolver::new(envelope)))
+        } else if key_ref.starts_with("boatramp:") {
+            Err(format!(
+                "sealed-store signer key {key_ref:?} resolution in the sealer needs the \
+                 control-plane KV (owned by the authority-scoped backend serve — a follow-on); use \
+                 a `path:<file>` KEK-sealed key under [privsep] Phase 1"
+            ))
+        } else {
+            Err(format!(
+                "unsupported sealed signer reference {key_ref:?} (want `boatramp:<name>` or `path:<file>`)"
+            ))
+        }
+    }
+
+    /// A `token.signer` instance: UNLOCK its sealed signing key, then prove it works. If this instance
+    /// also holds `secrets.sealer` (co-resident), resolve the key IN-PROCESS (it holds the KEK); else
+    /// ask the sealer to unseal it over the single feature-link (`request_unseal`). Then build a
+    /// [`boatramp_core::cose::LocalSigner`] and run a sign+verify self-test (the key is live + usable).
+    /// Fail-closed: any error returns `Err` → the instance exits → FailNodeClosed.
+    fn run_signer_unlock(
+        label: &str,
+        gate: &MaterializationGate,
+        fds: &PrivsepChildFds,
+        config: &ServerConfig,
+        key_ref: &str,
+    ) -> Result<(), String> {
+        use boatramp_core::cose::{LocalSigner, Signer};
+
+        // Obtain the plaintext key spec (`"<alg>:<hex>"`), held zeroizing (both arms return the
+        // `Zeroizing<Vec<u8>>` from the resolver / the unseal client).
+        let spec_bytes =
+            if gate.may_materialize(HostAuthority::SecretsSealer) {
+                // Co-resident signer+sealer: resolve in-process (it holds the KEK) — no link.
+                tracing::info!(instance = %label, "[privsep] signer: co-resident with the sealer — resolving its key in-process");
+                let resolver = build_sealer_resolver(config, key_ref)?;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("building a runtime for in-process unseal: {e}"))?;
+                rt.block_on(resolver.resolve(key_ref))?
+            } else {
+                // Split signer: ask the sealer over its single feature-link.
+                let (lname, link_fd) = fds.links.iter().next().ok_or_else(|| {
+                    "a sealed-key signer instance has no feature-link to a secrets.sealer (the \
+                     composition-closure lint requires one)"
+                        .to_string()
+                })?;
+                tracing::info!(instance = %label, link = %lname, "[privsep] signer: asking the sealer to unseal its signing key over the link");
+                // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+                let link = unsafe { LinkEndpoint::from_inherited_fd(*link_fd) };
+                boatramp_server::privsep_unseal::request_unseal(&link, key_ref)
+                    .map_err(|e| format!("unsealing the signing key over the link: {e}"))?
+            };
+
+        // The unsealed bytes are a `"<alg>:<hex>"` signer spec.
+        let spec = std::str::from_utf8(&spec_bytes)
+            .map_err(|_| "the unsealed signer key is not valid UTF-8 (expected `<alg>:<hex>`)".to_string())?;
+        let signer = LocalSigner::from_private_hex(spec)
+            .map_err(|e| format!("loading the unsealed signing key: {e}"))?;
+
+        // Self-test: sign + verify a fixed message so a bad/wrong key fails NOW (fail-closed), not at
+        // first mint. Proves the unlocked key is live and usable end-to-end.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("building a runtime for the signer self-test: {e}"))?;
+        const SELF_TEST: &[u8] = b"privsep signer-key unlock self-test";
+        let sig = rt
+            .block_on(signer.sign(SELF_TEST))
+            .map_err(|e| format!("signing the self-test with the unlocked key: {e}"))?;
+        signer
+            .public_key()
+            .verify(SELF_TEST, &sig)
+            .map_err(|e| format!("verifying the self-test signature (the unlocked key is bad): {e}"))?;
+
+        // The marker the live gate greps: only reached after a real unseal + a live sign/verify.
+        tracing::info!(instance = %label, "[privsep] PRIVSEP SIGNER UNSEAL OK");
+        Ok(())
+    }
+
+    /// A `secrets.sealer` instance: serve unseal requests on each root-wired allowlisted link,
+    /// enforcing the allowlist fail-closed (a request for a name not on a link's allowlist is refused,
+    /// logged, no bytes). One blocking serve thread per allowlisted link; after they end (peers gone)
+    /// the instance holds its remaining authorities inert and parks.
+    fn run_sealer(
+        label: &str,
+        fds: &PrivsepChildFds,
+        config: &ServerConfig,
+        allowlist: &UnsealAllowlist,
+    ) -> Result<(), String> {
+        // One envelope-backed resolver, shared across the per-link serve threads. The resolver is
+        // scheme-dispatched per request by `key_ref`; the allowlist has already been built from the
+        // signer key ref, so build the resolver for whichever scheme those names use.
+        let any_name = allowlist
+            .by_link
+            .values()
+            .flat_map(|s| s.iter())
+            .next()
+            .cloned()
+            .ok_or_else(|| "sealer has an empty unseal allowlist (nothing to serve)".to_string())?;
+        let resolver = build_sealer_resolver(config, &any_name)?;
+
+        let mut threads = Vec::new();
+        for (link_name, allowed) in &allowlist.by_link {
+            if allowed.is_empty() {
+                continue;
+            }
+            let Some(link_fd) = fds.links.get(link_name).copied() else {
+                return Err(format!(
+                    "the unseal allowlist names link {link_name:?}, but the root wired no such link \
+                     fd to this sealer instance"
+                ));
+            };
+            let link_name = link_name.clone();
+            let allowed = allowed.clone();
+            let resolver = resolver.clone();
+            let label = label.to_string();
+            threads.push(std::thread::spawn(move || {
+                // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+                let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] sealer: runtime build failed");
+                        return;
+                    }
+                };
+                tracing::info!(instance = %label, link = %link_name, allowed = ?allowed, "[privsep] sealer: serving unseal requests (fail-closed allowlist)");
+                if let Err(e) = rt.block_on(boatramp_server::privsep_unseal::serve_unseal(
+                    &link_name, &link, &allowed, resolver.as_ref(),
+                )) {
+                    tracing::error!(instance = %label, link = %link_name, error = %e, "[privsep] sealer: unseal serve ended with an error");
+                }
+            }));
+        }
+        tracing::info!(instance = %label, serve_links = threads.len(), "[privsep] sealer: unseal servers up; holding its other authorities inert");
+        for t in threads {
+            let _ = t.join();
+        }
+        // The signer(s) got their key(s) and hold the link(s); the sealer parks (its other authorities
+        // are inert in the Phase-1 cut).
+        park()
     }
 
     /// A `listen.*` frontend: accept on the inherited listener fd and splice each accepted client
@@ -1059,12 +1347,13 @@ mod instance_serve {
 
 #[cfg(not(unix))]
 mod instance_serve {
-    use super::{MaterializationGate, PrivsepChildFds};
+    use super::{MaterializationGate, PrivsepChildFds, ServerConfig};
 
     pub(super) fn run(
         _label: &str,
         _gate: &MaterializationGate,
         _fds: &PrivsepChildFds,
+        _config: &ServerConfig,
     ) -> Result<(), String> {
         Err(
             "privsep instance serving (socketpair/SCM_RIGHTS) is Unix-only; privsep is Linux-only \
@@ -1367,6 +1656,83 @@ mod tests {
         assert!(dropped.contains(&HostAuthority::SecretsSealer));
         assert!(!dropped.contains(&HostAuthority::ListenHttpParse));
         assert_eq!(dropped.len(), HostAuthority::ALL.len() - 2);
+    }
+
+    // ---- signer-key unlock: the root-wired per-link unseal allowlist ----
+
+    /// A split composition: edge=C∪D∪E, data=B, sealer=A∖{token.signer}, signer={token.signer},
+    /// with a `to-signer` link between the sealer and the signer.
+    fn split_signer_privsep() -> PrivsepConfig {
+        let mut p = clean_privsep();
+        // Remove the all-A "signer" instance; replace with a split sealer + signer.
+        p.instances.remove("signer");
+        p.instances.insert(
+            "sealer".to_string(),
+            inst(
+                &[
+                    HostAuthority::SecretsSealer,
+                    HostAuthority::ImageSigner,
+                    HostAuthority::OverlayDialSigner,
+                    HostAuthority::S3IngressRoot,
+                    HostAuthority::ClusterJoinSigner,
+                ],
+                &["to-signer"],
+            ),
+        );
+        p.instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["to-signer"]),
+        );
+        // edge's `to-signer` link in clean_privsep connected edge→signer; rewire for the split.
+        p.instances.get_mut("edge").unwrap().links = vec![];
+        p.links.clear();
+        p.links.insert(
+            "to-signer".to_string(),
+            PrivsepLink {
+                from: "sealer".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+            },
+        );
+        p
+    }
+
+    #[test]
+    fn unseal_allowlist_wires_only_the_sealer_end_of_a_sealer_signer_link() {
+        let mut cfg = cfg_with(Some(split_signer_privsep()));
+        cfg.serve.as_mut().unwrap().signer = Some(config::AuthSignerConfig::Sealed {
+            key_ref: "path:/srv/node/secrets/signer.sealed".to_string(),
+        });
+        let allow = compute_unseal_allowlists(&cfg);
+        // The SEALER end is wired to unseal the signer key ref over `to-signer`.
+        let sealer_allow = allow.get("sealer").expect("sealer has an allowlist");
+        assert!(sealer_allow.permits("to-signer", "path:/srv/node/secrets/signer.sealed"));
+        // The SIGNER end gets NO allowlist (it is the asker, not the sealer).
+        assert!(!allow.contains_key("signer"));
+        // A name not wired, or the wrong link, is denied.
+        assert!(!sealer_allow.permits("to-signer", "boatramp:something-else"));
+        assert!(!sealer_allow.permits("to-core", "path:/srv/node/secrets/signer.sealed"));
+    }
+
+    #[test]
+    fn unseal_allowlist_is_empty_for_a_non_sealed_signer() {
+        // No `[serve.signer]` sealed source ⇒ no allowlist wired at all (AwsKms/ambient/absent).
+        let cfg = cfg_with(Some(split_signer_privsep()));
+        assert!(compute_unseal_allowlists(&cfg).is_empty());
+    }
+
+    #[test]
+    fn unseal_allowlist_empty_when_signer_co_resides_the_sealer() {
+        // clean_privsep's "signer" holds BOTH secrets.sealer and token.signer → it resolves its key
+        // in-process; no cross-instance link, so no allowlist is wired.
+        let mut cfg = cfg_with(Some(clean_privsep()));
+        cfg.serve.as_mut().unwrap().signer = Some(config::AuthSignerConfig::Sealed {
+            key_ref: "path:/srv/node/secrets/signer.sealed".to_string(),
+        });
+        assert!(
+            compute_unseal_allowlists(&cfg).is_empty(),
+            "a co-resident signer+sealer needs no root-wired cross-link allowlist"
+        );
     }
 
     // ---- WS-C: the root→instance fd-pass contract ----

@@ -229,7 +229,7 @@ const RAW_SECRET_VALUE_FIELDS: &[&str] = &[
 /// ([`SecretBlindViolation::UncourierableSecretReference`]). These are the Security-review
 /// Finding 2 gaps: `secret_access_key` was declared "specially handled" but checked by
 /// nothing, and `url_secret` was absent from the screen entirely.
-const REFERENCE_SHAPED_SECRET_FIELDS: &[&str] = &["secret_access_key", "url_secret"];
+const REFERENCE_SHAPED_SECRET_FIELDS: &[&str] = &["secret_access_key", "url_secret", "key_ref"];
 
 /// Config field names whose VALUE is the NAME of an env var carrying a live secret (a
 /// bring-your-own DB connection URL/password, a KMS/admin/signer token, a PKCS#11 PIN).
@@ -405,8 +405,38 @@ fn env_token_signer_variant(signer: &AuthSignerConfig) -> Option<&'static str> {
         AuthSignerConfig::GcpKms { .. } => Some("GcpKms"),
         AuthSignerConfig::AzureKv { .. } => Some("AzureKv"),
         AuthSignerConfig::Pkcs11 { .. } => Some("Pkcs11"),
-        AuthSignerConfig::Local { .. } | AuthSignerConfig::AwsKms { .. } => None,
+        // `Sealed` carries a `boatramp:`/`path:` REFERENCE (screened by the reference-shaped
+        // walk via `key_ref`), not an env token — supported under `[privsep]`. `Local` carries a
+        // raw `private_key` caught by the raw-value walk.
+        AuthSignerConfig::Local { .. }
+        | AuthSignerConfig::AwsKms { .. }
+        | AuthSignerConfig::Sealed { .. } => None,
     }
+}
+
+/// The sealed signer key reference, if `[serve.signer]` is the [`AuthSignerConfig::Sealed`] variant
+/// (a `boatramp:<name>` or `path:<file>` reference the `token.signer` instance resolves via a
+/// `secrets.sealer` over the feature-link). `None` for any other signer (in-process / KMS / absent).
+/// The root derives the sealed-signer composition-closure fact + the per-link unseal allowlist from
+/// this (the wasm-clean types layer does not see `AuthSignerConfig`).
+#[must_use]
+pub fn sealed_signer_key_ref(cfg: &ServerConfig) -> Option<&str> {
+    match cfg.serve.as_ref()?.signer.as_ref()? {
+        AuthSignerConfig::Sealed { key_ref } => Some(key_ref.as_str()),
+        _ => None,
+    }
+}
+
+/// The on-disk FILE path a `[serve.signer] = Sealed { key_ref: "path:<file>" }` names — the
+/// KEK-sealed signer-key blob the SEALER reads + unwraps. `None` for a `boatramp:<name>`
+/// (sealed-store) source or any non-sealed signer. Used to grant that file READ-ONLY to the
+/// `secrets.sealer` holder (never the `token.signer` holder — the signer never has it on disk).
+#[must_use]
+pub fn sealed_signer_key_file(cfg: &ServerConfig) -> Option<PathBuf> {
+    sealed_signer_key_ref(cfg)
+        .and_then(|r| r.strip_prefix("path:"))
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Count the opaque secret REFERENCES the root carries (path / env-name) for the
@@ -418,7 +448,10 @@ fn count_opaque_references(cfg: &ServerConfig) -> usize {
         n += usize::from(serve.s3_ingress_secret_file.is_some());
         n += usize::from(matches!(
             &serve.signer,
-            Some(AuthSignerConfig::AwsKms { .. })
+            // An AwsKms signer carries a key-ARN reference; a Sealed signer carries a
+            // `boatramp:`/`path:` sealed-key reference — both are opaque refs the root carries,
+            // never dereferences.
+            Some(AuthSignerConfig::AwsKms { .. } | AuthSignerConfig::Sealed { .. })
         ));
     }
     if let Some(secrets) = &cfg.secrets {
@@ -715,7 +748,13 @@ pub fn resolve_key_input_paths(cfg: &ServerConfig, data_dir: &Path) -> KeyInputP
     });
     KeyInputPaths {
         kek_file,
-        // AwsKms-ambient / sealed-cred in Phase 1 (no plaintext key file to grant). Follow-on.
+        // A `[serve.signer] = Sealed { key_ref: "path:<file>" }` names a KEK-sealed signer-key
+        // blob the SEALER reads + unwraps; grant that file READ-ONLY to the `secrets.sealer`
+        // holder (never the signer, which gets the plaintext over the link). `boatramp:<name>`
+        // (sealed-store) + non-sealed signers resolve without a dedicated file ⇒ `None`.
+        sealed_signer_key_file: sealed_signer_key_file(cfg),
+        // AwsKms-ambient / sealed-cred in Phase 1 (no PLAINTEXT signer key file to grant: a Sealed
+        // signer's key is never on the signer's disk — it arrives over the link). Follow-on.
         token_signer_key: None,
         image_signer_key: None,
         overlay_seed,
@@ -961,6 +1000,145 @@ mod tests {
             region: None,
         }))
         .expect("AwsKms (ambient IAM) signer accepted");
+    }
+
+    #[test]
+    fn sealed_signer_accepts_boatramp_and_path_refs_refuses_raw_and_env() {
+        let mk = |key_ref: &str| {
+            let mut cfg = serve_only();
+            cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::Sealed {
+                key_ref: key_ref.to_string(),
+            });
+            cfg
+        };
+        // Accepted: a sealed-store ref + a KEK-sealed key-file path (the signer resolves these NOT
+        // inline — via the sealer over the link).
+        screen_secret_blind(&mk("boatramp:auth-root-signer"))
+            .expect("a boatramp: sealed signer ref is accepted");
+        screen_secret_blind(&mk("path:/var/lib/boatramp/secrets/signer.sealed"))
+            .expect("a path: sealed signer-key file is accepted");
+        // Refused (the root is secret-blind + the no-courier rule): a raw inline spec, or an `env:`
+        // live reference the root would have to courier. Caught via the reference-shaped `key_ref`.
+        let raw = screen_secret_blind(&mk("es256:deadbeef")).unwrap_err();
+        assert!(
+            raw.violations.iter().any(|v| matches!(
+                v,
+                SecretBlindViolation::UncourierableSecretReference { field, .. }
+                    if field == "key_ref"
+            )),
+            "a raw inline sealed-signer key_ref is refused: {raw}"
+        );
+        assert!(
+            screen_secret_blind(&mk("env:AUTH_ROOT_KEY")).is_err(),
+            "an env: sealed-signer key_ref is uncourierable under [privsep]"
+        );
+    }
+
+    #[test]
+    fn sealed_signer_key_ref_and_file_helpers() {
+        let mut cfg = serve_only();
+        assert_eq!(sealed_signer_key_ref(&cfg), None);
+        assert_eq!(sealed_signer_key_file(&cfg), None);
+
+        cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::Sealed {
+            key_ref: "path:/keys/signer.sealed".to_string(),
+        });
+        assert_eq!(sealed_signer_key_ref(&cfg), Some("path:/keys/signer.sealed"));
+        assert_eq!(
+            sealed_signer_key_file(&cfg),
+            Some(PathBuf::from("/keys/signer.sealed"))
+        );
+
+        cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::Sealed {
+            key_ref: "boatramp:auth-root".to_string(),
+        });
+        assert_eq!(sealed_signer_key_ref(&cfg), Some("boatramp:auth-root"));
+        // A boatramp: (sealed-store) ref has no dedicated on-disk file to grant.
+        assert_eq!(sealed_signer_key_file(&cfg), None);
+
+        // A non-sealed signer yields neither.
+        cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::AwsKms {
+            key_id: "arn:...".to_string(),
+            region: None,
+        });
+        assert_eq!(sealed_signer_key_ref(&cfg), None);
+        assert_eq!(sealed_signer_key_file(&cfg), None);
+    }
+
+    #[test]
+    fn sealed_signer_path_file_is_granted_to_the_sealer_not_the_signer() {
+        use boatramp_server::sandbox;
+        // A `path:` sealed signer-key file must be in the SEALER's FS view (read-only), and MUST
+        // NOT leak into a non-sealer instance (e.g. the token.signer holder). Place it outside the
+        // backend state subtrees (a dedicated secrets dir) so the leak check is clean for holders.
+        let mut cfg = serve_only();
+        cfg.serve.as_mut().unwrap().data_dir = Some(PathBuf::from("/srv/node"));
+        cfg.serve.as_mut().unwrap().signer = Some(AuthSignerConfig::Sealed {
+            key_ref: "path:/srv/node/secrets/signer.sealed".to_string(),
+        });
+        // Also give the sealer a `[secrets]` KEK (it holds secrets.sealer).
+        cfg.secrets = Some(crate::config::SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: Some(PathBuf::from("/srv/node/secrets/kek")),
+            vault: None,
+        });
+
+        // The SEALER (holds secrets.sealer) is granted the sealed signer-key file read-only.
+        let sealer_caps = [HostAuthority::SecretsSealer];
+        let sealer_inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &sealer_caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+        );
+        assert_eq!(
+            sealer_inputs.keys.sealed_signer_key_file,
+            Some(PathBuf::from("/srv/node/secrets/signer.sealed"))
+        );
+        let sealer_held: std::collections::BTreeSet<HostAuthority> =
+            sealer_caps.iter().copied().collect();
+        let sealer_profile = sandbox::derive_profile(
+            &sealer_held,
+            boatramp_core::privsep::SandboxPosture::Derived,
+            &sealer_inputs,
+        )
+        .expect("sealer derives a clean profile");
+        assert!(
+            sealer_profile
+                .policy
+                .read_only_paths
+                .contains(&PathBuf::from("/srv/node/secrets/signer.sealed")),
+            "the sealer is granted the sealed signer-key file read-only"
+        );
+
+        // The SIGNER (holds token.signer, NOT secrets.sealer) must NOT be granted it — and since it
+        // has no FS grant that is an ancestor of the file, derivation is clean (the file is simply
+        // absent from its view). A HYPOTHETICAL over-broad grant WOULD be refused by the key-leak
+        // check (proven by the sandbox crate's CrownJewelKeyLeak tests).
+        let signer_caps = [HostAuthority::TokenSigner];
+        let signer_inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &signer_caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+        );
+        let signer_held: std::collections::BTreeSet<HostAuthority> =
+            signer_caps.iter().copied().collect();
+        let signer_profile = sandbox::derive_profile(
+            &signer_held,
+            boatramp_core::privsep::SandboxPosture::Derived,
+            &signer_inputs,
+        )
+        .expect("signer derives a clean profile (the sealed key file is not in its view)");
+        assert!(
+            !signer_profile
+                .policy
+                .read_only_paths
+                .iter()
+                .chain(signer_profile.policy.read_write_paths.iter())
+                .any(|p| p == &PathBuf::from("/srv/node/secrets/signer.sealed")),
+            "the signer never has the sealed signer-key file on disk"
+        );
     }
 
     #[test]

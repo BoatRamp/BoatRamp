@@ -662,6 +662,24 @@ pub enum CompositionViolation {
         /// The unresolved link name.
         link: String,
     },
+    /// `[serve.signer]` is a SEALED key source (resolved NOT inline — the `token.signer`
+    /// instance asks a `secrets.sealer` instance to unseal its key over the feature-link,
+    /// per the "signer-key unlock" owner decision), but NO instance in the composition holds
+    /// `secrets.sealer` — the signer's key could never be unsealed. Fail-closed
+    /// ([`check_sealed_signer_closure`]).
+    SealedSignerWithoutSealer {
+        /// The instance(s) holding `token.signer` (the signer that could not be unlocked).
+        signer_instances: Vec<String>,
+    },
+    /// A `token.signer` instance with a SEALED key source does NOT itself hold
+    /// `secrets.sealer` AND has NO feature-link to any `secrets.sealer` instance — it cannot
+    /// ask the sealer to unseal its key. Fail-closed: a sealed signer must either CO-RESIDE
+    /// the sealer (resolve in-process) or be LINKED to a sealer instance
+    /// ([`check_sealed_signer_closure`]).
+    SealedSignerUnlinkedToSealer {
+        /// The offending `token.signer` instance.
+        signer_instance: String,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -694,6 +712,21 @@ impl std::fmt::Display for CompositionViolation {
             Self::InstanceLinkUnknown { instance, link } => write!(
                 f,
                 "instance {instance:?} references link {link:?}, which is not defined in [privsep].links"
+            ),
+            Self::SealedSignerWithoutSealer { signer_instances } => write!(
+                f,
+                "[serve.signer] is a sealed key source (unsealed by a secrets.sealer over the \
+                 feature-link), but no instance holds `secrets.sealer` — the token.signer \
+                 instance(s) [{}] could never unlock the signing key; add a `secrets.sealer` \
+                 instance (and link it to the signer)",
+                signer_instances.join(", ")
+            ),
+            Self::SealedSignerUnlinkedToSealer { signer_instance } => write!(
+                f,
+                "token.signer instance {signer_instance:?} has a sealed key source but neither \
+                 holds `secrets.sealer` itself nor is linked to a `secrets.sealer` instance — it \
+                 cannot ask the sealer to unseal its key; co-reside the sealer or add a link \
+                 between them"
             ),
         }
     }
@@ -935,6 +968,91 @@ pub fn check_composition_closure(
 
     if violations.is_empty() {
         Ok(CompositionReport { warnings })
+    } else {
+        Err(CompositionError { violations })
+    }
+}
+
+/// Whether some link in `cfg` DIRECTLY connects instances `a` and `b` (either direction).
+fn instances_linked(cfg: &PrivsepConfig, a: &str, b: &str) -> bool {
+    cfg.links
+        .values()
+        .any(|l| (l.from == a && l.to == b) || (l.from == b && l.to == a))
+}
+
+/// The **sealed-signer composition-closure rule** (the "signer-key unlock" owner decision):
+/// when `[serve.signer]` is a SEALED key source (`sealed_signer == true` — a `boatramp:<name>`
+/// or `path:` reference the signer resolves NOT inline), a `token.signer` instance cannot hold
+/// the `[secrets]` KEK itself (that would collapse the `secrets.sealer` ↔ `token.signer` split),
+/// so it must obtain its key by asking a `secrets.sealer` instance to unseal it over the
+/// feature-link. This fail-closed check — run IN THE ROOT, before any spawn, alongside
+/// [`check_composition_closure`] — REFUSES a composition where that is impossible:
+///
+/// - a sealed signer but NO instance holds `secrets.sealer` ([`CompositionViolation::SealedSignerWithoutSealer`]);
+/// - a `token.signer` instance that neither CO-RESIDES `secrets.sealer` (resolving its key
+///   in-process) nor is LINKED to a `secrets.sealer` instance
+///   ([`CompositionViolation::SealedSignerUnlinkedToSealer`]).
+///
+/// `sealed_signer` is the node-global fact "`[serve.signer]` is the sealed variant" — the caller
+/// (the root) derives it from the resolved `ServerConfig`, since this wasm-clean types layer does
+/// not see `AuthSignerConfig`. An AwsKms / ambient / absent signer passes `false` and the rule is
+/// a no-op (it needs no sealer).
+///
+/// Kept SEPARATE from [`check_composition_closure`] (whose signature + many callers stay pure over
+/// [`PrivsepConfig`] alone): the root runs both and surfaces either refusal identically.
+pub fn check_sealed_signer_closure(
+    cfg: &PrivsepConfig,
+    sealed_signer: bool,
+) -> Result<(), CompositionError> {
+    if !sealed_signer {
+        return Ok(());
+    }
+    let mut violations = Vec::new();
+
+    let signer_instances: Vec<&String> = cfg
+        .instances
+        .iter()
+        .filter(|(_, inst)| inst.capabilities.contains(&HostAuthority::TokenSigner))
+        .map(|(name, _)| name)
+        .collect();
+    let sealer_instances: Vec<&String> = cfg
+        .instances
+        .iter()
+        .filter(|(_, inst)| inst.capabilities.contains(&HostAuthority::SecretsSealer))
+        .map(|(name, _)| name)
+        .collect();
+
+    // A sealed signer source with the `token.signer` authority unhosted is already an
+    // UnhostedCapabilities refusal from `check_composition_closure`; nothing to add here.
+    if signer_instances.is_empty() {
+        return Ok(());
+    }
+
+    if sealer_instances.is_empty() {
+        violations.push(CompositionViolation::SealedSignerWithoutSealer {
+            signer_instances: signer_instances.into_iter().cloned().collect(),
+        });
+        return Err(CompositionError { violations });
+    }
+
+    for signer in signer_instances {
+        // Co-resident signer+sealer resolves its key in-process (it holds the KEK) — no link
+        // needed. This is the less-separated (but valid) composition, e.g. an A∪B "core".
+        if sealer_instances.contains(&signer) {
+            continue;
+        }
+        let linked = sealer_instances
+            .iter()
+            .any(|sealer| instances_linked(cfg, signer, sealer));
+        if !linked {
+            violations.push(CompositionViolation::SealedSignerUnlinkedToSealer {
+                signer_instance: signer.clone(),
+            });
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
     } else {
         Err(CompositionError { violations })
     }
@@ -1367,6 +1485,137 @@ mod tests {
             cfg.supervisor.as_ref().unwrap().crown_jewel_crash,
             CrownJewelCrashPolicy::FailNodeClosed
         );
+    }
+
+    // ---- sealed-signer closure rule (signer-key unlock) ----
+
+    /// A composition with the signer (`token.signer`) SPLIT onto its own instance, linked to a
+    /// separate `secrets.sealer`-holding instance — the intended sealed-signer topology.
+    fn split_signer_composition() -> PrivsepConfig {
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "edge".to_string(),
+            inst(&[
+                HostAuthority::ListenPublicTls,
+                HostAuthority::ListenHttpParse,
+                HostAuthority::ListenMail,
+                HostAuthority::ListenOverlay,
+                HostAuthority::ListenS3Ingress,
+                HostAuthority::ListenInboundTcp,
+                HostAuthority::ListenGateway,
+                HostAuthority::ExecWasmtime,
+                HostAuthority::ExecCompute,
+                HostAuthority::ControlAdminApi,
+                HostAuthority::AcmeDnsControl,
+            ]),
+        );
+        instances.insert(
+            "core".to_string(),
+            inst(&[
+                HostAuthority::BackendKv,
+                HostAuthority::BackendSql,
+                HostAuthority::BackendBlob,
+                HostAuthority::BackendMessaging,
+            ]),
+        );
+        // The SEALER: every crown jewel EXCEPT token.signer.
+        instances.insert(
+            "sealer".to_string(),
+            inst(&[
+                HostAuthority::SecretsSealer,
+                HostAuthority::ImageSigner,
+                HostAuthority::OverlayDialSigner,
+                HostAuthority::S3IngressRoot,
+                HostAuthority::ClusterJoinSigner,
+            ]),
+        );
+        // The SIGNER: token.signer alone.
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-signer".to_string(),
+            PrivsepLink {
+                from: "sealer".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+            },
+        );
+        PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+        }
+    }
+
+    #[test]
+    fn sealed_signer_check_is_a_noop_for_a_non_sealed_signer() {
+        // `sealed_signer == false` (AwsKms / ambient / absent) ⇒ the rule never fires, even for
+        // a composition that WOULD fail it (no sealer at all).
+        let mut cfg = clean_composition();
+        // Drop secrets.sealer from the signer instance → no sealer anywhere.
+        cfg.instances
+            .get_mut("signer")
+            .unwrap()
+            .capabilities
+            .retain(|a| *a != HostAuthority::SecretsSealer);
+        // The clean lint would now flag UnhostedCapabilities (sealer unhosted), but the
+        // sealed-signer check specifically is a no-op when the signer is not sealed.
+        check_sealed_signer_closure(&cfg, false).expect("non-sealed signer skips the rule");
+    }
+
+    #[test]
+    fn sealed_signer_split_from_a_linked_sealer_is_accepted() {
+        check_sealed_signer_closure(&split_signer_composition(), true)
+            .expect("a sealed signer linked to a separate sealer is accepted");
+    }
+
+    #[test]
+    fn sealed_signer_co_resident_with_the_sealer_is_accepted() {
+        // The `clean_composition` "signer" instance holds BOTH secrets.sealer and token.signer —
+        // it resolves its key in-process (holds the KEK), so no link is required.
+        check_sealed_signer_closure(&clean_composition(), true)
+            .expect("a signer co-resident with the sealer resolves in-process (no link needed)");
+    }
+
+    #[test]
+    fn sealed_signer_without_any_sealer_is_refused() {
+        let mut cfg = split_signer_composition();
+        // Remove secrets.sealer entirely (move its remaining jewels onto the signer so the union
+        // still == ALL and this is the SOLE fault the sealed-signer check sees).
+        let sealer_caps = cfg.instances.remove("sealer").unwrap().capabilities;
+        let keep: Vec<HostAuthority> = sealer_caps
+            .into_iter()
+            .filter(|a| *a != HostAuthority::SecretsSealer)
+            .collect();
+        cfg.instances
+            .get_mut("signer")
+            .unwrap()
+            .capabilities
+            .extend(keep);
+        // Drop the now-dangling link.
+        cfg.links.clear();
+        let err = check_sealed_signer_closure(&cfg, true).unwrap_err();
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            CompositionViolation::SealedSignerWithoutSealer { signer_instances }
+                if signer_instances.contains(&"signer".to_string())
+        )));
+    }
+
+    #[test]
+    fn sealed_signer_unlinked_to_the_sealer_is_refused() {
+        let mut cfg = split_signer_composition();
+        // Keep the separate sealer, but SEVER the signer↔sealer link.
+        cfg.links.clear();
+        let err = check_sealed_signer_closure(&cfg, true).unwrap_err();
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            CompositionViolation::SealedSignerUnlinkedToSealer { signer_instance }
+                if signer_instance == "signer"
+        )));
     }
 
     #[test]

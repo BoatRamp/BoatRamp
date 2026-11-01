@@ -52,6 +52,11 @@ pub mod messaging_shim;
 /// Always compiled; the real implementation is `cfg(unix)` (the mechanism is POSIX) and a non-Unix
 /// build fails-closed (privsep is Linux-only in Phase 1, gated by the fail-closed sandbox install).
 pub mod privsep_link;
+/// The privsep signer-key unlock protocol (signer-unlock workstream): a `token.signer` instance asks
+/// a `secrets.sealer` instance to unseal its sealed signing key over the feature-link, under a
+/// root-wired, per-link ALLOWLIST the sealer enforces fail-closed. The typed request/response rides
+/// the bounded `privsep_link` frames; the concrete resolvers use the existing `[secrets]` KEK path.
+pub mod privsep_unseal;
 /// The whole-process OS sandbox (privsep Phase 0, WS1): a seccomp-bpf default-deny syscall
 /// allow-list (`exec*` + the kernel-escape surface KILLED, other misses `EPERM`) + a Landlock
 /// filesystem confinement. Installed BEFORE the Tokio runtime starts so every worker thread

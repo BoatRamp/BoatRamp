@@ -501,6 +501,14 @@ axum.workspace = true
 # dependency above is off. A dev-dependency is feature-independent, so it's present
 # for the test harness regardless of which features the build enables.
 async-trait.workspace = true
+# The privsep signer-unlock live gate (`privsep_live.rs`) seals a signer key with the
+# SAME `[secrets]` KEK envelope the sealer unwraps (`LocalKek::wrap`), so the test must
+# pre-seal exactly as the running node reads it. These are already regular deps of this
+# crate (so they add no new compile cost — cargo unifies), surfaced to the integration
+# test harness. `tokio` needs `rt` to drive the async `KeyEnvelope::wrap`.
+boatramp-server.workspace = true
+boatramp-core = { workspace = true, features = ["authz"] }
+tokio = { workspace = true, features = ["rt"] }
 
 # ---------------------------------------------------------------------------
 # OS-native package metadata. Version / license / description /

@@ -618,6 +618,13 @@ pub enum KeyAccess {
 pub struct KeyInputPaths {
     /// `secrets.sealer` — the AES-256-GCM KEK file (`[secrets].kek_file`); read + first-run gen.
     pub kek_file: Option<PathBuf>,
+    /// `secrets.sealer` — a KEK-SEALED signer-key blob FILE the SEALER reads + unwraps to serve the
+    /// `token.signer`'s unseal request over the feature-link (the "signer-key unlock" owner decision
+    /// with a `[serve.signer] = Sealed { key_ref: "path:<file>" }` source). Granted READ-ONLY to the
+    /// SEALER — NOT to the `token.signer` holder: the signer never has its key on disk, it receives
+    /// the plaintext over the link. `None` for a `boatramp:<name>` (sealed-store) source or any
+    /// non-sealed signer.
+    pub sealed_signer_key_file: Option<PathBuf>,
     /// `token.signer` — the control-plane auth-root private key file.
     pub token_signer_key: Option<PathBuf>,
     /// `image.signer` — the key-based image-signing key file.
@@ -635,11 +642,18 @@ impl KeyInputPaths {
     /// field of `self`, so it lives as long as the borrow of `self` (no closure — a closure
     /// parameter's lifetime would not outlive its body).
     fn entries(&self) -> Vec<(HostAuthority, &Path, KeyAccess)> {
-        let fields: [(HostAuthority, &Option<PathBuf>, KeyAccess); 6] = [
+        let fields: [(HostAuthority, &Option<PathBuf>, KeyAccess); 7] = [
             (
                 HostAuthority::SecretsSealer,
                 &self.kek_file,
                 KeyAccess::ReadWrite,
+            ),
+            // The sealer custodies the sealed signer-key blob (read-only); the token.signer holder
+            // never has it on disk (it gets the plaintext over the link).
+            (
+                HostAuthority::SecretsSealer,
+                &self.sealed_signer_key_file,
+                KeyAccess::ReadOnly,
             ),
             (
                 HostAuthority::TokenSigner,
@@ -777,6 +791,7 @@ impl SandboxDerivationInputs {
             shared_temp: norm_vec(&self.shared_temp),
             keys: KeyInputPaths {
                 kek_file: norm_key(&self.keys.kek_file),
+                sealed_signer_key_file: norm_key(&self.keys.sealed_signer_key_file),
                 token_signer_key: norm_key(&self.keys.token_signer_key),
                 image_signer_key: norm_key(&self.keys.image_signer_key),
                 overlay_seed: norm_key(&self.keys.overlay_seed),
@@ -2106,6 +2121,7 @@ mod privsep_derivation_tests {
         // Keys deliberately placed OUTSIDE the granted subtrees (a dedicated keystore).
         inp.keys = KeyInputPaths {
             kek_file: Some(PathBuf::from("/keys/kek")),
+            sealed_signer_key_file: None,
             token_signer_key: Some(PathBuf::from("/keys/token-signer.pem")),
             image_signer_key: Some(PathBuf::from("/keys/image-signer.pem")),
             overlay_seed: Some(PathBuf::from("/keys/overlay.seed")),
