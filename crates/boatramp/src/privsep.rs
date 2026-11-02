@@ -100,6 +100,11 @@ pub enum PrivsepError {
     /// cannot see from a single instance).
     #[error(transparent)]
     CompositionGrant(#[from] boatramp_server::sandbox::CompositionGrantError),
+    /// The `[privsep].per_tenant` scale-to-zero policy is misconfigured (design §Phase-4 WS-C) and
+    /// the composition declares a per-tenant template. The root refuses BEFORE any spawn rather
+    /// than standing up a template composition that could never instantiate a tenant.
+    #[error(transparent)]
+    PerTenantPolicy(#[from] boatramp_core::privsep::PerTenantPolicyError),
     /// privsep requires an ENFORCED per-instance sandbox (Linux + the `sandbox` feature). On any
     /// other platform/build the wall cannot be installed, so the root refuses the node closed
     /// rather than spawning instances that would serve without it (design §2 F6).
@@ -223,12 +228,29 @@ impl InstanceSpawnSpec {
 /// this value is the proof that spawning is authorized (design §5 inv4).
 #[derive(Debug, Clone)]
 pub struct RootPlan {
-    /// One spawn spec per instance (stable order — the `[privsep].instances` map is sorted).
-    pub instances: Vec<InstanceSpawnSpec>,
+    /// The spawn specs for the BOOT-FORKED static instances (lifecycle = `Static`) — forked ONCE at
+    /// boot by the root supervisor and held for the node's life. Stable order (the
+    /// `[privsep].instances` map is sorted). This is the set the supervise loop fork+execs; a
+    /// per-tenant template is NOT here (design §Phase-4 WS-C — a template boot-forked once, with no
+    /// wired `BOATRAMP_PRIVSEP_TENANT_SCOPE`, would die `Unwired` → `FailNodeClosed`).
+    pub static_instances: Vec<InstanceSpawnSpec>,
+    /// The spawn specs for the per-tenant TEMPLATE instances (lifecycle = `PerTenantTemplate`) — NOT
+    /// forked at boot. The per-tenant router (the frontend) instantiates one copy per active tenant
+    /// on demand, wiring each a fresh `BOATRAMP_PRIVSEP_TENANT_SCOPE` + socketpair link
+    /// ([`InstanceSpawnSpec`] via the root's own fork+exec primitive). An authorized composition has
+    /// at most a handful (the Phase-4 cut wires exactly one wasm template).
+    pub templates: Vec<InstanceSpawnSpec>,
     /// The secret-blindness report (the opaque-reference tally).
     pub secret_blind: SecretBlindReport,
     /// The composition-closure report (any non-fatal flags to log).
     pub composition: CompositionReport,
+}
+
+impl RootPlan {
+    /// Every spawn spec (static + template), for logging the whole authorized plan.
+    pub fn all_specs(&self) -> impl Iterator<Item = &InstanceSpawnSpec> {
+        self.static_instances.iter().chain(self.templates.iter())
+    }
 }
 
 /// Build the root's authorized spawn plan — the PURE, fail-closed authorization gate
@@ -264,39 +286,61 @@ where
     let sealed_signer = privsep_resolve::sealed_signer_key_ref(cfg).is_some();
     check_sealed_signer_closure(privsep, sealed_signer)?;
 
+    // 2c. Per-tenant scale-to-zero policy (design §Phase-4 WS-C): fail-closed BEFORE any spawn when
+    //     the composition declares a per-tenant template, so a misconfigured policy (e.g. a 0
+    //     concurrency cap that could never serve a tenant) refuses the node closed rather than
+    //     standing up a template composition that cannot instantiate. A no-template composition
+    //     never reads the policy (byte-compat), so this is gated on template presence.
+    let has_per_tenant_template = privsep
+        .instances
+        .values()
+        .any(|i| i.lifecycle.is_per_tenant_template());
+    if has_per_tenant_template {
+        privsep.per_tenant.validate()?;
+    }
+
     // 3. The per-instance re-exec spawn spec (F11-B minimal env). Reached ONLY after
     //    both gates pass — so a refused composition yields no spawn spec at all.
     let path_str = config_path.to_string_lossy().into_owned();
     // The config-driven secret-env set (Finding 1): env-var names the config declares as
     // secret references (`url_env`/`password_env`/…), scrubbed from every instance's env.
     let declared_secret_env = privsep_resolve::declared_secret_env_var_names(cfg);
-    let instances = privsep
-        .instances
-        .iter()
-        .map(|(label, inst)| {
-            let argv = vec![
-                INSTANCE_SUBCOMMAND.to_string(),
-                label.clone(),
-                "--config".to_string(),
-                path_str.clone(),
-            ];
-            let env = privsep_resolve::build_instance_env(
-                parent_env.clone(),
-                &inst.capabilities,
-                &declared_secret_env,
-            );
-            InstanceSpawnSpec {
-                label: label.clone(),
-                capabilities: inst.capabilities.clone(),
-                substrate: inst.substrate,
-                argv,
-                env,
-            }
-        })
-        .collect();
+    // Partition on lifecycle (design §Phase-4 WS-C): STATIC instances are fork+exec'd once at boot;
+    // per-tenant TEMPLATE instances are built as spawnable specs but NOT forked here — the per-tenant
+    // router instantiates them on demand, one per tenant, wiring each its own scope + socketpair.
+    // The spec (argv + the minimal secret-scrubbed env, F11-B) is built IDENTICALLY for both, so a
+    // template's on-demand child inherits NO secret either (the env_clear contract is the same).
+    let mut static_instances: Vec<InstanceSpawnSpec> = Vec::new();
+    let mut templates: Vec<InstanceSpawnSpec> = Vec::new();
+    for (label, inst) in &privsep.instances {
+        let argv = vec![
+            INSTANCE_SUBCOMMAND.to_string(),
+            label.clone(),
+            "--config".to_string(),
+            path_str.clone(),
+        ];
+        let env = privsep_resolve::build_instance_env(
+            parent_env.clone(),
+            &inst.capabilities,
+            &declared_secret_env,
+        );
+        let spec = InstanceSpawnSpec {
+            label: label.clone(),
+            capabilities: inst.capabilities.clone(),
+            substrate: inst.substrate,
+            argv,
+            env,
+        };
+        if inst.lifecycle.is_per_tenant_template() {
+            templates.push(spec);
+        } else {
+            static_instances.push(spec);
+        }
+    }
 
     Ok(RootPlan {
-        instances,
+        static_instances,
+        templates,
         secret_blind,
         composition,
     })
@@ -361,18 +405,26 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
         tracing::warn!(flag = %w, "[privsep] composition flag");
     }
     tracing::info!(
-        instances = plan.instances.len(),
+        static_instances = plan.static_instances.len(),
+        templates = plan.templates.len(),
         opaque_secret_refs = plan.secret_blind.opaque_reference_count,
         "[privsep] root: composition authorized (secret-blind + closure-lint clean); the root \
          holds bootstrap authority only"
     );
-    for spec in &plan.instances {
+    for spec in plan.all_specs() {
+        let per_tenant_template = plan.templates.iter().any(|t| t.label == spec.label);
         tracing::info!(
             instance = %spec.label,
             capabilities = spec.capabilities.len(),
             substrate = spec.substrate.tag(),
             env_vars = spec.env.len(),
-            "[privsep] root: instance authorized to spawn (re-exec __instance, minimal scrubbed env)"
+            per_tenant_template,
+            "[privsep] root: instance authorized ({})",
+            if per_tenant_template {
+                "per-tenant template — instantiated on demand, NOT boot-forked"
+            } else {
+                "static — boot-forked, re-exec __instance, minimal scrubbed env"
+            }
         );
     }
 
@@ -621,7 +673,7 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     // serve its slice. The materialization gate (above) is the construction wall; the link
     // mediation + the profile are the other two defence-in-depth layers.
     let fds = PrivsepChildFds::from_env().map_err(fail)?;
-    instance_serve::run(label, &gate, &fds, &config).map_err(|e| fail(e).into())
+    instance_serve::run(label, &gate, &fds, &config, config_path).map_err(|e| fail(e).into())
 }
 
 // =============================================================================
@@ -931,13 +983,322 @@ fn authority_link_purpose_marked(config: &ServerConfig) -> bool {
 }
 
 // =============================================================================
+// WS-C runtime: the root's own fork+exec spawn primitive + the live per-tenant registry
+// =============================================================================
+
+/// The root's own fork+exec spawn primitive + the LIVE per-tenant instance registry (design
+/// §Phase-4 WS-C). Both are the root supervisor's OWN mechanism — per-tenant spawning stays INSIDE
+/// the (secret-blind) router via the root's `fork`+`exec`, NOT a `ComputeBackend` trait (owner
+/// decision; the compute-plane generalization is Phase 5). Unix-only (needs `socketpair`/`fork`);
+/// the whole live path additionally refuses off-Linux / no-`sandbox` at [`super::run_instance`].
+#[cfg(unix)]
+mod per_tenant {
+    use std::collections::BTreeMap;
+    use std::os::fd::RawFd;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use boatramp_core::privsep::{PRIVSEP_TENANT_SCOPE_ENV, PerTenantPolicy, TenantScope};
+    use boatramp_server::privsep_link::LinkEndpoint;
+    use boatramp_server::privsep_tenant::{
+        LinkEndpointRelay, PerTenantInstanceRegistry, TenantInstanceLink,
+    };
+
+    use super::{InstanceSpawnSpec, PRIVSEP_FDS_ENV, PrivsepChildFds};
+
+    /// Set `FD_CLOEXEC` on `fd` so a per-tenant child the router fork+exec's never INHERITS it. The
+    /// root-passed listener fd is NOT CLOEXEC (it survived the frontend's OWN exec), so without this
+    /// it would leak into every per-tenant instance — a violation of F5 (the only fd that ever
+    /// crosses to a per-tenant instance is its own socketpair link, then accepted CLIENT fds over
+    /// it). The frontend keeps accepting on the listener: `FD_CLOEXEC` only affects `exec`, never the
+    /// owning process. (The socketpair ends are already CLOEXEC from [`LinkEndpoint::socketpair`].)
+    pub(super) fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+        // SAFETY: F_GETFD/F_SETFD take no pointers; they read/tighten only this fd's own flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The root supervisor's OWN fork+exec spawn primitive (design §2 / §4.1) — EXTRACTED (WS-C step
+    /// 1) from the boot supervisor's spawn loop so the boot supervisor AND the per-tenant router
+    /// instantiate an `__instance` the EXACT same way: re-exec the current binary with the spec's
+    /// minimal secret-scrubbed env (F11-B `env_clear`), add `extra_env` (the fd map, the tenant
+    /// scope), and in the child's `pre_exec` `dup2` each `(src → tgt)` onto its fixed target + clear
+    /// `CLOEXEC` so it survives the exec, then `PR_SET_PDEATHSIG(SIGKILL)` (Linux) so a dead parent
+    /// takes the child with it (no orphaned authority-holding instance). A `(src, tgt)` with
+    /// `src == tgt` clears `CLOEXEC` in place WITHOUT a dup2 — how the router passes a single link fd
+    /// at its own number, avoiding a target collision in its crowded fd table. The `dup2`/`fcntl`
+    /// machinery is POSIX; only `PR_SET_PDEATHSIG` is Linux-gated.
+    pub(super) fn spawn_wired_instance(
+        current_exe: &Path,
+        spec: &InstanceSpawnSpec,
+        dups: Vec<(RawFd, RawFd)>,
+        extra_env: &BTreeMap<String, String>,
+    ) -> std::io::Result<std::process::Child> {
+        let mut cmd = spec.to_command(current_exe);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are
+        // async-signal-safe and touch only this child's fd table + death-signal. The caller assigns
+        // target fds above every source (boot path) or uses `src == tgt` (per-tenant single link),
+        // so no `dup2` clobbers a not-yet-processed source.
+        unsafe {
+            cmd.pre_exec(move || {
+                for (src, tgt) in &dups {
+                    if *src != *tgt && libc::dup2(*src, *tgt) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Clear CLOEXEC on the target so it survives the exec (dup2 already clears it for
+                    // a distinct target; this also covers the src == tgt no-op case).
+                    let flags = libc::fcntl(*tgt, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(*tgt, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // FailNodeClosed robustness: if the parent dies, the kernel kills this instance (so a
+                // crashed parent never leaves authority-holding instances orphaned). Linux only; a
+                // best-effort hardening, not the containment itself.
+                #[cfg(target_os = "linux")]
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn()
+    }
+
+    /// Why the per-tenant router could not INSTANTIATE a tenant's instance — fail-closed in every
+    /// arm (the router refuses the connection rather than serving it from a wrong/absent instance).
+    #[derive(Debug, thiserror::Error)]
+    pub(super) enum InstantiateError {
+        /// Creating the per-tenant `socketpair(2)` link failed.
+        #[error("per-tenant instantiate: socketpair for tenant {project:?}: {source}")]
+        Socketpair {
+            /// The tenant project.
+            project: String,
+            /// The underlying OS error.
+            source: std::io::Error,
+        },
+        /// The fork+exec of the per-tenant `__instance` failed.
+        #[error("per-tenant instantiate: fork+exec for tenant {project:?}: {source}")]
+        Spawn {
+            /// The tenant project.
+            project: String,
+            /// The underlying OS error.
+            source: std::io::Error,
+        },
+    }
+
+    /// One live per-tenant instance the router is pooling.
+    struct LiveInstance {
+        link: TenantInstanceLink,
+        child: std::process::Child,
+        last_used: Instant,
+    }
+
+    /// The LIVE per-tenant instance registry (WS-C step 3) — the real
+    /// [`PerTenantInstanceRegistry`] the WS-B frontend router routes against. A `project → live
+    /// instance` map the router grows ON DEMAND (one isolated `{exec.wasmtime}` OS process per
+    /// tenant), with operator-tunable scale-to-zero ([`PerTenantPolicy`]). Per-tenant spawning stays
+    /// INSIDE the (secret-blind) router via the root's own [`spawn_wired_instance`] — NOT a
+    /// `ComputeBackend`. Each tenant's socketpair link is created LAZILY at
+    /// [`instantiate`](Self::instantiate), never at boot, never shared.
+    pub(super) struct ComputePlaneRegistry {
+        /// The current binary to re-exec for each per-tenant instance.
+        current_exe: PathBuf,
+        /// The per-tenant TEMPLATE's spawn spec (argv + the minimal secret-scrubbed env, F11-B) — the
+        /// root's authorized template, cloned per tenant with a scope + fd map added.
+        template_spec: InstanceSpawnSpec,
+        /// The declared frontend→template relay link NAME — the fd-map key under which each
+        /// per-tenant child receives its socketpair end.
+        link_name: String,
+        /// The scale-to-zero policy (idle-eviction window + concurrency cap).
+        policy: PerTenantPolicy,
+        /// The live instances, keyed by project. Interior-mutable so `resolve`/`instantiate` take
+        /// `&self` (the trait object + the router accept loop share one `&registry`).
+        live: Mutex<BTreeMap<String, LiveInstance>>,
+    }
+
+    impl ComputePlaneRegistry {
+        /// Build a registry over the authorized template spec + the declared relay link + the policy.
+        pub(super) fn new(
+            current_exe: PathBuf,
+            template_spec: InstanceSpawnSpec,
+            link_name: String,
+            policy: PerTenantPolicy,
+        ) -> Self {
+            Self {
+                current_exe,
+                template_spec,
+                link_name,
+                policy,
+                live: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        /// Instantiate — or return the already-live — per-tenant instance for `scope` (the WS-C
+        /// wake / cold-start seam the router drives on a [`RouteOutcome::NotReady`](boatramp_server::privsep_tenant::RouteOutcome::NotReady)).
+        /// Lazily creates ONE socketpair for this tenant, forks the template via the root's own
+        /// primitive with the scope wired into `BOATRAMP_PRIVSEP_TENANT_SCOPE` + the link fd map, and
+        /// registers the live link. Enforces scale-to-zero first: an idle/exited sweep, then — if
+        /// still at the concurrency cap — a least-recently-used eviction (never exceeds the cap,
+        /// never silently refuses a valid tenant). Fail-closed on a socketpair / fork error.
+        pub(super) fn instantiate(
+            &self,
+            scope: &TenantScope,
+        ) -> Result<TenantInstanceLink, InstantiateError> {
+            let mut live = self.live.lock().unwrap();
+            // A concurrent route may already have instantiated it (cold-start race): reuse it.
+            if let Some(inst) = live.get_mut(scope.project()) {
+                inst.last_used = Instant::now();
+                return Ok(inst.link.clone());
+            }
+            // Scale-to-zero: reap exited + evict idle, then enforce the cap (LRU) BEFORE inserting.
+            Self::sweep(&mut live, &self.policy);
+            Self::enforce_cap(&mut live, self.policy.max_instances);
+            // LAZY per-tenant socketpair (never shared, never at boot). `front` stays with the router
+            // (the relay half); `back` is handed to the child at its own fd number.
+            let (front, back) =
+                LinkEndpoint::socketpair().map_err(|e| InstantiateError::Socketpair {
+                    project: scope.project().to_string(),
+                    source: e,
+                })?;
+            let back_fd = back.as_raw_fd();
+            // The per-tenant child's fd map: the one relay link, under its declared name, at `back_fd`.
+            let mut fds = PrivsepChildFds::default();
+            fds.links.insert(self.link_name.clone(), back_fd);
+            let mut extra_env = BTreeMap::new();
+            extra_env.insert(PRIVSEP_FDS_ENV.to_string(), fds.to_env_value());
+            // The UNFORGEABLE tenant scope — a non-secret BOATRAMP_* name the child RE-VALIDATES.
+            extra_env.insert(
+                PRIVSEP_TENANT_SCOPE_ENV.to_string(),
+                scope.env_value().to_string(),
+            );
+            // Fork via the root's OWN primitive. `src == tgt == back_fd` clears CLOEXEC in place so
+            // the child inherits `back` at its own number WITHOUT a dup2 (no target collision in the
+            // router's crowded fd table); `front` + the listener stay CLOEXEC so neither leaks.
+            let child = spawn_wired_instance(
+                &self.current_exe,
+                &self.template_spec,
+                vec![(back_fd, back_fd)],
+                &extra_env,
+            )
+            .map_err(|e| InstantiateError::Spawn {
+                project: scope.project().to_string(),
+                source: e,
+            })?;
+            // The child inherited `back` (fork duplicated the fd table); drop the router's copy so
+            // ONLY the child holds its end.
+            drop(back);
+            let relay = Arc::new(LinkEndpointRelay::new(
+                format!("tenant:{}", scope.project()),
+                Arc::new(front),
+            ));
+            let link = TenantInstanceLink::new(scope.clone(), relay);
+            tracing::info!(
+                project = %scope.project(),
+                pid = child.id(),
+                live = live.len() + 1,
+                "[privsep] per-tenant router: instantiated a tenant instance (lazy socketpair, \
+                 scope-wired via env_clear, NO secret inherited)"
+            );
+            live.insert(
+                scope.project().to_string(),
+                LiveInstance {
+                    link: link.clone(),
+                    child,
+                    last_used: Instant::now(),
+                },
+            );
+            Ok(link)
+        }
+
+        /// Reap exited children + evict instances idle past the policy window (scale-to-zero).
+        fn sweep(live: &mut BTreeMap<String, LiveInstance>, policy: &PerTenantPolicy) {
+            let idle = policy.idle_eviction();
+            let now = Instant::now();
+            let evict: Vec<String> = live
+                .iter_mut()
+                .filter_map(|(p, inst)| {
+                    // Reap a child that already exited (crashed/killed) — its link is dead.
+                    let exited = matches!(inst.child.try_wait(), Ok(Some(_)));
+                    let idle_out = idle.is_some_and(|w| now.duration_since(inst.last_used) >= w);
+                    (exited || idle_out).then(|| p.clone())
+                })
+                .collect();
+            for p in evict {
+                if let Some(inst) = live.remove(&p) {
+                    Self::kill(inst);
+                    tracing::info!(project = %p, "[privsep] per-tenant router: evicted an idle/exited tenant instance (scale-to-zero)");
+                }
+            }
+        }
+
+        /// Enforce the concurrency cap: while at/over `max`, evict the LEAST-recently-used instance
+        /// (so the subsequent insert never exceeds the cap). `max` is validated ≥ 1 at the root.
+        fn enforce_cap(live: &mut BTreeMap<String, LiveInstance>, max: u32) {
+            let max = (max as usize).max(1);
+            while live.len() >= max {
+                let Some(lru) = live
+                    .iter()
+                    .min_by_key(|(_, i)| i.last_used)
+                    .map(|(p, _)| p.clone())
+                else {
+                    break;
+                };
+                if let Some(inst) = live.remove(&lru) {
+                    Self::kill(inst);
+                    tracing::info!(project = %lru, "[privsep] per-tenant router: evicted the LRU tenant instance to honor the concurrency cap");
+                }
+            }
+        }
+
+        /// SIGKILL + reap one per-tenant child (its relay link drops → the socketpair end closes).
+        fn kill(mut inst: LiveInstance) {
+            let _ = inst.child.kill();
+            let _ = inst.child.wait();
+        }
+    }
+
+    impl PerTenantInstanceRegistry for ComputePlaneRegistry {
+        fn resolve(&self, scope: &TenantScope) -> Option<TenantInstanceLink> {
+            let mut live = self.live.lock().unwrap();
+            let Some(inst) = live.get_mut(scope.project()) else {
+                return None;
+            };
+            // A child that has exited has a dead link — reap it and report NOT live, so the router
+            // fails over to a fresh NotReady → instantiate rather than relaying onto a dead socket.
+            if matches!(inst.child.try_wait(), Ok(Some(_))) {
+                if let Some(dead) = live.remove(scope.project()) {
+                    Self::kill(dead);
+                }
+                return None;
+            }
+            inst.last_used = Instant::now();
+            Some(inst.link.clone())
+        }
+    }
+}
+
+// =============================================================================
 // The root supervisor: socketpair wiring + privileged listener bind + fork/exec + supervise
 // =============================================================================
 
 #[cfg(unix)]
 mod supervise {
     use std::os::fd::{AsRawFd, RawFd};
-    use std::os::unix::process::CommandExt;
     use std::path::Path;
 
     use boatramp_core::privsep::LinkTransport;
@@ -971,6 +1332,21 @@ mod supervise {
             super::resolve_spawn_backend(label, inst.substrate)?;
         }
 
+        // Phase-4 WS-C: per-tenant TEMPLATE instances are NOT forked at boot and their links are NOT
+        // socketpaired at boot — the per-tenant router instantiates a copy (with its own scope +
+        // socketpair) per tenant on demand. Collect the template labels so the boot wiring below
+        // skips them (a template boot-forked once, with no wired tenant scope, would die `Unwired` →
+        // `FailNodeClosed`). A composition with NO template leaves this empty ⇒ byte-unchanged.
+        let template_labels: std::collections::BTreeSet<&String> = privsep
+            .instances
+            .iter()
+            .filter(|(_, inst)| inst.lifecycle.is_per_tenant_template())
+            .map(|(label, _)| label)
+            .collect();
+        let touches_template = |link: &boatramp_core::privsep::PrivsepLink| -> bool {
+            template_labels.contains(&link.from) || template_labels.contains(&link.to)
+        };
+
         // The per-sealer unseal allowlist (the signer-key-unlock containment): the root wires each
         // `secrets.sealer` instance the exact names each of its links' peers may unseal. NON-SECRET
         // (names only), handed in via an env var alongside the fd map.
@@ -985,6 +1361,11 @@ mod supervise {
         let mut links_by_instance: std::collections::BTreeMap<String, Vec<(String, LinkEndpoint)>> =
             std::collections::BTreeMap::new();
         for (lname, link) in &privsep.links {
+            // Defer a link that touches a per-tenant template: its socketpair is created LAZILY, per
+            // tenant, by the router at instantiation time — never at boot, never shared (WS-C step 2).
+            if touches_template(link) {
+                continue;
+            }
             match &link.transport {
                 LinkTransport::Local => {
                     let (a, b) = LinkEndpoint::socketpair()
@@ -1037,6 +1418,10 @@ mod supervise {
         }
         let mut wirings: Vec<ChildWiring> = Vec::new();
         for label in privsep.instances.keys() {
+            // A per-tenant template is not boot-forked, so it gets no boot fd wiring (WS-C step 2).
+            if template_labels.contains(label) {
+                continue;
+            }
             let mut fds = PrivsepChildFds::default();
             let mut dups = Vec::new();
             if let Some(eps) = links_by_instance.get(label) {
@@ -1060,19 +1445,26 @@ mod supervise {
             });
         }
 
-        // 4. `fork`+`exec` each `__instance` with its scrubbed env (already built, F11-B) + the fd
-        //    map, duping its ends onto the fixed targets in `pre_exec`.
+        // 4. `fork`+`exec` each STATIC `__instance` (NOT the per-tenant templates — WS-C step 2) with
+        //    its scrubbed env (already built, F11-B) + the fd map, via the root's own extracted spawn
+        //    primitive (`spawn_wired_instance`, WS-C step 1 — the SAME primitive the per-tenant router
+        //    reuses). The extra env carries the fd map, plus a sealer's unseal allowlist / a crown
+        //    jewel's authority-serve links (names only), exactly as before.
         let mut children: Vec<(String, std::process::Child)> = Vec::new();
-        for spec in &plan.instances {
+        for spec in &plan.static_instances {
             let Some(wiring) = wirings.iter().find(|w| w.label == spec.label) else {
                 continue;
             };
-            let mut cmd = spec.to_command(&current_exe);
-            cmd.env(super::PRIVSEP_FDS_ENV, wiring.fds.to_env_value());
+            let mut extra_env: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            extra_env.insert(
+                super::PRIVSEP_FDS_ENV.to_string(),
+                wiring.fds.to_env_value(),
+            );
             // A `secrets.sealer` instance also gets its root-wired unseal allowlist (names only).
             if let Some(allow) = unseal_allowlists.get(&spec.label) {
-                cmd.env(
-                    boatramp_server::privsep_unseal::PRIVSEP_UNSEAL_ALLOW_ENV,
+                extra_env.insert(
+                    boatramp_server::privsep_unseal::PRIVSEP_UNSEAL_ALLOW_ENV.to_string(),
                     allow.to_env_value(),
                 );
             }
@@ -1080,42 +1472,17 @@ mod supervise {
             if let Some(links) = authority_serve_links.get(&spec.label)
                 && !links.is_empty()
             {
-                cmd.env(
-                    super::PRIVSEP_AUTHORITY_LINKS_ENV,
+                extra_env.insert(
+                    super::PRIVSEP_AUTHORITY_LINKS_ENV.to_string(),
                     serde_json::to_string(links).expect("authority-serve link set serializes"),
                 );
             }
-            let dups = wiring.dups.clone();
-            // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are
-            // async-signal-safe and touch only this child's fd table + death-signal. The target
-            // fds are above every source, so no `dup2` clobbers a not-yet-processed source.
-            unsafe {
-                cmd.pre_exec(move || {
-                    for (src, tgt) in &dups {
-                        if *src != *tgt && libc::dup2(*src, *tgt) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        // Clear CLOEXEC on the target so it survives the exec (dup2 already clears
-                        // it for a distinct target; this also covers the src == tgt no-op case).
-                        let flags = libc::fcntl(*tgt, libc::F_GETFD);
-                        if flags < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::fcntl(*tgt, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    // FailNodeClosed robustness: if the root dies, the kernel kills this instance
-                    // (so a crashed root never leaves authority-holding instances orphaned). Linux
-                    // only; a best-effort hardening, not the containment itself.
-                    #[cfg(target_os = "linux")]
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            match cmd.spawn() {
+            match super::per_tenant::spawn_wired_instance(
+                &current_exe,
+                spec,
+                wiring.dups.clone(),
+                &extra_env,
+            ) {
                 Ok(child) => {
                     tracing::info!(instance = %spec.label, pid = child.id(), "[privsep] root: spawned __instance (fds wired, scrubbed env)");
                     children.push((spec.label.clone(), child));
@@ -1269,7 +1636,8 @@ mod supervise {
 #[cfg(unix)]
 mod instance_serve {
     use std::net::SocketAddr;
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::path::Path;
     use std::sync::Arc;
 
     use boatramp_core::cose::{Signer, TokenPublicKey};
@@ -1280,10 +1648,14 @@ mod instance_serve {
         DurableAudit, ReplayCache, SealerHandler, SignerHandler, TokenBucketLimiter,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
+    use boatramp_server::privsep_tenant::{
+        RouteOutcome, WiredTenantIdentity, route_by_host, routing_head, scope_backend_call,
+    };
     use boatramp_server::privsep_unseal::{
         EnvelopeSealedFileResolver, SealedKeyResolver, UnsealAllowlist,
     };
 
+    use super::per_tenant::{ComputePlaneRegistry, set_cloexec};
     use super::{
         MaterializationGate, PrivsepChildFds, ServerConfig, authority_serve_links_from_env,
         privsep_resolve,
@@ -1308,10 +1680,25 @@ mod instance_serve {
         gate: &MaterializationGate,
         fds: &PrivsepChildFds,
         config: &ServerConfig,
+        config_path: &Path,
     ) -> Result<(), String> {
         let allowlist = UnsealAllowlist::from_env()?;
         let authority_links = authority_serve_links_from_env()?;
         let signer_key_ref = privsep_resolve::sealed_signer_key_ref(config);
+        // Phase-4 WS-C opt-in triggers (derived from the resolved on-disk composition — restart-class):
+        //   is_template  ⇒ THIS instance is a per-tenant template the router spawned on demand;
+        //   has_template ⇒ the composition defines ANY per-tenant template, so the listener holder is
+        //                   the per-tenant ROUTER rather than a plain splice frontend.
+        // Both are false for a no-template composition, so every pre-Phase-4 path below is UNCHANGED.
+        let privsep = config.privsep.as_ref();
+        let is_template = privsep
+            .and_then(|p| p.instances.get(label))
+            .is_some_and(|i| i.lifecycle.is_per_tenant_template());
+        let has_template = privsep.is_some_and(|p| {
+            p.instances
+                .values()
+                .any(|i| i.lifecycle.is_per_tenant_template())
+        });
         tracing::info!(
             instance = %label,
             held = gate.held().count(),
@@ -1368,7 +1755,24 @@ mod instance_serve {
             return run_sealer(label, fds, config, &allowlist);
         }
 
+        // PER-TENANT TEMPLATE BACKEND (WS-C step 4): THIS instance was instantiated on demand by the
+        // router for one tenant. It establishes its UNFORGEABLE wired tenant identity from the
+        // root/router-set `BOATRAMP_PRIVSEP_TENANT_SCOPE` (fail-closed if absent/invalid — an instance
+        // that cannot prove its own tenant must not serve) and serves received client fds, scoping
+        // every backend call by that identity (never a guest-named tenant). Only fires for a
+        // per-tenant template, so a no-template composition never reaches it.
+        if is_template {
+            return run_per_tenant_backend(label, fds);
+        }
+
         if let Some(listener_fd) = fds.listener {
+            // PER-TENANT ROUTER FRONTEND (WS-C step 5): when the composition defines a per-tenant
+            // template, the public-listener holder is the per-tenant ROUTER — it resolves each
+            // connection's Host → project (Stage-0), routes to that tenant's instance, instantiating
+            // on a NotReady cold-start, and relays the client fd. Opt-in: fires ONLY with a template.
+            if has_template {
+                return run_per_tenant_frontend(label, gate, listener_fd, config, config_path);
+            }
             let link_fd = *fds.links.values().next().ok_or_else(|| {
                 "a listener instance has no feature-link to forward client connections over \
                  (the composition must link it to a backend)"
@@ -1939,10 +2343,399 @@ mod instance_serve {
             )
         }
     }
+
+    // =========================================================================
+    // Phase-4 WS-C: the per-tenant TEMPLATE backend + the per-tenant ROUTER frontend
+    // =========================================================================
+
+    /// A PER-TENANT TEMPLATE instance the router instantiated on demand for ONE tenant (WS-C step 4).
+    /// It establishes its UNFORGEABLE wired tenant identity from `BOATRAMP_PRIVSEP_TENANT_SCOPE`
+    /// (re-validated fail-closed by [`WiredTenantIdentity::from_env`] — an `Unwired`/invalid/unreadable
+    /// scope EXITS the instance → the router treats the dead instance as `NotReady` and re-instantiates),
+    /// then serves received client fds with EVERY backend call scoped by that identity
+    /// ([`scope_backend_call`]) — never a guest-named tenant (artifact #2). Same splice/serve shape as
+    /// [`run_backend`], but scope-keyed and identity-fail-closed.
+    fn run_per_tenant_backend(label: &str, fds: &PrivsepChildFds) -> Result<(), String> {
+        // The UNFORGEABLE wired tenant identity FIRST — fail-closed (an instance that cannot prove its
+        // own tenant must not reach a shared backend). Read SOLELY from the router-wired env + RE-VALIDATED.
+        let wired = WiredTenantIdentity::from_env().map_err(|e| e.to_string())?;
+        let (lname, link_fd) = fds.links.iter().next().ok_or_else(|| {
+            "a per-tenant instance has no feature-link to receive client connections over"
+                .to_string()
+        })?;
+        tracing::info!(
+            instance = %label,
+            project = %wired.scope().project(),
+            link = %lname,
+            "[privsep] per-tenant backend: wired tenant identity established + re-validated; serving \
+             scope-keyed (fail-closed)"
+        );
+        // The marker the live gate greps — reached ONLY after a VALID wired identity (an Unwired /
+        // invalid scope exits above), so it PROVES one isolated per-tenant instance stood up scoped.
+        tracing::info!(instance = %label, project = %wired.scope().project(), "[privsep] PRIVSEP PER-TENANT OK");
+        // SAFETY: `link_fd` is the fd the router dup'd into this child + named in its fd map.
+        let link = unsafe { LinkEndpoint::from_inherited_fd(*link_fd) };
+        let wired = Arc::new(wired);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("building the Tokio runtime: {e}"))?;
+        rt.block_on(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(OwnedFd, Vec<u8>)>(64);
+            // Blocking link-drain on a dedicated thread; hands each received (client fd, routing head)
+            // to the async consumer. EOF/err ends the loop (the router went away).
+            let drain = std::thread::spawn(move || {
+                loop {
+                    match link.recv_client_conn() {
+                        Ok((fd, head)) => {
+                            if tx.blocking_send((fd, head)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "[privsep] per-tenant backend: link recv ended");
+                            break;
+                        }
+                    }
+                }
+            });
+            while let Some((fd, head)) = rx.recv().await {
+                tokio::spawn(serve_per_tenant_client_fd(fd, head, wired.clone()));
+            }
+            let _ = drain.join();
+        });
+        Ok(())
+    }
+
+    /// Serve one received client fd for a per-tenant instance: the frontend's routing marker
+    /// ([`routing_head`]) is a defence-in-depth consistency check (did the router splice us the right
+    /// tenant's connection?) — a mismatch is logged loudly, but the WIRED identity stays authoritative
+    /// (the head NEVER overrides the env). The request is served by a [`PerTenantHandler`] scoped to
+    /// the wired identity.
+    async fn serve_per_tenant_client_fd(
+        fd: OwnedFd,
+        head: Vec<u8>,
+        wired: Arc<WiredTenantIdentity>,
+    ) {
+        if !head.is_empty() && !wired.matches_routed(&head) {
+            tracing::warn!(
+                project = %wired.scope().project(),
+                "[privsep] per-tenant backend: routing head did not match the wired scope — serving by \
+                 the (authoritative) wired identity, NOT the head"
+            );
+        }
+        let std_stream = std::net::TcpStream::from(fd);
+        if let Err(e) = std_stream.set_nonblocking(true) {
+            tracing::debug!(error = %e, "[privsep] per-tenant backend: set_nonblocking on a client fd");
+            return;
+        }
+        let peer = std_stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let stream = match tokio::net::TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "[privsep] per-tenant backend: adopting a client fd into Tokio");
+                return;
+            }
+        };
+        if let Err(e) = boatramp_http::serve_connection(stream, PerTenantHandler { wired }).await {
+            tracing::debug!(%peer, error = %e, "[privsep] per-tenant backend: connection served with error");
+        }
+    }
+
+    /// The per-tenant backend handler: EVERY backend call is scoped by the instance's UNFORGEABLE
+    /// wired identity via [`scope_backend_call`] (a guest names no tenant — `None`), so a shared
+    /// backend is keyed by the unforgeable scope, never a guest-supplied one (artifact #2). The body
+    /// carries the resolved scope so TWO tenants produce TWO DISTINCT responses (the live gate asserts
+    /// it). The full authority-scoped app router is the WS-D/WS-E per-tenant backend-call extension.
+    struct PerTenantHandler {
+        wired: Arc<WiredTenantIdentity>,
+    }
+
+    impl boatramp_http::Handler for PerTenantHandler {
+        async fn handle(&self, _req: boatramp_http::Request) -> boatramp_http::Response {
+            // The normal shape: a guest has NO tenant field, so `None`. The scope is ALWAYS the wired
+            // identity; `scope_backend_call` would REFUSE a guest that named a foreign tenant.
+            match scope_backend_call(&self.wired, None) {
+                Ok(scope) => boatramp_http::response(
+                    200,
+                    format!(
+                        "boatramp privsep per-tenant backend [project={} prefix={}]\n",
+                        scope.project(),
+                        scope.resource_prefix()
+                    )
+                    .into_bytes(),
+                ),
+                Err(e) => boatramp_http::response(403, e.to_string().into_bytes()),
+            }
+        }
+    }
+
+    /// The PER-TENANT ROUTER frontend (WS-C step 5): accept on the inherited listener, resolve each
+    /// connection's `Host` → project (Stage-0, before any guest byte — via a `MSG_PEEK` that consumes
+    /// NOTHING, so the backend re-reads the full request), route to that tenant's instance, and relay
+    /// the accepted CLIENT fd. On a [`RouteOutcome::NotReady`] cold-start, INSTANTIATE the tenant's
+    /// instance (lazy socketpair + fork via the root's own primitive) then relay. On a `RouteRefusal`,
+    /// REFUSE the connection fail-closed — never a wildcard, a default site, or a fallback tenant. The
+    /// accepted fd confers no authority (F5); the tenant is taken ONLY from the host resolution, never
+    /// a guest field (the router has no parameter by which a guest could name a tenant).
+    fn run_per_tenant_frontend(
+        label: &str,
+        gate: &MaterializationGate,
+        listener_fd: i32,
+        config: &ServerConfig,
+        config_path: &Path,
+    ) -> Result<(), String> {
+        // The router resolves Host→project via the control-plane KV (the SAME source of truth the
+        // monolith uses). WS-C requires the router to be the SOLE `backend.kv` holder so opening the
+        // KV here does not DOUBLE-OPEN the single-writer control-plane store. A router that holds no
+        // backend.kv cannot resolve hosts → fail-closed (resolving host over a link to a separate
+        // backend.kv holder is the WS-D/WS-E per-tenant backend-call extension — flagged, not built).
+        if !gate.may_materialize(HostAuthority::BackendKv) {
+            return Err(
+                "per-tenant router holds no `backend.kv` — it cannot resolve Host→project to a \
+                 tenant. Co-locate `backend.kv` on the router (the sole KV opener), or await the \
+                 WS-D host-resolution-over-a-link extension"
+                    .to_string(),
+            );
+        }
+        // Re-derive the authorized plan IN THE ROUTER so the template's spawn spec is built by the
+        // SAME secret-scrubbed contract (F11-B) the root used (the router's own env is already
+        // scrubbed, and `build_instance_env` filters further) — a per-tenant child inherits NO secret.
+        let parent_env: Vec<(String, String)> = std::env::vars().collect();
+        let plan = super::plan_root(config, config_path, parent_env).map_err(|e| e.to_string())?;
+        let template_spec = plan.templates.into_iter().next().ok_or_else(|| {
+            "the composition defines no per-tenant template spec (a WS-C router needs one)"
+                .to_string()
+        })?;
+        let link_name = per_tenant_relay_link_name(config, label, &template_spec.label)?;
+        let current_exe =
+            std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?;
+        let policy = config
+            .privsep
+            .as_ref()
+            .map(|p| p.per_tenant)
+            .unwrap_or_default();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("building the Tokio runtime: {e}"))?;
+        rt.block_on(async move {
+            let deploy = build_routing_deploy_store(config).await?;
+            let registry =
+                ComputePlaneRegistry::new(current_exe, template_spec, link_name, policy);
+            // Mark the root-passed listener CLOEXEC so per-tenant children the router forks never
+            // INHERIT it (F5 — it is NOT CLOEXEC, having survived the router's own exec).
+            set_cloexec(listener_fd).map_err(|e| format!("CLOEXEC on the listener fd: {e}"))?;
+            // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map.
+            let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+            tracing::info!(
+                instance = %label,
+                idle_evict_secs = policy.idle_eviction_secs,
+                max_instances = policy.max_instances,
+                "[privsep] per-tenant router: accepting; resolving Host→project (Stage-0) + routing to \
+                 per-tenant instances (fail-closed — no wildcard / default / fallback tenant)"
+            );
+            loop {
+                let (conn, _peer) = listener
+                    .accept()
+                    .map_err(|e| format!("accepting on the listener: {e}"))?;
+                // Stage-0: PEEK (consume NOTHING) just enough to parse the Host, BEFORE any guest byte;
+                // the full request still reaches the backend intact over the spliced fd.
+                let host = peek_host(&conn).unwrap_or_default();
+                match route_by_host(&deploy, &host, &registry).await {
+                    Ok(RouteOutcome::Routed(link)) => relay_client_to_tenant(&link, &conn),
+                    Ok(RouteOutcome::NotReady(scope)) => match registry.instantiate(&scope) {
+                        Ok(link) => relay_client_to_tenant(&link, &conn),
+                        Err(e) => tracing::error!(
+                            project = %scope.project(),
+                            error = %e,
+                            "[privsep] per-tenant router: cold-start instantiate FAILED — refusing the \
+                             connection (fail-closed)"
+                        ),
+                    },
+                    Err(refusal) => tracing::warn!(
+                        host = %host,
+                        %refusal,
+                        "[privsep] per-tenant router: refusing a connection (fail-closed, no fallback \
+                         tenant)"
+                    ),
+                }
+                // Our copy: a relay SCM_RIGHTS-duplicated it to the tenant; a refusal closes it here.
+                drop(conn);
+            }
+        })
+    }
+
+    /// Relay one accepted client fd to a tenant's instance over its wired link, with the
+    /// non-authoritative routing marker ([`routing_head`]). Fail-closed on a transport error (the
+    /// connection is dropped; the next request for that tenant re-instantiates if the instance died).
+    fn relay_client_to_tenant(
+        link: &boatramp_server::privsep_tenant::TenantInstanceLink,
+        conn: &std::net::TcpStream,
+    ) {
+        let head = routing_head(link.scope());
+        if let Err(e) = link.relay_client(conn.as_raw_fd(), &head) {
+            tracing::warn!(
+                project = %link.scope().project(),
+                error = %e,
+                "[privsep] per-tenant router: relaying the client fd to the tenant instance failed \
+                 (connection dropped; a dead instance is re-instantiated on the next request)"
+            );
+        }
+    }
+
+    /// The declared relay link NAME between the per-tenant router and the template — the fd-map key
+    /// under which each per-tenant child receives its socketpair end. Fail-closed: a composition with
+    /// no such link cannot relay to its per-tenant instances.
+    fn per_tenant_relay_link_name(
+        config: &ServerConfig,
+        router_label: &str,
+        template_label: &str,
+    ) -> Result<String, String> {
+        let privsep = config
+            .privsep
+            .as_ref()
+            .ok_or_else(|| "no [privsep] composition at router start".to_string())?;
+        privsep
+            .links
+            .iter()
+            .find(|(_, l)| {
+                (l.from == router_label && l.to == template_label)
+                    || (l.from == template_label && l.to == router_label)
+            })
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| {
+                format!(
+                    "the composition declares no link between the per-tenant router {router_label:?} \
+                     and the template {template_label:?} — add a `local` relay link so the router can \
+                     splice client connections to each per-tenant instance"
+                )
+            })
+    }
+
+    /// Build the routing-only [`DeployStore`](boatramp_core::deploy::DeployStore) the per-tenant
+    /// router resolves Host→project against, from the node's control-plane KV (the router is the SOLE
+    /// `backend.kv` holder, so opening it here does NOT double-open the single-writer store). The blob
+    /// `Storage` is a real FS backend that host resolution NEVER touches (it reads only the KV), so it
+    /// is inert here (a KV-only resolve constructor would avoid even constructing it — flagged WS-D).
+    /// The KV backend is derived from the resolved `[serve.kv]` (sql ⇒ Sql, else the Slatedb default),
+    /// restart-class like the rest of the composition.
+    #[cfg(feature = "fs")]
+    async fn build_routing_deploy_store(
+        config: &ServerConfig,
+    ) -> Result<boatramp_core::deploy::DeployStore, String> {
+        use boatramp_core::kv::KvOpenPolicy;
+        use boatramp_node::backends::{KvBackend, build_kv};
+        let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+        let data_dir = super::normalized_data_dir(config, &cwd);
+        let sql = config
+            .serve
+            .as_ref()
+            .and_then(|s| s.kv.as_ref())
+            .and_then(|k| k.sql.clone());
+        let backend = if sql.is_some() {
+            KvBackend::Sql
+        } else {
+            KvBackend::Slatedb
+        };
+        let kv = build_kv(
+            backend,
+            &data_dir,
+            None,
+            KvOpenPolicy::SelfHeal,
+            sql.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("opening the control-plane KV for host routing: {e}"))?;
+        let storage = Arc::new(boatramp_storage::FsStorage::new(data_dir.join("blobs")));
+        Ok(boatramp_core::deploy::DeployStore::new(storage, kv))
+    }
+
+    /// Fail-closed fallback when the `fs` feature (the router's blob `Storage` backend) is not built.
+    #[cfg(not(feature = "fs"))]
+    async fn build_routing_deploy_store(
+        _config: &ServerConfig,
+    ) -> Result<boatramp_core::deploy::DeployStore, String> {
+        Err(
+            "per-tenant routing needs the `fs` feature for its blob Storage — build boatramp with \
+             default features (fs on)"
+                .to_string(),
+        )
+    }
+
+    /// `MSG_PEEK` the start of an HTTP/1.x request to extract the `Host` header, consuming NOTHING so
+    /// the full request still reaches the backend over the spliced fd. Bounded by a read deadline + a
+    /// header cap (a slow/short peer cannot pin the accept loop). `None` ⇒ no Host within the bound
+    /// (the router then refuses fail-closed). HTTP/2 / TLS-SNI host extraction is a WS-D follow-on; the
+    /// Phase-1 backend + the live gate use plaintext HTTP/1.1.
+    fn peek_host(conn: &std::net::TcpStream) -> Option<String> {
+        // Bound the peek so a stalled peer cannot pin the loop (slowloris). Best-effort.
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut buf = [0u8; 8192];
+        for _ in 0..16 {
+            let n = conn.peek(&mut buf).ok()?;
+            if n == 0 {
+                return None; // peer closed before sending a request
+            }
+            if let Some(h) = parse_host_header(&buf[..n]) {
+                return Some(h);
+            }
+            // A complete header block with no Host ⇒ there is no host (refuse).
+            if find_subslice(&buf[..n], b"\r\n\r\n").is_some() {
+                return None;
+            }
+            if n == buf.len() {
+                return None; // header block larger than the cap — refuse fail-closed
+            }
+            // Otherwise more bytes may still be arriving: peek again (it re-reads from the start).
+        }
+        None
+    }
+
+    /// Parse the `Host` header value (lowercased, port stripped) from a COMPLETE header line in `buf`
+    /// (one terminated by CRLF, so a partial peek never yields a truncated host). Case-insensitive
+    /// header name; returns `None` if the end-of-headers is reached without a complete Host line.
+    fn parse_host_header(buf: &[u8]) -> Option<String> {
+        let mut start = 0usize;
+        while let Some(eol) = find_subslice(&buf[start..], b"\r\n") {
+            let line = &buf[start..start + eol];
+            start += eol + 2;
+            if line.is_empty() {
+                break; // end of the header block
+            }
+            if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"host:") {
+                let val = std::str::from_utf8(&line[5..]).ok()?.trim();
+                let host = val
+                    .split(':')
+                    .next()
+                    .unwrap_or(val)
+                    .trim()
+                    .to_ascii_lowercase();
+                if host.is_empty() {
+                    return None;
+                }
+                return Some(host);
+            }
+        }
+        None
+    }
+
+    /// First index of `needle` in `hay` (small, allocation-free; the peeked header is bounded).
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
 }
 
 #[cfg(not(unix))]
 mod instance_serve {
+    use std::path::Path;
+
     use super::{MaterializationGate, PrivsepChildFds, ServerConfig};
 
     pub(super) fn run(
@@ -1950,6 +2743,7 @@ mod instance_serve {
         _gate: &MaterializationGate,
         _fds: &PrivsepChildFds,
         _config: &ServerConfig,
+        _config_path: &Path,
     ) -> Result<(), String> {
         Err(
             "privsep instance serving (socketpair/SCM_RIGHTS) is Unix-only; privsep is Linux-only \
@@ -1962,7 +2756,8 @@ mod instance_serve {
 #[cfg(test)]
 mod tests {
     use boatramp_core::privsep::{
-        InstanceSubstrate, LinkPurpose, LinkTransport, PrivsepConfig, PrivsepLink, SandboxPosture,
+        InstanceLifecycle, InstanceSubstrate, LinkPurpose, LinkTransport, PerTenantPolicy,
+        PrivsepConfig, PrivsepLink, SandboxPosture,
     };
 
     use super::*;
@@ -2091,6 +2886,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }
     }
 
@@ -2127,8 +2923,10 @@ mod tests {
         let cfg = cfg_with(Some(clean_privsep()));
         let plan = plan_root(&cfg, Path::new("/etc/boatramp.cfg"), fake_env())
             .expect("clean composition authorized");
-        assert_eq!(plan.instances.len(), 3);
-        for spec in &plan.instances {
+        // clean_privsep has NO per-tenant template, so all three instances are STATIC (boot-forked).
+        assert_eq!(plan.static_instances.len(), 3);
+        assert!(plan.templates.is_empty());
+        for spec in &plan.static_instances {
             // The re-exec argv is the __instance tail with the config path.
             assert_eq!(spec.argv[0], INSTANCE_SUBCOMMAND);
             assert_eq!(&spec.argv[1], &spec.label);
@@ -2187,7 +2985,7 @@ mod tests {
     fn spawn_spec_to_command_clears_env_and_re_execs() {
         let cfg = cfg_with(Some(clean_privsep()));
         let plan = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env()).unwrap();
-        let spec = &plan.instances[0];
+        let spec = &plan.static_instances[0];
         let cmd = spec.to_command(Path::new("/usr/local/bin/boatramp"));
         // The program is the current binary (re-exec), args carry the __instance tail.
         assert_eq!(
@@ -2435,6 +3233,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         };
         let out = compute_authority_serve_links(&cfg_with(Some(p)));
         // The crown-jewel SIGNER end is designated to serve WS-E on `to-sign`.
@@ -2479,6 +3278,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }));
         // ...IS designated (so the designation is not what stops it)...
         assert!(
@@ -2541,6 +3341,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }));
 
         // The marker designates the crown-jewel SIGNER to serve on the link EVEN THOUGH the peer is a
@@ -2620,6 +3421,7 @@ mod tests {
             instances: instances.clone(),
             links: link(LinkPurpose::Unspecified),
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }));
         assert!(
             compute_authority_serve_links(&unspec)
@@ -2631,10 +3433,200 @@ mod tests {
             instances,
             links: link(LinkPurpose::Relay),
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }));
         assert!(
             compute_authority_serve_links(&relay).is_empty(),
             "a relay-marked link must never be an authority-serve link"
+        );
+    }
+
+    // ---- Phase-4 WS-C: the static/template partition + the per-tenant registry ----
+
+    fn template_inst(caps: &[HostAuthority], links: &[&str]) -> PrivsepInstanceConfig {
+        PrivsepInstanceConfig {
+            capabilities: caps.to_vec(),
+            sandbox: SandboxPosture::Derived,
+            substrate: InstanceSubstrate::OsProcess,
+            lifecycle: InstanceLifecycle::PerTenantTemplate,
+            links: links.iter().copied().map(String::from).collect(),
+        }
+    }
+
+    /// A valid Phase-4 WS-C composition (union == ALL): `router` = listeners + `backend.kv` (the
+    /// per-tenant router + sole KV opener), `tenant-wasm` = `{exec.wasmtime}` PER-TENANT TEMPLATE,
+    /// `core` = crown jewels + the other backends, `aux` = the other listeners + exec.compute +
+    /// control. A `to-tenant` relay link connects the router and the template.
+    fn phase4_privsep() -> PrivsepConfig {
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "router".to_string(),
+            inst(
+                &[
+                    HostAuthority::ListenPublicTls,
+                    HostAuthority::ListenHttpParse,
+                    HostAuthority::BackendKv,
+                    // `exec.compute` = the compute-plane spawn authority: it is what legitimately
+                    // grants the router `execve` (the per-capability profile kills `execve` for
+                    // every instance EXCEPT the root + `exec.compute` holders) so it can fork the
+                    // per-tenant `exec.wasmtime` instances. NOT co-resident with `exec.wasmtime`
+                    // (that lives only on the template), so the Phase-4 lint is satisfied.
+                    HostAuthority::ExecCompute,
+                ],
+                &["to-tenant"],
+            ),
+        );
+        instances.insert(
+            "tenant-wasm".to_string(),
+            template_inst(&[HostAuthority::ExecWasmtime], &["to-tenant"]),
+        );
+        instances.insert(
+            "core".to_string(),
+            inst(
+                &[
+                    HostAuthority::SecretsSealer,
+                    HostAuthority::TokenSigner,
+                    HostAuthority::ImageSigner,
+                    HostAuthority::OverlayDialSigner,
+                    HostAuthority::S3IngressRoot,
+                    HostAuthority::ClusterJoinSigner,
+                    HostAuthority::BackendSql,
+                    HostAuthority::BackendBlob,
+                    HostAuthority::BackendMessaging,
+                ],
+                &[],
+            ),
+        );
+        instances.insert(
+            "aux".to_string(),
+            inst(
+                &[
+                    HostAuthority::ListenMail,
+                    HostAuthority::ListenOverlay,
+                    HostAuthority::ListenS3Ingress,
+                    HostAuthority::ListenInboundTcp,
+                    HostAuthority::ListenGateway,
+                    HostAuthority::ControlAdminApi,
+                    HostAuthority::AcmeDnsControl,
+                ],
+                &[],
+            ),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-tenant".to_string(),
+            PrivsepLink {
+                from: "router".to_string(),
+                to: "tenant-wasm".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Relay,
+            },
+        );
+        PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn plan_root_partitions_static_instances_from_on_demand_templates() {
+        let cfg = cfg_with(Some(phase4_privsep()));
+        let plan = plan_root(&cfg, Path::new("/etc/boatramp.cfg"), fake_env())
+            .expect("the Phase-4 WS-C composition is authorized");
+        // The per-tenant TEMPLATE is in `templates` (instantiated on demand), NOT in the boot fork
+        // set `static_instances` (the bug step 2 fixes: a boot-forked template with no wired scope
+        // would die Unwired → FailNodeClosed).
+        let template_labels: Vec<&str> = plan.templates.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(template_labels, vec!["tenant-wasm"]);
+        let static_labels: std::collections::BTreeSet<&str> = plan
+            .static_instances
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert!(
+            !static_labels.contains("tenant-wasm"),
+            "a per-tenant template must NOT be in the boot fork set"
+        );
+        assert_eq!(
+            static_labels,
+            ["aux", "core", "router"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>(),
+            "every non-template instance is boot-forked"
+        );
+        // The template's spec still inherits NO secret (the SAME env_clear/scrub contract).
+        let t = &plan.templates[0];
+        assert!(!t.env.contains_key("VAULT_TOKEN"));
+        assert!(!t.env.contains_key("BOATRAMP_AUTH_ROOT_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn plan_root_refuses_a_zero_concurrency_policy_when_a_template_exists() {
+        // Fail-closed: a per-tenant template composition with max_instances == 0 could never
+        // instantiate any tenant — the root refuses BEFORE any spawn.
+        let mut p = phase4_privsep();
+        p.per_tenant = PerTenantPolicy {
+            idle_eviction_secs: 300,
+            max_instances: 0,
+        };
+        let cfg = cfg_with(Some(p));
+        let err = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env()).unwrap_err();
+        assert!(
+            matches!(err, PrivsepError::PerTenantPolicy(_)),
+            "a 0 concurrency cap with a template is a fail-closed refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_root_ignores_the_per_tenant_policy_without_a_template() {
+        // A no-template composition never reads the policy — even a (would-be-invalid) 0 cap passes,
+        // so every pre-Phase-4 composition is byte-unchanged.
+        let mut p = clean_privsep();
+        p.per_tenant = PerTenantPolicy {
+            idle_eviction_secs: 0,
+            max_instances: 0,
+        };
+        let cfg = cfg_with(Some(p));
+        let plan = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env())
+            .expect("a no-template composition ignores the per_tenant policy");
+        assert!(plan.templates.is_empty());
+        assert_eq!(plan.static_instances.len(), 3);
+    }
+
+    /// An empty [`per_tenant::ComputePlaneRegistry`] resolves EVERY scope to `None` — the WS-C
+    /// `NotReady` wake/cold-start seam; a tenant with no live instance is NEVER a fallback for
+    /// another. (The live instantiate path forks a real `__instance` and is exercised by the Linux
+    /// live gate, not here.)
+    #[cfg(unix)]
+    #[test]
+    fn compute_plane_registry_resolves_an_unseen_tenant_to_not_ready() {
+        use boatramp_core::privsep::TenantScope;
+        use boatramp_server::privsep_tenant::PerTenantInstanceRegistry;
+
+        let spec = InstanceSpawnSpec {
+            label: "tenant-wasm".to_string(),
+            capabilities: vec![HostAuthority::ExecWasmtime],
+            substrate: InstanceSubstrate::OsProcess,
+            argv: vec![
+                INSTANCE_SUBCOMMAND.to_string(),
+                "tenant-wasm".to_string(),
+                "--config".to_string(),
+                "boatramp.cfg".to_string(),
+            ],
+            env: BTreeMap::new(),
+        };
+        let reg = super::per_tenant::ComputePlaneRegistry::new(
+            PathBuf::from("/usr/local/bin/boatramp"),
+            spec,
+            "to-tenant".to_string(),
+            PerTenantPolicy::default(),
+        );
+        let scope = TenantScope::resolve("acme").expect("valid scope");
+        assert!(
+            reg.resolve(&scope).is_none(),
+            "an empty registry must resolve to NotReady, never a fallback instance"
         );
     }
 }
