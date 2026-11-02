@@ -101,6 +101,17 @@ pub enum TenantSource {
     /// request-carried firm is safe BECAUSE the auth is the real gate; this source only selects
     /// *which* configured firm to seal.
     ///
+    /// **CLAIMED, not authenticated.** The firm this source resolves is a pre-auth *selection*, not an
+    /// authentication: an UNAUTHENTICATED caller can drive `/sso/start` and obtain a sealed `state`
+    /// for ANY configured firm (that is the whole point — the staff member holds no token yet). The
+    /// sealed firm is therefore a **claimed** tenant, NOT a proven one. Every
+    /// [`SealedState`](Self::SealedState) consumer MUST treat the recovered firm as claimed-only until
+    /// the IdP authorization-code exchange and the PKCE / nonce validation complete at the callback —
+    /// only then is the firm an authenticated identity. This is intrinsic to pre-auth SSO (the firm
+    /// *must* ride in the request before any token exists); it is a documented contract, not a defect,
+    /// and the seal-only confinement above keeps a merely-claimed firm from touching any data before
+    /// the callback proves it.
+    ///
     /// **Configured-firm, fail-closed.** The extracted selector resolves ONLY to a firm that is a
     /// provisioned/configured tenant in the project (the host checks a registry — the same
     /// provisioning signal the `sealed-state` source's defense-in-depth check uses). Unknown /
@@ -160,7 +171,7 @@ pub enum ParamKind {
 pub const DEFAULT_PREAUTH_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// A hard ceiling on the configurable [`PreAuthSelector::max_body_bytes`] — a config asking for more
-/// is refused at apply, so a mis-set cap can never let an unauthenticated POST force unbounded
+/// is refused at apply, so a misconfigured cap can never let an unauthenticated POST force unbounded
 /// pre-auth buffering.
 pub const PREAUTH_BODY_MAX_BYTES_CEILING: usize = 1024 * 1024;
 

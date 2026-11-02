@@ -545,11 +545,12 @@ pub(super) async fn dispatch_handler(
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned);
-            let (parts, body) = request.into_parts();
+            let (mut parts, body) = request.into_parts();
             match axum::body::to_bytes(body, cap).await {
                 Ok(raw) => {
                     let bytes = raw.to_vec();
-                    // Put the buffered body back so the guest still receives it.
+                    // Put the buffered body back so the guest still receives it (unchanged: the
+                    // success path faithfully restores the original body and its `Content-Length`).
                     request = Request::from_parts(parts, axum::body::Body::from(raw));
                     Some(crate::tenant_resolve::PreAuthBody {
                         content_type,
@@ -557,6 +558,11 @@ pub(super) async fn dispatch_handler(
                     })
                 }
                 Err(_) => {
+                    // The over-cap (or errored) read leaves the guest an EMPTY body, so drop any
+                    // stale `Content-Length` — it described the original, larger body and would
+                    // desync a length-delimited guest read against the now-empty body. Only this
+                    // error arm is touched; the success arm above is left untouched.
+                    parts.headers.remove(header::CONTENT_LENGTH);
                     request = Request::from_parts(parts, axum::body::Body::empty());
                     None
                 }

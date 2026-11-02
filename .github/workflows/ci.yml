@@ -471,8 +471,8 @@ jobs:
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
             --features handlers,oidc,mcp,compression,domain-verify-dns --lib \
             tenant_resolve::preauth -- --nocapture 2>&1 | tee preauth-source.log
-          grep -qE 'test result: ok\. 8 passed' preauth-source.log \
-            || { echo "::error::pre-auth tenant source gate did not run all 8 tests (silent skip, a failure, or a dropped case)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 9 passed' preauth-source.log \
+            || { echo "::error::pre-auth tenant source gate did not run all 9 tests (silent skip, a failure, or a dropped case)" >&2; exit 1; }
           grep -q 'PRE-AUTH TENANT SOURCE OK' preauth-source.log \
             || { echo "::error::pre-auth tenant source e2e gate never reached its marker — the unscoped-start-fails-closed / seal-only-start-resolves / callback-recovers flow regressed" >&2; exit 1; }
 

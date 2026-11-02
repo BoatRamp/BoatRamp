@@ -345,7 +345,7 @@ pub(crate) async fn resolve_host_tenancy(
                             facts,
                             // No data access at /start: force both axes to `None` (deny every scoped
                             // op), independent of the declared modes — airtight even if a pre-auth
-                            // route mis-declares `read: all`.
+                            // route wrongly declares `read: all`.
                             AccessMode::None,
                             AccessMode::None,
                         )
@@ -1036,19 +1036,31 @@ fn extract_preauth_body_field(
     if body.bytes.len() > selector.effective_body_cap() {
         return None;
     }
-    let ct = body.content_type.as_deref().unwrap_or("");
-    // Is this request's content-type accepted? The configured allowlist (each entry substring-matched
-    // against the `Content-Type` header), or — when the operator configured none — any content-type
-    // (the two understood parsers then self-select on the actual header below). A header matching no
-    // configured entry fails closed (never parsed).
+    // The request's MEDIA TYPE: the `Content-Type` header with any parameters (`; charset=utf-8`)
+    // dropped, then trimmed and lowercased. Matching is a proper media-type EQUALITY test — never a
+    // substring test, which would let a crafted header like `application/json-evil` or
+    // `text/x-application/json` smuggle past the allowlist and pick a parser it was never granted.
+    let media_type = body
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // Is this request's media type accepted? The configured allowlist (each entry matched for EQUALITY
+    // against the request media type, case-insensitively), or — when the operator configured none —
+    // any media type (the two understood parsers then self-select on the actual media type below). A
+    // media type matching no configured entry fails closed (never parsed).
     let accepted = selector.content_types.is_empty()
         || selector
             .content_types
             .iter()
-            .any(|c| !c.is_empty() && ct.contains(c.as_str()));
-    // Dispatch the parser on the ACTUAL header (only among the understood types); an accepted but
-    // unrecognized content-type still fails closed (never guess a parser).
-    let accepts = |needle: &str| accepted && ct.contains(needle);
+            .any(|c| !c.is_empty() && c.trim().eq_ignore_ascii_case(&media_type));
+    // Dispatch the parser on the ACTUAL media type (only among the understood types); an accepted but
+    // unrecognized media type still fails closed (never guess a parser).
+    let accepts = |expected: &str| accepted && media_type == expected;
     if accepts("application/x-www-form-urlencoded") {
         // Reuse the form-urlencoded value decoder (first matching key wins).
         let text = std::str::from_utf8(&body.bytes).ok()?;
@@ -4125,6 +4137,62 @@ mod preauth_source {
         )
         .await;
         assert_seal_only(&ht, "ten_x");
+    }
+
+    /// Multi-firm POSITIVE-DISCRIMINATION gate (the standing "tenancy gate needs a multi-tenant
+    /// fixture" rule). With TWO configured firms, `/sso/start?tenant=<firm>` must resolve the seal-only
+    /// subject to EXACTLY the requested firm and never the OTHER configured firm — a single-firm
+    /// fixture is blind to a lookup that returns the first/any configured firm instead of echoing the
+    /// request-selected one. Guards against a future "lookup-returns-value" refactor.
+    #[tokio::test]
+    async fn two_configured_firms_resolve_exactly_the_requested_one() {
+        // firm-x requested; BOTH firm-x and firm-y configured => the seal subject is EXACTLY firm-x.
+        let req_x = Req {
+            query: vec![("tenant".into(), "firm-x".into())],
+            ..Default::default()
+        };
+        let ht_x = resolve(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req_x,
+            None,
+            None,
+            &["firm-x", "firm-y"],
+        )
+        .await;
+        assert_eq!(
+            ht_x.preauth_seal_subject(),
+            Some("firm-x"),
+            "the requested firm-x is the resolved seal subject"
+        );
+        assert_ne!(
+            ht_x.preauth_seal_subject(),
+            Some("firm-y"),
+            "and NEVER the other configured firm (firm-y)"
+        );
+
+        // firm-y requested; the SAME two firms configured => the seal subject is EXACTLY firm-y.
+        let req_y = Req {
+            query: vec![("tenant".into(), "firm-y".into())],
+            ..Default::default()
+        };
+        let ht_y = resolve(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req_y,
+            None,
+            None,
+            &["firm-x", "firm-y"],
+        )
+        .await;
+        assert_eq!(
+            ht_y.preauth_seal_subject(),
+            Some("firm-y"),
+            "the requested firm-y is the resolved seal subject"
+        );
+        assert_ne!(
+            ht_y.preauth_seal_subject(),
+            Some("firm-x"),
+            "and NEVER the other configured firm (firm-x)"
+        );
     }
 
     #[tokio::test]
