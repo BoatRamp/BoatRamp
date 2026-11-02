@@ -47,6 +47,10 @@ unparseable = "unparseable"
 # `controllen` = the libc `msghdr.msg_controllen` field name (the privsep `local` link's
 # `SCM_RIGHTS` fd-passing in `privsep_link.rs`). A POSIX struct field, not a typo of "controller".
 controllen = "controllen"
+# `mis` = the hyphenated prefix the tokenizer splits off (`mis-routed` / `mis-keying` / `mis-route`
+# / `mis-key`) in the privsep per-tenant routing comments (`privsep_tenant.rs`). A valid English
+# prefix describing a routing/keying error, not a typo of "miss"/"mist".
+mis = "mis"
 
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
