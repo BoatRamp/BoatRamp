@@ -487,6 +487,12 @@ chrono = { version = "0.4", default-features = false, features = [
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# The `dns-publish` SERVE-WIRING gate (cap-req #25, tests/dns_publish_serve_wiring_live.rs) installs
+# a `ManualDnsProvider` (the credential-free dev writer) as the provider source and asserts the real
+# `router()` dispatch seam captures a guest's writes. `boatramp-acme`'s `dns` module (DnsProvider /
+# ManualDnsProvider / DnsRecord) is ALWAYS compiled (no feature needed), so the base dep suffices;
+# dev-only, so the shipped binary's dep graph is unchanged.
+boatramp-acme = { workspace = true }
 # Self-signed cert minting for the per-listener host-TLS live gate (cap-req 06):
 # `tcp_listener_tls_live` builds a `rustls::ServerConfig` from an rcgen cert + a
 # `tokio_rustls` client to prove the handshake terminates host-side.

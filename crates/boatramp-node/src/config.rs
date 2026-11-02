@@ -2409,6 +2409,14 @@ pub struct ServeConfig {
     pub http_redirect_addr: Option<SocketAddr>,
     /// Site to serve for a `Host` matching no domain, instead of 404.
     pub default_site: Option<String>,
+    /// `[serve.dns_publish]` — the guest **`dns-publish` WRITE** capability's host-held DNS provider
+    /// (cap-req #24/#25): the config-file analog of `--dns-publish-provider` / `--dns-publish-zone-root`
+    /// (the flag/env win). **Absent (the default) ⇒ no provider is wired ⇒ every guest `dns-publish`
+    /// call fail-closes to `access-denied`** (compiling the capability in grants no one by itself).
+    /// Credentials are NEVER here — they come from the ENVIRONMENT (the "no secrets in config"
+    /// posture), via the SAME per-provider env vars `--acme-dns-provider` reads. See
+    /// `boatramp::dns_publish_serve` and [`DnsPublishServeConfig`].
+    pub dns_publish: Option<DnsPublishServeConfig>,
     /// The fleet's canonical public origin (e.g. `https://cp.example.com`) that a
     /// per-request proof-of-possession must bind to (`aud`). Required for
     /// holder-bound (`cnf`/PoP) tokens to be usable — a proof's origin is compared
@@ -2891,6 +2899,24 @@ pub struct BlobBackendConfig {
     /// `access_key_id` is a public identifier; `secret_access_key` is a `boatramp:`/`env:` **reference**
     /// (never the raw secret in config, invariant 3). Absent ⇒ the ambient AWS env chain.
     pub s3_credential: Option<S3CredentialConfig>,
+}
+
+/// `[serve.dns_publish]` — the guest **`dns-publish` WRITE** capability's host-held DNS provider
+/// (cap-req #24/#25 serve-wiring). The config-file analog of `--dns-publish-provider` /
+/// `--dns-publish-zone-root` (the flag/env override these). **Absent — or `provider` unset — ⇒ no
+/// provider is wired ⇒ every guest `dns-publish` call fail-closes to `access-denied`** (the unchanged
+/// default). Credentials are NEVER stored here (the "no secrets in config" posture) — they come from
+/// the ENVIRONMENT, via the SAME per-provider env vars `--acme-dns-provider` reads. The per-handler
+/// writable-zone allowlist (`dns_publish_zones`) is deploy-record config, not here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsPublishServeConfig {
+    /// Which provider adapter writes guest DNS (`manual` | `cloudflare` | `route53` | `oci` | …, the
+    /// SAME grammar as `--acme-dns-provider`). Absent ⇒ fail-closed (no provider wired).
+    pub provider: Option<String>,
+    /// The authoritative zone apex the provider writes (e.g. `example.com`), passed to the central
+    /// `validate_writable` guardrail so an apex `NS` is refused. Required when `provider` is set.
+    pub zone_root: Option<String>,
 }
 
 /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch
