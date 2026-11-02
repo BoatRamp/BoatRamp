@@ -163,6 +163,8 @@ Nickel-generated config on a non-`.json` path). See
 | `--dns-target <addr\|host>` | — | `--tls acme-dns` only: point every site's verified **custom** domains at this address via a leader-gated background reconcile loop (never the `*.deploy.<host>` preview wildcard). An IPv4/IPv6 literal becomes an A/AAAA record, anything else a CNAME — the same convention as `dns configure-domain --target`. Unset (default) disables the loop; `dns configure-domain` remains the manual, one-shot path. See [Automate DNS with a provider](../how-to/auto-dns.md). |
 | `--dns-reconcile-tick-secs <n>` | `300` | How often the `--dns-target` reconcile loop re-sweeps every site's verified custom domains. Ignored when `--dns-target` is unset. |
 | `--dns-reconcile-ttl <n>` | `300` | TTL (seconds) for the A/AAAA/CNAME records the `--dns-target` reconcile loop writes. Ignored when `--dns-target` is unset. |
+| `--dns-publish-provider <name>` | — (off) | Install a host-held DNS provider for the guest **`dns-publish` WRITE** capability (same provider grammar as `--acme-dns-provider`; `manual` for an offline proof). Unset ⇒ nothing wired ⇒ every guest `dns-publish` is `access-denied` (fail-closed). A distinct authority from `--acme-dns-provider`. Also needs the posture `allow_guest_dns_publish` + a per-handler `dns_publish_zones` allowlist. See [`serve.dns_publish`](./boatramp-cfg.md#servedns_publish). |
+| `--dns-publish-zone-root <apex>` | — | The authoritative zone apex the `--dns-publish-provider` credential writes (e.g. `example.com`). Required once `--dns-publish-provider` is set. |
 | `--http-redirect-addr <host:port>` | `BOATRAMP_HTTP_REDIRECT_ADDR` | Second listener that `308`s plain HTTP to HTTPS. |
 
 ### Uploads, serving, cluster

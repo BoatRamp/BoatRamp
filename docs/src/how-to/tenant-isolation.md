@@ -50,6 +50,7 @@ and bound once per invocation:
 | `domain` | The routed request domain's [context tag](./custom-domain.md#map-each-host-to-a-tenant-domainscontexts) (`domains.contexts`). | Storefronts / public-render paths — one deployment, many customer domains, no app-side `Host`→tenant lookup. |
 | `signed_context` | A host-verifiable signed context stamped on an async job/message. The producer host-stamps its own verified tenant at publish; a consumer declaring `sources: [(kind: "signed_context")]` resolves that tenant on the async lane (verified against the fleet anchor). A forged/expired/absent context resolves nothing, so an "own" op fails closed. Wired since v0.4.3. | Message consumers, cron, webhooks, workflow steps, fan-out workers. |
 | `sealed_state` | An AEAD-sealed **state token** carried on the request — `sources: [(kind: "sealed_state", param: (kind: "query", name: "state"))]` (or `kind: "header"`). A host op seals `{tenant, …}` at login-start, binding the guest's own host-resolved tenant (the guest never names it); at the **pre-auth callback** — which carries no bearer and no routed domain, so no other source can resolve — this source verifies+decrypts the named param with the node's `[secrets]` envelope and extracts the host-bound tenant. The tenant comes from the crypto seal, **never parsed from request text**; a tampered/forged/expired/wrong-`(project,site)`/missing token resolves nothing (fail-closed, like an unresolved token). | A pre-auth OIDC `/sso/callback` (and similar redirect flows that carry no other tenant signal). |
+| `pre_auth_request` | The firm (tenant) extracted **host-side** from a configured request location (`host` / `query` / `path` / `body`) on an **unscoped login-start** that carries no bearer and no routed domain. **Seal-only — never a data tenant**: its sole consumer is the `sealed_state` *mint* (so `sealed_state` can later recover the firm at the callback); `/sso/start` grants **no** row/`orm`/`tenant-secrets` access. Resolves only to a **provisioned** firm; unknown/missing/malformed/wildcard all resolve nothing with a **uniform** fail-closed outcome. Must be the route's **only** source; off by default. See [Pre-auth login-start](#pre-auth-login-start-resolve-the-firm-to-seal-pre_auth_request). | An unscoped SSO `/sso/start?tenant=ten_X` (the firm must ride in the request because the staff member holds no token yet). |
 | `none` | There is no "own" tenant (truly anonymous / HMAC-webhook auth). Only the `null`/`all` access modes are meaningful; an "own" mode fails closed. | Funnel reads, unauthenticated webhooks. |
 
 For the **`token`** source, configure the JWKS/issuer that verifies the app bearer with a
@@ -118,6 +119,49 @@ silently-denied requests.
 > agrees). It does **not** change the [GraphQL data connector](./graphql.md)'s `row_filter`, which
 > binds the claim verbatim; do not scope the same tenant column through both a transformed `token`
 > source and a GDC `row_filter`, or the two surfaces will key the same principal differently.
+
+### Pre-auth login-start: resolve the firm to seal (`pre_auth_request`)
+
+`sealed_state` (above) recovers the firm at the **callback**, but something must seal it at the
+**start** of a login that carries no token and no routed-tenant domain — an unscoped SSO
+`/sso/start`. The `pre_auth_request` source is that one controlled exception to the
+never-take-the-tenant-from-request-text rule: it resolves the firm **host-side** from a configured
+request location so the `sealed_state` *mint* can seal it into the OIDC `state`.
+
+```ron
+# /sso/start?tenant=ten_8f3a…  — the firm rides in the query, sealed into the login state
+tenancy: (mode: "scoped", column: "tenant_id",
+          sources: [(kind: "pre_auth_request", selector: (location: "query", name: "tenant"))])
+```
+
+The `selector.location` chooses where the firm selector is read from:
+
+- **`host`** — the already-verified routed host's context tag (the strongest signal; `name` is ignored).
+- **`query`** — a URL query parameter `?<name>=<firm>` (the `/sso/start?tenant=ten_X` case).
+- **`path`** — a path segment following the literal label `name`.
+- **`body`** — a login-start POST body (`application/x-www-form-urlencoded` or `application/json`),
+  the AWS-IAM-style credentials-against-the-firm shape. Set the accepted `content_types` (empty ⇒ the
+  two understood defaults) and an optional `max_body_bytes` (default 64 KiB, hard ceiling 1 MiB; a
+  larger body fails closed **before** parsing). The body is buffered only on a route that declares a
+  `body` selector — never on the per-tenant serving hot path.
+
+Two properties make this safe:
+
+- **Seal-only — never a data tenant.** Unlike every other source, a `pre_auth_request` firm is carried
+  as a *seal-only* subject that reaches **only** the `sealed_state` mint. There is no `sql`/`orm` row
+  access and no `tenant-secrets` read at `/sso/start`: every scoped read/write stays fail-closed until
+  the callback unseals the firm and the IdP auth has actually run. The request-carried firm is a
+  **claimed** selection, not an authenticated identity — the external auth at the callback is the real
+  gate; this source only selects *which* configured firm to seal.
+- **Configured-firm, fail-closed, no enumeration oracle.** The extracted selector is key-safety
+  screened and resolves **only** to a firm already provisioned in the project; unknown / missing /
+  malformed / wildcard all resolve nothing (the mint then fails closed), and the guest-facing outcome
+  is **uniform** across every failure so a caller can't probe which firms exist. Key firms by an
+  **opaque** identifier (e.g. `ten_8f3a…`) rather than a guessable slug so the selector space is
+  unguessable.
+
+`pre_auth_request` must be the route's **only** source (a seal-only firm must never co-resolve with a
+real data tenant), and it is **off by default** — a route that doesn't declare it is unaffected.
 
 ## Dimension 2: the access mode, per read/write axis
 
