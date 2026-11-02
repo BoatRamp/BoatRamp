@@ -1110,6 +1110,45 @@ mod per_tenant {
             /// The underlying OS error.
             source: std::io::Error,
         },
+        /// The tenant's cold start is BACKED OFF: its child failed to instantiate, or died within
+        /// the configured min-healthy window, too recently — so the router declines to re-fork it
+        /// until the (exponential, capped) backoff elapses, rather than re-forking on every request.
+        /// Fail-closed: the connection is refused; it is NEVER served from another tenant's instance,
+        /// and the tenant recovers automatically once the window passes.
+        #[error(
+            "per-tenant instantiate: tenant {project:?} is backed off after a failed/crash-looping \
+             cold start (retry in ~{retry_after_ms} ms)"
+        )]
+        BackedOff {
+            /// The tenant project.
+            project: String,
+            /// Approximately how long until the next cold-start attempt is admitted.
+            retry_after_ms: u64,
+        },
+        /// The NODE-WIDE cold-start rate budget is exhausted: admitting this cold start now would
+        /// fork past the operator-tuned cold-start rate, so it is declined to protect already-warm
+        /// instances from evict+fork churn under a cross-tenant request spray. Fail-closed: the
+        /// connection is refused, never served from another tenant's instance.
+        #[error(
+            "per-tenant instantiate: node cold-start rate limit reached — declining to fork tenant \
+             {project:?} right now (fail-closed)"
+        )]
+        ColdStartRateLimited {
+            /// The tenant project.
+            project: String,
+        },
+    }
+
+    impl InstantiateError {
+        /// Whether this is an ADMISSION decline (backoff / rate-limit) — EXPECTED under crash-loop
+        /// churn or a cross-tenant spray, so the router logs it at `warn` — vs. a genuine
+        /// socketpair/fork failure, logged at `error`. Both refuse the connection fail-closed.
+        pub(super) fn is_admission_decline(&self) -> bool {
+            matches!(
+                self,
+                Self::BackedOff { .. } | Self::ColdStartRateLimited { .. }
+            )
+        }
     }
 
     /// One live per-tenant instance the router is pooling.
@@ -1117,6 +1156,152 @@ mod per_tenant {
         link: TenantInstanceLink,
         child: std::process::Child,
         last_used: Instant,
+    }
+
+    /// Per-project cold-start admission + backoff state (WS-C MEDIUM — the cold-start churn / DoS
+    /// guard). It dampens two failure shapes WITHOUT ever relaxing isolation: (1) a tenant whose
+    /// child fails to fork or dies within the min-healthy window is BACKED OFF (exponential, capped)
+    /// so it is not re-forked on every request; (2) a node-wide cold-start TOKEN BUCKET bounds the
+    /// global fork rate so a request spray across more tenants than `max_instances` cannot force
+    /// continuous SIGKILL+fork churn that evicts warm instances for free. Every decline is
+    /// fail-closed: the router refuses the connection (`NotReady`/refusal), NEVER serving it from
+    /// another tenant. All state is bounded (pruned) and operator-tunable via [`PerTenantPolicy`].
+    #[derive(Debug)]
+    struct Admission {
+        /// Per-project backoff / crash-loop tracking. Pruned to the set currently backing off or with
+        /// an armed crash-loop marker, so the map stays bounded by the recently-active tenant set.
+        projects: BTreeMap<String, ProjectAdmission>,
+        /// Node-wide cold-start token bucket: `tokens` refills at `cold_start_rate_per_sec` up to
+        /// `cold_start_burst`, and each admitted cold start spends one.
+        tokens: f64,
+        /// When the bucket was last refilled.
+        last_refill: Instant,
+    }
+
+    /// One project's cold-start admission state.
+    #[derive(Debug, Default)]
+    struct ProjectAdmission {
+        /// When this project's most recent child was forked — arms crash-loop detection: if the
+        /// NEXT cold-start attempt finds the instance already gone within the min-healthy window,
+        /// the child crash-looped. `None` once consumed / after a healthy reset.
+        last_spawn: Option<Instant>,
+        /// Consecutive failed / crash-looping cold starts, driving the exponential (capped) backoff.
+        consecutive_failures: u32,
+        /// The earliest instant the next cold start for this project is admitted (the open backoff
+        /// window), or `None` when not backing off.
+        retry_after: Option<Instant>,
+    }
+
+    impl Admission {
+        /// A fresh bucket seeded full (a cold node may wake up to `cold_start_burst` tenants at once).
+        fn new(policy: &PerTenantPolicy) -> Self {
+            Self {
+                projects: BTreeMap::new(),
+                tokens: policy.cold_start_burst_capacity(),
+                last_refill: Instant::now(),
+            }
+        }
+
+        /// Decide whether a cold start for `project` is admitted NOW. Called on the COLD path only
+        /// (a reuse never forks), under the registry's `live` lock — so exactly one admit decision
+        /// runs at a time. Fail-closed: `Err` ⇒ refuse the connection. On `Ok` a rate-limit token has
+        /// been spent and the caller proceeds to fork.
+        fn admit(
+            &mut self,
+            project: &str,
+            now: Instant,
+            policy: &PerTenantPolicy,
+        ) -> Result<(), InstantiateError> {
+            self.prune(now, policy);
+            let min_healthy = policy.cold_start_min_healthy();
+            let entry = self.projects.entry(project.to_string()).or_default();
+            // Crash-loop: a child forked within the min-healthy window is ALREADY gone (we are on the
+            // cold path ⇒ no live instance), so it died too fast — treat as a failed cold start and
+            // back off. A zero window disables this (an instance is never "too short-lived").
+            if let Some(ls) = entry.last_spawn {
+                if !min_healthy.is_zero() && now.duration_since(ls) < min_healthy {
+                    entry.last_spawn = None;
+                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    let delay = policy.cold_start_backoff(entry.consecutive_failures);
+                    entry.retry_after = Some(now + delay);
+                    return Err(InstantiateError::BackedOff {
+                        project: project.to_string(),
+                        retry_after_ms: delay.as_millis() as u64,
+                    });
+                }
+                // Lived at least the min-healthy window ⇒ it was healthy (now idle/cap-evicted): the
+                // tenant is in good standing again, so clear the failure history.
+                entry.last_spawn = None;
+                entry.consecutive_failures = 0;
+                entry.retry_after = None;
+            }
+            // An open backoff window (e.g. from a prior FORK failure) still blocks.
+            if let Some(ra) = entry.retry_after {
+                if now < ra {
+                    return Err(InstantiateError::BackedOff {
+                        project: project.to_string(),
+                        retry_after_ms: ra.saturating_duration_since(now).as_millis() as u64,
+                    });
+                }
+                entry.retry_after = None; // the window elapsed ⇒ half-open: allow one attempt
+            }
+            // Node-wide cold-start rate limit (protects warm instances from evict+fork churn). A rate
+            // of 0 disables it entirely.
+            if policy.cold_start_rate_per_sec > 0 {
+                self.refill(now, policy);
+                if self.tokens < 1.0 {
+                    return Err(InstantiateError::ColdStartRateLimited {
+                        project: project.to_string(),
+                    });
+                }
+                self.tokens -= 1.0;
+            }
+            Ok(())
+        }
+
+        /// Record that `project`'s child was successfully forked — arms crash-loop detection for the
+        /// next cold-start attempt.
+        fn record_spawn(&mut self, project: &str, now: Instant) {
+            self.projects
+                .entry(project.to_string())
+                .or_default()
+                .last_spawn = Some(now);
+        }
+
+        /// Record a FORK failure for `project` (socketpair / fork+exec) — back off before the next
+        /// attempt so a persistently-failing tenant is not re-forked on every request.
+        fn record_failure(&mut self, project: &str, now: Instant, policy: &PerTenantPolicy) {
+            let entry = self.projects.entry(project.to_string()).or_default();
+            entry.last_spawn = None;
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            entry.retry_after = Some(now + policy.cold_start_backoff(entry.consecutive_failures));
+        }
+
+        /// Refill the token bucket for the time elapsed since the last refill, capped at the burst.
+        fn refill(&mut self, now: Instant, policy: &PerTenantPolicy) {
+            let elapsed = now
+                .saturating_duration_since(self.last_refill)
+                .as_secs_f64();
+            if elapsed > 0.0 {
+                let cap = policy.cold_start_burst_capacity();
+                self.tokens =
+                    (self.tokens + elapsed * f64::from(policy.cold_start_rate_per_sec)).min(cap);
+                self.last_refill = now;
+            }
+        }
+
+        /// Drop entries that carry no live obligation (no open backoff window, no armed crash-loop
+        /// marker) so the map stays bounded by the recently-active tenant set.
+        fn prune(&mut self, now: Instant, policy: &PerTenantPolicy) {
+            let min_healthy = policy.cold_start_min_healthy();
+            self.projects.retain(|_, e| {
+                let backing_off = e.retry_after.is_some_and(|ra| now < ra);
+                let armed = e.last_spawn.is_some_and(|ls| {
+                    !min_healthy.is_zero() && now.duration_since(ls) < min_healthy
+                });
+                backing_off || armed
+            });
+        }
     }
 
     /// The LIVE per-tenant instance registry (WS-C step 3) — the real
@@ -1135,11 +1320,16 @@ mod per_tenant {
         /// The declared frontend→template relay link NAME — the fd-map key under which each
         /// per-tenant child receives its socketpair end.
         link_name: String,
-        /// The scale-to-zero policy (idle-eviction window + concurrency cap).
+        /// The scale-to-zero policy (idle-eviction window + concurrency cap + cold-start admission).
         policy: PerTenantPolicy,
         /// The live instances, keyed by project. Interior-mutable so `resolve`/`instantiate` take
         /// `&self` (the trait object + the router accept loop share one `&registry`).
         live: Mutex<BTreeMap<String, LiveInstance>>,
+        /// Cold-start admission + backoff state (WS-C MEDIUM). A SEPARATE lock from `live`, only ever
+        /// taken from `instantiate` while `live` is held (so the lock order is fixed `live → admission`
+        /// and there is no cross-path contention). It decides whether a cold start may fork; it never
+        /// influences which tenant a connection routes to.
+        admission: Mutex<Admission>,
     }
 
     impl ComputePlaneRegistry {
@@ -1150,12 +1340,14 @@ mod per_tenant {
             link_name: String,
             policy: PerTenantPolicy,
         ) -> Self {
+            let admission = Admission::new(&policy);
             Self {
                 current_exe,
                 template_spec,
                 link_name,
                 policy,
                 live: Mutex::new(BTreeMap::new()),
+                admission: Mutex::new(admission),
             }
         }
 
@@ -1176,16 +1368,37 @@ mod per_tenant {
                 inst.last_used = Instant::now();
                 return Ok(inst.link.clone());
             }
+            // Cold-start ADMISSION (WS-C MEDIUM): before forking anything, consult the backoff +
+            // node-wide cold-start rate budget. A declined cold start refuses THIS connection
+            // fail-closed (it is NEVER served from another tenant) and leaves every warm instance
+            // untouched (no fork ⇒ no eviction). Consulted only here on the cold path (a reuse above
+            // never forks). The `admission` lock is taken while `live` is held (fixed order), and
+            // this critical section contains no `.await` and no fork.
+            let now = Instant::now();
+            self.admission
+                .lock()
+                .unwrap()
+                .admit(scope.project(), now, &self.policy)?;
             // Scale-to-zero: reap exited + evict idle, then enforce the cap (LRU) BEFORE inserting.
             Self::sweep(&mut live, &self.policy);
             Self::enforce_cap(&mut live, self.policy.max_instances);
             // LAZY per-tenant socketpair (never shared, never at boot). `front` stays with the router
-            // (the relay half); `back` is handed to the child at its own fd number.
-            let (front, back) =
-                LinkEndpoint::socketpair().map_err(|e| InstantiateError::Socketpair {
-                    project: scope.project().to_string(),
-                    source: e,
-                })?;
+            // (the relay half); `back` is handed to the child at its own fd number. A failure backs the
+            // tenant off (so a persistently-failing cold start is not re-forked on every request).
+            let (front, back) = match LinkEndpoint::socketpair() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.admission.lock().unwrap().record_failure(
+                        scope.project(),
+                        Instant::now(),
+                        &self.policy,
+                    );
+                    return Err(InstantiateError::Socketpair {
+                        project: scope.project().to_string(),
+                        source: e,
+                    });
+                }
+            };
             let back_fd = back.as_raw_fd();
             // The per-tenant child's fd map: the one relay link, under its declared name, at `back_fd`.
             let mut fds = PrivsepChildFds::default();
@@ -1200,16 +1413,31 @@ mod per_tenant {
             // Fork via the root's OWN primitive. `src == tgt == back_fd` clears CLOEXEC in place so
             // the child inherits `back` at its own number WITHOUT a dup2 (no target collision in the
             // router's crowded fd table); `front` + the listener stay CLOEXEC so neither leaks.
-            let child = spawn_wired_instance(
+            let child = match spawn_wired_instance(
                 &self.current_exe,
                 &self.template_spec,
                 vec![(back_fd, back_fd)],
                 &extra_env,
-            )
-            .map_err(|e| InstantiateError::Spawn {
-                project: scope.project().to_string(),
-                source: e,
-            })?;
+            ) {
+                Ok(child) => child,
+                Err(e) => {
+                    self.admission.lock().unwrap().record_failure(
+                        scope.project(),
+                        Instant::now(),
+                        &self.policy,
+                    );
+                    return Err(InstantiateError::Spawn {
+                        project: scope.project().to_string(),
+                        source: e,
+                    });
+                }
+            };
+            // A fresh child forked: arm crash-loop detection (a death within the min-healthy window,
+            // observed on the NEXT cold start, backs the tenant off).
+            self.admission
+                .lock()
+                .unwrap()
+                .record_spawn(scope.project(), Instant::now());
             // The child inherited `back` (fork duplicated the fd table); drop the router's copy so
             // ONLY the child holds its end.
             drop(back);
@@ -1299,6 +1527,106 @@ mod per_tenant {
             }
             inst.last_used = Instant::now();
             Some(inst.link.clone())
+        }
+    }
+
+    #[cfg(test)]
+    mod admission_tests {
+        use std::time::Duration;
+
+        use super::*;
+
+        fn policy() -> PerTenantPolicy {
+            PerTenantPolicy {
+                cold_start_min_healthy_ms: 1000,
+                cold_start_backoff_base_ms: 500,
+                cold_start_backoff_max_ms: 30_000,
+                cold_start_rate_per_sec: 0, // isolate backoff from the rate limit in these tests
+                cold_start_burst: 100,
+                ..PerTenantPolicy::default()
+            }
+        }
+
+        #[test]
+        fn first_cold_start_is_admitted_and_a_healthy_reuse_cycle_does_not_back_off() {
+            let p = policy();
+            let mut adm = Admission::new(&p);
+            let t0 = Instant::now();
+            // First cold start: admitted; arm the crash-loop marker.
+            adm.admit("acme", t0, &p)
+                .expect("first cold start admitted");
+            adm.record_spawn("acme", t0);
+            // The instance lived well past the min-healthy window, then was idle/cap-evicted. The
+            // next cold start sees a HEALTHY prior life → admitted, failure history cleared.
+            let t1 = t0 + Duration::from_secs(5);
+            adm.admit("acme", t1, &p)
+                .expect("a cold start after a healthy prior life is admitted");
+            assert_eq!(adm.projects["acme"].consecutive_failures, 0);
+        }
+
+        #[test]
+        fn a_child_dying_within_the_window_backs_the_tenant_off_exponentially() {
+            let p = policy();
+            let mut adm = Admission::new(&p);
+            let t0 = Instant::now();
+            adm.admit("acme", t0, &p).unwrap();
+            adm.record_spawn("acme", t0);
+            // The child died ~200ms later (within the 1s window); the next cold start detects the
+            // crash loop and backs off (base 500ms).
+            let t1 = t0 + Duration::from_millis(200);
+            let err = adm.admit("acme", t1, &p).unwrap_err();
+            assert!(err.is_admission_decline());
+            assert!(matches!(err, InstantiateError::BackedOff { .. }));
+            assert_eq!(adm.projects["acme"].consecutive_failures, 1);
+            // Still inside the backoff window ⇒ still declined.
+            let err2 = adm
+                .admit("acme", t1 + Duration::from_millis(100), &p)
+                .unwrap_err();
+            assert!(matches!(err2, InstantiateError::BackedOff { .. }));
+            // A DIFFERENT tenant is unaffected (per-project — never a foreign tenant's instance).
+            adm.admit("globex", t1, &p)
+                .expect("an unrelated tenant is not backed off");
+        }
+
+        #[test]
+        fn a_fork_failure_backs_off_then_recovers_after_the_window() {
+            let p = policy();
+            let mut adm = Admission::new(&p);
+            let t0 = Instant::now();
+            adm.admit("acme", t0, &p).unwrap();
+            adm.record_failure("acme", t0, &p); // socketpair/fork failed
+            // Within the 500ms window: declined.
+            assert!(matches!(
+                adm.admit("acme", t0 + Duration::from_millis(100), &p),
+                Err(InstantiateError::BackedOff { .. })
+            ));
+            // After the window: half-open, admitted again.
+            adm.admit("acme", t0 + Duration::from_millis(600), &p)
+                .expect("the backoff window elapsed ⇒ a retry is admitted");
+        }
+
+        #[test]
+        fn the_node_wide_token_bucket_rate_limits_cold_start_sprays() {
+            let p = PerTenantPolicy {
+                cold_start_min_healthy_ms: 0, // disable crash-loop backoff; isolate the rate limit
+                cold_start_rate_per_sec: 10,
+                cold_start_burst: 3,
+                ..PerTenantPolicy::default()
+            };
+            let mut adm = Admission::new(&p);
+            let t0 = Instant::now();
+            // A spray across distinct tenants: the burst (3) is admitted, the 4th is rate-limited —
+            // so warm instances are never evicted to fork a 4th in the same instant.
+            for i in 0..3 {
+                adm.admit(&format!("t{i}"), t0, &p)
+                    .unwrap_or_else(|_| panic!("burst slot {i} admitted"));
+            }
+            let err = adm.admit("t3", t0, &p).unwrap_err();
+            assert!(err.is_admission_decline());
+            assert!(matches!(err, InstantiateError::ColdStartRateLimited { .. }));
+            // 100ms later the bucket refilled one token (10/s) ⇒ one more admitted.
+            adm.admit("t3", t0 + Duration::from_millis(100), &p)
+                .expect("a refilled token admits one more cold start");
         }
     }
 }
@@ -2535,49 +2863,142 @@ mod instance_serve {
             .map_err(|e| format!("building the Tokio runtime: {e}"))?;
         rt.block_on(async move {
             let deploy = build_routing_deploy_store(config).await?;
-            let registry =
-                ComputePlaneRegistry::new(current_exe, template_spec, link_name, policy);
+            // Shared across the spawned per-connection tasks: the registry (one, interior-mutable)
+            // and the Host→project resolver (cloneable, `Arc`-backed).
+            let registry = Arc::new(ComputePlaneRegistry::new(
+                current_exe,
+                template_spec,
+                link_name,
+                policy,
+            ));
             // Mark the root-passed listener CLOEXEC so per-tenant children the router forks never
             // INHERIT it (F5 — it is NOT CLOEXEC, having survived the router's own exec).
             set_cloexec(listener_fd).map_err(|e| format!("CLOEXEC on the listener fd: {e}"))?;
             // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map.
-            let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+            // Adopt the listener into Tokio so the accept loop is async: it NEVER blocks on client
+            // bytes or on a fork. Each accepted connection is handled in its OWN task (host-peek +
+            // route + cold-start + relay), so a slow/silent peer or a tenant's cold-start fork can
+            // no longer pin ingress (the HIGH slowloris / cold-start head-of-line fix).
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking on the listener: {e}"))?;
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| format!("adopting the listener into Tokio: {e}"))?;
+            // Bound concurrent in-flight routing tasks. Over the cap ⇒ DROP the connection fail-closed
+            // (never queue unboundedly, never let spawn-per-connection become its own task DoS).
+            let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_TENANT_ROUTING));
             tracing::info!(
                 instance = %label,
                 idle_evict_secs = policy.idle_eviction_secs,
                 max_instances = policy.max_instances,
-                "[privsep] per-tenant router: accepting; resolving Host→project (Stage-0) + routing to \
-                 per-tenant instances (fail-closed — no wildcard / default / fallback tenant)"
+                max_inflight = MAX_INFLIGHT_PER_TENANT_ROUTING,
+                "[privsep] per-tenant router: accepting (async, de-serialized); resolving Host→project \
+                 (Stage-0) + routing to per-tenant instances (fail-closed — no wildcard / default / \
+                 fallback tenant)"
             );
             loop {
-                let (conn, _peer) = listener
-                    .accept()
-                    .map_err(|e| format!("accepting on the listener: {e}"))?;
-                // Stage-0: PEEK (consume NOTHING) just enough to parse the Host, BEFORE any guest byte;
-                // the full request still reaches the backend intact over the spliced fd.
-                let host = peek_host(&conn).unwrap_or_default();
-                match route_by_host(&deploy, &host, &registry).await {
-                    Ok(RouteOutcome::Routed(link)) => relay_client_to_tenant(&link, &conn),
-                    Ok(RouteOutcome::NotReady(scope)) => match registry.instantiate(&scope) {
-                        Ok(link) => relay_client_to_tenant(&link, &conn),
-                        Err(e) => tracing::error!(
-                            project = %scope.project(),
-                            error = %e,
-                            "[privsep] per-tenant router: cold-start instantiate FAILED — refusing the \
-                             connection (fail-closed)"
-                        ),
-                    },
-                    Err(refusal) => tracing::warn!(
-                        host = %host,
-                        %refusal,
-                        "[privsep] per-tenant router: refusing a connection (fail-closed, no fallback \
-                         tenant)"
-                    ),
-                }
-                // Our copy: a relay SCM_RIGHTS-duplicated it to the tenant; a refusal closes it here.
-                drop(conn);
+                let (conn, _peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(e) => return Err::<(), String>(format!("accepting on the listener: {e}")),
+                };
+                // Admission for the HANDLER tasks themselves (distinct from the cold-start budget):
+                // over the in-flight cap we drop fail-closed rather than spawn without bound.
+                let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        cap = MAX_INFLIGHT_PER_TENANT_ROUTING,
+                        "[privsep] per-tenant router: at the in-flight cap — dropping a connection \
+                         (fail-closed, no unbounded queue)"
+                    );
+                    drop(conn);
+                    continue;
+                };
+                let deploy = deploy.clone();
+                let registry = registry.clone();
+                // One task per connection: the peek/route/cold-start/relay all run OFF the accept
+                // loop. The permit is held for the task's lifetime (so the semaphore bounds concurrent
+                // tasks) and released on completion.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_routed_connection(conn, &deploy, registry.as_ref()).await;
+                });
             }
         })
+    }
+
+    /// Hard ceiling on concurrently in-flight per-tenant routing tasks (host-peek + route + relay +
+    /// cold-start). Over the cap the router DROPS the connection fail-closed rather than queue
+    /// unboundedly or spawn without bound — so a connection spray (including silent slowloris
+    /// connections, each otherwise holding its task only until [`PER_TENANT_PEEK_DEADLINE`]) cannot
+    /// exhaust memory / task slots.
+    const MAX_INFLIGHT_PER_TENANT_ROUTING: usize = 256;
+
+    /// The per-connection host-peek deadline (sub-second). A peer that sends no parseable `Host`
+    /// within this window is refused fail-closed. Far shorter than the old inline 5s blocking
+    /// `SO_RCVTIMEO`: with the peek now off the accept loop (one task per connection) a stall no
+    /// longer pins ingress, and a tight deadline frees the task + its in-flight permit promptly.
+    const PER_TENANT_PEEK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Handle ONE accepted connection end-to-end, OFF the accept loop (its own task): async host-peek
+    /// (deadline-bounded) → route → on `Routed` relay, on `NotReady` cold-start-then-relay, on refusal
+    /// drop. Fail-closed throughout — an unresolved/ambiguous/absent Host, a backed-off/rate-limited
+    /// or failed cold start, or a relay error all DROP the connection; none falls back to another
+    /// tenant. The cold-start `instantiate` runs HERE (never on the accept loop), so one tenant's
+    /// fork never stalls routing for others.
+    async fn handle_routed_connection(
+        conn: tokio::net::TcpStream,
+        deploy: &boatramp_core::deploy::DeployStore,
+        registry: &ComputePlaneRegistry,
+    ) {
+        // Stage-0: async PEEK (consume NOTHING) just enough to parse the Host, BEFORE any guest byte;
+        // the full request still reaches the backend intact over the spliced fd. Deadline-bounded so
+        // a slow/silent peer cannot hold even this one task indefinitely.
+        let host = peek_host_async(&conn, PER_TENANT_PEEK_DEADLINE)
+            .await
+            .unwrap_or_default();
+        // Hand the raw client fd to the UNCHANGED SCM_RIGHTS relay path. Reclaim a blocking std stream
+        // from Tokio (the backend re-sets non-blocking on its OWN received copy, so the relayed fd's
+        // shape matches the pre-change accept-from-a-blocking-listener behavior); the peeked bytes
+        // stay queued in the kernel for the backend.
+        let conn = match conn.into_std() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[privsep] per-tenant router: reclaiming the client fd from Tokio failed \
+                     (dropping the connection, fail-closed)"
+                );
+                return;
+            }
+        };
+        let _ = conn.set_nonblocking(false);
+        match route_by_host(deploy, &host, registry).await {
+            Ok(RouteOutcome::Routed(link)) => relay_client_to_tenant(&link, &conn),
+            Ok(RouteOutcome::NotReady(scope)) => match registry.instantiate(&scope) {
+                Ok(link) => relay_client_to_tenant(&link, &conn),
+                // A backoff / rate-limit decline is EXPECTED under churn (warn); a socketpair/fork
+                // failure is a genuine error. Either way the connection is refused fail-closed.
+                Err(e) if e.is_admission_decline() => tracing::warn!(
+                    project = %scope.project(),
+                    error = %e,
+                    "[privsep] per-tenant router: cold-start declined by admission control \
+                     (backoff / rate-limit) — refusing the connection (fail-closed)"
+                ),
+                Err(e) => tracing::error!(
+                    project = %scope.project(),
+                    error = %e,
+                    "[privsep] per-tenant router: cold-start instantiate FAILED — refusing the \
+                     connection (fail-closed)"
+                ),
+            },
+            Err(refusal) => tracing::warn!(
+                host = %host,
+                %refusal,
+                "[privsep] per-tenant router: refusing a connection (fail-closed, no fallback tenant)"
+            ),
+        }
+        // Our copy: a relay SCM_RIGHTS-duplicated it to the tenant; a refusal closes it here.
+        drop(conn);
     }
 
     /// Relay one accepted client fd to a tenant's instance over its wired link, with the
@@ -2677,33 +3098,48 @@ mod instance_serve {
         )
     }
 
-    /// `MSG_PEEK` the start of an HTTP/1.x request to extract the `Host` header, consuming NOTHING so
-    /// the full request still reaches the backend over the spliced fd. Bounded by a read deadline + a
-    /// header cap (a slow/short peer cannot pin the accept loop). `None` ⇒ no Host within the bound
-    /// (the router then refuses fail-closed). HTTP/2 / TLS-SNI host extraction is a WS-D follow-on; the
-    /// Phase-1 backend + the live gate use plaintext HTTP/1.1.
-    fn peek_host(conn: &std::net::TcpStream) -> Option<String> {
-        // Bound the peek so a stalled peer cannot pin the loop (slowloris). Best-effort.
-        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        let mut buf = [0u8; 8192];
-        for _ in 0..16 {
-            let n = conn.peek(&mut buf).ok()?;
-            if n == 0 {
-                return None; // peer closed before sending a request
+    /// Async `MSG_PEEK` of the start of an HTTP/1.x request to extract the `Host` header, consuming
+    /// NOTHING so the full request still reaches the backend over the spliced fd. Bounded by
+    /// `deadline` (a sub-second async timeout) + a header cap. Because each connection is handled in
+    /// its OWN task, a slow / silent peer can no longer pin the accept loop at all — the worst it can
+    /// do is hold its own task until the deadline, after which it is refused fail-closed. `None` ⇒ no
+    /// Host within the bound. HTTP/2 / TLS-SNI host extraction is a WS-D follow-on; the Phase-1 backend
+    /// + the live gate use plaintext HTTP/1.1.
+    pub(super) async fn peek_host_async(
+        conn: &tokio::net::TcpStream,
+        deadline: std::time::Duration,
+    ) -> Option<String> {
+        let scan = async {
+            let mut buf = [0u8; 8192];
+            let mut last_n = 0usize;
+            loop {
+                // `peek` awaits readability, then MSG_PEEKs the queued bytes (consumes nothing — the
+                // backend still receives the full request over the spliced fd).
+                let n = conn.peek(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None; // peer closed before sending a request
+                }
+                if let Some(h) = parse_host_header(&buf[..n]) {
+                    return Some(h);
+                }
+                // A complete header block with no Host ⇒ there is no host (refuse).
+                if find_subslice(&buf[..n], b"\r\n\r\n").is_some() {
+                    return None;
+                }
+                if n == buf.len() {
+                    return None; // header block larger than the cap — refuse fail-closed
+                }
+                if n == last_n {
+                    // No new bytes since the last peek (MSG_PEEK always re-reads from the start, and
+                    // the readiness is not cleared by a peek that returns data): yield briefly so a
+                    // peer that dribbles its header cannot busy-loop this task. Strictly bounded by
+                    // `deadline` (the enclosing timeout), after which the peer is refused.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                last_n = n;
             }
-            if let Some(h) = parse_host_header(&buf[..n]) {
-                return Some(h);
-            }
-            // A complete header block with no Host ⇒ there is no host (refuse).
-            if find_subslice(&buf[..n], b"\r\n\r\n").is_some() {
-                return None;
-            }
-            if n == buf.len() {
-                return None; // header block larger than the cap — refuse fail-closed
-            }
-            // Otherwise more bytes may still be arriving: peek again (it re-reads from the start).
-        }
-        None
+        };
+        tokio::time::timeout(deadline, scan).await.ok().flatten()
     }
 
     /// Parse the `Host` header value (lowercased, port stripped) from a COMPLETE header line in `buf`
@@ -3581,6 +4017,7 @@ mod tests {
         p.per_tenant = PerTenantPolicy {
             idle_eviction_secs: 300,
             max_instances: 0,
+            ..PerTenantPolicy::default()
         };
         let cfg = cfg_with(Some(p));
         let err = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env()).unwrap_err();
@@ -3598,6 +4035,7 @@ mod tests {
         p.per_tenant = PerTenantPolicy {
             idle_eviction_secs: 0,
             max_instances: 0,
+            ..PerTenantPolicy::default()
         };
         let cfg = cfg_with(Some(p));
         let plan = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env())
@@ -3639,5 +4077,67 @@ mod tests {
             reg.resolve(&scope).is_none(),
             "an empty registry must resolve to NotReady, never a fallback instance"
         );
+    }
+
+    /// The HIGH de-serialization property, proven portably (no fork / sandbox / fd wiring needed):
+    /// the router accepts in an async loop and handles EACH connection in its OWN task, so a silent
+    /// (slowloris) peer pins only its own task until the peek deadline — it NEVER blocks the accept
+    /// loop or another connection's host-peek. This mirrors the production accept-loop shape
+    /// (`accept → spawn one task per conn → `[`per_tenant::...peek_host_async`]). The full live
+    /// serve path (real listener fd + SCM_RIGHTS splice + per-tenant fork under the sandbox) stays
+    /// on the `#[ignore]` Linux live gate (`privsep_per_tenant_serves_end_to_end`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_connection_does_not_block_routing_a_second_connection() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral local listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+
+        // The de-serialized accept loop: accept two connections, each peeked in its own task.
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().await.expect("accept");
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let host =
+                        super::instance_serve::peek_host_async(&conn, Duration::from_secs(1)).await;
+                    let _ = tx.send(host);
+                });
+            }
+        });
+
+        // A: connect and send NOTHING (slowloris). Held open for the whole test so its peek task
+        // stays pinned until the 1s deadline.
+        let _silent = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("silent peer connects");
+        // B: connect and send a real request with a Host.
+        let mut real = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("real peer connects");
+        real.write_all(b"GET / HTTP/1.1\r\nHost: acme.example\r\n\r\n")
+            .await
+            .expect("write the real request");
+
+        // B's host MUST resolve promptly — well within the 1s peek deadline — even though A is still
+        // silent. The silent peer can only ever yield `None`, and only after ~1s (past this window),
+        // so the first result delivered here is necessarily B's.
+        let got = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a connection resolves promptly despite the silent peer")
+            .expect("the channel delivered a result");
+        assert_eq!(
+            got.as_deref(),
+            Some("acme.example"),
+            "the real connection routes while the silent peer is still pinned (de-serialized)"
+        );
+
+        server.abort();
     }
 }

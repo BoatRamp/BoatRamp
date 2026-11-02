@@ -1573,7 +1573,11 @@ mod tests {
         let mut cfg = serve_only();
         cfg.serve.as_mut().unwrap().data_dir = Some(PathBuf::from("/srv/node"));
         // A deterministic, absolute, NON-existent binary path (so `into_normalized` keeps it lexical
-        // — no `fs::canonicalize` surprise — and it sits outside every backend state subtree).
+        // — no `fs::canonicalize` surprise). The exe is a SINGLE-FILE read grant, which `derive_profile`
+        // only ever refuses when it is an ANCESTOR of `data_dir` (`OverbroadStateGrant`) or overlaps a
+        // NON-held authority's state subtree (`CrossAuthorityStateLeak`); a single-file grant merely
+        // *sitting under* `data_dir` is neither, so it would be harmless there too. This path sidesteps
+        // both to keep the test self-evidently clean.
         let exe = PathBuf::from("/opt/boatramp/bin/boatramp");
 
         // The per-tenant router holds `exec.compute` (+ `backend.kv`, its Host→project resolver): its

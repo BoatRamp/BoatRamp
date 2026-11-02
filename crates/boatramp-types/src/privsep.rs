@@ -953,8 +953,10 @@ pub enum CrownJewelCrashPolicy {
 /// composition never reads it, so the defaults carried for every pre-Phase-4 composition change
 /// nothing.
 ///
-/// **Defaults (owner-ratified):** `idle_eviction_secs = 300`, `max_instances = 64`. **Fail-closed:**
-/// a misconfigured policy (`max_instances == 0`) is REFUSED at the root's authorization gate before
+/// **Defaults (owner-ratified):** `idle_eviction_secs = 300`, `max_instances = 64`. The cold-start
+/// admission knobs (`cold_start_*`) default to a generous-but-bounded budget that is a no-op for a
+/// healthy node and only dampens crash-loop / cross-tenant-spray fork churn. **Fail-closed:** a
+/// misconfigured policy (`max_instances == 0`) is REFUSED at the root's authorization gate before
 /// any spawn ([`validate`](PerTenantPolicy::validate)) rather than silently serving no tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -969,6 +971,27 @@ pub struct PerTenantPolicy {
     /// live instance to make room — it never exceeds the cap and never silently refuses a valid
     /// tenant. Fail-closed: `0` is a misconfiguration ([`PerTenantPolicyError::ZeroMaxInstances`]).
     pub max_instances: u32,
+    /// Cold-start crash-loop guard (milliseconds): a per-tenant child that dies within this window
+    /// of its fork is treated as a FAILED cold start and its tenant is backed off, so a tenant whose
+    /// child keeps crashing is not re-forked on every request. Default `1000`. `0` DISABLES
+    /// crash-loop backoff (a fork FAILURE still backs off). Fail-closed: a backed-off tenant is
+    /// refused (`NotReady`), never served from another tenant's instance.
+    pub cold_start_min_healthy_ms: u64,
+    /// The base backoff delay (milliseconds) after the first failed / crash-looping cold start; it
+    /// doubles per consecutive failure up to [`cold_start_backoff_max_ms`](Self::cold_start_backoff_max_ms).
+    /// Default `500`.
+    pub cold_start_backoff_base_ms: u64,
+    /// The ceiling (milliseconds) on the exponential cold-start backoff. Default `30000` (30s).
+    pub cold_start_backoff_max_ms: u64,
+    /// Node-wide cold-start admission rate (forks PER SECOND): the refill rate of the cold-start
+    /// token bucket. It bounds how fast NEW per-tenant instances are forked so a request spray across
+    /// more tenants than [`max_instances`](Self::max_instances) cannot force continuous evict+fork
+    /// churn that evicts warm instances for free. Default `50`. `0` DISABLES cold-start rate limiting.
+    pub cold_start_rate_per_sec: u32,
+    /// The cold-start token-bucket burst (capacity): how many cold starts may happen back-to-back
+    /// before the per-second rate applies (e.g. a cold node waking many tenants at once). Default
+    /// `100`. Clamped to at least `1` so a node can always make progress.
+    pub cold_start_burst: u32,
 }
 
 impl Default for PerTenantPolicy {
@@ -976,6 +999,11 @@ impl Default for PerTenantPolicy {
         Self {
             idle_eviction_secs: 300,
             max_instances: 64,
+            cold_start_min_healthy_ms: 1000,
+            cold_start_backoff_base_ms: 500,
+            cold_start_backoff_max_ms: 30000,
+            cold_start_rate_per_sec: 50,
+            cold_start_burst: 100,
         }
     }
 }
@@ -1016,6 +1044,33 @@ impl PerTenantPolicy {
     pub fn idle_eviction(&self) -> Option<std::time::Duration> {
         (self.idle_eviction_secs > 0)
             .then(|| std::time::Duration::from_secs(self.idle_eviction_secs))
+    }
+
+    /// The crash-loop min-healthy window: a child that dies within this of its fork is treated as a
+    /// failed cold start (and its tenant backed off). `0` ⇒ zero window ⇒ crash-loop backoff is
+    /// disabled (a child is never "too short-lived").
+    #[must_use]
+    pub fn cold_start_min_healthy(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cold_start_min_healthy_ms)
+    }
+
+    /// The exponential, capped cold-start backoff delay after `failures` consecutive failed /
+    /// crash-looping cold starts (`failures >= 1`): `base * 2^(failures - 1)`, clamped to the
+    /// configured max. Overflow-safe (the doubling shift is capped).
+    #[must_use]
+    pub fn cold_start_backoff(&self, failures: u32) -> std::time::Duration {
+        let base = self.cold_start_backoff_base_ms.max(1);
+        let max = self.cold_start_backoff_max_ms.max(base);
+        // Cap the shift so `1 << shift` can never overflow; by ~20 doublings we are already clamped.
+        let shift = failures.saturating_sub(1).min(20);
+        let delay = base.saturating_mul(1u64 << shift).min(max);
+        std::time::Duration::from_millis(delay)
+    }
+
+    /// The cold-start token-bucket capacity (burst), always `>= 1` so a node can always cold-start.
+    #[must_use]
+    pub fn cold_start_burst_capacity(&self) -> f64 {
+        f64::from(self.cold_start_burst.max(1))
     }
 }
 
@@ -2788,6 +2843,7 @@ mod tests {
         let bad = PerTenantPolicy {
             idle_eviction_secs: 300,
             max_instances: 0,
+            ..PerTenantPolicy::default()
         };
         assert_eq!(
             bad.validate(),
@@ -2798,9 +2854,42 @@ mod tests {
         let no_evict = PerTenantPolicy {
             idle_eviction_secs: 0,
             max_instances: 8,
+            ..PerTenantPolicy::default()
         };
         assert_eq!(no_evict.validate(), Ok(()));
         assert_eq!(no_evict.idle_eviction(), None);
+    }
+
+    #[test]
+    fn cold_start_backoff_is_exponential_and_capped() {
+        let p = PerTenantPolicy {
+            cold_start_backoff_base_ms: 500,
+            cold_start_backoff_max_ms: 30_000,
+            ..PerTenantPolicy::default()
+        };
+        assert_eq!(
+            p.cold_start_backoff(1),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            p.cold_start_backoff(2),
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            p.cold_start_backoff(3),
+            std::time::Duration::from_millis(2000)
+        );
+        // Climbs geometrically but never exceeds the cap — even for an absurd failure count
+        // (the shift is bounded, so there is no overflow / wrap).
+        assert_eq!(
+            p.cold_start_backoff(100),
+            std::time::Duration::from_millis(30_000)
+        );
+        assert_eq!(p.cold_start_burst_capacity(), 100.0);
+        assert_eq!(
+            p.cold_start_min_healthy(),
+            std::time::Duration::from_millis(1000)
+        );
     }
 
     #[test]
