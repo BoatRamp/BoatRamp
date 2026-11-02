@@ -172,7 +172,7 @@ async fn subscribe_and_assert(base_url: String, protocol: ClientProtocol) {
         );
     })
     .await
-    .expect("spawn_blocking join")
+    .expect("spawn_blocking join");
 }
 
 #[tokio::test(flavor = "multi_thread")]
