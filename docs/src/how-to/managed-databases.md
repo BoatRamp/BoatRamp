@@ -253,6 +253,28 @@ multi-GiB volume), enforced fail-closed at declare (a `422` before any provision
 The provisioning is bound to the caller's project — a manifest can only ever
 provision onto its **own** project's server.
 
+## Use it from a compute workload (a real DSN)
+
+A wasm handler reaches the database through `sql.open("app")`. A plain **compute
+workload** (container / micro-VM) reaches the *same* per-tenant database by binding
+it — and, because it is a managed co-located Postgres/MySQL, boatramp injects a real
+`postgres://` / `mysql://` **DSN** into the workload's env (not a boatramp shim/token),
+so an off-the-shelf app, ORM, or migration tool Just Works:
+
+```ron
+compute: [
+  ( name: "simertec",
+    spec: ( root: image("ghcr.io/acme/simertec:1"), vcpus: 1, mem_mib: 512, port: 8080,
+            bindings: [ ( kind: sql, name: "app" ) ] ),
+    replicas: 1 ),
+]
+```
+
+The default injects `BOATRAMP_SQL_URL` (runtime) + `BOATRAMP_SQL_URL_MIGRATION`
+(DDL); the operator can instead template the exact env vars the workload wants from
+`{{sql.host}}` / `{{sql.user}}` / `{{sql.password}}` / … (+ sealed secrets). See
+[Use a managed Postgres/MySQL from a compute workload](./compute.md#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn).
+
 ## See also
 
 - [`databases:` schema](../reference/project-cfg.md#managed-databases-databases)

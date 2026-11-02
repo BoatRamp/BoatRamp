@@ -1482,6 +1482,26 @@ pub trait ComputeBindingResolver: Send + Sync {
         bindings: &[ComputeBinding],
     ) -> Vec<(String, String)>;
 
+    /// Like [`resolve`](Self::resolve), but also given the workload's operator-declared
+    /// `env` so a resolver can **render operator templates** against the resolved binding
+    /// (e.g. a managed-DB DSN composed from `{{sql.host}}` / `{{sql.user}}` / … plus
+    /// referenced sealed secrets — all filled SERVER-SIDE at launch). A value it returns
+    /// whose matching `env` entry contains a `{{…}}` placeholder **replaces** that entry
+    /// at launch (see `launch_one`); other returned pairs are injected only when the key
+    /// is absent (a hand-set literal always wins). The default delegates to
+    /// [`resolve`](Self::resolve) (ignores `env`), so a resolver that does no templating —
+    /// every shim — needs no change.
+    async fn resolve_with_env(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        self.resolve(project, workload, replica, bindings).await
+    }
+
     /// Release the shim state for a torn-down replica.
     async fn release(
         &self,
@@ -1531,6 +1551,25 @@ impl ComputeBindingResolver for ChainedBindingResolver {
         let mut env = Vec::new();
         for resolver in &self.resolvers {
             env.extend(resolver.resolve(project, workload, replica, bindings).await);
+        }
+        env
+    }
+
+    async fn resolve_with_env(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        workload_env: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        for resolver in &self.resolvers {
+            env.extend(
+                resolver
+                    .resolve_with_env(project, workload, replica, bindings, workload_env)
+                    .await,
+            );
         }
         env
     }
@@ -2119,7 +2158,14 @@ pub async fn reconcile_once(
                     // the shim token for this replica).
                     let mut launch_env = match resolver {
                         Some(r) if !spec.bindings.is_empty() => {
-                            r.resolve(&project_name, &wl, replica, &spec.bindings).await
+                            r.resolve_with_env(
+                                &project_name,
+                                &wl,
+                                replica,
+                                &spec.bindings,
+                                &spec.env,
+                            )
+                            .await
                         }
                         _ => Vec::new(),
                     };
@@ -2474,11 +2520,27 @@ async fn launch_one(
     let artifact = backend
         .materialize(project, workload, spec, pull_auth)
         .await?;
-    // Fold the resolved binding env into the launched spec. The workload's own env
-    // wins on a collision, so a hand-set value is never clobbered by a binding.
+    // Fold the resolved binding env into the launched spec. A hand-set **literal** always
+    // wins (never clobbered by a binding default) — EXCEPT a value that is an operator
+    // **template** (contains a `{{…}}` placeholder): that is replaced by the resolver's
+    // SERVER-SIDE-rendered value (the filled DSN / unsealed secret), since the raw
+    // template is not what the workload should receive. A key the operator did not set is
+    // injected as the binding default. No pre-existing workload has `{{` in an env value,
+    // so this only activates the new managed-DB templating path.
     let mut spec = spec.clone();
     for (k, v) in extra_env {
-        spec.env.entry(k.clone()).or_insert_with(|| v.clone());
+        match spec.env.get(k) {
+            // Operator templated this var — take the rendered value.
+            Some(existing) if existing.contains("{{") => {
+                spec.env.insert(k.clone(), v.clone());
+            }
+            // Hand-set literal — operator wins, keep it.
+            Some(_) => {}
+            // Unset — inject the binding default.
+            None => {
+                spec.env.insert(k.clone(), v.clone());
+            }
+        }
     }
     // A managed-DB privilege strategy (rootless user / cap allowlist) — launch spec
     // only; never overrides an operator-set `user`/`cap_add`.

@@ -884,6 +884,7 @@ mod tests {
             kind: BindingKind::Blob,
             name: name.to_string(),
             url_env: None,
+            migration_url_env: None,
         }
     }
 
