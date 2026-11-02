@@ -62,6 +62,15 @@ pub mod privsep_authority;
 /// Always compiled; the real implementation is `cfg(unix)` (the mechanism is POSIX) and a non-Unix
 /// build fails-closed (privsep is Linux-only in Phase 1, gated by the fail-closed sandbox install).
 pub mod privsep_link;
+/// Per-tenant wasm-runtime routing, keying + link-wiring (privsep Phase 4 — WS-B). The FRONTEND
+/// side of the per-tenant isolation boundary: resolve the project STRUCTURALLY from the routed
+/// `Host` (the same Stage-0 resolution the monolith does), derive a fail-closed `TenantScope`, and
+/// route to that tenant's per-tenant `exec.wasmtime` instance via a `PerTenantInstanceRegistry` (the
+/// WS-C seam). Also carries the UNFORGEABLE backend-call identity (`WiredTenantIdentity`, read from
+/// the root-wired env + re-validated, never guest-supplied). The real compute-plane spawn/wake is
+/// WS-C; this ships the routing/keying/identity core + the `local`-link relay (reused verbatim) + an
+/// in-process mock. Always compiled + host-testable; the fd relay is `cfg(unix)`.
+pub mod privsep_tenant;
 /// The privsep signer-key unlock protocol (signer-unlock workstream): a `token.signer` instance asks
 /// a `secrets.sealer` instance to unseal its sealed signing key over the feature-link, under a
 /// root-wired, per-link ALLOWLIST the sealer enforces fail-closed. The typed request/response rides
