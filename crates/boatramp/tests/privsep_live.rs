@@ -308,6 +308,134 @@ fn privsep_sealer_signer_unseal_serves_end_to_end() {
     println!("PRIVSEP SIGNER UNSEAL LIVE OK");
 }
 
+/// Live end-to-end gate for the privsep **frontend authority-inversion** composition (Phase-3 —
+/// "the most-exposed holds the least"). Unlike the mechanism-proof `edge` demo (which piles every
+/// listener + both exec + both control onto one instance), the `frontend` here holds ONLY the
+/// most-exposed parsers it must — `listen.public-tls` + `listen.http-parse` + `exec.wasmtime` — with
+/// NO keys, NO backend creds, NO control surface, NO `exec.compute`: a parser RCE on the inverted
+/// frontend reaches none of those. It relays inward over the `local` splice to a `core` holding the
+/// crown jewels + backends; the other listeners + `exec.compute` + control live on a separate `aux`.
+///
+/// This is the composition the whole program exists for, and it also exercises the Phase-3
+/// operator-selectable SUBSTRATE field: `frontend` is pinned to `substrate: OsProcess` (the wired
+/// default backend) explicitly, proving the new config vocabulary parses + stands up end-to-end.
+///
+/// Proves (against the live kernel, all three instances sandboxed `Enforced`): a client `GET /`
+/// flows client → frontend listener fd → SCM_RIGHTS splice → core → hand-rolled HTTP → a real 200.
+///
+/// `#[ignore]`d like the gates above (forks + sandboxes against the live kernel); the CI
+/// `live gate (privsep)` job runs it via `--include-ignored` and greps the
+/// `PRIVSEP FRONTEND INVERSION LIVE OK` marker + the pass count.
+#[test]
+#[ignore = "live: forks boatramp __root for the frontend-inversion composition (frontend holds only \
+            public-tls + http-parse + exec.wasmtime, substrate OsProcess; relays inward to a crown+backend \
+            core) + serves end-to-end (Linux + `sandbox`); run via --include-ignored in the \
+            `live gate (privsep)` job"]
+fn privsep_frontend_inversion_serves_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-frontend-{}", std::process::id()));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The frontend-inversion composition (union == ALL; no crown co-resident with a listener/exec/
+    // control surface; grants disjoint; no F8 warning):
+    //   - `frontend` = ONLY listen.public-tls + listen.http-parse + exec.wasmtime (no keys, no
+    //                  backends, no control, no exec.compute) — the INVERTED frontend. Pinned to the
+    //                  OsProcess substrate explicitly. Binds serve.addr, splices client fds to core.
+    //   - `aux`      = the OTHER listeners + exec.compute + both control (C∖{public-tls,http-parse}
+    //                  ∪ exec.compute ∪ E) — no keys, no backends. Parks (Phase 1 binds only the
+    //                  public listener), present so the union closes.
+    //   - `core`     = every crown jewel + every backend (A ∪ B) — the serving BACKEND.
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "frontend": (
+                capabilities: ["listen.public-tls", "listen.http-parse", "exec.wasmtime"],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay", "listen.s3ingress",
+                    "listen.inbound-tcp", "listen.gateway",
+                    "exec.compute", "control.admin-api", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "frontend", to: "core", transport: Local, purpose: Relay) }},
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let response = loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!("the frontend-inversion node did not serve a response within 20s");
+        }
+        if let Ok(Some(status)) = root.try_wait() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the frontend-inversion composition \
+                 failed to stand up (sandbox not Enforced? link/listener wiring? substrate?)"
+            );
+        }
+        match try_http_get(&addr) {
+            Ok(resp) if !resp.is_empty() => break resp,
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    };
+
+    let _ = root.kill();
+    let _ = root.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        response.contains("200"),
+        "expected a 200 from the core backend over the inverted-frontend splice, got:\n{response}"
+    );
+    assert!(
+        response.contains("boatramp privsep backend"),
+        "expected the backend body marker (the SCM_RIGHTS splice reached the sandboxed core), got:\n{response}"
+    );
+
+    // The marker the CI gate greps — only reached after a real 200 came back over the full inverted path.
+    println!("PRIVSEP FRONTEND INVERSION LIVE OK");
+}
+
 /// One blocking HTTP/1.1 `GET /` with `Connection: close`, returning the raw response text.
 fn try_http_get(addr: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(addr)?;

@@ -490,8 +490,77 @@ pub struct PrivsepInstanceConfig {
     /// installed profile is REQUIRED `Enforced` fleetwide (design §2 F6 / §5 F7 inv7); `Off`
     /// is dev-only. WS-A parses + carries this; WS-B derives + installs the profile.
     pub sandbox: SandboxPosture,
+    /// The ISOLATION SUBSTRATE this instance's process runs under (design §Phase-3 / fabric §(b) —
+    /// the `in`-axis spectrum). An OPERATOR-SELECTABLE choice (owner: NOT a hard pick —
+    /// benchmark-guided), default [`InstanceSubstrate::OsProcess`]. The Phase-3 FOUNDATION cut wires
+    /// `OsProcess`; `Container`/`Vm` are the config vocabulary + the supervisor's spawn-backend seam,
+    /// refused fail-closed until their compute-plane-backend wiring lands (a reported follow-on). The
+    /// struct-level `#[serde(default)]` supplies `OsProcess` for a config that omits it, so every
+    /// Phase-1 composition is unchanged.
+    pub substrate: InstanceSubstrate,
     /// The link names (keys of [`PrivsepConfig::links`]) this instance opens.
     pub links: Vec<String>,
+}
+
+/// The ISOLATION SUBSTRATE a feature-instance's process runs under (design §Phase-3; fabric-composition
+/// §(b) — the `in`-axis containment spectrum). **Operator-selectable, benchmark-guided (owner decision
+/// 2026-11-02 — NOT a hard pick):** the same instance abstraction is substrate-agnostic (design §7 —
+/// "substrate is a spawn backend"), so the root supervisor picks the spawn backend per instance,
+/// graded by containment strength vs crossing overhead. See `docs/privsep-substrate-benchmark.md` for
+/// the measured `local`-shape crossing costs that inform the choice.
+///
+/// - [`OsProcess`](InstanceSubstrate::OsProcess) — a privilege-dropped OS process wired over the
+///   root-created `local` socketpair (the Phase-1 spawn backend, the default). Native speed, shared
+///   kernel; the containment is the separate address space + the per-capability seccomp/Landlock wall.
+/// - [`Container`](InstanceSubstrate::Container) — the same dropped process under namespace/cgroup
+///   confinement, reusing the `boatramp-container` compute-plane backend. Native speed, a namespace
+///   wall; excludes kernel-escape from the threat model.
+/// - [`Vm`](InstanceSubstrate::Vm) — a hardware-virtualized microVM guest with its own kernel, reusing
+///   the `boatramp-firecracker` / `boatramp-vz` compute-plane backends. The strongest wall (survives a
+///   guest-kernel RCE); a vsock crossing per request + a boot cost.
+///
+/// **Phase-3 FOUNDATION scope:** only `OsProcess` is a WIRED spawn backend. `Container`/`Vm` parse +
+/// lint as valid composition vocabulary, but the supervisor REFUSES to spawn them fail-closed (naming
+/// the compute-plane backend each reuses) rather than silently downgrading to an OS process — a silent
+/// downgrade would discard the operator's chosen isolation wall. See [`InstanceSubstrate::is_wired`].
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum InstanceSubstrate {
+    /// A privilege-dropped OS process over the `local` socketpair (the Phase-1 spawn backend). Default.
+    #[default]
+    OsProcess,
+    /// A namespace/cgroup-confined process (reuses the `boatramp-container` backend). Follow-on.
+    Container,
+    /// A hardware-virtualized microVM guest (reuses `boatramp-firecracker` / `boatramp-vz`). Follow-on.
+    Vm,
+}
+
+impl InstanceSubstrate {
+    /// The stable config/log spelling.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::OsProcess => "os-process",
+            Self::Container => "container",
+            Self::Vm => "vm",
+        }
+    }
+
+    /// Whether the Phase-3 FOUNDATION cut wires this substrate's spawn backend. Only `OsProcess` is
+    /// wired; `Container`/`Vm` are the reported follow-on (refused fail-closed by the supervisor).
+    pub const fn is_wired(self) -> bool {
+        matches!(self, Self::OsProcess)
+    }
+
+    /// The compute-plane backend crate a NESTING substrate reuses — for the fail-closed follow-on
+    /// message. `None` for `OsProcess` (the root's own fork+exec is the backend).
+    pub const fn compute_plane_backend(self) -> Option<&'static str> {
+        match self {
+            Self::OsProcess => None,
+            Self::Container => Some("boatramp-container (namespace/cgroup confinement)"),
+            Self::Vm => Some("boatramp-firecracker / boatramp-vz (microVM over a vsock crossing)"),
+        }
+    }
 }
 
 /// The **per-instance profile-DERIVATION posture** (design §1.3 / §2 F6):
@@ -561,7 +630,7 @@ pub enum ProfileEnforcement {
 
 /// One logical inter-instance link (design §3). WS-A carries `from`/`to`/`transport`; the
 /// transport implementation (`local` socketpair / `tcp` / `overlay`) + the authority-API
-/// grammar are WS-C.
+/// grammar are WS-C. Phase-3 adds the explicit per-link [`purpose`](PrivsepLink::purpose) marker.
 ///
 /// TODO(privsep WS-C): wire `LocalLink`/`TcpLink`/`OverlayLink` behind the one `Link` API
 /// (design §3.2) and fill the per-capability authority-API grammar (design §3.4).
@@ -574,6 +643,64 @@ pub struct PrivsepLink {
     pub to: String,
     /// The transport shape behind the one link API.
     pub transport: LinkTransport,
+    /// The declared PURPOSE of this link (design §3.1 — the two use-shapes over one link; §3.4
+    /// precondition 4 — the per-link marker). Default [`LinkPurpose::Unspecified`] ⇒ the role is
+    /// INFERRED from the endpoints (the pre-Phase-3 behavior, back-compat). An explicit
+    /// [`LinkPurpose::AuthorityServe`] designates the link's crown-jewel endpoint to serve the
+    /// authority grammar on it (even when the peer is a listener frontend — the shape the inference
+    /// could not safely disambiguate); [`LinkPurpose::Relay`] marks it a serving splice that is
+    /// NEVER an authority-serve link. The struct-level `#[serde(default)]` supplies
+    /// [`LinkPurpose::Unspecified`] for a config that omits it.
+    pub purpose: LinkPurpose,
+}
+
+impl PrivsepLink {
+    /// Whether this link is EXPLICITLY purpose-marked as an authority-serve link (design §3.4). The
+    /// half that — together with the sibling PoP/`cnf` verifier (an AND-gate) — lets the Phase-1
+    /// authority-serve stand-up gate open.
+    pub const fn is_authority_serve(&self) -> bool {
+        matches!(self.purpose, LinkPurpose::AuthorityServe)
+    }
+
+    /// Whether this link is EXPLICITLY purpose-marked as a serving-splice relay (frontend→backend).
+    pub const fn is_relay(&self) -> bool {
+        matches!(self.purpose, LinkPurpose::Relay)
+    }
+}
+
+/// The declared PURPOSE of a feature-link (design §3.1's two use-shapes, made EXPLICIT per-link in
+/// the Phase-3 foundation). A link between a listener FRONTEND and a crown-jewel SIGNER is
+/// byte-for-byte the same TOPOLOGY shape as a listener frontend → a serving backend, so the
+/// Phase-1 inference ([`crate::privsep`]'s `compute_authority_serve_links`, over in `boatramp`)
+/// conservatively refused to auto-designate that shape for the authority grammar. This marker lets
+/// the operator state the intent, which is design §3.4 wiring-gate precondition 4 — the half that,
+/// together with the sibling PoP/`cnf` verifier (an AND-gate, both required), lets the
+/// authority-serve stand-up gate open.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum LinkPurpose {
+    /// Unspecified — the link's role is INFERRED from its endpoints' authorities (the pre-Phase-3
+    /// behavior, kept for back-compat + the simple splits the Phase-1 live gates use). A crown↔
+    /// (non-listener) link is conservatively inferred as an authority-serve link; every other shape
+    /// (notably a listener-frontend link) is treated as a serving splice and NEVER auto-designated
+    /// for the authority grammar. The default.
+    #[default]
+    Unspecified,
+    /// The frontend→backend SERVING SPLICE relay — the per-request-hot path carrying spliced client
+    /// connections (`SCM_RIGHTS` / byte-relay), NOT authority calls. Marking a link `relay` states
+    /// explicitly that it is a splice, so it is NEVER designated for the authority grammar even when
+    /// an endpoint happens to hold a crown jewel.
+    Relay,
+    /// An AUTHORITY-SERVE link: the non-crown endpoint (a frontend / control relay) makes typed,
+    /// bounded authority calls (seal/unseal/mint_token) to the crown-jewel endpoint, which serves
+    /// the WS-E grammar re-validating each call's end-principal context. This explicit marker lets a
+    /// listener-FRONTEND→signer authority link be designated WITHOUT colliding with the
+    /// link-shape-identical serving splice. It designates the serve but does NOT by itself open the
+    /// LIVE serve — the stand-up gate additionally requires the PoP/`cnf` verifier (the AND-gate the
+    /// sibling authority layer owns). The composition-closure lint REFUSES an `authority-serve` link
+    /// that lacks exactly one crown-jewel endpoint ([`CompositionViolation::AuthorityServeLinkNotSingleCrownJewel`]).
+    AuthorityServe,
 }
 
 /// The link transport — a config SHAPE behind one API (design §3.3). WS-A placeholder.
@@ -680,6 +807,18 @@ pub enum CompositionViolation {
         /// The offending `token.signer` instance.
         signer_instance: String,
     },
+    /// A link is explicitly purpose-marked [`LinkPurpose::AuthorityServe`] but does NOT have EXACTLY
+    /// ONE crown-jewel (group A) endpoint, so it cannot be an authority-serve link: the authority
+    /// grammar (seal/unseal/mint_token) is held only by a crown jewel, so ZERO crown endpoints has
+    /// no server, and TWO is the crown↔crown bootstrap-unseal shape (handled by the root-wired
+    /// unseal allowlist, not the WS-E grammar). Fail-closed: a misconfigured marker refuses the node
+    /// closed rather than standing up an unserveable or ambiguous authority link (design §3.4).
+    AuthorityServeLinkNotSingleCrownJewel {
+        /// The offending link name.
+        link: String,
+        /// Its endpoints that hold a crown jewel (0, or ≥2 — never exactly 1, or this would not fire).
+        crown_endpoints: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -727,6 +866,18 @@ impl std::fmt::Display for CompositionViolation {
                  holds `secrets.sealer` itself nor is linked to a `secrets.sealer` instance — it \
                  cannot ask the sealer to unseal its key; co-reside the sealer or add a link \
                  between them"
+            ),
+            Self::AuthorityServeLinkNotSingleCrownJewel {
+                link,
+                crown_endpoints,
+            } => write!(
+                f,
+                "link {link:?} is purpose-marked `authority-serve` but has {} crown-jewel \
+                 endpoint(s) [{}] — an authority-serve link must have EXACTLY ONE crown-jewel \
+                 endpoint (the server) and one non-crown relay (the caller); a crown↔crown link is \
+                 bootstrap-unseal, not an authority serve",
+                crown_endpoints.len(),
+                crown_endpoints.join(", ")
             ),
         }
     }
@@ -966,6 +1117,38 @@ pub fn check_composition_closure(
         }
     }
 
+    // --- Purpose-marker closure: an `authority-serve` link needs EXACTLY ONE crown-jewel endpoint
+    //     (design §3.4). Only meaningful when both endpoints are hosted — an unhosted endpoint is
+    //     already a LinkEndpointUnhosted violation above, and this would double-report. ---
+    for (link_name, link) in &cfg.links {
+        if !link.is_authority_serve() {
+            continue;
+        }
+        let from_hosted = cfg.instances.contains_key(&link.from);
+        let to_hosted = cfg.instances.contains_key(&link.to);
+        if !(from_hosted && to_hosted) {
+            continue;
+        }
+        let holds_crown = |ep: &str| -> bool {
+            cfg.instances
+                .get(ep)
+                .is_some_and(|i| i.capabilities.iter().any(|a| a.is_crown_jewel()))
+        };
+        let crown_endpoints: Vec<String> = [&link.from, &link.to]
+            .into_iter()
+            .filter(|ep| holds_crown(ep))
+            .cloned()
+            .collect();
+        if crown_endpoints.len() != 1 {
+            violations.push(
+                CompositionViolation::AuthorityServeLinkNotSingleCrownJewel {
+                    link: link_name.clone(),
+                    crown_endpoints,
+                },
+            );
+        }
+    }
+
     if violations.is_empty() {
         Ok(CompositionReport { warnings })
     } else {
@@ -1167,6 +1350,7 @@ mod tests {
         PrivsepInstanceConfig {
             capabilities: caps.to_vec(),
             sandbox: SandboxPosture::Derived,
+            substrate: InstanceSubstrate::OsProcess,
             links: Vec::new(),
         }
     }
@@ -1331,6 +1515,7 @@ mod tests {
                 from: "edge".to_string(),
                 to: "ghost".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         let err = check_composition_closure(&cfg).unwrap_err();
@@ -1428,6 +1613,7 @@ mod tests {
                 from: "edge".to_string(),
                 to: "missing".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         let err = check_composition_closure(&cfg).unwrap_err();
@@ -1538,6 +1724,7 @@ mod tests {
                 from: "sealer".to_string(),
                 to: "signer".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         PrivsepConfig {
@@ -1613,6 +1800,140 @@ mod tests {
             CompositionViolation::SealedSignerUnlinkedToSealer { signer_instance }
                 if signer_instance == "signer"
         )));
+    }
+
+    // ---- per-link PURPOSE marker (Phase-3 foundation, design §3.4 precondition 4) ----
+
+    #[test]
+    fn link_purpose_defaults_to_unspecified_and_round_trips_through_ron() {
+        // A config that omits `purpose` defaults to Unspecified (back-compat with every Phase-1 cfg).
+        let ron = r#"(
+            instances: {
+                "edge": ( capabilities: ["listen.http-parse"], links: ["to-sign"] ),
+                "signer": ( capabilities: ["token.signer"], links: ["to-sign"] ),
+            },
+            links: {
+                "to-sign": (from: "edge", to: "signer", transport: Local, purpose: AuthorityServe),
+                "to-core": (from: "edge", to: "signer", transport: Local),
+            },
+        )"#;
+        let cfg: PrivsepConfig = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(ron)
+            .expect("parse privsep RON with a purpose marker");
+        assert_eq!(cfg.links["to-sign"].purpose, LinkPurpose::AuthorityServe);
+        assert!(cfg.links["to-sign"].is_authority_serve());
+        // An omitted `purpose` defaults to Unspecified.
+        assert_eq!(cfg.links["to-core"].purpose, LinkPurpose::Unspecified);
+        assert!(!cfg.links["to-core"].is_authority_serve());
+        assert!(!cfg.links["to-core"].is_relay());
+    }
+
+    #[test]
+    fn authority_serve_marker_requires_exactly_one_crown_jewel_endpoint() {
+        // A crown↔non-crown authority-serve link is accepted (exactly one crown endpoint = the server).
+        let mut instances = BTreeMap::new();
+        instances.insert("relay".to_string(), inst(&[HostAuthority::ControlAdminApi]));
+        instances.insert("signer".to_string(), inst(&[HostAuthority::TokenSigner]));
+        // The union of these two is NOT ALL — but the purpose-marker check is orthogonal; we assert
+        // ONLY on the AuthorityServeLinkNotSingleCrownJewel variant's presence/absence below.
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-sign".to_string(),
+            PrivsepLink {
+                from: "relay".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        let cfg = PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+        };
+        let authorityserve_fault = |cfg: &PrivsepConfig| {
+            check_composition_closure(cfg).err().is_some_and(|e| {
+                e.violations.iter().any(|v| {
+                    matches!(
+                        v,
+                        CompositionViolation::AuthorityServeLinkNotSingleCrownJewel { .. }
+                    )
+                })
+            })
+        };
+        assert!(
+            !authorityserve_fault(&cfg),
+            "a crown↔non-crown authority-serve link must not raise the purpose-marker fault"
+        );
+
+        // crown↔crown (bootstrap shape) — two crown endpoints → the fault fires.
+        let mut cfg2 = cfg.clone();
+        cfg2.instances.get_mut("relay").unwrap().capabilities = vec![HostAuthority::SecretsSealer];
+        assert!(
+            authorityserve_fault(&cfg2),
+            "a crown↔crown authority-serve link must be refused (bootstrap shape, not WS-E)"
+        );
+
+        // non-crown↔non-crown — zero crown endpoints → the fault fires.
+        let mut cfg3 = cfg.clone();
+        cfg3.instances.get_mut("signer").unwrap().capabilities = vec![HostAuthority::BackendKv];
+        assert!(
+            authorityserve_fault(&cfg3),
+            "a non-crown↔non-crown authority-serve link must be refused (no grammar server)"
+        );
+
+        // The SAME topology WITHOUT the marker (Unspecified) raises no purpose-marker fault.
+        let mut cfg4 = cfg3.clone();
+        cfg4.links.get_mut("to-sign").unwrap().purpose = LinkPurpose::Unspecified;
+        assert!(
+            !authorityserve_fault(&cfg4),
+            "an unmarked link is never subject to the authority-serve purpose check"
+        );
+    }
+
+    // ---- operator-selectable isolation substrate (Phase-3 foundation) ----
+
+    #[test]
+    fn instance_substrate_defaults_to_os_process_and_round_trips_through_ron() {
+        let ron = r#"(
+            instances: {
+                "frontend": (
+                    capabilities: ["listen.public-tls", "listen.http-parse", "exec.wasmtime"],
+                    substrate: OsProcess,
+                ),
+                "edge-vm": ( capabilities: ["listen.mail"], substrate: Vm ),
+                "core": ( capabilities: ["backend.kv"] ),
+            },
+        )"#;
+        let cfg: PrivsepConfig = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(ron)
+            .expect("parse privsep RON with substrate markers");
+        assert_eq!(
+            cfg.instances["frontend"].substrate,
+            InstanceSubstrate::OsProcess
+        );
+        assert_eq!(cfg.instances["edge-vm"].substrate, InstanceSubstrate::Vm);
+        // An omitted `substrate` defaults to OsProcess (back-compat: every Phase-1 cfg is unchanged).
+        assert_eq!(
+            cfg.instances["core"].substrate,
+            InstanceSubstrate::OsProcess
+        );
+        // The foundation cut wires only OsProcess; the nesting substrates name their reuse backend.
+        assert!(InstanceSubstrate::OsProcess.is_wired());
+        assert!(!InstanceSubstrate::Container.is_wired());
+        assert!(!InstanceSubstrate::Vm.is_wired());
+        assert!(
+            InstanceSubstrate::OsProcess
+                .compute_plane_backend()
+                .is_none()
+        );
+        assert!(
+            InstanceSubstrate::Vm
+                .compute_plane_backend()
+                .is_some_and(|b| b.contains("firecracker"))
+        );
     }
 
     #[test]

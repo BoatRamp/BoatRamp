@@ -56,8 +56,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use boatramp_core::privsep::{
-    CompositionReport, HostAuthority, PrivsepInstanceConfig, check_composition_closure,
-    check_sealed_signer_closure,
+    CompositionReport, HostAuthority, InstanceSubstrate, LinkPurpose, PrivsepInstanceConfig,
+    check_composition_closure, check_sealed_signer_closure,
 };
 use boatramp_node::privsep_resolve::{self, SecretBlindReport};
 use serde::{Deserialize, Serialize};
@@ -190,6 +190,11 @@ pub struct InstanceSpawnSpec {
     pub label: String,
     /// The fine-grained authority set this instance materializes.
     pub capabilities: Vec<HostAuthority>,
+    /// The ISOLATION SUBSTRATE this instance's spawn backend uses (design §7 "substrate is a spawn
+    /// backend"). The supervisor dispatches on it: `OsProcess` is the wired fork+exec backend;
+    /// `Container`/`Vm` are refused fail-closed by [`resolve_spawn_backend`] until their
+    /// compute-plane-backend wiring lands (a reported follow-on).
+    pub substrate: InstanceSubstrate,
     /// The re-exec argv TAIL (after `argv[0]`): `["__instance", "<label>", "--config", "<path>"]`.
     pub argv: Vec<String>,
     /// The EXPLICITLY MINIMAL, secret-scrubbed environment for this instance (design
@@ -283,6 +288,7 @@ where
             InstanceSpawnSpec {
                 label: label.clone(),
                 capabilities: inst.capabilities.clone(),
+                substrate: inst.substrate,
                 argv,
                 env,
             }
@@ -364,6 +370,7 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
         tracing::info!(
             instance = %spec.label,
             capabilities = spec.capabilities.len(),
+            substrate = spec.substrate.tag(),
             env_vars = spec.env.len(),
             "[privsep] root: instance authorized to spawn (re-exec __instance, minimal scrubbed env)"
         );
@@ -540,6 +547,7 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
         held = ?held,
         dropped = ?dropped,
         sandbox = ?inst.sandbox,
+        substrate = inst.substrate.tag(),
         "[privsep] instance: slice resolved; materialization gate built (dropped authorities are \
          never constructed)"
     );
@@ -698,6 +706,34 @@ fn instance_listener_addr(
     config.serve.as_ref().and_then(|s| s.addr)
 }
 
+/// The per-instance SPAWN-BACKEND dispatch for the operator-selectable isolation SUBSTRATE (design §7
+/// generalizing seam — "substrate is a spawn backend"). The root calls this for EACH instance BEFORE
+/// wiring any links / binding any listener, so a composition that selects an unwired substrate is
+/// refused fail-closed before anything is allocated — never spawned part-way, never silently
+/// downgraded to an OS process (which would discard the operator's chosen isolation wall).
+///
+/// **Phase-3 FOUNDATION scope.** [`InstanceSubstrate::OsProcess`] is the WIRED backend (the root's
+/// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] and
+/// [`InstanceSubstrate::Vm`] are the config vocabulary + this seam: they reuse the
+/// `boatramp-container` and `boatramp-firecracker` / `boatramp-vz` compute-plane backends
+/// respectively, whose supervisor wiring (the container/VM socketpair-equivalent — a vsock crossing
+/// for a VM; see `docs/privsep-substrate-benchmark.md` for the measured cost) is a reported follow-on.
+/// Until then this refuses them, naming the backend each reuses. Pure (host-testable).
+fn resolve_spawn_backend(label: &str, substrate: InstanceSubstrate) -> Result<(), PrivsepError> {
+    if substrate.is_wired() {
+        return Ok(());
+    }
+    let backend = substrate.compute_plane_backend().unwrap_or("(none)");
+    Err(PrivsepError::Supervise(format!(
+        "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is not wired in \
+         the Phase-3 foundation cut (it reuses {backend} — a reported follow-on). Refusing \
+         fail-closed rather than silently downgrading to an OS process (which would discard the \
+         chosen isolation wall); use `substrate: OsProcess` (the default) until the {} backend lands",
+        substrate.tag(),
+        substrate.tag(),
+    )))
+}
+
 /// Compute the per-instance unseal ALLOWLIST the root wires onto each `secrets.sealer` instance (the
 /// "signer-key unlock" containment): for every feature-link that connects a `secrets.sealer` instance
 /// to a DIFFERENT `token.signer` instance, the sealer end of that link may unseal ONLY the configured
@@ -754,26 +790,30 @@ fn compute_unseal_allowlists(
 /// should serve the seal/unseal/mint_token grammar to a relayed end principal. Secret-blind (link
 /// names only), handed in via [`PRIVSEP_AUTHORITY_LINKS_ENV`].
 ///
-/// **The designation rule (conservative + unambiguous, so it NEVER collides with the single-purpose
-/// Phase-1 links).** A link designates WS-E serve on its crown-jewel endpoint `E` iff:
-/// - EXACTLY ONE endpoint holds a crown jewel (so a crown↔crown link — the bootstrap-unseal shape — is
-///   excluded; that path is [`compute_unseal_allowlists`]); AND
-/// - the PEER holds NO `listen.*` authority (so a listener-frontend link — the client-fd SPLICE shape,
-///   AND the design's own frontend→signer authority-call shape — is excluded).
+/// **The designation rule (Phase-3 foundation — the per-link PURPOSE marker now disambiguates).** A
+/// link designates WS-E serve on its crown-jewel endpoint `E` when:
+/// - it is EXPLICITLY purpose-marked [`LinkPurpose::AuthorityServe`] AND has exactly one crown-jewel
+///   endpoint (the closure lint enforces the exactly-one rule — `AuthorityServeLinkNotSingleCrownJewel`);
+///   this fires EVEN when the peer is a listener frontend — the design's primary WS-E case (a listener
+///   FRONTEND relaying authority calls to an isolated signer), which is link-shape-identical to a
+///   client-fd splice and so could not be auto-inferred; or
+/// - it is [`LinkPurpose::Unspecified`] (the default — back-compat) AND falls in the conservative,
+///   unambiguous inference: EXACTLY ONE crown-jewel endpoint (a crown↔crown link is bootstrap-unseal,
+///   handled by [`compute_unseal_allowlists`], excluded) AND the PEER holds NO `listen.*` authority
+///   (a listener-frontend link is a client-fd SPLICE / the marker-requiring authority shape — excluded,
+///   fail-safe).
 ///
-/// The listener exclusion is why this never fires for the Phase-1 live-gate compositions (both have a
-/// listener frontend as the relay). **FLAGGED for the lead:** the design's primary WS-E case is a
-/// listener FRONTEND relaying authority calls to an isolated signer — which is link-shape-identical to
-/// a client-fd splice and so needs an explicit per-link PURPOSE marker in the composition model to
-/// disambiguate (a follow-on). This wave designates only the unambiguous crown↔(non-listener relay)
-/// shape (e.g. a `control.admin-api` / `exec.*` relay → an isolated signer). Pure (host-testable).
+/// A [`LinkPurpose::Relay`] link is NEVER designated (an explicit serving splice). The Unspecified
+/// listener exclusion is why this never fires for the Phase-1 live-gate compositions (both relay
+/// through a listener frontend and mark nothing). Pure (host-testable).
 ///
-/// **WIRING-GATE PRECONDITIONS (tracked).** Before ANY composition designates a real
-/// relay→crown-jewel authority-serve link, the hard preconditions in
-/// [`boatramp_server::privsep_authority::AuthorityServe`]'s doc MUST be met — notably the HIGH-1
-/// per-principal `sub` identity claim + the seal-granularity owner decision (the sealer's `scope_of`
-/// fails closed without it today), PoP/`cnf`-binding, a real limiter + durable audit sink, and the
-/// per-link PURPOSE marker named above.
+/// **WIRING-GATE PRECONDITIONS (tracked).** Designating a link here does NOT make the serve LIVE: the
+/// stand-up gate [`check_authority_serve_preconditions`] AND-gates the per-link marker (THIS wave)
+/// with a configured PoP/`cnf` verifier (the sibling authority layer's half). Until BOTH hold, a
+/// designated composition FAILS THE NODE CLOSED at [`run_authority_serve`] rather than serving a
+/// PoP-less grammar. The other hard preconditions in
+/// [`boatramp_server::privsep_authority::AuthorityServe`]'s doc (the HIGH-1 per-principal `sub` claim +
+/// the seal-granularity owner decision, a real limiter + durable audit sink) also remain.
 fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let Some(privsep) = config.privsep.as_ref() else {
@@ -791,16 +831,33 @@ fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTre
         if link.from == link.to {
             continue;
         }
+        // An explicit `relay` marker is a serving splice — never an authority-serve link.
+        if link.is_relay() {
+            continue;
+        }
         let from_cj = any_crown(&link.from);
         let to_cj = any_crown(&link.to);
-        // Exactly one crown-jewel endpoint (XOR) — a crown↔crown link is bootstrap, excluded.
+        // Exactly one crown-jewel endpoint (XOR) — a crown↔crown link is bootstrap, excluded. (The
+        // lint refuses a crown↔crown / no-crown link that IS marked `authority-serve`, so a marked
+        // link that reaches here always has its single crown endpoint.)
         let (holder, peer) = match (from_cj, to_cj) {
             (true, false) => (&link.from, &link.to),
             (false, true) => (&link.to, &link.from),
             _ => continue,
         };
-        // A listener peer is a frontend — its link is a client-fd SPLICE (or the frontend→signer
-        // authority shape that needs the purpose marker). Excluded here (fail-safe, never a collision).
+        // EXPLICIT authority-serve marker: designate the crown endpoint EVEN when the peer is a
+        // listener frontend (the shape the inference could not safely disambiguate — design §3.4
+        // precondition 4). This is the half that, together with the sibling PoP verifier, lets the
+        // stand-up gate open.
+        if link.is_authority_serve() {
+            out.entry(holder.clone())
+                .or_default()
+                .insert(link_name.clone());
+            continue;
+        }
+        // UNSPECIFIED (the default) — conservative inference: a listener peer is a frontend whose link
+        // is a client-fd SPLICE (or the frontend→signer authority shape that NEEDS the explicit marker
+        // above), so it is excluded here (fail-safe, never a collision).
         if any_listener(peer) {
             continue;
         }
@@ -848,17 +905,29 @@ fn check_authority_serve_preconditions(config: &ServerConfig) -> Result<(), Stri
 }
 
 /// Whether a PoP / `cnf` verifier is configured for the authority API (wiring-gate precondition 1).
-/// No config surface for one exists until Phase 3, so this is structurally `false` today — the gate
-/// stays closed. Phase 3 flips this when the PoP-verifier config lands.
+///
+/// **This is the sibling AUTHORITY-LAYER's half of the AND-gate** (the `privsep_authority` / `cose`
+/// PoP/`cnf` verifier, out of this agent's Phase-3 lane). No config surface for one exists yet, so it
+/// is structurally `false` and the stand-up gate stays CLOSED even once the per-link PURPOSE marker
+/// (below) is present — exactly the required invariant: the marker ALONE must never make the serve go
+/// live without PoP. The authority layer flips this when its PoP-verifier config lands.
 fn pop_cnf_verifier_configured(_config: &ServerConfig) -> bool {
     false
 }
 
-/// Whether the composition explicitly PURPOSE-marks its authority-serve links (wiring-gate
-/// precondition 2). `PrivsepLink` has no purpose field yet, so this is structurally `false` today —
-/// the gate stays closed. Phase 3 flips this when the per-link PURPOSE marker lands.
-fn authority_link_purpose_marked(_config: &ServerConfig) -> bool {
-    false
+/// Whether the composition explicitly PURPOSE-marks at least one authority-serve link (wiring-gate
+/// precondition 2 — design §3.4 precondition 4). **Phase-3 foundation (this lane):** the per-link
+/// [`LinkPurpose::AuthorityServe`] marker now EXISTS in the composition model, so this returns `true`
+/// for a composition that declares one. It is one half of the AND-gate in
+/// [`check_authority_serve_preconditions`]; the PoP/`cnf` half ([`pop_cnf_verifier_configured`], the
+/// sibling authority layer's) keeps the live serve closed until it too lands, so a marked-but-PoP-less
+/// composition still fails the node closed rather than serving. Pure (host-testable).
+fn authority_link_purpose_marked(config: &ServerConfig) -> bool {
+    config.privsep.as_ref().is_some_and(|p| {
+        p.links
+            .values()
+            .any(|l| matches!(l.purpose, LinkPurpose::AuthorityServe))
+    })
 }
 
 // =============================================================================
@@ -893,6 +962,14 @@ mod supervise {
             .ok_or_else(|| err("no [privsep] section at supervise time".to_string()))?;
         let current_exe =
             std::env::current_exe().map_err(|e| err(format!("resolving current exe: {e}")))?;
+
+        // Phase-3 spawn-backend dispatch (design §7 "substrate is a spawn backend"): resolve EACH
+        // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process is the
+        // wired Phase-1 backend; container/VM are refused fail-closed here (never a partial spawn,
+        // never a silent downgrade) until their compute-plane-backend wiring lands (a follow-on).
+        for (label, inst) in &privsep.instances {
+            super::resolve_spawn_backend(label, inst.substrate)?;
+        }
 
         // The per-sealer unseal allowlist (the signer-key-unlock containment): the root wires each
         // `secrets.sealer` instance the exact names each of its links' peers may unseal. NON-SECRET
@@ -1869,7 +1946,9 @@ mod instance_serve {
 
 #[cfg(test)]
 mod tests {
-    use boatramp_core::privsep::{LinkTransport, PrivsepConfig, PrivsepLink, SandboxPosture};
+    use boatramp_core::privsep::{
+        InstanceSubstrate, LinkPurpose, LinkTransport, PrivsepConfig, PrivsepLink, SandboxPosture,
+    };
 
     use super::*;
 
@@ -1929,6 +2008,7 @@ mod tests {
         PrivsepInstanceConfig {
             capabilities: caps.to_vec(),
             sandbox: SandboxPosture::Derived,
+            substrate: InstanceSubstrate::OsProcess,
             links: links.iter().copied().map(String::from).collect(),
         }
     }
@@ -1988,6 +2068,7 @@ mod tests {
                 from: "edge".to_string(),
                 to: "signer".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         PrivsepConfig {
@@ -2196,6 +2277,7 @@ mod tests {
                 from: "sealer".to_string(),
                 to: "signer".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         p
@@ -2330,6 +2412,7 @@ mod tests {
                 from: "ctl".to_string(),
                 to: "signer".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         let p = PrivsepConfig {
@@ -2373,6 +2456,7 @@ mod tests {
                 from: "ctl".to_string(),
                 to: "signer".to_string(),
                 transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
             },
         );
         let cfg = cfg_with(Some(PrivsepConfig {
@@ -2396,8 +2480,145 @@ mod tests {
         // The two Phase-1 compositions designate no authority-serve link at all (never reach the gate).
         assert!(compute_authority_serve_links(&cfg_with(Some(clean_privsep()))).is_empty());
         assert!(compute_authority_serve_links(&cfg_with(Some(split_signer_privsep()))).is_empty());
-        // The predicates are structurally false today (the gate is unconditionally closed).
+        // An UNMARKED composition is not purpose-marked; the PoP half is the sibling layer's and
+        // remains structurally false (so the gate is closed regardless of the marker half).
         assert!(!pop_cnf_verifier_configured(&cfg));
         assert!(!authority_link_purpose_marked(&cfg));
+    }
+
+    // ---- Phase-3 foundation: the per-link PURPOSE marker ----
+
+    /// An EXPLICIT `authority-serve` marker on a listener-FRONTEND → signer link (the design's primary
+    /// WS-E shape that the conservative inference refused to auto-designate) IS now designated — yet
+    /// the stand-up gate STILL refuses it, because the PoP/`cnf` half of the AND-gate (the sibling
+    /// authority layer's) is not configured. This is the required invariant: the marker ALONE never
+    /// makes the serve go live without PoP.
+    #[test]
+    fn authority_serve_marker_designates_but_the_and_gate_stays_closed_without_pop() {
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "frontend".to_string(),
+            inst(
+                &[
+                    HostAuthority::ListenPublicTls,
+                    HostAuthority::ListenHttpParse,
+                    HostAuthority::ExecWasmtime,
+                ],
+                &["to-signer"],
+            ),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["to-signer"]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-signer".to_string(),
+            PrivsepLink {
+                from: "frontend".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        let cfg = cfg_with(Some(PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+        }));
+
+        // The marker designates the crown-jewel SIGNER to serve on the link EVEN THOUGH the peer is a
+        // listener frontend (the shape the inference excluded).
+        let designated = compute_authority_serve_links(&cfg);
+        assert!(
+            designated
+                .get("signer")
+                .is_some_and(|s| s.contains("to-signer")),
+            "an authority-serve-marked listener-frontend → signer link must be designated: {designated:?}"
+        );
+        assert!(
+            !designated.contains_key("frontend"),
+            "the frontend relay is the caller — it serves nothing: {designated:?}"
+        );
+
+        // The purpose-marker half of the AND-gate is now satisfied...
+        assert!(authority_link_purpose_marked(&cfg));
+        // ...but the PoP/cnf half (the sibling authority layer's) is not, so the gate stays CLOSED.
+        assert!(!pop_cnf_verifier_configured(&cfg));
+        let err = check_authority_serve_preconditions(&cfg)
+            .expect_err("the stand-up gate must still refuse without a PoP/cnf verifier");
+        assert!(
+            err.contains("PoP"),
+            "the only unmet precondition must be the PoP/cnf verifier, got: {err}"
+        );
+    }
+
+    // ---- Phase-3 foundation: the operator-selectable substrate spawn-backend seam ----
+
+    #[test]
+    fn resolve_spawn_backend_wires_os_process_and_refuses_the_follow_on_substrates() {
+        // OS-process is the wired Phase-1 backend.
+        resolve_spawn_backend("frontend", InstanceSubstrate::OsProcess)
+            .expect("os-process is the wired spawn backend");
+        // Container + VM are refused fail-closed, naming the compute-plane backend each reuses.
+        let c = resolve_spawn_backend("frontend", InstanceSubstrate::Container).unwrap_err();
+        assert!(
+            matches!(&c, PrivsepError::Supervise(m) if m.contains("boatramp-container") && m.contains("fail-closed")),
+            "container must be refused with its reuse backend named, got {c:?}"
+        );
+        let v = resolve_spawn_backend("frontend", InstanceSubstrate::Vm).unwrap_err();
+        assert!(
+            matches!(&v, PrivsepError::Supervise(m) if m.contains("firecracker") && m.contains("OsProcess")),
+            "vm must be refused with its reuse backend named + the OsProcess fallback, got {v:?}"
+        );
+    }
+
+    /// An explicit `relay` marker (a serving splice) is NEVER designated for the authority grammar —
+    /// even on a crown↔non-listener shape that the UNSPECIFIED inference WOULD designate.
+    #[test]
+    fn relay_marker_is_never_designated_for_the_authority_grammar() {
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "ctl".to_string(),
+            inst(&[HostAuthority::ControlAdminApi], &["to-sign"]),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["to-sign"]),
+        );
+        let link = |purpose| {
+            let mut links = BTreeMap::new();
+            links.insert(
+                "to-sign".to_string(),
+                PrivsepLink {
+                    from: "ctl".to_string(),
+                    to: "signer".to_string(),
+                    transport: LinkTransport::Local,
+                    purpose,
+                },
+            );
+            links
+        };
+        // Unspecified: the inference designates the crown↔(non-listener) shape.
+        let unspec = cfg_with(Some(PrivsepConfig {
+            instances: instances.clone(),
+            links: link(LinkPurpose::Unspecified),
+            supervisor: None,
+        }));
+        assert!(
+            compute_authority_serve_links(&unspec)
+                .get("signer")
+                .is_some_and(|s| s.contains("to-sign"))
+        );
+        // Relay: the SAME topology is NOT designated (an explicit serving splice).
+        let relay = cfg_with(Some(PrivsepConfig {
+            instances,
+            links: link(LinkPurpose::Relay),
+            supervisor: None,
+        }));
+        assert!(
+            compute_authority_serve_links(&relay).is_empty(),
+            "a relay-marked link must never be an authority-serve link"
+        );
     }
 }

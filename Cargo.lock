@@ -1683,6 +1683,7 @@ dependencies = [
  "wac-graph",
  "walkdir",
  "wasmparser 0.252.0",
+ "wasmtime",
  "wit-component 0.252.0",
  "wit-parser 0.252.0",
 ]

@@ -185,7 +185,81 @@ need no sealer; they resolve their key themselves.)
   A×B co-residency the model *permits* (Finding 4, owner-design sanctioned) is the floor, not the
   recommendation; a hardened node keeps them apart.
 
-## 6. Checklist
+## 6. The per-link purpose marker (authority-serve vs. serving splice)
+
+A feature-link carries two kinds of traffic (design §3.1): a per-request **serving splice** (the
+frontend hands the backend an accepted client connection to serve) and an infrequent **authority
+call** (a relay asks a crown jewel to `seal`/`unseal`/`mint_token`). On the `local` socketpair these
+two shapes are topologically **identical** — a listener FRONTEND → a crown-jewel SIGNER looks exactly
+like a listener frontend → a serving backend. So a link may carry an explicit **`purpose`** marker to
+disambiguate:
+
+```ron
+links: {
+    // A serving splice (the hot path) — client fds relayed inward, never authority calls:
+    "frontend-to-core": ( from: "frontend", to: "core",   transport: Local, purpose: Relay ),
+    // An authority-serve link — the relay makes typed authority calls to the crown jewel:
+    "edge-to-signer":   ( from: "edge",     to: "signer", transport: Local, purpose: AuthorityServe ),
+}
+```
+
+- **`purpose: Unspecified`** (the default; omit the field) — the role is INFERRED from the endpoints
+  (back-compat with every Phase-1 composition). A crown↔(non-listener) link is conservatively taken as
+  an authority-serve link; a listener-frontend link is taken as a serving splice and is **never**
+  auto-designated for the authority grammar (the shape could be either, so inference refuses to guess).
+- **`purpose: Relay`** — states explicitly that the link is a serving splice; never an authority-serve
+  link, even if an endpoint holds a crown jewel.
+- **`purpose: AuthorityServe`** — designates the link's crown-jewel endpoint to serve the authority
+  grammar on it, **including** the listener-frontend→signer shape the inference could not disambiguate.
+  The composition-closure lint REFUSES an `authority-serve` link that lacks **exactly one** crown-jewel
+  endpoint (zero has no server; two is the bootstrap-unseal shape, not a WS-E serve).
+
+**An `authority-serve` marker does NOT by itself make the authority grammar go live.** Standing up a
+live seal/unseal/`mint_token` serve is an **AND-gate**: it requires BOTH the per-link `purpose` marker
+(this) AND a configured PoP/`cnf` verifier (the authority-layer half, not yet landed). Until both hold,
+a composition that designates an authority-serve link **fails the node closed** at stand-up (a loud
+misconfiguration signal) rather than serving a PoP-less grammar. So the marker is expressible now, but
+the live authority serve stays code-inert until the verifier lands — by design.
+
+## 7. The frontend substrate (operator-selectable)
+
+The isolation **substrate** for an instance is a per-instance config choice
+(`substrate: OsProcess | Container | Vm`, default `OsProcess`) — **operator-selectable, not a hard
+pick** (owner decision), chosen per the node's threat model and serving latency budget. This is the
+Phase-3 **frontend authority-inversion**: run the most-exposed byte parser holding the LEAST authority,
+relaying typed requests inward.
+
+```ron
+instances: {
+    // The INVERTED frontend: ONLY the parsers it must hold — no keys, no backends, no control.
+    "frontend": ( capabilities: ["listen.public-tls", "listen.http-parse", "exec.wasmtime"],
+                  sandbox: Derived, substrate: OsProcess, links: ["frontend-to-core"] ),
+    // ... the other listeners / exec.compute / control on their own instance(s), and the crown
+    //     jewels + backends on a serving `core`, wired by `frontend-to-core` (purpose: Relay).
+}
+```
+
+A parser RCE on this `frontend` reaches no key, no backend credential, no control surface, and no
+`exec.compute` — it can only relay inward. The `substrate` grades the wall around it:
+
+- **`OsProcess`** (default, **wired today**) — a privilege-dropped process over the `local` socketpair;
+  the separate address space + the fail-closed per-capability seccomp/Landlock profile is the wall, at
+  a flat ~7 µs per-request crossing (fd-pass). The right default for almost every node.
+- **`Container`** — namespace/cgroup confinement (reuses `boatramp-container`); a kernel-visible
+  boundary when the threat model excludes kernel-escape.
+- **`Vm`** — a hardware-virtualized microVM with its own kernel (reuses `boatramp-firecracker` /
+  `boatramp-vz`); survives a guest-kernel RCE. Reserve it for high-threat multi-tenant frontends whose
+  latency budget absorbs the hypervisor crossing + VM boot.
+
+Pick from REAL numbers, not estimates: the measured `local`-shape crossing cost across all four
+substrates, plus the re-run recipe, is in **`docs/privsep-substrate-benchmark.md`**.
+
+**Phase-3 foundation scope:** only `OsProcess` is a wired spawn backend today. `Container`/`Vm` parse
+and lint as valid vocabulary, but the supervisor **refuses them fail-closed** (naming the compute-plane
+backend each reuses) rather than silently downgrading to an OS process — a silent downgrade would
+discard the operator's chosen wall. Their spawn-backend wiring is a reported follow-on.
+
+## 8. Checklist
 
 - [ ] `listen.http-parse` (and every `listen.*`) holds the parser and nothing else.
 - [ ] `listen.public-tls` (cert key) is a separate instance from `listen.http-parse`.
@@ -196,5 +270,9 @@ need no sealer; they resolve their key themselves.)
 - [ ] `backend.kv` is isolated far from any attacker-facing surface (the integrity residual).
 - [ ] A sealed-key `token.signer` has a linked `secrets.sealer` (the closure lint requires it).
 - [ ] Every parser links only inward to the backends/signers it must reach, never to another parser.
+- [ ] Each link's `purpose` is correct — `Relay` for a serving splice, `AuthorityServe` only on a
+      crown↔non-crown link (and the live serve still needs the PoP verifier; the marker alone is inert).
+- [ ] Each instance's `substrate` matches its threat model + latency budget (default `OsProcess`;
+      `Container`/`Vm` are a reported follow-on) — see `docs/privsep-substrate-benchmark.md`.
 </content>
 </invoke>
