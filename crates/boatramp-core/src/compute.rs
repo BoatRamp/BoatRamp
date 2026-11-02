@@ -1614,6 +1614,43 @@ pub trait ManagedDbEnvResolver: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// **Mint** this replica's per-replica DYNAMIC database credential at launch, for a
+    /// workload that CONSUMES a managed database (PLAN-compute-managed-db phase 2). Called
+    /// once per launch, BEFORE binding resolution, so a DSN injector reads the freshly-
+    /// minted (sealed) per-replica credential. A workload that consumes no managed database
+    /// — and every cell where phase 2 does not apply (a bring-your-own `url_env` binding,
+    /// the reserved default tenant, `Single` isolation) — is a no-op `Ok(())`. An `Err`
+    /// FAILS the launch CLOSED (a consumer must not serve without its credential). The node
+    /// impl delegates to
+    /// [`boatramp_node::dynamic_creds::mint_dynamic_role`](../../boatramp_node/dynamic_creds/fn.mint_dynamic_role.html).
+    /// Defaulted to a no-op so a resolver that does not implement phase 2 is unaffected.
+    async fn mint_dynamic_db_cred(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _replica: u32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// **Revoke + drop** this replica's dynamic database credential at stop (PLAN-compute-
+    /// managed-db phase 2) — the `DROP OWNED` / `DROP ROLE` (or `DROP USER`) that keeps a
+    /// stopped replica's role from lingering. Idempotent: a non-consumer workload, an
+    /// already-dropped role, and an already-deleted credential are all no-ops, so it is safe
+    /// to call again (and from the orphan reaper). A revoke error is non-fatal to the
+    /// reconcile (the replica is already stopped; the next sweep retries). The node impl
+    /// delegates to
+    /// [`boatramp_node::dynamic_creds::revoke_dynamic_role`](../../boatramp_node/dynamic_creds/fn.revoke_dynamic_role.html).
+    /// Defaulted no-op.
+    async fn revoke_dynamic_db_cred(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _replica: u32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// How a managed database is made able to initialize its stock image on a shared-kernel
@@ -2114,6 +2151,18 @@ pub async fn reconcile_once(
                             .push(format!("{wl}/{replica}: no backend {backend:?}"));
                         continue;
                     };
+                    // Phase 2 (PLAN-compute-managed-db): mint this replica's DYNAMIC database
+                    // credential BEFORE binding resolution, so a DSN injector reads the
+                    // freshly-sealed per-replica credential. Fail CLOSED — a consumer must not
+                    // launch without its credential. A non-consumer workload is a no-op.
+                    if let Some(m) = managed_db
+                        && let Err(e) = m.mint_dynamic_db_cred(&project_name, &wl, replica).await
+                    {
+                        report
+                            .errors
+                            .push(format!("{wl}/{replica}: mint dynamic db cred: {e}"));
+                        continue;
+                    }
                     let node_region = region_of_node(nodes, node);
                     // Resolve declared bindings → env injected into the guest (registers
                     // the shim token for this replica).
@@ -2230,6 +2279,19 @@ pub async fn reconcile_once(
                                 &spec.bindings,
                             )
                             .await;
+                    }
+                    // Phase 2 (PLAN-compute-managed-db): revoke + drop this replica's DYNAMIC
+                    // database credential (idempotent; non-fatal — the replica is already
+                    // stopped, and the next sweep/reaper retries). A non-consumer is a no-op.
+                    if let Some(m) = managed_db
+                        && let Err(e) = m
+                            .revoke_dynamic_db_cred(&project_name, &handle.workload, handle.replica)
+                            .await
+                    {
+                        report.errors.push(format!(
+                            "{}/{}: revoke dynamic db cred: {e}",
+                            handle.workload, handle.replica
+                        ));
                     }
                 }
                 Action::Snapshot { handle } => {

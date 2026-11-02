@@ -705,6 +705,211 @@ pub fn rotate_ddl(kind: ExternalSqlKind, role: &str, password: &str) -> Vec<Stri
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ownership-safe DYNAMIC (per-replica) credentials — the PLAN-compute-managed-db
+// phase-2 lifecycle. A compute workload that consumes a Shared managed database gets
+// a short-lived login role minted at REPLICA launch and dropped at REPLICA stop,
+// instead of sharing one long-lived tenant login role across every replica forever.
+//
+// # The ownership-orphaning hazard this is built to design out
+//
+// The naive "one distinct dynamic role per workload, let the app run DDL on its own
+// connection" makes the EPHEMERAL role the OWNER of every object its app/ORM/migration
+// tool creates (`CREATE TABLE` ⇒ owner = the creating role). Postgres then refuses to
+// `DROP ROLE` a role that still owns objects (`role "…" cannot be dropped because some
+// objects depend on it`), AND the next dynamic role can neither `ALTER` nor `DROP` the
+// tables it does not own — so schema management breaks across rotations and the role
+// leaks. (Verified live on pg16: see the `dynamic_creds_ownership_sqlx_live` gate.)
+//
+// # The design (verified live on pg16 — see the gate + the DESIGN note)
+//
+// The STABLE, persistent, boatramp-managed [`tenant_owner_role_name`] role — created at
+// DB-provision time by [`provision_ddl`], owning the database + its schema, NEVER dropped
+// — stays the one true owner. The per-replica dynamic role is minted as a **member of the
+// owner role** and configured to **operate AS the owner** on every session via the `role`
+// GUC (`ALTER ROLE <dyn> SET role = '<owner>'`). The verified consequences:
+//
+// - Anything the dynamic role creates (`CREATE TABLE`, the backing `serial` sequence, an
+//   index, …) is owned by the STABLE OWNER, so the dynamic role **owns nothing**.
+// - A fresh dynamic role on relaunch is another member operating as the same owner, so it
+//   has **identical** access to every object the owner holds (reads prior data, ALTERs/
+//   DROPs owner-owned tables).
+// - Because the dynamic role owns nothing, [`drop_dynamic_role_ddl`] drops it **cleanly**:
+//   `REASSIGN OWNED BY <dyn> TO <owner>` (a belt-and-suspenders no-op unless an app
+//   escaped the GUC with `SET ROLE NONE` and created objects as the raw role — then it
+//   moves them to the stable owner, no orphan, no data loss), then `DROP OWNED BY <dyn>`
+//   (clears the role's privileges + default-privilege entries, INCLUDING the shared
+//   database-level `CONNECT` grant when run connected to the tenant DB — verified), then
+//   `DROP ROLE <dyn>` (succeeds, and auto-removes the owner→dyn membership — verified).
+//
+// `role` is a Postgres GUC name, not a reserved word here; its value is emitted as a
+// **single-quoted string literal** of the owner role name (the safest, most portable
+// form — verified that string-literal, bare-identifier, and double-quoted-identifier
+// values all resolve, and the literal matches how this module already quotes a role-name
+// literal in the `pg_roles` existence check).
+//
+// # MySQL
+//
+// MySQL has **no object ownership**, so the hazard does not exist: a dynamic user is
+// granted `ALL PRIVILEGES ON <db>.*` (every current + future table, DDL included) and
+// `DROP USER` drops it cleanly with nothing to orphan (the data outlives the user). No
+// owner role is involved — the `owner` argument is inert, exactly as in [`provision_ddl`].
+
+/// Derive the per-REPLICA **dynamic login role** name.
+///
+/// Scheme: `<base>_<tenant_ident>_d_<instance_id>`, re-sanitized + length-capped to the
+/// tighter [`MAX_ROLE_IDENT_LEN`] (MySQL's 32-char user limit) via [`sanitize_ident_capped`].
+/// `base` is the binding's compute/server workload (the SAME base [`tenant_role_name`] /
+/// [`tenant_owner_role_name`] use, so a dynamic role sits in the tenant's own role family);
+/// `tenant_ident` is the already-`sanitize_ident`-ed tenant; `instance_id` is the
+/// replica identity ([`compute_instance_id`](boatramp_core::compute::compute_instance_id),
+/// e.g. `acme-web-0`) so two replicas of one workload get two DISTINCT roles.
+///
+/// Distinct from [`tenant_role_name`] (`_role`), [`tenant_owner_role_name`] (`_owner`), and
+/// [`ensure_user_role_name`] (`_u_`) by the `_d_` marker being part of the whole-input
+/// digest — so even when the cosmetic body truncates away under the 32-char cap, the
+/// 128-bit digest keeps every dynamic role distinct from the static roles, the owner role,
+/// the database name, and every OTHER replica's dynamic role. Never digit- or `pg_`-leading
+/// (the [`sanitize_ident_capped`] guards apply).
+pub fn dynamic_role_name(base: &str, tenant_ident: &str, instance_id: &str) -> String {
+    sanitize_ident_capped(
+        &format!("{base}_{tenant_ident}_d_{instance_id}"),
+        MAX_ROLE_IDENT_LEN,
+    )
+}
+
+/// Ordered, **idempotent** DDL to MINT a per-replica dynamic login role that operates AS
+/// the stable tenant owner (so anything it creates is owner-owned and it owns nothing).
+///
+/// `db` is the tenant database ([`tenant_db_name`]); `owner_role` is the stable owner
+/// ([`tenant_owner_role_name`]) that already owns `db`; `dyn_role` is the per-replica role
+/// ([`dynamic_role_name`]); `password` is its fresh login password (hex in practice, quoted
+/// defensively). All names are pre-derived + sanitized; every statement quotes identifiers
+/// and literals regardless.
+///
+/// # Postgres (run as the superuser on the MAINTENANCE database)
+///
+/// Every statement here is cluster-global or touches a shared object (the database-level
+/// `CONNECT`), so none needs a connection to `db` itself:
+/// 1. Idempotent `CREATE ROLE <dyn> LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS
+///    NOREPLICATION PASSWORD …` (via `DO $$ … pg_roles … $$`), tolerating a crash-relaunch
+///    where the prior stop's drop did not run.
+/// 2. `ALTER ROLE <dyn> WITH LOGIN … PASSWORD …` — re-assert the locked-down attributes +
+///    resync the fresh password.
+/// 3. `GRANT <owner> TO <dyn>` — membership, so `<dyn>` may operate as `<owner>` (PG16's
+///    default grant carries `SET TRUE`, permitting the session-start `SET ROLE`).
+/// 4. `ALTER ROLE <dyn> SET role = '<owner>'` — every `<dyn>` session starts AS `<owner>`,
+///    so objects it creates are owned by `<owner>` and `<dyn>` owns nothing.
+/// 5. `GRANT CONNECT ON DATABASE <db> TO <dyn>` — `CONNECT` is checked against the
+///    authenticated role (`<dyn>`) BEFORE the `role` GUC applies, so the dynamic role needs
+///    its own grant (the database was `REVOKE CONNECT … FROM PUBLIC`-locked at provision).
+///
+/// # MySQL (run as the superuser)
+/// `CREATE USER IF NOT EXISTS` + `ALTER USER` (resync password) + `GRANT ALL PRIVILEGES ON
+/// <db>.*` (the tenant-scoped isolation boundary; DDL included) + `FLUSH PRIVILEGES`. No
+/// owner role (no object ownership to transfer).
+pub fn mint_dynamic_role_ddl(
+    kind: ExternalSqlKind,
+    db: &str,
+    owner_role: &str,
+    dyn_role: &str,
+    password: &str,
+) -> Vec<String> {
+    let db_id = quote_ident(kind, db);
+    let dyn_id = quote_ident(kind, dyn_role);
+    let pw_lit = quote_literal(password);
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let dyn_lit = quote_literal(dyn_role);
+            let owner_id = quote_ident(kind, owner_role);
+            // The `role` GUC value is emitted as a single-quoted string literal of the owner
+            // role name (verified: literal / bare / double-quoted all resolve; the literal is
+            // the safest + matches this module's `pg_roles` role-name-literal convention).
+            let owner_lit = quote_literal(owner_role);
+            vec![
+                // 1. Idempotent, locked-down create (tolerates a crash-relaunch leftover).
+                format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {dyn_lit}) THEN \
+                     CREATE ROLE {dyn_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit}; \
+                     END IF; END $$;"
+                ),
+                // 2. Re-assert the safe attributes + resync the fresh password.
+                format!(
+                    "ALTER ROLE {dyn_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit};"
+                ),
+                // 3. Membership so the dynamic role may SET ROLE to the stable owner.
+                format!("GRANT {owner_id} TO {dyn_id};"),
+                // 4. Operate AS the owner on every session (the ownership-transfer core).
+                format!("ALTER ROLE {dyn_id} SET role = {owner_lit};"),
+                // 5. Admit the dynamic role to the (PUBLIC-locked) tenant database.
+                format!("GRANT CONNECT ON DATABASE {db_id} TO {dyn_id};"),
+            ]
+        }
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(dyn_role);
+            vec![
+                format!("CREATE USER IF NOT EXISTS {user} IDENTIFIED BY {pw_lit};"),
+                format!("ALTER USER {user} IDENTIFIED BY {pw_lit};"),
+                format!("GRANT ALL PRIVILEGES ON {db_id}.* TO {user};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
+/// Ordered DDL to DROP a per-replica dynamic role **cleanly** (the inverse of
+/// [`mint_dynamic_role_ddl`]). `dyn_role` is the pre-derived [`dynamic_role_name`];
+/// `owner_role` is the stable [`tenant_owner_role_name`] the safety-net reassign targets.
+///
+/// # Postgres — run connected to the role's own TENANT database, as the superuser
+///
+/// `REASSIGN OWNED` / `DROP OWNED` act only on the CURRENT database (+ shared objects), so
+/// they MUST run connected to the tenant DB, where all of the dynamic role's privileges and
+/// any (escaped) objects live; `DROP ROLE` is cluster-global and runs fine from that same
+/// connection:
+/// 1. `REASSIGN OWNED BY <dyn> TO <owner>` — **safety net**: the dynamic role normally owns
+///    nothing (it operates as `<owner>`), but if an app did `SET ROLE NONE` and created
+///    objects as the raw role, this moves them to the STABLE OWNER — no orphan, no data
+///    loss — so the drop is clean regardless. (Verified live on pg16.)
+/// 2. `DROP OWNED BY <dyn>` — clear the role's privileges + default-privilege entries,
+///    including the shared database-level `CONNECT` grant (verified cleared when run in the
+///    tenant DB). Now the role is depended on by nothing.
+/// 3. `DROP ROLE IF EXISTS <dyn>` — drop the cluster role; auto-removes the owner→dyn
+///    membership (verified — no explicit `REVOKE` needed).
+///
+/// Steps 1–2 error if the role does not exist; the caller treats a "role does not exist"
+/// error as success (idempotent — already gone), the same contract [`drop_login_role_ddl`]
+/// uses. Step 3 is `IF EXISTS` and never errors on absence.
+///
+/// # MySQL
+/// `DROP USER IF EXISTS '<dyn>'@'%'` + `FLUSH PRIVILEGES` — privileges drop with the user;
+/// nothing to orphan (`owner_role` is inert).
+pub fn drop_dynamic_role_ddl(
+    kind: ExternalSqlKind,
+    dyn_role: &str,
+    owner_role: &str,
+) -> Vec<String> {
+    let dyn_id = quote_ident(kind, dyn_role);
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let owner_id = quote_ident(kind, owner_role);
+            vec![
+                format!("REASSIGN OWNED BY {dyn_id} TO {owner_id};"),
+                format!("DROP OWNED BY {dyn_id};"),
+                format!("DROP ROLE IF EXISTS {dyn_id};"),
+            ]
+        }
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(dyn_role);
+            vec![
+                format!("DROP USER IF EXISTS {user};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,5 +1712,178 @@ mod tests {
         assert_eq!(hash_suffix("appdb"), "6ldpyd2wfh6vhvqhj6s5o6hg0");
         // Therefore the whole identifier for a clean name is fully determined.
         assert_eq!(sanitize_ident("appdb"), "appdb_6ldpyd2wfh6vhvqhj6s5o6hg0");
+    }
+
+    // ---- dynamic (per-replica) role name + mint/drop DDL -----------------
+
+    /// A dynamic role name is derived from `(base, tenant_ident, instance_id)`, stays
+    /// within the MySQL 32-char user cap, is safe-charset, never digit-/`pg_`-leads, and
+    /// is DISTINCT from the static runtime role, the owner role, the ensure-user role, and
+    /// the database name of the same tenant — the distinctness that keeps a dropped dynamic
+    /// role from ever colliding with (and clobbering) a persistent identity.
+    #[test]
+    fn dynamic_role_name_is_bounded_distinct_and_safe() {
+        let ident = sanitize_ident("acme");
+        let d0 = dynamic_role_name("pg", &ident, "acme-web-0");
+        // Fits the tightest engine (MySQL user) cap, safe charset, not reserved/digit-leading.
+        assert!(d0.len() <= MAX_ROLE_IDENT_LEN, "dyn role over cap: {d0}");
+        assert!(!d0.starts_with("pg_"), "reserved pg_ prefix: {d0}");
+        assert!(!d0.as_bytes()[0].is_ascii_digit(), "digit-leading: {d0}");
+        assert!(
+            d0.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        );
+        // Distinct from every persistent identity of the SAME tenant (carried by the digest).
+        assert_ne!(d0, tenant_role_name("pg", &ident));
+        assert_ne!(d0, tenant_owner_role_name("pg", &ident));
+        assert_ne!(d0, ensure_user_role_name("pg", &ident, "web"));
+        assert_ne!(d0, tenant_db_name("appdb", &ident));
+        // Distinct PER REPLICA: a second replica of the same workload gets a different role.
+        assert_ne!(d0, dynamic_role_name("pg", &ident, "acme-web-1"));
+        // Deterministic for a given replica (idempotent mint/drop key).
+        assert_eq!(d0, dynamic_role_name("pg", &ident, "acme-web-0"));
+        // Even a long instance id (truncates the body) stays distinct via the digest.
+        let long_a = dynamic_role_name("pg", &ident, &format!("{}-0", "z".repeat(60)));
+        let long_b = dynamic_role_name("pg", &ident, &format!("{}-1", "z".repeat(60)));
+        assert_ne!(long_a, long_b, "long instance ids collided");
+        assert!(long_a.len() <= MAX_ROLE_IDENT_LEN);
+    }
+
+    /// Postgres mint DDL: the load-bearing ownership-transfer mechanism is present and in
+    /// order — membership, then `SET role = '<owner>'`, then the CONNECT grant — the role
+    /// is locked down (non-superuser, no cluster reach, RLS-subject), and names/passwords
+    /// are quoted. MUTATION: dropping the `SET role` statement (so the dynamic role creates
+    /// objects as ITSELF — the orphaning hazard) MUST fail this test.
+    #[test]
+    fn mint_dynamic_role_postgres_operates_as_owner_and_is_locked_down() {
+        let stmts = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d_acme_web_0",
+            "deadbeef",
+        );
+        let joined = stmts.join("\n");
+        // The ownership-transfer core: membership + operate-AS-owner via the `role` GUC, the
+        // owner quoted as a STRING LITERAL (not an identifier) in the SET value.
+        assert!(
+            joined.contains("GRANT \"appdb_acme_owner\" TO \"appdb_acme_d_acme_web_0\""),
+            "missing owner membership:\n{joined}"
+        );
+        assert!(
+            joined.contains("ALTER ROLE \"appdb_acme_d_acme_web_0\" SET role = 'appdb_acme_owner'"),
+            "missing the operate-AS-owner SET role GUC (string-literal owner):\n{joined}"
+        );
+        // Admitted to the PUBLIC-locked tenant database.
+        assert!(
+            joined.contains(
+                "GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_d_acme_web_0\""
+            )
+        );
+        // Locked down exactly like the owner/runtime roles: no cluster-level reach, RLS-subject.
+        assert!(joined.contains("CREATE ROLE \"appdb_acme_d_acme_web_0\" LOGIN NOSUPERUSER"));
+        assert!(joined.contains("NOCREATEDB") && joined.contains("NOCREATEROLE"));
+        assert!(
+            joined.contains("NOBYPASSRLS"),
+            "dynamic role must not bypass RLS"
+        );
+        assert!(
+            !joined.to_ascii_uppercase().contains(" SUPERUSER"),
+            "dynamic role must never be SUPERUSER:\n{joined}"
+        );
+        // Password only ever a quoted literal, never a bare token.
+        assert!(!joined.contains(" deadbeef"), "unquoted password leaked");
+        assert!(joined.contains("PASSWORD 'deadbeef'"));
+        // Ordering: create/alter, THEN membership, THEN SET role, THEN CONNECT.
+        let idx = |needle: &str| stmts.iter().position(|s| s.contains(needle)).unwrap();
+        assert!(idx("CREATE ROLE") < idx("GRANT \"appdb_acme_owner\" TO"));
+        assert!(idx("GRANT \"appdb_acme_owner\" TO") < idx("SET role ="));
+        assert!(idx("SET role =") < idx("GRANT CONNECT ON DATABASE"));
+    }
+
+    /// Postgres clean-drop DDL: `REASSIGN OWNED … TO <owner>` (safety net, to the STABLE
+    /// OWNER — NOT the superuser), then `DROP OWNED`, then `DROP ROLE IF EXISTS`, in that
+    /// order, quoted. MUTATION: dropping the REASSIGN step, or reassigning to the superuser
+    /// instead of the owner, changes this structure and fails the ordering/owner asserts.
+    #[test]
+    fn drop_dynamic_role_postgres_reassigns_to_owner_then_drops_cleanly() {
+        let stmts = drop_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme_d_acme_web_0",
+            "appdb_acme_owner",
+        );
+        assert_eq!(
+            stmts,
+            vec![
+                "REASSIGN OWNED BY \"appdb_acme_d_acme_web_0\" TO \"appdb_acme_owner\";"
+                    .to_string(),
+                "DROP OWNED BY \"appdb_acme_d_acme_web_0\";".to_string(),
+                "DROP ROLE IF EXISTS \"appdb_acme_d_acme_web_0\";".to_string(),
+            ]
+        );
+        // The safety net reassigns to the OWNER, never the superuser (CURRENT_USER) — so an
+        // escaped object lands with the stable owner, not the cluster superuser.
+        assert!(
+            !stmts[0].contains("CURRENT_USER"),
+            "must reassign to the owner, not the superuser"
+        );
+    }
+
+    /// MySQL mint/drop: grant-based, scoped to `<db>.*` (the isolation boundary, DDL
+    /// included), NO owner role (no object ownership), dropped cleanly with `DROP USER`.
+    #[test]
+    fn mint_and_drop_dynamic_role_mysql_is_grant_based_and_scoped() {
+        let mint = mint_dynamic_role_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "ignored_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+        )
+        .join("\n");
+        assert!(
+            mint.contains("CREATE USER IF NOT EXISTS 'appdb_acme_d0'@'%' IDENTIFIED BY 'deadbeef'")
+        );
+        assert!(
+            mint.contains("GRANT ALL PRIVILEGES ON `appdb_acme`.* TO 'appdb_acme_d0'@'%'"),
+            "mysql dynamic grant must be scoped to the tenant db only:\n{mint}"
+        );
+        assert!(mint.contains("FLUSH PRIVILEGES"));
+        // MySQL has no object ownership, so the owner role never appears + there is no SET ROLE.
+        assert!(
+            !mint.contains("ignored_owner"),
+            "mysql mint must not reference an owner role"
+        );
+        assert!(!mint.to_ascii_uppercase().contains("SET ROLE"));
+        assert!(!mint.contains(" deadbeef"), "unquoted password leaked");
+
+        let drop = drop_dynamic_role_ddl(ExternalSqlKind::Mysql, "appdb_acme_d0", "ignored_owner");
+        assert_eq!(
+            drop,
+            vec![
+                "DROP USER IF EXISTS 'appdb_acme_d0'@'%';".to_string(),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        );
+    }
+
+    /// A malicious password/owner can't escape its literal in any emitted dynamic-cred
+    /// statement (defense-in-depth, mirroring the provision/rotate payload test).
+    #[test]
+    fn dynamic_role_ddl_neutralizes_injection() {
+        let evil = "'; DROP DATABASE postgres; --";
+        for stmts in [
+            mint_dynamic_role_ddl(ExternalSqlKind::Postgres, "db", "own", "dyn", evil),
+            mint_dynamic_role_ddl(ExternalSqlKind::Mysql, "db", "own", "dyn", evil),
+        ] {
+            for s in stmts {
+                if s.contains("DROP DATABASE postgres") {
+                    assert!(
+                        s.contains("''; DROP DATABASE postgres; --"),
+                        "password broke out of its literal: {s}"
+                    );
+                }
+            }
+        }
     }
 }
