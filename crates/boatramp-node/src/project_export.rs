@@ -88,6 +88,7 @@ use crate::pg_client::{
     mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
     mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
     pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major, psql_invocation,
+    psql_script_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -633,6 +634,14 @@ pub struct NodeProjectExport {
     /// relative name under this base; the host confines it (no escape) — the caller never
     /// supplies an absolute node path.
     resumable_base: Option<PathBuf>,
+    /// TEST-ONLY restore-window widener (milliseconds). `0` in every production build — only a
+    /// debug/test build can set it via [`with_shadow_restore_test_delay_ms`](Self::with_shadow_restore_test_delay_ms)
+    /// (that builder does not even compile under `--release`). When non-zero, `pg_create_shadow`
+    /// holds the SHARED shadow in existence (locked down: PUBLIC CONNECT already revoked + swept)
+    /// for this long before the restore proceeds, so the cross-tenant live gate can observe the
+    /// shadow while it exists and prove a sibling can never CONNECT to it. The hold is a plain
+    /// `tokio::time::sleep` that owns no DB connection; it changes no DDL and no statement order.
+    shadow_restore_test_delay_ms: u64,
 }
 
 impl NodeProjectExport {
@@ -667,7 +676,22 @@ impl NodeProjectExport {
             import_total_cap: DEFAULT_IMPORT_TOTAL_CAP,
             trusted_extensions: Vec::new(),
             resumable_base: None,
+            shadow_restore_test_delay_ms: 0,
         }
+    }
+
+    /// TEST-ONLY: hold the SHARED pg shadow in existence for `ms` milliseconds inside
+    /// `pg_create_shadow` — AFTER the shadow is created AND locked down (PUBLIC CONNECT revoked +
+    /// a terminate-sweep) — before the restore proceeds. Lets the cross-tenant live gate
+    /// (`project_export_clone_self_provisions_a_fresh_shared_tenant_live`) observe the shadow while
+    /// it exists and prove a sibling tenant can never CONNECT to it. Gated to debug builds so it
+    /// cannot be reached from a release binary; production leaves the field `0` (inert). It widens
+    /// only the window — it changes no DDL, no statement order, and holds no DB connection.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn with_shadow_restore_test_delay_ms(mut self, ms: u64) -> Self {
+        self.shadow_restore_test_delay_ms = ms;
+        self
     }
 
     /// Set the operator trusted-extension allowlist (from
@@ -1251,6 +1275,23 @@ fn shadow_suffix() -> String {
 /// utility SQL (the db name is driver-derived, never a credential or bundle data).
 fn pg_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Compose the superuser terminate-sweep that evicts EVERY backend attached to database `db`
+/// except our own. On the SHARED shadow path this clears any session a sibling tenant slipped
+/// onto the shadow during the (now batched, gap-minimized) `CREATE DATABASE` → `REVOKE CONNECT …
+/// FROM PUBLIC` window — `REVOKE` blocks only NEW connects, so the sweep is what evicts a session
+/// that connected before the revoke took effect. Run immediately before the untrusted restore so
+/// the restore begins on a shadow with ZERO foreign sessions.
+///
+/// `db` is a driver-derived name (never attacker-controlled); it is quoted as a SQL string literal
+/// via [`pg_lit`] for the `datname =` predicate — the SAME quoting the swap/teardown sweeps use.
+fn pg_terminate_backends_sql(db: &str) -> String {
+    format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = {} AND pid <> pg_backend_pid()",
+        pg_lit(db)
+    )
 }
 
 /// POSIX-single-quote each token of a driver-composed argv and join with spaces, so the
@@ -5174,6 +5215,25 @@ impl NodeProjectExport {
             self.pg_drop_shadow(&plan, stage_dir).await;
             return Err(e);
         }
+        // SHARED tenancy, immediately before the UNTRUSTED restore runs: one last terminate-sweep on
+        // the shadow (belt-and-suspenders to the create-time REVOKE + sweep in `pg_create_shadow`).
+        // At this point no LEGITIMATE session is on the shadow — the restore has not started, and each
+        // prior step (create/lockdown, the non-superuser probe) ran in its own now-closed container —
+        // so this evicts ONLY a sibling tenant that slipped a CONNECT into the (now minimized) create
+        // window. REVOKE blocks new connects; this sweep drops the slipped-in one, so the restore
+        // begins on a shadow with zero foreign sessions. No-op off the Shared path (no sibling).
+        if plan.shared_reprovision.is_some()
+            && let Err(e) = self
+                .pg_run_ddl(
+                    &plan,
+                    &pg_terminate_backends_sql(&plan.shadow_db),
+                    stage_dir,
+                )
+                .await
+        {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
         // Apply the untrusted dump into the shadow AS the ephemeral role, reading the staged member
         // FILE on stdin. `--single-transaction` (in `pg_restore_shadow_invocation`) makes the shadow
         // restore all-or-nothing; stderr is merged so a refused/failed object is diagnosable
@@ -5266,6 +5326,30 @@ impl NodeProjectExport {
         Ok(())
     }
 
+    /// Run SEVERAL trusted DDL/utility statements through the SUPERUSER / maintenance connection in
+    /// ONE psql process (a REPEATED `-c` per statement — see [`psql_script_invocation`]), each in
+    /// its own implicit transaction. Used to keep a sequence that must be GAP-FREE inside a single
+    /// connection/container launch — the SHARED shadow's `CREATE DATABASE` + `REVOKE CONNECT … FROM
+    /// PUBLIC` + terminate-sweep — so no sibling tenant can slip a PUBLIC CONNECT into a
+    /// cross-container gap. `ON_ERROR_STOP=1` aborts the whole run on the first failed statement.
+    async fn pg_run_ddl_script(
+        &self,
+        plan: &PgShadowPlan,
+        statements: &[String],
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = psql_script_invocation(&plan.maint, statements);
+        let (code, out) = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg shadow DDL script exited {code} ({statements:?}): {out}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether a database `name` exists (via the maintenance connection) — so the swap can skip the
     /// rename-aside when cloning into a target that has no live db yet.
     async fn pg_db_exists(
@@ -5310,23 +5394,75 @@ impl NodeProjectExport {
             stage_dir,
         )
         .await?;
-        self.pg_run_ddl(
-            plan,
-            &format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
-            stage_dir,
-        )
-        .await?;
         // SHARED tenancy lockdown: the shadow is a sibling of OTHER tenants' databases on ONE shared
-        // cluster, so strip the default everyone-can-connect grant the MOMENT it exists — closing the
-        // restore-window cross-tenant surface (a sibling tenant's role must never reach the restoring
-        // dump). The ephemeral role OWNS the shadow, so it still connects to apply the dump; this is
-        // the same REVOKE the normal per-tenant provisioning applies, re-granted to the tenant's
-        // roles on the swapped-in db by the post-swap re-provision. No-op for Single/dedicated +
-        // Shared-DEFAULT (`shared_reprovision` is `None`), whose server hosts no sibling tenant.
+        // cluster. A fresh `CREATE DATABASE` grants PUBLIC CONNECT by default, so until it is stripped
+        // a sibling tenant's role can reach the restoring dump — the restore-window cross-tenant
+        // surface. Close it with THREE moves run GAP-FREE in ONE psql process (a repeated `-c` per
+        // statement — each its own txn, so `CREATE DATABASE` is legal):
+        //   1. CREATE DATABASE (OWNED by the ephemeral role, so the apply still connects).
+        //   2. REVOKE CONNECT … FROM PUBLIC — blocks any NEW sibling connect.
+        //   3. a terminate-sweep — evicts a sibling session that connected in the sub-statement
+        //      window before the REVOKE took effect (REVOKE alone does not drop an existing session).
+        // Running these as ONE invocation (not three separate `pg_run_ddl` container spawns) shrinks
+        // the PUBLIC-connectable window from a whole container launch to a few back-to-back statements
+        // on one connection; a second terminate-sweep runs immediately before the untrusted restore
+        // (`pg_sidecar_shadow_restore`) as belt-and-suspenders. This is the same REVOKE the normal
+        // per-tenant provisioning applies, re-granted to the tenant's roles on the swapped-in db by
+        // the post-swap re-provision. No-op for Single/dedicated + Shared-DEFAULT (`shared_reprovision`
+        // is `None`), whose server hosts no sibling tenant.
         if plan.shared_reprovision.is_some() {
+            self.pg_run_ddl_script(
+                plan,
+                &[
+                    format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
+                    format!("REVOKE CONNECT ON DATABASE {shadow_q} FROM PUBLIC"),
+                    pg_terminate_backends_sql(&plan.shadow_db),
+                ],
+                stage_dir,
+            )
+            .await?;
+            // PG≤14 defense-in-depth (cheap extra layer; PG15+ already revokes CREATE on `public`
+            // from PUBLIC by default): make it unconditional so even a hypothetical in-window connect
+            // cannot leave a SURVIVING object in schema `public` (the swap's `REASSIGN OWNED` only
+            // moves eph-role-owned objects — an intruder-owned one would survive the swap). Must run
+            // CONNECTED to the shadow (schema-local). Two statements:
+            //   1. REVOKE CREATE ON SCHEMA public FROM PUBLIC — a gap-intruder cannot create in public.
+            //   2. ALTER SCHEMA public OWNER TO <eph_role> — WHY this is REQUIRED, not optional: on
+            //      PG≤14 the DB-owner does NOT implicitly get CREATE on `public` (that comes only from
+            //      PUBLIC's default grant, which step 1 just removed), so without this the NON-superuser
+            //      restore (and later the tenant owner's migrations) could not create objects in public.
+            //      Making the ephemeral role OWN public restores its CREATE right, and the swap's
+            //      existing `REASSIGN OWNED BY <eph_role> TO <owner>` then transfers `public` (like
+            //      every other eph-owned object) to the tenant owner — so the cloned tenant's owner
+            //      keeps CREATE on public (no PG≤14 regression) while PUBLIC stays locked out.
+            let maint_shadow = PgShadowPlan {
+                maint: plan.maint_on_shadow(),
+                ..plan.clone()
+            };
+            self.pg_run_ddl_script(
+                &maint_shadow,
+                &[
+                    "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string(),
+                    format!("ALTER SCHEMA public OWNER TO {role_q}"),
+                ],
+                stage_dir,
+            )
+            .await?;
+            // TEST-ONLY widener (inert in production — field is 0, its setter does not compile under
+            // `--release`): hold here, with the shadow created but LOCKED DOWN (PUBLIC CONNECT revoked
+            // + swept above), so the cross-tenant live gate can observe the shadow while it exists and
+            // prove a sibling can never CONNECT to it. A plain sleep owning no DB connection; it moves
+            // no statement and changes no DDL.
+            if self.shadow_restore_test_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    self.shadow_restore_test_delay_ms,
+                ))
+                .await;
+            }
+        } else {
             self.pg_run_ddl(
                 plan,
-                &format!("REVOKE CONNECT ON DATABASE {shadow_q} FROM PUBLIC"),
+                &format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
                 stage_dir,
             )
             .await?;
@@ -9026,6 +9162,35 @@ mod tests {
         // EXTERNAL (not managed): applied directly with the operator's own credential, FULL or not.
         assert_eq!(sidecar_pg_apply(false, false), SidecarPgApply::External);
         assert_eq!(sidecar_pg_apply(false, true), SidecarPgApply::External);
+    }
+
+    /// The SHARED-shadow restore-window closer's terminate-sweep SQL composes correctly: it targets
+    /// the shadow by its `datname` (a safely-quoted SQL string LITERAL, not an identifier) and
+    /// EXCLUDES our own backend. A mutation that dropped the `pid <> pg_backend_pid()` self-exclusion
+    /// (self-terminating the maintenance session) or misquoted the db name fails here. This is the
+    /// exact sweep run both in `pg_create_shadow` (batched after the REVOKE) and immediately before
+    /// the untrusted restore in `pg_sidecar_shadow_restore`.
+    #[test]
+    fn terminate_backends_sweep_targets_the_db_literal_and_spares_self() {
+        let sql = pg_terminate_backends_sql("clonesp_fresh__shadow_1700_42");
+        assert!(sql.starts_with("SELECT pg_terminate_backend(pid) FROM pg_stat_activity"));
+        // The db name is a single-quoted STRING LITERAL (datname is text), never an identifier.
+        assert!(
+            sql.contains("datname = 'clonesp_fresh__shadow_1700_42'"),
+            "the shadow db must be matched as a quoted datname literal: {sql}"
+        );
+        // Never evict our own maintenance backend (which runs the sweep).
+        assert!(
+            sql.contains("pid <> pg_backend_pid()"),
+            "the sweep must spare the running backend: {sql}"
+        );
+        // A db name bearing a quote is doubled (defensive — the name is driver-derived, not attacker
+        // input, but the literal quoting must be correct regardless).
+        let tricky = pg_terminate_backends_sql("od'd");
+        assert!(
+            tricky.contains("datname = 'od''d'"),
+            "embedded quote doubled: {tricky}"
+        );
     }
 
     /// Driver-level (in-process, no Docker): a `--data-only` export must NOT stage the
