@@ -219,6 +219,74 @@ fn is_managed_binding(cfg: &ExternalDatabaseConfig) -> bool {
     cfg.compute.as_deref().is_some_and(|c| !c.is_empty())
 }
 
+/// The sealed-credential KV keys that THIS node's own managed-DB self-provisioning
+/// (`ensure_target_db_provisioned` → [`crate::tenant_sql::provision_tenant`], run during a clone's
+/// member restore) mints for the tenant `(project, "")` across `databases`.
+///
+/// Re-derived the SAME way `provision_tenant` seals them (via [`crate::tenant_sql::tenant_key`] +
+/// [`crate::tenant_sql::tenant_names`] + the credential-key helpers) — the established "re-derive the
+/// tenant's names rather than guess" pattern in this crate — so the set can never drift from what a
+/// fresh provision actually writes. It is the `--fresh` identity drop's keep-set: those creds are
+/// locally minted + sealed under THIS node's KEK and the live roles/containers already authenticate
+/// with them, so the drop must NOT delete them (dropping one desyncs the sealed credential from the
+/// live role → the cloned tenant's own role can no longer connect). Every other `managed-sql-cred`
+/// key under the project is source-carried (a `--include-identity` KV member) and IS dropped.
+///
+/// Mirrors `provision_tenant`'s scope rules: a site-scoped binding is skipped (the clone
+/// self-provision refuses it, so it mints nothing); a Shared DEFAULT tenant mints nothing (the
+/// superuser is the app user); a Shared non-default tenant mints the login + owner creds; a Single
+/// tenant mints its workload cred (under its own `(cred_project, workload)`).
+fn self_provisioned_managed_cred_keys(
+    databases: &std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+    project: &str,
+) -> std::collections::BTreeSet<String> {
+    use crate::config::{TenantIsolation, TenantScope};
+    use crate::tenant_sql::{
+        credential_workload_key, owner_credential_workload_key, single_credential_project,
+        tenant_key, tenant_names,
+    };
+    // The KV key layout `ManagedSqlCredentials` seals under (kept in lockstep with
+    // `ManagedSqlCredentials::key`, which is private, and with the `managed-sql-cred/{project}/`
+    // prefix in `sealed_secret_prefixes`).
+    let cred_key = |project: &str, workload: &str| format!("managed-sql-cred/{project}/{workload}");
+
+    let mut keys = std::collections::BTreeSet::new();
+    for cfg in databases.values() {
+        let Some(compute) = cfg.compute.as_deref().filter(|c| !c.is_empty()) else {
+            continue; // bring-your-own url_env binding — not ours to provision.
+        };
+        if ExternalSqlKind::parse(&cfg.kind).is_none() {
+            continue; // config validation rejects this before serve.
+        }
+        // The clone self-provision only provisions a project-scoped binding (a site-scoped one is
+        // skipped by `ensure_target_db_provisioned`), so only that mints a credential.
+        if matches!(cfg.tenant_scope, TenantScope::Site) {
+            continue;
+        }
+        let database = cfg.database.as_deref().unwrap_or_default();
+        let (tenant_ident_raw, is_default) = tenant_key(cfg.tenant_scope, project, "");
+        let names = tenant_names(cfg.tenant, compute, database, &tenant_ident_raw, is_default);
+        match cfg.tenant {
+            TenantIsolation::Single => {
+                let cred_project = single_credential_project(project, is_default);
+                keys.insert(cred_key(&cred_project, &names.workload));
+            }
+            TenantIsolation::Shared => {
+                if is_default {
+                    continue; // the default shared tenant is the plain install — mints nothing.
+                }
+                let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+                keys.insert(cred_key(project, &credential_workload_key(compute, &ident)));
+                keys.insert(cred_key(
+                    project,
+                    &owner_credential_workload_key(compute, &ident),
+                ));
+            }
+        }
+    }
+    keys
+}
+
 /// How a SIDECAR (non-chunked) pg dump member must be applied on import — the narrowed post-HIGH-1
 /// policy (the untrusted dump must never reach the bootstrap superuser). A pure (managed × data_only)
 /// decision, factored out so the narrowing is unit-testable without a live backend.
@@ -2915,16 +2983,36 @@ impl ProjectExport for NodeProjectExport {
         if matches!(opts.identity, IdentityChoice::Fresh) && !data_only && opts.apply {
             let prefixes =
                 boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
+            // The managed-SQL credential prefix needs special handling. This import's OWN managed-DB
+            // self-provisioning (`ensure_target_db_provisioned` → `provision_tenant`, run during
+            // member restore) MINTS the target tenant's login/owner (Shared) or workload (Single)
+            // credential under `managed-sql-cred/{project}/…`, sealed under THIS node's KEK, and
+            // sets the live role's password (or inits the container) to exactly it. Dropping one of
+            // THOSE would desync the sealed credential from the live role: the next
+            // `creds.password(...)` would mint a fresh random value that no longer authenticates the
+            // role (psql exit 2 — "password authentication failed", not "permission denied"), so the
+            // cloned tenant's own runtime/owner role could never connect. So keep exactly the keys
+            // this target's own self-provisioning owns (re-derived the same way `provision_tenant`
+            // seals them) and drop every OTHER managed cred under the prefix — a source-carried one
+            // (restored via a `--include-identity` KV member) is un-unsealable here and must go.
+            let managed_cred_prefix = format!("managed-sql-cred/{project}/");
+            let keep_managed = self_provisioned_managed_cred_keys(&self.databases, project);
             let mut dropped = 0usize;
+            let mut kept_minted = 0usize;
             for prefix in &prefixes {
                 for key in self.kv.list_prefix(prefix).await.map_err(other)? {
+                    if prefix == &managed_cred_prefix && keep_managed.contains(&key) {
+                        kept_minted += 1;
+                        continue;
+                    }
                     self.kv.delete_checkpointed(&key).await.map_err(other)?;
                     dropped += 1;
                 }
             }
             report.notes.push(format!(
-                "identity: --fresh dropped {dropped} source-sealed secret key(s); re-provision \
-                 secrets + the managed-DB credential on the target"
+                "identity: --fresh dropped {dropped} source-sealed secret key(s); kept \
+                 {kept_minted} self-provisioned managed-DB credential(s) (they match the cloned \
+                 tenant's live roles); re-provision application secrets on the target"
             ));
         }
 
@@ -8700,6 +8788,93 @@ mod tests {
         assert!(!capture_entry_shielded(0, ttl + 1, now, ttl)); // old file → stale
         // A future/garbled created_at never under-ages into staleness (saturating_sub → 0 → shielded).
         assert!(capture_entry_shielded(now + 5, 0, now, ttl));
+    }
+
+    /// The `--fresh` drop's keep-set: `self_provisioned_managed_cred_keys` must name EXACTLY the
+    /// managed-SQL credential keys this node's own self-provisioning mints for `(project, "")` — so
+    /// the drop keeps the freshly cloned tenant's live-matching creds and drops only source-carried
+    /// ones. Regression for the clone live gate's 4th issue (fresh tenant's own role could not
+    /// connect because the drop wiped its just-minted credential).
+    #[test]
+    fn self_provisioned_managed_cred_keys_names_only_this_tenants_own_creds() {
+        use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+        use boatramp_core::project::DEFAULT_PROJECT;
+        use std::collections::BTreeMap;
+
+        let binding = |tenant, scope| ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("appdb".into()),
+            user: Some("postgres".into()),
+            tenant,
+            tenant_scope: scope,
+            ..Default::default()
+        };
+
+        // Shared, project-scoped, NON-default tenant → the login + owner creds (both under the
+        // project, the owner one carrying the `/owner` suffix) — and NOTHING else.
+        let shared = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Shared, TenantScope::Project),
+        )]);
+        let keys = self_provisioned_managed_cred_keys(&shared, "acme");
+        assert_eq!(
+            keys.len(),
+            2,
+            "shared non-default mints login + owner: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with("managed-sql-cred/acme/pg/")),
+            "keys are scoped to the project + compute: {keys:?}"
+        );
+        assert_eq!(
+            keys.iter().filter(|k| k.ends_with("/owner")).count(),
+            1,
+            "exactly one owner-role credential: {keys:?}"
+        );
+
+        // No managed bindings → NOTHING is self-provisioned, so a source-carried managed cred
+        // restored under this project IS dropped (the `adopt_..._fresh_drops_source_secrets` path).
+        assert!(
+            self_provisioned_managed_cred_keys(&BTreeMap::new(), "acme").is_empty(),
+            "no bindings → empty keep-set"
+        );
+
+        // A SITE-scoped binding is skipped by the clone self-provision, so it mints nothing.
+        let site = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Shared, TenantScope::Site),
+        )]);
+        assert!(
+            self_provisioned_managed_cred_keys(&site, "acme").is_empty(),
+            "site-scoped binding mints nothing"
+        );
+
+        // The reserved DEFAULT project (shared) is the plain install — the superuser is the app
+        // user, so no per-tenant cred is minted.
+        assert!(
+            self_provisioned_managed_cred_keys(&shared, DEFAULT_PROJECT).is_empty(),
+            "the default shared tenant mints nothing"
+        );
+
+        // Single, project-scoped → ONE workload credential (no `/owner` role — the container is the
+        // isolation), keyed under the tenant's project.
+        let single = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Single, TenantScope::Project),
+        )]);
+        let keys = self_provisioned_managed_cred_keys(&single, "acme");
+        assert_eq!(
+            keys.len(),
+            1,
+            "single mints exactly one workload cred: {keys:?}"
+        );
+        let k = keys.iter().next().unwrap();
+        assert!(
+            k.starts_with("managed-sql-cred/acme/pg-") && !k.ends_with("/owner"),
+            "single's cred is the per-tenant workload, not an owner role: {k}"
+        );
     }
 
     /// Drive the streaming export into an in-memory buffer (the v2 bundle bytes) — the
