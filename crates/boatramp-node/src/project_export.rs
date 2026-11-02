@@ -684,10 +684,11 @@ impl NodeProjectExport {
     /// `pg_create_shadow` — AFTER the shadow is created AND locked down (PUBLIC CONNECT revoked +
     /// a terminate-sweep) — before the restore proceeds. Lets the cross-tenant live gate
     /// (`project_export_clone_self_provisions_a_fresh_shared_tenant_live`) observe the shadow while
-    /// it exists and prove a sibling tenant can never CONNECT to it. Gated to debug builds so it
-    /// cannot be reached from a release binary; production leaves the field `0` (inert). It widens
-    /// only the window — it changes no DDL, no statement order, and holds no DB connection.
-    #[cfg(debug_assertions)]
+    /// it exists and prove a sibling tenant can never CONNECT to it. Inert by default — the field
+    /// stays `0` unless a test sets it, so a release binary (which never calls this setter) runs
+    /// with no added delay. It widens only the window — it changes no DDL, no statement order, and
+    /// holds no DB connection. NOT `cfg(debug_assertions)`-gated: the integration test links the
+    /// library as built in CI (a non-debug profile), where that gate would hide the setter → E0599.
     #[must_use]
     pub fn with_shadow_restore_test_delay_ms(mut self, ms: u64) -> Self {
         self.shadow_restore_test_delay_ms = ms;
