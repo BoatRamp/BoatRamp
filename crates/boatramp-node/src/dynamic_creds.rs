@@ -85,7 +85,7 @@ pub struct DynamicDbCredential {
 /// Hand-written `Debug` that REDACTS the cleartext password, matching the codebase
 /// convention (`boatramp_core::registry_auth::RegistryCredential`,
 /// `managed_db_declare`'s error redaction). A `{:?}` of this struct — in a log line, a
-/// `tracing` field, an `anyhow` chain — must never surface the sealed login secret.
+/// `tracing` field, a boxed error chain — must never surface the sealed login secret.
 impl std::fmt::Debug for DynamicDbCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamicDbCredential")
