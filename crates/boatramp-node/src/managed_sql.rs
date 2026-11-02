@@ -86,9 +86,39 @@ impl ManagedSqlCredentials {
         Self { kv, envelope }
     }
 
+    /// The shared key prefix every sealed managed-SQL credential lives under. Also the
+    /// scan prefix the orphan sweep enumerates (see [`list_cred_keys`](Self::list_cred_keys)).
+    pub(crate) const CRED_PREFIX: &'static str = "managed-sql-cred/";
+
     /// KV key holding a workload's sealed password.
     fn key(project: &str, workload: &str) -> String {
-        format!("managed-sql-cred/{project}/{workload}")
+        format!("{}{project}/{workload}", Self::CRED_PREFIX)
+    }
+
+    /// Borrow the underlying KV + envelope — so a caller holding only a
+    /// [`ManagedSqlCredentials`] (the managed-DB resolver) can drive the free dynamic-cred
+    /// functions ([`revoke_dynamic_role`](crate::dynamic_creds::revoke_dynamic_role)), which
+    /// take the handles directly, without a second copy being threaded in.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub(crate) fn kv(&self) -> &Arc<dyn KvStore> {
+        &self.kv
+    }
+
+    /// See [`kv`](Self::kv).
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub(crate) fn envelope(&self) -> &Arc<dyn KeyEnvelope> {
+        &self.envelope
+    }
+
+    /// Every sealed-credential KEY under the managed-SQL prefix (names only, values never
+    /// unsealed). The orphan-cred sweep reads this and filters to the per-replica DYNAMIC
+    /// keys with [`parse_dynamic_cred_key`](crate::dynamic_creds::parse_dynamic_cred_key).
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub(crate) async fn list_cred_keys(&self) -> Result<Vec<String>, String> {
+        self.kv
+            .list_prefix(Self::CRED_PREFIX)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// The stable password for managed DB `workload` in `project`: unsealed from the
@@ -593,6 +623,121 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                 Ok(())
             }
         }
+    }
+
+    async fn sweep_orphan_dynamic_db_creds(
+        &self,
+        live_instance_ids: &std::collections::HashSet<String>,
+        dry_run: bool,
+    ) -> Result<Vec<boatramp_core::compute::SweptDynamicCred>, String> {
+        use crate::dynamic_creds::{parse_dynamic_cred_key, revoke_dynamic_role};
+        use boatramp_core::compute::SweptDynamicCred;
+
+        let mut out = Vec::new();
+        for key in self.creds.list_cred_keys().await? {
+            // Filter to the per-replica DYNAMIC keys; a runtime/owner/superuser credential
+            // (a persistent identity) never parses here, so the sweep can never touch one.
+            let Some(parsed) = parse_dynamic_cred_key(&key) else {
+                continue;
+            };
+            // Tenant-correctness: KEEP the cred while its owning replica still has a persisted
+            // record (Running or parked — any phase). Only a cred whose replica is entirely
+            // gone is an orphan. The `instance_id` encodes (project, workload, replica), and
+            // the reaper's live set spans the whole cluster, so a replica live on another node
+            // protects its cred too.
+            if live_instance_ids.contains(&parsed.instance_id) {
+                continue;
+            }
+            // Rebuild the binding shape (kind / user / database / isolation) for this
+            // (consumer_project, compute). A dynamic cred is only ever minted for a Shared,
+            // project-scoped, compute-backed binding; resolve the spec + synthesize that
+            // binding so `revoke_dynamic_role` re-derives the SAME role/owner/db names the mint
+            // used. A binding that no longer resolves (config removed) is left fail-closed — a
+            // removed binding's own teardown owns its credential cleanup, and we must not drop a
+            // key whose shape/tenant we can't prove.
+            let Some(spec) = self
+                .resolve_spec(&parsed.consumer_project, &parsed.compute)
+                .await
+            else {
+                tracing::debug!(
+                    key = %key,
+                    "dynamic-cred sweep: no binding resolves for this key — left untouched"
+                );
+                continue;
+            };
+            // Only Shared bindings carry the owner-role model phase 2 builds on; a non-Shared
+            // spec means this isn't a key we own (defensive — such a key can't be minted).
+            if spec.tenant != crate::config::TenantIsolation::Shared {
+                continue;
+            }
+            let role = boatramp_storage::tenant_provision::dynamic_role_name(
+                &parsed.compute,
+                &parsed.tenant_ident,
+                &parsed.instance_id,
+            );
+            if dry_run {
+                out.push(SweptDynamicCred {
+                    project: parsed.consumer_project,
+                    compute: parsed.compute,
+                    instance_id: parsed.instance_id,
+                    role,
+                    dropped: false,
+                });
+                continue;
+            }
+            let binding = synth_shared_binding(&spec, &parsed.compute);
+            revoke_dynamic_role(
+                &self.deploy,
+                self.creds.kv(),
+                self.creds.envelope(),
+                &binding,
+                &parsed.consumer_project,
+                &parsed.instance_id,
+            )
+            .await?;
+            tracing::warn!(
+                project = %parsed.consumer_project,
+                compute = %parsed.compute,
+                instance = %parsed.instance_id,
+                role = %role,
+                "dynamic-cred sweep: REVOKED an orphaned dynamic DB credential (no live replica)"
+            );
+            out.push(SweptDynamicCred {
+                project: parsed.consumer_project,
+                compute: parsed.compute,
+                instance_id: parsed.instance_id,
+                role,
+                dropped: true,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Synthesize the minimal [`ExternalDatabaseConfig`](crate::config::ExternalDatabaseConfig)
+/// the dynamic-cred lifecycle derives its target from, for a resolved Shared managed-DB
+/// `spec` on `compute`. The sweep holds only the reduced [`ManagedDbSpec`] (kind/db/user/
+/// isolation) + the `compute` segment from the key, but `revoke_dynamic_role` takes the full
+/// binding so it re-derives the owner/role/database names through the SAME path the mint used.
+/// Only the fields `resolve_target` reads are set; a dynamic cred is only ever minted for a
+/// Shared, project-scoped binding, so those two are fixed.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn synth_shared_binding(
+    spec: &ManagedDbSpec,
+    compute: &str,
+) -> crate::config::ExternalDatabaseConfig {
+    crate::config::ExternalDatabaseConfig {
+        kind: match spec.kind {
+            ExternalSqlKind::Postgres => "postgres",
+            ExternalSqlKind::Mysql => "mysql",
+        }
+        .to_string(),
+        compute: Some(compute.to_string()),
+        database: Some(spec.database.clone()),
+        user: Some(spec.user.clone()),
+        tenant: crate::config::TenantIsolation::Shared,
+        tenant_scope: crate::config::TenantScope::Project,
+        ..crate::config::ExternalDatabaseConfig::default()
     }
 }
 
@@ -3027,6 +3172,89 @@ mod tests {
             .set_compute_workload(boatramp_core::project::ProjectRef::new(project), &wl)
             .await
             .expect("register workload");
+    }
+
+    /// Security HIGH-1: the orphan dynamic-cred sweep DROPS a sealed dynamic credential whose
+    /// owning replica is gone (not in the live set) and LEAVES one whose replica is still live
+    /// — tenant-correct selection, exercised in dry-run (which identifies the orphans without
+    /// touching the live DB). The actual revoke DDL + KV delete are proved by the lighthouse
+    /// live gate + `drop_dynamic_role_ddl` unit tests.
+    #[tokio::test]
+    async fn dynamic_cred_sweep_selects_orphans_and_spares_live_replicas() {
+        use crate::dynamic_creds::dynamic_cred_workload_key;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+
+        // Seal two per-replica dynamic-cred keys for tenant `acme` on the shared `pg` server:
+        // replica -0 (its owning replica is GONE) and -1 (still live).
+        let seed = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
+        for inst in ["acme-web-0", "acme-web-1"] {
+            seed.password("acme", &dynamic_cred_workload_key("pg", "acme", inst))
+                .await
+                .unwrap();
+        }
+        // A non-dynamic persistent credential (the shared superuser) must be ignored entirely.
+        seed.password("default", "pg").await.unwrap();
+
+        // A Shared, project-scoped managed binding on compute `pg`, so `resolve_spec` resolves
+        // the owner-role model the sweep rebuilds the revoke target from.
+        let mut binding = db("postgres", Some("pg"), "", None);
+        binding.tenant = crate::config::TenantIsolation::Shared;
+        binding.tenant_scope = crate::config::TenantScope::Project;
+        let mut dbs = BTreeMap::new();
+        dbs.insert("app".to_string(), binding);
+
+        let env = ManagedDbEnv::from_config(
+            &dbs,
+            ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope)),
+            ManagedDbPrivilege::default(),
+            deploy,
+        );
+
+        // Live set holds only replica -1 → only -0 is an orphan.
+        let live: std::collections::HashSet<String> =
+            ["acme-web-1".to_string()].into_iter().collect();
+        let swept = env
+            .sweep_orphan_dynamic_db_creds(&live, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            swept.len(),
+            1,
+            "exactly the one orphan is selected: {swept:?}"
+        );
+        assert_eq!(swept[0].instance_id, "acme-web-0");
+        assert_eq!(swept[0].project, "acme");
+        assert_eq!(swept[0].compute, "pg");
+        assert!(!swept[0].dropped, "dry-run identifies but does not drop");
+        assert!(
+            !swept[0].role.is_empty() && swept[0].role.len() <= 32,
+            "the dropped role name is derived + bounded: {}",
+            swept[0].role
+        );
+
+        // With BOTH replicas live, nothing is swept (a cred with a live replica is left).
+        let both: std::collections::HashSet<String> =
+            ["acme-web-0".to_string(), "acme-web-1".to_string()]
+                .into_iter()
+                .collect();
+        assert!(
+            env.sweep_orphan_dynamic_db_creds(&both, true)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no cred is swept while its owning replica is live"
+        );
+
+        // With NEITHER live, both dynamic creds are orphans — and the superuser key is never
+        // mistaken for one.
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let all = env
+            .sweep_orphan_dynamic_db_creds(&none, true)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "both dynamic creds are orphans: {all:?}");
     }
 
     #[tokio::test]

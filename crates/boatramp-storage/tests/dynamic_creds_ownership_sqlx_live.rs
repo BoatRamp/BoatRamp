@@ -11,6 +11,9 @@
 //! 1. **Ownership transfer** — a per-replica dynamic role, minted as a member of the stable
 //!    owner + `ALTER ROLE … SET role = '<owner>'`, creates a table (its serial sequence, an
 //!    index) owned by the STABLE OWNER, not the dynamic role; the dynamic role owns NOTHING.
+//!    1b. **NOINHERIT escape closure (MEDIUM-1)** — the same role, dropped to its RAW identity
+//!    with `SET ROLE NONE`, CANNOT create an owner-orphan (no direct grant, no inherited one),
+//!    while the operate-as-owner happy path keeps working.
 //! 2. **Clean drop** — [`drop_dynamic_role_ddl`] (`REASSIGN OWNED … TO <owner>` → `DROP
 //!    OWNED` → `DROP ROLE`) drops the dynamic role cleanly, and the drop clears its
 //!    database-level `CONNECT` grant too.
@@ -174,6 +177,37 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
         .await,
         "0",
         "the dynamic role must own NOTHING"
+    );
+
+    // STEP 1b (Security MEDIUM-1): NOINHERIT structurally closes the `SET ROLE NONE` escape.
+    // The happy path above (operate AS owner) is UNAFFECTED — owner authority flows through
+    // the `SET role` GUC, not inheritance. But a dynamic role that drops back to its RAW
+    // identity with `SET ROLE NONE` must NOT be able to create an owner-orphan object: it has
+    // no direct CREATE grant on schema public, and NOINHERIT means it inherits none from the
+    // owner. (Contrast STEP 4, which first GRANTs CREATE directly to materialize the hazard.)
+    {
+        let mut tx = dyn1.begin().await.unwrap();
+        tx.execute("SET ROLE NONE", &[]).await.unwrap();
+        let denied = tx
+            .execute("CREATE TABLE noinherit_should_fail (id int)", &[])
+            .await;
+        assert!(
+            denied.is_err(),
+            "NOINHERIT must deny a raw (post-SET ROLE NONE) create with no direct grant — \
+             the owner-orphan escape is closed structurally, not merely cleaned up after"
+        );
+        // The failed statement aborts the tx; roll back so nothing persists.
+        let _ = tx.rollback().await;
+    }
+    // And the happy path still works right after: a fresh owner-authority create succeeds and
+    // is owner-owned (NOINHERIT did not disturb operate-as-owner).
+    dyn1.run_script("CREATE TABLE t1b (id int)")
+        .await
+        .expect("operate-as-owner create must still work under NOINHERIT");
+    assert_eq!(
+        probe(&su_tenant, &owned_by("t1b", OWNER)).await,
+        "true",
+        "operate-as-owner object stays owner-owned under NOINHERIT"
     );
 
     // =====================================================================

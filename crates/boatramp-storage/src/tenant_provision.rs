@@ -311,12 +311,38 @@ pub fn quote_ident(kind: ExternalSqlKind, id: &str) -> String {
     }
 }
 
-/// Quote a SQL **string literal** (single-quoted, doubling any embedded `'`).
+/// Quote a SQL **string literal**, doubling any embedded `'` AND making it
+/// **backslash-safe** per engine.
 ///
-/// Used for the password and for the role-name literal in Postgres's
-/// `pg_roles` existence check. Same single-quote convention on both engines.
-fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+/// Used for passwords (minted hex, but also a BYO operator secret via
+/// [`ensure_login_role_ddl`]) and for the role-name literal in Postgres's `pg_roles`
+/// existence check. A doubled `'` alone is NOT enough on every engine: MySQL (default
+/// `sql_mode`) treats `\` as an escape *inside* a `'…'` literal, so a value ending in a
+/// lone backslash (`p\`) would turn our closing quote into an escaped one and break out —
+/// an injection vector for any non-hex literal. We therefore quote defensively for both:
+///
+/// * **MySQL** — double both `\` → `\\` and `'` → `''` inside a plain `'…'` literal.
+/// * **Postgres** — with `standard_conforming_strings` (the default) a backslash is an
+///   ordinary character, so a backslash-FREE literal (every minted/hex/sanitized value)
+///   keeps the exact plain `'…'` form it always had (no behavior change, no corruption).
+///   A literal that *does* carry a backslash (only a BYO secret can) is emitted as an
+///   `E'…'` escape string doubling both `\` and `'`, so it is interpreted deterministically
+///   even on a server with `standard_conforming_strings` off.
+///
+/// Replace `\` before `'` so neither pass can reintroduce the other's metacharacter.
+fn quote_literal(kind: ExternalSqlKind, s: &str) -> String {
+    match kind {
+        ExternalSqlKind::Mysql => {
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+        }
+        ExternalSqlKind::Postgres => {
+            if s.contains('\\') {
+                format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+            } else {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+        }
+    }
 }
 
 /// For MySQL, a user is `'name'@'host'`. We always scope to `@'%'` (any host);
@@ -324,7 +350,7 @@ fn quote_literal(s: &str) -> String {
 /// reachable). The name goes through [`quote_literal`] (single-quoted) because
 /// MySQL account names are string-literal-quoted, not identifier-quoted.
 fn mysql_user(role: &str) -> String {
-    format!("{}@'%'", quote_literal(role))
+    format!("{}@'%'", quote_literal(ExternalSqlKind::Mysql, role))
 }
 
 /// Ordered, **idempotent** DDL to create a tenant's isolated database + login
@@ -369,14 +395,14 @@ pub fn provision_ddl(
 ) -> Vec<String> {
     let db_id = quote_ident(kind, db);
     let role_id = quote_ident(kind, role);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
 
     match kind {
         ExternalSqlKind::Postgres => {
-            let role_lit = quote_literal(role);
+            let role_lit = quote_literal(kind, role);
             let owner_id = quote_ident(kind, owner_role);
-            let owner_lit = quote_literal(owner_role);
-            let owner_pw_lit = quote_literal(owner_password);
+            let owner_lit = quote_literal(kind, owner_role);
+            let owner_pw_lit = quote_literal(kind, owner_password);
             vec![
                 // 1. Idempotent runtime-role create (CREATE ROLE has no IF NOT EXISTS).
                 format!(
@@ -459,10 +485,10 @@ pub fn ensure_login_role_ddl(
 ) -> Vec<String> {
     let role_id = quote_ident(kind, role);
     let db_id = quote_ident(kind, database);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
     match kind {
         ExternalSqlKind::Postgres => {
-            let role_lit = quote_literal(role);
+            let role_lit = quote_literal(kind, role);
             vec![
                 format!(
                     "DO $$ BEGIN \
@@ -649,7 +675,7 @@ pub fn soft_deprovision_ddl(db: &str, renamed: &str, role: &str) -> Vec<String> 
     let db_id = quote_ident(kind, db);
     let renamed_id = quote_ident(kind, renamed);
     let role_id = quote_ident(kind, role);
-    let db_lit = quote_literal(db);
+    let db_lit = quote_literal(kind, db);
     vec![
         // 1. Evict live sessions so the RENAME can take the lock.
         format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {db_lit};"),
@@ -688,7 +714,7 @@ pub fn recover_soft_deprovision_ddl(renamed: &str, original: &str, role: &str) -
 ///   `FLUSH PRIVILEGES;`.
 pub fn rotate_ddl(kind: ExternalSqlKind, role: &str, password: &str) -> Vec<String> {
     let role_id = quote_ident(kind, role);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
     match kind {
         ExternalSqlKind::Postgres => {
             vec![format!(
@@ -727,7 +753,13 @@ pub fn rotate_ddl(kind: ExternalSqlKind, role: &str, password: &str) -> Vec<Stri
 // DB-provision time by [`provision_ddl`], owning the database + its schema, NEVER dropped
 // — stays the one true owner. The per-replica dynamic role is minted as a **member of the
 // owner role** and configured to **operate AS the owner** on every session via the `role`
-// GUC (`ALTER ROLE <dyn> SET role = '<owner>'`). The verified consequences:
+// GUC (`ALTER ROLE <dyn> SET role = '<owner>'`). It is also minted **NOINHERIT** (Security
+// MEDIUM-1): membership alone grants it NOTHING automatically — all owner-level authority
+// flows through the explicit `SET role` GUC, which is unaffected by INHERIT. So an app that
+// does `SET ROLE NONE` / `RESET ROLE` drops back to a raw role with no direct grants on the
+// owner's schema and cannot create an owner-orphan object — the escape is closed
+// structurally, not merely cleaned up after by the drop-time `REASSIGN OWNED` safety net.
+// The verified consequences:
 //
 // - Anything the dynamic role creates (`CREATE TABLE`, the backing `serial` sequence, an
 //   index, …) is owned by the STABLE OWNER, so the dynamic role **owns nothing**.
@@ -792,10 +824,13 @@ pub fn dynamic_role_name(base: &str, tenant_ident: &str, instance_id: &str) -> S
 /// Every statement here is cluster-global or touches a shared object (the database-level
 /// `CONNECT`), so none needs a connection to `db` itself:
 /// 1. Idempotent `CREATE ROLE <dyn> LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS
-///    NOREPLICATION PASSWORD …` (via `DO $$ … pg_roles … $$`), tolerating a crash-relaunch
-///    where the prior stop's drop did not run.
-/// 2. `ALTER ROLE <dyn> WITH LOGIN … PASSWORD …` — re-assert the locked-down attributes +
-///    resync the fresh password.
+///    NOREPLICATION NOINHERIT PASSWORD …` (via `DO $$ … pg_roles … $$`), tolerating a
+///    crash-relaunch where the prior stop's drop did not run. `NOINHERIT` means the role
+///    does not automatically wield the owner's privileges by membership — its owner-level
+///    access comes solely from the `SET role` GUC (step 4), so `SET ROLE NONE`/`RESET ROLE`
+///    back to the raw role leaves it unable to create an owner-orphan object.
+/// 2. `ALTER ROLE <dyn> WITH LOGIN … NOINHERIT PASSWORD …` — re-assert the locked-down
+///    attributes + resync the fresh password.
 /// 3. `GRANT <owner> TO <dyn>` — membership, so `<dyn>` may operate as `<owner>` (PG16's
 ///    default grant carries `SET TRUE`, permitting the session-start `SET ROLE`).
 /// 4. `ALTER ROLE <dyn> SET role = '<owner>'` — every `<dyn>` session starts AS `<owner>`,
@@ -817,26 +852,33 @@ pub fn mint_dynamic_role_ddl(
 ) -> Vec<String> {
     let db_id = quote_ident(kind, db);
     let dyn_id = quote_ident(kind, dyn_role);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
     match kind {
         ExternalSqlKind::Postgres => {
-            let dyn_lit = quote_literal(dyn_role);
+            let dyn_lit = quote_literal(kind, dyn_role);
             let owner_id = quote_ident(kind, owner_role);
             // The `role` GUC value is emitted as a single-quoted string literal of the owner
             // role name (verified: literal / bare / double-quoted all resolve; the literal is
             // the safest + matches this module's `pg_roles` role-name-literal convention).
-            let owner_lit = quote_literal(owner_role);
+            let owner_lit = quote_literal(kind, owner_role);
             vec![
                 // 1. Idempotent, locked-down create (tolerates a crash-relaunch leftover).
+                // NOINHERIT (Security MEDIUM-1): the dynamic role must NOT automatically wield
+                // the stable owner's privileges by mere membership. Its owner-level authority
+                // comes ONLY from the explicit `SET role = '<owner>'` GUC applied at connect
+                // (step 4) — which works regardless of INHERIT — so the happy path is
+                // unaffected, while `SET ROLE NONE` / `RESET ROLE` back to the raw dynamic role
+                // now leaves it with NO inherited CREATE on the owner's schema, structurally
+                // closing the escape that could otherwise create an owner-orphan object.
                 format!(
                     "DO $$ BEGIN \
                      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {dyn_lit}) THEN \
-                     CREATE ROLE {dyn_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit}; \
+                     CREATE ROLE {dyn_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD {pw_lit}; \
                      END IF; END $$;"
                 ),
-                // 2. Re-assert the safe attributes + resync the fresh password.
+                // 2. Re-assert the safe attributes (incl. NOINHERIT) + resync the fresh password.
                 format!(
-                    "ALTER ROLE {dyn_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {pw_lit};"
+                    "ALTER ROLE {dyn_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD {pw_lit};"
                 ),
                 // 3. Membership so the dynamic role may SET ROLE to the stable owner.
                 format!("GRANT {owner_id} TO {dyn_id};"),
@@ -1458,17 +1500,43 @@ mod tests {
         assert_eq!(quote_ident(ExternalSqlKind::Mysql, "plain"), "`plain`");
     }
 
-    /// Literal quoting doubles the embedded single quote and wraps.
+    /// Literal quoting doubles the embedded single quote and wraps. Backslash-free
+    /// literals (every minted/hex value) keep the identical plain `'…'` form on both
+    /// engines (no behavior change).
     #[test]
     fn quote_literal_doubles_embedded_quote() {
-        assert_eq!(quote_literal("O'Brien"), "'O''Brien'");
-        assert_eq!(quote_literal("hex_pw"), "'hex_pw'");
-        // The classic injection payload is neutralized (the closing quote is
-        // doubled, so it stays inside the literal).
+        for k in [ExternalSqlKind::Postgres, ExternalSqlKind::Mysql] {
+            assert_eq!(quote_literal(k, "O'Brien"), "'O''Brien'");
+            assert_eq!(quote_literal(k, "hex_pw"), "'hex_pw'");
+            // The classic injection payload is neutralized (the closing quote is
+            // doubled, so it stays inside the literal).
+            assert_eq!(
+                quote_literal(k, "'; DROP TABLE users; --"),
+                "'''; DROP TABLE users; --'"
+            );
+        }
+    }
+
+    /// LOW-2: a backslash in a literal is made engine-safe so it can't escape the closing
+    /// quote on MySQL (where `\` is a string escape by default). MySQL doubles the backslash
+    /// inside a plain literal; Postgres switches to an `E'…'` escape string (doubling both),
+    /// so the value is interpreted deterministically regardless of `standard_conforming_strings`.
+    #[test]
+    fn quote_literal_is_backslash_safe_per_engine() {
+        // A value ending in a lone backslash — the MySQL break-out shape.
+        assert_eq!(quote_literal(ExternalSqlKind::Mysql, "p\\"), "'p\\\\'");
+        assert_eq!(quote_literal(ExternalSqlKind::Postgres, "p\\"), "E'p\\\\'");
+        // Backslash + quote together: both are doubled, nothing escapes.
+        assert_eq!(quote_literal(ExternalSqlKind::Mysql, "a\\'b"), "'a\\\\''b'");
         assert_eq!(
-            quote_literal("'; DROP TABLE users; --"),
-            "'''; DROP TABLE users; --'"
+            quote_literal(ExternalSqlKind::Postgres, "a\\'b"),
+            "E'a\\\\''b'"
         );
+        // The adversarial MySQL break-out `\'; DROP ...` stays inside its literal (the
+        // leading backslash is doubled, so the following quote is still a doubled data quote).
+        let evil = "\\'; DROP TABLE users; --";
+        let my = quote_literal(ExternalSqlKind::Mysql, evil);
+        assert!(my.starts_with("'\\\\''") && my.ends_with('\''));
     }
 
     // ---- provision_ddl ---------------------------------------------------
@@ -1787,6 +1855,21 @@ mod tests {
             joined.contains("NOBYPASSRLS"),
             "dynamic role must not bypass RLS"
         );
+        // MEDIUM-1: NOINHERIT on BOTH the create and the re-assert, so membership alone grants
+        // the dynamic role nothing — owner authority flows only through the SET role GUC, and
+        // `SET ROLE NONE` cannot create an owner-orphan. Present on the create AND the ALTER.
+        assert!(
+            joined.contains(
+                "CREATE ROLE \"appdb_acme_d_acme_web_0\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD"
+            ),
+            "the dynamic role must be minted NOINHERIT:\n{joined}"
+        );
+        assert!(
+            joined.contains(
+                "ALTER ROLE \"appdb_acme_d_acme_web_0\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD"
+            ),
+            "the re-assert must also carry NOINHERIT:\n{joined}"
+        );
         assert!(
             !joined.to_ascii_uppercase().contains(" SUPERUSER"),
             "dynamic role must never be SUPERUSER:\n{joined}"
@@ -1881,6 +1964,25 @@ mod tests {
                     assert!(
                         s.contains("''; DROP DATABASE postgres; --"),
                         "password broke out of its literal: {s}"
+                    );
+                }
+            }
+        }
+
+        // LOW-2 backslash case: a payload LEADING with a backslash is the MySQL break-out
+        // shape (`\` escapes the quote that would otherwise double-close the literal). The
+        // backslash must be doubled so the following quote stays a data quote — on BOTH
+        // engines — and the injection text can never reach statement level.
+        let evil_bs = "\\'; DROP DATABASE postgres; --";
+        for (kind, pre) in [
+            (ExternalSqlKind::Postgres, "E'\\\\''"),
+            (ExternalSqlKind::Mysql, "'\\\\''"),
+        ] {
+            for s in mint_dynamic_role_ddl(kind, "db", "own", "dyn", evil_bs) {
+                if s.contains("DROP DATABASE postgres") {
+                    assert!(
+                        s.contains(&format!("{pre}; DROP DATABASE postgres; --")),
+                        "backslash payload broke out of its literal on {kind:?}: {s}"
                     );
                 }
             }

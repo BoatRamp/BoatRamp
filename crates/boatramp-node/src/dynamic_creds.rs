@@ -69,7 +69,7 @@ use crate::tenant_sql::{maintenance_database, tenant_key, tenant_names};
 /// The ephemeral, per-replica credential phase 2 minted — the input phase 1 builds the
 /// DSN from (host/port come from the existing endpoint resolver phase 1 already uses; this
 /// carries only the parts phase 2 owns).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DynamicDbCredential {
     /// The engine (so phase 1 picks `postgres://` vs `mysql://`).
     pub kind: ExternalSqlKind,
@@ -78,8 +78,23 @@ pub struct DynamicDbCredential {
     /// The per-replica dynamic role / user name to connect as.
     pub role: String,
     /// The role's fresh login password (hex). Ephemeral: deleted on
-    /// [`revoke_dynamic_role`].
+    /// [`revoke_dynamic_role`]. REDACTED by `Debug` (LOW-1) — do not derive `Debug`.
     pub password: String,
+}
+
+/// Hand-written `Debug` that REDACTS the cleartext password, matching the codebase
+/// convention (`boatramp_core::registry_auth::RegistryCredential`,
+/// `managed_db_declare`'s error redaction). A `{:?}` of this struct — in a log line, a
+/// `tracing` field, an `anyhow` chain — must never surface the sealed login secret.
+impl std::fmt::Debug for DynamicDbCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicDbCredential")
+            .field("kind", &self.kind)
+            .field("database", &self.database)
+            .field("role", &self.role)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The KV **workload** segment for a per-replica dynamic credential: the
@@ -95,6 +110,41 @@ pub(crate) fn dynamic_cred_workload_key(
     instance_id: &str,
 ) -> String {
     format!("{compute}/{tenant_ident}/dyn/{instance_id}")
+}
+
+/// The facts parsed back out of a **full** sealed dynamic-cred KV key
+/// (`managed-sql-cred/<consumer_project>/<compute>/<tenant_ident>/dyn/<instance_id>` — the
+/// [`ManagedSqlCredentials`](crate::managed_sql::ManagedSqlCredentials) prefix followed by a
+/// [`dynamic_cred_workload_key`]). The inverse of how the key is built, for the orphan sweep:
+/// `instance_id` decides whether the owning replica is still live, and
+/// `consumer_project` + `compute` rebuild the revoke target.
+pub(crate) struct ParsedDynCredKey {
+    pub consumer_project: String,
+    pub compute: String,
+    pub tenant_ident: String,
+    pub instance_id: String,
+}
+
+/// Parse a full `managed-sql-cred/…` key, returning `Some` ONLY for a per-replica DYNAMIC
+/// credential key (exactly `<project>/<compute>/<tenant_ident>/dyn/<instance_id>` after the
+/// prefix). Every other sealed credential — the runtime role (`<proj>/<compute>`), the owner
+/// role (`…/owner`), the superuser (`default/<compute>`), or a workload literally named
+/// `dyn` — has a different segment count / shape and returns `None`, so the sweep can never
+/// touch a persistent credential. All segments are `/`-free by construction (resource names
+/// are `[a-z0-9-]`, the tenant ident is sanitized, the instance id carries no `/`).
+pub(crate) fn parse_dynamic_cred_key(key: &str) -> Option<ParsedDynCredKey> {
+    let rest = key.strip_prefix(crate::managed_sql::ManagedSqlCredentials::CRED_PREFIX)?;
+    // [consumer_project, compute, tenant_ident, "dyn", instance_id]
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() != 5 || parts[3] != "dyn" || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(ParsedDynCredKey {
+        consumer_project: parts[0].to_string(),
+        compute: parts[1].to_string(),
+        tenant_ident: parts[2].to_string(),
+        instance_id: parts[4].to_string(),
+    })
 }
 
 /// The derived facts phase 2 needs for one `(binding, consumer_project, instance_id)`, or
@@ -334,14 +384,64 @@ mod tests {
     use crate::config::{TenantIsolation, TenantScope};
 
     fn shared_pg_binding() -> ExternalDatabaseConfig {
-        let mut b = ExternalDatabaseConfig::default();
-        b.kind = "postgres".to_string();
-        b.compute = Some("pg".to_string());
-        b.database = Some("appdb".to_string());
-        b.user = Some("postgres".to_string());
-        b.tenant = TenantIsolation::Shared;
-        b.tenant_scope = TenantScope::Project;
-        b
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            compute: Some("pg".to_string()),
+            database: Some("appdb".to_string()),
+            user: Some("postgres".to_string()),
+            tenant: TenantIsolation::Shared,
+            tenant_scope: TenantScope::Project,
+            ..ExternalDatabaseConfig::default()
+        }
+    }
+
+    /// LOW-1: the credential's `Debug` REDACTS the cleartext password (a `{:?}` in a log line
+    /// / `tracing` field must never surface the sealed login secret), while keeping the
+    /// non-secret fields for diagnostics.
+    #[test]
+    fn debug_redacts_the_password() {
+        let cred = DynamicDbCredential {
+            kind: ExternalSqlKind::Postgres,
+            database: "appdb_acme".into(),
+            role: "appdb_acme_d_acme_web_0".into(),
+            password: "s3cr3t_hex_password".into(),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("s3cr3t_hex_password"),
+            "password leaked in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected a redaction marker: {dbg}"
+        );
+        // Non-secret fields stay visible for diagnostics.
+        assert!(dbg.contains("appdb_acme_d_acme_web_0"));
+        assert!(dbg.contains("appdb_acme"));
+    }
+
+    /// The sweep's key parser is the exact inverse of how a dynamic-cred key is built, and —
+    /// crucially — returns `None` for EVERY non-dynamic credential key, so the orphan sweep
+    /// can never touch a persistent runtime/owner/superuser credential.
+    #[test]
+    fn parse_dynamic_cred_key_round_trips_and_rejects_non_dynamic() {
+        let prefix = crate::managed_sql::ManagedSqlCredentials::CRED_PREFIX;
+        let full = format!(
+            "{prefix}acme/{}",
+            dynamic_cred_workload_key("pg", "acme_abc", "acme-web-0")
+        );
+        let p = parse_dynamic_cred_key(&full).expect("a dynamic key parses");
+        assert_eq!(p.consumer_project, "acme");
+        assert_eq!(p.compute, "pg");
+        assert_eq!(p.tenant_ident, "acme_abc");
+        assert_eq!(p.instance_id, "acme-web-0");
+        // Non-dynamic credential keys never parse.
+        assert!(parse_dynamic_cred_key(&format!("{prefix}acme/pg")).is_none()); // runtime role
+        assert!(parse_dynamic_cred_key(&format!("{prefix}acme/pg/owner")).is_none()); // owner role
+        assert!(parse_dynamic_cred_key(&format!("{prefix}default/pg")).is_none()); // superuser
+        assert!(parse_dynamic_cred_key(&format!("{prefix}acme/pg/acme_abc/notdyn/x")).is_none());
+        // A key under a different prefix never parses.
+        assert!(parse_dynamic_cred_key("other/acme/pg/acme_abc/dyn/acme-web-0").is_none());
     }
 
     /// The per-replica credential key is distinct from the runtime/owner keys AND distinct

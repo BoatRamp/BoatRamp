@@ -946,6 +946,13 @@ pub struct NodeComputeReaper {
     /// the RECORD of a container still lingering on the OLD node (Security LOW). Single-node
     /// is `0`, and every local replica's `node` is `0`, so this is inert there.
     self_node: u64,
+    /// The managed-DB resolver, present only on a node with a managed SQL binding + a secrets
+    /// envelope, used ONLY for its [`sweep_orphan_dynamic_db_creds`](boatramp_core::compute::ManagedDbEnvResolver::sweep_orphan_dynamic_db_creds)
+    /// step: the `All`-target reap also drops per-replica dynamic DB credentials whose owning
+    /// replica is gone (PLAN-compute-managed-db phase 2, Security HIGH-1). `None` ⇒ the sweep
+    /// is simply skipped (a node with no managed DB mints no dynamic creds). Cluster-wide KV +
+    /// an idempotent revoke make it safe to run from the (leader-gated) reap pass.
+    dynamic_cred_sweeper: Option<std::sync::Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>>,
 }
 
 impl NodeComputeReaper {
@@ -962,6 +969,65 @@ impl NodeComputeReaper {
             backends,
             deploy,
             self_node,
+            dynamic_cred_sweeper: None,
+        }
+    }
+
+    /// Attach the managed-DB resolver so an `All`-target reap also sweeps orphaned per-replica
+    /// dynamic DB credentials (PLAN-compute-managed-db phase 2, Security HIGH-1). Builder-style
+    /// so single-node / lean nodes (and every test) keep [`new`](Self::new) unchanged; the node
+    /// passes a clone of the managed_db resolver here when one is wired.
+    #[must_use]
+    pub fn with_dynamic_cred_sweeper(
+        mut self,
+        sweeper: Option<std::sync::Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>>,
+    ) -> Self {
+        self.dynamic_cred_sweeper = sweeper;
+        self
+    }
+
+    /// Drop every orphaned per-replica dynamic DB credential — one whose owning replica has
+    /// no persisted record left — by delegating to the managed-DB resolver's idempotent sweep.
+    /// Runs only on an `All`-target pass (a periodic / full orphan reap), never a surgically
+    /// operator-targeted single replica. The live set is the `compute_instance_id` of every
+    /// CURRENTLY persisted replica (re-listed fresh, so a replica reaped earlier in THIS pass
+    /// is already absent and its cred becomes an orphan here). Best-effort + audited: a sweep
+    /// error is logged, never failing the replica reap it rides alongside.
+    async fn sweep_dynamic_creds(&self, dry_run: bool) {
+        let Some(sweeper) = self.dynamic_cred_sweeper.as_ref() else {
+            return;
+        };
+        let states = match self.deploy.list_all_replica_states().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "dynamic-cred sweep: could not list replica states; skipped");
+                return;
+            }
+        };
+        let live: std::collections::HashSet<String> = states
+            .iter()
+            .map(|s| {
+                boatramp_core::compute::compute_instance_id(
+                    &s.handle.project,
+                    &s.handle.workload,
+                    s.handle.replica,
+                )
+            })
+            .collect();
+        match sweeper.sweep_orphan_dynamic_db_creds(&live, dry_run).await {
+            Ok(swept) if !swept.is_empty() => {
+                tracing::warn!(
+                    count = swept.len(),
+                    dry_run,
+                    "dynamic-cred sweep: {} orphaned dynamic DB credential(s) {}",
+                    swept.len(),
+                    if dry_run { "identified" } else { "revoked" }
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "dynamic-cred sweep: failed (replica reap unaffected)");
+            }
         }
     }
 
@@ -1268,6 +1334,14 @@ impl boatramp_core::compute::ComputeReaper for NodeComputeReaper {
                     }
                 }
             }
+        }
+        // Orphan-cred sweep (PLAN-compute-managed-db phase 2, Security HIGH-1): a FULL
+        // (`All`-target) pass also drops per-replica dynamic DB credentials whose owning
+        // replica is gone — including any just reaped above (the sweep re-lists the live set).
+        // A surgically operator-targeted single replica (`specific`) is NOT a global sweep
+        // trigger. Dormant (no-op) on a node without a managed DB.
+        if specific.is_none() {
+            self.sweep_dynamic_creds(opts.dry_run).await;
         }
         Ok(report)
     }

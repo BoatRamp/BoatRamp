@@ -969,8 +969,19 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // `POST /api/compute/maintenance/reap` (System·Admin) AND the alerting loop's orphan
     // scan + opt-in auto-reap. Clone the registry before the reconcile loop consumes the
     // original below.
+    // The reaper also runs the orphan DYNAMIC-DB-credential sweep (PLAN-compute-managed-db
+    // phase 2, Security HIGH-1) on its full passes, so hand it a clone of the managed-DB
+    // resolver (the same one the reconcile uses) when one is wired — `None` on a node with no
+    // managed SQL binding / no secrets envelope, where the sweep is simply inert.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let reaper_dynamic_cred_sweeper = managed_db_resolver.clone();
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let reaper_dynamic_cred_sweeper: Option<
+        Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>,
+    > = None;
     let compute_reaper: Arc<dyn boatramp_core::compute::ComputeReaper> = Arc::new(
-        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone(), node_id),
+        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone(), node_id)
+            .with_dynamic_cred_sweeper(reaper_dynamic_cred_sweeper),
     );
 
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
