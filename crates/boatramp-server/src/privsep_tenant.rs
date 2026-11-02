@@ -147,6 +147,17 @@ pub enum RouteRefusal {
     /// [`DeployStore::resolve_site_by_host`] itself errored (a store/IO failure). Fail-closed: a
     /// resolution that could not complete is refused, never guessed. Carries a non-secret message.
     Resolve(String),
+    /// The [`PerTenantInstanceRegistry`] returned a link keyed to a DIFFERENT scope than the one
+    /// requested (a WS-C mis-keying bug at the #1 tenant-keying boundary). Fail-closed, RELEASE-active:
+    /// routing a request to an instance keyed for another tenant would cross tenants (the #1 leak
+    /// surface), so a mismatch REFUSES rather than routes — it is never guessed or coerced. Carries
+    /// only the non-secret project slugs (what was requested vs. what the registry returned).
+    RegistryScopeMismatch {
+        /// The project slug WS-B resolved from the host and asked the registry for (authoritative).
+        requested: String,
+        /// The project slug of the link the registry actually returned (the mis-key).
+        returned: String,
+    },
 }
 
 impl std::fmt::Display for RouteRefusal {
@@ -161,6 +172,16 @@ impl std::fmt::Display for RouteRefusal {
                 f,
                 "per-tenant routing refused: host→project resolution failed ({e}) — refusing \
                  fail-closed rather than guessing a tenant"
+            ),
+            Self::RegistryScopeMismatch {
+                requested,
+                returned,
+            } => write!(
+                f,
+                "per-tenant routing refused: the registry returned a link keyed for project \
+                 {returned:?} but the request resolved to {requested:?} — refusing fail-closed \
+                 rather than routing a request to another tenant's instance (the resolved scope is \
+                 authoritative; a mismatch is a registry/keying bug)"
             ),
         }
     }
@@ -193,12 +214,17 @@ pub fn route_resolved_host(
     match registry.resolve(&scope) {
         Some(link) => {
             // The registry must key the link by the SAME scope WS-B resolved — the resolved scope is
-            // authoritative. A mismatching registry is a WS-C bug, caught loudly in debug builds.
-            debug_assert_eq!(
-                link.scope(),
-                &scope,
-                "a PerTenantInstanceRegistry returned a link for a DIFFERENT scope than requested"
-            );
+            // authoritative. A mismatch is a WS-C mis-keying bug at the #1 tenant-keying boundary;
+            // routing a request to a link keyed for another tenant would cross tenants. Refuse
+            // fail-closed, RELEASE-active (not a `debug_assert`, which is compiled out in release and
+            // would silently mis-route there), and panic-free — BEFORE building the routing head /
+            // returning the route.
+            if link.scope() != &scope {
+                return Err(RouteRefusal::RegistryScopeMismatch {
+                    requested: scope.project().to_string(),
+                    returned: link.scope().project().to_string(),
+                });
+            }
             Ok(RouteOutcome::Routed(link))
         }
         None => Ok(RouteOutcome::NotReady(scope)),
@@ -632,6 +658,46 @@ mod tests {
             RouteOutcome::NotReady(scope) => assert_eq!(scope.project(), "shop-gamma"),
             other => panic!("expected NotReady (the WS-C wake seam), got {other:?}"),
         }
+    }
+
+    /// A deliberately BROKEN registry (a WS-C mis-keying bug model): it IGNORES the requested scope
+    /// and always returns a link keyed to a FIXED project — so a lookup for one tenant hands back
+    /// another tenant's link. Used only by the LOW-1 scope↔link consistency test.
+    #[derive(Debug)]
+    struct MiskeyedRegistry {
+        returned_project: String,
+    }
+
+    impl PerTenantInstanceRegistry for MiskeyedRegistry {
+        fn resolve(&self, _requested: &TenantScope) -> Option<TenantInstanceLink> {
+            let returned =
+                TenantScope::resolve(&self.returned_project).expect("valid fixture slug");
+            Some(TenantInstanceLink::new(
+                returned,
+                Arc::new(MockRelay::new("instance:wrong-tenant")),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_registry_returning_a_mis_keyed_link_refuses_release_active_not_a_route() {
+        // LOW-1: at the #1 tenant-keying boundary, a registry that hands back a link keyed for a
+        // DIFFERENT scope than requested must be REFUSED fail-closed (RELEASE-active, panic-free) —
+        // not routed, not silently mis-routed. (The old `debug_assert_eq!` was compiled out in release
+        // and would silently return the wrong tenant's link there.) This test runs under normal,
+        // release-semantics expectations: it asserts a refusal value, not a panic.
+        let registry = MiskeyedRegistry {
+            returned_project: "shop-beta".to_string(),
+        };
+        let refusal = route_resolved_host(Some("shop-alpha"), &registry).unwrap_err();
+        assert!(
+            matches!(
+                &refusal,
+                RouteRefusal::RegistryScopeMismatch { requested, returned }
+                    if requested == "shop-alpha" && returned == "shop-beta"
+            ),
+            "expected a RegistryScopeMismatch refusal (not a route, no panic), got {refusal:?}"
+        );
     }
 
     // ---- deliverable 4 / artifact #2: unforgeable backend-call tenant identity ----

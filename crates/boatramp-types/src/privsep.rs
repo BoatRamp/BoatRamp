@@ -1046,6 +1046,26 @@ pub enum CompositionViolation {
         /// The offending instance label.
         instance: String,
     },
+    /// A STATIC (non-template) instance holds `exec.wasmtime` WHILE the composition defines a
+    /// per-tenant TEMPLATE (design §Phase-4 WS-A). Once a per-tenant template exists, the guest JIT
+    /// runs ONLY as a per-tenant instance — one isolated `exec.wasmtime` per tenant — so a shared,
+    /// cross-tenant `exec.wasmtime` on ANY static instance re-opens the very boundary the template
+    /// draws: a wasmtime escape there would land in a runtime common to every tenant's guests at once.
+    /// Fail-closed: once templates exist, `exec.wasmtime` may live ONLY on a per-tenant template.
+    ///
+    /// This STRICTLY SUBSUMES the `exec.wasmtime`-on-scheduler case of
+    /// [`CompositionViolation::ExecComputeAndWasmtimeCoResident`] (that scheduler is a static instance
+    /// that holds `exec.wasmtime`), making the "one wasmtime instance per tenant" invariant COMPLETE
+    /// and on-disk-provable — not only the exec.compute co-residency shape.
+    ///
+    /// **Gated on template presence** (at least one [`InstanceLifecycle::PerTenantTemplate`]): without
+    /// a template, `exec.wasmtime` on a static instance is the shipped monolith-equivalent runtime and
+    /// UNCHANGED — every pre-Phase-4 composition stays byte-compatible.
+    ExecWasmtimeOutsidePerTenantTemplate {
+        /// The offending static instance label (it holds `exec.wasmtime` but is not a per-tenant
+        /// template, while the composition defines at least one template).
+        instance: String,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -1139,6 +1159,15 @@ impl std::fmt::Display for CompositionViolation {
                  composition defines a per-tenant template — the compute-plane supervisor that \
                  schedules per-tenant instances must not itself run guests; split `exec.wasmtime` \
                  (the per-tenant template) off the `exec.compute` supervisor instance"
+            ),
+            Self::ExecWasmtimeOutsidePerTenantTemplate { instance } => write!(
+                f,
+                "instance {instance:?} holds `exec.wasmtime` but is NOT a per-tenant template, while \
+                 the composition defines a per-tenant template — once per-tenant templates exist the \
+                 guest runtime must run ONLY as a per-tenant instance (one isolated `exec.wasmtime` \
+                 per tenant); a shared, cross-tenant `exec.wasmtime` here would defeat the \
+                 one-wasmtime-instance-per-tenant guarantee. Move `exec.wasmtime` onto a per-tenant \
+                 template instance (lifecycle `per-tenant-template`)"
             ),
         }
     }
@@ -1259,7 +1288,13 @@ fn tags(authorities: &[HostAuthority]) -> String {
 /// - **(Phase-4 WS-A)** `exec.compute` co-resident with `exec.wasmtime` on one instance WHEN the
 ///   composition defines a per-tenant template
 ///   ([`CompositionViolation::ExecComputeAndWasmtimeCoResident`]) — gated on template presence, so
-///   every pre-Phase-4 composition is unchanged.
+///   every pre-Phase-4 composition is unchanged;
+/// - **(Phase-4 WS-A)** `exec.wasmtime` held by a STATIC (non-template) instance WHEN the composition
+///   defines a per-tenant template
+///   ([`CompositionViolation::ExecWasmtimeOutsidePerTenantTemplate`]) — once templates exist the
+///   guest runtime lives ONLY on per-tenant templates, so a shared cross-tenant wasmtime is refused;
+///   strictly subsumes the exec.wasmtime-on-scheduler case of the rule above, and likewise gated on
+///   template presence (pre-Phase-4 byte-compatible).
 ///
 /// It FLAGS (returns `Ok` with [`CompositionWarning`]s) on:
 /// - a crown jewel held by >1 instance (duplication widens exposure);
@@ -1328,6 +1363,20 @@ pub fn check_composition_closure(
             && held.contains(&HostAuthority::ExecWasmtime)
         {
             violations.push(CompositionViolation::ExecComputeAndWasmtimeCoResident {
+                instance: name.clone(),
+            });
+        }
+
+        // Phase-4 WS-A rule (c): once a per-tenant template exists, `exec.wasmtime` may live ONLY on a
+        // per-tenant template — a STATIC instance holding it is a shared, cross-tenant guest runtime
+        // that re-opens the per-tenant boundary (a wasmtime escape would reach every tenant's guests).
+        // This STRICTLY SUBSUMES the exec.wasmtime-on-scheduler case of rule (b) (a static scheduler
+        // holding exec.wasmtime trips here too); rule (b) stays as belt-and-suspenders.
+        if has_per_tenant_template
+            && held.contains(&HostAuthority::ExecWasmtime)
+            && !inst.lifecycle.is_per_tenant_template()
+        {
+            violations.push(CompositionViolation::ExecWasmtimeOutsidePerTenantTemplate {
                 instance: name.clone(),
             });
         }
@@ -2454,6 +2503,54 @@ mod tests {
         assert!(!has_violation(&cfg, |v| matches!(
             v,
             CompositionViolation::ExecComputeAndWasmtimeCoResident { .. }
+        )));
+    }
+
+    #[test]
+    fn lint_rejects_exec_wasmtime_on_a_static_instance_when_a_template_exists() {
+        // MEDIUM-1: the canonical Phase-4 composition {template `tenant-wasm`={exec.wasmtime};
+        // `edge`={listeners, exec.compute, control, acme}; `data`={backend.*}; `signer`={6 crown
+        // jewels}} is authorized — exec.wasmtime lives ONLY on the per-tenant template.
+        let mut cfg = phase4_template_composition();
+        check_composition_closure(&cfg).expect("the canonical Phase-4 composition is authorized");
+
+        // Now add exec.wasmtime to the STATIC `data` instance. Rule (a) does not apply (data is not a
+        // template) and rule (b) does not fire (data holds no exec.compute), yet this stands up a
+        // SHARED, cross-tenant wasm runtime alongside the per-tenant template — the MEDIUM-1 gap.
+        // Pre-fix this was wrongly ACCEPTED (only an F8 warning); rule (c) must now REFUSE it.
+        cfg.instances
+            .get_mut("data")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::ExecWasmtime);
+        assert!(has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::ExecWasmtimeOutsidePerTenantTemplate { instance }
+                if instance == "data"
+        )));
+    }
+
+    #[test]
+    fn exec_wasmtime_outside_template_rule_is_gated_on_template_presence() {
+        // With NO per-tenant template, exec.wasmtime on a static instance is the shipped
+        // monolith-equivalent runtime — UNCHANGED (pre-Phase-4 byte-compatible). `clean_composition`'s
+        // `edge` holds exec.wasmtime and is static, with no template anywhere: it must pass clean and
+        // raise NO ExecWasmtimeOutsidePerTenantTemplate violation.
+        let cfg = clean_composition();
+        assert!(
+            !cfg.instances
+                .values()
+                .any(|i| i.lifecycle.is_per_tenant_template())
+        );
+        assert!(
+            cfg.instances["edge"]
+                .capabilities
+                .contains(&HostAuthority::ExecWasmtime)
+        );
+        check_composition_closure(&cfg).expect("a no-template composition is unchanged");
+        assert!(!has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::ExecWasmtimeOutsidePerTenantTemplate { .. }
         )));
     }
 
