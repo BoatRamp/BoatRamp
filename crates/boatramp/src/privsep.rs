@@ -1198,9 +1198,9 @@ mod instance_serve {
     use boatramp_core::cose::{Signer, TokenPublicKey};
     use boatramp_core::privsep::HostAuthority;
     use boatramp_server::privsep_authority::{
-        AuthorityRegistry, AuthorityServe, ContextVerifier, DEFAULT_CONTEXT_MAX_AGE_SECS,
-        DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT, ReplayCache, SealerHandler,
-        SignerHandler, TracingAudit, Unlimited,
+        AuthorityAudit, AuthorityRateLimiter, AuthorityRegistry, AuthorityServe, ContextVerifier,
+        DEFAULT_CONTEXT_MAX_AGE_SECS, DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT,
+        DurableAudit, ReplayCache, SealerHandler, SignerHandler, TokenBucketLimiter,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_unseal::{
@@ -1546,6 +1546,22 @@ mod instance_serve {
         let verifier = ContextVerifier::new(trust_root);
         let replay = Arc::new(ReplayCache::with_defaults());
         let max_in_flight = Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_IN_FLIGHT));
+        // Phase-2 HARDENING (tasks #2/#3): the PRODUCTION limiter + durable audit sink replace the
+        // Wave-1 defaults (`Unlimited` / `TracingAudit`). One shared instance per crown jewel, cloned
+        // into each link thread. The append-only audit log lives in this instance's OWN data subtree;
+        // the composition's sandbox profile must grant the crown jewel WRITE here and deny the relay
+        // any access (the sink is write-only from the caller's view). Opening it fails the stand-up
+        // closed if the path is not writable (an audit the caller could evade is not an audit).
+        let audit: Arc<dyn AuthorityAudit> = {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            let path = super::normalized_data_dir(config, &cwd)
+                .join("privsep")
+                .join("authority-audit.jsonl");
+            Arc::new(DurableAudit::open(&path).map_err(|e| {
+                format!("opening the durable authority audit sink at {path:?}: {e}")
+            })?)
+        };
+        let limiter: Arc<dyn AuthorityRateLimiter> = Arc::new(TokenBucketLimiter::with_defaults());
         tracing::info!(
             instance = %label,
             served = ?registry.served().iter().map(|a| a.tag()).collect::<Vec<_>>(),
@@ -1609,6 +1625,8 @@ mod instance_serve {
             let verifier = verifier.clone();
             let replay = replay.clone();
             let max_in_flight = max_in_flight.clone();
+            let limiter = limiter.clone();
+            let audit = audit.clone();
             threads.push(std::thread::spawn(move || {
                 // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
                 let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
@@ -1622,16 +1640,13 @@ mod instance_serve {
                         return;
                     }
                 };
-                // Phase-2 Wave 1 uses the default limiter + the tracing audit sink; a hardened
-                // composition swaps in a token-bucket limiter + a durable append-only sink (the seams
-                // are unchanged — a flagged follow-on).
-                let limiter = Unlimited;
-                let audit = TracingAudit;
+                // Phase-2 HARDENING: the PRODUCTION token-bucket limiter + durable append-only audit
+                // sink (shared across links, cloned in above) — the Wave-1 defaults are gone.
                 let serve = AuthorityServe {
                     verifier: &verifier,
                     replay: &replay,
-                    limiter: &limiter,
-                    audit: &audit,
+                    limiter: limiter.as_ref(),
+                    audit: audit.as_ref(),
                     handler: registry.as_ref(),
                     max_in_flight: &max_in_flight,
                     read_deadline: DEFAULT_LINK_READ_DEADLINE,

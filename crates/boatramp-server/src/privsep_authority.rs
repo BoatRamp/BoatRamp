@@ -12,8 +12,9 @@
 //! therefore ships:
 //!
 //! 1. A **typed authority-call envelope** over the existing bounded [`LinkEndpoint::send_frame`] /
-//!    [`LinkEndpoint::recv_frame`] byte frames: an [`AuthorityLink::call`] carrying an
-//!    [`AuthorityCall`] (a context + a bounded request) and returning an [`AuthorityResponse`]. The
+//!    [`LinkEndpoint::recv_frame`] byte frames: an [`AuthorityLink::relay`] carrying an
+//!    [`AuthorityCall`] (a context + nonce + per-call PoP + a bounded request) and returning an
+//!    [`AuthorityResponse`]. The
 //!    request enum admits ONLY bounded operations returning RESULTS — **there is no variant that
 //!    returns a key, seed, or KEK**. The TYPE SYSTEM, not a runtime check, forecloses the exfiltration
 //!    op (design §3.4.3). Phase 1 ships a single no-op [`AuthorityRequest::Ping`] that proves the
@@ -24,8 +25,24 @@
 //!    bearer token, relayed VERBATIM by the caller and **RE-VALIDATED by the receiving instance
 //!    against the PUBLIC trust root on every call** ([`ContextVerifier::verify_context`]). It is a
 //!    verifiable CREDENTIAL, NEVER a caller-asserted id.
-//! 3. **Audit + rate-limit hooks keyed on the VERIFIED principal** — framework seams
-//!    ([`AuthorityAudit`], [`AuthorityRateLimiter`]), not full impls.
+//! 3. **Audit + rate-limit hooks keyed on the VERIFIED principal** — the trait seams
+//!    ([`AuthorityAudit`], [`AuthorityRateLimiter`]) plus BOTH a default ([`TracingAudit`] /
+//!    [`Unlimited`]) and a production impl ([`DurableAudit`] / [`TokenBucketLimiter`]).
+//!
+//! ## Phase-2 authority-serve HARDENING (this pass)
+//!
+//! On top of the Wave-1 grammars, this module now carries the wiring-gate containment preconditions:
+//! - **Per-call proof-of-possession (mechanism (c)).** Every authority call carries an
+//!   [`AuthorityCall::pop`] the ORIGINATING principal signs with its holder (`cnf`) key;
+//!   [`ContextVerifier::verify_call`] REQUIRES and re-verifies it against the context token's own `cnf`,
+//!   bound to the exact call. This defeats the active-principal new-call forgery the Wave-1 freshness
+//!   bound + nonce cache alone do not — a compromised frontend, lacking the holder key, can at most
+//!   replay an exact observed call (which the nonce cache catches). The host REFUSES fail-closed a
+//!   context with no `cnf` or a call with no valid PoP. See the cross-repo guest-SDK follow-on on
+//!   [`AuthorityServe`].
+//! - **Mint→mint closure.** A `mint_token` output is `cnf`-bound (so it is itself PoP-bound) AND marked
+//!   `br_authz_issued`, so the verifier refuses it if relayed back as a context ([`cose::mint_authority_output`]).
+//! - **Durable audit + real limiter** — [`DurableAudit`] + [`TokenBucketLimiter`].
 //!
 //! ## The context primitive (F3) — why a CREDENTIAL, not an id
 //!
@@ -76,7 +93,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use boatramp_core::authz::GrantedRole;
-use boatramp_core::cose::{self, Claims, Signer, TokenError, TokenPublicKey, VerifiedToken};
+use boatramp_core::cose::{
+    self, AuthorityPopBinding, Claims, Signer, TokenError, TokenPublicKey, VerifiedToken,
+};
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::privsep::HostAuthority;
 
@@ -248,24 +267,77 @@ pub enum AuthorityResponse {
 }
 
 /// The wire envelope sent frame-by-frame over the link: a [`AuthorityContext`] (the verifiable
-/// end-principal credential) PAIRED with the [`AuthorityRequest`]. Pairing them in one struct makes it
-/// **structurally impossible to send a request without a context** — there is no `call` path that omits
-/// the credential.
+/// end-principal credential), a per-call nonce, a per-call **proof-of-possession**, and the
+/// [`AuthorityRequest`]. Bundling them in one struct makes it **structurally impossible to send a
+/// request without a context AND a possession proof** — there is no relay path that omits either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityCall {
     /// The relayed end-principal credential, re-validated by the receiver before any dispatch.
     pub context: AuthorityContext,
-    /// A fresh per-call anti-replay NONCE (design §3.4 watch-item mechanism (b)). The caller mints a
-    /// CSPRNG value per call ([`AuthorityLink::call`] does this); the receiver records `(cti, nonce)`
-    /// in a bounded, TTL-evicting [`ReplayCache`] and REFUSES a reused pair — so a captured call frame
-    /// cannot be replayed verbatim, while a legitimate second call under the same token (a fresh
-    /// nonce) still proceeds. The nonce is NOT signed, so it does not bind the request to the token;
-    /// it suppresses exact-duplicate replays within the freshness window (the window itself is bounded
-    /// by [`ContextVerifier`]'s max-age). See the module doc on why PoP (c) is the stronger, flagged
-    /// follow-on.
+    /// A fresh per-call anti-replay NONCE (design §3.4 watch-item mechanism (b)). The ORIGINATING
+    /// principal mints a CSPRNG value per call ([`AuthorityCall::signed`] does this) and BINDS it into
+    /// the PoP (`pop`); the receiver records `(cti, nonce)` in a bounded, TTL-evicting [`ReplayCache`]
+    /// and REFUSES a reused pair — so a captured call frame cannot be replayed verbatim. Unlike Wave-1
+    /// (where the nonce was unsigned), the nonce is now bound by the PoP to the token + holder key, so
+    /// a frontend RCE cannot swap it on an observed proof: mechanisms (a)+(b)+(c) together contain both
+    /// the verbatim replay AND the active-principal new-call forgery.
     pub nonce: u128,
+    /// The per-call **authority-call proof-of-possession** (design §3.4 watch-item mechanism (c)),
+    /// base64url. The ORIGINATING end principal signs it with its holder (`cnf`) key over
+    /// (`op`, context token, `nonce`, serialized `request`); the receiver re-verifies it against the
+    /// context token's own `cnf` ([`ContextVerifier::verify_call`]). Because the holder key is one the
+    /// relaying frontend does NOT hold, a valid proof can only originate from the real principal — a
+    /// compromised frontend can at most replay an exact observed call (caught by the nonce cache) and
+    /// can NEVER forge a new authority call under an observed context. A call whose `pop` is
+    /// absent / unverifiable / bound to a different call is refused fail-closed.
+    pub pop: String,
     /// The bounded operation requested.
     pub request: AuthorityRequest,
+}
+
+/// The canonical serialized request bytes bound into the authority-call PoP. BOTH the originator
+/// ([`AuthorityCall::signed`]) and the receiver ([`ContextVerifier::verify_call`]) run this over the
+/// same [`AuthorityRequest`] value, so the PoP's request binding compares identically — a receiver
+/// re-serializes the request it deserialized from the frame and gets the originator's bytes back. (The
+/// guest-SDK half, in another repo, MUST serialize the request with this same codec; see the module
+/// doc's cross-repo follow-on.)
+#[must_use]
+pub fn request_pop_bytes(request: &AuthorityRequest) -> Vec<u8> {
+    // serde_json over our bounded enum is deterministic (declaration-order fields, order-preserving
+    // arrays, no maps) and round-trip stable, so mint and verify agree on the bound bytes.
+    serde_json::to_vec(request).unwrap_or_default()
+}
+
+impl AuthorityCall {
+    /// Build a PoP-SIGNED authority call: pick a fresh anti-replay nonce, then sign an authority-call
+    /// proof-of-possession over (`op`, context token, nonce, request) with the end principal's holder
+    /// (`cnf`) key. **This is the ORIGINATING end principal's operation** (e.g. the guest SDK) — the
+    /// frontend that relays the call never runs it, because it does not hold the holder key. The
+    /// resulting call is what the frontend relays verbatim with [`AuthorityLink::relay`].
+    pub async fn signed(
+        context: AuthorityContext,
+        request: AuthorityRequest,
+        holder: &dyn Signer,
+        now_unix: u64,
+    ) -> Result<Self, AuthorityError> {
+        let nonce = fresh_nonce();
+        let req_bytes = request_pop_bytes(&request);
+        let binding = AuthorityPopBinding {
+            op: request.op_name(),
+            context_token: &context.token,
+            nonce,
+            request_bytes: &req_bytes,
+        };
+        let pop = cose::mint_authority_pop(&binding, holder, now_unix)
+            .await
+            .map_err(|e| AuthorityError::Codec(format!("minting authority-call PoP: {e}")))?;
+        Ok(Self {
+            context,
+            nonce,
+            pop,
+            request,
+        })
+    }
 }
 
 /// A fresh 128-bit CSPRNG anti-replay nonce for one [`AuthorityCall`]. The OS CSPRNG is treated as
@@ -302,29 +374,18 @@ pub enum AuthorityError {
 /// (The design sketches `async fn call`; the async signature is realized when the networked transports
 /// land — the local transport is blocking and does not need it.)
 pub trait AuthorityLink {
-    /// Relay one bounded `request` under `context` (the end-principal credential) and return the typed
-    /// reply. Never ships key material — the reply type forecloses it. A transport/codec failure is an
-    /// [`AuthorityError`]; an authorization refusal is an `Ok(`[`AuthorityResponse::Refused`]`)`.
-    fn call(
-        &self,
-        context: &AuthorityContext,
-        request: &AuthorityRequest,
-    ) -> Result<AuthorityResponse, AuthorityError>;
+    /// RELAY one already-[`signed`](AuthorityCall::signed) authority call and return the typed reply.
+    /// The relay (a frontend) forwards the originator's call verbatim — it does NOT mint the context or
+    /// the PoP (it holds neither the issuer key nor the holder key). Never ships key material — the
+    /// reply type forecloses it. A transport/codec failure is an [`AuthorityError`]; an authorization
+    /// refusal (bad/absent/replayed context or PoP) rides back as `Ok(`[`AuthorityResponse::Refused`]`)`.
+    fn relay(&self, call: &AuthorityCall) -> Result<AuthorityResponse, AuthorityError>;
 }
 
 #[cfg(unix)]
 impl AuthorityLink for LinkEndpoint {
-    fn call(
-        &self,
-        context: &AuthorityContext,
-        request: &AuthorityRequest,
-    ) -> Result<AuthorityResponse, AuthorityError> {
-        let call = AuthorityCall {
-            context: context.clone(),
-            nonce: fresh_nonce(),
-            request: request.clone(),
-        };
-        let bytes = serde_json::to_vec(&call).map_err(|e| AuthorityError::Codec(e.to_string()))?;
+    fn relay(&self, call: &AuthorityCall) -> Result<AuthorityResponse, AuthorityError> {
+        let bytes = serde_json::to_vec(call).map_err(|e| AuthorityError::Codec(e.to_string()))?;
         self.send_frame(&bytes)
             .map_err(|e| AuthorityError::Link(e.to_string()))?;
         let reply = self
@@ -383,6 +444,22 @@ pub enum ContextRejection {
     /// The token is authentic and unexpired but its claims are wrong for an authority call (e.g. a
     /// kind the grammar does not accept). Refused.
     Claims(String),
+    /// The token is itself an AUTHORITY-API OUTPUT (it carries the `br_authz_issued` marker — see
+    /// [`cose::mint_authority_output`]). An output can NEVER be relayed back as a fresh authority
+    /// context: this closes the mint→mint refresh chain (and any re-redemption of an output). Refused.
+    AuthorityIssued,
+    /// The token is authentic but carries NO holder key (`cnf`), so no per-call proof-of-possession can
+    /// bind to it — an authority context MUST be holder-bound (mechanism (c)). Refused fail-closed (a
+    /// bare bearer context, replayable by whoever observes it, is exactly what PoP-binding forecloses).
+    NoHolderBinding,
+    /// No per-call proof-of-possession was relayed with the call (an empty `pop`). The host refuses a
+    /// context lacking a valid PoP (fail-closed). Refused.
+    MissingPop,
+    /// A PoP was relayed but it did not verify against the context token's `cnf`, was stale/future, or
+    /// was bound to a DIFFERENT call (a different op / context / nonce / request) — i.e. anything other
+    /// than a fresh proof minted by the real holder for THIS exact call. This is the mechanism-(c)
+    /// refusal that defeats an active principal's new-call forgery under an observed context. Refused.
+    PopUnverifiable(String),
 }
 
 impl ContextRejection {
@@ -395,6 +472,20 @@ impl ContextRejection {
             Self::Expired => "authority context expired".into(),
             Self::Stale(e) => format!("authority context stale (freshness bound): {e}"),
             Self::Claims(e) => format!("authority context claims rejected: {e}"),
+            Self::AuthorityIssued => {
+                "authority context rejected: a machine-minted authority-API output is not \
+                 re-redeemable as a context"
+                    .into()
+            }
+            Self::NoHolderBinding => {
+                "authority context rejected: the token carries no holder key (cnf) to bind a \
+                 proof-of-possession"
+                    .into()
+            }
+            Self::MissingPop => {
+                "authority context rejected: no per-call proof-of-possession was relayed".into()
+            }
+            Self::PopUnverifiable(e) => format!("authority-call proof-of-possession rejected: {e}"),
         }
     }
 }
@@ -480,20 +571,29 @@ impl ContextVerifier {
         self
     }
 
-    /// RE-VALIDATE the relayed `context` against the public trust root at `now_unix`, returning the
-    /// VERIFIED principal or a fail-closed [`ContextRejection`]. This is the F3 crux: the receiver does
-    /// NOT trust the caller's relay — it re-runs the same control-plane verifier
+    /// RE-VALIDATE the relayed `context` TOKEN against the public trust root at `now_unix`, returning
+    /// the VERIFIED principal or a fail-closed [`ContextRejection`]. This is the F3 crux: the receiver
+    /// does NOT trust the caller's relay — it re-runs the same control-plane verifier
     /// ([`cose::verify`](boatramp_core::cose::verify), the function that authenticates a client's own
     /// presented bearer/role token into a verified principal) against the trust root on EVERY call. An
     /// absent, forged, or expired token refuses — no principal, no dispatch, no bytes.
     ///
-    /// **Anti-replay (Phase-2 Wave 1, §3.4 watch-item).** A frontend RCE can REPLAY any end-principal
-    /// token it OBSERVES transiting the frontend. This verifier TIGHTENS that window with mechanism (a)
-    /// — a freshness bound on `iat` ([`max_age_secs`](Self::with_max_age_secs)) that refuses a token
-    /// older than the bound even when its `exp` is further out — complemented by the per-call
-    /// [`ReplayCache`] (mechanism (b)) in the serve loop. Mechanism (c) (PoP / `cnf`-binding), which
-    /// would also defeat an ACTIVE principal's NEW-call forgery within the window (which (a)+(b) do
-    /// not), is a documented wiring-gate precondition (see [`AuthorityServe`]).
+    /// **This is the TOKEN step only — it does NOT check the per-call PoP.** The serve path calls
+    /// [`verify_call`](Self::verify_call), which runs this PLUS the mechanism-(c) proof-of-possession
+    /// check. This method is `pub` for the token-level checks a consumer may want in isolation, but an
+    /// authority serve MUST go through [`verify_call`](Self::verify_call) so a context lacking a valid
+    /// PoP is refused fail-closed.
+    ///
+    /// **Anti-replay (Phase-2 Wave 1 + hardening, §3.4 watch-item).** A frontend RCE can REPLAY any
+    /// end-principal token it OBSERVES transiting the frontend. The defense is three mechanisms:
+    /// (a) a freshness bound on `iat` ([`max_age_secs`](Self::with_max_age_secs)) HERE, refusing a token
+    /// older than the bound even when its `exp` is further out; (b) the per-call [`ReplayCache`] in the
+    /// serve loop, refusing a verbatim `(cti, nonce)` replay; and (c) the PoP / `cnf`-binding in
+    /// [`verify_call`](Self::verify_call), which defeats an ACTIVE principal's NEW-call forgery within
+    /// the window that (a)+(b) alone do not. This method also enforces two structural preconditions for
+    /// (c): the context must be holder-bound ([`ContextRejection::NoHolderBinding`] if it carries no
+    /// `cnf`) and must NOT be a machine-minted authority output ([`ContextRejection::AuthorityIssued`],
+    /// closing the mint→mint refresh chain).
     ///
     /// **LOW-1 revocation residual (documented, inherent to the secret-blind split).** This verifier
     /// checks signature + `exp` + freshness, NOT KV revocation (`cti` lookup) — it is IO-free and the
@@ -543,6 +643,23 @@ impl ContextVerifier {
             )));
         }
 
+        // MINT→MINT CLOSURE: refuse a token that is itself a machine-minted AUTHORITY-API OUTPUT. The
+        // signer's `mint_token` stamps `br_authz_issued` on its result (and binds it to the principal's
+        // `cnf`); an output relayed BACK as a fresh context to mint again would extend the chain beyond
+        // the originating context's freshness — the per-call TTL clamp alone does not stop it. Refusing
+        // the marker here closes the refresh chain at the verifier (and any re-redemption of an output).
+        if token.authority_issued {
+            return Err(ContextRejection::AuthorityIssued);
+        }
+
+        // HOLDER-BINDING PRECONDITION (mechanism (c)). An authority context MUST declare a holder key
+        // (`cnf`) so the per-call proof-of-possession can bind to a key the frontend does NOT hold. A
+        // bare (non-`cnf`) bearer context is replayable by whoever observes it — exactly what PoP
+        // forecloses — so refuse it here (fail-closed). `verify_call` relies on this to parse the cnf.
+        if token.cnf.is_none() {
+            return Err(ContextRejection::NoHolderBinding);
+        }
+
         // TIGHTENED FRESHNESS BOUND (mechanism (a)). The signature + `exp` are good; now bound how OLD
         // the token may be, independent of its (possibly generous) `exp`. A frontend RCE can only
         // replay a token it OBSERVED; capping the age shrinks that window to `max_age_secs` rather than
@@ -565,6 +682,60 @@ impl ContextVerifier {
             )));
         }
         Ok(VerifiedPrincipal { token })
+    }
+
+    /// RE-VALIDATE a whole [`AuthorityCall`] — its context token ([`verify_context`](Self::verify_context))
+    /// AND its per-call **proof-of-possession** (mechanism (c)) — at `now_unix`, returning the VERIFIED
+    /// principal or a fail-closed [`ContextRejection`]. **This is the method the serve loop uses; it is
+    /// the host's fail-closed refusal of a context lacking a valid PoP.**
+    ///
+    /// After the token re-validates (which also guarantees a `cnf` is present and the token is not an
+    /// authority output), this:
+    /// 1. refuses a call with no PoP relayed ([`ContextRejection::MissingPop`]);
+    /// 2. parses the context token's own `cnf` into the holder public key (the key the frontend does
+    ///    NOT hold);
+    /// 3. re-verifies the relayed PoP against that holder key, bound to THIS exact call — the op, the
+    ///    context token, the per-call nonce, and the serialized request ([`request_pop_bytes`]). A proof
+    ///    that is absent / stale / signed by a different key / bound to a different call is refused
+    ///    ([`ContextRejection::PopUnverifiable`]).
+    ///
+    /// Because a valid proof can only be produced by the real holder, a compromised frontend can at most
+    /// REPLAY an exact observed call (which the serve loop's [`ReplayCache`] then catches on the bound
+    /// nonce) and can NEVER forge a new authority call under an observed context.
+    pub fn verify_call(
+        &self,
+        call: &AuthorityCall,
+        now_unix: u64,
+    ) -> Result<VerifiedPrincipal, ContextRejection> {
+        // (token) re-validate the context token first — this also enforces cnf-present + not-an-output.
+        let principal = self.verify_context(&call.context, now_unix)?;
+
+        // (c.1) a PoP MUST be relayed — fail-closed on an absent one.
+        if call.pop.is_empty() {
+            return Err(ContextRejection::MissingPop);
+        }
+
+        // (c.2) the holder key is the context token's OWN `cnf` (verify_context guaranteed it present).
+        let cnf = principal
+            .token()
+            .cnf
+            .as_deref()
+            .ok_or(ContextRejection::NoHolderBinding)?;
+        let holder = TokenPublicKey::from_hex(cnf)
+            .map_err(|e| ContextRejection::PopUnverifiable(format!("malformed holder key: {e}")))?;
+
+        // (c.3) re-verify the PoP against the holder, bound to THIS exact call.
+        let req_bytes = request_pop_bytes(&call.request);
+        let binding = AuthorityPopBinding {
+            op: call.request.op_name(),
+            context_token: &call.context.token,
+            nonce: call.nonce,
+            request_bytes: &req_bytes,
+        };
+        cose::verify_authority_pop(&call.pop, &holder, now_unix, &binding)
+            .map_err(|e| ContextRejection::PopUnverifiable(e.to_string()))?;
+
+        Ok(principal)
     }
 }
 
@@ -592,12 +763,13 @@ pub enum ReplayDecision {
 /// is refused as [`ContextRejection::Stale`], so remembering its nonces buys nothing).
 ///
 /// **Property + honest bound.** This suppresses the VERBATIM replay of a captured call frame (same
-/// token, same nonce) and the duplicate side-effect of a frontend re-sending one call. It does NOT,
-/// on its own, stop a frontend RCE from crafting a NEW call (fresh nonce) under an observed token
-/// within the freshness window — the nonce is not signed, so nothing binds it to the token. That
-/// residual is what PoP / `cnf`-binding (mechanism (c)) closes; it is flagged, not implemented here
-/// (see the module doc). Mechanisms (a)+(b) together bound the replay window tightly; (c) would close
-/// it to the holder-of-`cnf` only.
+/// token, same nonce) and the duplicate side-effect of a frontend re-sending one call. On its own it
+/// does NOT stop a frontend RCE from crafting a NEW call (fresh nonce) under an observed token within
+/// the freshness window. That residual is now closed by PoP / `cnf`-binding (mechanism (c)) in
+/// [`ContextVerifier::verify_call`]: the PoP binds the nonce to the token + holder key, so the only
+/// call a frontend can get past (c) is one whose exact `(cti, nonce)` it observed — which this cache
+/// then refuses. Mechanisms (a)+(b)+(c) together contain both the verbatim replay AND the
+/// active-principal new-call forgery.
 ///
 /// Thread-safe (an instance serves authority calls on several link tasks sharing one cache).
 pub struct ReplayCache {
@@ -726,6 +898,83 @@ impl AuthorityAudit for TracingAudit {
     }
 }
 
+/// The **durable, append-only, write-only authority-audit sink** (wiring-gate precondition #3 / F9) —
+/// the production replacement for [`TracingAudit`]. It appends one JSON-lines record per call to a file
+/// held on the RECEIVING (authority-holding) instance, keyed on the VERIFIED `principal_id`:
+///
+/// - **Append-only.** The file is opened with `O_APPEND`, and each record is a single line written with
+///   one `write_all` under a mutex — records are only ever added, never rewritten; a crash mid-write
+///   leaves whole prior lines intact (a partial last line is detectable + ignorable by a reader).
+/// - **Write-only from the caller's view.** Like the trait, the sink exposes no read path to the
+///   authority caller — a compromised frontend can neither read nor tamper the record of what it asked.
+///   The file lives in the crown jewel's own state subtree (the composition must grant it WRITE and
+///   deny the relay any access — a sandbox-profile concern of the wiring composition).
+/// - **Never signals the caller.** A persist failure is logged on the receiver (`tracing::error`) and
+///   swallowed — `record` is infallible from the caller's view, so an audit outage never leaks back as
+///   a distinguishable authority-call outcome.
+///
+/// Durability note: records are flushed to the OS on each write (no userspace buffering is held across
+/// calls); an `fsync`-per-record is deliberately NOT done (authority calls are infrequent but a per-call
+/// fsync is still a needless stall, and the OS page cache already survives a process crash — only a
+/// machine crash loses the tail, an accepted bound for a throttle/forensic log, not a containment).
+pub struct DurableAudit {
+    /// The append-handle, behind a mutex so concurrent link tasks serialize their whole-line writes.
+    file: Mutex<std::fs::File>,
+    /// The path, for the self-logged failure message only (never written into a record).
+    path: std::path::PathBuf,
+}
+
+impl DurableAudit {
+    /// Open (creating if absent, creating parent dirs as needed) the append-only audit file at `path`.
+    /// Fails closed: if the file cannot be opened the authority serve MUST NOT stand up (an audit the
+    /// caller could evade is not an audit), so the error is returned to the stand-up, not swallowed.
+    pub fn open(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(Self {
+            file: Mutex::new(file),
+            path,
+        })
+    }
+}
+
+impl AuthorityAudit for DurableAudit {
+    fn record(&self, entry: &AuthorityAuditEntry) {
+        use std::io::Write as _;
+        // One JSON object per line: the credential-derived principal id, the op, the outcome, and a
+        // receiver-side wall-clock stamp. NON-SECRET only (the entry type forecloses bytes/token/args).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Hand-built JSON over three non-secret, control-character-free fields (principal_id is a
+        // credential-derived `kind|roles` string; op + outcome are &'static tags) — no injection vector.
+        let line = format!(
+            "{{\"ts\":{stamp},\"principal\":{:?},\"op\":{:?},\"outcome\":{:?}}}\n",
+            entry.principal_id,
+            entry.op,
+            format!("{:?}", entry.outcome),
+        );
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = file.write_all(line.as_bytes()) {
+            // Log on the receiver + swallow — never signal the authority caller (append-only, write-only).
+            tracing::error!(
+                path = %self.path.display(), error = %e,
+                "[privsep] durable authority audit: append failed (record dropped; caller not signaled)"
+            );
+        }
+    }
+}
+
 /// The rate-limit decision for one verified principal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitDecision {
@@ -754,6 +1003,171 @@ pub struct Unlimited;
 impl AuthorityRateLimiter for Unlimited {
     fn check(&self, _principal_id: &str) -> RateLimitDecision {
         RateLimitDecision::Allow
+    }
+}
+
+/// A token-bucket quota: at most `capacity` tokens, refilled at `refill_per_sec` tokens/second. One
+/// token is consumed per authority call. `capacity` is the burst allowance; `refill_per_sec` is the
+/// sustained rate.
+#[derive(Debug, Clone, Copy)]
+pub struct RateQuota {
+    /// The maximum (burst) token count.
+    pub capacity: f64,
+    /// The sustained refill rate, tokens per second.
+    pub refill_per_sec: f64,
+}
+
+/// One token bucket (continuous refill via a monotonic clock).
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl Bucket {
+    fn full(q: RateQuota, now: std::time::Instant) -> Self {
+        Self {
+            tokens: q.capacity,
+            last: now,
+        }
+    }
+    /// Refill for the elapsed time, then try to take one token. Returns whether a token was taken.
+    fn refill_and_take(&mut self, q: RateQuota, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * q.refill_per_sec).min(q.capacity);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+    /// Whether the bucket is (approximately) full — an idle bucket safe to evict (a fresh one is full
+    /// too, so dropping it loses no accrued debt).
+    fn is_full(&self, q: RateQuota, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        (self.tokens + elapsed * q.refill_per_sec) >= q.capacity
+    }
+}
+
+/// The **real per-verified-principal + global token-bucket rate limiter** (wiring-gate precondition
+/// #3 / F9) — the production replacement for [`Unlimited`]. A call is allowed only if BOTH the
+/// per-principal bucket AND the global bucket have a token; a token is consumed from each only when
+/// both allow (so a throttled principal never drains the global bucket). Keyed on the VERIFIED
+/// `principal_id` (never the calling instance or an asserted field).
+///
+/// **Throttle, NOT containment (F9).** The containment is the context-binding + PoP; this caps blast
+/// *rate* and surfaces an anomaly. The per-principal map is bounded (`max_tracked`): when full, idle
+/// (refilled-to-capacity) buckets are pruned, and if the map is still full a brand-new principal is
+/// throttled — a flood of distinct principals cannot grow memory unbounded (fail-closed under flood,
+/// matching the replay cache).
+pub struct TokenBucketLimiter {
+    per_principal: RateQuota,
+    state: Mutex<LimiterState>,
+    max_tracked: usize,
+}
+
+struct LimiterState {
+    global: Bucket,
+    global_quota: RateQuota,
+    principals: HashMap<String, Bucket>,
+}
+
+/// The default per-principal token-bucket capacity (burst) — generous, as authority calls are infrequent.
+pub const DEFAULT_RATE_PER_PRINCIPAL_BURST: f64 = 60.0;
+/// The default per-principal sustained refill rate (tokens/sec).
+pub const DEFAULT_RATE_PER_PRINCIPAL_PER_SEC: f64 = 1.0;
+/// The default GLOBAL token-bucket capacity (burst) across all principals on the instance.
+pub const DEFAULT_RATE_GLOBAL_BURST: f64 = 600.0;
+/// The default GLOBAL sustained refill rate (tokens/sec).
+pub const DEFAULT_RATE_GLOBAL_PER_SEC: f64 = 50.0;
+/// The default cap on distinct principals tracked at once (bounds the limiter's memory).
+pub const DEFAULT_RATE_MAX_TRACKED: usize = 65_536;
+
+impl TokenBucketLimiter {
+    /// Build with explicit per-principal + global quotas and a tracking-table bound.
+    #[must_use]
+    pub fn new(per_principal: RateQuota, global: RateQuota, max_tracked: usize) -> Self {
+        Self {
+            per_principal,
+            state: Mutex::new(LimiterState {
+                global: Bucket::full(global, std::time::Instant::now()),
+                global_quota: global,
+                principals: HashMap::new(),
+            }),
+            max_tracked,
+        }
+    }
+
+    /// Build with the documented defaults.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(
+            RateQuota {
+                capacity: DEFAULT_RATE_PER_PRINCIPAL_BURST,
+                refill_per_sec: DEFAULT_RATE_PER_PRINCIPAL_PER_SEC,
+            },
+            RateQuota {
+                capacity: DEFAULT_RATE_GLOBAL_BURST,
+                refill_per_sec: DEFAULT_RATE_GLOBAL_PER_SEC,
+            },
+            DEFAULT_RATE_MAX_TRACKED,
+        )
+    }
+}
+
+impl AuthorityRateLimiter for TokenBucketLimiter {
+    fn check(&self, principal_id: &str) -> RateLimitDecision {
+        let now = std::time::Instant::now();
+        let per_principal = self.per_principal;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // The global bucket first (peek by refilling; only consume if the principal also allows).
+        let global_quota = state.global_quota;
+        let mut global = state.global;
+        let global_elapsed = now.saturating_duration_since(global.last).as_secs_f64();
+        let global_tokens = (global.tokens + global_elapsed * global_quota.refill_per_sec)
+            .min(global_quota.capacity);
+        if global_tokens < 1.0 {
+            // Even refilled, the global bucket is empty: throttle (do not touch the principal bucket).
+            global.tokens = global_tokens;
+            global.last = now;
+            state.global = global;
+            return RateLimitDecision::Throttled;
+        }
+
+        // Bound the tracking table: if full and this principal is new, prune idle (full) buckets.
+        if state.principals.len() >= self.max_tracked
+            && !state.principals.contains_key(principal_id)
+        {
+            state
+                .principals
+                .retain(|_, b| !b.is_full(per_principal, now));
+            if state.principals.len() >= self.max_tracked {
+                // Still full of ACTIVE buckets — a genuine many-principal flood. Fail-closed (throttle)
+                // rather than grow unbounded or evict an active (debt-carrying) bucket.
+                return RateLimitDecision::Throttled;
+            }
+        }
+
+        let bucket = state
+            .principals
+            .entry(principal_id.to_string())
+            .or_insert_with(|| Bucket::full(per_principal, now));
+        if bucket.refill_and_take(per_principal, now) {
+            // The principal allowed — now actually consume the global token too.
+            global.tokens = global_tokens - 1.0;
+            global.last = now;
+            state.global = global;
+            RateLimitDecision::Allow
+        } else {
+            // The principal is throttled — leave the global bucket untouched.
+            RateLimitDecision::Throttled
+        }
     }
 }
 
@@ -1045,13 +1459,46 @@ impl SignerHandler {
                     .to_string(),
             };
         }
+        // PoP-BIND THE OUTPUT (wiring-gate precondition). The minted token is holder-bound (`cnf`) to
+        // the SAME key the originating principal holds — read from the verified context's own `cnf`
+        // (which `verify_call` guaranteed present). So the output is itself proof-of-possession-bound,
+        // not a bare-replayable bearer; AND `mint_authority_output` stamps it `br_authz_issued`, so the
+        // context verifier refuses it if it is ever relayed back as a fresh context — closing the
+        // mint→mint refresh chain. If the principal somehow carries no `cnf` (it never should past
+        // `verify_call`, but a handler can be invoked directly), fail closed rather than mint an
+        // unbindable output.
+        let Some(cnf) = principal.token().cnf.as_deref() else {
+            tracing::warn!(
+                principal = %principal.principal_id(),
+                "[privsep] signer REFUSED mint_token: the verified context carries no holder key (cnf) to PoP-bind the output (fail-closed)"
+            );
+            return AuthorityResponse::Refused {
+                reason:
+                    "mint_token refused: the authority context carries no holder key to bind the \
+                         minted output"
+                        .to_string(),
+            };
+        };
+        let holder = match TokenPublicKey::from_hex(cnf) {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::warn!(
+                    principal = %principal.principal_id(),
+                    "[privsep] signer REFUSED mint_token: the verified context holder key (cnf) is malformed (fail-closed)"
+                );
+                return AuthorityResponse::Refused {
+                    reason: "mint_token refused: the authority context holder key is malformed"
+                        .to_string(),
+                };
+            }
+        };
         let claims = Claims {
             roles: requested_roles,
             kind: cose::KIND_ROLE.to_string(),
             ttl_secs: Some(ttl),
             now_unix,
         };
-        match cose::mint(&claims, self.signer.as_ref()).await {
+        match cose::mint_authority_output(&claims, &holder, self.signer.as_ref()).await {
             Ok(token) => AuthorityResponse::Minted { token },
             // A mint failure is non-secret; never echo the signer error verbatim (it is key-side).
             Err(_) => AuthorityResponse::Refused {
@@ -1229,28 +1676,40 @@ impl AuthorityHandler for AuthorityRegistry {
 /// ## WIRING-GATE PRECONDITIONS (TRACKED — do NOT ship a real frontend→signer serve-link without these)
 ///
 /// This serve is inert in every current composition (no serve-link is designated — see
-/// `boatramp::privsep::compute_authority_serve_links`). BEFORE any composition designates a REAL
-/// relay→crown-jewel authority-serve link, ALL of these are HARD preconditions:
-/// 1. **HIGH-1 per-principal identity.** A mandatory per-principal `sub` claim must be minted into
-///    end-principal role tokens (today [`scope_of`] fails closed because none exists), and the owner
-///    must settle the seal-GRANULARITY model (per-identity `sub` vs per-tenant). Until then the sealer
-///    grammar seals/unseals NOTHING.
-/// 2. **(c) PoP / `cnf`-binding.** (a)+(b) tighten the replay window but do NOT stop an ACTIVE
-///    principal's NEW-call forgery within it (the nonce is unsigned); `cnf`-binding closes that
-///    residual. Needs the originating client to sign an authority-call challenge the frontend relays —
-///    a token-format + guest-SDK change. **Additionally, a machine-minted token output (`mint_token`)
-///    must itself be PoP-bound AND NOT re-redeemable as a mint context** — this closes the mint→mint
-///    refresh chain (a minted token relayed back as a fresh context to mint again) that the per-call
-///    TTL clamp (MEDIUM-1) alone does not.
-/// 3. **Real limiter + durable audit (LOW-3 / INFO).** Swap the default [`Unlimited`] limiter for a
-///    token-bucket and [`TracingAudit`] for a durable append-only sink.
-/// 4. **Per-link PURPOSE marker.** The composition model needs an explicit per-link purpose so a
-///    listener-FRONTEND→signer authority link can be designated WITHOUT colliding with the
-///    link-shape-identical client-fd splice (why `compute_authority_serve_links` conservatively
-///    excludes the listener-peer shape today).
+/// `boatramp::privsep::compute_authority_serve_links`) AND code-fail-closed at stand-up (the gate
+/// `boatramp::privsep::check_authority_serve_preconditions` refuses until BOTH a PoP/cnf verifier is
+/// configured AND the link is purpose-marked). This Phase-2 HARDENING pass builds the containment
+/// preconditions; the remaining ones are the composition/config + owner items:
+/// 1. **HIGH-1 per-principal identity (open — owner + issuance).** A mandatory per-principal `sub` claim
+///    must be minted into end-principal role tokens (today [`scope_of`] fails closed because none
+///    exists), and the owner must settle the seal-GRANULARITY model (per-identity `sub` vs per-tenant).
+///    Until then the sealer grammar seals/unseals NOTHING.
+/// 2. **(c) PoP / `cnf`-binding (BUILT — host side).** [`ContextVerifier::verify_call`] now REQUIRES and
+///    verifies a per-call authority-call proof-of-possession ([`AuthorityCall::pop`]) against the
+///    context token's own `cnf`, bound to (op, context token, nonce, request) — defeating both the
+///    verbatim replay and the ACTIVE-principal new-call forgery that (a)+(b) alone do not. A context
+///    lacking a `cnf`, or a call lacking a valid PoP, is refused fail-closed. A machine-minted
+///    `mint_token` output is itself PoP-bound (`cnf` = the principal's holder key) AND marked
+///    `br_authz_issued`, so it is refused if relayed back as a context — closing the mint→mint refresh
+///    chain. **Cross-repo FOLLOW-ON (guest SDK, `boatramp-uchron-shim`):** the ORIGINATING client must
+///    (i) hold a holder key and present end-principal role tokens that are `cnf`-bound to it, and
+///    (ii) sign each authority call's PoP ([`AuthorityCall::signed`] is the reference impl) and thread
+///    it through the frontend relay ([`AuthorityLink::relay`] forwards it verbatim). Until the issuance
+///    path mints `cnf`-bound end-principal tokens, the host fails closed (a non-`cnf` context is
+///    [`ContextRejection::NoHolderBinding`]) — correct + inert.
+/// 3. **Real limiter + durable audit (BUILT).** [`TokenBucketLimiter`] (per-principal + global) replaces
+///    [`Unlimited`]; [`DurableAudit`] (append-only, write-only, principal-keyed JSONL) replaces
+///    [`TracingAudit`]. The composition's stand-up wires these in (its sandbox profile must grant the
+///    crown jewel WRITE to the audit path and deny the relay any access).
+/// 4. **Per-link PURPOSE marker (open — composition model, sibling lane).** The composition needs an
+///    explicit per-link purpose so a listener-FRONTEND→signer authority link can be designated WITHOUT
+///    colliding with the link-shape-identical client-fd splice (why `compute_authority_serve_links`
+///    conservatively excludes the listener-peer shape today).
 ///
-/// The **LOW-1 revocation residual** (a revoked-but-fresh token is accepted within the freshness
-/// window — inherent to the control-plane-KV-blind crown-jewel split) is documented on
+/// The stand-up gate opens only when BOTH a PoP/cnf verifier is configured (precondition 2's host side
+/// is now present) AND the link is purpose-marked (precondition 4) — so the serve stays inert until
+/// both land. The **LOW-1 revocation residual** (a revoked-but-fresh token is accepted within the
+/// freshness window — inherent to the control-plane-KV-blind crown-jewel split) is documented on
 /// [`ContextVerifier::verify_context`].
 pub struct AuthorityServe<'a> {
     /// The context verifier (public trust root + freshness bound).
@@ -1324,9 +1783,10 @@ impl AuthorityServe<'_> {
             let op = call.request.op_name();
             let now = now_unix();
 
-            // (2) RE-VALIDATE the context (signature + exp + freshness). A rejection reaches no
-            // authority: refused, logged, no principal-keyed audit (there is no verified principal).
-            let principal = match self.verifier.verify_context(&call.context, now) {
+            // (2) RE-VALIDATE the whole call: the context (signature + exp + freshness + cnf-present +
+            // not-an-output) AND the per-call proof-of-possession (mechanism (c)). A rejection reaches
+            // no authority: refused, logged, no principal-keyed audit (there is no verified principal).
+            let principal = match self.verifier.verify_call(&call, now) {
                 Ok(p) => p,
                 Err(rejection) => {
                     tracing::warn!(
@@ -1436,22 +1896,22 @@ mod tests {
             .expect("build a current-thread runtime")
     }
 
-    /// Mint a valid role bearer token (`br_kind = "role"`) with `ttl` seconds from `now`.
-    fn mint_token(signer: &LocalSigner, now: u64, ttl: Option<u64>) -> String {
-        let claims = Claims {
-            roles: Vec::new(),
-            kind: boatramp_core::cose::KIND_ROLE.to_string(),
-            ttl_secs: ttl,
-            now_unix: now,
-        };
-        runtime()
-            .block_on(cose::mint(&claims, signer))
-            .expect("mint")
+    /// Mint a valid, `cnf`-BOUND role bearer token (`br_kind = "role"`) with `ttl` seconds from `now`,
+    /// holder-bound to `holder` (the key a per-call PoP must verify against). This is the realistic
+    /// Phase-3 authority-context shape: an authority context MUST carry a `cnf`.
+    fn mint_ctx(
+        signer: &LocalSigner,
+        holder: &TokenPublicKey,
+        now: u64,
+        ttl: Option<u64>,
+    ) -> String {
+        mint_ctx_roles(signer, holder, now, ttl, Vec::new())
     }
 
-    /// Mint a valid role bearer token carrying `roles`, `ttl` seconds from `now`.
-    fn mint_token_roles(
+    /// Mint a `cnf`-bound role token carrying `roles`.
+    fn mint_ctx_roles(
         signer: &LocalSigner,
+        holder: &TokenPublicKey,
         now: u64,
         ttl: Option<u64>,
         roles: Vec<GrantedRole>,
@@ -1463,8 +1923,48 @@ mod tests {
             now_unix: now,
         };
         runtime()
-            .block_on(cose::mint(&claims, signer))
+            .block_on(cose::mint_delegatable(&claims, holder, signer))
             .expect("mint")
+    }
+
+    /// A `cnf`-bound role token for the verify_context-only / principal-shape tests that do NOT exercise
+    /// the per-call PoP (a throwaway holder is embedded — the private half is never needed here).
+    fn mint_token(signer: &LocalSigner, now: u64, ttl: Option<u64>) -> String {
+        let holder = LocalSigner::generate(TokenAlg::Es256).public_key();
+        mint_ctx(signer, &holder, now, ttl)
+    }
+
+    /// As [`mint_token`] but carrying `roles` (throwaway holder — no PoP exercised).
+    fn mint_token_roles(
+        signer: &LocalSigner,
+        now: u64,
+        ttl: Option<u64>,
+        roles: Vec<GrantedRole>,
+    ) -> String {
+        let holder = LocalSigner::generate(TokenAlg::Es256).public_key();
+        mint_ctx_roles(signer, &holder, now, ttl, roles)
+    }
+
+    /// Build a fully PoP-SIGNED call as the ORIGINATING principal would — a `cnf`-bound context (holder
+    /// `holder`) plus a per-call PoP signed by that holder. The reference for what the guest SDK emits.
+    fn signed_call(
+        root: &LocalSigner,
+        holder: &LocalSigner,
+        now: u64,
+        ttl: Option<u64>,
+        roles: Vec<GrantedRole>,
+        request: AuthorityRequest,
+    ) -> AuthorityCall {
+        let ctx = AuthorityContext::from_token(mint_ctx_roles(
+            root,
+            &holder.public_key(),
+            now,
+            ttl,
+            roles,
+        ));
+        runtime()
+            .block_on(AuthorityCall::signed(ctx, request, holder, now))
+            .expect("sign the authority call")
     }
 
     fn role(name: &str) -> GrantedRole {
@@ -1640,6 +2140,248 @@ mod tests {
         );
     }
 
+    // ---- mechanism (c): the per-call proof-of-possession binding ----
+
+    #[test]
+    fn cnf_less_context_is_refused_no_holder_binding() {
+        // A valid, trust-root-signed role token that is NOT cnf-bound (the ordinary non-delegatable
+        // mint) cannot be an authority context — there is no holder key to bind a PoP to. Refused.
+        let now = 1_000;
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let verifier = ContextVerifier::new(root.public_key());
+        let claims = Claims {
+            roles: Vec::new(),
+            kind: boatramp_core::cose::KIND_ROLE.to_string(),
+            ttl_secs: Some(300),
+            now_unix: now,
+        };
+        let plain = runtime().block_on(cose::mint(&claims, &root)).unwrap();
+        let err = verifier
+            .verify_context(&AuthorityContext::from_token(plain), now + 1)
+            .unwrap_err();
+        assert_eq!(err, ContextRejection::NoHolderBinding);
+    }
+
+    #[test]
+    fn pop_less_call_is_refused() {
+        // verify_call with an empty PoP is refused fail-closed (MissingPop), even on an otherwise valid
+        // cnf-bound context.
+        let now = 1_000;
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let verifier = ContextVerifier::new(root.public_key());
+        let call = AuthorityCall {
+            context: AuthorityContext::from_token(mint_ctx(
+                &root,
+                &holder.public_key(),
+                now,
+                Some(300),
+            )),
+            nonce: fresh_nonce(),
+            pop: String::new(),
+            request: AuthorityRequest::Ping { witness: 1 },
+        };
+        assert_eq!(
+            verifier.verify_call(&call, now + 1).unwrap_err(),
+            ContextRejection::MissingPop
+        );
+    }
+
+    #[test]
+    fn valid_signed_call_verifies_and_wrong_holder_pop_is_refused() {
+        // A PoP signed by the context's OWN holder verifies; a PoP signed by a DIFFERENT key (what a
+        // frontend lacking the holder private key can at best produce) does not.
+        let now = 1_000;
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let verifier = ContextVerifier::new(root.public_key());
+
+        let good = signed_call(
+            &root,
+            &holder,
+            now,
+            Some(300),
+            Vec::new(),
+            AuthorityRequest::Ping { witness: 1 },
+        );
+        assert!(verifier.verify_call(&good, now + 1).is_ok());
+
+        // Same context, but a PoP signed by an IMPOSTOR key (not the context's cnf).
+        let impostor = LocalSigner::generate(TokenAlg::Es256);
+        let req = AuthorityRequest::Ping { witness: 1 };
+        let req_bytes = request_pop_bytes(&req);
+        let binding = AuthorityPopBinding {
+            op: req.op_name(),
+            context_token: &good.context.token,
+            nonce: good.nonce,
+            request_bytes: &req_bytes,
+        };
+        let bad_pop = runtime()
+            .block_on(cose::mint_authority_pop(&binding, &impostor, now))
+            .unwrap();
+        let bad = AuthorityCall {
+            pop: bad_pop,
+            ..good.clone()
+        };
+        assert!(matches!(
+            verifier.verify_call(&bad, now + 1).unwrap_err(),
+            ContextRejection::PopUnverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn pop_bound_to_a_different_request_is_refused() {
+        // THE ACTIVE-PRINCIPAL FORGERY the nonce alone does not stop: a frontend observes a valid
+        // (context, PoP) for op A and tries to pair it with a DIFFERENT request B. The PoP is bound to
+        // the exact request, so swapping it is refused (PopUnverifiable).
+        let now = 1_000;
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let verifier = ContextVerifier::new(root.public_key());
+
+        // A proof minted for a benign Ping...
+        let benign = signed_call(
+            &root,
+            &holder,
+            now,
+            Some(300),
+            vec![role("admin")],
+            AuthorityRequest::Ping { witness: 1 },
+        );
+        // ...re-paired with a privileged MintToken request (same context, same nonce, same PoP).
+        let swapped = AuthorityCall {
+            request: AuthorityRequest::MintToken {
+                requested_roles: vec![role("admin")],
+                ttl_secs: 60,
+            },
+            ..benign.clone()
+        };
+        assert!(matches!(
+            verifier.verify_call(&swapped, now + 1).unwrap_err(),
+            ContextRejection::PopUnverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn mint_output_is_not_re_redeemable_as_a_context() {
+        // Close the mint→mint refresh chain: an output minted by the signer grammar carries the
+        // br_authz_issued marker and so is REFUSED if relayed back as a fresh authority context.
+        let now = 1_000;
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        // The signer's key is the trust root, so a minted output verifies against the context verifier.
+        let signer_key = Arc::new(LocalSigner::from_private_hex(&root.private_hex()).unwrap());
+        let handler = SignerHandler::new(signer_key, DEFAULT_CONTEXT_MAX_AGE_SECS);
+        // A subject-bearing, cnf-bound principal mints an output bound to its holder.
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let mut principal =
+            principal_with_subject("alice", vec![role("admin")], now, now + 1_000_000);
+        principal.token.cnf = Some(holder.public_key().to_hex());
+
+        let out = runtime().block_on(handler.handle(
+            &principal,
+            AuthorityRequest::MintToken {
+                requested_roles: vec![role("admin")],
+                ttl_secs: 60,
+            },
+            now,
+        ));
+        let AuthorityResponse::Minted { token } = out else {
+            panic!("expected Minted, got {out:?}");
+        };
+        // The output verifies as a token AND is marked authority-issued.
+        let v = cose::verify(&token, &root.public_key(), now + 1).unwrap();
+        assert!(v.authority_issued);
+
+        // Relaying it BACK as a fresh authority context is refused (AuthorityIssued).
+        let verifier = ContextVerifier::new(root.public_key());
+        let err = verifier
+            .verify_context(&AuthorityContext::from_token(token), now + 1)
+            .unwrap_err();
+        assert_eq!(err, ContextRejection::AuthorityIssued);
+    }
+
+    // ---- durable audit sink (task #2): append-only, write-only, principal-keyed ----
+
+    #[test]
+    fn durable_audit_appends_one_line_per_record() {
+        let dir = std::env::temp_dir().join(format!("privsep-audit-{}", fresh_nonce()));
+        let path = dir.join("authority-audit.jsonl");
+        let audit = DurableAudit::open(&path).expect("open durable audit");
+        audit.record(&AuthorityAuditEntry {
+            principal_id: "role|admin".to_string(),
+            op: "mint_token",
+            outcome: AuthorityOutcome::Served,
+        });
+        audit.record(&AuthorityAuditEntry {
+            principal_id: "role|viewer".to_string(),
+            op: "ping",
+            outcome: AuthorityOutcome::RateLimited,
+        });
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "append-only: one line per record");
+        assert!(lines[0].contains("\"op\":\"mint_token\"") && lines[0].contains("role|admin"));
+        assert!(lines[1].contains("RateLimited") && lines[1].contains("role|viewer"));
+        // Re-opening appends (never truncates) — the durable property.
+        drop(audit);
+        let audit2 = DurableAudit::open(&path).expect("re-open");
+        audit2.record(&AuthorityAuditEntry {
+            principal_id: "role|admin".to_string(),
+            op: "ping",
+            outcome: AuthorityOutcome::Replayed,
+        });
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(body.lines().count(), 3, "re-open appends, never truncates");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- token-bucket rate limiter (task #3): per-principal + global ----
+
+    #[test]
+    fn token_bucket_throttles_a_principal_past_its_burst() {
+        // A tiny per-principal bucket (capacity 3, no refill) allows exactly 3 then throttles; a
+        // DIFFERENT principal is unaffected (per-principal keying).
+        let limiter = TokenBucketLimiter::new(
+            RateQuota {
+                capacity: 3.0,
+                refill_per_sec: 0.0,
+            },
+            RateQuota {
+                capacity: 1_000.0,
+                refill_per_sec: 0.0,
+            },
+            1_024,
+        );
+        for _ in 0..3 {
+            assert_eq!(limiter.check("alice"), RateLimitDecision::Allow);
+        }
+        assert_eq!(limiter.check("alice"), RateLimitDecision::Throttled);
+        // A different principal still has its own full bucket.
+        assert_eq!(limiter.check("bob"), RateLimitDecision::Allow);
+    }
+
+    #[test]
+    fn token_bucket_global_cap_throttles_across_principals() {
+        // A global cap of 2 (no refill) throttles the 3rd call even across DISTINCT principals, and a
+        // throttled call does not consume a principal's own tokens needlessly.
+        let limiter = TokenBucketLimiter::new(
+            RateQuota {
+                capacity: 100.0,
+                refill_per_sec: 0.0,
+            },
+            RateQuota {
+                capacity: 2.0,
+                refill_per_sec: 0.0,
+            },
+            1_024,
+        );
+        assert_eq!(limiter.check("alice"), RateLimitDecision::Allow);
+        assert_eq!(limiter.check("bob"), RateLimitDecision::Allow);
+        // Global bucket is now empty → everyone is throttled regardless of per-principal headroom.
+        assert_eq!(limiter.check("carol"), RateLimitDecision::Throttled);
+        assert_eq!(limiter.check("alice"), RateLimitDecision::Throttled);
+    }
+
     // ---- audit sink: append-only + receiver-side, keyed on the verified principal ----
 
     /// A receiver-side collecting sink for the harness. The append-only CALLER-FACING contract is the
@@ -1743,6 +2485,9 @@ mod tests {
         iat: u64,
         exp: u64,
     ) -> VerifiedPrincipal {
+        // A holder key so an authority-output mint (which binds the output to the principal's `cnf`)
+        // has one to bind to — the realistic shape of a verify_call'd principal.
+        let holder = LocalSigner::generate(TokenAlg::Es256).public_key().to_hex();
         VerifiedPrincipal {
             token: VerifiedToken {
                 roles,
@@ -1751,7 +2496,8 @@ mod tests {
                 cti: "test-cti".to_string(),
                 iat: Some(iat),
                 exp: Some(exp),
-                cnf: None,
+                cnf: Some(holder),
+                authority_issued: false,
             },
         }
     }
@@ -2075,22 +2821,29 @@ mod tests {
         }
 
         #[test]
-        fn ping_round_trips_under_a_valid_context() {
+        fn ping_round_trips_under_a_valid_signed_context() {
             let now = 1_000;
-            let signer = LocalSigner::generate(TokenAlg::Es256);
-            let ctx = AuthorityContext::from_token(mint_token(&signer, now, Some(300)));
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
             let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
             let server = spawn_server(
                 server_end,
-                ContextVerifier::new(signer.public_key()),
+                ContextVerifier::new(root.public_key()),
                 Arc::new(PingHandler),
                 Arc::new(Unlimited),
                 Arc::new(CollectingAudit::default()),
                 now + 1,
             );
-            let resp = client_end
-                .call(&ctx, &AuthorityRequest::Ping { witness: 42 })
-                .expect("the call round-trips");
+            // The ORIGINATING principal signs the call with its holder key; the frontend relays it.
+            let call = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 42 },
+            );
+            let resp = client_end.relay(&call).expect("the call round-trips");
             assert_eq!(resp, AuthorityResponse::Pong { witness: 42 });
             drop(client_end); // EOF → the serve loop returns Ok
             server.join().unwrap().expect("serve ends cleanly on EOF");
@@ -2098,12 +2851,13 @@ mod tests {
 
         #[test]
         fn grammar_round_trips_and_a_replayed_call_is_refused() {
-            // The WS-E grammar over a real socketpair, with a RELAYED real token (which carries no
-            // subject today): the sealer seal FAILS CLOSED (HIGH-1 — no identity ⇒ no scope); the
-            // signer mint_token works (roles-based); then a VERBATIM replay of a captured call frame
-            // (same context, same nonce) is refused by the anti-replay cache.
+            // The WS-E grammar over a real socketpair, with a PoP-SIGNED relayed call: the sealer seal
+            // FAILS CLOSED (HIGH-1 — no subject ⇒ no scope); the signer mint_token works (roles-based)
+            // and its output is cnf-bound + authority-issued; then a VERBATIM replay of a captured call
+            // frame (same context, same nonce, same PoP) is refused by the anti-replay cache.
             let now = 2_000;
             let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
             let trust_root = root.public_key();
             let kek = Arc::new(LocalKek::from_bytes([9u8; 32])) as Arc<dyn KeyEnvelope>;
             // The signer handler's own key is the trust root here (so a minted token verifies).
@@ -2118,12 +2872,6 @@ mod tests {
                 Arc::new(SignerHandler::new(signer_key, DEFAULT_CONTEXT_MAX_AGE_SECS)),
             );
 
-            let ctx = AuthorityContext::from_token(mint_token_roles(
-                &root,
-                now,
-                Some(300),
-                vec![role("admin")],
-            ));
             let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
             let server = spawn_server(
                 server_end,
@@ -2134,46 +2882,60 @@ mod tests {
                 now + 1,
             );
 
-            // seal FAILS CLOSED over the wire: a relayed real token carries no subject (HIGH-1).
-            let sealed = client_end
-                .call(
-                    &ctx,
-                    &AuthorityRequest::Seal {
-                        plaintext: b"serving secret".to_vec(),
-                    },
-                )
-                .expect("seal call carried");
+            // seal FAILS CLOSED over the wire: a relayed token carries no subject (HIGH-1).
+            let seal = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![role("admin")],
+                AuthorityRequest::Seal {
+                    plaintext: b"serving secret".to_vec(),
+                },
+            );
+            let sealed = client_end.relay(&seal).expect("seal call carried");
             assert!(
                 matches!(sealed, AuthorityResponse::Refused { .. }),
                 "a subjectless relayed context must seal nothing (fail-closed), got {sealed:?}"
             );
 
             // mint_token works (roles-based, not identity-scoped): the principal holds admin, mints
-            // admin (a subset of itself), TTL bound to the context's remaining freshness.
-            let minted = client_end
-                .call(
-                    &ctx,
-                    &AuthorityRequest::MintToken {
-                        requested_roles: vec![role("admin")],
-                        ttl_secs: 60,
-                    },
-                )
-                .expect("mint call");
+            // admin (a subset of itself); the output is cnf-bound to the holder + authority-issued.
+            let mint = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![role("admin")],
+                AuthorityRequest::MintToken {
+                    requested_roles: vec![role("admin")],
+                    ttl_secs: 60,
+                },
+            );
+            let minted = client_end.relay(&mint).expect("mint call");
             let AuthorityResponse::Minted { token } = minted else {
                 panic!("expected Minted, got {minted:?}");
             };
+            let v = cose::verify(&token, &trust_root, now + 2).unwrap();
+            assert_eq!(v.roles, vec![role("admin")]);
+            assert!(v.authority_issued, "the output must be authority-issued");
             assert_eq!(
-                cose::verify(&token, &trust_root, now + 2).unwrap().roles,
-                vec![role("admin")]
+                v.cnf.as_deref(),
+                Some(holder.public_key().to_hex().as_str()),
+                "the output must be cnf-bound to the principal's holder"
             );
 
-            // Now a VERBATIM REPLAY: send the identical call frame (same context + same nonce) twice.
-            let call = AuthorityCall {
-                context: ctx.clone(),
-                nonce: 0xDEAD_BEEF,
-                request: AuthorityRequest::Ping { witness: 1 },
-            };
-            let frame = serde_json::to_vec(&call).unwrap();
+            // Now a VERBATIM REPLAY: send the identical signed call frame twice. The first is served;
+            // the second is refused by the (cti, nonce) anti-replay cache even though the PoP re-verifies.
+            let ping = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![role("admin")],
+                AuthorityRequest::Ping { witness: 1 },
+            );
+            let frame = serde_json::to_vec(&ping).unwrap();
             client_end.send_frame(&frame).unwrap();
             let first: AuthorityResponse =
                 serde_json::from_slice(&client_end.recv_frame().unwrap()).unwrap();
@@ -2191,14 +2953,85 @@ mod tests {
         }
 
         #[test]
+        fn pop_less_call_is_refused_over_the_wire() {
+            // A relayed call with NO proof-of-possession (empty `pop`) is refused fail-closed — the host
+            // refuses a context lacking a valid PoP (mechanism (c) is mandatory). A fresh valid call on
+            // the same link still succeeds (the server keeps serving).
+            let now = 1_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(PingHandler),
+                Arc::new(Unlimited),
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+            // A cnf-bound context but a STRIPPED PoP (what a frontend that observed only the token, not a
+            // per-call proof, could at best present).
+            let no_pop = AuthorityCall {
+                context: AuthorityContext::from_token(mint_ctx(
+                    &root,
+                    &holder.public_key(),
+                    now,
+                    Some(300),
+                )),
+                nonce: fresh_nonce(),
+                pop: String::new(),
+                request: AuthorityRequest::Ping { witness: 7 },
+            };
+            let resp = client_end
+                .relay(&no_pop)
+                .expect("the link carries the call");
+            assert!(
+                matches!(resp, AuthorityResponse::Refused { .. }),
+                "a PoP-less call must be refused, got {resp:?}"
+            );
+            let good = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 8 },
+            );
+            assert_eq!(
+                client_end.relay(&good).expect("still serving"),
+                AuthorityResponse::Pong { witness: 8 }
+            );
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+        }
+
+        #[test]
         fn forged_context_is_refused_no_pong() {
-            // A compromised frontend relays a token it forged with a key it holds (not the trust root):
-            // the receiver re-validates and REFUSES — no `Pong`, and it keeps serving.
+            // A compromised frontend relays a (self-signed-PoP) call whose CONTEXT token it forged with a
+            // key it holds (not the trust root): the receiver re-validates the token and REFUSES before
+            // the PoP even matters — no `Pong`, and it keeps serving.
             let now = 1_000;
             let real = LocalSigner::generate(TokenAlg::Es256);
             let attacker = LocalSigner::generate(TokenAlg::Es256);
-            let good_ctx = AuthorityContext::from_token(mint_token(&real, now, Some(300)));
-            let forged_ctx = AuthorityContext::from_token(mint_token(&attacker, now, Some(300)));
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            // The attacker can produce a self-consistent call (its own forged context + a matching PoP),
+            // but the context does not verify against the REAL trust root.
+            let forged = signed_call(
+                &attacker,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 1 },
+            );
+            let good = signed_call(
+                &real,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 2 },
+            );
 
             let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
             let server = spawn_server(
@@ -2210,18 +3043,14 @@ mod tests {
                 now + 1,
             );
 
-            // The forged context is refused (no bytes, no pong) ...
             let resp = client_end
-                .call(&forged_ctx, &AuthorityRequest::Ping { witness: 1 })
+                .relay(&forged)
                 .expect("the link still carries the call");
             assert!(
                 matches!(resp, AuthorityResponse::Refused { .. }),
                 "got {resp:?}"
             );
-            // ... and the server keeps serving: a valid context on the same link still succeeds.
-            let resp = client_end
-                .call(&good_ctx, &AuthorityRequest::Ping { witness: 2 })
-                .expect("still serving");
+            let resp = client_end.relay(&good).expect("still serving");
             assert_eq!(resp, AuthorityResponse::Pong { witness: 2 });
 
             drop(client_end);
@@ -2231,11 +3060,19 @@ mod tests {
         #[test]
         fn throttled_principal_is_refused_and_audited() {
             let now = 1_000;
-            let signer = LocalSigner::generate(TokenAlg::Es256);
-            let ctx = AuthorityContext::from_token(mint_token(&signer, now, Some(300)));
-            // Pre-compute the principal id the limiter must deny.
-            let denied_id = ContextVerifier::new(signer.public_key())
-                .verify_context(&ctx, now + 1)
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let call = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 9 },
+            );
+            // Pre-compute the principal id the limiter must deny (verify_context yields the same id).
+            let denied_id = ContextVerifier::new(root.public_key())
+                .verify_context(&call.context, now + 1)
                 .unwrap()
                 .principal_id();
             let mut deny = std::collections::BTreeSet::new();
@@ -2245,16 +3082,14 @@ mod tests {
             let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
             let server = spawn_server(
                 server_end,
-                ContextVerifier::new(signer.public_key()),
+                ContextVerifier::new(root.public_key()),
                 Arc::new(PingHandler),
                 Arc::new(DenyPrincipals(deny)),
                 audit.clone(),
                 now + 1,
             );
 
-            let resp = client_end
-                .call(&ctx, &AuthorityRequest::Ping { witness: 9 })
-                .expect("the link carries the call");
+            let resp = client_end.relay(&call).expect("the link carries the call");
             assert!(
                 matches!(resp, AuthorityResponse::Refused { .. }),
                 "got {resp:?}"

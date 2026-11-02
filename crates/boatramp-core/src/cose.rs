@@ -206,6 +206,12 @@ const CLAIM_BH: &str = "bh";
 pub const POP_WINDOW_SECS: u64 = 60;
 /// Clock skew tolerated for a proof minted slightly in the future, in seconds.
 pub const POP_SKEW_SECS: u64 = 30;
+/// The audience domain-separation marker bound into an **AUTHORITY-CALL** proof-of-possession (privsep
+/// WS-E; see [`AuthorityPopBinding`]), as its PoP `aud`. It is a fixed, non-origin sentinel distinct
+/// from any HTTP DPoP `aud` (a fleet origin like `https://cp.example.com`), so a DPoP proof the end
+/// principal minted for an HTTP control-plane request can NEVER be relayed as an authority-call proof,
+/// and vice versa — the two possession proofs are domain-separated by this audience.
+pub const AUTHORITY_POP_AUD: &str = "br:privsep:authority-call";
 /// The largest request body bound by a PoP `bh` hash. Both the client (which
 /// signs) and the server (which buffers + verifies) key the body binding off
 /// `body length ≤ this`, so they always agree on whether a proof carries a `bh`.
@@ -219,6 +225,13 @@ pub const POP_MAX_BODY_HASH_BYTES: usize = 1024 * 1024;
 const CLAIM_CNF: &str = "br_cnf";
 /// Text claim key for a delegation block's narrowing caveats (a CBOR map).
 const CLAIM_CAVEATS: &str = "br_caveats";
+/// Bool claim key marking a token as an **AUTHORITY-API OUTPUT** — a token MACHINE-MINTED by a privsep
+/// crown jewel over the WS-E `mint_token` grammar (see [`mint_authority_output`]). It is set only on
+/// such outputs; a token minted by the ordinary control-plane issuance path never carries it. A privsep
+/// context verifier REFUSES any authority context bearing this marker, so an authority-API output can
+/// NEVER be relayed back as a fresh authority context — this closes the mint→mint refresh chain (and the
+/// seal-context re-redemption of an output) that a per-call TTL clamp alone does not.
+const CLAIM_AUTHZ_ISSUED: &str = "br_authz_issued";
 
 /// Max blocks in a presented delegation chain — a resource bound checked *before*
 /// any signature verification.
@@ -627,13 +640,20 @@ pub struct VerifiedToken {
     /// The expiry (Unix seconds), if any.
     pub exp: Option<u64>,
     /// The holder key `"<alg>:<hex>"` (RFC 8747 `cnf`), when this token is
-    /// *delegatable* — the key allowed to mint the next chain block.
+    /// *delegatable* — the key allowed to mint the next chain block. For the privsep
+    /// authority API it is also the key a per-call [`AuthorityPopBinding`] proof must verify
+    /// against (an authority context MUST be holder-bound — see the privsep context verifier).
     pub cnf: Option<String>,
+    /// Whether this token was MACHINE-MINTED as an authority-API output (the `br_authz_issued`
+    /// marker — [`mint_authority_output`]). `true` only for a privsep WS-E `mint_token` result;
+    /// a token from the ordinary control-plane issuance path is `false`. A privsep context verifier
+    /// refuses an authority context carrying `true` (closing the mint→mint refresh chain).
+    pub authority_issued: bool,
 }
 
 /// Mint a signed `COSE_Sign1` CWT for role `claims`, returning the base64url token.
 pub async fn mint(claims: &Claims, signer: &dyn Signer) -> Result<String, TokenError> {
-    mint_inner(claims, None, signer).await
+    mint_inner(claims, None, false, signer).await
 }
 
 /// Mint a **delegatable** role token: like [`mint`] but declaring a holder key
@@ -645,12 +665,32 @@ pub async fn mint_delegatable(
     holder: &TokenPublicKey,
     signer: &dyn Signer,
 ) -> Result<String, TokenError> {
-    mint_inner(claims, Some(holder), signer).await
+    mint_inner(claims, Some(holder), false, signer).await
+}
+
+/// Mint an **AUTHORITY-API OUTPUT** token — the result of a privsep WS-E `mint_token` grammar call.
+/// It differs from a plain [`mint`] in two load-bearing ways that harden the authority serve:
+///
+/// 1. **Holder-bound (`cnf`) — the output is itself PoP-bound.** `holder` is the ORIGINATING end
+///    principal's holder key (the key the frontend does NOT hold, carried as the request context's own
+///    `cnf`). A later use of the output therefore still requires a proof of possession by that key — the
+///    output is not a bare-replayable bearer.
+/// 2. **Marked `br_authz_issued` — not re-redeemable as an authority context.** The privsep context
+///    verifier refuses any authority context bearing this marker, so the output can NEVER be relayed
+///    back to the crown jewel as a fresh context to mint again. This closes the mint→mint refresh chain
+///    (an output fed back to `mint_token`) that the per-call TTL clamp alone does not.
+pub async fn mint_authority_output(
+    claims: &Claims,
+    holder: &TokenPublicKey,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    mint_inner(claims, Some(holder), true, signer).await
 }
 
 async fn mint_inner(
     claims: &Claims,
     holder: Option<&TokenPublicKey>,
+    authority_issued: bool,
     signer: &dyn Signer,
 ) -> Result<String, TokenError> {
     let mut builder = ClaimsSetBuilder::new()
@@ -660,6 +700,9 @@ async fn mint_inner(
         .text_claim(CLAIM_KIND.to_string(), CborValue::Text(claims.kind.clone()));
     if let Some(holder) = holder {
         builder = builder.text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder.to_hex()));
+    }
+    if authority_issued {
+        builder = builder.text_claim(CLAIM_AUTHZ_ISSUED.to_string(), CborValue::Bool(true));
     }
     if let Some(ttl) = claims.ttl_secs {
         builder = builder.expiration_time(Timestamp::WholeSeconds(
@@ -924,6 +967,7 @@ fn role_token(claims: &ClaimsSet, exp: Option<u64>) -> Result<VerifiedToken, Tok
         iat: claim_iat(claims),
         exp,
         cnf: claim_cnf(claims),
+        authority_issued: claim_bool(claims, CLAIM_AUTHZ_ISSUED),
     })
 }
 
@@ -2480,6 +2524,85 @@ pub fn verify_pop(
     claim_cti(&claims)
 }
 
+/// The bound facts of an **AUTHORITY-CALL proof-of-possession** (privsep WS-E — `PLAN-privsep-phase1.md`
+/// §3.4 watch-item mechanism (c)). The ORIGINATING end principal signs a proof over these with its
+/// holder (`cnf`) key for each authority call; the crown-jewel instance rebuilds them from the received
+/// call and verifies the proof against the context token's `cnf`. Because the holder key is one the
+/// (possibly RCE'd) frontend relaying the call does NOT hold, a valid proof can only come from the real
+/// principal — so a frontend can at most REPLAY an exact observed `(context, nonce, request, proof)`
+/// tuple (caught by the per-call nonce replay cache), and can NEVER forge a NEW authority call under an
+/// observed context. This is what the freshness bound (a) + nonce cache (b) alone do not stop.
+///
+/// It reuses the vetted DPoP [`PopClaims`]/[`mint_pop`]/[`verify_pop`] machinery (same `COSE_Sign1`
+/// `br_kind = "pop"` proof, same freshness window, same alg-pinned verify), domain-separated from an
+/// HTTP DPoP proof by the fixed [`AUTHORITY_POP_AUD`] audience. The authority-call facts map onto the
+/// DPoP fields deterministically (see [`authority_pop_claims`]), so a single shared builder keeps mint
+/// and verify from drifting.
+#[derive(Debug, Clone)]
+pub struct AuthorityPopBinding<'a> {
+    /// The op name (the caller's `op_name`) — bound so a proof for one op can't authorize another.
+    pub op: &'a str,
+    /// The exact context bearer token the call relays (its base64url text) — bound via its hash so the
+    /// proof is tied to THAT specific context and can't be paired with a different one.
+    pub context_token: &'a str,
+    /// The per-call anti-replay nonce — bound so the (otherwise unsigned) nonce is cryptographically
+    /// tied to the token + holder key (a frontend can't swap the nonce on an observed proof).
+    pub nonce: u128,
+    /// The serialized request bytes — bound so a captured proof can't be re-paired with swapped
+    /// arguments. Both sides MUST serialize the request identically (the privsep serve re-serializes the
+    /// received request with the same codec the originator used).
+    pub request_bytes: &'a [u8],
+}
+
+/// Map the authority-call facts onto the DPoP [`PopClaims`] shape, deterministically, so
+/// [`mint_authority_pop`] and [`verify_authority_pop`] bind the IDENTICAL facts. The op goes in `htm`,
+/// a fixed marker path in `htp`, the domain-separation audience in `aud`, the context-token hash in
+/// `ath`, and a hash over `nonce ‖ request_bytes` in `bh` (binding BOTH the nonce and the exact
+/// request in one bound fact).
+fn authority_pop_claims(b: &AuthorityPopBinding<'_>) -> PopClaims {
+    let mut challenge = Vec::with_capacity(16 + b.request_bytes.len());
+    challenge.extend_from_slice(&b.nonce.to_le_bytes());
+    challenge.extend_from_slice(b.request_bytes);
+    PopClaims {
+        htm: b.op.to_ascii_uppercase(),
+        htp: canon_pop_path("/privsep/authority"),
+        aud: AUTHORITY_POP_AUD.to_string(),
+        ath: pop_sha256_hex(b.context_token.as_bytes()),
+        bh: Some(pop_sha256_hex(&challenge)),
+    }
+}
+
+/// Mint an authority-call proof-of-possession for `binding`, signed by the end principal's holder
+/// (`cnf`) key. Returned base64url. (This is the ORIGINATING client's operation — the frontend relaying
+/// the call never mints it, as it does not hold the key; the guest-SDK half that calls this is a
+/// cross-repo follow-on.)
+pub async fn mint_authority_pop(
+    binding: &AuthorityPopBinding<'_>,
+    holder: &dyn Signer,
+    now_unix: u64,
+) -> Result<String, TokenError> {
+    mint_pop(&authority_pop_claims(binding), holder, now_unix).await
+}
+
+/// Verify an authority-call proof-of-possession `proof` against `holder_public` (the context token's
+/// `cnf`) at `now_unix`, rebuilding the expected bound facts from `binding` (the received call). On
+/// success returns the proof's `jti` (its `cti`, hex) — a replay handle the caller may additionally
+/// track. Fail-closed: a proof that is not a PoP, is stale/future, or whose bound facts do not match the
+/// call is rejected.
+pub fn verify_authority_pop(
+    proof: &str,
+    holder_public: &TokenPublicKey,
+    now_unix: u64,
+    binding: &AuthorityPopBinding<'_>,
+) -> Result<String, TokenError> {
+    verify_pop(
+        proof,
+        holder_public,
+        now_unix,
+        &authority_pop_claims(binding),
+    )
+}
+
 /// Decode a presented credential into its ordered blocks (raw tagged
 /// `COSE_Sign1` bytes). A plain token is a bare `COSE_Sign1` (one block); a chain
 /// is a CBOR array of byte strings. Enforces the size/depth bounds *before* any
@@ -2575,6 +2698,12 @@ fn claim_cnf(claims: &ClaimsSet) -> Option<String> {
         CborValue::Text(t) => Some(t.clone()),
         _ => None,
     })
+}
+
+/// Read a boolean text-keyed claim: `true` only when present AND literally `true` (an absent or
+/// non-`true` value reads `false` — fail-closed for a security marker like `br_authz_issued`).
+fn claim_bool(claims: &ClaimsSet, name: &str) -> bool {
+    matches!(text_claim(claims, name), Some(CborValue::Bool(true)))
 }
 
 /// Look up a text-keyed private-use claim by name.
@@ -3564,6 +3693,115 @@ mod tests {
             verify_pop(&role, &public, NOW, &want),
             Err(TokenError::Claims(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn authority_pop_binds_the_call_and_rejects_mismatch() {
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let public = holder.public_key();
+        let req = b"serialized-mint_token-request-bytes";
+        let binding = AuthorityPopBinding {
+            op: "mint_token",
+            context_token: "the-context-token-base64url",
+            nonce: 0xA1B2_C3D4_u128,
+            request_bytes: req,
+        };
+        let proof = mint_authority_pop(&binding, &holder, NOW).await.unwrap();
+        // The matching call verifies against the holder (the context's cnf).
+        assert!(verify_authority_pop(&proof, &public, NOW + 5, &binding).is_ok());
+
+        // Wrong holder key (a frontend that does NOT hold the cnf key) → rejected.
+        let other = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_authority_pop(&proof, &other.public_key(), NOW + 5, &binding).is_err());
+
+        // A changed op / context-token / nonce / request each breaks a bound fact → rejected
+        // (an active principal's NEW-call forgery under an observed proof is foreclosed).
+        for bad in [
+            AuthorityPopBinding {
+                op: "seal",
+                ..binding.clone()
+            },
+            AuthorityPopBinding {
+                context_token: "a-different-context",
+                ..binding.clone()
+            },
+            AuthorityPopBinding {
+                nonce: 0xDEAD_BEEF_u128,
+                ..binding.clone()
+            },
+            AuthorityPopBinding {
+                request_bytes: b"serialized-mint_token-request-bytes-SWAPPED",
+                ..binding.clone()
+            },
+        ] {
+            assert!(
+                verify_authority_pop(&proof, &public, NOW + 5, &bad).is_err(),
+                "must reject a proof bound to a different call"
+            );
+        }
+
+        // Past the freshness window → Expired (short replay window).
+        assert!(matches!(
+            verify_authority_pop(&proof, &public, NOW + POP_WINDOW_SECS + 5, &binding),
+            Err(TokenError::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authority_pop_is_domain_separated_from_http_dpop() {
+        // A DPoP proof the principal minted for an HTTP control-plane request must NOT verify as an
+        // authority-call proof (different `aud`), even with the SAME holder key — and vice versa.
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let public = holder.public_key();
+
+        let http = PopClaims {
+            htm: "MINT_TOKEN".into(),
+            htp: canon_pop_path("/privsep/authority"),
+            aud: "https://cp.example.com".into(), // an HTTP origin, NOT the authority audience
+            ath: pop_sha256_hex(b"ctx"),
+            bh: None,
+        };
+        let http_proof = mint_pop(&http, &holder, NOW).await.unwrap();
+
+        let binding = AuthorityPopBinding {
+            op: "mint_token",
+            context_token: "ctx",
+            nonce: 1,
+            request_bytes: b"",
+        };
+        // The HTTP DPoP proof does not satisfy the authority-call binding (aud mismatch).
+        assert!(verify_authority_pop(&http_proof, &public, NOW + 1, &binding).is_err());
+
+        // And an authority-call proof does not satisfy an HTTP DPoP expectation (aud mismatch).
+        let auth_proof = mint_authority_pop(&binding, &holder, NOW).await.unwrap();
+        assert!(verify_pop(&auth_proof, &public, NOW + 1, &http).is_err());
+    }
+
+    #[tokio::test]
+    async fn authority_output_is_cnf_bound_and_marked_issued() {
+        // An authority-API output is holder-bound (cnf) AND carries the br_authz_issued marker; a plain
+        // mint carries neither. The marker is what a privsep context verifier keys the re-redemption
+        // refusal on.
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let output = mint_authority_output(&claims(), &holder.public_key(), &root)
+            .await
+            .unwrap();
+        let v = verify(&output, &root.public_key(), NOW + 1).unwrap();
+        assert!(v.authority_issued, "output must be marked authority-issued");
+        assert_eq!(
+            v.cnf.as_deref(),
+            Some(holder.public_key().to_hex().as_str()),
+            "output must be cnf-bound to the holder"
+        );
+
+        let plain = mint(&claims(), &root).await.unwrap();
+        let pv = verify(&plain, &root.public_key(), NOW + 1).unwrap();
+        assert!(
+            !pv.authority_issued,
+            "a plain mint is never authority-issued"
+        );
+        assert!(pv.cnf.is_none(), "a plain mint is not cnf-bound");
     }
 
     #[tokio::test]
