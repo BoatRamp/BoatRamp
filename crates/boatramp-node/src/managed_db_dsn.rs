@@ -49,37 +49,37 @@
 //! runtime DSN) + `migration_url_env` (the DDL-identity DSN) injected, so the simple case
 //! needs no template. Templating is the general mechanism; these are the defaults.
 //!
-//! ## Phase-1 trade-off (documented)
+//! ## Dynamic per-replica credential (Phase 2, now WIRED)
 //!
-//! The managed credential sits in the workload's env as a STATIC DSN (owner-accepted for
-//! Phase 1). The follow-up replaces it with a dynamic, per-replica role minted at launch
-//! and revoked on stop, anchored to a stable owner role — tracked at [`DYNAMIC_ROLE_TODO`].
-//! Nothing here blocks it: the only seam a workload sees is its env DSN, which the follow-up
-//! fills from a short-lived role instead of the static managed credential.
+//! For a **Shared**, non-default, project-scoped managed binding the DSN's RUNTIME identity is a
+//! DYNAMIC, per-replica role minted at launch and dropped at stop (anchored to a stable owner
+//! role) — [`crate::dynamic_creds`]. The reconcile mints it (via
+//! [`ManagedDbEnvResolver::mint_dynamic_db_cred`](boatramp_core::compute::ManagedDbEnvResolver))
+//! BEFORE binding resolution; here [`resolve_dynamic_credential`] reads the freshly-sealed role
+//! back and the runtime DSN carries IT instead of the static per-tenant credential. Every cell
+//! where phase 2 does not apply (the reserved `default` tenant, `Single` isolation, a `Site`
+//! scope, a bring-your-own `url_env` binding) falls back to the static Runtime credential, exactly
+//! as before. The migration/DDL identity always stays the static owner-role credential.
 
 #![cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
+use boatramp_core::compute::{
+    BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution, compute_instance_id,
+};
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
-use boatramp_core::project::ProjectRef;
 use boatramp_core::secret_store::SecretStore;
 
 use crate::config::ExternalDatabaseConfig;
+use crate::dynamic_creds::resolve_dynamic_credential;
 use crate::managed_db_declare::resolve_binding;
+use crate::managed_env_template::apply_env_render;
 use crate::tenant_sql::{ConnRole, NodeTenantSqlResolver, SqlConnParts};
-
-/// The Phase-2 follow-up this Phase-1 resolver leaves room for: replace the STATIC managed
-/// credential in the workload's env DSN with a DYNAMIC, per-replica role minted at launch
-/// and revoked on stop, anchored to a stable owner role. Not implemented here; the env DSN
-/// is the only seam a workload sees, so the follow-up changes how the password is sourced
-/// without touching the workload contract. (PLAN-compute-managed-db-dsn Phase 2.)
-pub const DYNAMIC_ROLE_TODO: &str = "PLAN-compute-managed-db-dsn Phase 2: dynamic per-replica role";
 
 /// Resolves a workload's `sql` [`ComputeBinding`]s, injecting a real `postgres://` /
 /// `mysql://` DSN for a managed co-located Postgres/MySQL target and delegating every other
@@ -139,6 +139,7 @@ impl ManagedDbDsnResolver {
         &self,
         project: &str,
         workload: &str,
+        replica: u32,
         binding: &ComputeBinding,
     ) -> Result<Option<ManagedBinding>, String> {
         let cfg = match resolve_binding(&self.databases, &self.deploy, project, &binding.name).await
@@ -162,7 +163,7 @@ impl ManagedDbDsnResolver {
         // The compute binding's tenant is `(project, site = workload)` — the SAME tenant a
         // handler for that workload would resolve (the shim passes `workload` as the site),
         // so a workload can never reach another tenant's database.
-        let runtime = resolver
+        let mut runtime = resolver
             .connection_parts(project, workload, ConnRole::Runtime)
             .await
             .map_err(|e| e.to_string())?;
@@ -170,6 +171,24 @@ impl ManagedDbDsnResolver {
             .connection_parts(project, workload, ConnRole::Migration)
             .await
             .map_err(|e| e.to_string())?;
+        // Phase 2: if a DYNAMIC per-replica role was minted for this replica (the reconcile mints
+        // it BEFORE binding resolution for a Shared, non-default, project-scoped binding), the
+        // runtime identity is that short-lived role — the DSN then carries it instead of the static
+        // per-tenant credential. `Ok(None)` (not yet minted, or a cell where phase 2 does not apply)
+        // ⇒ keep the static Runtime credential, exactly as Phase 1. A read error is surfaced (the
+        // binding is then skipped, fail-closed) rather than silently serving the static cred.
+        let instance_id = compute_instance_id(project, workload, replica);
+        if let Some(dynamic) =
+            resolve_dynamic_credential(&self.kv, &self.envelope, &cfg, project, &instance_id)
+                .await?
+        {
+            // Only the RUNTIME identity rotates; host/port stay the tenant DB's, and the dynamic
+            // role's database IS this tenant's database. The MIGRATION/DDL identity stays the
+            // static owner-role credential (the dynamic role operates AS the owner).
+            runtime.user = dynamic.role;
+            runtime.password = dynamic.password;
+            runtime.database = dynamic.database;
+        }
         Ok(Some(ManagedBinding {
             binding: binding.clone(),
             runtime,
@@ -177,34 +196,23 @@ impl ManagedDbDsnResolver {
         }))
     }
 
-    /// Unseal the project-scoped sealed secret `name` to its UTF-8 value. `Ok(None)` when no
-    /// secret store is wired or the secret is absent. The value is NEVER logged.
-    async fn resolve_secret(&self, project: &str, name: &str) -> Result<Option<String>, String> {
-        let Some(store) = &self.secret_store else {
-            return Ok(None);
-        };
-        match store.get(ProjectRef::new(project), name).await {
-            Ok(Some(bytes)) => String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| format!("secret {name:?} is not valid UTF-8")),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    /// The core of [`resolve`](ComputeBindingResolver::resolve) /
-    /// [`resolve_with_env`](ComputeBindingResolver::resolve_with_env): resolve the `sql`
-    /// bindings, build template variables, render the operator's `env` templates, inject the
-    /// defaults, and delegate the rest to the shim. `workload_env` is the operator-declared
-    /// env (empty for the token-repopulation / no-env path).
-    async fn resolve_inner(
+    /// Build this resolver's [`SurfaceContribution`] — the `{{sql.*}}` template variables + the
+    /// managed DSN defaults — and MERGE the wrapped shim's contribution for every `sql` binding
+    /// the managed path does not own (per-site libsql, external). No rendering / secret unsealing
+    /// happens here: the unified render stage ([`apply_env_render`]) renders the operator `env`
+    /// once against the UNION of every surface's vars, so a value may interleave `{{sql.*}}` with
+    /// `{{kv.*}}`/`{{blob.*}}`/`{{secret.*}}`. The managed path registers no per-replica state (the
+    /// dynamic credential is minted by the reconcile's `mint_dynamic_db_cred` hook and read back in
+    /// [`resolve_managed`](Self::resolve_managed)); the shim's contribution registers its libsql
+    /// token. `workload_env` is unused for the sql surface's own vars but threaded to the shim.
+    async fn contribution(
         &self,
         project: &str,
         workload: &str,
         replica: u32,
         bindings: &[ComputeBinding],
         workload_env: &BTreeMap<String, String>,
-    ) -> Vec<(String, String)> {
+    ) -> SurfaceContribution {
         // 1. Classify each `sql` binding: managed co-located pg/mysql vs shim-owned.
         let mut managed: Vec<ManagedBinding> = Vec::new();
         let mut shim_bindings: Vec<ComputeBinding> = Vec::new();
@@ -213,7 +221,10 @@ impl ManagedDbDsnResolver {
                 // Not ours — the chained blob/kv/messaging resolvers own the other kinds.
                 continue;
             }
-            match self.resolve_managed(project, workload, binding).await {
+            match self
+                .resolve_managed(project, workload, replica, binding)
+                .await
+            {
                 Ok(Some(m)) => managed.push(m),
                 Ok(None) => shim_bindings.push(binding.clone()),
                 Err(e) => tracing::warn!(
@@ -226,104 +237,42 @@ impl ManagedDbDsnResolver {
             }
         }
 
-        let mut out: Vec<(String, String)> = Vec::new();
+        let mut out = SurfaceContribution::default();
 
-        if !managed.is_empty() {
-            // 2. Build template variables from the managed bindings.
-            let single = managed.len() == 1;
-            let mut vars: BTreeMap<String, String> = BTreeMap::new();
-            for m in &managed {
-                // `sql.<name>` for a named binding; bare `sql` for the empty-name (site
-                // default) binding OR the sole managed binding (the common single case, so
-                // `sql:app` still answers `{{sql.host}}`).
-                if m.binding.name.is_empty() || single {
-                    register_parts(&mut vars, "sql", &m.runtime, &m.migration);
-                }
-                if !m.binding.name.is_empty() {
-                    register_parts(
-                        &mut vars,
-                        &format!("sql.{}", m.binding.name),
-                        &m.runtime,
-                        &m.migration,
-                    );
-                }
+        // 2. `{{sql.*}}` template variables from the managed bindings.
+        let single = managed.len() == 1;
+        for m in &managed {
+            // `sql.<name>` for a named binding; bare `sql` for the empty-name (site default)
+            // binding OR the sole managed binding (the common single case, so `sql:app` still
+            // answers `{{sql.host}}`).
+            if m.binding.name.is_empty() || single {
+                register_parts(&mut out.vars, "sql", &m.runtime, &m.migration);
             }
-
-            // 3. Resolve any `{{secret.<NAME>}}` referenced by a template value — SERVER-SIDE.
-            let mut secret_names: BTreeSet<String> = BTreeSet::new();
-            for value in workload_env.values() {
-                if value.contains("{{") {
-                    for key in referenced_keys(value) {
-                        if let Some(name) = key.strip_prefix("secret.") {
-                            secret_names.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-            for name in &secret_names {
-                match self.resolve_secret(project, name).await {
-                    Ok(Some(value)) => {
-                        vars.insert(format!("secret.{name}"), value);
-                    }
-                    // Absent/unavailable → leave unresolved so the render fails closed for
-                    // that value (never inject an empty/partial secret). Never log the value.
-                    Ok(None) => tracing::warn!(
-                        %project,
-                        %workload,
-                        secret = %name,
-                        "managed-db DSN: referenced secret is unset or no secret store configured"
-                    ),
-                    Err(e) => tracing::warn!(
-                        %project,
-                        %workload,
-                        secret = %name,
-                        error = %e,
-                        "managed-db DSN: referenced secret could not be unsealed"
-                    ),
-                }
-            }
-
-            // 4. Render the operator's env templates. A value with a `{{…}}` placeholder is
-            // rendered and REPLACES the raw template at launch; a render error leaves the raw
-            // template in place (diagnosable) and injects nothing for that key.
-            for (key, value) in workload_env {
-                if !value.contains("{{") {
-                    continue;
-                }
-                match render(value, &vars) {
-                    Ok(rendered) => out.push((key.clone(), rendered)),
-                    Err(e) => tracing::warn!(
-                        %project,
-                        %workload,
-                        key = %key,
-                        error = %e,
-                        "managed-db DSN: env template left unrendered"
-                    ),
-                }
-            }
-
-            // 5. Defaults (simple case): inject `url_env`=runtime DSN + `migration_url_env`=
-            // DDL DSN for each managed binding, UNLESS the operator already set that key
-            // (a template rendered in step 4, or a hand-set literal).
-            for m in &managed {
-                let url_key = m.binding.url_env();
-                if !workload_env.contains_key(&url_key) {
-                    out.push((url_key, m.runtime.dsn()));
-                }
-                let migration_key = m.binding.migration_url_env();
-                if !workload_env.contains_key(&migration_key) {
-                    out.push((migration_key, m.migration.dsn()));
-                }
+            if !m.binding.name.is_empty() {
+                register_parts(
+                    &mut out.vars,
+                    &format!("sql.{}", m.binding.name),
+                    &m.runtime,
+                    &m.migration,
+                );
             }
         }
 
-        // 6. Delegate every shim-owned `sql` binding (per-site libsql, external) to the
-        // wrapped sql-shim — endpoint + token, exactly as before.
+        // 3. Defaults (simple case): `url_env`=runtime DSN + `migration_url_env`=DDL DSN for each
+        // managed binding — the render stage injects each only for a key the operator did not set.
+        for m in &managed {
+            out.defaults.push((m.binding.url_env(), m.runtime.dsn()));
+            out.defaults
+                .push((m.binding.migration_url_env(), m.migration.dsn()));
+        }
+
+        // 4. Merge the wrapped sql-shim's contribution for every shim-owned `sql` binding (per-site
+        // libsql, external) — endpoint + token, exactly as before (it registers its own token).
         if let Some(shim) = &self.shim
             && !shim_bindings.is_empty()
         {
-            out.extend(
-                shim.resolve_with_env(project, workload, replica, &shim_bindings, workload_env)
+            out.merge(
+                shim.contribute(project, workload, replica, &shim_bindings, workload_env)
                     .await,
             );
         }
@@ -340,10 +289,11 @@ impl ComputeBindingResolver for ManagedDbDsnResolver {
         replica: u32,
         bindings: &[ComputeBinding],
     ) -> Vec<(String, String)> {
-        // No operator env available (the reconcile's token-repopulation path): inject the
-        // defaults for managed bindings + re-register the shim's libsql tokens.
-        self.resolve_inner(project, workload, replica, bindings, &BTreeMap::new())
+        // No operator env available (the reconcile's token-repopulation path): re-register the
+        // shim's libsql tokens + return the managed defaults. No rendering (no env to render).
+        self.contribution(project, workload, replica, bindings, &BTreeMap::new())
             .await
+            .defaults
     }
 
     async fn resolve_with_env(
@@ -354,7 +304,32 @@ impl ComputeBindingResolver for ManagedDbDsnResolver {
         bindings: &[ComputeBinding],
         workload_env: &BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
-        self.resolve_inner(project, workload, replica, bindings, workload_env)
+        // Standalone render (also the direct-test path): gather the sql-surface contribution, then
+        // run the SHARED render stage against it. In production the top-level `RenderStageResolver`
+        // calls `contribute` across ALL surfaces and renders once; this renders the sql surface
+        // alone (its own `secret_store` backs `{{secret.*}}`).
+        let contribution = self
+            .contribution(project, workload, replica, bindings, workload_env)
+            .await;
+        apply_env_render(
+            project,
+            workload,
+            workload_env,
+            contribution,
+            self.secret_store.as_ref(),
+        )
+        .await
+    }
+
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        workload_env: &BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        self.contribution(project, workload, replica, bindings, workload_env)
             .await
     }
 
@@ -398,108 +373,9 @@ fn register_parts(
     vars.insert(format!("{ns}.migration_dsn"), migration.dsn());
 }
 
-/// The template keys referenced by `{{key}}` placeholders in `text` (keys trimmed). A
-/// minimal, documented placeholder syntax: `{{` opens, `}}` closes; an unclosed `{{` ends
-/// the scan. Used to pre-collect `secret.<NAME>` references so they are unsealed before the
-/// (synchronous) [`render`].
-fn referenced_keys(text: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("{{") {
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
-            break;
-        };
-        let key = after[..close].trim();
-        if !key.is_empty() {
-            keys.push(key.to_string());
-        }
-        rest = &after[close + 2..];
-    }
-    keys
-}
-
-/// Render `{{key}}` placeholders in `template` from `vars`. Literal text passes through; an
-/// unknown placeholder or an unclosed `{{` is an error (fail closed — the caller then leaves
-/// the raw template in place rather than inject a half-rendered value). The one place a
-/// template is expanded.
-fn render(template: &str, vars: &BTreeMap<String, String>) -> Result<String, String> {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        let close = after
-            .find("}}")
-            .ok_or_else(|| "unclosed `{{` placeholder".to_string())?;
-        let key = after[..close].trim();
-        let value = vars
-            .get(key)
-            .ok_or_else(|| format!("unknown placeholder `{{{{{key}}}}}`"))?;
-        out.push_str(value);
-        rest = &after[close + 2..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn vars() -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("sql.host".to_string(), "pg-acme".to_string()),
-            ("sql.port".to_string(), "5432".to_string()),
-            ("sql.user".to_string(), "app".to_string()),
-            ("sql.password".to_string(), "s3cr3t".to_string()),
-            ("sql.database".to_string(), "appdb".to_string()),
-            ("secret.API_KEY".to_string(), "xyz".to_string()),
-        ])
-    }
-
-    #[test]
-    fn render_fills_placeholders_and_passes_literals() {
-        let v = vars();
-        assert_eq!(
-            render(
-                "postgres://{{sql.user}}:{{sql.password}}@{{sql.host}}:{{sql.port}}/{{sql.database}}?sslmode=require",
-                &v
-            )
-            .unwrap(),
-            "postgres://app:s3cr3t@pg-acme:5432/appdb?sslmode=require"
-        );
-        // Discrete + whitespace in the placeholder + a static literal mixed in.
-        assert_eq!(render("{{ sql.host }}", &v).unwrap(), "pg-acme");
-        assert_eq!(
-            render("key={{secret.API_KEY}};x=1", &v).unwrap(),
-            "key=xyz;x=1"
-        );
-        assert_eq!(
-            render("no placeholders here", &v).unwrap(),
-            "no placeholders here"
-        );
-    }
-
-    #[test]
-    fn render_fails_closed_on_unknown_or_unclosed() {
-        let v = vars();
-        assert!(render("{{sql.nope}}", &v).is_err());
-        assert!(render("{{secret.MISSING}}", &v).is_err());
-        assert!(render("{{sql.host", &v).is_err());
-    }
-
-    #[test]
-    fn referenced_keys_collects_each_placeholder() {
-        let keys = referenced_keys("{{sql.user}}@{{sql.host}} {{secret.API_KEY}}");
-        assert_eq!(keys, vec!["sql.user", "sql.host", "secret.API_KEY"]);
-        // Only `secret.*` keys become secret lookups.
-        let secrets: Vec<&str> = keys
-            .iter()
-            .filter_map(|k| k.strip_prefix("secret."))
-            .collect();
-        assert_eq!(secrets, vec!["API_KEY"]);
-    }
 
     // ---- end-to-end resolve_with_env over a managed co-located Postgres ----
 
@@ -616,6 +492,39 @@ mod tests {
         }
     }
 
+    /// A Shared, project-scoped managed Postgres binding — the ONE shape phase 2's dynamic
+    /// per-replica role applies to.
+    fn shared_pg_binding_cfg() -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("appdb".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Shared,
+            tenant_scope: crate::config::TenantScope::Project,
+            ..Default::default()
+        }
+    }
+
+    /// A resolver over one Shared managed Postgres `databases` entry named "app", returning the kv +
+    /// envelope so a test can seal a dynamic credential the resolver then reads back.
+    fn shared_resolver() -> (ManagedDbDsnResolver, Arc<dyn KvStore>, Arc<dyn KeyEnvelope>) {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+        let shim = Arc::new(FakeShim::default());
+        let databases = BTreeMap::from([("app".to_string(), shared_pg_binding_cfg())]);
+        let resolver = ManagedDbDsnResolver::wrap(
+            Some(shim),
+            databases,
+            deploy,
+            kv.clone(),
+            envelope.clone(),
+            None,
+        );
+        (resolver, kv, envelope)
+    }
+
     fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
         env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
@@ -719,6 +628,82 @@ mod tests {
         );
         // The migration default (a key the operator did not set) is still injected.
         assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_some());
+    }
+
+    /// Phase 2: once a per-replica dynamic role is minted (here sealed mint-minus-DDL), the RUNTIME
+    /// DSN carries IT instead of the static per-tenant credential — and a replica with no minted
+    /// role keeps the static identity (fall-back). The migration default still injects (its owner-
+    /// role identity does not rotate).
+    #[tokio::test]
+    async fn dynamic_cred_rotates_the_runtime_dsn_identity() {
+        let (resolver, kv, envelope) = shared_resolver();
+        // Before any mint: the runtime DSN carries the STATIC runtime identity.
+        let before = resolver
+            .resolve_with_env(
+                "acme",
+                "simertec",
+                0,
+                &[sql_binding("app")],
+                &BTreeMap::new(),
+            )
+            .await;
+        let static_url = get(&before, "BOATRAMP_SQL_URL")
+            .expect("static runtime DSN injected")
+            .to_string();
+
+        // Seal a dynamic cred for THIS replica (mint minus the live DDL).
+        let binding_cfg = shared_pg_binding_cfg();
+        let instance_id = boatramp_core::compute::compute_instance_id("acme", "simertec", 0);
+        let cred = crate::dynamic_creds::seal_dynamic_credential_for_test(
+            &kv,
+            &envelope,
+            &binding_cfg,
+            "acme",
+            &instance_id,
+        )
+        .await
+        .expect("phase 2 applies for a Shared project binding");
+
+        // After the mint: the runtime DSN now carries the DYNAMIC role.
+        let after = resolver
+            .resolve_with_env(
+                "acme",
+                "simertec",
+                0,
+                &[sql_binding("app")],
+                &BTreeMap::new(),
+            )
+            .await;
+        let dyn_url = get(&after, "BOATRAMP_SQL_URL").expect("dynamic runtime DSN injected");
+        assert!(
+            dyn_url.contains(&cred.role),
+            "the runtime DSN must carry the dynamic role {}: {dyn_url}",
+            cred.role
+        );
+        assert_ne!(
+            static_url, dyn_url,
+            "the runtime identity must rotate to the dynamic role"
+        );
+        assert!(
+            get(&after, "BOATRAMP_SQL_URL_MIGRATION").is_some(),
+            "the migration default (static owner-role identity) is still injected"
+        );
+
+        // A DIFFERENT replica has no sealed cred → it keeps the static identity (fall-back).
+        let other = resolver
+            .resolve_with_env(
+                "acme",
+                "simertec",
+                1,
+                &[sql_binding("app")],
+                &BTreeMap::new(),
+            )
+            .await;
+        assert_eq!(
+            get(&other, "BOATRAMP_SQL_URL"),
+            Some(static_url.as_str()),
+            "a replica with no minted role keeps the static Runtime credential"
+        );
     }
 
     /// Tenancy: two projects get DISTINCT DSNs (different per-tenant workload host).

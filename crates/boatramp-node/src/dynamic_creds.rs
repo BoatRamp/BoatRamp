@@ -378,10 +378,39 @@ pub async fn resolve_dynamic_credential(
     }))
 }
 
+/// Test-only: seal a dynamic credential the SAME way [`mint_dynamic_role`] does but WITHOUT running
+/// the mint DDL (the live DDL round-trip is covered by the `#[ignore]`-gated live gate). It seals a
+/// fresh password under the per-replica key + returns the [`DynamicDbCredential`] a
+/// [`resolve_dynamic_credential`] (and the DSN resolver) then reads back — so the readback → DSN
+/// wiring is unit-testable in-process. `None` for a cell where phase 2 does not apply.
+#[cfg(test)]
+pub(crate) async fn seal_dynamic_credential_for_test(
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    binding: &ExternalDatabaseConfig,
+    consumer_project: &str,
+    instance_id: &str,
+) -> Option<DynamicDbCredential> {
+    let t = resolve_target(binding, consumer_project, instance_id)?;
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let pw = creds
+        .password(&t.cred_project, &t.cred_workload)
+        .await
+        .expect("seal dynamic credential");
+    Some(DynamicDbCredential {
+        kind: t.kind,
+        database: t.database,
+        role: t.dyn_role,
+        password: pw,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{TenantIsolation, TenantScope};
+    use boatramp_core::envelope::EnvelopeError;
+    use boatramp_core::kv::MemoryKv;
 
     fn shared_pg_binding() -> ExternalDatabaseConfig {
         ExternalDatabaseConfig {
@@ -534,6 +563,57 @@ mod tests {
         assert_ne!(
             a.owner_role, g.owner_role,
             "distinct tenants → distinct owner roles"
+        );
+    }
+
+    /// A reversible test "envelope" (NOT encryption) — the sealed password round-trips.
+    struct RevEnvelope;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for RevEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(&self, w: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+
+    /// The phase-1 seam the DSN resolver reads: a credential sealed under the per-replica key is
+    /// read back by [`resolve_dynamic_credential`] with the SAME role/database (and NO mint ⇒
+    /// `None`, so the DSN falls back to the static Runtime credential). Proves the readback half of
+    /// the mint→DSN→revoke wiring in-process; the live DDL half is the `#[ignore]`-gated gate.
+    #[tokio::test]
+    async fn resolve_dynamic_credential_reads_back_a_sealed_role() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+        let binding = shared_pg_binding();
+
+        // No mint yet ⇒ `None` (the DSN resolver then keeps the static Runtime credential).
+        assert!(
+            resolve_dynamic_credential(&kv, &envelope, &binding, "acme", "acme-web-0")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Seal one (mint minus DDL) ⇒ `resolve_dynamic_credential` reads it back, same role + db.
+        let sealed =
+            seal_dynamic_credential_for_test(&kv, &envelope, &binding, "acme", "acme-web-0")
+                .await
+                .expect("phase 2 applies for a Shared project binding");
+        let read = resolve_dynamic_credential(&kv, &envelope, &binding, "acme", "acme-web-0")
+            .await
+            .unwrap()
+            .expect("the sealed dynamic credential reads back");
+        assert_eq!(read.role, sealed.role);
+        assert_eq!(read.database, sealed.database);
+        assert_eq!(read.password, sealed.password);
+        // A DIFFERENT replica has no sealed cred (per-replica keying).
+        assert!(
+            resolve_dynamic_credential(&kv, &envelope, &binding, "acme", "acme-web-1")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

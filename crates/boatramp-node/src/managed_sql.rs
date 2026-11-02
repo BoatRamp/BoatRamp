@@ -261,6 +261,12 @@ struct ManagedDbSpec {
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 pub struct ManagedDbEnv {
     dbs: HashMap<String, ManagedDbSpec>,
+    /// The RAW handler `sql` `databases` map (keyed by BINDING name), so the phase-2 dynamic-cred
+    /// mint/revoke can re-resolve a consuming workload's `sql` binding to the managed DB config it
+    /// names — the SAME `resolve_binding` merge point the DSN resolver uses. (`dbs` above is keyed
+    /// by backing WORKLOAD and holds only the reduced spec, insufficient to derive the owner/role
+    /// family the dynamic-cred DDL needs.)
+    databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
     creds: ManagedSqlCredentials,
     /// How a managed DB's stock image runs on a shared-kernel backend so it can init
     /// (`[compute].managed_db_privilege`).
@@ -329,6 +335,7 @@ impl ManagedDbEnv {
         }
         Self {
             dbs,
+            databases: databases.clone(),
             creds,
             privilege,
             deploy,
@@ -623,6 +630,92 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                 Ok(())
             }
         }
+    }
+
+    async fn mint_dynamic_db_cred(
+        &self,
+        project: &str,
+        workload: &str,
+        bindings: &[boatramp_core::compute::ComputeBinding],
+        replica: u32,
+    ) -> Result<(), String> {
+        // Resolve each `sql` binding this workload declares to the managed DB it names, and mint a
+        // per-replica dynamic role for that tenant. `mint_dynamic_role` is a no-op `Ok(None)` for
+        // every cell where phase 2 does not apply (the reserved default tenant, `Single` isolation,
+        // a `Site` scope, a bring-your-own `url_env` binding), so a non-consumer / Phase-1-only
+        // binding is harmless. Fail CLOSED: a resolve/mint error aborts the launch (the reconcile
+        // skips it) rather than serving a consumer without its credential.
+        let instance_id = boatramp_core::compute::compute_instance_id(project, workload, replica);
+        for binding in bindings {
+            if binding.kind != boatramp_core::compute::BindingKind::Sql {
+                continue;
+            }
+            let cfg = match crate::managed_db_declare::resolve_binding(
+                &self.databases,
+                &self.deploy,
+                project,
+                &binding.name,
+            )
+            .await
+            {
+                Ok(Some(cfg)) => cfg,
+                // Not a declared managed DB (per-site libsql / undeclared) — nothing to mint.
+                Ok(None) => continue,
+                Err(e) => return Err(format!("resolve sql binding {:?}: {e}", binding.name)),
+            };
+            crate::dynamic_creds::mint_dynamic_role(
+                &self.deploy,
+                self.creds.kv(),
+                self.creds.envelope(),
+                &cfg,
+                project,
+                &instance_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn revoke_dynamic_db_cred(
+        &self,
+        project: &str,
+        workload: &str,
+        bindings: &[boatramp_core::compute::ComputeBinding],
+        replica: u32,
+    ) -> Result<(), String> {
+        // The mirror of `mint_dynamic_db_cred`: drop every `sql` binding's per-replica dynamic role.
+        // Idempotent (a non-consumer / already-gone role / already-deleted password are no-ops), so
+        // a re-run (the reconcile retries a failed revoke) is harmless. A revoke error is surfaced
+        // and keeps the replica record for a retry (the reconcile's Stop path), so a credential can
+        // never linger past a forgotten replica; a MISSED stop is caught by the orphan sweep below.
+        let instance_id = boatramp_core::compute::compute_instance_id(project, workload, replica);
+        for binding in bindings {
+            if binding.kind != boatramp_core::compute::BindingKind::Sql {
+                continue;
+            }
+            let cfg = match crate::managed_db_declare::resolve_binding(
+                &self.databases,
+                &self.deploy,
+                project,
+                &binding.name,
+            )
+            .await
+            {
+                Ok(Some(cfg)) => cfg,
+                Ok(None) => continue,
+                Err(e) => return Err(format!("resolve sql binding {:?}: {e}", binding.name)),
+            };
+            crate::dynamic_creds::revoke_dynamic_role(
+                &self.deploy,
+                self.creds.kv(),
+                self.creds.envelope(),
+                &cfg,
+                project,
+                &instance_id,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn sweep_orphan_dynamic_db_creds(

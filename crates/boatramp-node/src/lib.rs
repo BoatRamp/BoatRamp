@@ -57,6 +57,12 @@ pub mod dynamic_creds;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
+/// The shared managed-env template engine + unified render stage (PLAN-compute-managed-resources
+/// Phase 3): the `{{key}}` expander every surface resolver's vars are rendered against, and the
+/// [`RenderStageResolver`](managed_env_template::RenderStageResolver) the node wraps the binding
+/// chain with. Surface-independent, so it is available on a node with no sqlx engine (kv/blob/
+/// messaging shims still get the unified render).
+pub mod managed_env_template;
 // The managed-SQL module carries the Postgres/MySQL operator-SQL + credential machinery (sqlx) AND
 // the migration substrate. It compiles whenever a sqlx engine OR `migrate` (⇒ the embedded libsql
 // migration runner) is on, so the libsql migrate parity is reachable on a node with no external sqlx

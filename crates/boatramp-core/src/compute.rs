@@ -1463,6 +1463,38 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
+/// One binding resolver's contribution to the **unified managed-env render stage**
+/// (PLAN-compute-managed-resources Phase 3): the `{surface}.*` template variables it
+/// exposes (e.g. `kv.url`, `kv.token`, `blob.endpoint`, `sql.dsn`) and the default
+/// `(env_key, value)` pairs it injects when the operator set no template for that key.
+///
+/// The render stage unions every resolver's [`vars`](Self::vars) into ONE variable map,
+/// unseals any `{{secret.NAME}}` the operator referenced, renders each templated `env`
+/// value ONCE against that union (so an operator may interleave surfaces in a single
+/// value — `"{{sql.host}} {{kv.token}}"`), then folds each resolver's
+/// [`defaults`](Self::defaults) for the keys the operator did not set. Keeping vars and
+/// defaults distinct (rather than a resolver pre-rendering its own slice) is what lets
+/// the render happen in exactly one place and fail CLOSED on an unknown key.
+#[derive(Debug, Default, Clone)]
+pub struct SurfaceContribution {
+    /// The `{surface}.{key}` template variables this resolver exposes (no `{{}}`
+    /// delimiters — bare keys like `kv.url`). Unioned across resolvers by the render
+    /// stage; a later resolver's key wins on a collision (surfaces never share a key).
+    pub vars: std::collections::BTreeMap<String, String>,
+    /// The default `(env_key, value)` pairs to inject when the operator set no value for
+    /// `env_key` (a hand-set literal or an operator template for that key always wins).
+    pub defaults: Vec<(String, String)>,
+}
+
+impl SurfaceContribution {
+    /// Fold another contribution into this one (the chain merge): extend the var map
+    /// (later keys win) and concatenate the defaults.
+    pub fn merge(&mut self, other: SurfaceContribution) {
+        self.vars.extend(other.vars);
+        self.defaults.extend(other.defaults);
+    }
+}
+
 /// Resolves a workload's declared [`ComputeBinding`]s (PLAN-compute-bindings) to
 /// env vars injected into the guest at launch, registering any backing shim state.
 /// The concrete impl (the sql-shim resolver) lives server-side, where the
@@ -1500,6 +1532,29 @@ pub trait ComputeBindingResolver: Send + Sync {
         _env: &std::collections::BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
         self.resolve(project, workload, replica, bindings).await
+    }
+
+    /// Contribute this resolver's [`SurfaceContribution`] — the `{surface}.*` template
+    /// variables + per-surface default env for `bindings` — to the unified render stage
+    /// (PLAN-compute-managed-resources Phase 3), registering the SAME per-replica shim
+    /// state (token / minted credential) `resolve` would. `env` is the operator-declared
+    /// env (so a surface that must mint only at launch can gate on it being non-empty),
+    /// though most resolvers ignore it (their vars are env-independent). The default impl
+    /// contributes NO vars and takes [`resolve`](Self::resolve)'s output as the defaults —
+    /// so a resolver that does no templating (the libsql sql-shim) needs no change and the
+    /// render stage still injects its endpoint/token as a default.
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        SurfaceContribution {
+            vars: std::collections::BTreeMap::new(),
+            defaults: self.resolve(project, workload, replica, bindings).await,
+        }
     }
 
     /// Release the shim state for a torn-down replica.
@@ -1572,6 +1627,28 @@ impl ComputeBindingResolver for ChainedBindingResolver {
             );
         }
         env
+    }
+
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        workload_env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        // Union every inner resolver's `{surface}.*` vars + per-surface defaults into ONE
+        // contribution, so the render stage above renders the operator `env` once against
+        // the whole set (each shim already filters to its own `BindingKind`).
+        let mut out = SurfaceContribution::default();
+        for resolver in &self.resolvers {
+            out.merge(
+                resolver
+                    .contribute(project, workload, replica, bindings, workload_env)
+                    .await,
+            );
+        }
+        out
     }
 
     async fn release(
@@ -1675,7 +1752,9 @@ pub trait ManagedDbEnvResolver: Send + Sync {
     /// **Mint** this replica's per-replica DYNAMIC database credential at launch, for a
     /// workload that CONSUMES a managed database (PLAN-compute-managed-db phase 2). Called
     /// once per launch, BEFORE binding resolution, so a DSN injector reads the freshly-
-    /// minted (sealed) per-replica credential. A workload that consumes no managed database
+    /// minted (sealed) per-replica credential. `bindings` are the launching workload's
+    /// declared bindings — the node impl resolves each `sql` binding to the managed DB it
+    /// names and mints that tenant's per-replica role. A workload that consumes no managed database
     /// — and every cell where phase 2 does not apply (a bring-your-own `url_env` binding,
     /// the reserved default tenant, `Single` isolation) — is a no-op `Ok(())`. An `Err`
     /// FAILS the launch CLOSED (a consumer must not serve without its credential). The node
@@ -1686,6 +1765,7 @@ pub trait ManagedDbEnvResolver: Send + Sync {
         &self,
         _project: &str,
         _workload: &str,
+        _bindings: &[ComputeBinding],
         _replica: u32,
     ) -> Result<(), String> {
         Ok(())
@@ -1704,6 +1784,7 @@ pub trait ManagedDbEnvResolver: Send + Sync {
         &self,
         _project: &str,
         _workload: &str,
+        _bindings: &[ComputeBinding],
         _replica: u32,
     ) -> Result<(), String> {
         Ok(())
@@ -2235,7 +2316,9 @@ pub async fn reconcile_once(
                     // freshly-sealed per-replica credential. Fail CLOSED — a consumer must not
                     // launch without its credential. A non-consumer workload is a no-op.
                     if let Some(m) = managed_db
-                        && let Err(e) = m.mint_dynamic_db_cred(&project_name, &wl, replica).await
+                        && let Err(e) = m
+                            .mint_dynamic_db_cred(&project_name, &wl, &spec.bindings, replica)
+                            .await
                     {
                         report
                             .errors
@@ -2368,7 +2451,12 @@ pub async fn reconcile_once(
                     // whose replica record is gone.
                     if let Some(m) = managed_db
                         && let Err(e) = m
-                            .revoke_dynamic_db_cred(&project_name, &handle.workload, handle.replica)
+                            .revoke_dynamic_db_cred(
+                                &project_name,
+                                &handle.workload,
+                                &spec.bindings,
+                                handle.replica,
+                            )
                             .await
                     {
                         report.errors.push(format!(
@@ -4417,7 +4505,13 @@ mod tests {
         async fn managed_db_env(&self, _p: &str, _w: &str) -> Vec<(String, String)> {
             Vec::new()
         }
-        async fn revoke_dynamic_db_cred(&self, _p: &str, _w: &str, _r: u32) -> Result<(), String> {
+        async fn revoke_dynamic_db_cred(
+            &self,
+            _p: &str,
+            _w: &str,
+            _bindings: &[ComputeBinding],
+            _r: u32,
+        ) -> Result<(), String> {
             self.revokes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail {
