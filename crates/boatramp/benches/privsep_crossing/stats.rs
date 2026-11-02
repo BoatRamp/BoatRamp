@@ -61,7 +61,7 @@ pub struct Cell {
 
 impl Cell {
     pub fn na(substrate: &str, payload_label: &str, reason: &str) -> Self {
-        Cell {
+        Self {
             substrate: substrate.to_string(),
             payload_label: payload_label.to_string(),
             warm: None,

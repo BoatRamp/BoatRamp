@@ -21,10 +21,10 @@ const FILL: u8 = 0xAB;
 const READY: &[u8] = b"READY";
 
 fn maybe_pin_from_env() {
-    if let Ok(v) = std::env::var("PRIVSEP_BENCH_PIN_CORE") {
-        if let Ok(core) = v.parse::<usize>() {
-            let _ = affinity::pin_current_thread(core);
-        }
+    if let Ok(v) = std::env::var("PRIVSEP_BENCH_PIN_CORE")
+        && let Ok(core) = v.parse::<usize>()
+    {
+        let _ = affinity::pin_current_thread(core);
     }
 }
 

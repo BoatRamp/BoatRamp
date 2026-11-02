@@ -161,13 +161,10 @@ fn dial_firecracker_vsock(uds_path: &Path, guest_port: u32) -> io::Result<RawFd>
         }
     }
     if !line.starts_with(b"OK") {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "firecracker vsock CONNECT refused: {}",
-                String::from_utf8_lossy(&line)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "firecracker vsock CONNECT refused: {}",
+            String::from_utf8_lossy(&line)
+        )));
     }
     Ok(fd)
 }
@@ -189,7 +186,7 @@ pub fn run_firecracker(
             match dial_firecracker_vsock(&vm.uds_path, cfg.guest_port) {
                 Ok(fd) => break fd,
                 Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => return Err(e),
             }

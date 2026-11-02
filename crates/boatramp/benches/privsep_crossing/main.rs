@@ -187,10 +187,10 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
-    if let Some(core) = cli.frontend_cpu {
-        if let Err(e) = affinity::pin_current_thread(core) {
-            eprintln!("warning: failed to pin frontend to core {core}: {e}");
-        }
+    if let Some(core) = cli.frontend_cpu
+        && let Err(e) = affinity::pin_current_thread(core)
+    {
+        eprintln!("warning: failed to pin frontend to core {core}: {e}");
     }
 
     let current_exe = match std::env::current_exe() {
