@@ -624,11 +624,22 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
             tracing::debug!(?dir, error = %e, "[privsep] could not pre-create own state dir (will stay lexical)");
         }
     }
+    // The per-tenant router (`exec.compute`) re-execs THIS binary to fork per-tenant children, so
+    // it needs its own executable Landlock read+EXECUTE-pinned — exactly like the root
+    // (`sandbox::root_supervisor_policy`). Resolve it the SAME way the root does
+    // (`std::env::current_exe()`) and fail CLOSED on a resolve error (the node refuses to serve);
+    // a non-`exec.compute` instance needs no execute grant, so it is not resolved and stays `None`.
+    let exec_self = if held_set.contains(&HostAuthority::ExecCompute) {
+        Some(std::env::current_exe().map_err(|e| fail(format!("resolving current exe: {e}")))?)
+    } else {
+        None
+    };
     let inputs = privsep_resolve::build_instance_sandbox_inputs(
         &config,
         &inst.capabilities,
         config_path,
         &cwd,
+        exec_self.as_deref(),
     );
 
     let node_allows_unsandboxed = matches!(

@@ -780,12 +780,21 @@ pub fn resolve_key_input_paths(cfg: &ServerConfig, data_dir: &Path) -> KeyInputP
 ///   state subtrees (never `data_dir` itself — refused). The composition-layer disjointness of
 ///   those grants is enforced separately in the root
 ///   ([`boatramp_server::sandbox::check_grant_disjointness`]).
+///
+/// `exec_self` is the per-tenant-router self-exec pin: for the `exec.compute` holder (the compute
+/// -plane spawner / per-tenant router) ONLY, the caller passes this instance's own executable so it
+/// lands read+EXECUTE in the Landlock view and the router can re-exec the boatramp binary to fork
+/// per-tenant children — mirroring the root's execute-pin ([`boatramp_server::sandbox::root_supervisor_policy`]).
+/// The caller resolves it via `std::env::current_exe()` and fails closed on a resolve error exactly
+/// as the root does; it passes `None` for every non-`exec.compute` instance, and the gate below
+/// also keys on the capability, so a non-router's execute grant is never widened.
 #[must_use]
 pub fn build_instance_sandbox_inputs(
     cfg: &ServerConfig,
     caps: &[HostAuthority],
     config_path: &Path,
     cwd: &Path,
+    exec_self: Option<&Path>,
 ) -> SandboxDerivationInputs {
     let data_dir = resolve_data_dir(cfg);
     // Grant the config FILE read-only (a single-file rule), NOT its parent dir: a config dir that
@@ -806,6 +815,21 @@ pub fn build_instance_sandbox_inputs(
     // The FULL crown-jewel key-path set (holder-only granting + non-holder leak-checking happen in
     // `derive_profile`).
     inputs.keys = resolve_key_input_paths(cfg, &data_dir);
+
+    // WS-C exec.compute self-exec pin. A per-tenant router (the `exec.compute` holder) forks its
+    // per-tenant children by re-execing THIS boatramp binary, so — exactly like the privsep root
+    // ([`boatramp_server::sandbox::root_supervisor_policy`]) — it needs its OWN executable in its
+    // Landlock read view, which is installed via `landlock::AccessFs::from_read` and so ALSO carries
+    // EXECUTE. Granted ONLY to an `exec.compute` holder (the same capability the seccomp `EXEC_SPAWN`
+    // allow keys off); every other instance keeps `execve` seccomp-killed AND Landlock-blocked, so
+    // the default is never widened. `exec_self` is the raw `std::env::current_exe()` the caller
+    // resolved + fail-closed just as the root does — it is normalized here by `into_normalized`, the
+    // SAME transform the root applies to its own binary via `normalize_for_landlock`.
+    if held.contains(&HostAuthority::ExecCompute)
+        && let Some(exe) = exec_self
+    {
+        inputs.base_read_only.push(exe.to_path_buf());
+    }
 
     inputs.into_normalized(cwd)
 }
@@ -1093,6 +1117,7 @@ mod tests {
             &sealer_caps,
             Path::new("/etc/boatramp/boatramp.cfg"),
             Path::new("/cwd"),
+            None,
         );
         assert_eq!(
             sealer_inputs.keys.sealed_signer_key_file,
@@ -1124,6 +1149,7 @@ mod tests {
             &signer_caps,
             Path::new("/etc/boatramp/boatramp.cfg"),
             Path::new("/cwd"),
+            None,
         );
         let signer_held: std::collections::BTreeSet<HostAuthority> =
             signer_caps.iter().copied().collect();
@@ -1459,6 +1485,7 @@ mod tests {
             &caps,
             Path::new("/etc/boatramp/boatramp.cfg"),
             Path::new("/cwd"),
+            None,
         );
 
         // Contract #2: the FULL backend state map is populated (never inert).
@@ -1507,6 +1534,7 @@ mod tests {
             &fe,
             Path::new("/etc/boatramp/boatramp.cfg"),
             Path::new("/cwd"),
+            None,
         );
         assert!(
             fe_inputs.base_read_write.is_empty(),
@@ -1527,12 +1555,80 @@ mod tests {
             &[HostAuthority::BackendKv],
             Path::new("boatramp.cfg"),
             Path::new("/srv/app"),
+            None,
         );
         assert_eq!(inputs.data_dir, PathBuf::from("/srv/app/data"));
         assert!(
             inputs
                 .base_read_write
                 .contains(&PathBuf::from("/srv/app/data/kv"))
+        );
+    }
+
+    #[test]
+    fn exec_compute_router_gets_its_own_binary_read_execute_pinned() {
+        use boatramp_core::privsep::SandboxPosture;
+        use boatramp_server::sandbox;
+
+        let mut cfg = serve_only();
+        cfg.serve.as_mut().unwrap().data_dir = Some(PathBuf::from("/srv/node"));
+        // A deterministic, absolute, NON-existent binary path (so `into_normalized` keeps it lexical
+        // — no `fs::canonicalize` surprise — and it sits outside every backend state subtree).
+        let exe = PathBuf::from("/opt/boatramp/bin/boatramp");
+
+        // The per-tenant router holds `exec.compute` (+ `backend.kv`, its Host→project resolver): its
+        // OWN binary is pinned into the read view (installed read+EXECUTE via `AccessFs::from_read`)
+        // so it can re-exec to fork per-tenant children — the root's execute-pin, mirrored.
+        let router_caps = [HostAuthority::ExecCompute, HostAuthority::BackendKv];
+        let router_inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &router_caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+            Some(&exe),
+        );
+        assert!(
+            router_inputs.base_read_only.contains(&exe),
+            "an exec.compute router pins its own executable read+EXECUTE"
+        );
+        // ...and it survives into the derived Landlock policy's read_only_paths (the execute grant).
+        let router_held: std::collections::BTreeSet<HostAuthority> =
+            router_caps.iter().copied().collect();
+        let router_profile =
+            sandbox::derive_profile(&router_held, SandboxPosture::Derived, &router_inputs)
+                .expect("router inputs derive a clean profile");
+        assert!(
+            router_profile.policy.read_only_paths.contains(&exe),
+            "the router's own binary is in the installed read+EXECUTE view"
+        );
+
+        // A non-exec.compute instance must NOT get an execute grant on the binary — EVEN if a path is
+        // (mistakenly) supplied: the gate keys on the capability, so the default is never widened.
+        let backend_caps = [HostAuthority::BackendKv];
+        let backend_inputs = build_instance_sandbox_inputs(
+            &cfg,
+            &backend_caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+            Some(&exe),
+        );
+        assert!(
+            !backend_inputs.base_read_only.contains(&exe),
+            "a non-exec.compute instance never gets an execute grant on the binary"
+        );
+
+        // An exec.compute instance whose caller could not resolve its exe (`None`) simply has no pin
+        // — the caller fails the node closed before serving (mirrors the root); nothing is widened.
+        let no_exe = build_instance_sandbox_inputs(
+            &cfg,
+            &router_caps,
+            Path::new("/etc/boatramp/boatramp.cfg"),
+            Path::new("/cwd"),
+            None,
+        );
+        assert!(
+            !no_exe.base_read_only.contains(&exe),
+            "no exe supplied ⇒ no pin (the caller fail-closes the node instead)"
         );
     }
 }
