@@ -612,18 +612,32 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // `compute.blob_shim_url` are both present, so a workload's `--bind blob` reaches the
     // SAME per-site `hblob/{qualified-site}/…` namespace a `wasi:blobstore` handler sees.
     #[cfg(feature = "handlers")]
-    let blob_resolver = boatramp_server::blob_shim::spawn_blob_shim(
-        handlers.blob_backends(),
-        config
-            .compute
-            .as_ref()
-            .and_then(|c| c.blob_shim_url.clone()),
-        config
-            .compute
-            .as_ref()
-            .and_then(|c| c.blob_shim_max_object_bytes),
-    )
-    .await;
+    let blob_resolver = {
+        // The direct-S3 STS minter (PLAN-compute-managed-resources Phase 3): when the node wires
+        // guest blob-upload minting (local S3 face or a cloud broker), a `--bind blob:<container>`
+        // ALSO gets short-lived `TempCredentials` + `AWS_*` env so an off-the-shelf S3 client talks
+        // DIRECTLY to R2/Tigris — the HMAC shim stays the full-R/W fallback. `()` (no minter) in a
+        // build without `blob-upload`; `None` when minting is not offered ⇒ the HMAC shim only.
+        #[cfg(feature = "blob-upload")]
+        let mint_slot = handlers
+            .blob_upload_minter()
+            .map(|(minter, max_ttl_secs, _max_bytes)| (minter, max_ttl_secs));
+        #[cfg(not(feature = "blob-upload"))]
+        let mint_slot = ();
+        boatramp_server::blob_shim::spawn_blob_shim(
+            handlers.blob_backends(),
+            config
+                .compute
+                .as_ref()
+                .and_then(|c| c.blob_shim_url.clone()),
+            config
+                .compute
+                .as_ref()
+                .and_then(|c| c.blob_shim_max_object_bytes),
+            mint_slot,
+        )
+        .await
+    };
     #[cfg(not(feature = "handlers"))]
     let blob_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
@@ -681,6 +695,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         messaging_resolver,
         kv_resolver,
     ]);
+    // PLAN-compute-managed-resources Phase 3: wrap the per-surface chain in the UNIFIED render
+    // stage, so an operator `env` value templating ANY surface — `{{sql.dsn}}`, `{{kv.token}}`,
+    // `{{blob.access_key}}`, `{{messaging.url}}` — plus `{{secret.NAME}}` is rendered ONCE,
+    // server-side, at launch (fail-closed on an unknown key). The per-surface resolvers now only
+    // CONTRIBUTE their `{surface}.*` vars + defaults; this stage holds the sealed-secret store and
+    // does the single render. `None` chain ⇒ no wrap (the feature stays off).
+    let binding_resolver = binding_resolver.map(|chain| {
+        crate::managed_env_template::RenderStageResolver::wrap(chain, secret_store.clone())
+    });
 
     // Managed compute-backed SQL (PLAN-managed-compute-sql P2-b): if the handler
     // `sql` config declares any managed database, inject its `POSTGRES_*`/`MYSQL_*`
