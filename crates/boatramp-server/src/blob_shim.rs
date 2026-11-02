@@ -430,6 +430,13 @@ impl BlobShimResolver {
         let Some((minter, max_ttl_secs)) = &self.blob_minter else {
             return;
         };
+        // Posture-off kill switch: a `0` TTL ceiling disables direct-S3 minting entirely — mirror
+        // the guest mint path's guard (bindings/blob_upload.rs) so this path fails closed to the
+        // HMAC shim regardless of the upstream `set_blob_upload_minting` 0-ceiling drop, rather than
+        // relying on that invariant (LOW-1, security review).
+        if *max_ttl_secs == 0 {
+            return;
+        }
         // Direct-S3 needs a concrete container to scope the credential to; a bare `--bind blob`
         // (no container) stays HMAC-only.
         if binding.name.is_empty() {
