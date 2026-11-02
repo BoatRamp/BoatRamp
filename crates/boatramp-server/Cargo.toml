@@ -302,6 +302,11 @@ boatramp-core = { workspace = true, features = ["authz"] }
 # *the* serving path, replacing hyper/axum_server. Non-optional. A first-party,
 # published workspace member (its HPACK codec is our own — no external HPACK crate).
 boatramp-http = { workspace = true }
+# Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4): the live-topic stream
+# fan-out frames each delivered payload as a length-prefixed envelope + a terminal end frame when
+# the client requested a Connect/gRPC-web content-type (`stream.rs`), instead of SSE `event:` lines.
+# The same codec the guest-side `boatramp-connect` serving shim uses — pure bytes, no deps.
+boatramp-connect-frame = { workspace = true }
 # `time` + `sync` (beyond the workspace defaults) for the bounded shutdown drain
 # in `serve` (in-flight requests finish under a deadline).
 tokio = { workspace = true, features = ["time", "sync"] }

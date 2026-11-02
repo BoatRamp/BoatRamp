@@ -1175,9 +1175,21 @@ async fn serve_resolved(
                 &vary,
             );
         }
-        // No handler matched: a GET to a configured SSE stream route fans out
-        // its messaging topics. Streams are GET-only.
-        if request.method() == Method::GET
+        // No handler matched: a configured stream route fans out its messaging topics. A GET is
+        // SSE (or a WebSocket on upgrade); a Connect/gRPC-web **server-stream** RPC (PLAN §7 / IU-4)
+        // arrives as a POST carrying an enveloped streaming content-type (`application/connect+*`
+        // or `application/grpc-web*`) and rides the SAME fan-out + per-subscriber authz, but with
+        // length-prefixed envelope framing selected by that content-type.
+        let connect_stream_wire = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(boatramp_connect_frame::parse_content_type)
+            // Only the enveloped (streaming) wires serve a server-stream; a bare Connect-unary
+            // content-type is a unary handler's job, never a topic fan-out.
+            .filter(boatramp_connect_frame::Wire::is_enveloped);
+        if (request.method() == Method::GET
+            || (request.method() == Method::POST && connect_stream_wire.is_some()))
             && let Some(stream) = manifest
                 .config
                 .streams
@@ -1199,7 +1211,11 @@ async fn serve_resolved(
                 // fallback, mirroring handler dispatch).
                 let stream_project =
                     project.unwrap_or(boatramp_core::project::ProjectRef::DEFAULT.as_str());
-                if stream.websocket && is_upgrade_request(request.headers()) {
+                // WebSocket is a GET-upgrade only; a Connect server-stream POST never upgrades.
+                if stream.websocket
+                    && request.method() == Method::GET
+                    && is_upgrade_request(request.headers())
+                {
                     return apply_vary(
                         serve_ws_stream(
                             inner,
@@ -1231,6 +1247,15 @@ async fn serve_resolved(
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.strip_prefix("Bearer "))
                     .map(str::to_string);
+                // A Connect server-stream POST carries a single request message in its body. The
+                // host fan-out is protobuf-agnostic (the subscribed scope rides the route params +
+                // bearer, like every scoped stream — PLAN §11.2), so the message is DRAINED, not
+                // decoded; draining keeps the request fully consumed before the long-lived response
+                // body begins. (Mapping request-message fields → topic/membership would need proto
+                // descriptors in the host — an IU-5-adjacent follow-up held for luigi.)
+                if connect_stream_wire.is_some() {
+                    let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
+                }
                 return apply_vary(
                     serve_stream(
                         inner,
@@ -1243,6 +1268,7 @@ async fn serve_resolved(
                         bearer.as_deref(),
                         client_ip,
                         preview,
+                        connect_stream_wire,
                     )
                     .await,
                     &vary,

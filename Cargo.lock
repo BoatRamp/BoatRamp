@@ -1754,6 +1754,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boatramp-connect-frame"
+version = "0.0.1"
+
+[[package]]
 name = "boatramp-container"
 version = "0.50.0"
 dependencies = [
@@ -2064,6 +2068,7 @@ dependencies = [
  "azure_storage_common",
  "azure_storage_sas",
  "base64 0.22.1",
+ "boatramp-connect-frame",
  "boatramp-core",
  "boatramp-handlers",
  "boatramp-http",

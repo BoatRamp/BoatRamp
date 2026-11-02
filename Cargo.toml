@@ -3,6 +3,9 @@ resolver = "2"
 members = [
   "crates/boatramp-http",
   "crates/boatramp-types",
+  # Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4), shared with the
+  # boatramp-uchron-shim's `boatramp-connect` serving shim (which vendors a byte-identical copy).
+  "crates/boatramp-connect-frame",
   "crates/boatramp-core",
   "crates/boatramp-storage",
   "crates/boatramp-server",
@@ -121,6 +124,9 @@ boatramp-vz = { path = "crates/boatramp-vz", version = "0.50.0" }
 boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.50.0" }
 boatramp-node = { path = "crates/boatramp-node", version = "0.50.0" }
 boatramp-http = { path = "crates/boatramp-http", version = "0.50.0" }
+# Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4). Pre-release + publish=false
+# (the dedicated Connect cut is held), so it carries no published version yet — a plain path dep.
+boatramp-connect-frame = { path = "crates/boatramp-connect-frame" }
 
 tokio = { version = "1", features = [
   "rt-multi-thread",

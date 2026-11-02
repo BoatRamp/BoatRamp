@@ -30,6 +30,9 @@ name: CI
 #                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
 #                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
 #                       that must never compression-mangle a framed body),
+#                       live-gate-connect-server-stream (real Connect/gRPC-web SERVER-STREAMs over
+#                       the host topic fan-out AND a guest serve_server_stream — PLAN-connect-grpc
+#                       §7 / IU-4, both framed via the shared boatramp-connect-frame codec),
 #                       test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
@@ -1619,6 +1622,61 @@ jobs:
             || { echo "::error::connect-unary live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'CONNECT UNARY LIVE OK' connect-unary-live.log \
             || { echo "::error::connect-unary live gate never reached its marker (a Connect/gRPC-web serve-path regression — likely the host residual that must not compression-mangle a framed body, PLAN-connect-grpc §5 / IU-1)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §7 IU-4 CONNECT-SERVER-STREAM LIVE GATES. Two seams, each a real Connect /
+  # gRPC-web server-stream over the ACTUAL hand-rolled HTTP stack on a loopback socket, each wired as
+  # a hard CI success-marker per the ignore-gated-tests-not-evidence discipline:
+  #   • FANOUT (marker `CONNECT SERVER-STREAM FANOUT LIVE OK`): the host's live-topic fan-out frames
+  #     each delivered messaging payload as a length-prefixed Connect/gRPC-web envelope (instead of an
+  #     SSE `event:` line) when the client opens the stream with a Connect/gRPC-web content-type
+  #     (`stream.rs::serve_connect_stream`). A live `LogMessaging` backend + a background publisher
+  #     (the PLAN §7 producer) feed it; the client reads framed data frames decoding to the published
+  #     protobuf, the gRPC-web body comes back UNCOMPRESSED (the host residual on the fan-out path),
+  #     and a Scoped route with no bearer is 401 (per-subscriber authz gates the Connect path). No
+  #     wasm toolchain — the fan-out has no guest in the serving loop.
+  #   • GUEST (marker `CONNECT SERVER-STREAM GUEST LIVE OK`): a REAL compiled guest
+  #     (`connect-ticker.wasm`, built from the shim's `examples/connect-ticker` on `serve_server_stream`
+  #     with GENERATED prost messages) yields N Ticks onto the shim's incremental ResponseStream (the
+  #     §8 `#[handler(stream)]` arm), which the host drains chunk-by-chunk; the client asserts N data
+  #     frames + the terminal end frame (Connect EndStream / gRPC-web trailers) for both wires, and the
+  #     gRPC-web framed body is never HTTP-compressed. The `include_bytes!`-embedded fixture runs on
+  #     musl with no wasm toolchain. Both `#[ignore]`d (timing-sensitive loopback sockets) and run here
+  #     with `--include-ignored` as their OWN job, NOT folded into the general `--all-features` suite
+  #     (v0.49.0 timing-flake lesson); each step greps its marker + the pass count, so a silent skip /
+  #     compile-out fails the merge.
+  live-gate-connect-server-stream:
+    name: live gate (connect-server-stream)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-server-stream-musl
+
+      - name: "connect-server-stream FANOUT live gate (host topic fan-out framed as Connect/gRPC-web)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_server_stream_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-ss-fanout.log
+          grep -qE 'test result: ok\. 1 passed' connect-ss-fanout.log \
+            || { echo "::error::connect server-stream FANOUT live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT SERVER-STREAM FANOUT LIVE OK' connect-ss-fanout.log \
+            || { echo "::error::connect server-stream FANOUT live gate never reached its marker (a stream.rs Connect-framing-mode regression, PLAN-connect-grpc §7 / IU-4)" >&2; exit 1; }
+
+      - name: "connect-server-stream GUEST live gate (guest serve_server_stream over the §8 streaming arm)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_server_stream_guest_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-ss-guest.log
+          grep -qE 'test result: ok\. 1 passed' connect-ss-guest.log \
+            || { echo "::error::connect server-stream GUEST live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT SERVER-STREAM GUEST LIVE OK' connect-ss-guest.log \
+            || { echo "::error::connect server-stream GUEST live gate never reached its marker (a serve_server_stream / §8 streaming-arm / shared frame-codec regression, PLAN-connect-grpc §6-§8 / IU-3+IU-4)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
