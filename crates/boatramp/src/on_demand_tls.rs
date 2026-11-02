@@ -497,8 +497,9 @@ pub fn from_serve_config(
     // enabling on-demand TLS in production configures `[secrets]`.
     let envelope_wrapped = account_envelope.is_some();
     // DNS-01 propagation knobs (`[serve.on_demand_tls]`): a real readiness poll, max `propagation_wait`,
-    // re-checked every `propagation_poll_interval`. Default to the behaviour-equivalent 15s cap / 2s poll.
-    let propagation_wait = Duration::from_secs(cfg.propagation_wait_secs.unwrap_or(15));
+    // re-checked every `propagation_poll_interval`. Default to a 45s cap / 2s poll — the authoritative-NS
+    // pre-check returns the moment the record is live, so the cap only bounds the slow/fallback case.
+    let propagation_wait = Duration::from_secs(cfg.propagation_wait_secs.unwrap_or(45));
     let propagation_poll_interval =
         Duration::from_secs(cfg.propagation_poll_interval_secs.unwrap_or(2));
     let issuer = Arc::new(AcmeIssuer::new(
@@ -832,10 +833,12 @@ impl CertIssuer for AcmeIssuer {
         };
         let issued = match &self.challenge {
             AcmeChallenge::Dns01(provider) => {
-                // Wire the propagation pre-check so we tell the CA to validate only once the
-                // `_acme-challenge` TXT is live (the fix). If the resolver can't be built, fall back to
-                // the no-pre-check solver (blind `propagation_wait`), no worse than before.
-                match boatramp_acme::acme::HickoryTxtResolver::system() {
+                // Wire the authoritative-NS propagation pre-check so we tell the CA to validate only
+                // once the `_acme-challenge` TXT is live at the zone's own nameservers (the fix for the
+                // recursive-resolver negative-cache race); it falls forward to the recursive resolver
+                // internally. Only if NO recursive resolver can be built do we fall back to the
+                // no-pre-check solver (blind `propagation_wait`), no worse than before.
+                match boatramp_acme::acme::AuthoritativeTxtResolver::system() {
                     Ok(resolver) => {
                         let solver = boatramp_acme::acme::Dns01Solver::with_resolver(
                             provider.as_ref(),

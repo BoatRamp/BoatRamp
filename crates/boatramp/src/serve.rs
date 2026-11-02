@@ -547,7 +547,7 @@ pub struct ServeArgs {
     /// the zone before telling the CA to validate. This is a real readiness poll (resolve the record
     /// and confirm the expected value), not a blind sleep — issuance proceeds the moment the record
     /// is live, and only falls back to proceeding-anyway (the CA retries) if this elapses first.
-    #[arg(long, env = "BOATRAMP_ACME_PROPAGATION_WAIT", default_value_t = 15)]
+    #[arg(long, env = "BOATRAMP_ACME_PROPAGATION_WAIT", default_value_t = 45)]
     acme_propagation_wait_secs: u64,
 
     /// DNS-01 only: how often (seconds) to re-check DNS while waiting for the `_acme-challenge` TXT to

@@ -158,7 +158,7 @@ Nickel-generated config on a non-`.json` path). See
 | `--acme-cache <path>` | `./data/acme` | Certificate cache directory. |
 | `--acme-dns-provider <name>` | `manual` | DNS-01 provider (`--tls acme-dns`); see [DNS providers](./dns-providers.md). |
 | `--acme-wildcard-preview` | `false` | Also issue `*.deploy.<domain>` for by-id previews. |
-| `--acme-propagation-wait-secs <n>` | `15` | DNS-01: max seconds to wait for the `_acme-challenge` TXT to propagate before validating (a readiness poll, not a blind sleep). |
+| `--acme-propagation-wait-secs <n>` | `45` | DNS-01: max seconds to wait for the `_acme-challenge` TXT to propagate before validating (a readiness poll against the zone's authoritative nameservers, not a blind sleep). |
 | `--acme-propagation-poll-interval-secs <n>` | `2` | DNS-01: how often to re-check DNS while waiting for the TXT to propagate. |
 | `--dns-target <addr\|host>` | — | `--tls acme-dns` only: point every site's verified **custom** domains at this address via a leader-gated background reconcile loop (never the `*.deploy.<host>` preview wildcard). An IPv4/IPv6 literal becomes an A/AAAA record, anything else a CNAME — the same convention as `dns configure-domain --target`. Unset (default) disables the loop; `dns configure-domain` remains the manual, one-shot path. See [Automate DNS with a provider](../how-to/auto-dns.md). |
 | `--dns-reconcile-tick-secs <n>` | `300` | How often the `--dns-target` reconcile loop re-sweeps every site's verified custom domains. Ignored when `--dns-target` is unset. |

@@ -216,8 +216,9 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
                 contact_email: acme_contact,
                 domains: Vec::new(),
                 dns_ttl: 60,
-                // Behaviour-equivalent default: a real readiness poll up to 15s, re-checked every 2s.
-                propagation_wait: Duration::from_secs(15),
+                // A real readiness poll up to 45s, re-checked every 2s. The authoritative-NS pre-check
+                // returns as soon as the record is live, so the cap only bounds the slow/fallback case.
+                propagation_wait: Duration::from_secs(45),
                 propagation_poll_interval: Duration::from_secs(2),
                 timeout: Duration::from_secs(120),
                 // The `boatramp dns` CLI issues against the public CA (no test-CA knob here).

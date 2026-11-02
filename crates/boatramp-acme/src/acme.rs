@@ -25,6 +25,12 @@ pub use instant_acme::{Account, AccountCredentials, ChallengeType, KeyAuthorizat
 
 use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, TxtResolver, acme_challenge_name};
 
+// The default DNS-01 propagation pre-check resolver: query the zone's AUTHORITATIVE nameservers
+// directly (the lego/certbot approach), so a recursive resolver's negative cache can't make a
+// freshly-written `_acme-challenge` TXT read as "not yet live". Falls forward to the recursive
+// [`HickoryTxtResolver`] (and then to a blind wait) so issuance is never worse than before.
+pub use crate::authoritative::AuthoritativeTxtResolver;
+
 /// A failure during ACME DNS-01 issuance.
 #[derive(Debug, thiserror::Error)]
 pub enum AcmeError {
@@ -100,7 +106,11 @@ impl Default for CertRequest {
             contact_email: None,
             domains: Vec::new(),
             dns_ttl: 60,
-            propagation_wait: Duration::from_secs(15),
+            // The happy path returns the instant the record is observed live at the zone's
+            // authoritative nameservers (see `AuthoritativeTxtResolver`), so this is only an upper
+            // bound for the slow/fallback case — a 45s budget absorbs a lagging zone without the CA
+            // having to retry, while the authoritative pre-check still returns in a poll or two.
+            propagation_wait: Duration::from_secs(45),
             propagation_poll_interval: Duration::from_secs(2),
             timeout: Duration::from_secs(120),
             extra_root_ca: None,
@@ -341,18 +351,21 @@ async fn txt_record_visible(
     })
 }
 
-/// The default [`TxtResolver`] for the DNS-01 propagation pre-check: a hickory recursive resolver.
+/// A hickory **recursive** [`TxtResolver`] — the system resolver (`/etc/resolv.conf`), or the
+/// `BOATRAMP_ACME_PROPAGATION_RESOLVER` override.
 ///
-/// **Why recursive, not authoritative-NS-direct (lego's robustest mode):** a *positive* observation
-/// here — the unique-per-challenge TXT value resolving — is already proof that the authoritative
-/// servers are serving the record (a recursive resolver only returns what some authority answered,
-/// and a stale/unrelated value can't match the unique challenge value), which is exactly the
-/// precondition the CA's own (recursive, multi-vantage) validator needs. The only thing a direct
-/// authoritative-NS query would buy is shaving a recursive resolver's *negative*-cache lag — and a
-/// false negative here merely costs extra wait up to `propagation_wait`, after which the driver
-/// proceeds anyway and the CA retries. That marginal latency gain is not worth the complexity (SOA/NS
-/// walking, per-NS querying, quorum) or the extra SSRF surface of dialing arbitrary nameserver IPs.
-/// We cap the resolver's own negative cache (below) so a just-written record is re-queried quickly.
+/// This is the **fallback** tier of the DNS-01 propagation pre-check: the default is now
+/// [`AuthoritativeTxtResolver`], which queries the zone's authoritative nameservers directly so a
+/// recursive resolver's *negative* cache can't make a just-written `_acme-challenge` TXT keep reading
+/// as "not live" (the field-reported Cloudflare slow-happy-path). When authoritative discovery can't
+/// run (no SOA/NS resolvable, a NS unreachable), the authoritative resolver falls forward to **this**
+/// recursive resolver, and if even this can't be built the driver blind-waits — so issuance is never
+/// worse than before the authoritative path existed.
+///
+/// A *positive* observation here is still real evidence: the unique-per-challenge TXT value resolving
+/// means some authority served it (a stale/unrelated value can't match the unique challenge value),
+/// which is the precondition the CA's own recursive validator needs. We cap this resolver's negative
+/// cache ([`resolver_opts`]) so a just-written record is re-queried within seconds.
 #[derive(Clone)]
 pub struct HickoryTxtResolver {
     inner: hickory_resolver::TokioResolver,
@@ -369,76 +382,92 @@ impl HickoryTxtResolver {
     /// public resolver. Any entry that fails to parse is ignored; an all-unparseable value falls back
     /// to the system config.
     pub fn system() -> Result<Self, AcmeError> {
-        use hickory_resolver::Resolver;
-        use hickory_resolver::config::ResolverConfig;
-        use hickory_resolver::net::runtime::TokioRuntimeProvider;
-
-        if let Ok(spec) = std::env::var("BOATRAMP_ACME_PROPAGATION_RESOLVER") {
-            let servers: Vec<std::net::SocketAddr> = spec
-                .split(',')
-                .filter_map(|s| parse_resolver_addr(s.trim()))
-                .collect();
-            if !servers.is_empty() {
-                return Self::with_nameservers(&servers);
-            }
-        }
-
-        let build = |builder: hickory_resolver::ResolverBuilder<TokioRuntimeProvider>| {
-            builder.with_options(Self::opts()).build()
-        };
-        let inner = hickory_resolver::TokioResolver::builder_tokio()
-            .and_then(build)
-            .or_else(|_| {
-                // No usable system config ⇒ the library default (public roots): still a recursive
-                // resolver, so the pre-check keeps working on a host without `/etc/resolv.conf`.
-                build(Resolver::builder_with_config(
-                    ResolverConfig::default(),
-                    TokioRuntimeProvider::default(),
-                ))
-            })
-            .map_err(|e| {
-                AcmeError::Dns(DnsError::Config(format!("building the DNS resolver: {e}")))
-            })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: build_system_resolver()?,
+        })
     }
 
     /// Build a resolver that queries exactly `nameservers` over UDP (used to point the pre-check at a
-    /// specific server — e.g. a test's mock DNS, or an operator-pinned recursive resolver). A port in
-    /// the `SocketAddr` overrides the default 53.
+    /// specific server — e.g. a test's mock DNS, an operator-pinned recursive resolver, or a zone's
+    /// **authoritative** nameservers so the [`AuthoritativeTxtResolver`] bypasses a recursive
+    /// resolver's negative cache). A port in the `SocketAddr` overrides the default 53.
     pub fn with_nameservers(nameservers: &[std::net::SocketAddr]) -> Result<Self, AcmeError> {
-        use hickory_resolver::Resolver;
-        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
-        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        Ok(Self {
+            inner: build_resolver_at(nameservers)?,
+        })
+    }
+}
 
-        let servers: Vec<NameServerConfig> = nameservers
-            .iter()
-            .map(|addr| {
-                let mut ns = NameServerConfig::udp(addr.ip());
-                for conn in &mut ns.connections {
-                    conn.port = addr.port();
-                }
-                ns
-            })
+/// Resolver options tuned for a "just published, poll until live" lookup: a small negative-cache
+/// floor so a record that was absent moments ago is re-queried quickly, and a modest positive cap.
+pub(crate) fn resolver_opts() -> hickory_resolver::config::ResolverOpts {
+    let mut opts = hickory_resolver::config::ResolverOpts::default();
+    opts.negative_min_ttl = Some(Duration::from_secs(1));
+    opts.negative_max_ttl = Some(Duration::from_secs(5));
+    opts.positive_max_ttl = Some(Duration::from_secs(30));
+    opts
+}
+
+/// Build the shared `TokioResolver` behind [`HickoryTxtResolver::system`] — the host's recursive
+/// resolver (`/etc/resolv.conf` etc.), honouring the `BOATRAMP_ACME_PROPAGATION_RESOLVER` override,
+/// with a library-default-config fallback so the pre-check still works on a host without a usable
+/// resolver config. Shared so the [`AuthoritativeTxtResolver`]'s zone/NS **discovery** queries run
+/// against the same recursive resolver as the fallback TXT lookups.
+pub(crate) fn build_system_resolver() -> Result<hickory_resolver::TokioResolver, AcmeError> {
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::ResolverConfig;
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+    if let Ok(spec) = std::env::var("BOATRAMP_ACME_PROPAGATION_RESOLVER") {
+        let servers: Vec<std::net::SocketAddr> = spec
+            .split(',')
+            .filter_map(|s| parse_resolver_addr(s.trim()))
             .collect();
-        let config = ResolverConfig::from_parts(None, Vec::new(), servers);
-        let inner = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(Self::opts())
-            .build()
-            .map_err(|e| {
-                AcmeError::Dns(DnsError::Config(format!("building the DNS resolver: {e}")))
-            })?;
-        Ok(Self { inner })
+        if !servers.is_empty() {
+            return build_resolver_at(&servers);
+        }
     }
 
-    /// Resolver options tuned for a "just published, poll until live" lookup: a small negative-cache
-    /// floor so a record that was absent moments ago is re-queried quickly, and a modest positive cap.
-    fn opts() -> hickory_resolver::config::ResolverOpts {
-        let mut opts = hickory_resolver::config::ResolverOpts::default();
-        opts.negative_min_ttl = Some(Duration::from_secs(1));
-        opts.negative_max_ttl = Some(Duration::from_secs(5));
-        opts.positive_max_ttl = Some(Duration::from_secs(30));
-        opts
-    }
+    let build = |builder: hickory_resolver::ResolverBuilder<TokioRuntimeProvider>| {
+        builder.with_options(resolver_opts()).build()
+    };
+    hickory_resolver::TokioResolver::builder_tokio()
+        .and_then(build)
+        .or_else(|_| {
+            // No usable system config ⇒ the library default (public roots): still a recursive
+            // resolver, so the pre-check keeps working on a host without `/etc/resolv.conf`.
+            build(Resolver::builder_with_config(
+                ResolverConfig::default(),
+                TokioRuntimeProvider::default(),
+            ))
+        })
+        .map_err(|e| AcmeError::Dns(DnsError::Config(format!("building the DNS resolver: {e}"))))
+}
+
+/// Build a `TokioResolver` that queries exactly `nameservers` over UDP (a specific recursive resolver,
+/// or a zone's authoritative nameservers). A port in the `SocketAddr` overrides the default 53.
+pub(crate) fn build_resolver_at(
+    nameservers: &[std::net::SocketAddr],
+) -> Result<hickory_resolver::TokioResolver, AcmeError> {
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+    let servers: Vec<NameServerConfig> = nameservers
+        .iter()
+        .map(|addr| {
+            let mut ns = NameServerConfig::udp(addr.ip());
+            for conn in &mut ns.connections {
+                conn.port = addr.port();
+            }
+            ns
+        })
+        .collect();
+    let config = ResolverConfig::from_parts(None, Vec::new(), servers);
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(resolver_opts())
+        .build()
+        .map_err(|e| AcmeError::Dns(DnsError::Config(format!("building the DNS resolver: {e}"))))
 }
 
 /// Parse one `BOATRAMP_ACME_PROPAGATION_RESOLVER` entry: `ip:port` (an explicit `SocketAddr`) or a
@@ -494,11 +523,13 @@ pub async fn obtain_certificate(
         request.extra_root_ca.as_deref(),
     )
     .await?;
-    // Wire the default system resolver for the propagation pre-check so the happy path waits until
-    // the `_acme-challenge` TXT is actually live before validating (the fix). If the resolver can't be
-    // built (e.g. no usable resolver config), fall back to the no-pre-check solver — issuance then
-    // blind-waits `propagation_wait`, no worse than before.
-    match HickoryTxtResolver::system() {
+    // Wire the authoritative-NS propagation pre-check so the happy path waits until the
+    // `_acme-challenge` TXT is actually live at the zone's own nameservers before validating (the
+    // fix). It falls forward internally to the recursive resolver when authoritative discovery can't
+    // run. Only if NO recursive resolver can be built at all (no usable resolver config) do we fall
+    // back to the no-pre-check solver — issuance then blind-waits `propagation_wait`, no worse than
+    // before.
+    match AuthoritativeTxtResolver::system() {
         Ok(resolver) => {
             let solver = Dns01Solver::with_resolver(provider, request.dns_ttl, &resolver);
             obtain_certificate_with(&account, request, &solver).await

@@ -17,6 +17,9 @@ pub mod dns;
 #[cfg(feature = "acme")]
 pub mod acme;
 
+#[cfg(feature = "acme")]
+pub mod authoritative;
+
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
