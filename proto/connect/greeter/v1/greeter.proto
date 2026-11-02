@@ -1,0 +1,34 @@
+// The Connect / gRPC-web UNARY example service (PLAN-connect-grpc §9 / IU-5 client codegen).
+//
+// This is the client-side counterpart of the identically-defined service the boatramp-uchron-shim
+// repo serves (`examples/connect-greeter`): the SAME `connect.greeter.v1.Greeter/SayHello` the host
+// Connect-unary live gate stands up. It is vendored here so the host repo's Nix-pinned client
+// codegen (`just codegen`) can compile it offline into the VENDORED/committed Rust client
+// (`examples/connect-clients/src/generated/`) and the Web/TypeScript connect-es client
+// (`clients/ts/generated/`), with no cross-repo path dependency — the same discipline the shared
+// `boatramp-connect-frame` crate follows (canonical copy elsewhere, vendored copy here; keep the
+// service/message definitions in sync).
+//
+// Keep the message + service definitions byte-for-byte in step with the shim repo's copy so a
+// client generated here talks to the service the shim serves.
+syntax = "proto3";
+
+package connect.greeter.v1;
+
+// A greeting request.
+message SayHelloRequest {
+  // Who to greet; empty greets "world".
+  string name = 1;
+}
+
+// A greeting reply.
+message SayHelloResponse {
+  // The rendered greeting, e.g. "hello, ada!".
+  string greeting = 1;
+}
+
+// A minimal unary greeter.
+service Greeter {
+  // Greet the caller by name (one request, one response).
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
+}

@@ -33,6 +33,10 @@ name: CI
 #                       live-gate-connect-server-stream (real Connect/gRPC-web SERVER-STREAMs over
 #                       the host topic fan-out AND a guest serve_server_stream — PLAN-connect-grpc
 #                       §7 / IU-4, both framed via the shared boatramp-connect-frame codec),
+#                       live-gate-connect-client (a GENERATED Rust client — the vendored `just
+#                       codegen` output — driving a real Connect unary + server-stream round trip
+#                       over the boatramp-connect-client shim, both wires — PLAN-connect-grpc §9 /
+#                       IU-5),
 #                       test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
@@ -1677,6 +1681,60 @@ jobs:
             || { echo "::error::connect server-stream GUEST live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'CONNECT SERVER-STREAM GUEST LIVE OK' connect-ss-guest.log \
             || { echo "::error::connect server-stream GUEST live gate never reached its marker (a serve_server_stream / §8 streaming-arm / shared frame-codec regression, PLAN-connect-grpc §6-§8 / IU-3+IU-4)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §9 IU-5 CONNECT-CLIENT LIVE GATES — the CLIENT-codegen "end-to-end proof". The
+  # client-side mirror of the connect-unary / connect-server-stream serving gates above: a GENERATED
+  # Rust client (`connect-clients` crate, the vendored `just codegen` output — prost messages + a
+  # typed client per service) drives a REAL Connect round trip over the `boatramp-connect-client`
+  # shim + its std `PlaintextHttpTransport`, against the SAME compiled guests (`connect-greeter.wasm`
+  # unary, `connect-ticker.wasm` server-stream) served over the ACTUAL hand-rolled HTTP/1.1 stack on
+  # a loopback socket. Each test exercises BOTH wires (Connect + gRPC-web):
+  #   • UNARY (marker `CONNECT CLIENT UNARY LIVE OK`): the generated GreeterClient.say_hello
+  #     round-trips a bare `application/proto` message and a framed `application/grpc-web+proto`
+  #     [data][grpc-status:0 trailers] response — proving the generated client, the client shim, and
+  #     the shared `boatramp-connect-frame` codec (its NEW client-side decoders) all agree with the
+  #     serving path. Confirms the client speaks `Connect-Protocol-Version: 1` (the shim's version).
+  #   • SERVER-STREAM (marker `CONNECT CLIENT SERVER-STREAM LIVE OK`): the generated
+  #     TickerClient.subscribe reads N framed Ticks + the terminal end-of-stream status (Connect
+  #     EndStream / gRPC-web trailers) via the shim's `ServerStream<Tick>` iterator.
+  # `include_bytes!`-embedded fixtures (runs on musl, no wasm toolchain). Both `#[ignore]`d (timing-
+  # sensitive loopback sockets) and run here with `--include-ignored` as their OWN job, NOT folded
+  # into the general suite (v0.49.0 timing-flake lesson); each step greps its marker + the pass
+  # count, so a silent skip / compile-out fails the merge (the ignore-gated-tests-not-evidence
+  # discipline).
+  live-gate-connect-client:
+    name: live gate (connect-client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-client-musl
+
+      - name: "connect-client UNARY live gate (generated client, Connect + gRPC-web wires)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_client_unary_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-client-unary.log
+          grep -qE 'test result: ok\. 1 passed' connect-client-unary.log \
+            || { echo "::error::connect-client UNARY live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT CLIENT UNARY LIVE OK' connect-client-unary.log \
+            || { echo "::error::connect-client UNARY live gate never reached its marker (a generated-client / client-shim / shared frame-codec regression, PLAN-connect-grpc §9 / IU-5)" >&2; exit 1; }
+
+      - name: "connect-client SERVER-STREAM live gate (generated client ServerStream, Connect + gRPC-web wires)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_client_server_stream_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-client-ss.log
+          grep -qE 'test result: ok\. 1 passed' connect-client-ss.log \
+            || { echo "::error::connect-client SERVER-STREAM live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT CLIENT SERVER-STREAM LIVE OK' connect-client-ss.log \
+            || { echo "::error::connect-client SERVER-STREAM live gate never reached its marker (a generated-client ServerStream / client-shim / shared frame-codec regression, PLAN-connect-grpc §9 / IU-5)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql

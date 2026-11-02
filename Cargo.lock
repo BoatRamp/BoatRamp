@@ -1754,6 +1754,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boatramp-connect-client"
+version = "0.0.1"
+dependencies = [
+ "boatramp-connect-frame",
+ "prost 0.14.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "boatramp-connect-frame"
 version = "0.0.1"
 
@@ -2068,6 +2077,7 @@ dependencies = [
  "azure_storage_common",
  "azure_storage_sas",
  "base64 0.22.1",
+ "boatramp-connect-client",
  "boatramp-connect-frame",
  "boatramp-core",
  "boatramp-handlers",
@@ -2076,6 +2086,7 @@ dependencies = [
  "boatramp-storage",
  "bytes",
  "chrono",
+ "connect-clients",
  "cryptoki",
  "ed25519-dalek",
  "futures",
@@ -2750,6 +2761,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7feb5cb312f774e8a24540e27206db4e890f7d488563671d24a16389cf4c2e4e"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "connect-clients"
+version = "0.0.1"
+dependencies = [
+ "boatramp-connect-client",
+ "prost 0.14.1",
 ]
 
 [[package]]
@@ -4764,8 +4783,8 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "pin-project",
- "prost 0.14.4",
- "prost-types 0.14.4",
+ "prost 0.14.1",
+ "prost-types 0.14.1",
  "reqwest 0.13.5",
  "rustc_version",
  "serde",
@@ -4945,8 +4964,8 @@ dependencies = [
  "http-body 1.0.1",
  "md5",
  "percent-encoding",
- "prost 0.14.4",
- "prost-types 0.14.4",
+ "prost 0.14.1",
+ "prost-types 0.14.1",
  "serde",
  "serde_json",
  "serde_with",
@@ -8849,9 +8868,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
 dependencies = [
  "bytes",
  "prost-derive 0.14.4",
@@ -8907,11 +8926,11 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.14.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
+checksum = "b9b4db3d6da204ed77bb26ba83b6122a73aeb2e87e25fbf7ad2e84c4ccbf8f72"
 dependencies = [
- "prost 0.14.4",
+ "prost 0.14.1",
 ]
 
 [[package]]
@@ -12062,7 +12081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost 0.14.4",
+ "prost 0.14.1",
  "tonic 0.14.6",
 ]
 

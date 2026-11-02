@@ -166,6 +166,77 @@ pub enum Code {
 }
 
 impl Code {
+    /// The [`Code`] for a gRPC numeric status (the inverse of [`Code::grpc_status`]). An unknown
+    /// number maps to [`Code::Unknown`] (a client must still surface a non-zero status as an error).
+    pub fn from_grpc_status(n: u32) -> Code {
+        match n {
+            0 => Code::Ok,
+            1 => Code::Canceled,
+            2 => Code::Unknown,
+            3 => Code::InvalidArgument,
+            4 => Code::DeadlineExceeded,
+            5 => Code::NotFound,
+            6 => Code::AlreadyExists,
+            7 => Code::PermissionDenied,
+            8 => Code::ResourceExhausted,
+            9 => Code::FailedPrecondition,
+            10 => Code::Aborted,
+            11 => Code::OutOfRange,
+            12 => Code::Unimplemented,
+            13 => Code::Internal,
+            14 => Code::Unavailable,
+            15 => Code::DataLoss,
+            16 => Code::Unauthenticated,
+            _ => Code::Unknown,
+        }
+    }
+
+    /// The [`Code`] for a Connect lower-snake-case name (the inverse of [`Code::connect_name`]). An
+    /// unrecognized name maps to [`Code::Unknown`].
+    pub fn from_connect_name(name: &str) -> Code {
+        match name {
+            "ok" => Code::Ok,
+            "canceled" => Code::Canceled,
+            "unknown" => Code::Unknown,
+            "invalid_argument" => Code::InvalidArgument,
+            "deadline_exceeded" => Code::DeadlineExceeded,
+            "not_found" => Code::NotFound,
+            "already_exists" => Code::AlreadyExists,
+            "permission_denied" => Code::PermissionDenied,
+            "resource_exhausted" => Code::ResourceExhausted,
+            "failed_precondition" => Code::FailedPrecondition,
+            "aborted" => Code::Aborted,
+            "out_of_range" => Code::OutOfRange,
+            "unimplemented" => Code::Unimplemented,
+            "internal" => Code::Internal,
+            "unavailable" => Code::Unavailable,
+            "data_loss" => Code::DataLoss,
+            "unauthenticated" => Code::Unauthenticated,
+            _ => Code::Unknown,
+        }
+    }
+
+    /// The [`Code`] a **Connect unary** error's HTTP status maps to (the inverse of
+    /// [`Code::http_status`], used by a client when the response body omits a `code`). The Connect
+    /// spec's HTTP→code fallback: an unmapped status folds to the nearest class default.
+    pub fn from_http_status(status: u16) -> Code {
+        match status {
+            200 => Code::Ok,
+            400 => Code::InvalidArgument,
+            401 => Code::Unauthenticated,
+            403 => Code::PermissionDenied,
+            404 => Code::NotFound,
+            409 => Code::Aborted,
+            412 => Code::FailedPrecondition,
+            429 => Code::ResourceExhausted,
+            499 => Code::Canceled,
+            501 => Code::Unimplemented,
+            503 => Code::Unavailable,
+            504 => Code::DeadlineExceeded,
+            _ => Code::Unknown,
+        }
+    }
+
     /// The gRPC numeric status (the `grpc-status` trailer value).
     pub fn grpc_status(self) -> u32 {
         match self {
@@ -507,6 +578,187 @@ pub fn split_rpc_path(path: &str) -> Option<(&str, &str)> {
     Some((service, method))
 }
 
+// ---- client-side decode (the inverses of the serving-side encoders above) ----------------------
+//
+// The serving path (and the guest shim) ENCODE the end-of-stream frames; a CLIENT reading a
+// response must DECODE them. These functions are the exact inverses of `encode_envelope` /
+// `encode_grpc_web_trailers` / `encode_connect_end_stream` / `connect_error_json`, kept in this
+// shared crate so the client shim and the serving shim speak one vocabulary (and so the shim can
+// vendor them unchanged, like the rest of this crate).
+
+/// Iterate every complete envelope frame in `buf` (a buffered streaming / gRPC-web response body).
+/// Stops at the first truncated or compressed frame (yielding the [`FrameError`] once, then ending).
+pub fn frames(buf: &[u8]) -> Frames<'_> {
+    Frames { buf, done: false }
+}
+
+/// Iterator over the envelope frames of a buffered body — see [`frames`].
+pub struct Frames<'a> {
+    buf: &'a [u8],
+    done: bool,
+}
+
+impl<'a> Iterator for Frames<'a> {
+    type Item = Result<Frame<'a>, FrameError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.buf.is_empty() {
+            return None;
+        }
+        match decode_one(self.buf) {
+            Ok((frame, consumed)) => {
+                self.buf = &self.buf[consumed..];
+                Some(Ok(frame))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// Parse a **gRPC-web trailers** frame payload (the `grpc-status: N\r\ngrpc-message: …\r\n` block
+/// produced by [`encode_grpc_web_trailers`]) back into a [`Status`]. A missing `grpc-status` line is
+/// treated as `grpc-status: 0` (ok), per the gRPC-web convention that an absent status means success.
+pub fn parse_grpc_web_trailers(payload: &[u8]) -> Status {
+    let text = String::from_utf8_lossy(payload);
+    let mut code = Code::Ok;
+    let mut message = String::new();
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "grpc-status" => {
+                if let Ok(n) = value.trim().parse::<u32>() {
+                    code = Code::from_grpc_status(n);
+                }
+            }
+            "grpc-message" => message = pct_decode(value.trim()),
+            _ => {}
+        }
+    }
+    Status { code, message }
+}
+
+/// Parse a **Connect EndStream** frame payload (the `{"error":{…},"metadata":{…}}` JSON produced by
+/// [`encode_connect_end_stream`]) back into a [`Status`]. The empty object `{}` (and any payload
+/// with no `error`) is [`Status::ok`].
+pub fn parse_connect_end_stream(payload: &[u8]) -> Status {
+    let text = String::from_utf8_lossy(payload);
+    // The only `code`/`message` string fields in the payload live inside the `error` object, so a
+    // global scan for them recovers the status (an `ok` EndStream has neither).
+    match json_find_string(&text, "code") {
+        Some(code) => Status {
+            code: Code::from_connect_name(&code),
+            message: json_find_string(&text, "message").unwrap_or_default(),
+        },
+        None => Status::ok(),
+    }
+}
+
+/// Parse a **Connect unary error** body (the `{"code":"…","message":"…"}` JSON produced by
+/// [`connect_error_json`]) back into a [`Status`], falling back to `http_status` when the body
+/// carries no `code` (a non-Connect error page from an intermediary). `http_status` 200 with no
+/// `code` is [`Status::ok`].
+pub fn parse_connect_unary_error(http_status: u16, body: &[u8]) -> Status {
+    let text = String::from_utf8_lossy(body);
+    let code = match json_find_string(&text, "code") {
+        Some(name) => Code::from_connect_name(&name),
+        None => Code::from_http_status(http_status),
+    };
+    let message = json_find_string(&text, "message").unwrap_or_default();
+    Status { code, message }
+}
+
+/// Percent-decode a `grpc-message` trailer value (the inverse of [`pct_encode`]).
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Find the first JSON string value for `"<key>"` in `src` and return it unescaped. A minimal scan
+/// (the only JSON this crate exchanges is a status `code`/`message` + metadata — the inverse of
+/// [`json_string`]); returns `None` if the key is absent or its value is not a string.
+fn json_find_string(src: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    // The key could appear as a substring of a longer key (e.g. `"message"` inside `"xmessage"`), so
+    // require the match to be preceded by a non-identifier byte (`{`, `,`, or whitespace) — JSON
+    // object keys are always preceded by `{` or `,`.
+    while let Some(rel) = src[from..].find(&needle) {
+        let at = from + rel;
+        let preceded_ok = at == 0
+            || matches!(
+                src.as_bytes()[at - 1],
+                b'{' | b',' | b' ' | b'\t' | b'\n' | b'\r'
+            );
+        let after = at + needle.len();
+        if preceded_ok {
+            // Expect optional whitespace, a `:`, optional whitespace, then a `"`-string.
+            let rest = src[after..].trim_start();
+            if let Some(rest) = rest.strip_prefix(':') {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('"') {
+                    return Some(json_unescape_until_quote(rest));
+                }
+            }
+        }
+        from = after;
+    }
+    None
+}
+
+/// Read a JSON string body (the bytes after the opening `"`) up to the closing unescaped `"`,
+/// resolving the escapes [`json_string`] emits.
+fn json_unescape_until_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000C}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +906,96 @@ mod tests {
         assert_eq!(Code::NotFound.http_status(), 404);
         assert_eq!(Code::Internal.http_status(), 500);
         assert_eq!(Code::Unauthenticated.grpc_status(), 16);
+    }
+
+    #[test]
+    fn grpc_web_trailers_round_trip() {
+        // Encode on the server side, decode on the client side — the status survives, message and all.
+        let status = Status::new(Code::NotFound, "a\nb%c room");
+        let framed = encode_grpc_web_trailers(&status, &[]);
+        let (frame, _) = decode_one(&framed).unwrap();
+        assert!(frame.is_grpc_web_trailer());
+        assert_eq!(parse_grpc_web_trailers(frame.payload), status);
+        // An absent grpc-status line decodes as ok (gRPC-web convention).
+        assert_eq!(parse_grpc_web_trailers(b"\r\n").code, Code::Ok);
+    }
+
+    #[test]
+    fn connect_end_stream_round_trip() {
+        assert_eq!(
+            parse_connect_end_stream(b"{}"),
+            Status::ok(),
+            "the empty EndStream object is ok"
+        );
+        let status = Status::new(Code::PermissionDenied, "nope \"quoted\"");
+        let framed = encode_connect_end_stream(&status, &[]);
+        let (frame, _) = decode_one(&framed).unwrap();
+        assert!(frame.is_connect_end_stream());
+        assert_eq!(parse_connect_end_stream(frame.payload), status);
+    }
+
+    #[test]
+    fn connect_unary_error_round_trip() {
+        let status = Status::new(Code::InvalidArgument, "bad input");
+        let body = connect_error_json(&status).into_bytes();
+        assert_eq!(
+            parse_connect_unary_error(status.code.http_status(), &body),
+            status
+        );
+        // No `code` in the body ⇒ fall back to the HTTP status.
+        assert_eq!(
+            parse_connect_unary_error(503, b"upstream unavailable").code,
+            Code::Unavailable
+        );
+    }
+
+    #[test]
+    fn frames_iterates_data_then_end() {
+        let mut body = encode_envelope(0, b"one");
+        body.extend_from_slice(&encode_envelope(0, b"two"));
+        body.extend_from_slice(&encode_connect_end_stream(&Status::ok(), &[]));
+        let collected: Vec<_> = frames(&body).map(|f| f.unwrap()).collect();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].payload, b"one");
+        assert_eq!(collected[1].payload, b"two");
+        assert!(collected[2].is_connect_end_stream());
+    }
+
+    #[test]
+    fn code_inverses_round_trip_every_variant() {
+        for code in [
+            Code::Ok,
+            Code::Canceled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::DeadlineExceeded,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ] {
+            assert_eq!(Code::from_grpc_status(code.grpc_status()), code);
+            assert_eq!(Code::from_connect_name(code.connect_name()), code);
+        }
+        assert_eq!(Code::from_grpc_status(999), Code::Unknown);
+        assert_eq!(Code::from_connect_name("bogus"), Code::Unknown);
+    }
+
+    #[test]
+    fn json_find_string_is_not_fooled_by_suffix_keys() {
+        // `"xcode"` must not match a scan for `"code"`.
+        assert_eq!(
+            json_find_string("{\"xcode\":\"no\",\"code\":\"yes\"}", "code"),
+            Some("yes".to_string())
+        );
     }
 
     #[test]

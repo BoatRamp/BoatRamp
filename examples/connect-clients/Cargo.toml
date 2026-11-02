@@ -1,0 +1,21 @@
+# Generated Connect / gRPC-web CLIENTS (PLAN-connect-grpc §9 / IU-5): the VENDORED output of
+# `just codegen` for the example services (`connect.greeter.v1` unary, `connect.ticker.v1`
+# server-stream) — `prost` message types + a typed client per service, on `boatramp-connect-client`.
+#
+# A host library member (not a wasm guest), so the normal `--workspace` build + clippy gate compiles
+# it and the client live-gates (in `boatramp-server`) drive it against a live boatramp Connect
+# service. The committed `src/generated/*.rs` is byte-reproducible — regenerate with `just codegen`.
+[package]
+name = "connect-clients"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+
+[dependencies]
+# The client shim the generated code calls into (Transport / Endpoint / call_unary / …).
+boatramp-connect-client = { workspace = true }
+# The protobuf runtime for the generated message derives (`#[derive(::prost::Message)]`).
+prost = { workspace = true }

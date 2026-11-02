@@ -484,6 +484,13 @@ chrono = { version = "0.4", default-features = false, features = [
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# Connect / gRPC-web CLIENT live gates (PLAN-connect-grpc §9 / IU-5): a GENERATED client + the
+# `boatramp-connect-client` shim drive a real Connect unary / server-stream round trip against the
+# live host serving path (the client-side analog of the existing `connect_*_live` serving gates).
+boatramp-connect-client = { workspace = true }
+# Dev-only (the client live gates); version pinned to match the crate (cargo-deny wildcard-path
+# hygiene, same as the frame crate), even though it is publish=false and only path-referenced.
+connect-clients = { path = "../../examples/connect-clients", version = "0.0.1" }
 # Self-signed cert minting for the per-listener host-TLS live gate (cap-req 06):
 # `tcp_listener_tls_live` builds a `rustls::ServerConfig` from an rcgen cert + a
 # `tokio_rustls` client to prove the handshake terminates host-side.

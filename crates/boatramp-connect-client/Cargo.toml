@@ -1,0 +1,38 @@
+# The boatramp Connect / gRPC-web **client shim** (PLAN-connect-grpc §9 / IU-5): the
+# client-direction analog of the `boatramp-connect` serving shim (which lives in the
+# boatramp-uchron-shim repo). Where the serving shim maps an inbound Connect RPC onto a managed
+# handler, this crate lets a Rust caller — the `boatramp` CLI, a host service, or (once vendored
+# into the shim repo) a guest making an outbound call — INVOKE a Connect unary / server-streaming
+# method on a live boatramp Connect service.
+#
+# It is built on the SAME shared `boatramp-connect-frame` codec the host serving path and the guest
+# serving shim use, so there is exactly one wire vocabulary; the Connect protocol version it speaks
+# is `boatramp_connect_frame::CONNECT_PROTOCOL_VERSION` ("1"), matching the serving shim.
+#
+# The protocol logic is transport-agnostic (a `Transport` trait); the crate ships a dependency-free
+# std `PlaintextHttpTransport` (HTTP/1.1, used by the live gates and for plaintext/overlay dials).
+# A production HTTPS caller implements the same trait over its own HTTP client — see the crate docs.
+[package]
+name = "boatramp-connect-client"
+version = "0.0.1"
+edition = "2021"
+# Held out of the crates.io publish like `boatramp-connect-frame` until the dedicated Connect
+# release; decide its publish posture at the cut.
+publish = false
+license = "Apache-2.0"
+description = "boatramp Connect / gRPC-web client shim: invoke a Connect unary / server-streaming RPC on a live boatramp Connect service. The client-direction analog of the boatramp-connect serving shim, built on the shared boatramp-connect-frame codec."
+repository = "https://git.bytesoba.net/uchron/boatramp"
+
+[lib]
+
+[dependencies]
+# The shared Connect / gRPC-web wire-framing codec (envelope + status vocabulary + the client-side
+# decoders). The one codec the host serving path and both shims share.
+boatramp-connect-frame = { workspace = true }
+# Protobuf runtime (message encode/decode). PINNED EXACT, matching the serving shim + codegen.
+prost = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests derive `prost::Message` directly (no protoc) to exercise the request build + response parse.
+prost = { workspace = true }

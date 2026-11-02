@@ -38,6 +38,15 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# Regenerate the VENDORED/committed Connect / gRPC-web CLIENTS from `proto/` (PLAN-connect-grpc §9
+# / IU-5): the Rust client (prost + a typed client per service) and the Web/TypeScript connect-es
+# client. Runs inside `nix develop` so protoc + buf + the toolchain are the pinned ones — the output
+# is reproducible (generate twice ⇒ identical bytes) and committed, so the normal build never runs
+# codegen. Review + commit `examples/connect-clients/src/generated/*.rs` and
+# `clients/ts/generated/**/*_pb.ts` afterwards.
+codegen:
+    nix develop --command bash scripts/connect-codegen.sh
+
 # Run the test suite.
 test:
     cargo nextest run --workspace

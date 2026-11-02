@@ -1,0 +1,23 @@
+{
+  "name": "@boatramp/connect-clients",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Generated Web/TypeScript Connect clients for boatramp Connect/gRPC-web services (PLAN-connect-grpc IU-5). The codegen toolchain (protoc-gen-es) + the connect-web transport runtime, exact-version-pinned; the generated client under src/generated/ is vendored/committed.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "generate": "buf generate ../../proto --template ../../proto/buf.gen.yaml",
+    "typecheck": "tsc --noEmit",
+    "verify": "node --experimental-strip-types verify.ts"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.11.0",
+    "@connectrpc/connect": "2.1.0",
+    "@connectrpc/connect-web": "2.1.0"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.11.0",
+    "@types/node": "24.9.2",
+    "typescript": "5.9.3"
+  }
+}

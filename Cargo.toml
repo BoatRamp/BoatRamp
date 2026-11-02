@@ -6,6 +6,10 @@ members = [
   # Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4), shared with the
   # boatramp-uchron-shim's `boatramp-connect` serving shim (which vendors a byte-identical copy).
   "crates/boatramp-connect-frame",
+  # Connect / gRPC-web CLIENT shim (PLAN-connect-grpc §9 / IU-5): the client-direction analog of
+  # the `boatramp-connect` serving shim. Built on the shared frame crate; a thin transport trait +
+  # a std plaintext transport + the generic unary / server-stream call primitives.
+  "crates/boatramp-connect-client",
   "crates/boatramp-core",
   "crates/boatramp-storage",
   "crates/boatramp-server",
@@ -22,6 +26,12 @@ members = [
   # excluded like the wasm guests): it targets the host, so the normal `--workspace` build/clippy gate
   # compiles it. Its dep set is only `boatramp-overlay-client` + a minimal tokio.
   "examples/overlay-embed",
+  # Generated Connect/gRPC-web CLIENTS (PLAN-connect-grpc §9 / IU-5): the VENDORED output of
+  # `just codegen` for the greeter (unary) + ticker (server-stream) example services — prost message
+  # types + a typed client per service, on `boatramp-connect-client`. A host lib member so
+  # `--workspace` compiles it and the client live-gates (in boatramp-server) can drive it. The
+  # committed `src/generated/*.rs` is byte-reproducible (regenerate: `just codegen`).
+  "examples/connect-clients",
   "crates/boatramp-cluster",
   "crates/boatramp-firecracker",
   "crates/boatramp-container",
@@ -132,6 +142,16 @@ boatramp-http = { path = "crates/boatramp-http", version = "0.50.0" }
 # version; at the Connect cut, flip publish=true + add it to `just publish` crate_order ahead of
 # boatramp-server (the crate-order gotcha).
 boatramp-connect-frame = { path = "crates/boatramp-connect-frame", version = "0.0.1" }
+# Connect / gRPC-web CLIENT shim (PLAN-connect-grpc §9 / IU-5): the client-direction analog of the
+# `boatramp-connect` serving shim, built on `boatramp-connect-frame`. Pre-release + publish=false
+# like the frame crate; it is a dev tool here (the client e2e gate + generated-client examples
+# depend on it), so it never enters the published control-plane binary unless a caller opts in.
+# At the Connect cut, decide its publish posture alongside the frame crate.
+boatramp-connect-client = { path = "crates/boatramp-connect-client", version = "0.0.1" }
+# Protobuf runtime for the Connect/gRPC-web message types (the client shim + generated code). PINNED
+# EXACT to match the `boatramp-connect` serving shim + the Nix-pinned `prost-build` codegen, so the
+# generated message bytes are reproducible across both repos (PLAN-connect-grpc §11.3).
+prost = "=0.14.1"
 
 tokio = { version = "1", features = [
   "rt-multi-thread",
