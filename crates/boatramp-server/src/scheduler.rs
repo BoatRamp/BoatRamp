@@ -1057,6 +1057,8 @@ pub(super) async fn run_scheduler_tick(
                                 None,
                                 // Background trigger (cron tick) carries no HTTP request ⇒ no `sealed-state`.
                                 None,
+                                // ...and no buffered request body ⇒ no `pre_auth_request` `body` source.
+                                None,
                             )
                             .await
                             {
@@ -1552,6 +1554,8 @@ async fn fire_cron(
         // Ask B-1 bindings sub-timing is request-lane only; the cron trigger passes None.
         None,
         // The cron trigger carries no HTTP request ⇒ no `sealed-state` source.
+        None,
+        // ...and no buffered request body ⇒ no `pre_auth_request` `body` source (fail closed).
         None,
     )
     .await

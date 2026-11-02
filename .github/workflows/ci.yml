@@ -454,6 +454,28 @@ jobs:
           grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
             || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
 
+      # construens #2 — PRE-AUTH TENANT SOURCE e2e GATE (marker `PRE-AUTH TENANT SOURCE OK`). The
+      # `pre_auth_request` tenancy source resolves an UNSCOPED SSO login-start's firm from the request
+      # (host/query/path/body) as a SEAL-ONLY subject so the existing sealed-state mint can seal it —
+      # with NO data access at `/start` (no RLS / tenant-secrets). This real-path gate drives the full
+      # construens RP flow through the REAL Stage-0 resolver: it MUST reproduce today's failing shape
+      # in the INERT arm (an unscoped start resolves no tenant → the mint fails closed → no sealed firm)
+      # AND pass in the WIRED arm (the firm is host-resolved seal-only → the mint seals it → /callback
+      # recovers it). The marker prints ONLY after BOTH arms pass, so a silent skip / `#[cfg]`-out /
+      # rename — or a regression that let the unscoped start resolve a tenant, or let the pre-auth firm
+      # become a data tenant — fails the merge. The `preauth_source` unit tests (each location +
+      # fail-closed + seal-only confinement) run in the same lane.
+      - name: Pre-auth tenant source e2e gate (construens #2 — seal-only firm, fail-closed start)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,mcp,compression,domain-verify-dns --lib \
+            tenant_resolve::preauth -- --nocapture 2>&1 | tee preauth-source.log
+          grep -qE 'test result: ok\. 9 passed' preauth-source.log \
+            || { echo "::error::pre-auth tenant source gate did not run all 9 tests (silent skip, a failure, or a dropped case)" >&2; exit 1; }
+          grep -q 'PRE-AUTH TENANT SOURCE OK' preauth-source.log \
+            || { echo "::error::pre-auth tenant source e2e gate never reached its marker — the unscoped-start-fails-closed / seal-only-start-resolves / callback-recovers flow regressed" >&2; exit 1; }
+
       # v0.29.0 NEGATIVE-CACHE SECRET-SCOPING GATE. `CachedKv` caches an ABSENCE (negative lookup) to
       # kill the ~400 ms-per-serve unset-secret re-read, but ONLY for the secret keyspace — an authz
       # "absent ⇒ permit" key (token revocation `authz/revoked/<cti>`, policy, `domain/<host>`) must
