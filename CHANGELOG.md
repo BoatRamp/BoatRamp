@@ -53,8 +53,13 @@ enable guest DNS-publish. Plus an ACME DNS-01 propagation fix and a project-clon
   and `dns_publish_zones`.
 - **ACME DNS-01 propagation pre-check now queries the zone's authoritative nameservers** directly,
   so a recursive resolver's negative cache can no longer stall issuance.
-- **Project clone self-provisions the target managed DB** before member restore, so
-  `import --clone-from` into a fresh project no longer fails when the destination DB does not exist yet.
+- **Project clone (`import --clone-from`) now provisions and safely restores a fresh managed-DB
+  target, including a Shared-tenant managed Postgres.** The target database is self-provisioned
+  before member restore (a clone into a fresh project/tenant no longer fails with "database does not
+  exist"), and a Shared-tenant managed-pg dump is applied through a **non-superuser shadow + atomic
+  swap** — the untrusted dump runs only as an ephemeral `NOSUPERUSER` role in an isolated shadow DB
+  (`REVOKE CONNECT FROM PUBLIC` + a terminate sweep close the cross-tenant window), closing the
+  bootstrap-superuser RCE path that previously forced the Shared-tenant managed-pg clone to refuse.
 
 ## [0.51.0] - 2026-11-02
 
