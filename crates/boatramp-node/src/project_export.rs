@@ -1271,6 +1271,50 @@ fn shadow_suffix() -> String {
     format!("{nanos}_{}", std::process::id())
 }
 
+/// Postgres `NAMEDATALEN - 1`: the maximum BYTE length of a stored identifier before the server
+/// silently TRUNCATES it to this prefix (emitting a `NOTICE: identifier … will be truncated`).
+/// MySQL's identifier cap is 64 bytes, so bounding a derived name to this value is safe for BOTH
+/// engines.
+const MAX_DERIVED_DB_NAME_LEN: usize = 63;
+
+/// Compose a transient database name `<live_db><marker><suffix>` (the `__shadow_` / `__old_` aside
+/// names) that NEVER exceeds Postgres's 63-byte identifier limit.
+///
+/// A Shared-tenant live db name is tenant-qualified and already close to the 63-byte cap, so the
+/// naive `format!("{live_db}{marker}{suffix}")` can push the identifier past `NAMEDATALEN`.
+/// Postgres then TRUNCATES the name back to its first 63 bytes — which, for a long live db,
+/// collapses right back to the LIVE name — so the shadow `CREATE DATABASE` fails with
+/// `database … already exists` and the clone/import fails. (Latent for ANY live db long enough
+/// that `<live><marker><suffix>` crosses 63 bytes, not only Shared tenants.)
+///
+/// Contract:
+/// - **Short names unchanged.** When `<live_db><marker><suffix>` already fits in 63 bytes the
+///   result is byte-identical to `format!("{live_db}{marker}{suffix}")`, so the dedicated/chunked
+///   path and every existing shadow-name test keep their exact names.
+/// - **Long names bounded.** Otherwise the `live_db` PREFIX is truncated (on a UTF-8 char
+///   boundary, never splitting a multi-byte sequence) to whatever room is left, so the whole name
+///   is ≤ 63 bytes while the FULL `{marker}{suffix}` distinguisher is preserved intact and within
+///   the first 63 bytes. This guarantees the result is (a) ≤ 63 bytes; (b) distinct from `live_db`
+///   truncated to 63 bytes (it ends in the `{marker}{suffix}` tail that a plain truncation of
+///   `live_db` drops — the exact collapse that caused the bug); (c) collision-free across imports,
+///   because the per-import-unique `suffix` is retained verbatim; and (d) still carrying the intact
+///   `marker` substring, so the `%__shadow_%` / `%__old_%` startup-sweep LIKE-patterns keep
+///   matching it. The marker (and suffix) are NEVER truncated — only the `live_db` prefix is.
+fn bounded_derived_db_name(live_db: &str, marker: &str, suffix: &str) -> String {
+    let tail_len = marker.len() + suffix.len();
+    if live_db.len() + tail_len <= MAX_DERIVED_DB_NAME_LEN {
+        return format!("{live_db}{marker}{suffix}");
+    }
+    // Keep the whole `{marker}{suffix}` distinguisher; give the live_db prefix whatever bytes are
+    // left (possibly zero). Floor the cut at a UTF-8 char boundary so a multi-byte char is intact.
+    let keep = MAX_DERIVED_DB_NAME_LEN.saturating_sub(tail_len);
+    let mut end = keep.min(live_db.len());
+    while end > 0 && !live_db.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}{suffix}", &live_db[..end])
+}
+
 /// Quote a Postgres **string literal** (single-quoted, doubling any embedded `'`) — for the
 /// `datname = '<db>'` predicate of our own generated `pg_terminate_backend` / `pg_database`
 /// utility SQL (the db name is driver-derived, never a credential or bundle data).
@@ -5162,7 +5206,10 @@ impl NodeProjectExport {
         // CREATE/ALTER/DROP DATABASE cannot run connected to the tenant db — point at `postgres`.
         maint.database = "postgres".to_string();
         let suffix = shadow_suffix();
-        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        // Bounded to Postgres's 63-byte NAMEDATALEN (truncating the live-db prefix, never the
+        // `__shadow_<suffix>` distinguisher) so a tenant-qualified Shared live db name does not push
+        // the shadow name past the limit and collapse it back to the live name on truncation.
+        let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_role = format!("brexp_apply_{suffix}");
         Ok(PgShadowPlan {
             live_db,
@@ -5545,7 +5592,10 @@ impl NodeProjectExport {
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
         let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
         let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_user);
-        let old_db = format!("{}__old_{}", plan.live_db, plan.suffix);
+        // Derive the rename-aside name through the SAME bounded helper as the shadow (above), so a
+        // long live db name keeps both the shadow and the `__old_<suffix>` aside within the 63-byte
+        // NAMEDATALEN limit and the `ALTER DATABASE … RENAME TO <old>` cannot overflow + collapse.
+        let old_db = bounded_derived_db_name(&plan.live_db, "__old_", &plan.suffix);
         let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
         // SWAP-SAFETY INVARIANT (defense in depth; mirror of the mysql guard): never rename live
         // aside + drop the aside without the shadow REPLACEMENT present. pg renames the whole shadow
@@ -5758,7 +5808,9 @@ impl NodeProjectExport {
         let maint = operator_conn; // mysql names no default db for the admin SQL
         // A SHORT suffix: `brexp_apply_<suffix>` must fit MySQL's 32-char USER-name cap.
         let suffix = mysql_eph_suffix();
-        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        // Bounded to 63 bytes (≤ MySQL's 64-char identifier cap) by truncating the live-db prefix,
+        // keeping the `__shadow_<suffix>` distinguisher intact — latent overflow for a long db name.
+        let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_user = format!("brexp_apply_{suffix}");
         Ok(MysqlShadowPlan {
             live_db,
@@ -7375,7 +7427,10 @@ fn mysql_binlog_image(client_image: &str) -> String {
 /// would collide on `CREATE DATABASE` (a clean refusal, never corruption — the restore never drops a
 /// pre-existing shadow). Concurrent-import support is a tracked follow-up.
 fn mysql_delta_shadow_db(live_db: &str) -> String {
-    format!("{live_db}__shadow_brdelta")
+    // Bounded to the 63-byte limit (truncating the live-db prefix, never the `__shadow_brdelta`
+    // marker). Both the CAPTURE rewrite target and the RESTORE shadow call THIS function, so they
+    // stay the SAME derived name even after truncation.
+    bounded_derived_db_name(live_db, "__shadow_", "brdelta")
 }
 
 /// SWAP-SAFETY INVARIANT (data-loss guard): `true` when swapping the shadow in for live would move
@@ -9071,6 +9126,67 @@ mod tests {
         assert_eq!(mysql_delta_shadow_db("app"), "app__shadow_brdelta");
         // Carries the `__shadow_` infix so the startup `%__shadow_%` sweep reclaims a crashed one.
         assert!(mysql_delta_shadow_db("tenant_x").contains("__shadow_"));
+    }
+
+    #[test]
+    fn bounded_derived_db_name_fits_63_bytes_and_stays_distinct() {
+        // SHORT live db: byte-identical to the old `format!("{live}{marker}{suffix}")` — the
+        // dedicated/chunked path and the existing shadow-name tests keep their exact names.
+        assert_eq!(
+            bounded_derived_db_name("appdb", "__shadow_", "1700000000_42"),
+            "appdb__shadow_1700000000_42"
+        );
+        assert_eq!(
+            bounded_derived_db_name("appdb", "__old_", "1700000000_42"),
+            "appdb__old_1700000000_42"
+        );
+        assert_eq!(
+            bounded_derived_db_name("app", "__shadow_", "brdelta"),
+            "app__shadow_brdelta"
+        );
+
+        // LONG live db (the Shared-tenant shape): ~62 bytes, so the naive name would be ~98 bytes
+        // and Postgres would truncate it back to the live name. The real `shadow_suffix()` shape.
+        let live = "clonesp_clonesp_fresh_1793655865_7rmx_4ahtlf3v6btes2g18bq7820bx";
+        assert!(live.len() >= 60, "fixture must exercise the bounded path");
+        let suffix = "1793655865123456789_4242";
+        let name = bounded_derived_db_name(live, "__shadow_", suffix);
+
+        // (result) ≤ 63 bytes — never overflows NAMEDATALEN.
+        assert!(
+            name.len() <= MAX_DERIVED_DB_NAME_LEN,
+            "derived name {name:?} is {} bytes (> {MAX_DERIVED_DB_NAME_LEN})",
+            name.len()
+        );
+        // (b) the FULL `__shadow_<suffix>` marker+distinguisher survives intact, within the first
+        // 63 bytes — so the `%__shadow_%` sweep still matches and the suffix still disambiguates.
+        let marker_tail = format!("__shadow_{suffix}");
+        assert!(
+            name.ends_with(&marker_tail) && name.contains("__shadow_"),
+            "derived name {name:?} dropped part of its {marker_tail:?} distinguisher"
+        );
+        // (a) distinct from the live db name truncated to 63 bytes — the exact collapse that caused
+        // `CREATE DATABASE … already exists`. The derived name keeps the `__shadow_…` tail a plain
+        // truncation of `live` would have thrown away.
+        let live_trunc = &live[..live.len().min(MAX_DERIVED_DB_NAME_LEN)];
+        assert_ne!(
+            name, live_trunc,
+            "derived name collapsed back to the live name"
+        );
+
+        // (c) collision-free: two different per-import suffixes yield two different names.
+        let other = bounded_derived_db_name(live, "__shadow_", "1793655865999999999_4242");
+        assert_ne!(
+            name, other,
+            "distinct suffixes must yield distinct shadow names (collision-free across imports)"
+        );
+
+        // The `__old_` aside for the same long live db is also bounded and distinct from the shadow.
+        let old = bounded_derived_db_name(live, "__old_", suffix);
+        assert!(old.len() <= MAX_DERIVED_DB_NAME_LEN);
+        assert!(old.ends_with(&format!("__old_{suffix}")));
+        assert_ne!(old, name);
+        assert_ne!(old, live_trunc);
     }
 
     #[test]

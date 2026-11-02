@@ -6246,7 +6246,16 @@ async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
         &db_name(&other_project),
     );
     let fresh_db = db_name(&fresh_project);
-    let shadow_like = format!("{fresh_db}__shadow_%");
+    // The driver bounds the shadow name to Postgres's 63-byte NAMEDATALEN by TRUNCATING the live-db
+    // prefix while keeping the full `__shadow_<suffix>` distinguisher (see `bounded_derived_db_name`),
+    // so a tenant-qualified `fresh_db` (already ~62 bytes) no longer appears verbatim in the shadow
+    // name — a `'{fresh_db}__shadow_%'` LIKE would never match. Discover the shadow by a
+    // guaranteed-retained prefix of `fresh_db` + the intact `__shadow_` marker. The helper always
+    // keeps `>= 63 - len("__shadow_") - len(suffix)` (~27) bytes of the live prefix, so the first 20
+    // bytes of `fresh_db` are always present; the `%` then spans the truncation point + the suffix.
+    // This import is the only one on the cluster, so no sibling shadow can match this pattern.
+    let fresh_prefix: String = fresh_db.chars().take(20).collect();
+    let shadow_like = format!("{fresh_prefix}%__shadow_%");
 
     // === EXPORT the source tenant (FULL) through the driver — a Shared binding frames its pg
     // dump SIDECAR (non-chunked), the exact member shape `restore_member`'s PgDump arm handles. ===
