@@ -202,6 +202,9 @@ async fn resolve_session_principal(
             // The `sealed-state` source is wired on the site-handler serving path (the canonical
             // console `/sso/callback` home); the session-primitive lane passes None (fail-closed).
             sealed_state: None,
+            // Likewise the construens #2 `pre_auth_request` source (the `/sso/start` login-start) is a
+            // site-handler serving-path capability; the session-primitive lane passes None.
+            preauth: None,
         },
     )
     .await
