@@ -189,8 +189,11 @@ mod unix_impl {
             let d = dur.filter(|d| !d.is_zero());
             let tv = libc::timeval {
                 // A zeroed timeval means "no timeout" to SO_RCVTIMEO, so `None` clears it.
-                tv_sec: d.map_or(0, |d| d.as_secs().min(i64::MAX as u64) as libc::time_t),
-                tv_usec: d.map_or(0, |d| d.subsec_micros() as libc::suseconds_t),
+                // Cast targets are INFERRED from the `timeval` field types (`as _`), not named, so
+                // we don't touch the `libc::{time_t,suseconds_t}` aliases that libc deprecates on
+                // musl (they go 64-bit in musl 1.2.0); behaviour is identical on glibc + musl.
+                tv_sec: d.map_or(0, |d| d.as_secs().min(i64::MAX as u64) as _),
+                tv_usec: d.map_or(0, |d| d.subsec_micros() as _),
             };
             // SAFETY: `&tv` points at a live, fully-initialized `timeval` of the passed length; the
             // fd is a live owned socket.
