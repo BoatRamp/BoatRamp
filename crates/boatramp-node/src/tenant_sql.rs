@@ -1572,6 +1572,180 @@ impl NodeTenantSqlResolver {
         }
         Ok(Arc::new(backend))
     }
+
+    /// Resolve the raw CONNECTION PARTS for `(project, site)` as `role` — the SAME
+    /// per-tenant derivation [`build_backend`](Self::build_backend) uses
+    /// ([`tenant_names`] + the sealed per-tenant credential), but returning the parts a
+    /// SIBLING compute workload composes into a real `postgres://` / `mysql://` DSN,
+    /// instead of a pooled backend (PLAN-compute-managed-db-dsn Phase 1).
+    ///
+    /// # Reachability — the internal-DNS name, not a bridge IP
+    ///
+    /// `host` is the managed DB **workload's own name** ([`TenantNames::workload`]) — the
+    /// per-project internal-DNS name a sibling resolves to the DB's live healthy replica
+    /// (`compute.internal_dns`, on by default). Deliberately NOT the numeric replica IP:
+    /// the DSN is injected into the sibling's env at launch and is static for its life, so
+    /// a name (which re-resolves at connect time, and survives a DB relaunch onto a new
+    /// bridge IP) is correct where a captured IP would go stale. `port` is the engine's
+    /// standard in-container bridge port (the stock image's port; boatramp never remaps
+    /// it). No deploy-store/endpoint lookup happens here, so a workload can launch before
+    /// its managed DB's first replica is healthy (the driver retries, DNS resolves once up).
+    ///
+    /// # The credential (`password`) is unsealed SERVER-SIDE
+    ///
+    /// The per-tenant managed credential is unsealed from the `[secrets]` envelope on the
+    /// node; it is returned in-memory for the DSN composition and MUST NEVER be logged.
+    ///
+    /// Phase-1 reachability limit (documented): a `Shared`, non-default-project managed DB
+    /// runs under the reserved default project, which a non-default project's container
+    /// cannot resolve by internal name — use the default `tenant: single` isolation for a
+    /// compute-bound managed DB.
+    pub(crate) async fn connection_parts(
+        &self,
+        project: &str,
+        site: &str,
+        role: ConnRole,
+    ) -> Result<SqlConnParts, SqlError> {
+        let (tenant_ident_raw, is_default) = tenant_key(self.scope, project, site);
+        let names = tenant_names(
+            self.isolation,
+            &self.compute,
+            &self.database,
+            &tenant_ident_raw,
+            is_default,
+        );
+        let creds = ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
+        let port = match self.kind {
+            ExternalSqlKind::Postgres => PG_BRIDGE_PORT,
+            ExternalSqlKind::Mysql => MYSQL_BRIDGE_PORT,
+        };
+
+        // The MIGRATION/DDL identity: only a Shared, non-default Postgres tenant has a
+        // DISTINCT owner role + sealed owner credential (the owner-role split that keeps the
+        // runtime role a non-owner). Prefer it when an owner credential is ALREADY sealed —
+        // read-only (`get_sealed_password`), NEVER minting one here (provisioning owns the
+        // owner credential; minting a fresh random one would not match the role's real
+        // password). Everywhere else — `Single` (its per-workload user owns its database),
+        // the default tenant (its plain user owns its one database), and MySQL (no
+        // owner/runtime split; managed-MySQL migration is a separate, currently-refused
+        // path) — the migration identity IS the runtime identity, so we fall through.
+        if role == ConnRole::Migration
+            && self.isolation == TenantIsolation::Shared
+            && self.kind == ExternalSqlKind::Postgres
+            && !is_default
+        {
+            let ident = sanitize_ident(&tenant_ident_raw);
+            let owner_workload = owner_credential_workload_key(&self.compute, &ident);
+            if let Some(password) = creds
+                .get_sealed_password(project, &owner_workload)
+                .await
+                .map_err(SqlError::other)?
+            {
+                return Ok(SqlConnParts {
+                    kind: self.kind,
+                    host: names.workload,
+                    port,
+                    user: names.owner_role,
+                    password,
+                    database: names.database,
+                });
+            }
+        }
+
+        // The RUNTIME identity — byte-identical to `build_backend`'s derivation, so the
+        // injected DSN authenticates as exactly what a handler's `sql.open()` would. The
+        // per-tenant password is minted-or-read under the SAME key the managed DB server
+        // initializes with, so it is consistent regardless of launch order.
+        let (cred_project, cred_workload, user) = match self.isolation {
+            TenantIsolation::Shared if is_default => (
+                DEFAULT_PROJECT.to_string(),
+                self.compute.clone(),
+                self.user.clone(),
+            ),
+            TenantIsolation::Shared => {
+                let ident = sanitize_ident(&tenant_ident_raw);
+                (
+                    project.to_string(),
+                    credential_workload_key(&self.compute, &ident),
+                    names.role.clone(),
+                )
+            }
+            TenantIsolation::Single => (
+                single_credential_project(project, is_default),
+                names.workload.clone(),
+                self.user.clone(),
+            ),
+        };
+
+        let password = creds
+            .password(&cred_project, &cred_workload)
+            .await
+            .map_err(SqlError::other)?;
+
+        Ok(SqlConnParts {
+            kind: self.kind,
+            host: names.workload,
+            port,
+            user,
+            password,
+            database: names.database,
+        })
+    }
+}
+
+/// The standard in-container listen port a managed co-located **Postgres** container
+/// exposes on the compute bridge (the stock image's port; boatramp never remaps it). A
+/// sibling workload reaching the DB by its internal-DNS name connects here.
+pub(crate) const PG_BRIDGE_PORT: u16 = 5432;
+/// The MySQL analogue of [`PG_BRIDGE_PORT`].
+pub(crate) const MYSQL_BRIDGE_PORT: u16 = 3306;
+
+/// Which role a resolved [`SqlConnParts`] authenticates as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnRole {
+    /// The per-tenant RUNTIME login — what a handler's `sql.open()` uses (the binding's
+    /// `url_env` DSN).
+    Runtime,
+    /// The schema-migration / DDL identity (the owner-role analog; the binding's
+    /// `migration_url_env` DSN).
+    Migration,
+}
+
+/// The resolved connection PARTS for a managed co-located SQL database, reachable from a
+/// SIBLING compute workload in the same project. `password` is already unsealed
+/// (server-side) — it MUST NEVER be logged. Consumed only to compose a `postgres://` /
+/// `mysql://` DSN + fill `{{sql.*}}` template variables.
+#[derive(Clone)]
+pub(crate) struct SqlConnParts {
+    /// Engine (selects the DSN scheme + default port).
+    pub kind: ExternalSqlKind,
+    /// The reachable host — the managed DB workload's internal-DNS name (see
+    /// [`NodeTenantSqlResolver::connection_parts`]).
+    pub host: String,
+    /// The engine's standard bridge port.
+    pub port: u16,
+    /// The role to connect as.
+    pub user: String,
+    /// The unsealed password (the ONLY secret) — never logged.
+    pub password: String,
+    /// The physical database to connect to.
+    pub database: String,
+}
+
+impl SqlConnParts {
+    /// The full `postgres://user:pass@host:port/db` (or `mysql://…`) DSN, user/password
+    /// percent-encoded. The one place a DSN string is assembled — reuses the handler
+    /// runtime's [`build_url`](boatramp_storage::sql_compute::build_url).
+    pub(crate) fn dsn(&self) -> String {
+        boatramp_storage::sql_compute::build_url(
+            self.kind,
+            &self.user,
+            &self.password,
+            &self.host,
+            self.port,
+            &self.database,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1890,6 +2064,112 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    // ---- connection_parts: the managed-DB DSN composition path ------------
+
+    fn single_pg_binding() -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("appdb".into()),
+            user: Some("app".into()),
+            tenant: TenantIsolation::Single,
+            tenant_scope: TenantScope::Project,
+            ..Default::default()
+        }
+    }
+
+    /// A `Single`-project managed Postgres resolves to the right parts: host = the managed
+    /// DB workload's internal-DNS name, the engine bridge port, the configured user +
+    /// database, and a password that round-trips the sealed credential. The default tenant
+    /// uses the bare `<compute>` workload.
+    #[tokio::test]
+    async fn connection_parts_single_pg_default_tenant() {
+        let binding = single_pg_binding();
+        let (kv, resolver) = build_resolver(&binding);
+        let parts = resolver
+            .connection_parts("default", "simertec", ConnRole::Runtime)
+            .await
+            .unwrap();
+        assert_eq!(parts.kind, ExternalSqlKind::Postgres);
+        assert_eq!(parts.host, "pg", "default tenant → bare compute workload");
+        assert_eq!(parts.port, PG_BRIDGE_PORT);
+        assert_eq!(parts.user, "app");
+        assert_eq!(parts.database, "appdb");
+        assert!(
+            !parts.password.is_empty(),
+            "the managed credential is unsealed"
+        );
+        // The DSN is a real postgres:// URL (scheme + host/port/db present).
+        assert!(parts.dsn().starts_with("postgres://app:"));
+        assert!(parts.dsn().ends_with("@pg:5432/appdb"));
+        // The password round-trips the sealed credential (RevEnvelope reverses).
+        let sealed = kv
+            .get("managed-sql-cred/default/pg")
+            .await
+            .unwrap()
+            .expect("default managed credential sealed");
+        let plain: String = sealed.iter().rev().map(|b| *b as char).collect();
+        assert_eq!(plain, parts.password);
+        // Single has NO owner/runtime split → the migration identity IS the runtime one.
+        let mig = resolver
+            .connection_parts("default", "simertec", ConnRole::Migration)
+            .await
+            .unwrap();
+        assert_eq!(mig.user, parts.user);
+        assert_eq!(mig.password, parts.password);
+        assert_eq!(mig.dsn(), parts.dsn());
+    }
+
+    /// Tenancy: a non-default project resolves to its OWN per-tenant workload (host) and a
+    /// DISTINCT sealed credential — a workload can never compose another tenant's DSN.
+    #[tokio::test]
+    async fn connection_parts_single_pg_is_tenant_isolated() {
+        let binding = single_pg_binding();
+        let (_kv, resolver) = build_resolver(&binding);
+        let acme = resolver
+            .connection_parts("acme", "simertec", ConnRole::Runtime)
+            .await
+            .unwrap();
+        let globex = resolver
+            .connection_parts("globex", "simertec", ConnRole::Runtime)
+            .await
+            .unwrap();
+        // The host is the dedicated per-tenant workload's internal-DNS name
+        // `pg-<sanitized-ident>` (the sanitizer appends a collision-resistant suffix, e.g.
+        // `pg-acme_3f9c…` as in the docs) — distinct per tenant.
+        assert!(
+            acme.host.starts_with("pg-acme"),
+            "non-default → dedicated per-tenant workload: {}",
+            acme.host
+        );
+        assert!(globex.host.starts_with("pg-globex"), "{}", globex.host);
+        assert_ne!(acme.host, globex.host, "distinct tenants ⇒ distinct hosts");
+        assert_ne!(
+            acme.password, globex.password,
+            "distinct tenants ⇒ distinct per-tenant credentials"
+        );
+        assert_ne!(acme.dsn(), globex.dsn());
+    }
+
+    /// The MySQL analogue: `mysql://` scheme + the MySQL bridge port.
+    #[tokio::test]
+    async fn connection_parts_single_mysql() {
+        let binding = ExternalDatabaseConfig {
+            kind: "mysql".into(),
+            ..single_pg_binding()
+        };
+        let (_kv, resolver) = build_resolver(&binding);
+        let parts = resolver
+            .connection_parts("acme", "simertec", ConnRole::Runtime)
+            .await
+            .unwrap();
+        assert_eq!(parts.kind, ExternalSqlKind::Mysql);
+        assert_eq!(parts.port, MYSQL_BRIDGE_PORT);
+        assert!(parts.host.starts_with("pg-acme"), "{}", parts.host);
+        assert!(parts.dsn().starts_with("mysql://app:"));
+        assert!(parts.dsn().ends_with(":3306/appdb"));
     }
 
     /// `deprovision_project("acme")` tears down EXACTLY acme's derived tenant (its

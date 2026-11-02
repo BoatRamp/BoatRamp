@@ -367,6 +367,12 @@ boatramp compute set app --image myapp:latest --port 8080 \
 | `messaging` / `messaging:<topic>` | BOTH halves of the project bus — publish AND consume (claim/ack/nack). | `BOATRAMP_MESSAGING_URL` |
 | `invoke` | Compute → function calls. **Declared only** — it parses and round-trips, but no shim backs it yet, so no env is injected (Phase 3). | — |
 
+The `sql` endpoint above is the libsql / hrana shim. When the `sql` target is a
+**managed co-located Postgres/MySQL** database instead, boatramp injects a real
+`postgres://` / `mysql://` **DSN** (operator-templatable) — see [Use a managed
+Postgres/MySQL from a compute workload](#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn)
+below.
+
 A bare `kv`/`blob` (no `:<name>`) is **site-wide** — the workload can read/write
 every bucket/container in the site's namespace; a bare `messaging` is
 **project-bus-wide** (any topic). Name a target (`kv:cache`, `blob:assets`,
@@ -377,6 +383,121 @@ injects no env, so declaring it grants nothing until the operator configures the
 shim. See [`kv_shim_url`/`blob_shim_url`/`messaging_shim_url`/`sql_shim_url` and
 their `*_max_*_bytes` size caps](../reference/boatramp-cfg.md#compute) in the
 config reference.
+
+## Use a managed Postgres/MySQL from a compute workload (a real DSN)
+
+The `sql` binding above hands a **libsql / hrana** endpoint — the right shape for
+the site's default per-site database, but not something an off-the-shelf
+Postgres/MySQL driver can speak. When the `sql` binding instead targets a
+**boatramp-managed, co-located Postgres or MySQL** database (a `databases:` entry
+boatramp runs — see [Declare a managed database](./managed-databases.md)), boatramp
+injects a **real `postgres://` / `mysql://` DSN** instead, so a stock app, ORM, or
+migration tool with a standard driver Just Works — no boatramp shim or token to
+understand.
+
+The backend is **auto-detected** by the binding's target: a managed pg/mysql DB → a
+real DSN; the per-site libsql default (or an external `url_env` database) → the
+libsql shim endpoint + token, exactly as before.
+
+### The default (simple case)
+
+Declare the managed DB, then bind it by name. With no further configuration the
+workload receives two env vars:
+
+| Env var | What it holds |
+| --- | --- |
+| `BOATRAMP_SQL_URL` (or the binding's `url_env`) | the full **runtime** DSN — `postgres://<user>:<pass>@<host>:<port>/<db>` |
+| `BOATRAMP_SQL_URL_MIGRATION` (or the binding's `migration_url_env`) | the **migration/DDL** DSN (the owner-role identity) |
+
+```ron
+// project.cfg (apply manifest)
+(
+  project: "acme",
+  databases: [ ( name: "app", kind: postgres, size: medium, tenant: single ) ],
+  compute: [
+    ( name: "simertec",
+      spec: (
+        root: image("ghcr.io/acme/simertec:1"), vcpus: 1, mem_mib: 512, port: 8080,
+        bindings: [ ( kind: sql, name: "app" ) ],
+      ),
+      replicas: 1 ),
+  ],
+)
+```
+
+The workload's env then carries (password redacted):
+
+```text
+BOATRAMP_SQL_URL=postgres://app:***@pg-acme_3f9c…:5432/appdb
+BOATRAMP_SQL_URL_MIGRATION=postgres://app:***@pg-acme_3f9c…:5432/appdb
+```
+
+Override the var NAMES on the binding (defaults: `BOATRAMP_SQL_URL` and
+`<url_env>_MIGRATION`):
+
+```ron
+bindings: [ ( kind: sql, name: "app",
+              url_env: "SIMERTEC_DATABASE_URL",
+              migration_url_env: "SIMERTEC_MIGRATE_URL" ) ]
+```
+
+### Operator-templatable env (the general mechanism)
+
+The operator decides **exactly** what env the workload receives. The resolved
+connection is exposed as **template variables** you reference from the workload's
+own `env:` map (or `compute set --env K=V`); a value containing a `{{…}}`
+placeholder is rendered **server-side** at launch and replaces the template:
+
+| Variable | Value |
+| --- | --- |
+| `{{sql.host}}` | the managed DB's internal-DNS name |
+| `{{sql.port}}` | the engine port (`5432` / `3306`) |
+| `{{sql.user}}` `{{sql.password}}` `{{sql.database}}` | the runtime role, its password, the database |
+| `{{sql.dsn}}` | the ready-made runtime DSN |
+| `{{sql.migration_user}}` `{{sql.migration_password}}` `{{sql.migration_dsn}}` | the migration/DDL identity |
+| `{{sql.<name>.*}}` | the same for a *named* binding (e.g. `{{sql.analytics.host}}`) |
+| `{{secret.<NAME>}}` | a sealed project secret, unsealed server-side |
+
+```ron
+env: {
+  // one DSN with your own query params
+  "SIMERTEC_DATABASE_URL": "postgres://{{sql.user}}:{{sql.password}}@{{sql.host}}:{{sql.port}}/{{sql.database}}?sslmode=require",
+  // …or discrete libpq-style vars
+  "PGHOST": "{{sql.host}}", "PGPORT": "{{sql.port}}", "PGUSER": "{{sql.user}}",
+  "PGPASSWORD": "{{sql.password}}", "PGDATABASE": "{{sql.database}}",
+  // …or a mix of DB parts, a static param, and a referenced sealed secret
+  "APP_DSN": "postgres://{{sql.user}}:{{sql.password}}@{{sql.host}}/{{sql.database}}?application_name=simertec",
+  "STRIPE_KEY": "{{secret.stripe_key}}",
+}
+```
+
+The DB password and any referenced secret are unsealed **server-side** at launch and
+injected only into this workload's env; rendered secret values are never logged. A
+hand-set **literal** env value (no `{{…}}`) is left untouched; a template that can't
+be fully rendered (an unknown placeholder, an unset secret) is left in place and
+logged, so a typo is diagnosable rather than silently half-filled.
+
+### Reachability & tenancy
+
+- **Host** is the managed DB workload's **internal-DNS name** (`pg-<ident>` — see
+  [Reach a sibling workload by name](#reach-a-sibling-workload-by-name-internal-dns)),
+  not a numeric IP, so the DSN survives a DB relaunch and re-resolves to the live
+  healthy replica at connect time. It needs `compute.internal_dns` (on by default on
+  the Linux container backend). **Port** is the engine's standard bridge port
+  (`5432` / `3306`).
+- The DB is resolved for the workload's **own project** (from the workload key), so a
+  workload can never compose another tenant's DSN — it is the same per-tenant database
+  + credential a handler for that project's `sql.open("app")` would get.
+- Phase-1 limit: a `shared`-tenant managed DB in a **non-default project** runs under
+  the reserved default project, which that project's container cannot resolve by
+  internal name — use the default `tenant: single` for a compute-bound managed DB.
+
+### Phase-1 trade-off (static credential)
+
+The managed credential rides in the workload's env as a **static DSN**. A follow-up
+replaces it with a dynamic, per-replica role minted at launch and revoked on stop
+(anchored to a stable owner role); the workload contract — a DSN in its env — does
+not change.
 
 ## Reach a sibling workload by name (internal DNS)
 

@@ -2823,6 +2823,7 @@ pub(super) async fn compute_dev_bind_blob(
         kind: boatramp_core::compute::BindingKind::Blob,
         name: req.container.unwrap_or_default(),
         url_env: None,
+        migration_url_env: None,
     };
     let env = resolver
         .resolve(
@@ -2934,6 +2935,7 @@ pub(super) async fn compute_dev_bind_messaging(
         kind: boatramp_core::compute::BindingKind::Messaging,
         name: req.topic.unwrap_or_default(),
         url_env: None,
+        migration_url_env: None,
     };
     let env = resolver
         .resolve(
