@@ -1042,6 +1042,54 @@ impl NodeProjectExport {
         Ok((ep.into_mysql(self.connect_timeout_secs), image, version))
     }
 
+    /// Clone/import self-provision (PLAN-clone-self-provision-managed-db): before an import's
+    /// pg/mysql member restore connects to the TARGET's managed database, make sure it actually
+    /// EXISTS. Reuses the EXISTING lazy provisioner, [`tenant_sql::provision_tenant`] — the SAME
+    /// code the platform already runs on a normal managed-sql access (`provision_single`'s
+    /// workload registration) and on the `boatramp apply` / `db ensure database` declare path
+    /// (`NodeManagedDbDeclare::provision`). Without this, a clone onto a FRESH target (project
+    /// shell created, managed db never touched) fails the readiness probe with a confusing
+    /// "database … does not exist" instead of actually provisioning it (construens's clone
+    /// failure shape).
+    ///
+    /// - **Idempotent**: "already exists" is success (re-running on an already-provisioned
+    ///   target is a no-op — [`tenant_sql::provision_tenant`]'s own contract).
+    /// - **Target-scoped ONLY**: provisions exactly `(project, "")`'s OWN binding — the tenant
+    ///   name/database/role are derived from `project` (the clone's TARGET), never from anything
+    ///   source-carried, and never another project's. This is the tenancy-sensitive seam a
+    ///   Security review gates.
+    /// - A no-op for a bring-your-own (`url_env`) binding (nothing of ours to provision) and for
+    ///   a **site-scoped** managed database: operator SQL (the seam `resolve_pg`/`resolve_mysql`
+    ///   use) is project-level only and refuses a site-scoped binding regardless
+    ///   ([`crate::managed_sql::operator_target`]), so there is nothing reachable here to
+    ///   provision — the existing refusal stands unchanged.
+    async fn ensure_target_db_provisioned(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<(), Perr> {
+        if !is_managed_binding(cfg) {
+            return Ok(()); // bring-your-own URL — the operator's own database, not ours to create.
+        }
+        if matches!(cfg.tenant_scope, crate::config::TenantScope::Site) {
+            return Ok(()); // operator SQL can't target a site's db anyway; resolve_* refuses it.
+        }
+        let envelope = self.envelope.as_ref().ok_or_else(|| {
+            Perr::Unavailable(format!(
+                "managed database {db:?} needs a [secrets] envelope to unseal its credential — \
+                 none on this node"
+            ))
+        })?;
+        crate::tenant_sql::provision_tenant(&self.deploy, &self.kv, envelope, cfg, project, "")
+            .await
+            .map_err(|e| {
+                Perr::Other(format!(
+                    "clone self-provision of database {db:?} failed: {e}"
+                ))
+            })
+    }
+
     /// Best-effort schema-ledger fingerprint of a Postgres database (the applied
     /// migration set + content hashes). `None` if the ledger can't be read (e.g. no
     /// migrations table, or no operator-SQL seam) — the skew check then has nothing to
@@ -3490,6 +3538,15 @@ impl NodeProjectExport {
                 let cfg = self.databases.get(db).ok_or_else(|| {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?;
+                // Clone self-provision (PLAN-clone-self-provision-managed-db): a Shared-tenant
+                // managed pg database restores via THIS sidecar arm (plan_export frames it
+                // non-chunked), so this is the seam that must provision a Shared tenant's own
+                // db before connecting. Gated on `opts.apply`: a verify/dry-run must mutate
+                // nothing — `resolve_pg` below still runs un-provisioned on a dry-run, exactly
+                // as before (an honest "not ready yet" is fine for a verify pass).
+                if opts.apply {
+                    self.ensure_target_db_provisioned(project, db, cfg).await?;
+                }
                 let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
                 if data_only {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
@@ -3563,6 +3620,11 @@ impl NodeProjectExport {
                 let cfg = self.databases.get(db).ok_or_else(|| {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?;
+                // Clone self-provision — mirror of the PgDump arm above (same seam, same
+                // apply-gating rationale).
+                if opts.apply {
+                    self.ensure_target_db_provisioned(project, db, cfg).await?;
+                }
                 let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
                 if data_only {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
@@ -4933,6 +4995,13 @@ impl NodeProjectExport {
                  is a cross-tenant surface deferred to the temp-schema follow-up"
             )));
         }
+        // Clone self-provision (PLAN-clone-self-provision-managed-db): both of this function's
+        // callers (the chunked streaming import + the true-delta chain restore) only reach here
+        // under `opts.apply` (their dry-run arm returns before calling `pg_shadow_plan` at all),
+        // so this is unconditional here. A dedicated/Single target whose workload was never
+        // registered/launched gets registered now (idempotent — `provision_tenant`'s own
+        // contract); the reconcile then launches it and its post-launch action creates the db.
+        self.ensure_target_db_provisioned(project, db, cfg).await?;
         // Operator identity (configured/superuser) + version-detect → client image. Its endpoint
         // (host/port) + the live tenant db name + the configured owner seed the maintenance conn.
         let (operator_conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
@@ -5308,6 +5377,9 @@ impl NodeProjectExport {
                  managed servers only; a Shared multi-tenant server is deferred"
             )));
         }
+        // Clone self-provision — mirror of `pg_shadow_plan`'s call above (both callers only
+        // reach here under `opts.apply`; see that function's comment for the rationale).
+        self.ensure_target_db_provisioned(project, db, cfg).await?;
         let (operator_conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
         let maint = operator_conn; // mysql names no default db for the admin SQL
@@ -8296,6 +8368,195 @@ mod tests {
         assert_eq!(
             pinned.mysql_image("not-a-version").unwrap(),
             "mysql:8.4@sha256:beef"
+        );
+    }
+
+    /// A reversible, in-memory [`KeyEnvelope`] fake for a unit test — no real KMS/KEK, so a
+    /// test never touches the network or disk for credential sealing.
+    struct TestEnvelope;
+    #[async_trait]
+    impl KeyEnvelope for TestEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(
+            &self,
+            w: &[u8],
+        ) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+
+    /// A minimal driver + control-plane fixture for [`NodeProjectExport::ensure_target_db_provisioned`]
+    /// unit tests: `MemoryKv` + a throwaway `FsStorage`-backed `DeployStore` + the reversible
+    /// `TestEnvelope` — no live backend/operator-SQL needed (this helper never connects to one).
+    fn provision_fixture() -> (NodeProjectExport, DeployStore, Arc<dyn KvStore>) {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let mut drv = NodeProjectExport::new(
+            BTreeMap::new(),
+            deploy.clone(),
+            kv.clone(),
+            blobs,
+            tmp.path().join("work"),
+        );
+        // Set the envelope directly (same module ⇒ private field access) — equivalent to
+        // `with_managed_pg` without needing a fake compute backend / operator-SQL seam, which
+        // `ensure_target_db_provisioned` never touches.
+        drv.envelope = Some(Arc::new(TestEnvelope) as Arc<dyn KeyEnvelope>);
+        (drv, deploy, kv)
+    }
+
+    /// PLAN-clone-self-provision-managed-db: a bring-your-own (`url_env`) binding is the
+    /// OPERATOR's own database — self-provision must be a clean no-op (never attempt to
+    /// `CREATE DATABASE` on someone else's server).
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_noop_for_external_binding() {
+        let (drv, _deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            url_env: "SOME_DSN".into(),
+            ..Default::default()
+        };
+        drv.ensure_target_db_provisioned("acme", "app", &cfg)
+            .await
+            .expect("external binding self-provision is a no-op");
+    }
+
+    /// A **site-scoped** managed binding: operator SQL (the seam the restore path's
+    /// `resolve_pg`/`resolve_mysql` use) refuses it regardless (project-level only), so
+    /// self-provision must no-op rather than provision a bogus `site=""` tenant.
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_noop_for_site_scoped_binding() {
+        let (drv, deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Single,
+            tenant_scope: crate::config::TenantScope::Site,
+            ..Default::default()
+        };
+        drv.ensure_target_db_provisioned("acme", "app", &cfg)
+            .await
+            .expect("site-scoped binding self-provision is a no-op");
+        // No workload was registered as a side effect (nothing was actually provisioned).
+        let workloads = deploy
+            .list_compute_workloads(ProjectRef::new("acme"))
+            .await
+            .unwrap();
+        assert!(
+            workloads.is_empty(),
+            "a site-scoped binding must register nothing"
+        );
+    }
+
+    /// PLAN-clone-self-provision-managed-db, the **dedicated/Single** half of the fix: before
+    /// this commit, nothing in the restore path registered a fresh target's dedicated managed-db
+    /// workload — `pg_shadow_plan` went straight to `resolve_pg` against a workload that might
+    /// never have been registered. `ensure_target_db_provisioned` now reuses the SAME lazy
+    /// provisioner (`tenant_sql::provision_tenant` → `provision_single`) the platform runs on a
+    /// normal first `sql` access, which durably REGISTERS the dedicated `<compute>-<ident>`
+    /// workload (idempotent — a re-run is a no-op). Registration is pure `DeployStore`/`KvStore`
+    /// I/O (no network connection), so this is provable without a live Postgres.
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_registers_a_fresh_single_tenant_workload() {
+        let (drv, deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Single,
+            tenant_scope: crate::config::TenantScope::Project,
+            ..Default::default()
+        };
+        let target = "acme-fresh";
+        // Nothing registered yet — the exact "fresh target" shape a clone onto a brand-new
+        // project shell has.
+        assert!(
+            deploy
+                .list_compute_workloads(ProjectRef::new(target))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drv.ensure_target_db_provisioned(target, "app", &cfg)
+            .await
+            .expect("Single self-provision registers the dedicated workload");
+        let workloads = deploy
+            .list_compute_workloads(ProjectRef::new(target))
+            .await
+            .unwrap();
+        assert_eq!(
+            workloads.len(),
+            1,
+            "exactly the target's own dedicated workload is registered"
+        );
+        // Idempotent: a second call (the retry-safe / already-provisioned-target shape) changes
+        // nothing — still exactly one workload, no clobber.
+        drv.ensure_target_db_provisioned(target, "app", &cfg)
+            .await
+            .expect("re-provisioning an already-provisioned target is a no-op");
+        let workloads_again = deploy
+            .list_compute_workloads(ProjectRef::new(target))
+            .await
+            .unwrap();
+        assert_eq!(
+            workloads_again.len(),
+            1,
+            "idempotent — no duplicate/clobber"
+        );
+
+        // TARGET-SCOPED ONLY: an unrelated project is never touched by provisioning `target`.
+        let other = deploy
+            .list_compute_workloads(ProjectRef::new("some-other-tenant"))
+            .await
+            .unwrap();
+        assert!(
+            other.is_empty(),
+            "self-provisioning one project must not register/touch another project's workload"
+        );
+    }
+
+    /// A **Shared**-tenant managed binding with no replica registered anywhere: self-provision
+    /// genuinely ATTEMPTS the real `provision_shared` DDL (reaching for the resolver / a
+    /// connection) rather than silently no-op'ing — it fails with a clear "no replica" / "not
+    /// ready" shape, never a panic and never a silent `Ok(())` that would mask the gap this fix
+    /// closes. (The success path — the server IS up and the tenant db gets created on it,
+    /// construens's exact failure shape going from broken to fixed — is proven live in
+    /// `project_export_roundtrip.rs`'s `project_export_clone_self_provisions_shared_tenant_live`,
+    /// which needs a real Postgres.)
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_shared_without_a_replica_fails_informatively() {
+        let (drv, _deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Shared,
+            tenant_scope: crate::config::TenantScope::Project,
+            connect_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let err = drv
+            .ensure_target_db_provisioned("acme-fresh", "app", &cfg)
+            .await
+            .expect_err("Shared self-provision with no registered replica cannot succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("clone self-provision"),
+            "error is attributed to the self-provision call: {msg}"
         );
     }
 

@@ -499,6 +499,15 @@ jobs:
           # exercised live. Same self-skip trap → gate on its marker.
           grep -q 'PROJECT EXPORT DRIVER ROUNDTRIP OK' project-export.log \
             || { echo "::error::full-driver project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # Clone self-provision on a Shared tenant (PLAN-clone-self-provision-managed-db):
+          # reproduces construens's exact "database … does not exist" readiness-probe failure
+          # (a clone into a FRESH, never-provisioned Shared-tenant target on an ALREADY-healthy
+          # shared server) through the REAL NodeProjectExport driver, then asserts the fix
+          # self-provisions + restores end-to-end, a pre-existing sibling tenant stays
+          # byte-for-byte untouched (target-scoped only), and a second import is a clean
+          # no-clobber no-op (idempotent). Same self-skip trap → gate on its marker.
+          grep -q 'PROJECT EXPORT CLONE SELF-PROVISION SHARED TENANT OK' project-export.log \
+            || { echo "::error::clone self-provision (Shared tenant) never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true
