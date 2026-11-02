@@ -63,6 +63,7 @@ Top-level sections, all optional:
 | `kv` | table | — | Control-plane SlateDB KV durability cadence + shutdown budget. See [`serve.kv`](#servekv). |
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
 | `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
+| `dns_publish` | table | — (off) | Host-held DNS provider backing the guest **`dns-publish` WRITE** capability (cap-req #24/#25). **Absent ⇒ no provider is wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed). See [`serve.dns_publish`](#servedns_publish). |
 | `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
@@ -644,6 +645,45 @@ a test MX at a local sink) is still dropped by the SSRF floor unless the operato
 turns on `allow_guest_private_egress` (dev/single-tenant) — so the override can be
 neither a cross-tenant escalation nor a private-IP oracle. Takes effect only on a build
 with the `tcp-egress` resolver compiled in.
+
+### `serve.dns_publish`
+
+The WRITE counterpart to `dns-resolve`: the host-held DNS provider that performs a
+granted guest's `dns-publish` mutations (cap-req #24/#25). The guest never holds a
+zone-write token — it only NAMES records; the host writes them through this
+operator-configured, host-held credential. **Absent (the default) ⇒ no provider is
+wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed; compiling the
+capability in grants no one by itself). This is the config-file form of the
+`--dns-publish-provider` / `--dns-publish-zone-root` flags (and `BOATRAMP_DNS_PUBLISH_PROVIDER`
+/ `BOATRAMP_DNS_PUBLISH_ZONE_ROOT`); **flag/env win** over the block.
+
+- **`provider`** — which provider adapter writes guest DNS: the same grammar as
+  `--acme-dns-provider` (`manual` | `cloudflare` | `route53` | `oci` | `digitalocean` |
+  `hetzner` | `ns1` | `dnsimple` | `gcp-dns` | `azure-dns` | `akamai`). `manual` installs
+  the credential-free Manual provider (records/echoes the intended writes — an offline
+  proof). Absent ⇒ fail-closed.
+- **`zone_root`** — the authoritative zone apex the credential writes (e.g.
+  `example.com`), passed to the central `validate_writable` guardrail so an apex `NS` is
+  refused. Required once `provider` is set.
+
+**Credentials are never in config** — they come from the environment, via the SAME
+per-provider env vars `--acme-dns-provider` reads (see `boatramp dns --help`), the
+established "no secrets in config" posture. Two further gates still bound every write:
+the node posture `allow_guest_dns_publish` (off in every built-in profile) and the
+per-handler `dns_publish_zones` writable-zone allowlist (empty ⇒ deny-all). This block
+is a DISTINCT authority from `--acme-dns-provider`, which configures the DNS credential
+for ACME **certificate issuance** only. Takes effect on a build with both the
+`dns-publish` and `acme-dns` features compiled in.
+
+```ron
+// Operator opt-in. Credentials come from the environment, never here.
+serve: (
+    dns_publish: (
+        provider: "cloudflare",        // or "manual" for an offline proof
+        zone_root: "example.com",      // the apex the credential is authoritative over
+    ),
+)
+```
 
 ### Memory ceilings per lane
 

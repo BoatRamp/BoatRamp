@@ -2064,6 +2064,7 @@ dependencies = [
  "azure_storage_common",
  "azure_storage_sas",
  "base64 0.22.1",
+ "boatramp-acme",
  "boatramp-core",
  "boatramp-handlers",
  "boatramp-http",
