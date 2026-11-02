@@ -125,8 +125,13 @@ boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.50.0" 
 boatramp-node = { path = "crates/boatramp-node", version = "0.50.0" }
 boatramp-http = { path = "crates/boatramp-http", version = "0.50.0" }
 # Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4). Pre-release + publish=false
-# (the dedicated Connect cut is held), so it carries no published version yet — a plain path dep.
-boatramp-connect-frame = { path = "crates/boatramp-connect-frame" }
+# (the dedicated Connect cut is held). It still needs an explicit `version` even though it is not
+# yet published: boatramp-server (a public/publish=true crate) depends on it, and cargo-deny's
+# `wildcards = "deny"` rejects a version-less (wildcard) path dep on a public crate regardless of
+# `allow-wildcard-paths` (crates.io disallows path deps). Keep this in sync with the crate's own
+# version; at the Connect cut, flip publish=true + add it to `just publish` crate_order ahead of
+# boatramp-server (the crate-order gotcha).
+boatramp-connect-frame = { path = "crates/boatramp-connect-frame", version = "0.0.1" }
 
 tokio = { version = "1", features = [
   "rt-multi-thread",
