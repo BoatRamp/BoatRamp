@@ -2025,6 +2025,7 @@ mod tests {
             sandbox: SandboxPosture::Derived,
             substrate: InstanceSubstrate::OsProcess,
             links: links.iter().copied().map(String::from).collect(),
+            ..Default::default()
         }
     }
 
