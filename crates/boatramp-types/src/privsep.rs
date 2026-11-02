@@ -498,8 +498,203 @@ pub struct PrivsepInstanceConfig {
     /// struct-level `#[serde(default)]` supplies `OsProcess` for a config that omits it, so every
     /// Phase-1 composition is unchanged.
     pub substrate: InstanceSubstrate,
+    /// The instance's LIFECYCLE model (design §Phase-4 WS-A). Default [`InstanceLifecycle::Static`]
+    /// — forked ONCE at boot by the root supervisor and held for the node's life (the Phase-1/2/3
+    /// behavior; the struct-level `#[serde(default)]` supplies it for a config that omits the field,
+    /// so every pre-Phase-4 composition is byte-unchanged). [`InstanceLifecycle::PerTenantTemplate`]
+    /// marks this entry a per-tenant **template**: a single on-disk definition the COMPUTE PLANE
+    /// instantiates per active tenant (the owner-ratified boundary = **project**), pooled-per-tenant
+    /// with scale-to-zero (WS-C) — NOT forked at boot. A template's AUTHORITY set is fixed on-disk
+    /// exactly like a static instance (the F4 restart-class invariant): WS-A requires it to be
+    /// precisely `{exec.wasmtime}` ([`CompositionViolation::WasmTemplateNotSoleExecWasmtime`]). Only
+    /// the per-tenant SCOPE ([`TenantScope`] — the project id) is runtime-derived, and it grants NO
+    /// authority; it only narrows which backend namespace the fixed feature-links reach. WS-A carries
+    /// and lints the marker; the compute-plane instantiation loop and the Host-header routing that
+    /// feed the scope are WS-B/WS-C.
+    pub lifecycle: InstanceLifecycle,
     /// The link names (keys of [`PrivsepConfig::links`]) this instance opens.
     pub links: Vec<String>,
+}
+
+/// The LIFECYCLE model of a [`PrivsepInstanceConfig`] (design §Phase-4 WS-A). Distinguishes the
+/// Phase-1/2/3 **static** instances — forked once at boot — from a Phase-4 per-tenant **template**:
+/// a single on-disk definition the compute plane instantiates per active tenant (boundary = project).
+///
+/// **The F4 restart-class invariant is preserved for a template.** A template's capability set is an
+/// on-disk fact, fixed before any spawn, exactly like a static instance's (design §1.1 / §5 F4): no
+/// runtime write grants it an authority. The ONLY per-tenant, runtime-derived dimension is the
+/// [`TenantScope`] (the project id), which grants NO authority — it narrows the backend namespace the
+/// template's fixed feature-links reach, nothing more. The template therefore does NOT add a
+/// per-tenant axis to [`HostAuthority`]: "the tenant's grants" is a SCOPE over mediated links, not a
+/// capability subset.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum InstanceLifecycle {
+    /// Forked ONCE at boot by the root supervisor and held for the node's life — every Phase-1/2/3
+    /// instance. The default: a config that omits `lifecycle` is byte-unchanged.
+    #[default]
+    Static,
+    /// A per-tenant TEMPLATE: a single on-disk definition the compute plane INSTANTIATES per active
+    /// tenant (boundary = project), pooled-per-tenant with scale-to-zero (WS-C). NOT forked at boot.
+    /// Its authority set is fixed on-disk and must be exactly `{exec.wasmtime}`
+    /// ([`CompositionViolation::WasmTemplateNotSoleExecWasmtime`]); only its per-tenant
+    /// [`TenantScope`] is runtime-derived (and grants no authority).
+    PerTenantTemplate,
+}
+
+impl InstanceLifecycle {
+    /// The stable config/log spelling.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::PerTenantTemplate => "per-tenant-template",
+        }
+    }
+
+    /// Whether this instance is a per-tenant template the compute plane instantiates per tenant
+    /// (rather than a static instance forked once at boot).
+    pub const fn is_per_tenant_template(self) -> bool {
+        matches!(self, Self::PerTenantTemplate)
+    }
+}
+
+/// The host-resolved per-tenant **scope** a per-tenant TEMPLATE instance
+/// ([`InstanceLifecycle::PerTenantTemplate`]) is instantiated FOR: the **project id** (the
+/// owner-ratified tenant boundary). Design §Phase-4 WS-A.
+///
+/// **It is a non-secret name, carried like the other privsep name-wiring.** A scope is the project
+/// slug — the same shape the data plane already keys tenant namespaces by (`project/<id>/…`, see
+/// [`crate::project::resource_prefix`]). It is wired into an instantiated template exactly as the
+/// fd map / unseal allowlist / authority-serve link set are (design §3.3 / the sibling
+/// `compute_unseal_allowlists` + `compute_authority_serve_links`): **names only, never a secret,
+/// never taken from a request body** — the root/compute-plane resolves it and sets it over
+/// [`PRIVSEP_TENANT_SCOPE_ENV`] (a `BOATRAMP_*` non-secret env, like `BOATRAMP_PRIVSEP_FDS`).
+///
+/// **It grants NO authority (the F4 invariant).** The template's authority set is fixed on-disk
+/// (`{exec.wasmtime}`); the scope only NARROWS which backend namespace the template's fixed
+/// feature-links reach. A scope is not a capability and is never a wildcard.
+///
+/// **WS-A scope.** This type + its **fail-closed** [`resolve`](TenantScope::resolve) validator +
+/// the non-secret env (de)serialization ([`env_value`](TenantScope::env_value) /
+/// [`from_env_value`](TenantScope::from_env_value)). The Host-header → project resolution that
+/// FEEDS `resolve` (the structural keying, mirroring `serve_pipeline::serve_by_host_inner`'s
+/// `resolve_site_by_host`) is **WS-B**, and the compute-plane instantiation that consumes the env
+/// is **WS-C** — NOT built here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantScope(String);
+
+/// The non-secret env var the root / compute plane sets on an instantiated per-tenant template to
+/// carry its resolved [`TenantScope`] (the project id — names only, never a secret, never from a
+/// request). A `BOATRAMP_*` name so it passes the spawn-env allowlist, exactly like
+/// `BOATRAMP_PRIVSEP_FDS` / `BOATRAMP_PRIVSEP_AUTHORITY_LINKS`. WS-C wires the actual set/read; WS-A
+/// defines the name + the fail-closed (de)serialization so both ends share one source of truth.
+pub const PRIVSEP_TENANT_SCOPE_ENV: &str = "BOATRAMP_PRIVSEP_TENANT_SCOPE";
+
+/// Why a host-resolved value could not become a [`TenantScope`] — every arm is a **fail-closed
+/// REFUSAL** (design §Phase-4 WS-A: an empty/unresolved scope refuses, and a scope is never a
+/// wildcard). A template instance is NEVER instantiated against a rejected scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantScopeError {
+    /// The host resolved NO tenant scope (the value is empty). Fail-closed: a per-tenant template is
+    /// never instantiated with an empty scope — that would leave the per-tenant namespace
+    /// unnarrowed. (The Host-header resolution that would produce a scope is WS-B; this is the
+    /// representation-layer refusal it funnels into.)
+    Unresolved,
+    /// The scope is a WILDCARD (`*`, or it contains `*`). Fail-closed: a template scope must name
+    /// EXACTLY ONE project — a wildcard would reach every tenant's namespace, defeating the
+    /// per-tenant isolation the template exists to draw.
+    Wildcard {
+        /// The offending value as supplied.
+        got: String,
+    },
+    /// The scope is not a valid project slug (contains `/`, `..`, a path-traversal or non-ASCII
+    /// byte, a Unicode homoglyph, or exceeds [`crate::project::MAX_RESOURCE_NAME_LEN`]). Validated
+    /// structurally by [`crate::project::is_valid_resource_slug`] — the single source of truth the
+    /// data plane already keys tenant namespaces by, so a scope can never be a crafted key.
+    Malformed {
+        /// The offending value as supplied.
+        got: String,
+    },
+}
+
+impl std::fmt::Display for TenantScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresolved => f.write_str(
+                "per-tenant template scope is empty/unresolved — refusing fail-closed (a template is \
+                 never instantiated without a concrete project id)",
+            ),
+            Self::Wildcard { got } => write!(
+                f,
+                "per-tenant template scope {got:?} is a wildcard — refusing fail-closed (a template \
+                 scope must name exactly one project, never a wildcard over every tenant)"
+            ),
+            Self::Malformed { got } => write!(
+                f,
+                "per-tenant template scope {got:?} is not a valid project slug ({}) — refusing \
+                 fail-closed",
+                crate::project::INVALID_NAME_REASON
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TenantScopeError {}
+
+impl TenantScope {
+    /// **Fail-closed** derive-and-validate (design §Phase-4 WS-A). Accepts a host-resolved project
+    /// id and returns a scope ONLY when it is a concrete, single, valid project slug. Refuses:
+    /// - an EMPTY value ([`TenantScopeError::Unresolved`]) — never a scope over the whole namespace;
+    /// - a WILDCARD (`*` / contains `*`) ([`TenantScopeError::Wildcard`]) — never every tenant;
+    /// - any non-slug value ([`TenantScopeError::Malformed`]) — validated by
+    ///   [`crate::project::is_valid_resource_slug`] (rejects `/`, `..`, path-traversal, non-ASCII
+    ///   homoglyphs, over-length), the same rule the data plane keys tenant namespaces by.
+    ///
+    /// Pure + host-testable; no routing, no env, no request context — the Host-header resolution
+    /// that produces the input is WS-B.
+    pub fn resolve(project: &str) -> Result<Self, TenantScopeError> {
+        if project.is_empty() {
+            return Err(TenantScopeError::Unresolved);
+        }
+        if project.contains('*') {
+            return Err(TenantScopeError::Wildcard {
+                got: project.to_string(),
+            });
+        }
+        if !crate::project::is_valid_resource_slug(project) {
+            return Err(TenantScopeError::Malformed {
+                got: project.to_string(),
+            });
+        }
+        Ok(Self(project.to_string()))
+    }
+
+    /// The resolved project id (the tenant boundary). Always a valid slug — never empty, never a
+    /// wildcard (enforced at [`resolve`](Self::resolve)).
+    pub fn project(&self) -> &str {
+        &self.0
+    }
+
+    /// The backend keyspace prefix this scope narrows the template's fixed feature-links to
+    /// (`project/<id>/…`). The scope grants no authority — it only selects this namespace.
+    pub fn resource_prefix(&self) -> String {
+        crate::project::resource_prefix(&self.0)
+    }
+
+    /// The non-secret value to set in [`PRIVSEP_TENANT_SCOPE_ENV`] (the bare project id — names
+    /// only, no secret). WS-C sets this on an instantiated template; the symmetric reader is
+    /// [`from_env_value`](Self::from_env_value).
+    pub fn env_value(&self) -> &str {
+        &self.0
+    }
+
+    /// Re-derive a scope from a [`PRIVSEP_TENANT_SCOPE_ENV`] value, re-validating fail-closed — so a
+    /// tampered or truncated env value refuses exactly as a bad resolution would, rather than being
+    /// trusted because it arrived in the environment.
+    pub fn from_env_value(value: &str) -> Result<Self, TenantScopeError> {
+        Self::resolve(value)
+    }
 }
 
 /// The ISOLATION SUBSTRATE a feature-instance's process runs under (design §Phase-3; fabric-composition
@@ -819,6 +1014,38 @@ pub enum CompositionViolation {
         /// Its endpoints that hold a crown jewel (0, or ≥2 — never exactly 1, or this would not fire).
         crown_endpoints: Vec<String>,
     },
+    /// A per-tenant TEMPLATE instance ([`InstanceLifecycle::PerTenantTemplate`]) holds a capability
+    /// set OTHER than exactly `{exec.wasmtime}` (design §Phase-4 WS-A). A template is the guest-JIT
+    /// surface the compute plane instantiates per tenant; it must materialize ONLY `exec.wasmtime` so
+    /// a wasmtime escape lands in a SINGLE tenant's guest runtime and nothing else — no key, no pool,
+    /// no listener, no control surface, and never a crown jewel. Fail-closed: the root refuses the
+    /// node closed rather than instantiate a template that would widen a per-tenant escape.
+    WasmTemplateNotSoleExecWasmtime {
+        /// The offending template instance label.
+        instance: String,
+        /// Whether it holds `exec.wasmtime` at all (`false` ⇒ it is MISSING the one capability it
+        /// must have).
+        holds_exec_wasmtime: bool,
+        /// The capabilities it holds BEYOND `exec.wasmtime` — the extras to remove (empty when the
+        /// sole fault is a missing `exec.wasmtime`). Any crown-jewel key here is doubly disqualifying.
+        extra: Vec<HostAuthority>,
+    },
+    /// One instance co-resides BOTH `exec.compute` and `exec.wasmtime` while the composition defines a
+    /// per-tenant TEMPLATE (design §Phase-4 WS-A). The compute-plane SUPERVISOR (`exec.compute`) that
+    /// SCHEDULES the per-tenant guest-runtime templates must not ITSELF run guests (`exec.wasmtime`):
+    /// co-residency would put a wasmtime escape in the very process that orchestrates every tenant's
+    /// instance, re-collapsing the per-tenant boundary Phase-4 exists to draw. Fail-closed.
+    ///
+    /// **Gated on template presence** (a composition with at least one
+    /// [`InstanceLifecycle::PerTenantTemplate`]): without a template, `exec.compute` schedules no
+    /// per-tenant instances, so a pre-Phase-4 composition that co-resides the two exec authorities on
+    /// one instance (the shipped monolith-equivalent `edge`/`all` compositions, the live-gate
+    /// fixtures) is UNCHANGED — the rule fires only once the per-tenant template makes `exec.compute`
+    /// the per-tenant scheduler.
+    ExecComputeAndWasmtimeCoResident {
+        /// The offending instance label.
+        instance: String,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -878,6 +1105,40 @@ impl std::fmt::Display for CompositionViolation {
                  bootstrap-unseal, not an authority serve",
                 crown_endpoints.len(),
                 crown_endpoints.join(", ")
+            ),
+            Self::WasmTemplateNotSoleExecWasmtime {
+                instance,
+                holds_exec_wasmtime,
+                extra,
+            } => {
+                if !*holds_exec_wasmtime {
+                    write!(
+                        f,
+                        "per-tenant template instance {instance:?} does not hold `exec.wasmtime` — a \
+                         wasm-runtime template must hold EXACTLY `{{exec.wasmtime}}`{}",
+                        if extra.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (and must drop [{}])", tags(extra))
+                        }
+                    )
+                } else {
+                    write!(
+                        f,
+                        "per-tenant template instance {instance:?} holds [{}] beyond `exec.wasmtime` \
+                         — a wasm-runtime template must hold EXACTLY `{{exec.wasmtime}}` (no key, no \
+                         pool, no listener, no control surface) so a guest escape is confined to one \
+                         tenant",
+                        tags(extra)
+                    )
+                }
+            }
+            Self::ExecComputeAndWasmtimeCoResident { instance } => write!(
+                f,
+                "instance {instance:?} co-resides `exec.compute` and `exec.wasmtime` while the \
+                 composition defines a per-tenant template — the compute-plane supervisor that \
+                 schedules per-tenant instances must not itself run guests; split `exec.wasmtime` \
+                 (the per-tenant template) off the `exec.compute` supervisor instance"
             ),
         }
     }
@@ -992,7 +1253,13 @@ fn tags(authorities: &[HostAuthority]) -> String {
 ///   `{C listeners ∪ exec.wasmtime ∪ exec.compute ∪ control.admin-api ∪ acme.dns-control}`
 ///   (the widened exclusion, design §1.2 / §5 F7);
 /// - a link endpoint naming an unhosted instance;
-/// - an instance `links` entry referencing an undefined link.
+/// - an instance `links` entry referencing an undefined link;
+/// - **(Phase-4 WS-A)** a per-tenant TEMPLATE instance whose capability set is not exactly
+///   `{exec.wasmtime}` ([`CompositionViolation::WasmTemplateNotSoleExecWasmtime`]);
+/// - **(Phase-4 WS-A)** `exec.compute` co-resident with `exec.wasmtime` on one instance WHEN the
+///   composition defines a per-tenant template
+///   ([`CompositionViolation::ExecComputeAndWasmtimeCoResident`]) — gated on template presence, so
+///   every pre-Phase-4 composition is unchanged.
 ///
 /// It FLAGS (returns `Ok` with [`CompositionWarning`]s) on:
 /// - a crown jewel held by >1 instance (duplication widens exposure);
@@ -1011,18 +1278,59 @@ pub fn check_composition_closure(
     let mut violations = Vec::new();
     let mut warnings = Vec::new();
 
-    // --- Per-instance checks: zero-cap, crown-jewel exclusion, F8 second tier. ---
+    // Phase-4 WS-A: does the composition define a per-tenant template at all? The exec.compute ×
+    // exec.wasmtime co-residency refusal is gated on this (a composition with no template schedules
+    // no per-tenant instances, so `exec.compute` is not yet the per-tenant scheduler — every
+    // pre-Phase-4 composition stays unchanged).
+    let has_per_tenant_template = cfg
+        .instances
+        .values()
+        .any(|i| i.lifecycle.is_per_tenant_template());
+
+    // --- Per-instance checks: zero-cap, crown-jewel exclusion, F8 second tier, Phase-4 template. ---
     for (name, inst) in &cfg.instances {
         if inst.capabilities.is_empty() {
             violations.push(CompositionViolation::ZeroCapabilityInstance {
                 instance: name.clone(),
             });
-            // A zero-cap instance has nothing further to check for co-residency.
+            // A zero-cap instance has nothing further to check for co-residency. (A zero-cap
+            // per-tenant template is reported here; its missing `exec.wasmtime` is the same fault.)
             continue;
         }
 
         // Deduplicate within an instance so a repeated tag doesn't skew the report.
         let held: BTreeSet<HostAuthority> = inst.capabilities.iter().copied().collect();
+
+        // Phase-4 WS-A rule (a): a per-tenant TEMPLATE must hold EXACTLY `{exec.wasmtime}` — no
+        // extra capability, no crown-jewel key. (A crown jewel on a template ALSO trips the
+        // crown-jewel exclusion below, since exec.wasmtime is in the exclusion surface; both fire,
+        // and this gives the template-specific message.)
+        if inst.lifecycle.is_per_tenant_template() {
+            let holds_exec_wasmtime = held.contains(&HostAuthority::ExecWasmtime);
+            let extra: Vec<HostAuthority> = held
+                .iter()
+                .copied()
+                .filter(|a| *a != HostAuthority::ExecWasmtime)
+                .collect();
+            if !holds_exec_wasmtime || !extra.is_empty() {
+                violations.push(CompositionViolation::WasmTemplateNotSoleExecWasmtime {
+                    instance: name.clone(),
+                    holds_exec_wasmtime,
+                    extra,
+                });
+            }
+        }
+
+        // Phase-4 WS-A rule (b): the compute supervisor must not itself run guests — reject
+        // exec.compute co-resident with exec.wasmtime ONCE a per-tenant template exists.
+        if has_per_tenant_template
+            && held.contains(&HostAuthority::ExecCompute)
+            && held.contains(&HostAuthority::ExecWasmtime)
+        {
+            violations.push(CompositionViolation::ExecComputeAndWasmtimeCoResident {
+                instance: name.clone(),
+            });
+        }
 
         // Crown-jewel exclusion (REFUSE): A × {C ∪ D ∪ E}.
         let jewels: Vec<HostAuthority> = held
@@ -1352,6 +1660,16 @@ mod tests {
             sandbox: SandboxPosture::Derived,
             substrate: InstanceSubstrate::OsProcess,
             links: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// A per-tenant TEMPLATE instance holding the given capability set (Phase-4 WS-A fixture).
+    fn template(caps: &[HostAuthority]) -> PrivsepInstanceConfig {
+        PrivsepInstanceConfig {
+            capabilities: caps.to_vec(),
+            lifecycle: InstanceLifecycle::PerTenantTemplate,
+            ..Default::default()
         }
     }
 
@@ -1934,6 +2252,335 @@ mod tests {
                 .compute_plane_backend()
                 .is_some_and(|b| b.contains("firecracker"))
         );
+    }
+
+    // ---- per-tenant wasm-runtime TEMPLATE + lifecycle (Phase-4 WS-A) ----
+
+    /// A valid Phase-4 composition whose union == ALL:
+    /// - `tenant-wasm`: a per-tenant TEMPLATE holding ONLY `exec.wasmtime` (the per-tenant guest JIT);
+    /// - `edge`: every listener + `exec.compute` + both control (no `exec.wasmtime` — it moved to the
+    ///   template; no keys, no backends; `exec.compute` is the per-tenant SCHEDULER, holds no guest);
+    /// - `data`: the four backends (B alone);
+    /// - `signer`: the six crown jewels (A alone).
+    fn phase4_template_composition() -> PrivsepConfig {
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "tenant-wasm".to_string(),
+            template(&[HostAuthority::ExecWasmtime]),
+        );
+        instances.insert(
+            "edge".to_string(),
+            inst(&[
+                HostAuthority::ListenPublicTls,
+                HostAuthority::ListenHttpParse,
+                HostAuthority::ListenMail,
+                HostAuthority::ListenOverlay,
+                HostAuthority::ListenS3Ingress,
+                HostAuthority::ListenInboundTcp,
+                HostAuthority::ListenGateway,
+                HostAuthority::ExecCompute,
+                HostAuthority::ControlAdminApi,
+                HostAuthority::AcmeDnsControl,
+            ]),
+        );
+        instances.insert(
+            "data".to_string(),
+            inst(&[
+                HostAuthority::BackendKv,
+                HostAuthority::BackendSql,
+                HostAuthority::BackendBlob,
+                HostAuthority::BackendMessaging,
+            ]),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[
+                HostAuthority::SecretsSealer,
+                HostAuthority::TokenSigner,
+                HostAuthority::ImageSigner,
+                HostAuthority::OverlayDialSigner,
+                HostAuthority::S3IngressRoot,
+                HostAuthority::ClusterJoinSigner,
+            ]),
+        );
+        PrivsepConfig {
+            instances,
+            links: BTreeMap::new(),
+            supervisor: None,
+        }
+    }
+
+    fn has_violation(cfg: &PrivsepConfig, pred: impl Fn(&CompositionViolation) -> bool) -> bool {
+        check_composition_closure(cfg)
+            .err()
+            .is_some_and(|e| e.violations.iter().any(pred))
+    }
+
+    #[test]
+    fn lifecycle_defaults_to_static_and_round_trips_with_a_template_through_ron() {
+        let ron = r#"(
+            instances: {
+                "tenant-wasm": ( capabilities: ["exec.wasmtime"], lifecycle: PerTenantTemplate ),
+                "edge": ( capabilities: ["listen.http-parse"] ),
+            },
+        )"#;
+        let cfg: PrivsepConfig = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(ron)
+            .expect("parse privsep RON with a lifecycle marker");
+        assert_eq!(
+            cfg.instances["tenant-wasm"].lifecycle,
+            InstanceLifecycle::PerTenantTemplate
+        );
+        assert!(
+            cfg.instances["tenant-wasm"]
+                .lifecycle
+                .is_per_tenant_template()
+        );
+        // An omitted `lifecycle` defaults to Static (back-compat: every pre-Phase-4 cfg is unchanged).
+        assert_eq!(cfg.instances["edge"].lifecycle, InstanceLifecycle::Static);
+        assert!(!cfg.instances["edge"].lifecycle.is_per_tenant_template());
+        assert_eq!(InstanceLifecycle::Static.tag(), "static");
+        assert_eq!(
+            InstanceLifecycle::PerTenantTemplate.tag(),
+            "per-tenant-template"
+        );
+        // serde round-trips value → JSON → value unchanged.
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: PrivsepConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn valid_wasm_template_composition_passes_clean() {
+        let report =
+            check_composition_closure(&phase4_template_composition()).expect("valid composition");
+        assert!(
+            report.warnings.is_empty(),
+            "the valid template composition must raise no flags, got {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn lint_rejects_template_with_an_extra_capability() {
+        let mut cfg = phase4_template_composition();
+        // The template now holds a backend credential in addition to exec.wasmtime.
+        cfg.instances
+            .get_mut("tenant-wasm")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::BackendKv);
+        assert!(has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::WasmTemplateNotSoleExecWasmtime { instance, holds_exec_wasmtime, extra }
+                if instance == "tenant-wasm" && *holds_exec_wasmtime && extra.contains(&HostAuthority::BackendKv)
+        )));
+    }
+
+    #[test]
+    fn lint_rejects_template_with_a_crown_jewel_key() {
+        let mut cfg = phase4_template_composition();
+        // A crown jewel on the template — doubly disqualifying (also trips crown-jewel exclusion).
+        cfg.instances
+            .get_mut("tenant-wasm")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::SecretsSealer);
+        assert!(has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::WasmTemplateNotSoleExecWasmtime { instance, extra, .. }
+                if instance == "tenant-wasm" && extra.contains(&HostAuthority::SecretsSealer)
+        )));
+    }
+
+    #[test]
+    fn lint_rejects_template_missing_exec_wasmtime() {
+        // A template that holds something OTHER than exec.wasmtime, and not exec.wasmtime at all.
+        let mut cfg = phase4_template_composition();
+        *cfg.instances.get_mut("tenant-wasm").unwrap() = template(&[HostAuthority::ExecCompute]);
+        // Keep the union == ALL (so the template fault is the clean thing under test): swap the two
+        // exec authorities between the template and `edge` — exec.wasmtime onto `edge`, exec.compute
+        // onto the template. Dropping exec.compute from `edge` also keeps this focused on rule (a)
+        // (otherwise `edge` would co-reside both exec authorities and trip rule (b) as well).
+        let edge = &mut cfg.instances.get_mut("edge").unwrap().capabilities;
+        edge.push(HostAuthority::ExecWasmtime);
+        edge.retain(|a| *a != HostAuthority::ExecCompute);
+        assert!(has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::WasmTemplateNotSoleExecWasmtime { instance, holds_exec_wasmtime, extra }
+                if instance == "tenant-wasm" && !*holds_exec_wasmtime && extra.contains(&HostAuthority::ExecCompute)
+        )));
+    }
+
+    #[test]
+    fn a_valid_exec_wasmtime_template_passes_rule_a() {
+        // A bare `{exec.wasmtime}` template raises NO template fault.
+        let cfg = phase4_template_composition();
+        assert!(!has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::WasmTemplateNotSoleExecWasmtime { .. }
+        )));
+    }
+
+    #[test]
+    fn lint_rejects_exec_compute_and_wasmtime_co_resident_when_a_template_exists() {
+        let mut cfg = phase4_template_composition();
+        // Put exec.wasmtime back on the exec.compute-holding `edge` while the template still exists.
+        cfg.instances
+            .get_mut("edge")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::ExecWasmtime);
+        assert!(has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::ExecComputeAndWasmtimeCoResident { instance } if instance == "edge"
+        )));
+    }
+
+    #[test]
+    fn exec_compute_wasmtime_co_residency_rule_is_gated_on_template_presence() {
+        // `clean_composition`'s `edge` co-resides exec.compute + exec.wasmtime, but has NO template —
+        // a pre-Phase-4 composition. The co-residency rule must NOT fire (it passes clean entirely).
+        let cfg = clean_composition();
+        assert!(
+            !cfg.instances
+                .values()
+                .any(|i| i.lifecycle.is_per_tenant_template())
+        );
+        let report = check_composition_closure(&cfg).expect("pre-Phase-4 composition is unchanged");
+        assert!(report.warnings.is_empty());
+        // Explicitly: no co-residency violation can arise without a template.
+        assert!(!has_violation(&cfg, |v| matches!(
+            v,
+            CompositionViolation::ExecComputeAndWasmtimeCoResident { .. }
+        )));
+    }
+
+    // ---- F4 restart-class invariant (Phase-4 WS-A) ----
+
+    #[test]
+    fn pre_phase4_compositions_are_unchanged_and_default_to_static() {
+        // Every instance of a composition that never mentions `lifecycle` is Static, and the clean
+        // Phase-1/2/3 composition still passes exactly as before (no new refusal, no new flag).
+        let cfg = clean_composition();
+        for inst in cfg.instances.values() {
+            assert_eq!(inst.lifecycle, InstanceLifecycle::Static);
+        }
+        check_composition_closure(&cfg).expect("the pre-Phase-4 clean composition is unchanged");
+    }
+
+    #[test]
+    fn absent_privsep_monolith_is_byte_unchanged() {
+        // The monolith is the ABSENT `[privsep]` section — carried as Option::None by the consumer,
+        // never linted. Its representation here (a defaulted PrivsepConfig) has no instances and is
+        // byte-stable through a serde round-trip, so adding `lifecycle` cannot perturb the monolith.
+        let empty = PrivsepConfig::default();
+        assert!(empty.instances.is_empty());
+        let json = serde_json::to_string(&empty).unwrap();
+        let back: PrivsepConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, empty);
+    }
+
+    #[test]
+    fn template_authority_is_fixed_on_disk_and_scope_grants_nothing() {
+        // The template's AUTHORITY is the on-disk fact `{exec.wasmtime}` — independent of any tenant.
+        let t = template(&[HostAuthority::ExecWasmtime]);
+        assert_eq!(t.capabilities, vec![HostAuthority::ExecWasmtime]);
+        assert!(t.lifecycle.is_per_tenant_template());
+        // Resolving DIFFERENT per-tenant scopes changes only the backend NAMESPACE, never the
+        // authority set: the scope carries no HostAuthority and selects a `project/<id>/…` prefix.
+        let a = TenantScope::resolve("acme").expect("valid scope");
+        let b = TenantScope::resolve("globex").expect("valid scope");
+        assert_eq!(a.resource_prefix(), "project/acme/");
+        assert_eq!(b.resource_prefix(), "project/globex/");
+        assert_ne!(a, b);
+        // The template definition is identical regardless of which scope it is instantiated for.
+        assert_eq!(t.capabilities, vec![HostAuthority::ExecWasmtime]);
+    }
+
+    // ---- fail-closed TenantScope (Phase-4 WS-A) ----
+
+    #[test]
+    fn tenant_scope_resolves_a_valid_project_slug() {
+        let s = TenantScope::resolve("acme-prod").expect("a valid slug resolves");
+        assert_eq!(s.project(), "acme-prod");
+        assert_eq!(s.env_value(), "acme-prod");
+        assert_eq!(s.resource_prefix(), "project/acme-prod/");
+        // The reserved default project is itself a valid, scopable tenant.
+        assert!(TenantScope::resolve(crate::project::DEFAULT_PROJECT).is_ok());
+    }
+
+    #[test]
+    fn tenant_scope_is_fail_closed_on_empty_unresolved() {
+        assert_eq!(TenantScope::resolve(""), Err(TenantScopeError::Unresolved));
+    }
+
+    #[test]
+    fn tenant_scope_is_fail_closed_on_a_wildcard() {
+        assert!(matches!(
+            TenantScope::resolve("*"),
+            Err(TenantScopeError::Wildcard { .. })
+        ));
+        assert!(matches!(
+            TenantScope::resolve("acme/*"),
+            Err(TenantScopeError::Wildcard { .. })
+        ));
+        assert!(matches!(
+            TenantScope::resolve("ac*me"),
+            Err(TenantScopeError::Wildcard { .. })
+        ));
+    }
+
+    #[test]
+    fn tenant_scope_is_fail_closed_on_a_malformed_slug() {
+        for bad in [
+            "a/b",          // a path segment separator
+            "..",           // traversal
+            "../x",         // traversal
+            "-acme",        // must start alphanumeric
+            "acme-",        // must end alphanumeric
+            "acme prod",    // space
+            "project/acme", // the keyspace prefix is not itself a scope
+            "café",         // non-ASCII homoglyph
+        ] {
+            assert!(
+                matches!(
+                    TenantScope::resolve(bad),
+                    Err(TenantScopeError::Malformed { .. })
+                ),
+                "{bad:?} must refuse fail-closed as malformed"
+            );
+        }
+        // An over-length slug (> MAX_RESOURCE_NAME_LEN) is malformed.
+        let too_long = "a".repeat(crate::project::MAX_RESOURCE_NAME_LEN + 1);
+        assert!(matches!(
+            TenantScope::resolve(&too_long),
+            Err(TenantScopeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn tenant_scope_from_env_value_re_validates_fail_closed() {
+        // A good value round-trips through the env representation.
+        let s = TenantScope::resolve("acme").unwrap();
+        assert_eq!(TenantScope::from_env_value(s.env_value()), Ok(s));
+        // A tampered/empty/wildcard env value refuses exactly as a bad resolution would — it is NOT
+        // trusted because it arrived in the environment.
+        assert_eq!(
+            TenantScope::from_env_value(""),
+            Err(TenantScopeError::Unresolved)
+        );
+        assert!(matches!(
+            TenantScope::from_env_value("*"),
+            Err(TenantScopeError::Wildcard { .. })
+        ));
+        assert!(matches!(
+            TenantScope::from_env_value("a/b"),
+            Err(TenantScopeError::Malformed { .. })
+        ));
+        // The env var name is the non-secret BOATRAMP_* spelling.
+        assert_eq!(PRIVSEP_TENANT_SCOPE_ENV, "BOATRAMP_PRIVSEP_TENANT_SCOPE");
     }
 
     #[test]
