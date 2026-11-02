@@ -1653,6 +1653,26 @@ jobs:
           grep -q 'DNS-PUBLISH SERVE-WIRING OK' dns-publish-serve-wiring.log \
             || { echo "::error::dns-publish serve-wiring gate never reached its marker (the serve-path provider-source install → maybe_attach → capture seam regressed to inert — cap-req #25)" >&2; exit 1; }
 
+      # SERVE-INSTALL CALL-SITE boot smoke. The gate above proves the install→dispatch→capture seam, but
+      # it installs the provider source itself — it cannot prove `boatramp serve` actually CALLS
+      # install_dns_publish_source at boot, and that one-line call-site is EXACTLY how #24 shipped inert
+      # (the call was missing). This smoke boots the REAL binary with `--dns-publish-provider manual` and
+      # asserts serve emits the install marker `DNS-PUBLISH SERVE-INSTALL CALLED` early in run() (before
+      # the mode fork / store seeding — so it is robust: capture the early stderr line, then kill; never
+      # waits for the full node boot). A lean feature set (fs,slatedb for a bootable store + the wiring)
+      # keeps the binary compile light. Deleting the call line drops the marker ⇒ this step fails.
+      - name: "dns-publish serve-INSTALL boot smoke (serve run() actually CALLS install_dns_publish_source)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --no-default-features --features fs,slatedb,dns-publish,acme-dns \
+            --test dns_publish_serve_install_boot \
+            -- --ignored --nocapture 2>&1 | tee dns-publish-install-boot.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-install-boot.log \
+            || { echo "::error::dns-publish serve-install boot smoke did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH SERVE-INSTALL-BOOT OK' dns-publish-install-boot.log \
+            || { echo "::error::serve did NOT call install_dns_publish_source at boot — the #24 inert-ship call-site regressed (cap-req #25)" >&2; exit 1; }
+
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
   # dispatch paths, incl. the legible terminal-outcome taxonomy) ran ONLY in the nightly

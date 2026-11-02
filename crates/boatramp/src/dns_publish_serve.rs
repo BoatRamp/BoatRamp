@@ -131,13 +131,20 @@ pub async fn install_dns_publish_source(
             boatramp_server::dns_publish::install_provider_source(Some(
                 source as Arc<dyn DnsPublishProviderSource>,
             ));
+            // The `DNS-PUBLISH SERVE-INSTALL CALLED` token is a STABLE boot marker: it is emitted ONLY
+            // from this install path, so a subprocess boot-smoke
+            // (`crates/boatramp/tests/dns_publish_serve_install_boot.rs`) can grep serve's early boot
+            // log to prove `boatramp serve` actually CALLS `install_dns_publish_source` at run() — the
+            // one-line call-site whose ABSENCE is exactly how #24 shipped inert. Deleting that call
+            // line (or regressing it to not install) drops this marker and fails the gate. Keep the
+            // token verbatim if you reword the message.
             tracing::info!(
                 target: "boatramp::dns::publish",
                 provider = provider_name,
                 zone_root = %zone_root,
-                "dns-publish: guest DNS-write provider source INSTALLED (operator opt-in) — the node \
-                 posture `allow_guest_dns_publish` + a per-handler `dns_publish_zones` allowlist still \
-                 gate every guest write",
+                "dns-publish: guest DNS-write provider source INSTALLED (operator opt-in) — \
+                 DNS-PUBLISH SERVE-INSTALL CALLED; the node posture `allow_guest_dns_publish` + a \
+                 per-handler `dns_publish_zones` allowlist still gate every guest write",
             );
         }
         None => {
