@@ -1791,6 +1791,7 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
                 kind,
                 name: name.to_string(),
                 url_env: None,
+                migration_url_env: None,
             })
         })
         .collect()
@@ -2089,17 +2090,20 @@ mod tests {
                             kind: BindingKind::Kv,
                             name: String::new(),
                             url_env: None,
+                            migration_url_env: None,
                         },
                         ComputeBinding {
                             kind: BindingKind::Kv,
                             name: "cache".into(),
                             url_env: None,
+                            migration_url_env: None,
                         },
                         // `invoke` parses like every other kind (Phase 3 — no resolver yet).
                         ComputeBinding {
                             kind: BindingKind::Invoke,
                             name: String::new(),
                             url_env: None,
+                            migration_url_env: None,
                         },
                     ]
                 );

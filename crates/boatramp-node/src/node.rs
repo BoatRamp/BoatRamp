@@ -568,12 +568,42 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         crate::compute::spawn_internal_dns(config.compute.as_ref(), &compute_backends, &deploy);
     // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener +
     // build the resolver when a sql provider and `compute.sql_shim_url` are both present.
+    // Then, when a sqlx engine + a `[secrets]` envelope are present, WRAP it with the
+    // managed-DB DSN resolver (PLAN-compute-managed-db-dsn Phase 1): a workload bound to a
+    // managed co-located Postgres/MySQL gets a real `postgres://`/`mysql://` DSN injected
+    // (operator-templatable), while per-site libsql / external bindings keep falling through
+    // to the shim. No envelope ⇒ no managed-credential path ⇒ just the shim, as before.
     #[cfg(feature = "handlers")]
-    let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
-        handlers.sql_backends(),
-        config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
-    )
-    .await;
+    let sql_resolver = {
+        let shim = boatramp_server::sql_shim::spawn_sql_shim(
+            handlers.sql_backends(),
+            config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
+        )
+        .await;
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        let resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> =
+            match secrets_envelope.clone() {
+                Some(envelope) => {
+                    Some(Arc::new(crate::managed_db_dsn::ManagedDbDsnResolver::wrap(
+                        shim,
+                        config
+                            .handlers
+                            .as_ref()
+                            .and_then(|h| h.bindings.sql.as_ref())
+                            .map(|sql| sql.databases.clone())
+                            .unwrap_or_default(),
+                        deploy.clone(),
+                        kv.clone(),
+                        envelope,
+                        secret_store.clone(),
+                    )))
+                }
+                None => shim,
+            };
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        let resolver = shim;
+        resolver
+    };
     #[cfg(not(feature = "handlers"))]
     let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 

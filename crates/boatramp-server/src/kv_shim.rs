@@ -661,6 +661,7 @@ mod tests {
             kind: BindingKind::Kv,
             name: name.to_string(),
             url_env: None,
+            migration_url_env: None,
         }
     }
 

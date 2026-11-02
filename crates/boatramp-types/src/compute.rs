@@ -285,6 +285,14 @@ pub struct ComputeBinding {
     /// (`sql` → `BOATRAMP_SQL_URL`). The credential is injected as `<url_env>_AUTH_TOKEN`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url_env: Option<String>,
+    /// For a `sql` binding to a managed co-located Postgres/MySQL database only: the env
+    /// var the **migration/DDL** connection URL is injected as (the owner-role analog used
+    /// to run schema migrations). `None` ⇒ the derived default `<url_env>_MIGRATION`. On a
+    /// per-site libsql binding (the shim path) it is ignored. The general override is an
+    /// operator `env:` template referencing `{{sql.migration_dsn}}`; this discrete name is
+    /// the simple-case default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_url_env: Option<String>,
 }
 
 /// The managed-resource kinds a [`ComputeBinding`] may name. `Sql`/`Kv`/`Blob`/`Messaging` each
@@ -315,6 +323,16 @@ impl ComputeBinding {
         self.url_env
             .clone()
             .unwrap_or_else(|| self.kind.default_url_env().to_string())
+    }
+
+    /// The env var the **migration/DDL** connection URL is injected as for a managed
+    /// Postgres/MySQL `sql` binding: the explicit `migration_url_env`, else the derived
+    /// default `<url_env()>_MIGRATION` (so `BOATRAMP_SQL_URL` → `BOATRAMP_SQL_URL_MIGRATION`,
+    /// a custom `SIMERTEC_DATABASE_URL` → `SIMERTEC_DATABASE_URL_MIGRATION`).
+    pub fn migration_url_env(&self) -> String {
+        self.migration_url_env
+            .clone()
+            .unwrap_or_else(|| format!("{}_MIGRATION", self.url_env()))
     }
 }
 
@@ -815,6 +833,7 @@ mod tests {
             kind: BindingKind::Sql,
             name: String::new(),
             url_env: None,
+            migration_url_env: None,
         }];
         assert_ne!(a.id(), b.id(), "a declared binding changes the id");
         assert!(serde_json::to_string(&b).unwrap().contains("bindings"));
@@ -830,14 +849,26 @@ mod tests {
             kind: BindingKind::Sql,
             name: String::new(),
             url_env: None,
+            migration_url_env: None,
         };
         assert_eq!(sql.url_env(), "BOATRAMP_SQL_URL");
         let custom = ComputeBinding {
             kind: BindingKind::Sql,
             name: "analytics".into(),
             url_env: Some("ANALYTICS_URL".into()),
+            migration_url_env: None,
         };
         assert_eq!(custom.url_env(), "ANALYTICS_URL");
+        // The migration/DDL env var defaults to `<url_env>_MIGRATION`, or an explicit override.
+        assert_eq!(sql.migration_url_env(), "BOATRAMP_SQL_URL_MIGRATION");
+        assert_eq!(custom.migration_url_env(), "ANALYTICS_URL_MIGRATION");
+        let explicit = ComputeBinding {
+            kind: BindingKind::Sql,
+            name: "analytics".into(),
+            url_env: Some("ANALYTICS_URL".into()),
+            migration_url_env: Some("ANALYTICS_DDL_URL".into()),
+        };
+        assert_eq!(explicit.migration_url_env(), "ANALYTICS_DDL_URL");
     }
 
     #[test]
@@ -857,6 +888,7 @@ mod tests {
             kind: BindingKind::Invoke,
             name: String::new(),
             url_env: None,
+            migration_url_env: None,
         };
         assert_eq!(invoke.url_env(), "BOATRAMP_INVOKE_URL");
         // Every kind's stable tag is distinct (the shim token HMAC relies on this).
@@ -888,6 +920,7 @@ mod tests {
             kind: BindingKind::Invoke,
             name: String::new(),
             url_env: None,
+            migration_url_env: None,
         }];
         assert_ne!(a.id(), b.id(), "a declared invoke binding changes the id");
         assert!(serde_json::to_string(&b).unwrap().contains("invoke"));
