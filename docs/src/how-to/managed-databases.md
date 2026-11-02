@@ -134,6 +134,13 @@ routing, and migrations each wait for a configurable readiness level, defaulting
 yet set up). An operator can relax a given gate to `service-ready` with the external
 database config's `readiness_gate` (`answerability` / `routing` / `migration`).
 
+A script or migration tool that would rather poll a plain HTTP endpoint than shell out
+to the CLI can use `GET /api/sql/:db/status` instead — the same readiness vocabulary
+(`pending`/`starting`/`service_ready`/`provisioned`/`provision_failed`), covering
+either a declared (`db declare`) or node-static binding from one place, with a
+`retry_after_secs` hint on any not-yet-usable state. See [Managed SQL
+(operator)](../reference/api.md#managed-sql-operator).
+
 ### Data-dir ownership (why a managed DB is stuck `starting`)
 
 A managed database runs rootless inside its container (Postgres/MySQL as uid `999`), so
@@ -245,6 +252,28 @@ multi-GiB volume), enforced fail-closed at declare (a `422` before any provision
 
 The provisioning is bound to the caller's project — a manifest can only ever
 provision onto its **own** project's server.
+
+## Use it from a compute workload (a real DSN)
+
+A wasm handler reaches the database through `sql.open("app")`. A plain **compute
+workload** (container / micro-VM) reaches the *same* per-tenant database by binding
+it — and, because it is a managed co-located Postgres/MySQL, boatramp injects a real
+`postgres://` / `mysql://` **DSN** into the workload's env (not a boatramp shim/token),
+so an off-the-shelf app, ORM, or migration tool Just Works:
+
+```ron
+compute: [
+  ( name: "simertec",
+    spec: ( root: image("ghcr.io/acme/simertec:1"), vcpus: 1, mem_mib: 512, port: 8080,
+            bindings: [ ( kind: sql, name: "app" ) ] ),
+    replicas: 1 ),
+]
+```
+
+The default injects `BOATRAMP_SQL_URL` (runtime) + `BOATRAMP_SQL_URL_MIGRATION`
+(DDL); the operator can instead template the exact env vars the workload wants from
+`{{sql.host}}` / `{{sql.user}}` / `{{sql.password}}` / … (+ sealed secrets). See
+[Use a managed Postgres/MySQL from a compute workload](./compute.md#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn).
 
 ## See also
 

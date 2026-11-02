@@ -10,6 +10,7 @@ mod config_editor;
 mod dashboard;
 mod deploy_ops;
 mod format;
+mod graphql;
 mod hooks;
 mod logstream;
 mod maintenance;
@@ -29,6 +30,12 @@ mod verify;
 mod widgets;
 
 pub use api::{ApiClient, ApiError, ApiResult};
+/// Re-exported for `tests/graphql_config.rs` (same precedent as the overlay re-export above):
+/// the GraphQL safelist invariant helper (`enforce_safelist` ⇒ `persisted_queries`) and the
+/// GraphQL-registry wire mirrors, so the Node test can exercise the real logic + wire shapes
+/// without a browser/DOM.
+pub use config_editor::set_enforce_safelist;
+pub use models::{SafelistOp, SupergraphEntity, SupergraphSummary};
 /// Re-exported for the console's own integration tests (`tests/overlay_policy.rs`): the pure
 /// decision/shaping helpers + wire mirrors the overlay flow-policy editor's states are built from,
 /// kept out of the module's otherwise-private surface. Mirrors the `api` re-export above.
@@ -41,6 +48,7 @@ use auth::{AuthProvider, LoginView, use_session};
 use config_editor::ConfigEditor;
 use dashboard::Dashboard;
 use deploy_ops::DeployOps;
+use graphql::GraphqlPage;
 use hooks::{Fetch, use_api};
 use maintenance::Maintenance;
 use models::{FunctionSummary, WhoAmI};
@@ -102,6 +110,9 @@ pub(crate) enum Route {
     /// A single function's live guest logs.
     #[at("/functions/:name")]
     Function { name: String },
+    /// The project's GraphQL registry: federation supergraph + operation safelist.
+    #[at("/graphql")]
+    Graphql,
     /// Cluster-wide maintenance (prune / scrub / certs).
     #[at("/maintenance")]
     Maintenance,
@@ -136,6 +147,7 @@ fn nav_group(route: &Route) -> u8 {
     match route {
         Route::Sites | Route::Site { .. } => 0,
         Route::Functions | Route::Function { .. } => 1,
+        Route::Graphql => 7,
         Route::Monitoring => 2,
         Route::Maintenance => 3,
         Route::Tokens => 4,
@@ -151,6 +163,7 @@ fn switch(route: Route) -> Html {
         Route::Site { name } => html! { <SitePage name={name} /> },
         Route::Functions => html! { <FunctionsPage /> },
         Route::Function { name } => html! { <FunctionPage name={name} /> },
+        Route::Graphql => html! { <GraphqlPage /> },
         Route::Monitoring => html! { <Monitoring /> },
         Route::Overlay => html! { <OverlayPage /> },
         Route::Maintenance => html! { <Maintenance /> },
@@ -214,6 +227,7 @@ fn shell() -> Html {
                                   title="scoped to the active project">{ "project" }</span>
                             <NavItem to={Route::Sites} label="Sites" />
                             <NavItem to={Route::Functions} label="Functions" />
+                            <NavItem to={Route::Graphql} label="GraphQL" />
                             <span class="mx-2 h-5 w-px bg-slate-200" aria-hidden="true"></span>
                             <span class="mr-0.5 text-[11px] uppercase tracking-wide text-slate-500"
                                   title="node-global — not scoped to a project">{ "node" }</span>
@@ -255,13 +269,30 @@ fn nav_item(props: &NavItemProps) -> Html {
     let active = use_route::<Route>()
         .as_ref()
         .is_some_and(|r| nav_group(r) == nav_group(&props.to));
+    // yew-router's `Link` forwards no ARIA attributes, so mark the active route for
+    // assistive tech by setting `aria-current="page"` on the rendered anchor itself
+    // (the highlight is otherwise colour-only).
+    let anchor_ref = use_node_ref();
+    {
+        let anchor_ref = anchor_ref.clone();
+        use_effect_with(active, move |active| {
+            if let Some(el) = anchor_ref.cast::<web_sys::Element>() {
+                if *active {
+                    let _ = el.set_attribute("aria-current", "page");
+                } else {
+                    let _ = el.remove_attribute("aria-current");
+                }
+            }
+            || ()
+        });
+    }
     let class = if active {
         "rounded-md bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-900"
     } else {
         "rounded-md px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
     };
     html! {
-        <Link<Route> to={props.to.clone()} classes={classes!(class)}>
+        <Link<Route> to={props.to.clone()} classes={classes!(class)} anchor_ref={anchor_ref}>
             { props.label.clone() }
         </Link<Route>>
     }

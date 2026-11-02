@@ -5988,3 +5988,347 @@ async fn project_export_libsql_true_delta_chain_and_crafted_escape_gate() {
 
     println!("PROJECT EXPORT LIBSQL TRUE-DELTA CHAIN OK");
 }
+
+/// **Live clone self-provision on a Shared tenant** (PLAN-clone-self-provision-managed-db;
+/// Tier-2 / nightly — needs a Docker daemon AND a Postgres server whose DSN user can `CREATE
+/// ROLE`/`CREATE DATABASE`). Self-skips.
+///
+/// Reproduces construens's exact clone failure shape and proves the fix end-to-end through the
+/// REAL `NodeProjectExport` driver (not a hand-rolled SQL reproduction, like the other
+/// `_chunked_shadow_live` tests): ONE Shared Postgres server is ALREADY up and serving an
+/// EXISTING tenant (`src`, provisioned + seeded through the shipped `provision_tenant` path,
+/// exactly as a real project would be) when a clone targets a BRAND-NEW tenant project
+/// (`fresh`) whose own database was NEVER provisioned on that already-healthy server —
+/// construens's "database … does not exist" readiness-probe failure, reached via the SAME
+/// sidecar `restore_member` arm a Shared binding's FULL dump always takes (`plan_export` frames
+/// a Shared managed pg dump non-chunked). Before the fix, `driver.import(.., apply: true, ..)`
+/// fails exactly that way; with the fix it self-provisions `fresh`'s own database first, so the
+/// clone succeeds and the restored row matches the source.
+///
+/// Also proves, in the SAME run (the tenancy-gate + idempotency discipline):
+/// - **Target-scoped only**: a THIRD, pre-existing tenant (`other`) is seeded and verified
+///   UNCHANGED after the clone into `fresh` — self-provisioning `fresh` must never create,
+///   touch, or affect `other`'s database.
+/// - **Idempotent**: importing the SAME bundle into the now-provisioned `fresh` AGAIN
+///   (`overwrite: true`) succeeds with no clobber/error — a retry-safe re-provision.
+#[tokio::test]
+async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
+    use async_trait::async_trait;
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live clone self-provision not run)");
+        return;
+    };
+    let Some((superuser, su_password, host, port, maint_db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live clone self-provision not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "clonesp";
+    let s = now_suffix();
+    let src_project = format!("clonesp-src-{s}");
+    let fresh_project = format!("clonesp-fresh-{s}");
+    let other_project = format!("clonesp-other-{s}");
+
+    let maint = conn(&superuser, &su_password, &host, port, &maint_db);
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "SHOW server_version_num; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("version maps to a client image");
+
+    // --- control plane: MemoryKv + a throwaway FsStorage-backed DeployStore + a reversible
+    // test envelope (mirrors `repair_reconcile_pg_live.rs`'s established live-gate fixture). ---
+    struct RevEnvelope;
+    #[async_trait]
+    impl KeyEnvelope for RevEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(&self, w: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-clone-selfprov-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+    // Pre-seal the SUPERUSER credential under the SAME key `provision_shared` + the server-init
+    // env injector read — `(DEFAULT_PROJECT, COMPUTE)` — to the test URL's ACTUAL password (a
+    // plain `.password()` would mint a random one the real server would reject).
+    let sealed_su = envelope
+        .wrap(su_password.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+
+    // Seed ONE healthy, ALREADY-Provisioned replica of the `pg` workload pointing at the test
+    // Postgres — "the shared server is already up," exactly construens's shape. No container is
+    // launched; the resolver just needs a healthy endpoint in the deploy store.
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+
+    let db_name = |project: &str| tenant_db_name(DATABASE, &sanitize_ident(project));
+    let direct = |db: &str| conn(&superuser, &su_password, &host, port, db);
+
+    // Teardown any prior run (re-runnable).
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name(p)),
+        )
+        .await;
+    }
+
+    // === Provision + seed the SOURCE and the OTHER (pre-existing sibling) tenant through the
+    // SHIPPED path — exactly as a normal first managed-sql access would. ===
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+    provision_tenant(&deploy, &kv, &envelope, &binding, &other_project, "")
+        .await
+        .expect("provision the pre-existing sibling tenant");
+
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&src_project)),
+        "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (1,'alpha'),(2,'beta');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed source tenant table");
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (99,'untouched');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed the pre-existing sibling tenant");
+    let other_before = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+
+    // --- the driver, wired exactly like the normal serve path (managed pg context). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-clone-selfprov-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-clone-selfprov-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false);
+
+    // === EXPORT the source tenant (FULL) through the driver — a Shared binding frames its pg
+    // dump SIDECAR (non-chunked), the exact member shape `restore_member`'s PgDump arm handles. ===
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(
+                &src_project,
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: false,
+                    transport_key: None,
+                    delta: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("driver export of the source tenant");
+        sink.into_inner()
+    };
+
+    // === IMPORT into the BRAND-NEW `fresh` tenant — construens's exact shape: its own db was
+    // NEVER provisioned on the already-healthy shared server. Before the fix this fails with the
+    // readiness-probe "database … does not exist"; with the fix it self-provisions first. ===
+    let report = {
+        let mut source = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: false, // a genuinely fresh target — no prior data to overlay.
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "clone into a fresh, never-provisioned Shared tenant must now self-provision \
+                 and succeed (construens's failure shape, fixed)",
+            )
+    };
+    assert!(
+        report.pg_databases >= 1,
+        "the clone restored at least one pg database"
+    );
+
+    // ROW equality on the newly self-provisioned target.
+    let got = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&fresh_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        got, "1:alpha\n2:beta",
+        "fresh tenant restored the source's rows"
+    );
+
+    // TENANCY GATE: the pre-existing sibling tenant is byte-for-byte UNCHANGED.
+    let other_after = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        other_after, other_before,
+        "self-provisioning the fresh target must not touch the pre-existing sibling tenant"
+    );
+
+    // IDEMPOTENCY: re-importing the SAME bundle into the now-provisioned `fresh` target is a
+    // clean, no-clobber success (retry-safe).
+    let report2 = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: true, // now has prior data from the first import.
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-importing into an already-provisioned target is idempotent")
+    };
+    assert!(
+        report2.pg_databases >= 1,
+        "the re-import still restored the pg database"
+    );
+    let got_again = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&fresh_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        got_again, "1:alpha\n2:beta",
+        "idempotent re-import — rows unchanged, no clobber"
+    );
+
+    // --- cleanup (best-effort) ---
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name(p)),
+        )
+        .await;
+    }
+
+    println!("PROJECT EXPORT CLONE SELF-PROVISION SHARED TENANT OK");
+}

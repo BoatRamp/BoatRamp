@@ -1081,6 +1081,39 @@ fn readiness_provisioned_backcompat() -> Readiness {
     Readiness::Provisioned
 }
 
+/// Reduce a managed workload's observed replica states to the single most-informative
+/// readiness signal (PLAN-managed-dependency-readiness WS4) — the shared primitive behind
+/// every readiness-polling surface (`db status`'s `database_status`, `OperatorSql::readiness`)
+/// so they report the identical, once-tested semantics instead of each re-deriving it.
+/// Most-informative-wins: a [`ProvisionFailed`](Readiness::ProvisionFailed) (with its reason)
+/// surfaces over a sibling that is merely [`Starting`](Readiness::Starting);
+/// [`Provisioned`](Readiness::Provisioned) means at least one replica is usable. `None` ⇒ no
+/// RUNNING replica recorded (not launched yet, scaled to zero, or registered under a scope the
+/// caller doesn't track) — "pending", distinct from `Starting` (launched but not yet probed).
+pub fn reduce_readiness(states: &[ObservedInstance]) -> Option<Readiness> {
+    let running: Vec<&Readiness> = states
+        .iter()
+        .filter(|s| s.phase == ReplicaPhase::Running)
+        .map(|s| &s.readiness)
+        .collect();
+    if running.is_empty() {
+        return None;
+    }
+    if let Some(reason) = running.iter().find_map(|r| match r {
+        Readiness::ProvisionFailed { reason } => Some(reason.clone()),
+        _ => None,
+    }) {
+        return Some(Readiness::ProvisionFailed { reason });
+    }
+    if running.iter().any(|r| r.is_provisioned()) {
+        return Some(Readiness::Provisioned);
+    }
+    if running.iter().any(|r| r.is_service_ready()) {
+        return Some(Readiness::ServiceReady);
+    }
+    Some(Readiness::Starting)
+}
+
 /// A **read-only** data-dir-ownership health observation for a volume-backed managed
 /// database replica, surfaced by `boatramp db status`.
 ///
@@ -1449,6 +1482,26 @@ pub trait ComputeBindingResolver: Send + Sync {
         bindings: &[ComputeBinding],
     ) -> Vec<(String, String)>;
 
+    /// Like [`resolve`](Self::resolve), but also given the workload's operator-declared
+    /// `env` so a resolver can **render operator templates** against the resolved binding
+    /// (e.g. a managed-DB DSN composed from `{{sql.host}}` / `{{sql.user}}` / … plus
+    /// referenced sealed secrets — all filled SERVER-SIDE at launch). A value it returns
+    /// whose matching `env` entry contains a `{{…}}` placeholder **replaces** that entry
+    /// at launch (see `launch_one`); other returned pairs are injected only when the key
+    /// is absent (a hand-set literal always wins). The default delegates to
+    /// [`resolve`](Self::resolve) (ignores `env`), so a resolver that does no templating —
+    /// every shim — needs no change.
+    async fn resolve_with_env(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        self.resolve(project, workload, replica, bindings).await
+    }
+
     /// Release the shim state for a torn-down replica.
     async fn release(
         &self,
@@ -1498,6 +1551,25 @@ impl ComputeBindingResolver for ChainedBindingResolver {
         let mut env = Vec::new();
         for resolver in &self.resolvers {
             env.extend(resolver.resolve(project, workload, replica, bindings).await);
+        }
+        env
+    }
+
+    async fn resolve_with_env(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        workload_env: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        for resolver in &self.resolvers {
+            env.extend(
+                resolver
+                    .resolve_with_env(project, workload, replica, bindings, workload_env)
+                    .await,
+            );
         }
         env
     }
@@ -2086,7 +2158,14 @@ pub async fn reconcile_once(
                     // the shim token for this replica).
                     let mut launch_env = match resolver {
                         Some(r) if !spec.bindings.is_empty() => {
-                            r.resolve(&project_name, &wl, replica, &spec.bindings).await
+                            r.resolve_with_env(
+                                &project_name,
+                                &wl,
+                                replica,
+                                &spec.bindings,
+                                &spec.env,
+                            )
+                            .await
                         }
                         _ => Vec::new(),
                     };
@@ -2441,11 +2520,27 @@ async fn launch_one(
     let artifact = backend
         .materialize(project, workload, spec, pull_auth)
         .await?;
-    // Fold the resolved binding env into the launched spec. The workload's own env
-    // wins on a collision, so a hand-set value is never clobbered by a binding.
+    // Fold the resolved binding env into the launched spec. A hand-set **literal** always
+    // wins (never clobbered by a binding default) — EXCEPT a value that is an operator
+    // **template** (contains a `{{…}}` placeholder): that is replaced by the resolver's
+    // SERVER-SIDE-rendered value (the filled DSN / unsealed secret), since the raw
+    // template is not what the workload should receive. A key the operator did not set is
+    // injected as the binding default. No pre-existing workload has `{{` in an env value,
+    // so this only activates the new managed-DB templating path.
     let mut spec = spec.clone();
     for (k, v) in extra_env {
-        spec.env.entry(k.clone()).or_insert_with(|| v.clone());
+        match spec.env.get(k) {
+            // Operator templated this var — take the rendered value.
+            Some(existing) if existing.contains("{{") => {
+                spec.env.insert(k.clone(), v.clone());
+            }
+            // Hand-set literal — operator wins, keep it.
+            Some(_) => {}
+            // Unset — inject the binding default.
+            None => {
+                spec.env.insert(k.clone(), v.clone());
+            }
+        }
     }
     // A managed-DB privilege strategy (rootless user / cap allowlist) — launch spec
     // only; never overrides an operator-set `user`/`cap_add`.
@@ -4373,6 +4468,69 @@ mod tests {
                 Err("boom".into())
             }
         }
+    }
+
+    /// `reduce_readiness` (PLAN-managed-dependency-readiness WS4) — the shared reduction
+    /// behind every readiness-polling surface. No RUNNING replica at all ⇒ `None` ("pending"),
+    /// distinct from an actually-`Starting` one.
+    #[test]
+    fn reduce_readiness_no_running_replica_is_pending() {
+        assert_eq!(reduce_readiness(&[]), None);
+        assert_eq!(reduce_readiness(&[zeroed("pg", 0, 1)]), None);
+    }
+
+    #[test]
+    fn reduce_readiness_starting_replica_reports_starting() {
+        let mut s = observed("pg", 0, 1, false);
+        s.readiness = Readiness::Starting;
+        assert_eq!(reduce_readiness(&[s]), Some(Readiness::Starting));
+    }
+
+    #[test]
+    fn reduce_readiness_provisioned_wins_over_a_starting_sibling() {
+        let mut starting = observed("pg", 0, 1, false);
+        starting.readiness = Readiness::Starting;
+        let mut provisioned = observed("pg", 1, 1, true);
+        provisioned.readiness = Readiness::Provisioned;
+        assert_eq!(
+            reduce_readiness(&[starting, provisioned]),
+            Some(Readiness::Provisioned)
+        );
+    }
+
+    #[test]
+    fn reduce_readiness_service_ready_without_provisioned() {
+        let mut s = observed("pg", 0, 1, false);
+        s.readiness = Readiness::ServiceReady;
+        assert_eq!(reduce_readiness(&[s]), Some(Readiness::ServiceReady));
+    }
+
+    /// A `ProvisionFailed` reason is the most actionable signal, so it surfaces even when a
+    /// sibling replica is merely `Starting` — an operator must see the failure, not a vague
+    /// "still starting" that buries it.
+    #[test]
+    fn reduce_readiness_provision_failed_wins_and_carries_its_reason() {
+        let mut starting = observed("pg", 0, 1, false);
+        starting.readiness = Readiness::Starting;
+        let mut failed = observed("pg", 1, 1, false);
+        failed.readiness = Readiness::ProvisionFailed {
+            reason: "data-dir ownership mismatch".into(),
+        };
+        assert_eq!(
+            reduce_readiness(&[starting, failed]),
+            Some(Readiness::ProvisionFailed {
+                reason: "data-dir ownership mismatch".into()
+            })
+        );
+    }
+
+    /// A `Zero`-phase (scaled-down) replica is not counted even if its stored readiness were
+    /// stale `Provisioned` — only `Running` replicas are consulted.
+    #[test]
+    fn reduce_readiness_ignores_non_running_phases() {
+        let mut parked = zeroed("pg", 0, 1);
+        parked.readiness = Readiness::Provisioned;
+        assert_eq!(reduce_readiness(&[parked]), None);
     }
 
     #[tokio::test]

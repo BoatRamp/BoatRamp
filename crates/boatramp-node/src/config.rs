@@ -733,7 +733,9 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
     "BOATRAMP_COMPUTE_MESSAGING_SHIM_URL",
+    "BOATRAMP_COMPUTE_KV_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES",
+    "BOATRAMP_COMPUTE_KV_SHIM_MAX_VALUE_BYTES",
     "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
     "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
     "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
@@ -1183,6 +1185,17 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub messaging_shim_url: Option<String>,
+    /// Guest-reachable base URL of the compute **kv-shim** (PLAN-compute-bindings) — e.g.
+    /// `http://10.0.0.1:8084` (the compute bridge gateway) or the docker bridge gateway. Set ⇒ a
+    /// workload's `--bind kv` reaches the SAME per-site `hkv/{qualified-site}/…` key/value
+    /// namespace a `wasi:keyvalue` handler sees, through a listener bound on the **host:port this
+    /// URL names** (the bridge-gateway IP / loopback — NOT all interfaces; the token-gated
+    /// `hkv/{site}/` data plane must not be off-node reachable). `None` (default) ⇒ compute kv
+    /// bindings off. The direct analogue of [`Self::sql_shim_url`] / [`Self::blob_shim_url`] /
+    /// [`Self::messaging_shim_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub kv_shim_url: Option<String>,
     /// Per-object PUT ceiling (bytes) for the compute blob-shim — bounds a single write so a
     /// compromised/buggy workload cannot exhaust node/bucket storage with one unbounded PUT (`413`
     /// on an oversize PUT). `None` (default) ⇒ the shim's built-in default (5 GiB, S3's single-PUT
@@ -1190,6 +1203,13 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub blob_shim_max_object_bytes: Option<u64>,
+    /// Per-value PUT ceiling (bytes) for the compute kv-shim — the direct analogue of
+    /// [`Self::blob_shim_max_object_bytes`], sized for [`boatramp_core::kv::KvStore`]'s "small
+    /// values" (`413` on an oversize PUT). `None` (default) ⇒ the shim's built-in default (1 MiB);
+    /// `Some(0)` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub kv_shim_max_value_bytes: Option<u64>,
     /// Privilege strategy for a managed database's stock image on a shared-kernel
     /// backend (see [`ManagedDbPrivilege`]). `rootless` by default.
     #[serde(default)]
@@ -1373,7 +1393,9 @@ impl Default for ComputeConfig {
             sql_shim_url: None,
             blob_shim_url: None,
             messaging_shim_url: None,
+            kv_shim_url: None,
             blob_shim_max_object_bytes: None,
+            kv_shim_max_value_bytes: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),
             dns_upstream: default_dns_upstream(),
@@ -2387,6 +2409,14 @@ pub struct ServeConfig {
     pub http_redirect_addr: Option<SocketAddr>,
     /// Site to serve for a `Host` matching no domain, instead of 404.
     pub default_site: Option<String>,
+    /// `[serve.dns_publish]` — the guest **`dns-publish` WRITE** capability's host-held DNS provider
+    /// (cap-req #24/#25): the config-file analog of `--dns-publish-provider` / `--dns-publish-zone-root`
+    /// (the flag/env win). **Absent (the default) ⇒ no provider is wired ⇒ every guest `dns-publish`
+    /// call fail-closes to `access-denied`** (compiling the capability in grants no one by itself).
+    /// Credentials are NEVER here — they come from the ENVIRONMENT (the "no secrets in config"
+    /// posture), via the SAME per-provider env vars `--acme-dns-provider` reads. See
+    /// `boatramp::dns_publish_serve` and [`DnsPublishServeConfig`].
+    pub dns_publish: Option<DnsPublishServeConfig>,
     /// The fleet's canonical public origin (e.g. `https://cp.example.com`) that a
     /// per-request proof-of-possession must bind to (`aud`). Required for
     /// holder-bound (`cnf`/PoP) tokens to be usable — a proof's origin is compared
@@ -2869,6 +2899,24 @@ pub struct BlobBackendConfig {
     /// `access_key_id` is a public identifier; `secret_access_key` is a `boatramp:`/`env:` **reference**
     /// (never the raw secret in config, invariant 3). Absent ⇒ the ambient AWS env chain.
     pub s3_credential: Option<S3CredentialConfig>,
+}
+
+/// `[serve.dns_publish]` — the guest **`dns-publish` WRITE** capability's host-held DNS provider
+/// (cap-req #24/#25 serve-wiring). The config-file analog of `--dns-publish-provider` /
+/// `--dns-publish-zone-root` (the flag/env override these). **Absent — or `provider` unset — ⇒ no
+/// provider is wired ⇒ every guest `dns-publish` call fail-closes to `access-denied`** (the unchanged
+/// default). Credentials are NEVER stored here (the "no secrets in config" posture) — they come from
+/// the ENVIRONMENT, via the SAME per-provider env vars `--acme-dns-provider` reads. The per-handler
+/// writable-zone allowlist (`dns_publish_zones`) is deploy-record config, not here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsPublishServeConfig {
+    /// Which provider adapter writes guest DNS (`manual` | `cloudflare` | `route53` | `oci` | …, the
+    /// SAME grammar as `--acme-dns-provider`). Absent ⇒ fail-closed (no provider wired).
+    pub provider: Option<String>,
+    /// The authoritative zone apex the provider writes (e.g. `example.com`), passed to the central
+    /// `validate_writable` guardrail so an apex `NS` is refused. Required when `provider` is set.
+    pub zone_root: Option<String>,
 }
 
 /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch

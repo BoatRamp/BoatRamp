@@ -62,6 +62,11 @@ pub mod managed_sql;
 // (it provisions a Postgres/MySQL managed DB).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod managed_db_declare;
+// The compute managed-DB DSN binding resolver (PLAN-compute-managed-db-dsn Phase 1): injects
+// a real `postgres://`/`mysql://` DSN (operator-templatable) into a compute workload bound to
+// a managed co-located pg/mysql database, delegating libsql/external bindings to the sql-shim.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod managed_db_dsn;
 pub mod node;
 /// Pure builders for the Postgres export/import client invocation (argv + `PG*` env);
 /// the credential non-leak rule (password in env, never argv) lives here.

@@ -42,7 +42,7 @@ and `boatramp domain add --provider <name>`.
   API token (`dns.hetzner.com`, `Auth-API-Token`) is decommissioned and no longer
   works. Mint a Cloud API token in the Hetzner Cloud Console
   (project → Security → API tokens). Supported record types include A, AAAA,
-  CNAME, TXT, MX, SRV, CAA, NS, PTR, and HTTPS/SVCB.
+  CNAME, TXT, MX, SRV, CAA, NS, PTR, TLSA, and HTTPS/SVCB.
 
 ## See also
 

@@ -281,3 +281,72 @@ pub struct OverlayService {
     #[serde(default)]
     pub client_auth: String,
 }
+
+// ---- GraphQL registry (the project-level GraphQL section) ------------------
+//
+// The GraphQL admin endpoints are project-owned (rewritten through the active
+// project by the `ApiClient`): `GET /api/graphql/supergraph` (the composed
+// federation summary), and the operation safelist `GET/POST
+// /api/graphql/safelist` + `DELETE …/safelist/{hash}`. All live behind the
+// server's `handlers` feature, so a `404` means "built without handlers" and a
+// `400` on the supergraph means "nothing composed yet". The shapes are defined
+// inline server-side (`graphql_registry::summary_json`, `admin_api`), so they
+// are mirrored here field-for-field (serde-tolerant) rather than imported.
+
+/// `GET /api/graphql/supergraph` — the composed supergraph **summary** for the
+/// active project (server: `graphql_registry::summary_json`). Not the full SDL:
+/// the registered subgraphs, the federated entities (key + resolving
+/// subgraphs), and the root `Query`/`Mutation` fields mapped to their owning
+/// subgraph. Drives the read-only subgraph / federation view.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct SupergraphSummary {
+    /// The names of the registered subgraphs composed into this supergraph.
+    #[serde(default)]
+    pub subgraphs: Vec<String>,
+    /// The federated entity types, keyed by type name.
+    #[serde(default)]
+    pub entities: std::collections::BTreeMap<String, SupergraphEntity>,
+    /// Root `Query` fields → the subgraph that owns each.
+    #[serde(default, rename = "rootQuery")]
+    pub root_query: std::collections::BTreeMap<String, String>,
+    /// Root `Mutation` fields → the subgraph that owns each.
+    #[serde(default, rename = "rootMutation")]
+    pub root_mutation: std::collections::BTreeMap<String, String>,
+}
+
+/// One federated entity in a [`SupergraphSummary`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct SupergraphEntity {
+    /// The entity's `@key` fields (the federation join key).
+    #[serde(default)]
+    pub key: String,
+    /// The subgraphs that resolve this entity.
+    #[serde(default)]
+    pub subgraphs: Vec<String>,
+}
+
+/// One row of `GET /api/graphql/safelist` — a trusted (persisted) operation and
+/// its sha256-hex hash (server: `{ hash, query }`). The hash is the `{hash}`
+/// path segment the DELETE removes.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SafelistOp {
+    /// The operation's sha256-hex hash (the delete key + the `run-persisted` hash).
+    pub hash: String,
+    /// The full GraphQL operation text.
+    pub query: String,
+}
+
+/// Body of `POST /api/graphql/safelist` — register a trusted operation by its
+/// text (server: `SafelistEntry { query }`); the response is `{ hash }`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterSafelistOp {
+    /// The GraphQL operation text to safelist.
+    pub query: String,
+}
+
+/// Response of `POST /api/graphql/safelist` — the registered operation's hash.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SafelistHash {
+    /// The sha256-hex hash the operation registered to.
+    pub hash: String,
+}

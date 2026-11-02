@@ -1766,6 +1766,43 @@ pub trait OperatorSql: Send + Sync {
     /// the reachable-but-not-served signature). Never runs a query or presents a
     /// credential; it only opens (and immediately drops) a TCP connection.
     async fn ping(&self, project: &str, db: &str) -> Result<Vec<SqlPingReplica>, SqlError>;
+
+    /// Report managed database `db`'s **readiness** in `project` — the single
+    /// authoritative signal an operator or migration probe polls to tell "starting" from
+    /// "ready" from "misconfigured" (PLAN-managed-dependency-readiness WS4). Covers
+    /// EITHER a node-static (`[handlers].bindings.sql.databases`) OR a project-declared
+    /// (`db declare`) managed binding — the SAME daemon-wins merge [`ping`](Self::ping)
+    /// uses — so an operator/migration gets one place to poll regardless of which
+    /// configuration surface declared the binding. Reads the SAME stored replica state
+    /// the WS2 serve-time managed-dependency gate is ultimately driven by; never opens a
+    /// connection or runs a query. Backs `GET /api/sql/{db}/status`.
+    async fn readiness(&self, project: &str, db: &str) -> Result<SqlReadiness, SqlError>;
+
+    /// Which of `project`'s managed SQL binding names are backed by compute `workload` —
+    /// the REVERSE of [`readiness`](Self::readiness) (name → workload), used to gate a
+    /// graceful drain before a managed-dependency compute-workload teardown
+    /// (PLAN-managed-dependency-readiness WS5: "drain dependents before tearing down the
+    /// DB"). Covers EITHER a node-static OR a project-declared binding (same merge).
+    /// Empty ⇒ `workload` backs no managed SQL binding in `project` (an ordinary compute
+    /// workload, or a Shared server this project doesn't use) — nothing to drain.
+    async fn dependents_of_workload(
+        &self,
+        project: &str,
+        workload: &str,
+    ) -> Result<Vec<String>, SqlError>;
+}
+
+/// [`OperatorSql::readiness`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlReadiness {
+    /// A bring-your-own (`url_env`) binding — not compute-backed. WS2 never hard-gates an
+    /// external database (per-DB resilience; invariant 2 of PLAN-managed-dependency-readiness),
+    /// so there is no replica fleet to poll and no readiness verdict to report.
+    NotManaged,
+    /// Compute-backed; the reduced readiness of its replica fleet
+    /// ([`reduce_readiness`](crate::compute::reduce_readiness)). `None` = declared/provisioned
+    /// but no RUNNING replica recorded yet ("pending").
+    Managed(Option<crate::compute::Readiness>),
 }
 
 /// One replica's reachability, returned by [`OperatorSql::ping`].

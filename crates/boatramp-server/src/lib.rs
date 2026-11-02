@@ -46,6 +46,7 @@ pub mod aot;
 #[cfg(feature = "handlers")]
 mod blob_ref;
 pub mod blob_shim;
+pub mod kv_shim;
 pub mod messaging_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
@@ -65,7 +66,7 @@ pub(crate) use admin_api::{
     migrate_dry_run, migrate_status, project_export, project_import, prune_delete, prune_report,
     put_blob, put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
     repair_apply, repair_dry_run, restart_database, rollback_daemon_config, scrub_blobs, set_alias,
-    set_operator_registry_auth, sql_exec, sql_move, sql_ping, sql_query,
+    set_operator_registry_auth, sql_exec, sql_move, sql_ping, sql_query, sql_status,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -1678,6 +1679,18 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn sql_backends(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
         self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
+    /// The node's single control-plane [`KvStore`](boatramp_core::kv::KvStore), if a handler
+    /// runtime is present. Backs the compute kv-shim (PLAN-compute-bindings) so an opaque
+    /// workload reads/writes the SAME per-site `hkv/{qualified-site}/…` namespace — over the
+    /// SAME store — the `wasi:keyvalue` host binding resolves. Unlike [`Self::sql_backends`] /
+    /// [`Self::blob_backends`], there is no per-project provider to look up: every project
+    /// shares this one store, namespaced entirely by key prefix (`inner.kv` is exactly what
+    /// `handler_dispatch`'s `with_keyvalue` passes).
+    #[cfg(feature = "handlers")]
+    pub fn kv(&self) -> Option<Arc<dyn boatramp_core::kv::KvStore>> {
+        self.inner.as_ref().map(|inner| inner.kv.clone())
     }
 
     /// The per-project blob-backend resolver, if a handler runtime is present. Backs the
@@ -9114,6 +9127,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("no secrets → resolves")
@@ -9263,6 +9277,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,

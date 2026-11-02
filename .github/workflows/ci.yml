@@ -27,6 +27,10 @@ name: CI
 #                       assertions of runner CPU), live-gate-dns-publish (a real wasm guest
 #                       publishing DNS through the host `dns-publish` gate into a credential-free
 #                       ManualDnsProvider — the #24 fail-closed proof at the serve seam),
+#                       live-gate-dns-publish-serve-wiring (the #25 fix: the SAME guest through the
+#                       REAL router() pipeline — access-denied with no provider source installed, then
+#                       applied + captured once serve's boot wiring installs it — so the serve seam
+#                       can't regress to inert again),
 #                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
 #                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
 #                       that must never compression-mangle a framed body),
@@ -459,6 +463,28 @@ jobs:
             || { echo "::error::a no_secrets handler no longer resolves ZERO site secrets (Ask B-3 B regressed)" >&2; exit 1; }
           grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
             || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
+
+      # construens #2 — PRE-AUTH TENANT SOURCE e2e GATE (marker `PRE-AUTH TENANT SOURCE OK`). The
+      # `pre_auth_request` tenancy source resolves an UNSCOPED SSO login-start's firm from the request
+      # (host/query/path/body) as a SEAL-ONLY subject so the existing sealed-state mint can seal it —
+      # with NO data access at `/start` (no RLS / tenant-secrets). This real-path gate drives the full
+      # construens RP flow through the REAL Stage-0 resolver: it MUST reproduce today's failing shape
+      # in the INERT arm (an unscoped start resolves no tenant → the mint fails closed → no sealed firm)
+      # AND pass in the WIRED arm (the firm is host-resolved seal-only → the mint seals it → /callback
+      # recovers it). The marker prints ONLY after BOTH arms pass, so a silent skip / `#[cfg]`-out /
+      # rename — or a regression that let the unscoped start resolve a tenant, or let the pre-auth firm
+      # become a data tenant — fails the merge. The `preauth_source` unit tests (each location +
+      # fail-closed + seal-only confinement) run in the same lane.
+      - name: Pre-auth tenant source e2e gate (construens #2 — seal-only firm, fail-closed start)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,mcp,compression,domain-verify-dns --lib \
+            tenant_resolve::preauth -- --nocapture 2>&1 | tee preauth-source.log
+          grep -qE 'test result: ok\. 9 passed' preauth-source.log \
+            || { echo "::error::pre-auth tenant source gate did not run all 9 tests (silent skip, a failure, or a dropped case)" >&2; exit 1; }
+          grep -q 'PRE-AUTH TENANT SOURCE OK' preauth-source.log \
+            || { echo "::error::pre-auth tenant source e2e gate never reached its marker — the unscoped-start-fails-closed / seal-only-start-resolves / callback-recovers flow regressed" >&2; exit 1; }
 
       # v0.29.0 NEGATIVE-CACHE SECRET-SCOPING GATE. `CachedKv` caches an ABSENCE (negative lookup) to
       # kill the ~400 ms-per-serve unset-secret re-read, but ONLY for the secret keyspace — an authz
@@ -1000,6 +1026,41 @@ jobs:
               exit 1
             else
               echo "compute messaging-shim mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
+      # PLAN-compute-bindings COMPUTE KV-SHIM SCOPED GATE (marker `COMPUTE KV-SHIM SCOPED OK`). The
+      # compute kv-shim gives an opaque workload the SAME per-site `hkv/{qualified-site}/{key}`
+      # (default bucket) / `hkv/{qualified-site}/{bucket}/{key}` (named bucket) key/value namespace —
+      # over the SAME `KvStore` — a `wasi:keyvalue` handler sees, scoped by a bearer token the shim
+      # mints (the site is bound by the TOKEN, never a client field). This gate drives the SINGLE
+      # enforced decision `kv_shim::authorize` + `KvShim::authenticate` (the same code every HTTP
+      # method handler calls, so tested == enforced) across the two security dimensions, AND proves
+      # the shared-namespace property by reading a shim PUT back THROUGH the real `wasi:keyvalue`
+      # host binding (and a guest-landed value back through the shim GET). Asserts the marker + pass
+      # count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test re-run under each
+      # `BOATRAMP_COMPUTEKV_MUTATION` neuters ONE check and MUST FAIL — `allow_cross_bucket` (a token
+      # scoped to site A / bucket X reaches a DIFFERENT bucket), `admit_unmatched` (an
+      # unauthenticated/mismatched token is admitted). A pass-under-mutation (a hollow gate) fails
+      # the merge.
+      - name: "compute kv-shim scoped gate (site/bucket-bound, authed; shared namespace)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers compute_kv_shim_scoped_gate -- --nocapture 2>&1 | tee compute-kv-shim.log
+          grep -qE 'test result: ok\. 1 passed' compute-kv-shim.log \
+            || { echo "::error::compute kv-shim gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'COMPUTE KV-SHIM SCOPED OK' compute-kv-shim.log \
+            || { echo "::error::compute kv-shim gate never reached its marker (a token-scope / auth / shared-namespace regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in allow_cross_bucket admit_unmatched; do
+            if BOATRAMP_COMPUTEKV_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server --features handlers compute_kv_shim_scoped_gate \
+              -- --nocapture > "compute-kv-shim-mutation-$mut.log" 2>&1; then
+              echo "::error::compute kv-shim gate is HOLLOW — it passed under mutation '$mut' (a kv-shim scope/auth security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "compute kv-shim mutation verified: '$mut' fails the gate as expected."
             fi
           done
 
@@ -1585,6 +1646,64 @@ jobs:
             || { echo "::error::dns-publish live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
             || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
+
+  # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
+  # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
+  # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
+  # the serve binding seam, so every guest `dns-publish` call fail-closed to `access-denied` in dev AND
+  # prod). THIS gate drives the REAL serving pipeline — `router()` → `serve_sites` → `handler_dispatch`
+  # → `build_handler_bindings` → `maybe_attach` → `provider_source()` — with the real `dns-publish-
+  # writer.wasm` guest, in two arms in ONE process: (1) with NO provider source installed, a granted
+  # in-zone posture-ON write is `access-denied` and NOTHING is captured (the v0.51.0 inert shape,
+  # reproduced live at the serve seam); (2) after `install_provider_source` (the EXACT call
+  # `boatramp serve`'s boot wiring now makes — `boatramp::dns_publish_serve`), the SAME writes are
+  # APPLIED + CAPTURED by a credential-free `ManualDnsProvider` (no secrets — the capture is the
+  # publish-through-serve proof), out-of-zone is `not-authorized`, apex-NS is `apex-refused`. So the
+  # dispatch seam can't silently regress to inert again. `#[ignore]`d (run with `--ignored`); this
+  # dedicated job greps the success marker + pass count so a silent skip / compile-out fails the merge.
+  live-gate-dns-publish-serve-wiring:
+    name: live gate (dns-publish serve wiring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-dns-publish-serve-wiring-musl
+
+      - name: "dns-publish serve-wiring gate (inert access-denied with no source → applied + captured once installed, through router())"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features dns-publish --test dns_publish_serve_wiring_live \
+            -- --ignored --nocapture 2>&1 | tee dns-publish-serve-wiring.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-serve-wiring.log \
+            || { echo "::error::dns-publish serve-wiring gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH SERVE-WIRING OK' dns-publish-serve-wiring.log \
+            || { echo "::error::dns-publish serve-wiring gate never reached its marker (the serve-path provider-source install → maybe_attach → capture seam regressed to inert — cap-req #25)" >&2; exit 1; }
+
+      # SERVE-INSTALL CALL-SITE boot smoke. The gate above proves the install→dispatch→capture seam, but
+      # it installs the provider source itself — it cannot prove `boatramp serve` actually CALLS
+      # install_dns_publish_source at boot, and that one-line call-site is EXACTLY how #24 shipped inert
+      # (the call was missing). This smoke boots the REAL binary with `--dns-publish-provider manual` and
+      # asserts serve emits the install marker `DNS-PUBLISH SERVE-INSTALL CALLED` early in run() (before
+      # the mode fork / store seeding — so it is robust: capture the early stderr line, then kill; never
+      # waits for the full node boot). A lean feature set (fs,slatedb for a bootable store + the wiring)
+      # keeps the binary compile light. Deleting the call line drops the marker ⇒ this step fails.
+      - name: "dns-publish serve-INSTALL boot smoke (serve run() actually CALLS install_dns_publish_source)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --no-default-features --features fs,slatedb,dns-publish,acme-dns \
+            --test dns_publish_serve_install_boot \
+            -- --ignored --nocapture 2>&1 | tee dns-publish-install-boot.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-install-boot.log \
+            || { echo "::error::dns-publish serve-install boot smoke did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH SERVE-INSTALL-BOOT OK' dns-publish-install-boot.log \
+            || { echo "::error::serve did NOT call install_dns_publish_source at boot — the #24 inert-ship call-site regressed (cap-req #25)" >&2; exit 1; }
 
   # PLAN-connect-grpc §9 IU-1 CONNECT-UNARY LIVE GATE (marker `CONNECT UNARY LIVE OK`). The
   # Connect / gRPC-web transport's milestone-1 end-to-end proof: a REAL compiled guest component

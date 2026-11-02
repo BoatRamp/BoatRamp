@@ -514,6 +514,11 @@ pub fn router_with_fast(
         // Active per-replica reachability probe (bypasses the stored-health gate).
         // Same project-owned `sql`-family right (`/api/sql/*` → Project·Deploy).
         .route("/api/sql/{db}/ping", post(sql_ping))
+        // The single authoritative readiness signal (PLAN-managed-dependency-readiness
+        // WS4) — "starting" vs "ready" vs "misconfigured" for EITHER a node-static or a
+        // project-declared managed binding, in the SAME vocabulary `db status` uses.
+        // Same `sql`-family right (`/api/sql/*` → Project·Deploy); GET, read-only.
+        .route("/api/sql/{db}/status", get(sql_status))
         // Owner-gated schema migrations: apply an ordered set / dry-run the plan / read the
         // ledger, run as the project's non-superuser OWNER role. `/api/migrate/*` is gated at
         // `Project·Admin` for the mutating verbs (never the deploy-grade publisher), `Project·Read`

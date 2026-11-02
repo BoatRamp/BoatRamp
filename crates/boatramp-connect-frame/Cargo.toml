@@ -16,18 +16,23 @@
 # gotcha), after which the shim MAY switch its vendored copy to the published dependency.
 [package]
 name = "boatramp-connect-frame"
-version = "0.0.1"
+version.workspace = true
+# Deliberately NOT `edition.workspace` (which is 2024): this crate's SOURCE is vendored
+# byte-identically into the boatramp-uchron-shim repo (the shim-alignment discipline), and edition
+# 2024 enables let-chains, which makes clippy's `collapsible_if` suggest a nested-`if let` rewrite
+# that would mutate the source and desync the vendored copy. Pinned to 2021 like the authored crate.
 edition = "2021"
-# Held out of the crates.io publish until the dedicated Connect/gRPC-web release (the cut is held
-# for the owner's signal). `boatramp-server` only path-depends on it meanwhile; flip this + add it
-# to the publish crate_order when the Connect release is cut.
-publish = false
-license = "Apache-2.0"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
 description = "Connect / gRPC-web wire-framing codec (5-byte length-prefixed envelope + Connect/gRPC-web status vocabulary), shared by the boatramp host serving path and the boatramp-connect guest serving shim. No protobuf runtime; std only."
-repository = "https://git.bytesoba.net/uchron/boatramp"
+repository = "https://github.com/BoatRamp/BoatRamp"
 
 [lib]
 
 [dependencies]
 # Deliberately none: the codec is pure bytes. Keeping it dependency-free is what lets the host
 # depend on it without feature entanglement and the shim vendor it unchanged.
+
+# NB: no `[lints] workspace = true`. This crate's SOURCE is vendored byte-identically into the
+# boatramp-uchron-shim repo (the shim-alignment discipline); opting into the host workspace's
+# idiomaticity lints (use_self, ...) would force source rewrites that desync that vendored copy.

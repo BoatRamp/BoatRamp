@@ -206,6 +206,9 @@ Matched after redirects, before static lookup. See
 | `env` | map\<string, string\> | `{}` | Static environment variables. **Never secrets** — a credential-shaped value is rejected at validate; use `[handlers].secrets` in `boatramp.cfg` for those. |
 | `invoke_targets` | list\<string\> | `[]` | Function names this handler may call via the `invoke` import — see [invoke_targets](#invoke_targets). |
 | `upload_containers` | list\<string\> | `[]` | Blob containers this handler may mint an S3 upload credential for via a [`blob-upload`](#imports) import — see [upload_containers](#upload_containers). Deny-by-default (empty ⇒ mint nothing). |
+| `egress_allowlist` | list\<string\> | `[]` | `host:port` / `ip:port` / `CIDR:port` targets this handler may dial via the [`wasi:sockets`](#imports) import — see [egress_allowlist](#egress_allowlist). Deny-by-default (empty ⇒ reach nothing). |
+| `dns_publish_zones` | list\<string\> | `[]` | Zone-suffix globs this handler may WRITE DNS records under via the [`dns-publish`](#imports) import — see [dns_publish_zones](#dns_publish_zones). Deny-by-default (empty ⇒ write nothing). |
+| `dns_publish_ns_targets` | list\<string\> | `[]` | Nameserver-target globs a sub-zone `NS` record this handler writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). Only consulted for a non-apex `NS` record when the node posture `guest_dns_publish_ns` is `allowlist`. |
 | `tenancy` | Tenancy? | `None` (inherit site) | Per-handler in-site [tenancy decision](./siteconfig.md#handlerstenancy) for this route, overriding the site-level ceiling. Absent ⇒ inherit the site decision. When present it must **narrow within** the site ceiling — a widening is refused fail-closed at bind. Same canonical RON shape as the site's, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. A `scoped` tenancy may add `exceed_site_ceiling: true` to deliberately **exceed** the ceiling (an authorized [inline exception](../how-to/tenant-isolation.md#an-unscoped-all-route-under-an-own-site-authorized-exception)) — takes effect only when the site sets [`allow_ceiling_exceptions`](./siteconfig.md#handlersallow_ceiling_exceptions) and (for `all`) the operator posture permits cross-tenant; otherwise the deploy is refused with a message naming the route. |
 | `token_claims` | HandlerGraphqlTokenClaims? | `None` (inherit) | Per-handler JWKS/issuer config verifying the app bearer for a `token` tenant source, overriding the site's `[handlers.graphql.data].claims_from_token`. Only consulted when this handler's (or the inherited) `tenancy` names a `token` source. Fields: `issuer`, `jwks_env`/`jwks_url`, optional `audience`. |
 
@@ -231,6 +234,9 @@ rejected at validate.
 | `admin:domains` / `admin:email` / `admin:site` / `admin:secrets` | A guest project-self-config surface via `boatramp:handlers/admin`. Each is a **specific** surface grant (a bare `admin` and `admin:*` are deliberately not accepted — deny-by-default, least-privilege) and is additionally gated by the matching `allow_guest_admin_*` posture knob (all off under `multi-tenant`). |
 | `session` | A duplex/resumable [session](#sessions) route's per-frame session binding. Accepted in `imports` but advertised only when the host is built with the `session` feature (the `requires` ABI gate enforces host support at activation). |
 | `tenancy` | Host-verify a guest-presented token to seal an async-lane producer context (`boatramp:handlers/tenancy` `present-token`). Accepted in `imports` but advertised only when the host is built with the `messaging` feature. |
+| `wasi:sockets` | Host-mediated outbound TCP `connect` (`boatramp:handlers/tcp-egress`) — never a raw socket. Gated by the per-handler [`egress_allowlist`](#egress_allowlist) (empty ⇒ deny-all) **and** the node posture `allow_guest_tcp_egress` (off under `multi-tenant`); the dial is connect-only and still SSRF-floored even against an allowlisted target. Advertised Experimental. |
+| `dns-resolve` | Host-side MX/address resolution (`boatramp:handlers/dns-resolve`, `resolve-mx`/`resolve-addr`) without holding `wasi:sockets`. Gated by the same `allow_guest_tcp_egress` posture as `wasi:sockets`; results are SSRF-floored. Advertised Experimental. |
+| `dns-publish` | Host-side DNS **write** (`boatramp:handlers/dns-publish`) — the guest NAMES a zone/record and the host performs the mutation through a host-held provider credential (the guest never holds a zone-write token). Three-layer fail-closed gate: the node posture `allow_guest_dns_publish` (**off** in every built-in profile), the per-handler [`dns_publish_zones`](#dns_publish_zones) writable-zone allowlist (empty ⇒ deny-all), and a per-invocation rate budget + audit log. A sub-zone `NS` record's target is additionally checked against [`dns_publish_ns_targets`](#dns_publish_ns_targets) when the node posture `guest_dns_publish_ns` is `allowlist`. Advertised Experimental. |
 | `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities (`wasi:logging` messages are captured into the site's logs alongside stdout/stderr). |
 
 The site's [`allow_imports`](./siteconfig.md#handlers) is the allowlist; a
@@ -274,6 +280,43 @@ handlers: [ (route: "/upload", component: "up.wasm", imports: ["blob-upload:writ
 
 See [S3-compatible blob ingress](../how-to/blob-ingress.md).
 
+### `egress_allowlist`
+
+The deny-by-default allowlist of `host:port` / `ip:port` / `CIDR:port` targets this
+handler may `connect` to through the gated [`wasi:sockets`](#imports) import (empty ⇒
+reach nothing). A domain entry is resolved host-side and matched against the resolved
+peer IP; an `ip:port` / `CIDR:port` entry is matched structurally. The gate is
+`connect`-only (never `bind`/`listen`), and even an allowlisted target is still held to
+the SSRF floor unless the posture also allows private egress. Only consulted when
+`imports` contains `wasi:sockets` **and** the node posture `allow_guest_tcp_egress` is on.
+
+```ron
+handlers: [ (route: "/api", component: "api.wasm", imports: ["wasi:sockets"], egress_allowlist: ["db.internal:5432"]) ],
+```
+
+### `dns_publish_zones`
+
+The deny-by-default **writable-zone allowlist** (globs) for the gated
+[`dns-publish`](#imports) capability: the zone suffixes this handler may WRITE DNS
+records under (empty ⇒ write nothing). The allowlist constrains a record's OWN
+name/owner only — an rdata TARGET (a CNAME/MX/SRV/NS exchange/target) may legitimately
+point at another domain and is never constrained by it. Matched case-insensitively
+(exact, `*.suffix` one label, `**.suffix` any depth). Only consulted when `imports`
+contains `dns-publish` **and** the node posture `allow_guest_dns_publish` is on.
+
+```ron
+handlers: [ (route: "/api", component: "api.wasm", imports: ["dns-publish"], dns_publish_zones: ["*.example.com"]) ],
+```
+
+### `dns_publish_ns_targets`
+
+The deny-by-default allowlist (globs) of nameserver targets a **sub-zone `NS`** record
+this handler writes may delegate to — the analog of
+[`dns_publish_zones`](#dns_publish_zones) but for the NS record's rdata TARGET rather
+than its own name. Only consulted when the node posture `guest_dns_publish_ns` is
+`allowlist` and the record is a non-apex `NS`; irrelevant under `none` (all sub-zone NS
+refused) or `any` (all permitted). Does not affect any other record type.
+
 ### `limits` (HandlerLimits)
 
 | Field | Type | Description |
@@ -300,6 +343,9 @@ A component invoked once per message on a topic. See
 | `component` | string | Path to the component `.wasm`. |
 | `imports` | list\<string\> | Requested capabilities. |
 | `upload_containers` | list\<string\> | Blob containers this consumer may mint an S3 upload credential for via a [`blob-upload`](#imports) import — same deny-by-default allowlist and host-forced [`{tenant}` template](#upload_containers) as a handler's. |
+| `egress_allowlist` | list\<string\> | Outbound-TCP targets this consumer may dial via [`wasi:sockets`](#imports) — same deny-by-default [allowlist](#egress_allowlist) as a handler's. |
+| `dns_publish_zones` | list\<string\> | Zone-suffix globs this consumer may WRITE DNS records under via [`dns-publish`](#imports) — same deny-by-default [allowlist](#dns_publish_zones) as a handler's. |
+| `dns_publish_ns_targets` | list\<string\> | Nameserver-target globs a sub-zone `NS` record this consumer writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). |
 | `group` | string | Consumer group. Empty (default) = the competing-consumer **work-queue** (one consumer handles each message); a non-empty name = a durable **fan-out** subscriber that receives *every* message on its own cursor, independent of other groups. |
 | `start` | `latest` \| `earliest` | Where a non-empty `group` starts on first subscription: `latest` (default — only new events) or `earliest` (replay the retained backlog). Ignored for the work-queue. |
 | `tenancy` | Tenancy? | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this consumer's `sql`/`orm` when a drained message is processed — the async-lane analog of a function's tenancy. Typically resolves from the `signed_context` source the producer stamped, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")`. Absent ⇒ *undeclared* (refused under `multi-tenant`, `disabled` under single-tenant/dev). |
@@ -344,6 +390,9 @@ backchannel.
 | `limits` | HandlerLimits | — | Optional resource caps, capped by site config at activation. |
 | `env` | map\<string, string\> | `{}` | Static environment variables (never secrets). |
 | `invoke_targets` | list\<string\> | `[]` | Function names the session may call via `invoke` (same contract as a handler's [`invoke_targets`](#invoke_targets)). |
+| `egress_allowlist` | list\<string\> | `[]` | Outbound-TCP targets the session may dial via [`wasi:sockets`](#imports) — same deny-by-default [allowlist](#egress_allowlist) as a handler's. (Distinct from a `[serve.listeners.<name>]` TCP listener's own `egress_allowlist`, which gates that listener's `promote-connection` escalation instead.) |
+| `dns_publish_zones` | list\<string\> | `[]` | Zone-suffix globs the session may WRITE DNS records under via [`dns-publish`](#imports) — same deny-by-default [allowlist](#dns_publish_zones) as a handler's. |
+| `dns_publish_ns_targets` | list\<string\> | `[]` | Nameserver-target globs a sub-zone `NS` record the session writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). |
 | `tenancy` | Tenancy? | `None` (plain) | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this session's `sql`/`orm`. Resolved once at **open** from the verified source and carried across every re-entry, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. |
 | `token_claims` | HandlerGraphqlTokenClaims? | `None` (inherit) | JWKS/issuer config verifying the app bearer for a `token`-sourced tenant (same as a handler's). |
 

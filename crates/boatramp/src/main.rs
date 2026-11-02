@@ -75,6 +75,9 @@ mod config_cmd;
 mod dlq;
 #[cfg(feature = "acme-dns")]
 mod dns;
+/// Serve-boot install of the guest `dns-publish` (write) provider source (cap-req #25).
+#[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
+mod dns_publish_serve;
 mod domains;
 mod error;
 mod function;

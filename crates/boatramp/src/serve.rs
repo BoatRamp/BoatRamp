@@ -122,6 +122,14 @@ pub enum Error {
     #[cfg(feature = "acme-dns")]
     #[error("unknown --acme-dns-provider {0:?} (expected manual | cloudflare | route53 | oci)")]
     UnknownDnsProvider(String),
+    /// `--dns-publish-provider` set without the required `--dns-publish-zone-root` (cap-req #25).
+    #[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
+    #[error(
+        "--dns-publish-zone-root (BOATRAMP_DNS_PUBLISH_ZONE_ROOT / [serve.dns_publish].zone_root) is \
+         required when --dns-publish-provider is set — it is the authoritative zone apex the guest \
+         dns-publish credential writes (passed to the apex-NS guardrail)"
+    )]
+    DnsPublishNoZoneRoot,
     /// No certificate is available yet — the cluster leader hasn't issued one.
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error("no certificates available yet — awaiting the cluster leader to issue (retry shortly)")]
@@ -532,6 +540,25 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_ACME_DNS_PROVIDER", default_value = "manual")]
     acme_dns_provider: String,
 
+    /// DNS provider backing the guest **`dns-publish` WRITE** capability (cap-req #24/#25) — which
+    /// host-held credential performs a granted guest's DNS mutations. Mirrors `--acme-dns-provider`
+    /// (`manual` | `cloudflare` | `route53` | `oci` | …); **credentials come from the ENVIRONMENT**
+    /// (the same per-provider vars `boatramp dns --help` documents), NEVER the config file. **UNSET
+    /// (the default) ⇒ no provider is wired ⇒ every guest `dns-publish` call fail-closes to
+    /// `access-denied`** — unchanged for an operator who does not opt in. `manual` installs the
+    /// credential-free Manual provider (records/echoes the intended writes) for an offline proof. The
+    /// node posture `allow_guest_dns_publish` (off by default) + a per-handler `dns_publish_zones`
+    /// allowlist still gate every write. Flag/env > `[serve.dns_publish].provider`. (DISTINCT from
+    /// `--acme-dns-provider`, which is the ACME cert-issuance DNS credential, a separate authority.)
+    #[arg(long, env = "BOATRAMP_DNS_PUBLISH_PROVIDER")]
+    dns_publish_provider: Option<String>,
+
+    /// The authoritative zone apex the `--dns-publish-provider` credential writes (e.g.
+    /// `example.com`), passed to the central `validate_writable` guardrail so an apex `NS` is refused.
+    /// **Required when `--dns-publish-provider` is set.** Flag/env > `[serve.dns_publish].zone_root`.
+    #[arg(long, env = "BOATRAMP_DNS_PUBLISH_ZONE_ROOT")]
+    dns_publish_zone_root: Option<String>,
+
     /// With `--tls acme-dns`, also issue a `*.deploy.<domain>` wildcard cert so
     /// the wildcard preview host form gets TLS.
     #[arg(
@@ -547,7 +574,7 @@ pub struct ServeArgs {
     /// the zone before telling the CA to validate. This is a real readiness poll (resolve the record
     /// and confirm the expected value), not a blind sleep — issuance proceeds the moment the record
     /// is live, and only falls back to proceeding-anyway (the CA retries) if this elapses first.
-    #[arg(long, env = "BOATRAMP_ACME_PROPAGATION_WAIT", default_value_t = 15)]
+    #[arg(long, env = "BOATRAMP_ACME_PROPAGATION_WAIT", default_value_t = 45)]
     acme_propagation_wait_secs: u64,
 
     /// DNS-01 only: how often (seconds) to re-check DNS while waiting for the `_acme-challenge` TXT to
@@ -558,6 +585,28 @@ pub struct ServeArgs {
         default_value_t = 2
     )]
     acme_propagation_poll_interval_secs: u64,
+
+    /// `--tls acme-dns` only: point every site's **verified custom domains**
+    /// (`domain add`/`domain verify`-attached hosts; never the `*.deploy.<host>`
+    /// preview wildcard, which is managed by the ACME-DNS setup above) at this
+    /// address, kept converged by a leader-gated background reconcile
+    /// (capability #24 Stage 6). An IPv4/IPv6 literal becomes an A/AAAA record;
+    /// anything else a CNAME (e.g. a load balancer hostname) — the same
+    /// convention as `dns configure-domain --target`. Unset (the default)
+    /// disables the loop entirely; `dns configure-domain` remains the manual,
+    /// one-shot path.
+    #[arg(long, env = "BOATRAMP_DNS_TARGET")]
+    dns_target: Option<String>,
+
+    /// How often the `--dns-target` reconcile loop re-sweeps every site's
+    /// verified custom domains (seconds). Ignored when `--dns-target` is unset.
+    #[arg(long, env = "BOATRAMP_DNS_RECONCILE_TICK", default_value_t = 300)]
+    dns_reconcile_tick_secs: u64,
+
+    /// TTL (seconds) for the A/AAAA/CNAME records the `--dns-target` reconcile
+    /// loop writes. Ignored when `--dns-target` is unset.
+    #[arg(long, env = "BOATRAMP_DNS_RECONCILE_TTL", default_value_t = 300)]
+    dns_reconcile_ttl: u32,
 
     /// Reject blob uploads larger than this many bytes (default: unlimited).
     /// Flag/env > `serve.max_upload_bytes`.
@@ -1408,6 +1457,36 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         let (directory, enroll) = spawn_overlay_roles(config, &serve_cfg).await?;
         options.overlay_directory = directory;
         options.overlay_enroll = enroll;
+    }
+    // cap-req #25 — the dns-publish SERVE-WIRING fix. v0.51.0 shipped the guest `dns-publish` (write)
+    // capability + the 3-layer gate + the 11 provider adapters, but NOTHING installed a provider
+    // source into the serve binding seam (`boatramp_server::dns_publish::install_provider_source`), so
+    // `provider_source()` was always `None`, `maybe_attach` attached no binding, and EVERY guest
+    // `dns-publish` call fail-closed to `access-denied` — in dev AND prod. Install the operator-
+    // configured host-held writer here, mirroring `--acme-dns-provider` (creds from env) and the READ
+    // capability's `dns_resolve_override` install. UNSET (the default) ⇒ nothing wired ⇒ fail-closed
+    // (unchanged). Both serve paths (plain + cluster) reach this before the mode fork, and it is
+    // before any guest invocation. The posture `allow_guest_dns_publish` + the per-handler
+    // `dns_publish_zones` allowlist still gate every write.
+    #[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
+    {
+        let dp_provider = args.dns_publish_provider.clone().or_else(|| {
+            serve_cfg
+                .dns_publish
+                .as_ref()
+                .and_then(|d| d.provider.clone())
+        });
+        let dp_zone_root = args.dns_publish_zone_root.clone().or_else(|| {
+            serve_cfg
+                .dns_publish
+                .as_ref()
+                .and_then(|d| d.zone_root.clone())
+        });
+        crate::dns_publish_serve::install_dns_publish_source(
+            dp_provider.as_deref(),
+            dp_zone_root.as_deref(),
+        )
+        .await?;
     }
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or
@@ -4689,6 +4768,24 @@ async fn serve_cluster_acme_dns(
         });
     }
 
+    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
+    // "unwired core": `plan_reconcile` existed with zero live callers). Leader-gated
+    // with the SAME `is_leader` + provider as the cert renewal above, so only the
+    // Raft leader ever writes a zone — no split-brain double-writes. Opt-in via
+    // `--dns-target`; unset leaves this inert and `dns configure-domain` remains the
+    // manual, one-shot path.
+    if let Some(target) = args.dns_target.as_deref() {
+        crate::acme_dns::spawn_dns_reconcile(
+            deploy.clone(),
+            provider.clone(),
+            args.acme_dns_provider.clone(),
+            crate::dns::parse_target(target),
+            args.dns_reconcile_ttl,
+            is_leader.clone(),
+            Duration::from_secs(args.dns_reconcile_tick_secs),
+        );
+    }
+
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
     #[cfg(feature = "handlers")]
     let scheduler = handlers.spawn_scheduler(deploy.clone());
@@ -4767,9 +4864,10 @@ async fn cluster_refresh_certs(
 /// Parse the `--acme-dns-provider` value into a provider kind, using the
 /// `ValueEnum` spellings + aliases so **every** built-in provider (all ten) is
 /// selectable at serve time — exactly as for the `dns` subcommand (the old
-/// hand-rolled match knew only four).
+/// hand-rolled match knew only four). `pub(crate)` so the `dns-publish` serve-wiring
+/// ([`crate::dns_publish_serve`]) reuses the SAME provider-name grammar (cap-req #25).
 #[cfg(feature = "acme-dns")]
-fn parse_dns_provider(value: &str) -> Result<crate::acme_dns::DnsProviderKind> {
+pub(crate) fn parse_dns_provider(value: &str) -> Result<crate::acme_dns::DnsProviderKind> {
     use clap::ValueEnum;
     crate::acme_dns::DnsProviderKind::from_str(value, true)
         .map_err(|_| Error::UnknownDnsProvider(value.to_string()))
@@ -4878,6 +4976,26 @@ async fn serve_acme_dns(
                 }
             }
         });
+    }
+
+    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
+    // "unwired core": `plan_reconcile` existed with zero live callers). Single-node
+    // is always the sole writer (no cluster, no leader lease to race), so the gate
+    // here is simply `|| true` — the same shape `serve_cluster_acme_dns` gates on its
+    // real `is_leader`. Opt-in via `--dns-target`; unset leaves this inert and `dns
+    // configure-domain` remains the manual, one-shot path.
+    if let Some(target) = args.dns_target.as_deref() {
+        let dns_provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
+            crate::acme_dns::build_provider(kind).await?.into();
+        crate::acme_dns::spawn_dns_reconcile(
+            deploy.clone(),
+            dns_provider,
+            args.acme_dns_provider.clone(),
+            crate::dns::parse_target(target),
+            args.dns_reconcile_ttl,
+            || true,
+            Duration::from_secs(args.dns_reconcile_tick_secs),
+        );
     }
 
     tracing::info!(%addr, domains = ?domains, "serving HTTPS (ACME DNS-01)");

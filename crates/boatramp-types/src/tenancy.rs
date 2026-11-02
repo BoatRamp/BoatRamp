@@ -85,6 +85,53 @@ pub enum TenantSource {
         /// callback; `header` is available for non-redirect flows).
         param: StateParam,
     },
+    /// **Pre-auth request firm selection** (construens #2 — the controlled exception to the
+    /// never-take-the-tenant-from-request-text rule). The archetype: an UNSCOPED SSO login-start
+    /// (`/sso/start?tenant=ten_X`) where the staff member holds no token yet, so the firm (tenant)
+    /// can only ride in the request. This source resolves that firm **host-side** from a configured
+    /// extraction [`location`](PreAuthSelector::location) so the existing `sealed-state` MINT can
+    /// seal it into the OIDC login `state` (which the pre-auth `/sso/callback` later unseals via
+    /// [`SealedState`](Self::SealedState)).
+    ///
+    /// **Seal/scope-ONLY — NEVER a data tenant.** Unlike every other source, a `PreAuthRequest`
+    /// resolution does **not** become a [`ScopeAxis::Tenant`] data fact: it is carried as a
+    /// *seal-only* subject that reaches ONLY the `sealed-state:mint` binding. There is therefore no
+    /// RLS/ORM row access and no `tenant-secrets` read at `/start` — those stay fail-closed until the
+    /// callback unseals the firm (and the external IdP / firm-credentials auth has actually run). The
+    /// request-carried firm is safe BECAUSE the auth is the real gate; this source only selects
+    /// *which* configured firm to seal.
+    ///
+    /// **CLAIMED, not authenticated.** The firm this source resolves is a pre-auth *selection*, not an
+    /// authentication: an UNAUTHENTICATED caller can drive `/sso/start` and obtain a sealed `state`
+    /// for ANY configured firm (that is the whole point — the staff member holds no token yet). The
+    /// sealed firm is therefore a **claimed** tenant, NOT a proven one. Every
+    /// [`SealedState`](Self::SealedState) consumer MUST treat the recovered firm as claimed-only until
+    /// the IdP authorization-code exchange and the PKCE / nonce validation complete at the callback —
+    /// only then is the firm an authenticated identity. This is intrinsic to pre-auth SSO (the firm
+    /// *must* ride in the request before any token exists); it is a documented contract, not a defect,
+    /// and the seal-only confinement above keeps a merely-claimed firm from touching any data before
+    /// the callback proves it.
+    ///
+    /// **Configured-firm, fail-closed.** The extracted selector resolves ONLY to a firm that is a
+    /// provisioned/configured tenant in the project (the host checks a registry — the same
+    /// provisioning signal the `sealed-state` source's defense-in-depth check uses). Unknown /
+    /// missing / malformed / wildcard ⇒ **no** value (fail closed, exactly like an unresolved token):
+    /// the mint then returns `no-resolved-tenant`. The guest-facing outcome is **uniform** across
+    /// every failure (no existence oracle — "unknown firm" and "known firm, other failure" are
+    /// indistinguishable); the host logs the precise reason. **Enumeration-oracle mitigation:** key
+    /// by an OPAQUE per-firm identifier (e.g. `ten_8f3a…`) rather than a guessable slug, so the
+    /// selector space is unguessable — the recommended, documented operator choice.
+    ///
+    /// **Opt-in, sole-source.** A route that declares `PreAuthRequest` must declare it as the ONLY
+    /// source (like `system_when`): a seal-only pre-auth firm must never co-resolve with a real data
+    /// tenant on the same route (which would blur "is this a data invocation or a login-start?").
+    /// Enforced at apply ([`crate::claim_extract::validate_sources`] — actually in `boatramp-core`)
+    /// AND as a runtime backstop in `resolve_from_sources` (fail closed). Off by default: a route
+    /// that does not declare it sees no behavior change.
+    PreAuthRequest {
+        /// Where the firm selector is extracted from, and (for `body`) how the body is parsed.
+        selector: PreAuthSelector,
+    },
     /// Truly anonymous / non-token auth (funnel reads, HMAC webhooks): there is no "own" tenant,
     /// so only the `null`/`all` access modes are meaningful (an "own" mode fails closed).
     #[default]
@@ -114,6 +161,79 @@ pub enum ParamKind {
     Query,
     /// A request header.
     Header,
+}
+
+/// The default body-size cap (bytes) a [`PreAuthSelector`] with `location: body` will buffer + parse.
+/// A login-start POST body (form fields or a small JSON object) is a few hundred bytes; 64 KiB is a
+/// generous ceiling that still bounds the pre-auth work an unauthenticated caller can force. A body
+/// over the configured (or this default) cap fails closed BEFORE parsing. Enforced at the serving
+/// buffer AND re-checked at parse.
+pub const DEFAULT_PREAUTH_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// A hard ceiling on the configurable [`PreAuthSelector::max_body_bytes`] — a config asking for more
+/// is refused at apply, so a misconfigured cap can never let an unauthenticated POST force unbounded
+/// pre-auth buffering.
+pub const PREAUTH_BODY_MAX_BYTES_CEILING: usize = 1024 * 1024;
+
+/// Where a [`TenantSource::PreAuthRequest`] extracts the firm selector — a **fieldless** enum (like
+/// [`ParamKind`]/[`ExtractSyntax`]) so [`PreAuthSelector`] stays a flat, RON↔JSON-bridge-safe struct.
+/// Config spelling: `(location: "query", name: "tenant")`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreAuthLocation {
+    /// The already-verified request **host** (its per-domain context tag) — the STRONGEST signal
+    /// (host-stamped at routing, never a client header). Reuses the [`Domain`](TenantSource::Domain)
+    /// source's resolved context; `name` is ignored.
+    Host,
+    /// A URL **query** parameter (`?<name>=<firm>`) — the construens `/sso/start?tenant=ten_X` case.
+    /// Extracted from the already-parsed request query string.
+    Query,
+    /// A URL **path** segment named `name` — extracted from the already-parsed request path. A
+    /// `name` matching a `{name}`-style route variable, else the first path segment equal to `name`'s
+    /// position is not inferred: the extractor treats `name` as a literal segment *label* preceding
+    /// the firm segment (see the resolver), keeping it unambiguous.
+    Path,
+    /// A request **body** field `name` (the AWS-IAM-style credentials-against-the-firm POST). Parsed
+    /// host-side at the tenancy stage with content-type dispatch (`x-www-form-urlencoded` + JSON), a
+    /// body-size cap, and malformed ⇒ fail-closed. Confined to this opt-in pre-auth route — it never
+    /// touches the per-tenant serving hot path.
+    Body,
+}
+
+/// How a [`TenantSource::PreAuthRequest`] source extracts its firm selector. A **flat struct** (a
+/// fieldless [`PreAuthLocation`] + a `name` + optional body knobs) so it round-trips cleanly through
+/// the RON↔JSON `ron::Value` bridge ([`de_opt_tenancy`]), mirroring [`StateParam`]/[`ClaimExtract`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreAuthSelector {
+    /// Where the selector is read from.
+    pub location: PreAuthLocation,
+    /// The query param / path-segment label / body field name the firm selector is read from (e.g.
+    /// `tenant`). Ignored for [`PreAuthLocation::Host`] (the whole host context is the selector).
+    pub name: String,
+    /// For [`PreAuthLocation::Body`]: the accepted request content-types (substring-matched against
+    /// the `Content-Type` header), each dispatching a parser — `application/x-www-form-urlencoded`
+    /// and `application/json` are understood. Empty ⇒ the two understood defaults. A content-type
+    /// that matches none understood ⇒ fail closed. Elided when empty (byte-identical round-trip).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_types: Vec<String>,
+    /// For [`PreAuthLocation::Body`]: the body-size cap (bytes). Absent ⇒
+    /// [`DEFAULT_PREAUTH_BODY_MAX_BYTES`]; a value over [`PREAUTH_BODY_MAX_BYTES_CEILING`] is refused
+    /// at apply. A body over the effective cap fails closed before parsing. Elided when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+}
+
+impl PreAuthSelector {
+    /// The effective body-size cap: the configured [`max_body_bytes`](Self::max_body_bytes), else
+    /// [`DEFAULT_PREAUTH_BODY_MAX_BYTES`], clamped to [`PREAUTH_BODY_MAX_BYTES_CEILING`] (defense in
+    /// depth — a config that bypassed apply-time validation still cannot force unbounded buffering).
+    #[must_use]
+    pub fn effective_body_cap(&self) -> usize {
+        self.max_body_bytes
+            .unwrap_or(DEFAULT_PREAUTH_BODY_MAX_BYTES)
+            .min(PREAUTH_BODY_MAX_BYTES_CEILING)
+    }
 }
 
 fn default_tid_claim() -> String {
@@ -670,6 +790,30 @@ impl Tenancy {
     /// built-once binding. `false` for `Target`/`Disabled`.
     pub fn declares_signed_context(&self) -> bool {
         matches!(self, Self::Scoped { sources, .. } if sources.contains(&TenantSource::SignedContext))
+    }
+
+    /// The [`TenantSource::PreAuthRequest`] selector this (own) decision declares, if any (construens
+    /// #2). `PreAuthRequest` is a **sole source** (enforced at apply + a runtime backstop), so this
+    /// returns the selector of the single declared `PreAuthRequest`, or `None` for every other route.
+    /// Used by the serving path to decide whether a pre-auth firm extraction is wired for this route
+    /// (and, for `location: body`, whether to conditionally buffer the request body).
+    pub fn preauth_request_source(&self) -> Option<&PreAuthSelector> {
+        match self {
+            Self::Scoped { sources, .. } => sources.iter().find_map(|s| match s {
+                TenantSource::PreAuthRequest { selector } => Some(selector),
+                _ => None,
+            }),
+            Self::Disabled | Self::Target { .. } => None,
+        }
+    }
+
+    /// Whether this (own) decision declares a [`TenantSource::PreAuthRequest`] with
+    /// [`PreAuthLocation::Body`] — the single signal the serving path uses to decide whether to
+    /// conditionally buffer + parse the request body at the tenancy stage (so the body parse NEVER
+    /// touches a route that did not opt into it).
+    pub fn declares_preauth_body(&self) -> bool {
+        self.preauth_request_source()
+            .is_some_and(|s| matches!(s.location, PreAuthLocation::Body))
     }
 
     /// Whether `self` (a **per-component** decision, e.g. a per-handler tenancy) stays **within**
@@ -1966,5 +2110,78 @@ mod tests {
         assert_eq!(disabled.tenancy, Some(Tenancy::Disabled));
         let absent: W = ron_opts.from_str(r#"()"#).expect("absent parses");
         assert_eq!(absent.tenancy, None);
+    }
+
+    /// construens #2: the `pre_auth_request` source (its nested `selector` struct — a fieldless
+    /// location + name + optional body knobs) round-trips through the RON↔JSON bridge from BOTH the
+    /// RON apply.cfg spelling and the byte-identical control-plane JSON — the construens `/sso/start`
+    /// `query` case and the AWS-IAM-style `body` case.
+    #[test]
+    fn de_opt_tenancy_bridges_pre_auth_request() {
+        use serde::Deserialize;
+        #[derive(Debug, Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "de_opt_tenancy")]
+            tenancy: Option<Tenancy>,
+        }
+        let ron_opts = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
+
+        // construens `/sso/start?tenant=ten_X` — the `query` location.
+        let q_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id",
+                    sources: [(kind: "pre_auth_request",
+                        selector: (location: "query", name: "tenant"))],
+                    read: "none", write: "none"))"#,
+            )
+            .expect("pre_auth_request query RON parses via the bridge");
+        let q_json: W = serde_json::from_str(
+            r#"{"tenancy":{"mode":"scoped","column":"tenant_id",
+                "sources":[{"kind":"pre_auth_request",
+                    "selector":{"location":"query","name":"tenant"}}],
+                "read":"none","write":"none"}}"#,
+        )
+        .expect("pre_auth_request query JSON parses via the bridge");
+        assert_eq!(q_ron.tenancy, q_json.tenancy);
+        match q_ron.tenancy.unwrap() {
+            Tenancy::Scoped { sources, .. } => assert_eq!(
+                sources,
+                vec![TenantSource::PreAuthRequest {
+                    selector: PreAuthSelector {
+                        location: PreAuthLocation::Query,
+                        name: "tenant".into(),
+                        content_types: Vec::new(),
+                        max_body_bytes: None,
+                    }
+                }]
+            ),
+            other => panic!("expected scoped, got {other:?}"),
+        }
+
+        // The AWS-IAM-style `body` location with content-types + a size cap.
+        let b_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id",
+                    sources: [(kind: "pre_auth_request",
+                        selector: (location: "body", name: "account",
+                            content_types: ["application/json"], max_body_bytes: 8192))],
+                    read: "none", write: "none"))"#,
+            )
+            .expect("pre_auth_request body RON parses via the bridge");
+        match b_ron.tenancy.unwrap() {
+            Tenancy::Scoped { sources, .. } => assert_eq!(
+                sources,
+                vec![TenantSource::PreAuthRequest {
+                    selector: PreAuthSelector {
+                        location: PreAuthLocation::Body,
+                        name: "account".into(),
+                        content_types: vec!["application/json".into()],
+                        max_body_bytes: Some(8192),
+                    }
+                }]
+            ),
+            other => panic!("expected scoped, got {other:?}"),
+        }
     }
 }

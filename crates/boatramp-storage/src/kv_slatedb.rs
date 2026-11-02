@@ -1714,6 +1714,31 @@ mod tests {
         settings
     }
 
+    /// Repair-then-open a LOCAL store with the TEST settings (compactor + GC OFF — see
+    /// [`test_settings`]), driving the SAME WAL-repair + reopen path as
+    /// [`SlateKv::open_local_with_flush_repair`] but WITHOUT the drain-on-`close()` stall. The
+    /// on-disk B-series repair tests `close()` the opened store; under the production
+    /// `settings_with_flush` profile (compactor + GC ON) that `close()` awaits
+    /// `shutdown_task(COMPACTOR)` then `shutdown_task(GC)` and can STALL on a loaded CI host —
+    /// the exact kv_slatedb close/reopen flake `test_settings` exists to kill. The WAL tail
+    /// repair runs BEFORE `Db::builder().build()` and is independent of the compactor/GC
+    /// options, so the recovery + loud-error assertions are unchanged. `repair = None` is the
+    /// plain default cold open (still fails LOUD on a torn trailing tail).
+    async fn open_local_repair_test(
+        dir: impl AsRef<Path>,
+        repair: Option<RepairMode>,
+    ) -> Result<SlateKv, KvError> {
+        std::fs::create_dir_all(&dir)?;
+        let fs = local_object_store(dir.as_ref())?;
+        SlateKv::open_with_repair(
+            Arc::new(fs),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            repair,
+        )
+        .await
+    }
+
     /// LOCAL diagnostic (serve-latency-floor, Ask B-3): measure the REAL latency of a single SlateDB
     /// `get` of a stable "secret"-like key through the PRODUCTION open path (`Settings::default()` ⇒
     /// compactor + GC on, plus the default 512 MiB foyer block cache that `DbBuilder::new` wires and
@@ -3073,8 +3098,11 @@ mod tests {
             // lands in the reopen's WAL replay range and fails the default open.
             inject_torn_tail(&dir, max_wal_id(&dir) + 1);
 
-            // DEFAULT open (no repair) must FAIL LOUD and name the repair.
-            let msg = match SlateKv::open_local_with_flush(&dir, Duration::from_millis(5)).await {
+            // DEFAULT open (no repair) must FAIL LOUD and name the repair. `repair = None` is the
+            // identical default cold open; compactor + GC OFF (see `open_local_repair_test`) does
+            // not affect torn-tail detection in WAL replay, and keeps this test on the stall-safe
+            // profile shared by the rest of the suite.
+            let msg = match open_local_repair_test(&dir, None).await {
                 Ok(_) => panic!("B1: default cold open MUST fail loud on a torn version-0 tail"),
                 Err(err) => err.to_string(),
             };
@@ -3116,14 +3144,13 @@ mod tests {
             // A torn version-0 tail beyond the readable WAL objects (the trailing tear).
             inject_torn_tail(&dir, max_wal_id(&dir) + 1);
 
-            // Repair-then-open (the `serve --repair-wal` path).
-            let kv = SlateKv::open_local_with_flush_repair(
-                &dir,
-                Duration::from_millis(5),
-                Some(RepairMode::Apply),
-            )
-            .await
-            .expect("B2: repair-then-open must succeed after quarantining the torn trailing tail");
+            // Repair-then-open (the `serve --repair-wal` path). Compactor + GC OFF for the test
+            // open (see `open_local_repair_test`): this test `close()`s the store below, and the
+            // production profile's close-drain is the kv_slatedb stall. The repair runs before
+            // `build()`, so key survival is unaffected.
+            let kv = open_local_repair_test(&dir, Some(RepairMode::Apply))
+                .await
+                .expect("B2: repair-then-open must succeed after quarantining the torn trailing tail");
 
             // EVERY committed key must survive — especially the sealed secret.
             assert_eq!(kv.get("project/acme").await.unwrap(), Some(b"seed".to_vec()));

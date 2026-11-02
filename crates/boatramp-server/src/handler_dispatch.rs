@@ -523,12 +523,62 @@ pub(super) async fn dispatch_handler(
     // Ask B-1: split the opaque `bindings_us` into resolve vs binding-build vs messaging-build.
     let bindings_timing = std::sync::Arc::new(BindingsTiming::default());
     let t_bindings = std::time::Instant::now();
-    // Snapshot the request's query + headers for a `sealed-state` tenancy source (the pre-auth SSO
-    // callback). Owned so it outlives the borrow (the request is consumed into the serve lane below);
-    // the resolver reads the config-named param from it only when the route declares that source.
+    // construens #2: if (and ONLY if) this route declared a `pre_auth_request` source with
+    // `location: body` (the AWS-IAM-style credentials-against-the-firm POST), buffer the request body
+    // HERE — at the tenancy stage — up to the selector's size cap, so the firm field can be parsed
+    // host-side, then put the buffered bytes back on the request so the guest still reads its own
+    // body (the GraphQL-edge precedent above). A route that did NOT opt into a `body` source never
+    // enters this block (`body_cap` is `None`), so the body parse NEVER touches the per-tenant serving
+    // hot path. An over-cap body (or a read error) fails the firm extraction closed (no `PreAuthBody`)
+    // and the guest then sees an empty body (its own credential parse fails) — fail closed end to end.
+    let preauth_body: Option<crate::tenant_resolve::PreAuthBody> = {
+        let body_cap = handler
+            .tenancy
+            .as_ref()
+            .or(site_handlers.tenancy.as_ref())
+            .and_then(|t| t.preauth_request_source())
+            .filter(|s| matches!(s.location, boatramp_core::tenancy::PreAuthLocation::Body))
+            .map(boatramp_core::tenancy::PreAuthSelector::effective_body_cap);
+        if let Some(cap) = body_cap {
+            let content_type = request
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let (mut parts, body) = request.into_parts();
+            match axum::body::to_bytes(body, cap).await {
+                Ok(raw) => {
+                    let bytes = raw.to_vec();
+                    // Put the buffered body back so the guest still receives it (unchanged: the
+                    // success path faithfully restores the original body and its `Content-Length`).
+                    request = Request::from_parts(parts, axum::body::Body::from(raw));
+                    Some(crate::tenant_resolve::PreAuthBody {
+                        content_type,
+                        bytes,
+                    })
+                }
+                Err(_) => {
+                    // The over-cap (or errored) read leaves the guest an EMPTY body, so drop any
+                    // stale `Content-Length` — it described the original, larger body and would
+                    // desync a length-delimited guest read against the now-empty body. Only this
+                    // error arm is touched; the success arm above is left untouched.
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    request = Request::from_parts(parts, axum::body::Body::empty());
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    // Snapshot the request's query + headers + path for the pre-auth tenancy sources (the
+    // `sealed-state` callback and the construens #2 `pre_auth_request` login-start). Owned so it
+    // outlives the borrow (the request is consumed into the serve lane below); the resolver reads the
+    // config-named param/segment only when the route declares that source.
     let state_params = crate::tenant_resolve::HttpStateParams {
         query: request.uri().query().map(str::to_owned),
         headers: request.headers().clone(),
+        path: Some(request.uri().path().to_owned()),
     };
     let bindings = match build_bindings(
         inner,
@@ -576,8 +626,12 @@ pub(super) async fn dispatch_handler(
         Some(blob_timing.clone()),
         // Ask B-1: record the resolve / messaging-build sub-phase µs for the phase log.
         Some(bindings_timing.clone()),
-        // The `sealed-state` source reads the OIDC `state` from this request's query/headers.
+        // The `sealed-state` source reads the OIDC `state` from this request's query/headers; the
+        // construens #2 `pre_auth_request` source reads the firm from query/path/host/body.
         Some(&state_params),
+        // The buffered request body for a `pre_auth_request` `body`-location route (construens #2);
+        // `None` for every route that did not opt into a `body` source.
+        preauth_body.as_ref(),
     )
     .await
     {
@@ -927,6 +981,9 @@ async fn resolve_gateway_caller_facts(
         // The `sealed-state` source resolves on the plain-wasm site-handler path (the pre-auth SSO
         // callback), not the federated `/graphql` gateway edge — fail closed here.
         sealed_state: None,
+        // The construens #2 `pre_auth_request` source resolves on the plain-wasm site-handler path
+        // (the pre-auth SSO login-start), not the federated `/graphql` gateway edge — fail closed.
+        preauth: None,
     };
     // `imports_db = false`: the gateway component itself runs no `orm`/`sql` (it fans out); the
     // "undeclared tenancy refused under strict posture" check applies to a handler that DIRECTLY
@@ -2121,11 +2178,6 @@ impl From<String> for BindingsError {
     }
 }
 
-/// `Retry-After` (seconds) advertised on the readiness-gate `503` — how soon a client / migration
-/// probe should re-poll while a managed database finishes starting. Small: startup is usually a
-/// handful of seconds and the probe is cheap.
-pub(super) const SQL_NOT_READY_RETRY_AFTER_SECS: u32 = 2;
-
 /// Open a granted SQL database for an invocation's bindings, applying a **short bounded readiness
 /// retry**. A host-managed database that is still starting returns
 /// [`SqlError::Unavailable`](boatramp_core::sql::SqlError::Unavailable); a DB that is only a moment
@@ -2326,6 +2378,11 @@ pub(super) async fn build_bindings(
     // with a wired per-tenant secret store (which supplies the `[secrets]` envelope that unseals the
     // token AND the real-tenant registry) to form the resolver's `SealedStateInputs`.
     state_params: Option<&dyn crate::tenant_resolve::RequestParams>,
+    // construens #2: the buffered request body for a `pre_auth_request` `body`-location route. `Some`
+    // ONLY when the route declared a `body` source AND the serving path buffered it; `None` on every
+    // other route/lane (so the `body` extraction fails closed). The body is never buffered — nor this
+    // ever `Some` — for a route that did not opt in (the per-tenant hot-path guarantee).
+    preauth_body: Option<&crate::tenant_resolve::PreAuthBody>,
 ) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -2359,7 +2416,7 @@ pub(super) async fn build_bindings(
                     );
                     return Err(BindingsError::NotReady {
                         detail: format!("database `{name}`: {err}"),
-                        retry_after_secs: SQL_NOT_READY_RETRY_AFTER_SECS,
+                        retry_after_secs: crate::admin_api::SQL_NOT_READY_RETRY_AFTER_SECS,
                     });
                 }
                 Err(err) => {
@@ -2374,7 +2431,12 @@ pub(super) async fn build_bindings(
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
     // Ask B-1: time the resolve block (auth + tenancy-resolve + per-table schema KV load) on its own.
     let t_resolve = std::time::Instant::now();
-    let (handler_caller_tenant, handler_caller_kind, handler_caller_pass) = {
+    let (
+        handler_caller_tenant,
+        handler_caller_kind,
+        handler_caller_pass,
+        handler_caller_preauth_seal,
+    ) = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
         // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets ⇒ it is a tenant-scoped
         // DATA capability like sql/orm, so a blob-importing handler on a multi-tenant posture must
@@ -2594,6 +2656,24 @@ pub(super) async fn build_bindings(
                     }
                     _ => None,
                 };
+                // construens #2 — the `pre_auth_request` source (pre-auth SSO login-start): built
+                // ONLY when the request carried a param/path lookup (HTTP serving lane) AND a
+                // per-tenant secret store is wired — the store is the configured-firm registry (a firm
+                // is "configured" iff provisioned, the SAME `TenantExists` signal sealed-state uses;
+                // checking EXISTENCE is not reading a secret VALUE, so no data access at /start). The
+                // host-resolved `project` scopes the registry check; `domain_context` feeds the `host`
+                // location; `preauth_body` (buffered above, only for a declared `body` route) feeds the
+                // `body` location. Absent the store ⇒ `None` ⇒ the source fails closed.
+                let preauth = match (state_params, ss_store) {
+                    (Some(params), Some(store)) => Some(crate::tenant_resolve::PreAuthInputs {
+                        params,
+                        body: preauth_body,
+                        domain_context,
+                        project: project.as_str(),
+                        registry: &**store,
+                    }),
+                    _ => None,
+                };
                 let inputs = crate::tenant_resolve::TenantSourceInputs {
                     bearer,
                     domain_context,
@@ -2604,6 +2684,7 @@ pub(super) async fn build_bindings(
                     context_anchor: context_anchor.as_ref(),
                     env_source: Some(inner.env_source()),
                     sealed_state,
+                    preauth,
                 };
                 crate::tenant_resolve::resolve_host_tenancy(
                     other,
@@ -2646,12 +2727,20 @@ pub(super) async fn build_bindings(
         let pass_unresolved = tenancy
             .as_ref()
             .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved);
+        // construens #2: carry out the SEAL-ONLY pre-auth firm (if the `pre_auth_request` source
+        // resolved one). It is NOT a data fact — it feeds ONLY the `sealed-state:mint` binding below,
+        // never `tenant-secrets`/blob/RLS (those read `resolved_tenant_string(facts)`, which is `None`
+        // for a seal-only invocation). Read before `tenancy` is consumed by `facts().to_vec()`.
+        let preauth_seal = tenancy
+            .as_ref()
+            .and_then(|h| h.preauth_seal_subject().map(str::to_owned));
         // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
         // inherits it (each fact keeps its axis).
         (
             tenancy.map(|h| h.facts().to_vec()).unwrap_or_default(),
             kind,
             pass_unresolved,
+            preauth_seal,
         )
     };
     if let Some(t) = &bindings_timing {
@@ -2819,11 +2908,20 @@ pub(super) async fn build_bindings(
     // grant (import ∩ site allowlist) AND a wired store (the `[secrets]` substrate). The resolved
     // tenant is the OWN-`Tenant` fact (`None` ⇒ every mint is `no-resolved-tenant`); the site is this
     // invocation's resolved site (`None` ⇒ `no-resolved-site`). The guest never names a tenant.
+    //
+    // construens #2: on an UNSCOPED login-start the OWN-`Tenant` fact is absent (there is no token),
+    // so the mint falls back to the SEAL-ONLY pre-auth firm (`handler_caller_preauth_seal`) resolved
+    // by the `pre_auth_request` source — the ONLY consumer of that seal-only subject. A real own
+    // tenant (an already-authed start) still takes precedence; the two are mutually exclusive in
+    // practice (`pre_auth_request` is sole-source and resolves no `Tenant` fact). This is the single
+    // seam that makes an unscoped start's firm host-resolved so the existing mint can seal it, while
+    // `tenant-secrets`/blob/RLS above stay fail-closed (they read only `resolved_tenant_string`).
     if granted("sealed-state:mint")
         && let Some(store) = inner.tenant_secret_store.get()
     {
         let resolved_tenant =
-            super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant)
+                .or_else(|| handler_caller_preauth_seal.clone());
         bindings = bindings.with_sealed_state_mint(
             store.envelope(),
             project.as_str(),
@@ -3635,6 +3733,8 @@ impl ConsumerRebuild<'_> {
             // Ask B-1 bindings sub-timing is request-lane only; the consumer lane passes None.
             None,
             // The consumer/async lane carries no HTTP request params ⇒ no `sealed-state` source.
+            None,
+            // ...and no buffered request body ⇒ no `pre_auth_request` `body` source (fail closed).
             None,
         )
         .await
@@ -4926,6 +5026,7 @@ mod consumer_dns_resolve_tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,

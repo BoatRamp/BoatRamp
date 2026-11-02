@@ -7,8 +7,138 @@ versions.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.51.0] - 2026-11-02
+
+This release ships five programs in one cut: guest **DNS-publish** (mailroom #24) — the write
+counterpart to `dns-resolve` — across every writable record type behind a three-layer fail-closed
+gate; the **compute kv-shim**, completing `boatramp compute set --bind kv`; a console **GraphQL
+coverage slice** (edge posture, cookie-auth, safelist and federation views — UX + a11y reviewed);
+**managed-dependency readiness** (one authoritative readiness endpoint plus a teardown drain for
+managed-SQL dependents); and a leader-gated, verified-only **auto-DNS reconcile** task that keeps
+custom-domain DNS records converged without a manual `dns configure-domain` step.
+
 ### Added
 
+- **Guest DNS-publish (mailroom #24).** A granted guest can now have the host write DNS records on
+  its behalf — `upsert`/`delete`/`upsert-set`, covering every writable record type
+  (A/AAAA/CNAME/TXT/MX/SRV/CAA/HTTPS/SVCB/NS/PTR/TLSA; SOA, apex-NS, and DNSSEC records remain
+  unrepresentable by construction). No zone-write token ever crosses to the guest — the host performs
+  the mutation through its own `DnsProvider`. Fail-closed three-layer gate: (a) a node posture
+  `allow_guest_dns_publish` (off by default); (b) a per-grant writable-zone allowlist constraining the
+  record's **own name only**, never the rdata target (empty ⇒ deny-all); (c) a store-resident rate
+  budget plus a redacted audit sink — ahead of a central `validate_writable` guardrail (apex-NS
+  refusal, per-provider supported-kind check, malformed-rdata rejection) that runs before any adapter
+  dispatch. A separate operator posture (`allow_guest_dns_publish_ns`: `Any`/`None`/`Allowlist`,
+  fail-closed default `None` on a MultiTenant profile) additionally gates sub-zone NS delegation.
+  `HOST_HANDLERS_VERSION` → `0.12.0`.
+- **Compute kv-shim — `boatramp compute set --bind kv` is now backed.** A native compute workload
+  can now read/write the same key/value entries a wasm handler sees via `wasi:keyvalue`, completing
+  PLAN-compute-bindings' Phase 2 alongside the existing `--bind blob`/`--bind messaging`. The node
+  spawns a kv-shim (`[compute].kv_shim_url`) serving the per-site `hkv/{site}/{key}` (default bucket)
+  and `hkv/{site}/{bucket}/{key}` (named bucket) namespace over the same control-plane `KvStore`
+  through a small HTTP API, with a per-node-secret HMAC token bound to `(project, workload, name,
+  replica)` — the site is carried by the token, never a client field, so cross-site is structural and
+  cross-bucket is rejected for a bucket-pinned token. PUTs are size-capped
+  (`kv_shim_max_value_bytes`, default 1 MiB). Also declares the `invoke` binding kind
+  (compute→function, Phase 3) — parses and round-trips, no shim resolver yet.
+- **Console GraphQL coverage slice.** Per-site edge posture under Handlers (presence + guard-active
+  toggle, max-depth/max-complexity caps, introspection tri-state, persisted-queries/safelist,
+  federation, GraphiQL, endpoint route, and a deny-by-default typed data connector) plus a new
+  project-scoped `/graphql` section (a read-only federation supergraph view; an operation-safelist
+  manager). Rides the existing verbatim `SiteConfig` PUT and the project's GraphQL registry APIs — no
+  new write endpoints. UX + a11y reviewed (both gating reviews returned FIX-THEN-SHIP; all findings
+  closed before ship — including live-region save/error announcements and accessible names on the
+  hand-rolled data-connector inputs).
+- **Managed-dependency readiness.** `GET /api/sql/{db}/status` (`Project·Deploy`) is the single
+  authoritative readiness signal for a managed database binding — covering either a node-static or a
+  project-declared binding — reporting the same `pending`/`starting`/`service_ready`/`provisioned`/
+  `provision_failed` vocabulary as `boatramp db status`, with a `retry_after_secs` hint while not yet
+  usable (a bring-your-own `url_env` binding reports `external`). Deleting a compute workload that
+  other workloads depend on through a managed-SQL binding now **drains** those dependents first —
+  flipping their replicas unhealthy (so the serve-time gate stops granting new connections
+  immediately), waiting a bounded grace period, then proceeding to the delete.
+- **Auto-DNS reconcile.** A leader-gated periodic task (opt-in `--dns-target`; the manual `dns
+  configure-domain` one-shot path is unchanged) diffs each site's verified custom domains against a
+  per-raw-host DNS ledger: it upserts A/AAAA/CNAME records for newly-verified hosts and retracts
+  orphaned ledger entries (a detached host, or a deleted site), re-asserting every host's verification
+  immediately before each upsert (fail-closed if verification is later dropped). A provider/ledger
+  error is logged and retried next tick, never crashes the loop.
+
+### Breaking
+
+- **Hetzner DNS migrated to the Hetzner Cloud API.** The classic `dns.hetzner.com` DNS API is
+  decommissioned (every request now 301-redirects), so the adapter was dead for all record types.
+  `HETZNER_DNS_TOKEN` must now be a **Hetzner Cloud API** bearer token, not the classic DNS token, and
+  `HETZNER_ZONE_ID` is no longer read — the zone is now addressed by its `HETZNER_ZONE` **name**. The
+  migrated adapter also gains HTTPS/SVCB/PTR record support (unavailable on the classic API).
+
+### Changed
+
+- Every genuinely-supporting DNS adapter (Cloudflare, GCP, DNSimple, Akamai, NS1) now advertises
+  HTTPS/SVCB record support, for ACME and DNS-publish callers alike.
+
+### Fixed
+
+- **DNS-publish zone-escape (Security review CRITICAL-1/MEDIUM-2).** The guest-supplied record name
+  was authorized against the writable-zone allowlist via a trim-normalized copy while the **raw**
+  name was dispatched to the provider — a crafted name could be authorized under one zone's glob and
+  dispatched into a different zone's provider path (cross-tenant zone takeover). Fixed by
+  canonicalizing the guest name once and using that single canonical string for both the allowlist
+  check and the dispatched `DnsRecord.name`; the canonicalizer also rejects anything that could escape
+  a URL path segment (`..`, oversized labels, non-LDH characters, control/non-ASCII bytes).
+- **`dns-publish` capability no longer advertised when the feature is compiled out.** It was
+  unconditionally mapped as a `Stable` host capability regardless of the `dns-publish` cargo feature
+  — a fail-open admission gap where a lean host still advertised it and then failed to instantiate a
+  dependent guest. Now advertised, as `Experimental`, iff the feature is actually compiled in.
+- **Auto-DNS reconcile no longer clobbers a verified wildcard's apex.** The reconcile ledger is now
+  keyed per **raw** host (wildcard preserved) rather than per normalized apex, so a wildcard and its
+  apex base are tracked, pointed, and retracted independently instead of collapsing onto one shared
+  record.
+
+## [0.50.0] - 2026-10-31
+
+This release hardens project-clone/export against a real-world failure mode — an aborted clone that
+fail-closed at ~96% on a legacy blob size mismatch — fixes an overlay-tunnel crash, and ships
+multi-arch GHCR images.
+
+### Added
+
+- **Clone/export blob-integrity tooling.** A blob-key integrity classifier (`der`/`base`/`primary`);
+  `--enumerate-mismatches` and `--skip-member-mismatch` (`der/`-scoped by default — `base`/`primary`
+  members still hard-fail) plus a louder `--skip-member-mismatch-any-blob`; `blob verify` now detects
+  a declared-vs-stored **size** mismatch; a guarded `blob reconcile` and `blob purge
+  --legacy-derivatives`.
+- **Multi-arch GHCR images.** `release.yml` now builds and publishes a `linux/amd64` +
+  `linux/arm64` manifest list for the base and cloudflare images.
+- `kubernetes-helm` added to the cluster-bring-up dev shell.
+
+### Fixed
+
+- **Clone/import member-mismatch tolerance.** The atomic bundle reader now tolerates a tolerable
+  (`der/`-scoped) member mismatch instead of failing the whole clone/import late in the transfer; the
+  target-side bundle format version is unchanged, so a v0.50.0 target can still pull from a v0.49.0
+  source.
+- **Overlay-tunnel DoS.** An inbound IPv4 frame with an unspecified (`0.0.0.0`) source could crash the
+  tunnel's smoltcp network stack; such frames are now dropped at ingest (found by the privsep nightly
+  fuzz job).
+
+## [0.49.0] - 2026-10-30
+
+A nine-item slate, built release-ready and cut in one pass: a stateless, sealed pre-auth tenancy
+source for SSO, authenticated private-registry pulls, a new guest TCP session-escalation capability,
+Stage 2 node-health alerting, clone-UX fixes, and a libsql double-free fix.
+
+### Added
+
+- **Sealed-state OIDC tenancy source.** The pre-auth `/sso/callback` tenant is now recovered from an
+  AEAD-sealed `state` token (host-sealed via the secrets-at-rest key envelope, AES-256-GCM) instead of
+  a server-side `pending_sso_login` row — stateless, with the guest `mint` operation host-forced to
+  its own tenant.
+- **Compute registry-auth.** Authenticated pulls from a private container registry: a project
+  `pull_secret` or an operator `[compute].registry_auth`, scoped by repository-path prefix, fail-closed
+  when no secret backend is configured.
 - **Session→connection escalation (`promote-connection`, mailroom cap-req #22).** A `mode =
   "session"` inbound-TCP listener guest may, **after authenticating the connection**, call
   `session::promote-connection(host, port, tls, sni, preamble)` to escalate that one connection out
@@ -26,7 +156,7 @@ versions.
   with the posture on and the SSRF floor applied — so a promote lacking the egress grant, or to an
   un-allowlisted/private upstream, is refused `not-authorized` **before any connect** (no bytes reach
   the upstream) and the session continues in the re-entry model. The persistent splice runs on its
-  **own** budget — a node-global ceiling (`[serve.handlers].max_promoted_splices`, default 4096) plus
+  **own** budget — a node-global ceiling (`[handlers].max_promoted_splices`, default 4096) plus
   a per-listener sub-cap (`[serve.listeners.<name>].max_promoted_splices`, default 256, so one
   listener can't monopolize the node budget on a multi-tenant node), never the session re-entry pool
   or the shared async request lane (the v0.36.0 lane-isolation lesson) — and is torn down
@@ -34,6 +164,180 @@ versions.
   wall-clock step), on `max_conn_duration_ms` (which also bounds the preamble write), or on node
   shutdown. Guest-facing WIT addition (`session.promote-connection`, off-by-default feature-gated in
   `boatramp-uchron-compat`); `HOST_HANDLERS_VERSION` → `0.11.0`.
+- **Node-health alerting, Stage 2.** `node_health` now reports `replicas_unhealthy`; a leader-gated
+  daemon-side `[serve.alerts]` webhook/email notifier.
+- `dns-resolve` dev/test resolver override (mailroom #21 residual) for the consumer-lane DNS seam.
+
+### Changed
+
+- Clone UX: a cheap plan-only dry-run, parallel blob diff, and live apply progress.
+
+### Fixed
+
+- **libsql 0.9.30 → 0.10.0** — picks up the upstream connection double-free-on-drop fix, replacing
+  the v0.48.0 exec-serialization mitigation.
+- `[serve.handlers]` config-path references corrected to `[handlers]` in docs and in a user-facing
+  error string.
+
+### Security
+
+- **Promote-connection (#22) Security review** — strict egress-grant parity with a raw `tcp-egress`
+  dial, a per-listener splice sub-cap, a deadline-bound preamble write, and a monotonic idle watchdog
+  folded in before ship.
+- **Compute registry-auth Security review** — a path-traversal guard and digest-parse hardening folded
+  in on top of the repo-path-prefix scoping.
+- **Node-health alerting Security review** — the alert webhook URL is no longer logged (it can carry a
+  secret), plus a node-local reaper guard.
+- **Sealed-state Security review** — the unseal input is length-capped, plus a KEK-rotation guard.
+
+## [0.48.0] - 2026-10-29
+
+This release adds streaming project-clone and re-gates project export/import to a self-serve project
+permission, alongside an ACME fix and a cryptography migration.
+
+### Added
+
+- **Streaming project-clone.** `boatramp project import --clone-from <source-url>`: a target-driven
+  pull that diffs the source's manifest against the target's own content-addressed store and streams
+  only the missing blobs/members — no staging on either end (closes the env-clone disk-fill that could
+  take a target down on a large clone).
+
+### Changed
+
+- **Project export/import re-gated to `Project·Admin`** on the project (was `System·Admin`) —
+  self-serve, mirroring the new clone surface. (`kv-export`/`kv-import` remain `System·Admin`.)
+- **ES256 COSE/CWT cryptography migrated to p256 0.14 / the RustCrypto-0.14 ecosystem** (boatramp-core
+  + signer fixtures), wire-compatible with the 0.13-ecosystem known-answer vectors.
+
+### Fixed
+
+- **ACME `dns-persist-01` fix.** instant-acme bumped 0.7.2 → 0.8.5, fixing a tokenless
+  `dns-persist-01` serde rejection that could crash-loop a staging certificate renewal.
+- RUSTSEC advisory clearances: tokio 1.54.1, ctutils 0.4.7, aws-sigv4 1.6.4 (removes the last
+  crypto-bigint 0.5.5 source); a justified `deny.toml` ignore added for the 4 unfixable zstd 0.13.3
+  decompress advisories (wasmtime 50 already pins the latest available zstd).
+
+### Security
+
+- **Project-clone Security review Part B** — an SSRF guard on the source-manifest fetch, a bounded
+  manifest size, and re-key hardening, folded in before ship.
+
+## [0.47.0] - 2026-10-28
+
+This release brings up **Hetzner cluster** support (mailroom #11) and completes the **overlay service
+tunneler** (mailroom #3) across all five platforms.
+
+### Added
+
+- **Hetzner cluster bring-up (#11).** `nix/hetzner-k3s.nix` (a prebuilt-binary derivation) + `kubectl`
+  in the dev shell + a cluster-on-Hetzner how-to.
+- **Overlay service tunneler, complete (#3).** R1 SOCKS5 core · R2 Linux TUN front-end · R3 macOS TUN
+  (utun + `/etc/resolver` split-DNS) · R4 Windows (wintun, a hardened NRPT split-DNS path, bundled
+  signed `wintun.dll`) · R5 a SOCKS-codec fuzz target. The release now ships `boatramp.exe` with the
+  `tun,overlay` feature union and a service-tunneler how-to. A signed Windows installer/certificate is
+  deferred.
+
+### Changed
+
+- The release preflight matrix now compiles the exact release-feature-union **Windows** build on
+  `windows-latest`, so a release-only-target break (as in v0.46.0) is caught before the tag, not
+  during the cut.
+
+## [0.46.0] - 2026-10-27
+
+This release completes the **SQL true-delta** export program (mailroom #5) across all three managed-
+SQL engines, adds a managed-database config-restart primitive, and closes a managed-DB volume
+cross-tenant isolation gap.
+
+### Added
+
+- **SQL true-delta export, all three engines.** libsql/SQLite session-changeset capture, Postgres
+  logical-WAL (pgoutput decode, snapshot-pinned base dump, overlap-window proof), and MySQL
+  binlog/GTID capture — each restorable through a multi-delta **chain** restore.
+- **`boatramp db restart`** (`POST /api/databases/{name}/restart`, `Project·Admin`) — a managed-DB
+  config-restart primitive, with opt-in `delta_capture` staging.
+- **Turnkey applied-DB reach.** `sql exec`/`sql query`/`sql migrate` and the sealed owner credential
+  now resolve an APPLIED managed database via `resolve_binding` (with a deploy-store fallback) on an
+  env-configured (turnkey) node, not only a deploy-store-backed one.
+- **`db ensure database`/`db ensure user`/`db drop user`.** Operator CLI surface to provision a
+  managed-DB database or login role ahead of the owning components, including a `--password-secret`
+  bring-your-own option.
+- A configurable SQL-pool warm-floor (`pool_min`) for the external SQL pool and the KV pool.
+- `db status` now surfaces a data-dir-ownership health signal.
+
+### Fixed
+
+- **Managed-DB volume tenant isolation.** A reused co-located managed-DB volume is now scoped per
+  `(project, workload)` — closing a cross-tenant `data`-volume collision — and is mapped to the
+  detected runtime uid rather than chowned, preserving existing data on reuse.
+- A managed DB's init process now launches as its detected runtime uid.
+- **Windows release build break** — the data-dir ownership scan used a Unix-only `MetadataExt` call
+  unconditionally, breaking the Windows release target (not caught by per-push/nightly CI, which don't
+  build Windows); it's now routed through a platform shim.
+- A deterministic-shadow same-db import race that could lose data on import is closed (HIGH).
+
+## [0.45.0] - 2026-10-24
+
+This release lands four mailroom capability requests for TCP listener guests — connection-security
+visibility, per-source-IP admission with PROXY-protocol support, host-mediated outbound TCP egress,
+and a guest-facing DNS resolver — plus the next slice of declarative/operator database provisioning
+and a resumable export/import operator surface.
+
+### Added
+
+- **`tcp-connection-context` TLS-active indicator (mailroom #16).** A TCP listener guest can observe
+  whether its current connection is TLS-secured, flipped live by the STARTTLS pump.
+- **Per-source-IP connection-rate admission + PROXY protocol (mailroom #18).** Host TCP listeners now
+  admit connections through a per-source-IP rate limiter (bounded LRU, IPv6 keyed by /64 prefix) and
+  support PROXY protocol v1/v2 (fail-closed, trusted-CIDR gated, with an explicit
+  `proxy_protocol_trust_any` opt-out).
+- **Host-mediated outbound TCP egress for listener guests (mailroom #19).** A listener guest can
+  request an outbound connection that the host dials and (optionally) TLS-terminates on its behalf —
+  connect-only, SSRF-floored, allowlist-gated; the guest never holds a raw socket.
+- **Guest-facing DNS resolver (mailroom #20).** `dns-resolve` lets a guest resolve a hostname through
+  the host's resolver (hickory), with a per-invocation (and, for session listeners, per-connection)
+  resolve budget, and the same SSRF floor applied to resolved addresses.
+- **Declarative DB provisioning parity.** `databases` joins the project-scoped declarative config
+  families.
+- **Compute readiness lifecycle.** A `ComputeSpec` post-launch action-runner plus a configurable
+  per-surface readiness gate (`Starting` → `ServiceReady` → `Provisioned`), distinct from raw TCP
+  health.
+- **Resumable export/import (T3).** The export/import operator surface now resumes from a per-member
+  object layout instead of restarting a whole bundle transfer.
+
+### Fixed
+
+- wasmtime 50's implicit pre-connect bind on `wasi:sockets` is now permitted (closes a regression
+  introduced by the v0.44.0 engine upgrade).
+
+### Security
+
+- **Per-IP admission bypass (HIGH).** The #18 hardening masked a v4-mapped IPv6 peer
+  (`::ffff:a.b.c.d`) to its /64 prefix, zeroing the v4 bits and collapsing every IPv4 client on a
+  dual-stack `[::]` listener into one bucket — defeating per-IP limiting (and letting one client lock
+  out all IPv4 traffic). Fixed: a v4-mapped address is now unwrapped and keyed as its distinct IPv4
+  /32 before masking.
+
+## [0.44.0] - 2026-10-23
+
+This release upgrades the wasm engine, clears the full RUSTSEC advisory backlog, moves to a newer
+Rust toolchain, and switches release image signing from keyless to key-based.
+
+### Changed
+
+- **wasmtime engine upgraded 30 → 50** — re-ported the engine and bindings onto current main, with a
+  programmatic compile-cache API.
+- **Toolchain bumped to rustc 1.99** (workspace MSRV → 1.97).
+- **Key-based release image signing.** GHCR images are now cosign-signed with a committed public key
+  (`cosign.pub`), verifiable via `cosign verify --key cosign.pub` (previously keyless).
+- Full RUSTSEC advisory remediation (`cargo deny` green) via a batch of dependency currency bumps
+  across the workspace.
+
+### Security
+
+- **Guest `wasi:http` DNS-rebinding TOCTOU.** Guest-facing `wasi:http` egress is now pinned to the
+  DNS-validated IP at connect time, closing a time-of-check/time-of-use window between resolution and
+  connect.
 
 ## [0.43.0] - 2026-10-22
 
