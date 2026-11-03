@@ -25,6 +25,13 @@
 //!    owner (no orphan, no data loss) before the drop.
 //! 5. **Negative control** — a naive role that creates an object as ITSELF CANNOT be dropped:
 //!    `DROP ROLE` is refused. This is the exact hazard the design removes.
+//! 6. **Cross-tenant isolation** — with a SECOND, independent tenant provisioned on the SAME
+//!    engine, tenant A's per-replica dynamic role CANNOT connect to tenant B's database (no
+//!    `CONNECT` grant — B revokes it from `PUBLIC` and admits only B's own roles) and CANNOT
+//!    `SET ROLE` into tenant B's cluster-wide owner (it is not a member). A positive control
+//!    (A's dynamic role on its OWN database) proves the two refusals are non-vacuous. Roles
+//!    are cluster-wide, so this is the managed-DB feature's most-cared property and only a
+//!    ≥2-tenant fixture on a real engine can rule the leak out.
 //!
 //! Requires `BOATRAMP_TEST_PG_URL` = a **superuser** Postgres URL (skips cleanly when unset).
 //! Marked `#[ignore]` (run it explicitly — e.g. on lighthouse — or via the live-pg CI lane,
@@ -53,6 +60,14 @@ const DYN3: &str = "dyn_appdb_d_web_1"; // the escape-safety-net role
 const DYN3_PW: &str = "d3pw";
 const NAIVE: &str = "dyn_naive";
 const NAIVE_PW: &str = "npw";
+// --- STEP 6 (cross-tenant isolation) fixture: a SECOND, independent tenant ---
+const DB_B: &str = "dyn_appdb_b"; // tenant B's own owner-owned database
+const ROLE_B: &str = "dyn_role_b"; // tenant B's runtime login role
+const ROLE_B_PW: &str = "rolepwb";
+const OWNER_B: &str = "dyn_owner_b"; // tenant B's stable owner role
+const OWNER_B_PW: &str = "0wnerpwb";
+const DYN_A: &str = "dyn_appdb_d_web_a"; // a per-replica dynamic role bound to TENANT A
+const DYN_A_PW: &str = "dapw";
 
 /// Rewrite a superuser URL to connect as `user`/`pw` to database `db` (the harness pattern).
 fn as_role(su_url: &str, user: &str, pw: &str, db: &str) -> String {
@@ -102,6 +117,10 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
         format!("DROP ROLE IF EXISTS \"{DYN2}\""),
         format!("DROP ROLE IF EXISTS \"{DYN3}\""),
         format!("DROP ROLE IF EXISTS \"{NAIVE}\""),
+        format!("DROP ROLE IF EXISTS \"{DYN_A}\""),
+        format!("DROP DATABASE IF EXISTS \"{DB_B}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{ROLE_B}\""),
+        format!("DROP ROLE IF EXISTS \"{OWNER_B}\""),
         format!("DROP ROLE IF EXISTS \"{ROLE}\""),
         format!("DROP ROLE IF EXISTS \"{OWNER}\""),
     ] {
@@ -366,11 +385,112 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
         let _ = su_tenant.run_script(&stmt).await;
     }
 
-    // Teardown (best-effort).
+    // =====================================================================
+    // STEP 6: CROSS-TENANT ISOLATION — tenant A's per-replica dynamic role
+    //         cannot reach tenant B. This is the managed-DB feature's
+    //         most-cared property: roles are CLUSTER-WIDE, so a dynamic role
+    //         minted for tenant A must be unable to CONNECT to a second
+    //         tenant's database or escalate (SET ROLE) into its owner. Only a
+    //         ≥2-tenant fixture on a live engine can rule the leak out.
+    //         (Tenant A — DB/ROLE/OWNER — is still live here; STEP 5 dropped
+    //         only dynamic/naive roles; the final teardown drops the tenants.)
+    // =====================================================================
+    // Provision a SECOND, independent tenant on the SAME engine (the ≥2-tenant
+    // fixture): its own owner-owned database + stable owner + runtime role, with
+    // CONNECT revoked from PUBLIC and granted only to tenant B's own two roles.
+    for stmt in provision_ddl(k, DB_B, ROLE_B, ROLE_B_PW, OWNER_B, OWNER_B_PW) {
+        su.run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("provision tenant B `{stmt}`: {e}"));
+    }
+    // Mint a per-replica dynamic role bound to TENANT A (its DB + its stable owner).
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN_A, DYN_A_PW) {
+        su.run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("mint dyn_a `{stmt}`: {e}"));
+    }
+
+    // POSITIVE CONTROL (non-vacuity): DYN_A CAN connect to its OWN tenant-A DB and
+    // run a trivial query — so the negatives below are a genuine CROSS-TENANT
+    // refusal, not a blanket inability of DYN_A to do anything at all.
+    let dyn_a_on_a = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, DYN_A, DYN_A_PW, DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&dyn_a_on_a, "SELECT 1::int").await,
+        "1",
+        "positive control: DYN_A must connect to its OWN DB_A and run a trivial query"
+    );
+    assert_eq!(
+        probe(&dyn_a_on_a, "SELECT session_user::text").await,
+        DYN_A,
+        "positive control: the authenticating session role on DB_A is indeed DYN_A"
+    );
+    eprintln!(
+        "xtenant positive control: DYN_A -> DB_A trivial query OK (session_user = {DYN_A})"
+    );
+
+    // NEGATIVE 3a (LEAK CHECK — cross-tenant CONNECT): DYN_A was granted CONNECT on
+    // DB_A only; tenant B revoked CONNECT from PUBLIC and admitted only B's own
+    // roles. A backend opened as DYN_A against DB_B must therefore FAIL to run any
+    // query. `connect` builds a LAZY pool (no I/O), so force a REAL query — NOT via
+    // the panicking `probe` — and assert the error (connection / permission refused).
+    let dyn_a_on_b = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, DYN_A, DYN_A_PW, DB_B)),
+    );
+    let connect_b_err: String = match dyn_a_on_b {
+        // Lazy pool: build normally succeeds; a refusal surfaces on first query.
+        Ok(be) => match be.run_query("SELECT 1").await {
+            Ok(_) => panic!(
+                "CROSS-TENANT LEAK: DYN_A (tenant A) connected to tenant B's DB and queried it"
+            ),
+            Err(e) => e.to_string(),
+        },
+        // Tolerate an eager-connect build error too (still a fail-closed refusal).
+        Err(e) => e.to_string(),
+    };
+    eprintln!("xtenant negative 3a (DYN_A -> DB_B CONNECT refused): {connect_b_err}");
+
+    // NEGATIVE 3b (LEAK CHECK — cross-tenant role escalation): DYN_A is a member of
+    // tenant A's owner ONLY. Roles are cluster-wide, so connected to its OWN DB_A
+    // (where it legitimately connects) it must NOT be able to `SET ROLE` into tenant
+    // B's owner. Run it in a transaction and assert the error ("permission denied to
+    // set role"); the failed statement aborts the tx, so roll back afterwards.
+    let set_role_b_err: String = {
+        let mut tx = dyn_a_on_a.begin().await.unwrap();
+        let msg = match tx.execute(&format!("SET ROLE \"{OWNER_B}\""), &[]).await {
+            Ok(_) => {
+                let _ = tx.rollback().await;
+                panic!("CROSS-TENANT LEAK: DYN_A was able to SET ROLE into tenant B's owner")
+            }
+            Err(e) => e.to_string(),
+        };
+        let _ = tx.rollback().await;
+        msg
+    };
+    eprintln!("xtenant negative 3b (DYN_A SET ROLE tenant-B owner refused): {set_role_b_err}");
+
+    // Clean up tenant A's dynamic role with the SAME safe drop sequence (it owns
+    // nothing — it operates as the owner), connected to its own tenant DB where the
+    // database-local REASSIGN/DROP OWNED run, so the gate stays re-runnable.
+    for stmt in drop_dynamic_role_ddl(k, DYN_A, OWNER) {
+        su_tenant
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("drop dyn_a `{stmt}`: {e}"));
+    }
+
+    // Teardown (best-effort) — both tenants.
     for stmt in [
         format!("DROP DATABASE IF EXISTS \"{DB}\" WITH (FORCE)"),
+        format!("DROP DATABASE IF EXISTS \"{DB_B}\" WITH (FORCE)"),
         format!("DROP ROLE IF EXISTS \"{ROLE}\""),
         format!("DROP ROLE IF EXISTS \"{OWNER}\""),
+        format!("DROP ROLE IF EXISTS \"{ROLE_B}\""),
+        format!("DROP ROLE IF EXISTS \"{OWNER_B}\""),
     ] {
         let _ = su.run_script(&stmt).await;
     }
