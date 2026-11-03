@@ -4813,9 +4813,9 @@ impl CertRefresh {
         cache: &Path,
     ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
         match self {
-            CertRefresh::Local => obtain_all(domains, base, provider.as_ref(), cache).await,
+            Self::Local => obtain_all(domains, base, provider.as_ref(), cache).await,
             #[cfg(feature = "cluster")]
-            CertRefresh::Replicated {
+            Self::Replicated {
                 cert_store,
                 is_leader,
             } => {
@@ -4828,9 +4828,9 @@ impl CertRefresh {
     /// (`|| true`); a cluster gates on the Raft leader so only one node ever writes a zone.
     fn reconcile_gate(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
         match self {
-            CertRefresh::Local => Arc::new(|| true),
+            Self::Local => Arc::new(|| true),
             #[cfg(feature = "cluster")]
-            CertRefresh::Replicated { is_leader, .. } => is_leader.clone(),
+            Self::Replicated { is_leader, .. } => is_leader.clone(),
         }
     }
 }
