@@ -1840,7 +1840,12 @@ mod tests {
             .attach_verified_domain(proj, &site, "www.deploy.test")
             .await
             .unwrap();
-        // An attached-but-UNVERIFIED name: written so it resolves, never verified.
+        // An attached-but-UNVERIFIED name: written so it resolves, never verified. Use the
+        // COOPERATIVE PUT — the realistic apply/operator/guest whole-config path — so the already
+        // attached+VERIFIED `www.deploy.test` (which this config omits) SURVIVES. A non-cooperative
+        // `set_site_config` here would prune the verified domain's `domain/www.deploy.test` index key,
+        // leaving BOTH hosts unresolvable: the gate would then deny `www` too and issuance would never
+        // run, so the "verified issues / unverified refused" property would go untested.
         let cfg = boatramp_core::config::SiteConfig {
             domains: boatramp_core::config::DomainConfig {
                 primary: Some("evil.deploy.test".to_string()),
@@ -1849,7 +1854,7 @@ mod tests {
             ..Default::default()
         };
         deploy
-            .set_site_config(proj, "storefront", &cfg)
+            .set_site_config_cooperative(proj, "storefront", &cfg)
             .await
             .unwrap();
 
