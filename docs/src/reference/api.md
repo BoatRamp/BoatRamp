@@ -513,7 +513,7 @@ Make-before-break root-key rotation (`auth rotate-root`). Admin-scoped.
 | `PUT` | `/api/auth/root` | Trust a new root anchor (`{ "pubkey": "alg:hex" }`). |
 | `DELETE` | `/api/auth/root/:pubkey` | Retire a root anchor. |
 
-See [Migrate the root key](../how-to/migrate-root-key.md).
+See [Rotate the root key](../how-to/rotate-root-key.md).
 
 ## Certificates & cache
 

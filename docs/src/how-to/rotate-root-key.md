@@ -1,4 +1,6 @@
-# Migrate the root key
+# Rotate the root key
+
+**For: operators**
 
 A cluster **is** its root key, so custody of that key (local ⇄ external
 KMS/HSM/Vault) is a first-class, low-friction operation — you never rebuild the

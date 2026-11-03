@@ -1,5 +1,7 @@
 # Upgrade a store to project scoping
 
+**For: operators**
+
 boatramp 0.2.0 makes [projects](./projects.md) a first-class boundary and **re-keys
 the control-plane store** so every mutable per-name record lives under
 `project/<proj>/…`. A store written by an earlier release must be migrated to the new
