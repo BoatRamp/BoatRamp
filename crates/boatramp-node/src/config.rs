@@ -1137,6 +1137,22 @@ pub struct ComputeConfig {
     #[serde(default = "default_k8s_retain_pvc")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_retain_pvc: bool,
+    /// The name of a pre-existing `kubernetes.io/dockerconfigjson` `Secret` in the serve
+    /// pod's namespace to attach to every launched pod as an `imagePullSecret`, so the
+    /// kubelet can pull an operand/workload image from a PRIVATE registry (Phase 2).
+    /// `None` (default) ⇒ anonymous/public pulls. The secret is managed outside boatramp
+    /// (the backend's least-privilege Role grants no `secrets` verb). Only read by the
+    /// `kubernetes` backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_image_pull_secret: Option<String>,
+    /// The CSI `VolumeSnapshotClass` the Kubernetes backend uses for volume snapshot /
+    /// restore (backup / clone-from-backup). `None` (default) ⇒ snapshot/restore is a
+    /// clean "unsupported" (the cluster's StorageClass CSI driver has no snapshot support,
+    /// or the operator did not opt in). Only read by the `kubernetes` backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_volume_snapshot_class: Option<String>,
     /// Bridge the container veths / VM taps attach to (default `br-boatramp`).
     pub bridge: String,
     /// Guest IP subnet (default `10.0.0.0/24`).
@@ -1414,6 +1430,8 @@ impl Default for ComputeConfig {
             backend: None,
             k8s_storage_class: None,
             k8s_retain_pvc: default_k8s_retain_pvc(),
+            k8s_image_pull_secret: None,
+            k8s_volume_snapshot_class: None,
             bridge: "br-boatramp".to_string(),
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,

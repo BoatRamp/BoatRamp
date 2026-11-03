@@ -228,6 +228,8 @@ pub async fn build_compute(
         match boatramp_k8s::KubernetesBackend::connect(
             cfg.k8s_storage_class.clone(),
             cfg.k8s_retain_pvc,
+            cfg.k8s_image_pull_secret.clone(),
+            cfg.k8s_volume_snapshot_class.clone(),
         )
         .await
         {
