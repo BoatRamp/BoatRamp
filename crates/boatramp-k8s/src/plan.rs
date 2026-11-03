@@ -9,18 +9,19 @@
 
 use std::collections::BTreeMap;
 
-use boatramp_core::compute::{ComputeSpec, RootSource};
-use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+use boatramp_core::compute::{ComputeSpec, RootSource, compute_instance_id};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    Container, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec,
+    PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, TCPSocketAction,
+    TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use serde::{Deserialize, Serialize};
 
 /// The field-manager boatramp applies its compute objects under (server-side apply).
 pub const FIELD_MANAGER: &str = "boatramp-compute";
@@ -82,6 +83,13 @@ pub struct PlanContext {
     /// **default** StorageClass is used (which must itself allow volume expansion — see
     /// [`expandable_storage_class`] for an operator-owned alternative).
     pub storage_class: Option<String>,
+    /// The name of a pre-existing k8s `Secret` of type `kubernetes.io/dockerconfigjson`
+    /// in this namespace to attach to the pod as an `imagePullSecret`, so the kubelet can
+    /// pull the operand image from a PRIVATE registry (Phase 2, item 7). `None` ⇒ an
+    /// anonymous/public pull. Operator-configured (`[compute].k8s_image_pull_secret`); the
+    /// secret itself is managed outside boatramp (never created here — the backend's RBAC
+    /// grants no `secrets` verb).
+    pub image_pull_secret: Option<String>,
 }
 
 /// The typed Kubernetes objects for one managed database — what the backend applies
@@ -195,20 +203,11 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     // The container running the operand image. The shared-kernel backends apply the
     // image filesystem, not its OCI config, so the explicit entrypoint from the spec is
     // the argv the pod runs (`command`), with the port + data mount wired through.
-    let env: Vec<EnvVar> = spec
-        .env
-        .iter()
-        .map(|(k, v)| EnvVar {
-            name: k.clone(),
-            value: Some(v.clone()),
-            ..Default::default()
-        })
-        .collect();
     let container = Container {
         name: "db".to_string(),
         image: Some(image.clone()),
         command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
-        env: (!env.is_empty()).then_some(env),
+        env: env_vars(spec),
         ports: Some(vec![ContainerPort {
             container_port: i32::from(spec.port),
             name: Some("db".to_string()),
@@ -236,16 +235,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     // A numeric `user` (`uid[:gid]`) becomes the pod security context, and `fsGroup`
     // makes the kubelet group-own the mounted PVC to that gid — the k8s-native
     // equivalent of the docker/native pre-chown so a rootless DB can write its data dir.
-    let security_context =
-        spec.user
-            .as_deref()
-            .and_then(parse_uid_gid)
-            .map(|(u, g)| PodSecurityContext {
-                run_as_user: Some(i64::from(u)),
-                run_as_group: Some(i64::from(g)),
-                fs_group: Some(i64::from(g)),
-                ..Default::default()
-            });
+    let security_context = pod_security_context(spec);
 
     let pod_volume = Volume {
         name: volume.name.clone(),
@@ -259,6 +249,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         containers: vec![container],
         volumes: Some(vec![pod_volume]),
         security_context,
+        image_pull_secrets: image_pull_secrets(ctx),
         ..Default::default()
     };
 
@@ -335,6 +326,479 @@ pub fn expandable_storage_class(name: &str, provisioner: &str) -> StorageClass {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: DNS-safe naming
+// ---------------------------------------------------------------------------
+
+/// The maximum length of an RFC 1123 DNS **label** — a Kubernetes object/Service name.
+pub const DNS_LABEL_MAX: usize = 63;
+
+/// Hex-digit width of the collision-resistant hash suffix appended to a shortened /
+/// sanitized name (16 hex = 64 bits of a SHA-256 digest — negligible collision odds for
+/// the handful of objects in one namespace, and stable across runs + binary versions
+/// since SHA-256 is fixed).
+const HASH_SUFFIX_LEN: usize = 16;
+
+/// A stable, collision-resistant short digest of `s` (`HASH_SUFFIX_LEN` lowercase hex
+/// chars of its SHA-256), used to disambiguate a shortened / sanitized object name.
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    let mut hex = hex::encode(digest);
+    hex.truncate(HASH_SUFFIX_LEN);
+    hex
+}
+
+/// Coerce `ident` into a valid RFC 1123 DNS label (a Kubernetes object/Service name),
+/// **deterministically and injectively**.
+///
+/// - An `ident` that is ALREADY a valid label is returned **unchanged** (byte-identical
+///   on the wire): every derived managed-DB workload name (`bramp-db-<digest>`) and any
+///   plain lowercase `[a-z0-9-]` workload passes through untouched, so existing names +
+///   their in-cluster DNS do not move.
+/// - Otherwise the name is sanitized (lowercased; every out-of-charset byte — `_`, `.`,
+///   uppercase, … — folded to `-`; runs of `-` collapsed; trimmed to an alphanumeric
+///   edge) AND a [`short_hash`] of the **original** `ident` is appended, so two distinct
+///   idents that sanitize to the same body can never collide on one k8s object. An
+///   over-long name is truncated to fit the hash within the 63-char label budget.
+///
+/// Total (never fails) and idempotent on an already-valid label.
+pub fn dns_safe_name(ident: &str) -> String {
+    if is_dns1123_label(ident) {
+        return ident.to_string();
+    }
+    // Sanitize to the DNS-label charset.
+    let mut body = String::with_capacity(ident.len());
+    let mut pending_dash = false;
+    for ch in ident.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            if pending_dash && !body.is_empty() {
+                body.push('-');
+            }
+            body.push(c);
+            pending_dash = false;
+        } else {
+            // Defer the separator so a leading / trailing run never produces an edge `-`.
+            pending_dash = true;
+        }
+    }
+    let suffix = short_hash(ident);
+    // Budget the readable body so `<body>-<suffix>` fits a 63-char label.
+    let max_body = DNS_LABEL_MAX - suffix.len() - 1;
+    let mut body: String = body.chars().take(max_body).collect();
+    while body.ends_with('-') {
+        body.pop();
+    }
+    if body.is_empty() {
+        // The ident was entirely out-of-charset: a stable alphanumeric-led name.
+        format!("x-{suffix}")
+    } else {
+        format!("{body}-{suffix}")
+    }
+}
+
+/// The DNS-safe k8s object name for a **generic (stateless) workload** replica — the
+/// Deployment + its routing Service share it, and it is the endpoint host the gateway
+/// routes to. Derived from the project-qualified [`compute_instance_id`] (so two
+/// projects' same-named workloads never collide) through [`dns_safe_name`] (so an
+/// underscore / over-long instance id still names a valid object).
+pub fn workload_object_name(project: &str, workload: &str, replica: u32) -> String {
+    dns_safe_name(&compute_instance_id(project, workload, replica))
+}
+
+// ---------------------------------------------------------------------------
+// Shared pod-spec helpers
+// ---------------------------------------------------------------------------
+
+/// The `imagePullSecrets` for a pod — one [`LocalObjectReference`] naming the configured
+/// pull secret, or `None` for a public/anonymous pull.
+fn image_pull_secrets(ctx: &PlanContext) -> Option<Vec<LocalObjectReference>> {
+    ctx.image_pull_secret
+        .as_ref()
+        .map(|name| vec![LocalObjectReference { name: name.clone() }])
+}
+
+/// The spec's env map as the k8s `EnvVar` list (stable order from the `BTreeMap`).
+fn env_vars(spec: &ComputeSpec) -> Option<Vec<EnvVar>> {
+    let env: Vec<EnvVar> = spec
+        .env
+        .iter()
+        .map(|(k, v)| EnvVar {
+            name: k.clone(),
+            value: Some(v.clone()),
+            ..Default::default()
+        })
+        .collect();
+    (!env.is_empty()).then_some(env)
+}
+
+/// The pod security context derived from a numeric `spec.user` (`uid[:gid]`), or `None`
+/// for an image username / unset (the pod then runs as the image's own user).
+fn pod_security_context(spec: &ComputeSpec) -> Option<PodSecurityContext> {
+    spec.user
+        .as_deref()
+        .and_then(parse_uid_gid)
+        .map(|(u, g)| PodSecurityContext {
+            run_as_user: Some(i64::from(u)),
+            run_as_group: Some(i64::from(g)),
+            fs_group: Some(i64::from(g)),
+            ..Default::default()
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: generic stateless Deployment
+// ---------------------------------------------------------------------------
+
+/// The typed objects for one **generic (stateless) workload** replica: a `Deployment`
+/// (one replica — the boatramp control plane drives per-ordinal launches, same as the
+/// docker/container backends run one container per replica) and a ClusterIP `Service`
+/// fronting it (a stable name/VIP the gateway routes to, since a Deployment's pod IP is
+/// ephemeral). No PVC — a workload that declares volumes takes the stateful
+/// ([`managed_db_plan`]) path instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeploymentPlan {
+    /// The one-replica Deployment running the pulled image.
+    pub deployment: Deployment,
+    /// The ClusterIP Service fronting it (the routable endpoint host).
+    pub service: Service,
+}
+
+/// Build the generic stateless [`DeploymentPlan`]. `ctx.workload` MUST already be the
+/// DNS-safe object name ([`workload_object_name`]). Pure: no I/O. Requires an
+/// [`RootSource::Image`] (the kubelet pulls it) and refuses a volume-bearing spec (that
+/// is the stateful StatefulSet case).
+pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<DeploymentPlan, PlanError> {
+    if !is_dns1123_label(&ctx.workload) {
+        return Err(PlanError::InvalidName(ctx.workload.clone()));
+    }
+    match &spec.root {
+        RootSource::Image(_) => {}
+        RootSource::Tar(_) => return Err(PlanError::NonImageRoot("tar rootfs")),
+        RootSource::Rootfs(_) => return Err(PlanError::NonImageRoot("rootfs image")),
+    }
+    // A stateless Deployment backs no persistent volume — a volume-bearing spec is the
+    // stateful case ([`managed_db_plan`]), routed there by the backend.
+    if !spec.volumes.is_empty() {
+        return Err(PlanError::VolumeCount(spec.volumes.len()));
+    }
+    let image = spec.root.as_str().to_string();
+
+    let container = Container {
+        name: "app".to_string(),
+        image: Some(image),
+        command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
+        env: env_vars(spec),
+        ports: Some(vec![ContainerPort {
+            container_port: i32::from(spec.port),
+            name: Some("app".to_string()),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        }]),
+        // A TCP readiness probe on the app port drives the Deployment's
+        // `availableReplicas` (what `health` reads) off the app actually accepting
+        // connections, not merely the container starting.
+        readiness_probe: Some(Probe {
+            tcp_socket: Some(TCPSocketAction {
+                port: IntOrString::Int(i32::from(spec.port)),
+                ..Default::default()
+            }),
+            period_seconds: Some(10),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let pod = PodSpec {
+        containers: vec![container],
+        security_context: pod_security_context(spec),
+        image_pull_secrets: image_pull_secrets(ctx),
+        ..Default::default()
+    };
+
+    let deployment = Deployment {
+        metadata: object_meta(ctx.workload.clone(), ctx),
+        spec: Some(DeploymentSpec {
+            replicas: Some(1),
+            selector: LabelSelector {
+                match_labels: Some(selector_labels(&ctx.workload)),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(selector_labels(&ctx.workload)),
+                    ..Default::default()
+                }),
+                spec: Some(pod),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let service = Service {
+        metadata: object_meta(ctx.workload.clone(), ctx),
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            selector: Some(selector_labels(&ctx.workload)),
+            ports: Some(vec![ServicePort {
+                name: Some("app".to_string()),
+                port: i32::from(spec.port),
+                target_port: Some(IntOrString::Int(i32::from(spec.port))),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    Ok(DeploymentPlan {
+        deployment,
+        service,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: exec / logs request construction (pure)
+// ---------------------------------------------------------------------------
+
+/// The container name every boatramp pod runs its app under — `db` for a stateful
+/// managed workload, `app` for a generic one. `exec`/`logs` must target it explicitly,
+/// since a pod with a single container still needs the name once sidecars are possible.
+pub fn pod_container_name(stateful: bool) -> &'static str {
+    if stateful { "db" } else { "app" }
+}
+
+/// Build the [`kube::api::AttachParams`] for an `exec` into a workload pod: attach stdout
+/// and stderr always, stdin only when there is input to feed, no TTY (so stdout/stderr
+/// stay separable), targeting the named container.
+pub fn exec_attach_params(container: &str, has_stdin: bool) -> kube::api::AttachParams {
+    let mut ap = kube::api::AttachParams::default()
+        .container(container)
+        .stdin(has_stdin)
+        .stdout(true)
+        .stderr(true)
+        .tty(false);
+    // Roomier internal pipes than the 1 KiB default so a chatty command does not stall
+    // the ws pump between drains (the caller still drains stdout/stderr concurrently).
+    ap.max_stdout_buf_size = Some(64 * 1024);
+    ap.max_stderr_buf_size = Some(64 * 1024);
+    ap.max_stdin_buf_size = Some(64 * 1024);
+    ap
+}
+
+/// Build the [`kube::api::LogParams`] for streaming (or tailing) a workload pod's logs,
+/// targeting the named container. `tail_lines` bounds the backlog (`None` ⇒ from the
+/// container start); `follow` streams new lines as they arrive.
+pub fn log_params(container: &str, follow: bool, tail_lines: Option<i64>) -> kube::api::LogParams {
+    kube::api::LogParams {
+        container: Some(container.to_string()),
+        follow,
+        tail_lines,
+        ..Default::default()
+    }
+}
+
+/// Extract a command's exit code from the Kubernetes `Status` the exec subresource sends
+/// when the remote command finishes (the `k8s-openapi` metav1 `Status` kube's
+/// `AttachedProcess::take_status` yields):
+/// - a `"Success"` status ⇒ `0`;
+/// - a `"Failure"` status carries the real code in a `details.causes[reason="ExitCode"]`
+///   whose `message` is the decimal code (the k8s remotecommand convention) ⇒ that code,
+///   or `1` for a failure with no explicit `ExitCode` cause;
+/// - no status delivered (`None`) ⇒ `0` (the command ran and the channel closed cleanly;
+///   mirrors the docker backend defaulting an unknown status to `0`).
+pub fn exec_exit_code(
+    status: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> i32 {
+    match status {
+        None => 0,
+        Some(s) if s.status.as_deref() == Some("Success") => 0,
+        Some(s) => s
+            .details
+            .as_ref()
+            .and_then(|d| d.causes.as_ref())
+            .and_then(|causes| {
+                causes
+                    .iter()
+                    .find(|c| c.reason.as_deref() == Some("ExitCode"))
+            })
+            .and_then(|c| c.message.as_deref())
+            .and_then(|m| m.parse::<i32>().ok())
+            .unwrap_or(1),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: PVC volume management (listing / removal selectors)
+// ---------------------------------------------------------------------------
+
+/// The label selector every boatramp-managed object carries
+/// (`app.kubernetes.io/managed-by=boatramp`) — the `labelSelector` the backend lists
+/// PVCs (and other managed objects) with, so a listing never sweeps in a foreign PVC.
+pub fn managed_label_selector() -> String {
+    format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")
+}
+
+/// Parse a Kubernetes storage [`Quantity`] (e.g. `"20480Mi"`, `"1Gi"`, `"512M"`,
+/// `"1073741824"`) into bytes, for a `list_volumes` size. Supports the binary (`Ki`/`Mi`/
+/// `Gi`/`Ti`/`Pi`/`Ei`) and decimal (`k`/`M`/`G`/`T`/`P`/`E`) suffixes k8s uses; an
+/// unrecognized form yields `None`. This is the REQUESTED capacity (the PVC's
+/// `resources.requests.storage`), not live usage — the core API exposes no per-PVC
+/// consumed-bytes figure.
+pub fn quantity_to_bytes(q: &str) -> Option<u64> {
+    let q = q.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let (num, mult): (&str, u128) = if let Some(n) = q.strip_suffix("Ki") {
+        (n, 1 << 10)
+    } else if let Some(n) = q.strip_suffix("Mi") {
+        (n, 1 << 20)
+    } else if let Some(n) = q.strip_suffix("Gi") {
+        (n, 1 << 30)
+    } else if let Some(n) = q.strip_suffix("Ti") {
+        (n, 1u128 << 40)
+    } else if let Some(n) = q.strip_suffix("Pi") {
+        (n, 1u128 << 50)
+    } else if let Some(n) = q.strip_suffix("Ei") {
+        (n, 1u128 << 60)
+    } else if let Some(n) = q.strip_suffix('k') {
+        (n, 1_000)
+    } else if let Some(n) = q.strip_suffix('M') {
+        (n, 1_000_000)
+    } else if let Some(n) = q.strip_suffix('G') {
+        (n, 1_000_000_000)
+    } else if let Some(n) = q.strip_suffix('T') {
+        (n, 1_000_000_000_000)
+    } else if let Some(n) = q.strip_suffix('P') {
+        (n, 1_000_000_000_000_000)
+    } else if let Some(n) = q.strip_suffix('E') {
+        (n, 1_000_000_000_000_000_000)
+    } else {
+        (q, 1)
+    };
+    let value: u128 = num.trim().parse().ok()?;
+    u64::try_from(value.saturating_mul(mult)).ok()
+}
+
+/// The workload a managed-DB [`compute_volume_scope`](boatramp_core::compute::compute_volume_scope)
+/// names, for mapping a reaper `remove_scoped_volume(scope)` back to the PVC
+/// (`data-<workload>`). The scope is `<workload>` (default project) or `<project>@<workload>`
+/// (the `@` join is injective + outside the resource-slug charset), so the workload is the
+/// part after any `@`.
+pub fn workload_from_scope(scope: &str) -> &str {
+    match scope.split_once('@') {
+        Some((_project, workload)) => workload,
+        None => scope,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: VolumeSnapshot (CSI) snapshot / restore
+// ---------------------------------------------------------------------------
+
+/// The CSI VolumeSnapshot API group boatramp's snapshot/restore objects live in (a CRD,
+/// not a built-in `k8s-openapi` type — so the objects are modelled here).
+pub const SNAPSHOT_API_GROUP: &str = "snapshot.storage.k8s.io";
+/// The CSI VolumeSnapshot API version.
+pub const SNAPSHOT_API_VERSION: &str = "v1";
+
+/// A CSI `VolumeSnapshot` (`snapshot.storage.k8s.io/v1`) — modelled here because it is a
+/// CRD with no `k8s-openapi` type. Serializes to the exact object the apiserver accepts;
+/// the backend applies it (dynamically) ONLY when a `VolumeSnapshotClass` is configured
+/// and the StorageClass's CSI driver supports snapshots — else snapshot/restore is a
+/// clean "unsupported".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeSnapshot {
+    /// `snapshot.storage.k8s.io/v1`.
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    /// `VolumeSnapshot`.
+    pub kind: String,
+    /// Name + namespace + labels.
+    pub metadata: ObjectMeta,
+    /// The source PVC + the snapshot class.
+    pub spec: VolumeSnapshotSpec,
+}
+
+/// A [`VolumeSnapshot`]'s spec: the source PVC and the class to snapshot it under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeSnapshotSpec {
+    /// What to snapshot (the PVC backing the workload's data).
+    pub source: VolumeSnapshotSource,
+    /// The `VolumeSnapshotClass` (selects the CSI driver's snapshot parameters).
+    #[serde(
+        rename = "volumeSnapshotClassName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub volume_snapshot_class_name: Option<String>,
+}
+
+/// The source of a [`VolumeSnapshot`] — a PVC in the same namespace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeSnapshotSource {
+    /// The name of the PVC to snapshot.
+    #[serde(rename = "persistentVolumeClaimName")]
+    pub persistent_volume_claim_name: String,
+}
+
+/// Build the [`VolumeSnapshot`] object that snapshots `pvc` under `class`, named
+/// `snapshot_name`, in the context's namespace + carrying the managed-by label.
+pub fn volume_snapshot(
+    ctx: &PlanContext,
+    snapshot_name: &str,
+    pvc: &str,
+    class: Option<&str>,
+) -> VolumeSnapshot {
+    VolumeSnapshot {
+        api_version: format!("{SNAPSHOT_API_GROUP}/{SNAPSHOT_API_VERSION}"),
+        kind: "VolumeSnapshot".to_string(),
+        metadata: object_meta(snapshot_name.to_string(), ctx),
+        spec: VolumeSnapshotSpec {
+            source: VolumeSnapshotSource {
+                persistent_volume_claim_name: pvc.to_string(),
+            },
+            volume_snapshot_class_name: class.map(str::to_string),
+        },
+    }
+}
+
+/// Build a `PersistentVolumeClaim` **restored from** a [`VolumeSnapshot`]: a new PVC whose
+/// `spec.dataSource` references the snapshot (the CSI driver rehydrates its contents on
+/// first bind). Sized from `size_mib` (must be ≥ the snapshot's restore size), RWO, on the
+/// configured/default StorageClass — the shape a `db restore`/clone-from-backup binds.
+pub fn restore_pvc_from_snapshot(
+    ctx: &PlanContext,
+    pvc_name: &str,
+    snapshot_name: &str,
+    size_mib: u32,
+) -> PersistentVolumeClaim {
+    PersistentVolumeClaim {
+        metadata: object_meta(pvc_name.to_string(), ctx),
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(format!("{size_mib}Mi")),
+                )])),
+                ..Default::default()
+            }),
+            storage_class_name: ctx.storage_class.clone(),
+            data_source: Some(TypedLocalObjectReference {
+                api_group: Some(SNAPSHOT_API_GROUP.to_string()),
+                kind: "VolumeSnapshot".to_string(),
+                name: snapshot_name.to_string(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Parse a `ComputeSpec.user` (`"uid"` or `"uid:gid"`, numeric) into `(uid, gid)`,
 /// defaulting `gid` to `uid`. `None` for a non-numeric value (an image username) — the
 /// pod then runs as the image's own user (no explicit security context). Mirrors the
@@ -361,6 +825,7 @@ mod tests {
             replica: 0,
             namespace: "boatramp".to_string(),
             storage_class: None,
+            image_pull_secret: None,
         }
     }
 
@@ -590,6 +1055,359 @@ mod tests {
         assert_eq!(
             sc.volume_binding_mode.as_deref(),
             Some("WaitForFirstConsumer")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: imagePullSecrets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_configured_pull_secret_rides_onto_the_statefulset_pod() {
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let mut c = ctx("pg");
+        c.image_pull_secret = Some("ghcr-cred".to_string());
+        let plan = managed_db_plan(&c, &spec).unwrap();
+        let secrets = plan
+            .stateful_set
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .image_pull_secrets
+            .expect("configured pull secret ⇒ imagePullSecrets on the pod");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "ghcr-cred");
+    }
+
+    #[test]
+    fn no_pull_secret_leaves_image_pull_secrets_unset() {
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        assert!(
+            plan.stateful_set
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .image_pull_secrets
+                .is_none(),
+            "no configured pull secret ⇒ an anonymous pull (no imagePullSecrets)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: DNS-safe naming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dns_safe_name_passes_through_an_already_valid_label() {
+        // Already-safe names are byte-identical (stable DNS + no churn).
+        for name in [
+            "pg",
+            "web-0",
+            "bramp-db-abcdef0123456789abcdef012",
+            "acme-web-0",
+        ] {
+            assert_eq!(dns_safe_name(name), name, "{name} should pass through");
+            assert!(is_dns1123_label(&dns_safe_name(name)));
+        }
+    }
+
+    #[test]
+    fn dns_safe_name_sanitizes_and_hash_disambiguates() {
+        // Underscores / uppercase / dots fold to '-', and a hash of the original is
+        // appended so the result is a valid label AND injective under sanitization.
+        let a = dns_safe_name("Acme_Web.0");
+        assert!(is_dns1123_label(&a), "got {a}");
+        assert!(a.starts_with("acme-web-0-"), "sanitized body kept: {a}");
+        // Two idents that sanitize to the SAME body must NOT collide (the hash differs).
+        let x = dns_safe_name("foo_bar");
+        let y = dns_safe_name("foo.bar");
+        assert_ne!(
+            x, y,
+            "distinct idents must map to distinct names: {x} vs {y}"
+        );
+        assert!(is_dns1123_label(&x) && is_dns1123_label(&y));
+        // Deterministic across calls (stable object names across relaunch/upgrade).
+        assert_eq!(dns_safe_name("foo_bar"), x);
+    }
+
+    #[test]
+    fn dns_safe_name_shortens_a_long_ident_within_the_label_budget() {
+        let long = format!("tenant_{}", "x".repeat(200));
+        let name = dns_safe_name(&long);
+        assert!(
+            name.len() <= DNS_LABEL_MAX,
+            "over budget: {} chars",
+            name.len()
+        );
+        assert!(is_dns1123_label(&name), "not a valid label: {name}");
+        // Collision-resistant even after truncation: two long idents sharing a 200-char
+        // prefix but differing at the tail still map to distinct names.
+        let other = format!("tenant_{}y", "x".repeat(199));
+        assert_ne!(dns_safe_name(&long), dns_safe_name(&other));
+    }
+
+    #[test]
+    fn dns_safe_name_handles_an_all_out_of_charset_ident() {
+        let name = dns_safe_name("___...");
+        assert!(is_dns1123_label(&name), "got {name}");
+        assert!(
+            name.starts_with("x-"),
+            "stable alphanumeric-led fallback: {name}"
+        );
+    }
+
+    #[test]
+    fn workload_object_name_is_dns_safe_and_project_qualified() {
+        // Default project keeps the bare instance id (valid label ⇒ unchanged).
+        assert_eq!(workload_object_name("default", "web", 0), "web-0");
+        // A non-default project qualifies it; an underscore workload still yields a label.
+        let n = workload_object_name("acme", "api_v2", 1);
+        assert!(is_dns1123_label(&n), "got {n}");
+        // Distinct projects never collide on one object name.
+        assert_ne!(
+            workload_object_name("acme", "web", 0),
+            workload_object_name("beta", "web", 0)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: generic stateless Deployment
+    // -----------------------------------------------------------------------
+
+    fn generic_spec() -> ComputeSpec {
+        ComputeSpec {
+            version: 1,
+            root: RootSource::Image("ghcr.io/acme/app:1.2".to_string()),
+            kernel: String::new(),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: 256,
+            entrypoint: vec!["/app/server".to_string()],
+            env: BTreeMap::from([("PORT".to_string(), "8080".to_string())]),
+            port: 8080,
+            restart: Default::default(),
+            startup_grace_secs: 30,
+            scale_to_zero: false,
+            volumes: Vec::new(),
+            writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
+            isolation: Default::default(),
+            prefer_backend: None,
+            pull_secret: None,
+            bindings: Vec::new(),
+            post_launch: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deployment_plan_maps_a_stateless_workload_to_a_deployment_and_service() {
+        let mut c = ctx("web-0");
+        c.image_pull_secret = Some("ghcr-cred".to_string());
+        let plan = deployment_plan(&c, &generic_spec()).expect("valid deployment plan");
+
+        let dep = &plan.deployment;
+        assert_eq!(dep.metadata.name.as_deref(), Some("web-0"));
+        assert_eq!(dep.metadata.namespace.as_deref(), Some("boatramp"));
+        let dspec = dep.spec.as_ref().unwrap();
+        assert_eq!(dspec.replicas, Some(1), "one replica per boatramp ordinal");
+        assert_eq!(
+            dspec
+                .selector
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get(WORKLOAD_LABEL)
+                .map(String::as_str),
+            Some("web-0")
+        );
+        let pod = dspec.template.spec.as_ref().unwrap();
+        let container = &pod.containers[0];
+        assert_eq!(container.name, "app");
+        assert_eq!(container.image.as_deref(), Some("ghcr.io/acme/app:1.2"));
+        assert_eq!(container.command.as_ref().unwrap()[0], "/app/server");
+        assert_eq!(container.ports.as_ref().unwrap()[0].container_port, 8080);
+        assert!(container.readiness_probe.is_some());
+        // The configured pull secret rides onto the generic pod too.
+        assert_eq!(
+            pod.image_pull_secrets.as_ref().unwrap()[0].name,
+            "ghcr-cred"
+        );
+
+        // The Service fronts it on the app port (the routable endpoint host).
+        let svc = &plan.service;
+        assert_eq!(svc.metadata.name.as_deref(), Some("web-0"));
+        let svcspec = svc.spec.as_ref().unwrap();
+        assert_eq!(svcspec.type_.as_deref(), Some("ClusterIP"));
+        assert_eq!(svcspec.ports.as_ref().unwrap()[0].port, 8080);
+        assert_eq!(
+            svcspec
+                .selector
+                .as_ref()
+                .unwrap()
+                .get(WORKLOAD_LABEL)
+                .map(String::as_str),
+            Some("web-0")
+        );
+    }
+
+    #[test]
+    fn deployment_plan_refuses_a_volume_bearing_spec() {
+        // A workload that declares a volume is the STATEFUL (StatefulSet) case.
+        let mut spec = generic_spec();
+        spec.volumes.push(boatramp_core::compute::VolumeRef {
+            name: "data".to_string(),
+            mount: "/data".to_string(),
+            size_mib: 1024,
+        });
+        assert!(matches!(
+            deployment_plan(&ctx("web-0"), &spec).unwrap_err(),
+            PlanError::VolumeCount(1)
+        ));
+    }
+
+    #[test]
+    fn deployment_plan_refuses_a_non_image_root() {
+        let mut spec = generic_spec();
+        spec.root = RootSource::Tar("blob".to_string());
+        assert!(matches!(
+            deployment_plan(&ctx("web-0"), &spec).unwrap_err(),
+            PlanError::NonImageRoot(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: exec / logs request construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pod_container_name_matches_the_plan() {
+        assert_eq!(pod_container_name(true), "db");
+        assert_eq!(pod_container_name(false), "app");
+    }
+
+    #[test]
+    fn exec_attach_params_attach_stdin_only_when_feeding_input() {
+        let no_in = exec_attach_params("app", false);
+        assert_eq!(no_in.container.as_deref(), Some("app"));
+        assert!(!no_in.stdin, "no stdin attach without input");
+        assert!(
+            no_in.stdout && no_in.stderr,
+            "stdout+stderr always attached"
+        );
+        assert!(!no_in.tty, "no TTY so stdout/stderr stay separable");
+        let with_in = exec_attach_params("db", true);
+        assert!(with_in.stdin, "stdin attached when input is fed");
+    }
+
+    #[test]
+    fn log_params_target_the_container_and_tail() {
+        let lp = log_params("app", true, Some(200));
+        assert_eq!(lp.container.as_deref(), Some("app"));
+        assert!(lp.follow);
+        assert_eq!(lp.tail_lines, Some(200));
+        let all = log_params("db", false, None);
+        assert!(!all.follow);
+        assert_eq!(all.tail_lines, None, "None ⇒ from the container start");
+    }
+
+    #[test]
+    fn exec_exit_code_reads_the_remotecommand_status() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
+        // Success ⇒ 0.
+        let ok: Status = serde_json::from_value(serde_json::json!({
+            "status": "Success"
+        }))
+        .unwrap();
+        assert_eq!(exec_exit_code(Some(&ok)), 0);
+        // Non-zero exit ⇒ the ExitCode cause's decimal message.
+        let fail: Status = serde_json::from_value(serde_json::json!({
+            "status": "Failure",
+            "reason": "NonZeroExitCode",
+            "details": { "causes": [ { "reason": "ExitCode", "message": "3" } ] }
+        }))
+        .unwrap();
+        assert_eq!(exec_exit_code(Some(&fail)), 3);
+        // Failure with no ExitCode cause ⇒ 1.
+        let bare: Status = serde_json::from_value(serde_json::json!({
+            "status": "Failure"
+        }))
+        .unwrap();
+        assert_eq!(exec_exit_code(Some(&bare)), 1);
+        // No status delivered ⇒ 0 (command ran, channel closed).
+        assert_eq!(exec_exit_code(None), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: PVC listing / removal selectors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn managed_label_selector_scopes_to_boatramp() {
+        assert_eq!(
+            managed_label_selector(),
+            "app.kubernetes.io/managed-by=boatramp"
+        );
+    }
+
+    #[test]
+    fn quantity_to_bytes_parses_binary_and_decimal_suffixes() {
+        assert_eq!(quantity_to_bytes("20480Mi"), Some(20480 * 1024 * 1024));
+        assert_eq!(quantity_to_bytes("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(quantity_to_bytes("512M"), Some(512_000_000));
+        assert_eq!(quantity_to_bytes("1073741824"), Some(1_073_741_824));
+        assert_eq!(quantity_to_bytes("2Ti"), Some(2u64 << 40));
+        assert_eq!(quantity_to_bytes("bogus"), None);
+        assert_eq!(quantity_to_bytes(""), None);
+    }
+
+    #[test]
+    fn workload_from_scope_recovers_the_workload() {
+        // Default-project scope is the bare workload.
+        assert_eq!(workload_from_scope("bramp-db-abc"), "bramp-db-abc");
+        // A `<project>@<workload>` scope yields the workload after the injective `@`.
+        assert_eq!(workload_from_scope("acme@bramp-db-abc"), "bramp-db-abc");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: VolumeSnapshot (CSI)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn volume_snapshot_object_has_the_csi_shape() {
+        let snap = volume_snapshot(&ctx("pg"), "pg-backup-1", "data-pg", Some("csi-snapclass"));
+        assert_eq!(snap.api_version, "snapshot.storage.k8s.io/v1");
+        assert_eq!(snap.kind, "VolumeSnapshot");
+        assert_eq!(snap.metadata.name.as_deref(), Some("pg-backup-1"));
+        assert_eq!(snap.metadata.namespace.as_deref(), Some("boatramp"));
+        assert_eq!(snap.spec.source.persistent_volume_claim_name, "data-pg");
+        assert_eq!(
+            snap.spec.volume_snapshot_class_name.as_deref(),
+            Some("csi-snapclass")
+        );
+        // It serializes to the exact JSON the apiserver accepts.
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["apiVersion"], "snapshot.storage.k8s.io/v1");
+        assert_eq!(v["spec"]["source"]["persistentVolumeClaimName"], "data-pg");
+        assert_eq!(v["spec"]["volumeSnapshotClassName"], "csi-snapclass");
+    }
+
+    #[test]
+    fn restore_pvc_references_the_snapshot_as_its_datasource() {
+        let pvc = restore_pvc_from_snapshot(&ctx("pg"), "data-pg-restored", "pg-backup-1", 20_480);
+        let pspec = pvc.spec.unwrap();
+        let ds = pspec.data_source.expect("restore PVC has a dataSource");
+        assert_eq!(ds.kind, "VolumeSnapshot");
+        assert_eq!(ds.api_group.as_deref(), Some("snapshot.storage.k8s.io"));
+        assert_eq!(ds.name, "pg-backup-1");
+        assert_eq!(
+            pspec.resources.unwrap().requests.unwrap().get("storage"),
+            Some(&Quantity("20480Mi".to_string()))
         );
     }
 }

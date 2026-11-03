@@ -23,12 +23,27 @@ tracing.workspace = true
 # provider the client's TLS needs — all OPTIONAL and gated behind `k8s-backend`, so a
 # build that never turns the feature on is an inert shell and pulls none of the tree
 # (mirrors how the `boatramp` crate gates the operator behind `dep:kube`/`dep:k8s-openapi`).
-kube = { workspace = true, optional = true }
+# `ws` adds the pod `exec` subresource (Phase 2 `ComputeExec` → kube `AttachedProcess`);
+# it is additive over the workspace kube features and pulled only when the backend is on.
+kube = { workspace = true, optional = true, features = ["ws"] }
 k8s-openapi = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+# Phase 2: a stable, collision-resistant short digest for the DNS-safe object-name
+# shortening (SHA-256 → hex), the dynamic VolumeSnapshot (CSI) object body, and the
+# exec stdout/stderr drain. All gated behind `k8s-backend` so the inert shell pulls none.
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+# The exec drain (feed stdin + concurrently read stdout/stderr off the kube
+# `AttachedProcess` tokio duplex streams): `io-util` for the Async{Read,Write}Ext
+# traits, `macros` for `tokio::join!`. Gated behind `k8s-backend`.
+tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+# The `#[ignore]`d `k8s_live` Phase-2 gate (needs a real cluster) needs a runtime.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 # ON by default so `cargo test -p boatramp-k8s` exercises the pure resource planner +
@@ -36,9 +51,18 @@ serde_json.workspace = true
 # own `k8s-backend` feature) gets the real backend. `--no-default-features` yields the
 # inert shell (no kube tree), for a size-sensitive probe build.
 default = ["k8s-backend"]
-# The in-cluster Kubernetes compute backend: the kube-rs client surface + the typed
-# k8s-openapi objects the resource planner builds.
-k8s-backend = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+# The in-cluster Kubernetes compute backend: the kube-rs client surface (incl. the `ws`
+# exec subresource) + the typed k8s-openapi objects the resource planner builds.
+k8s-backend = [
+  "dep:kube",
+  "dep:k8s-openapi",
+  "dep:rustls",
+  "dep:sha2",
+  "dep:hex",
+  "dep:serde_json",
+  "dep:futures",
+  "dep:tokio",
+]
 
 [lints]
 workspace = true
