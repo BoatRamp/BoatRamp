@@ -248,16 +248,12 @@ async fn managed_rls_fencing_enforces_against_the_owner_on_a_real_postgres() {
         "false",
         "a no-RLS table must NOT be force-enabled (the fencing is surgical, not blanket)"
     );
-    for stmt in [
-        "INSERT INTO plain (v) VALUES (10), (20)",
-        "SELECT count(*)::int FROM plain",
-    ] {
-        // Freely readable/writable — no RLS, no fence.
-        let _ = dynrole
-            .run_query(stmt)
-            .await
-            .unwrap_or_else(|e| panic!("no-RLS table must be freely usable `{stmt}`: {e}"));
-    }
+    // Freely writable — no RLS, no fence. Use `run_script` (read-write): `run_query` opens
+    // `BEGIN READ ONLY`, which (correctly) rejects an INSERT — unrelated to fencing.
+    dynrole
+        .run_script("INSERT INTO plain (v) VALUES (10), (20)")
+        .await
+        .unwrap_or_else(|e| panic!("no-RLS table must be freely writable (insert): {e}"));
     assert_eq!(
         probe(&dynrole, "SELECT count(*)::int FROM plain").await,
         "2",
