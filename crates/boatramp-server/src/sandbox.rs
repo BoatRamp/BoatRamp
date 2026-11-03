@@ -22,12 +22,14 @@
 //!      `SECCOMP_RET_KILL_PROCESS` action, so an RCE that lands in the server address
 //!      space cannot spawn a shell or a new binary: it is killed hard (not merely
 //!      `EPERM`'d) and is alertable. A benign allow-list *miss* still degrades to
-//!      `EPERM` (soft). (`fork`/`vfork` are also killed, but as DEFENSE-IN-DEPTH only,
-//!      NOT a guarantee that process creation is blocked: musl's `fork()` is issued as
-//!      `clone` — which stays allowed because the tokio runtime creates its threads with
-//!      it — so on a musl build the `fork`/`vfork` syscall kills are inert. The
-//!      load-bearing barrier is the exec family: a child without `exec` cannot become a
-//!      new program.)
+//!      `EPERM` (soft). (`fork`/`vfork` are also killed. This is NOT merely inert
+//!      defense-in-depth: while the tokio runtime creates its THREADS via `clone` (allowed),
+//!      a `std::process::Command` with a `pre_exec` hook cannot use `posix_spawn`, so Rust's
+//!      fork+exec path issues a BARE `fork(2)` — which the kill-surface `SIGSYS`-kills. So the
+//!      fork-kill really does block process creation here, and an `exec.compute` instance that
+//!      legitimately forks children at serve time has `fork`/`vfork` un-killed in its derived
+//!      profile ([`FORK_SPAWN`]). The other load-bearing barrier is the exec family: a child
+//!      without `exec` cannot become a new program.)
 //!   2. **Landlock** confines the process's filesystem view to the node's `data_dir`
 //!      (+ the system temp dirs) for writes, and a conservative set of system read
 //!      roots (so the server can still read `/etc/resolv.conf`, load shared objects,
@@ -197,10 +199,13 @@ pub const DENIED: &[&str] = &[
 /// alertable crash. (Everything else not in the allow-list still returns `EPERM`, so a
 /// benign allow-list bug degrades softly.)
 ///
-/// `fork`/`vfork` are listed as DEFENSE-IN-DEPTH, not a guarantee that process creation is
-/// blocked: musl issues `fork()` as `clone` (allowed for the tokio runtime's threads), so on a
-/// musl build these two kills are inert. The load-bearing barrier is `execve`/`execveat` — a
-/// forked child that cannot `exec` cannot become a new program.
+/// `fork`/`vfork` are killed too, and NOT merely inert: the tokio runtime makes its threads via
+/// `clone` (allowed), but a `std::process::Command` with a `pre_exec` hook takes Rust's fork+exec
+/// path, which issues a BARE `fork(2)` — so this kill really does stop process creation (a real,
+/// audited `SIGSYS` when the per-tenant router tries to spawn). The exec family
+/// (`execve`/`execveat`) is the other barrier — a forked child that cannot `exec` cannot become a
+/// new program. An `exec.compute` instance, which legitimately forks+execs children, has BOTH
+/// families un-killed in its derived profile ([`EXEC_SPAWN`] + [`FORK_SPAWN`]).
 pub const KILL_SURFACE: &[&str] = &[
     "execve",
     "execveat",
@@ -490,6 +495,19 @@ const KEY_LOCK: &[&str] = &["mlock", "munlock"];
 /// kill-list (hard `SIGSYS`, inherited from Phase 0).
 const EXEC_SPAWN: &[&str] = &["execve", "execveat"];
 
+/// The process-CREATION syscalls an `exec.compute` instance needs to fork a child BEFORE it
+/// `execve`s it. Allowed ONLY for an `exec.compute` instance; killed (hard `SIGSYS`) for every
+/// other. These were previously assumed inert on the fork-kill (the belief that libc routes
+/// `fork()` through `clone`, which stays allowed for the tokio runtime's threads) — but that is
+/// FALSE for the per-tenant router's spawn: `std::process::Command` with a `pre_exec` hook cannot
+/// use `posix_spawn`, so Rust's fork+exec path issues a BARE `fork(2)` (syscall 57), which the
+/// kill-surface `SIGSYS`-kills. A per-tenant router (`exec.compute`) forks children at SERVE time
+/// UNDER its installed sandbox (unlike the root, which forks at boot while still UNCONFINED), so it
+/// must be allowed to `fork`/`vfork`. Bounded: the Landlock view EXECUTE-pins ONLY its own binary
+/// (so a fork can only `execve` that one path) and WS-C's cold-start admission (token bucket +
+/// backoff) caps the spawn rate, so this does not open a fork-bomb or an arbitrary-exec surface.
+const FORK_SPAWN: &[&str] = &["fork", "vfork"];
+
 /// The conservative system read roots every instance (and the monolith) needs so the process
 /// keeps working (shared-object loading, `/etc/resolv.conf` + CA bundle, `/proc`). Single
 /// source of truth for [`SandboxPolicy::for_server`] and [`SandboxDerivationInputs`].
@@ -554,8 +572,8 @@ fn holds_exec_spawn(caps: &BTreeSet<HostAuthority>) -> bool {
 ///
 /// Invariant (regression-guarded cross-platform): for the full monolith set
 /// [`HostAuthority::ALL`] this returns a SUPERSET of [`whole_process_allowlist`] (so the
-/// `all`-composition never loses a syscall the monolith needs); the ONLY extra it adds is
-/// [`EXEC_SPAWN`], present solely because `ALL` includes `exec.compute`.
+/// `all`-composition never loses a syscall the monolith needs); the ONLY extras it adds are
+/// [`EXEC_SPAWN`] + [`FORK_SPAWN`], present solely because `ALL` includes `exec.compute`.
 pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     let gated = capability_gated_syscalls();
     let mut set: BTreeSet<String> = ALLOWED
@@ -575,20 +593,26 @@ pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     }
     if holds_exec_spawn(caps) {
         set.extend(EXEC_SPAWN.iter().copied().map(str::to_string));
+        // An exec.compute instance forks its child (musl's `Command`+`pre_exec` uses bare `fork`)
+        // before `execve`ing it — allow the fork family too, or the per-tenant router dies with
+        // `SIGSYS` on `fork(2)` the instant it tries to cold-start a tenant. See [`FORK_SPAWN`].
+        set.extend(FORK_SPAWN.iter().copied().map(str::to_string));
     }
     set.into_iter().collect()
 }
 
 /// Derive the per-instance seccomp KILL-set (hard `SECCOMP_RET_KILL_PROCESS`): the Phase-0
 /// [`KILL_SURFACE`], EXCEPT that an `exec.compute` instance does NOT kill `execve`/`execveat`
-/// (it re-execs the compute workers). Every non-`exec.compute` instance kills the exec family
-/// — the load-bearing containment for a dropped execution authority. Sorted + de-duplicated.
+/// (it re-execs the compute workers) NOR `fork`/`vfork` (it must fork the child first — see
+/// [`FORK_SPAWN`]; the per-tenant router's `fork(2)` is a real, audited `SIGSYS` without this).
+/// Every non-`exec.compute` instance kills the exec + fork family — the load-bearing containment
+/// for a dropped execution authority. Sorted + de-duplicated.
 pub fn derive_seccomp_killlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     let exec_spawner = holds_exec_spawn(caps);
     let set: BTreeSet<String> = KILL_SURFACE
         .iter()
         .copied()
-        .filter(|s| !(exec_spawner && EXEC_SPAWN.contains(s)))
+        .filter(|s| !(exec_spawner && (EXEC_SPAWN.contains(s) || FORK_SPAWN.contains(s))))
         .map(str::to_string)
         .collect();
     set.into_iter().collect()
@@ -685,9 +709,14 @@ pub fn root_supervisor_allowlist() -> Vec<String> {
 /// would break it; instead it is Landlock-pinned to its own binary (see [`root_supervisor_policy`])
 /// — a compromised root can re-exec ONLY its own fixed, trusted path, never a shell or arbitrary
 /// binary. The rest of the escape surface (`ptrace`/`mount`/`pivot_root`/`setns`/`unshare`/`bpf`/
-/// the module-load + `keyctl` + `kexec` primitives, and `fork`/`vfork` — inert on glibc/musl,
-/// which route `fork()` through `clone`, but kept as defence-in-depth) stays hard-killed. Sorted
-/// + de-duplicated.
+/// the module-load + `keyctl` + `kexec` primitives, and `fork`/`vfork`) stays hard-killed. The
+/// root does its boot fork+exec of every instance while still UNCONFINED (the self-profile is
+/// installed AFTER that loop), so killing `fork` here does not block boot; it is defence-in-depth
+/// against a post-boot RCE. NOTE: a `fork` kill is NOT inert (a `Command`+`pre_exec` spawn issues a
+/// bare `fork(2)`, as the per-tenant router's audited `SIGSYS` proved) — so IF a future wired
+/// root-side RESTART ever re-execs an instance AFTER the self-profile is up, it must un-kill
+/// [`FORK_SPAWN`] here too (today restart is not that path; the Phase-4 WS-C per-tenant spawn forks
+/// inside the exec.compute ROUTER, not the root). Sorted + de-duplicated.
 pub fn root_supervisor_killlist() -> Vec<String> {
     let set: BTreeSet<String> = KILL_SURFACE
         .iter()
@@ -2228,26 +2257,37 @@ mod privsep_derivation_tests {
     }
 
     #[test]
-    fn exec_compute_allows_execve_and_drops_it_from_the_kill_list() {
+    fn exec_compute_allows_the_spawn_family_and_drops_it_from_the_kill_list() {
         let set = caps(&[HostAuthority::ExecCompute]);
         let allow = derive_seccomp_allowlist(&set);
         assert!(
             has(&allow, "execve") && has(&allow, "execveat"),
             "the compute-supervisor must be able to re-exec its workers"
         );
+        // ...and `fork`/`vfork`: the per-tenant router forks the child (musl `Command`+`pre_exec`
+        // issues a BARE `fork(2)`) UNDER its installed sandbox before it `execve`s — without this it
+        // dies with a real `SIGSYS` on `fork(2)` at cold-start (regression against the audited bug).
+        assert!(
+            has(&allow, "fork") && has(&allow, "vfork"),
+            "the compute-supervisor must be able to fork its child before exec"
+        );
         let kill = derive_seccomp_killlist(&set);
         assert!(
             !has(&kill, "execve") && !has(&kill, "execveat"),
             "exec.compute must NOT kill the exec family it legitimately uses"
         );
-        // Every OTHER instance still kills it — proven by the frontend/signer/storage tests.
+        assert!(
+            !has(&kill, "fork") && !has(&kill, "vfork"),
+            "exec.compute must NOT kill the fork family it legitimately uses"
+        );
+        // Every OTHER instance still kills both — proven by the frontend/signer/storage tests.
     }
 
     #[test]
     fn monolith_derivation_is_a_superset_of_the_phase0_allowlist() {
         // The `all` composition (design §5.5 default-monolith invariant) must never LOSE a
-        // syscall the released Phase-0 monolith allow-list has; the ONLY extra it adds is the
-        // exec family, present solely because `all` includes exec.compute.
+        // syscall the released Phase-0 monolith allow-list has; the ONLY extras it adds are the
+        // exec + fork spawn families, present solely because `all` includes exec.compute.
         let allow: BTreeSet<String> = derive_seccomp_allowlist(&all_caps()).into_iter().collect();
         let phase0: BTreeSet<String> = whole_process_allowlist().into_iter().collect();
         assert!(
@@ -2256,13 +2296,13 @@ mod privsep_derivation_tests {
             phase0.difference(&allow).collect::<Vec<_>>()
         );
         let extra: BTreeSet<String> = allow.difference(&phase0).cloned().collect();
-        let expected: BTreeSet<String> = ["execve", "execveat"]
+        let expected: BTreeSet<String> = ["execve", "execveat", "fork", "vfork"]
             .into_iter()
             .map(str::to_string)
             .collect();
         assert_eq!(
             extra, expected,
-            "derive(ALL) adds exactly the exec family over Phase-0 (exec.compute ∈ ALL)"
+            "derive(ALL) adds exactly the exec + fork spawn families over Phase-0 (exec.compute ∈ ALL)"
         );
     }
 
