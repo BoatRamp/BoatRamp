@@ -2862,7 +2862,30 @@ mod instance_serve {
             .build()
             .map_err(|e| format!("building the Tokio runtime: {e}"))?;
         rt.block_on(async move {
-            let deploy = build_routing_deploy_store(config).await?;
+            // Bound the control-plane KV open with a fail-loud timeout: if the store open stalls
+            // (e.g. a `backend.kv` Landlock-grant/store-path mismatch makes SlateDB's retrying
+            // object store spin on EACCES forever), the router EXITS with a clear error → the root's
+            // FailNodeClosed tears the node down, rather than the router hanging up inert while the
+            // node's public listener accepts connections it can never route. 30s is far beyond a
+            // healthy control-plane open (sub-second); it only ever fires on a real stall.
+            let deploy = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                build_routing_deploy_store(config),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err::<(), String>(
+                        "per-tenant router: opening the control-plane KV for Host→project routing \
+                         timed out after 30s — the store open is stuck. The most likely cause is \
+                         that the `backend.kv` Landlock grant does not cover the store's real path \
+                         (see `sandbox::backend_state_subdir(BackendKv)` vs \
+                         `build_slatedb_kv`'s `data_dir.join(\"kv-slate\")`). Failing closed."
+                            .to_string(),
+                    );
+                }
+            };
             // Shared across the spawned per-connection tasks: the registry (one, interior-mutable)
             // and the Host→project resolver (cloneable, `Arc`-backed).
             let registry = Arc::new(ComputePlaneRegistry::new(
@@ -3073,6 +3096,16 @@ mod instance_serve {
         } else {
             KvBackend::Slatedb
         };
+        // A privsep `backend.kv` holder opens the control-plane store UNDER its Landlock sandbox.
+        // The store path (`<data_dir>/kv-slate` for Slatedb) MUST sit inside the `backend.kv` rw
+        // grant (`sandbox::backend_state_subdir(BackendKv)`); a mismatch EACCES-denies the open and
+        // SlateDB's retrying object store spins on it silently. Log the open at `info` so a stall is
+        // visible at the default filter (the caller also bounds it with a fail-loud timeout).
+        tracing::info!(
+            data_dir = %data_dir.display(),
+            backend = ?backend,
+            "[privsep] per-tenant router: opening the control-plane KV for Host→project routing"
+        );
         let kv = build_kv(
             backend,
             &data_dir,

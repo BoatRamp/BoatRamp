@@ -1222,14 +1222,20 @@ pub fn derive_profile(
 /// from another's. Non-backend authorities return `None` (crown-jewel keys are handled separately
 /// by [`KeyInputPaths`]; listeners/exec/control hold no node-base state subtree here).
 ///
-/// Phase-1 canonical layout. `backend.kv` maps to `<data_dir>/kv`, matching the control-plane KV
-/// store's real on-disk location; `sql`/`blob`/`messaging` are the canonical privsep names whose
+/// Phase-1 canonical layout. `backend.kv` maps to `<data_dir>/kv-slate` — the control-plane
+/// SlateDB store's REAL on-disk location (`SlateKv::open_local_with_flush_policy(data_dir.join(
+/// "kv-slate"))` in `boatramp_node::backends::build_slatedb_kv`). This MUST match the store path:
+/// a mismatch Landlock-EACCES-denies the store open, and SlateDB's retrying object store then
+/// spins on the permission error forever — a SILENT HANG, not a loud failure. The WS-C per-tenant
+/// router (the first privsep instance to actually OPEN `backend.kv` under the Derived sandbox) was
+/// bitten by exactly this when this mapped to the sibling `<data_dir>/kv`. `sql`/`blob`/`messaging`
+/// are the canonical privsep names whose
 /// reconciliation with each monolith backend's exact open path is part of the authority-serve
 /// follow-on (the SECURITY property — a non-inert, disjoint cross-authority map — holds regardless
 /// of the exact leaf names, because every backend authority maps to a distinct subtree).
 pub const fn backend_state_subdir(authority: HostAuthority) -> Option<&'static str> {
     match authority {
-        HostAuthority::BackendKv => Some("kv"),
+        HostAuthority::BackendKv => Some("kv-slate"),
         HostAuthority::BackendSql => Some("sql"),
         HostAuthority::BackendBlob => Some("blob"),
         HostAuthority::BackendMessaging => Some("messaging"),
