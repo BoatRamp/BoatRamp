@@ -648,7 +648,7 @@ impl ResolvesServerCert for SniCertResolver {
 /// `ClientHello` by value — it extracts the SNI + ALPN once and dispatches to each tier's
 /// `resolve_sni`. Only built when `[serve.on_demand_tls]` is enabled; otherwise the static resolver
 /// is used alone (unchanged).
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 #[derive(Debug)]
 struct CompositeResolver {
     static_resolver: Arc<SniCertResolver>,
@@ -662,7 +662,7 @@ struct CompositeResolver {
     default_cert: Option<Arc<CertifiedKey>>,
 }
 
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 impl ResolvesServerCert for CompositeResolver {
     fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         let Some(sni) = hello.server_name() else {
@@ -743,7 +743,7 @@ pub fn build_server_configs(
 
 /// A TCP rustls config from an arbitrary cert resolver (shared by the static + composite builders),
 /// advertising ALPN `h2`/`http/1.1`.
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 fn server_config_from(resolver: Arc<dyn ResolvesServerCert>) -> rustls::ServerConfig {
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -754,7 +754,7 @@ fn server_config_from(resolver: Arc<dyn ResolvesServerCert>) -> rustls::ServerCo
 
 /// Like [`build_server_config`] but composed with an **on-demand** per-SNI resolver (cap-req 03): the
 /// static wildcard certs win, then on-demand issuance handles an unknown-but-verified custom domain.
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 pub fn build_server_config_composite(
     entries: Vec<(String, IssuedCert)>,
     on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
@@ -778,7 +778,7 @@ pub fn build_server_config_composite(
 /// handshake. `default_cert` preserves the pre-composite `with_single_cert` behavior for an SNI-less
 /// client; `on_demand` is the *same* `Arc` the edge uses, so there is a single rate-limit / issuance
 /// budget and a single cluster certreq single-flight (never a second engine — see the design note).
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 pub fn build_listener_server_config_composite(
     cert_pem: &str,
     key_pem: &str,
@@ -803,7 +803,7 @@ pub fn build_listener_server_config_composite(
 }
 
 /// Like [`build_server_configs`] (TCP + h3) but composed with the on-demand resolver (cap-req 03).
-#[cfg(all(feature = "http3", feature = "acme-dns", feature = "cluster"))]
+#[cfg(all(feature = "http3", feature = "acme-dns"))]
 pub fn build_server_configs_composite(
     entries: Vec<(String, IssuedCert)>,
     on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
@@ -823,7 +823,7 @@ pub fn build_server_configs_composite(
 
 /// [`build_server_config`], composed with the on-demand resolver when `on_demand` is `Some` (cap-req
 /// 03), else the static resolver alone (unchanged). The serve path calls this at every (re)build site.
-#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[cfg(feature = "acme-dns")]
 pub fn build_server_config_maybe(
     entries: Vec<(String, IssuedCert)>,
     on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
@@ -835,7 +835,7 @@ pub fn build_server_config_maybe(
 }
 
 /// [`build_server_configs`] (TCP + h3), composed with the on-demand resolver when `Some` (cap-req 03).
-#[cfg(all(feature = "http3", feature = "acme-dns", feature = "cluster"))]
+#[cfg(all(feature = "http3", feature = "acme-dns"))]
 pub fn build_server_configs_maybe(
     entries: Vec<(String, IssuedCert)>,
     on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
@@ -952,7 +952,7 @@ mod tests {
     // exercises `build_listener_server_config_composite`'s SNI dispatch end to end: the listener's own
     // static cert serves its `server_names` and an SNI-less handshake; a verified SNI already in the
     // on-demand cache serves that cert; an unknown SNI is refused (no cert ⇒ failed handshake).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "acme-dns")]
     mod listener_composite {
         use super::*;
         use rustls::client::danger::{

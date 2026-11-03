@@ -3399,15 +3399,12 @@ fn spawn_s3_ingress(
 /// on-demand engine itself, so each opted-in listener mints its own PROJECT-SCOPED resolver from it
 /// (`scoped_resolver`) — one issuance budget, one cluster certreq single-flight, never a second engine
 /// (Security review Finding B: a listener serves only its own project's verified domains). It exists
-/// only where the engine can (`all(acme-dns, cluster)`); every other build degrades it to an
-/// uninhabited `Option` that is always `None`, so the on-demand branch compiles out and every call
-/// site simply passes `None`.
-#[cfg(all(feature = "tcp-listener", feature = "acme-dns", feature = "cluster"))]
+/// only where the engine can (`acme-dns`, single-node or cluster); a build without `acme-dns` degrades
+/// it to an uninhabited `Option` that is always `None`, so the on-demand branch compiles out and every
+/// call site simply passes `None`.
+#[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
 type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandTls>>;
-#[cfg(all(
-    feature = "tcp-listener",
-    not(all(feature = "acme-dns", feature = "cluster"))
-))]
+#[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
 type ListenerOnDemand = Option<std::convert::Infallible>;
 
 #[cfg(feature = "tcp-listener")]
@@ -3424,7 +3421,7 @@ fn spawn_listeners(
 ) {
     // In a build without the on-demand engine the arg is an always-`None` uninhabited `Option`; keep
     // it "used" so `-D warnings` stays green (the on-demand branch below is compiled out there).
-    #[cfg(not(all(feature = "acme-dns", feature = "cluster")))]
+    #[cfg(not(feature = "acme-dns"))]
     let _ = &on_demand;
     if listeners.is_empty() {
         return;
@@ -3465,7 +3462,7 @@ fn spawn_listeners(
                 // for its `server_names` + SNI-less handshakes; the shared engine issues for a verified
                 // custom-domain SNI). Protocol-agnostic: the composite advertises no ALPN and knows
                 // nothing of what speaks over the connection.
-                #[cfg(all(feature = "acme-dns", feature = "cluster"))]
+                #[cfg(feature = "acme-dns")]
                 if t.on_demand
                     && let Some(engine) = on_demand.clone()
                 {
