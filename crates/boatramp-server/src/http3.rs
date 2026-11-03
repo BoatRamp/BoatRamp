@@ -19,6 +19,12 @@ use futures::StreamExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tower::ServiceExt;
 
+/// The QUIC listener handle built by [`http3_endpoint`] and driven by
+/// [`serve_http3_endpoint`]. Re-exported so a caller (e.g. the serve-path tail helper
+/// in the `boatramp` binary, which does not depend on `quinn` directly) can NAME the
+/// type to pass it around as `Option<Http3Endpoint>`.
+pub use quinn::Endpoint as Http3Endpoint;
+
 /// A failure serving HTTP/3 (QUIC).
 #[derive(Debug, thiserror::Error)]
 pub enum Http3Error {

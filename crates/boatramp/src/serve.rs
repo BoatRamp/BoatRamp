@@ -130,8 +130,10 @@ pub enum Error {
          dns-publish credential writes (passed to the apex-NS guardrail)"
     )]
     DnsPublishNoZoneRoot,
-    /// No certificate is available yet — the cluster leader hasn't issued one.
-    #[cfg(all(feature = "cluster", feature = "acme-dns"))]
+    /// No certificate is available yet — the cluster leader hasn't issued one (and no on-demand
+    /// engine is serving, which would front SNI issuance without a static set). Reachable from the
+    /// unified AcmeDns serve arm on single-node + cluster alike.
+    #[cfg(feature = "acme-dns")]
     #[error("no certificates available yet — awaiting the cluster leader to issue (retry shortly)")]
     NoCertsYet,
 
@@ -1582,54 +1584,59 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
-        // PLAN-per-project-blob-backend: per-project blob backends are NOT supported on the cluster
-        // path in this cut — their sealed `boatramp:` credentials resolve against the REPLICATED
-        // control-plane KV, which does not exist at blob-build time on a cluster (the blob backend is
-        // built BEFORE the Raft node). Rather than silently ignore an operator's explicit
-        // `[serve.blob_backends]` (which would fall a configured project back to the global backend —
-        // surprising, and against invariant 4's no-silent-fallback), REFUSE loud. Single-node serves
-        // them fully. (A follow-up can build them in `run_cluster` after the replicated KV is up.)
-        if let Some(msg) = cluster_per_project_backend_refusal(&serve_cfg.blob_backends) {
-            return Err(Error::S3Ingress(msg));
-        }
-        // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
-        // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
-        // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Refuse a
-        // `boatramp:` ref STRUCTURALLY, by matching the ref scheme UP FRONT (not by relying on an empty
-        // stand-in store making the resolve miss — a future refactor that seeded/shared that KV would
-        // otherwise silently turn this into a live resolve against the wrong pre-replication store). The
-        // envelope-only forms (`env:`/bare, posture-gated) resolve NORMALLY so their own errors (unset
-        // var, posture-denied) surface UNWRAPPED — not buried under a misleading "use `env:`" suffix.
-        // Absent source ⇒ the ambient AWS env chain (unchanged).
+        // PLAN-serve-single-cluster-parity Stage C (reverse lift #4 — per-project blob backends; #6 —
+        // node-level sealed base S3 cred via a `boatramp:` KV-ref): both are now SUPPORTED on the cluster
+        // path. Their sealed `boatramp:` creds resolve against the REPLICATED control-plane KV, which does
+        // not exist at blob-build time HERE (the blob backend is built BEFORE the Raft node — it feeds
+        // `build_node`'s cross-node messaging payload store). Rather than REFUSE up front, DEFER: the KV-
+        // dependent wiring is built in `run_cluster`'s post-KV pass once `node.kv` is up. `[serve.blob_
+        // backends]` is deferred wholesale (those backends feed only the serve tail); the per-project
+        // builder fail-closes there on a kindless/unresolvable backend, same as single-node. For the base
+        // cred, a `boatramp:` ref is DEFERRED too — the early backend built here is UNCREDENTIALED (it
+        // only backs messaging payload spill), and the post-KV pass resolves the sealed cred against
+        // `node.kv` and REBUILDS the guest-serving backend. The envelope-only forms (`env:`/bare, posture-
+        // gated) still resolve HERE (they never touch the KV), so their own errors (unset var, posture-
+        // denied) surface UNWRAPPED. Absent source ⇒ the ambient AWS env chain (unchanged).
+        //
+        // `base_blob_args` is the UNDECORATED, uncredentialed base `BlobArgs` carried into `run_cluster`
+        // so the post-KV pass can rebuild the sealed serving backend (for a `boatramp:` ref) and wire the
+        // cloud minter at parity with single-node.
+        let base_blob_args = blob_args.clone();
+        let defer_base_cred = s3_credential_cfg.as_ref().is_some_and(|cfg| {
+            boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key).is_some()
+        });
         let mut cluster_blob_args = blob_args;
         if let Some(cfg) = s3_credential_cfg.as_ref() {
-            if let Some(name) =
-                boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key)
-            {
-                return Err(Error::S3Ingress(
-                    boatramp_node::s3_credential::S3CredentialError::BoatrampRefOnCluster(
-                        name.to_string(),
-                    )
-                    .to_string(),
-                ));
+            if defer_base_cred {
+                tracing::info!(
+                    "cluster: deferring the sealed `boatramp:` base S3 credential to the post-KV pass \
+                     (it resolves against the replicated control-plane KV once that store is up)"
+                );
+            } else {
+                let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
+                let cred = boatramp_node::s3_credential::resolve_s3_credential(
+                    cfg,
+                    // No replicated control-plane KV yet on this path; a `boatramp:` ref is DEFERRED
+                    // above (not resolved here), so an empty in-memory store is a correct stand-in for
+                    // the `env:`/bare forms (which never touch the KV).
+                    Arc::new(boatramp_core::kv::MemoryKv::new()),
+                    envelope,
+                    options.posture.allow_env_secret_refs,
+                    &boatramp_core::env::SystemEnv,
+                )
+                .await
+                .map_err(|e| Error::S3Ingress(e.to_string()))?;
+                cluster_blob_args.s3_credential = Some(cred);
             }
-            let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
-            let cred = boatramp_node::s3_credential::resolve_s3_credential(
-                cfg,
-                // No replicated control-plane KV yet on this path; a `boatramp:` ref was already
-                // refused structurally above, so an empty in-memory store is a correct stand-in for
-                // the `env:` forms (which never touch the KV).
-                Arc::new(boatramp_core::kv::MemoryKv::new()),
-                envelope,
-                options.posture.allow_env_secret_refs,
-                &boatramp_core::env::SystemEnv,
-            )
-            .await
-            .map_err(|e| Error::S3Ingress(e.to_string()))?;
-            cluster_blob_args.s3_credential = Some(cred);
         }
-        let built_blobs =
-            build_blobs(&cluster_blob_args, &data_dir, notify_tier, notify_account).await?;
+        // For a deferred `boatramp:` base cred the early backend is UNCREDENTIALED and backs only
+        // messaging payload spill, so skip blob-change WATCH provisioning on it — the post-KV serving
+        // rebuild provisions the watch correctly against the sealed backend.
+        let built_blobs = if defer_base_cred {
+            build_blobs(&cluster_blob_args, &data_dir, None, None).await?
+        } else {
+            build_blobs(&cluster_blob_args, &data_dir, notify_tier, notify_account).await?
+        };
         return run_cluster(
             args,
             config,
@@ -1637,6 +1644,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             addr,
             data_dir,
             built_blobs,
+            base_blob_args,
             options,
         )
         .await;
@@ -1890,10 +1898,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let kv_handle = kv.clone();
     // Rate-limit windows are coordination state, not config: they must NOT be
     // cached (a stale window would count wrong), so the limiter uses the
-    // *uncached* backend directly.
-    if cluster_rate_limit {
-        options.cluster_rate_limit_kv = Some(kv_backend.clone());
-    }
+    // *uncached* backend directly. Resolved here into the SharedServe
+    // `cluster_rate_limit_kv` input; `serve_assembled` sets it on `options`.
+    let cluster_rate_limit_kv: Option<Arc<dyn KvStore>> =
+        cluster_rate_limit.then(|| kv_backend.clone());
     // The dynamic daemon-config runtime, built here so SIGHUP and the shared-store
     // changelog can **wake** an immediate reload (push-driven convergence) rather
     // than relying on the runtime's backstop tick.
@@ -1968,7 +1976,6 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         &node_id,
         cp_report.as_ref(),
     ));
-    spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
         // Both authz-keyspace fences (policy + GraphQL registry) are tripped by an unreachable poll.
         let fences: Vec<Arc<boatramp_core::cache_coherence::AuthzFence>> =
@@ -2002,6 +2009,268 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             backing: kv_backend.clone(),
             fence: fence.clone(),
         });
+    // On-demand per-SNI TLS (cap-req 03) — single-node GAINS it with the forward serve-path
+    // consolidation (PLAN forward gaps 1/2/3). The STATIC cert set stays the FILESYSTEM refresh
+    // (`CertRefresh::Local`); the optional per-SNI engine is built only for `--tls acme-dns` +
+    // `[serve.on_demand_tls] enabled`, over a `KvCertStore` on the single-node control-plane `kv`
+    // (envelope-wrapped when `[secrets]` is set — cert-at-rest encryption), an always-`|| true` leader
+    // (one node), and `kv` as the ACME-account store. The engine itself is built in the shared AcmeDns
+    // serve arm (where the DNS provider is in scope) and reaches `spawn_listeners` via the deferred-
+    // listener spawn there (anti-inert — the omission that motivated this consolidation).
+    #[cfg(feature = "acme-dns")]
+    let cert_refresh = CertRefresh::Local;
+    #[cfg(feature = "acme-dns")]
+    let on_demand: Option<OnDemandBuild> = match serve_cfg.on_demand_tls.clone() {
+        Some(od_cfg) if single_node_on_demand_enabled(args.tls, Some(&od_cfg)) => {
+            let cert_envelope = build_cert_envelope(config.secrets.as_ref(), &data_dir)?;
+            let cert_store: Arc<dyn boatramp_core::cert::CertStore> = match &cert_envelope {
+                Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
+                    kv.clone(),
+                    envelope.clone(),
+                )),
+                None => Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone())),
+            };
+            Some(OnDemandBuild {
+                cfg: od_cfg,
+                cert_store,
+                is_leader: Arc::new(|| true),
+                account_kv: kv.clone(),
+                account_envelope: cert_envelope,
+            })
+        }
+        _ => None,
+    };
+
+    // MF-3 (extended) GraphQL registry fence (+ uncached backing): wired into the handler runtime
+    // AFTER assembly, inside `serve_assembled`. Multi-writer only; single-writer leaves it unchanged.
+    let registry_fence: Option<(
+        Arc<dyn KvStore>,
+        Arc<boatramp_core::cache_coherence::AuthzFence>,
+    )> = graphql_fence.map(|fence| (kv_backend.clone(), fence));
+
+    // Cloud blob-upload minter (M4): single-node wires it (the cluster path fills this in a sequenced
+    // follow-up — Stage C). Carried as a SharedServe input so the wiring is ONE code path.
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = serve_cfg
+        .s3_ingress_cloud
+        .clone()
+        .map(|cloud| CloudBlobUpload {
+            blob_args: blob_args.clone(),
+            cloud,
+            // #505: the SAME sealed base credential the blob backend uses (if any).
+            sealed_credential: sealed_s3_credential.clone(),
+            mint_max_ttl_secs: serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            mint_max_bytes: serve_cfg.s3_ingress_mint_max_bytes,
+        });
+
+    // Graceful-shutdown epilogue (single-node): the close-in-progress breadcrumb (UX C8b) + the
+    // leader-lease resign (C1), run around the shared `quiesce_and_close` in `serve_assembled`.
+    let shutdown_kv = args.kv;
+    #[cfg(feature = "slatedb")]
+    let pre_data_dir = data_dir.clone();
+    #[cfg(feature = "slatedb")]
+    let pre_slate_s3 = slate_s3.clone();
+    #[cfg(feature = "slatedb")]
+    let post_data_dir = data_dir.clone();
+    #[cfg(feature = "slatedb")]
+    let post_slate_s3 = slate_s3.clone();
+    let on_pre_close: Option<ShutdownHook> = Some(Box::new(move || {
+        Box::pin(async move {
+            #[cfg(feature = "slatedb")]
+            if shutdown_kv == boatramp_node::backends::KvBackend::Slatedb {
+                write_kv_close_breadcrumb(&pre_data_dir, pre_slate_s3.as_ref()).await;
+            }
+            #[cfg(not(feature = "slatedb"))]
+            let _ = &shutdown_kv;
+            // Resign the leader lease so a successor takes over at once (best-effort).
+            if let Some(lease) = &leader_lease {
+                lease.resign().await;
+            }
+        })
+    }));
+    let on_post_close: Option<ShutdownHookClean> = Some(Box::new(move |close_clean: bool| {
+        Box::pin(async move {
+            #[cfg(feature = "slatedb")]
+            if close_clean && shutdown_kv == boatramp_node::backends::KvBackend::Slatedb {
+                clear_kv_close_breadcrumb(&post_data_dir, post_slate_s3.as_ref()).await;
+            }
+            #[cfg(not(feature = "slatedb"))]
+            let _ = close_clean;
+        })
+    }));
+
+    // ONE shared serve tail. The single-node SUBSTRATE (local KV, self-heal, CAS-lease election,
+    // checkpoint/GC) was built above + migration/default-scope already ran; every genuine single-vs-
+    // cluster difference below is a SharedServe field, so a capability can never be wired on one serve
+    // path and silently omitted from the other.
+    serve_assembled(SharedServe {
+        addr,
+        config,
+        data_dir,
+        args,
+        options,
+        built_blobs,
+        per_project_blob_backends,
+        kv,
+        kv_handle,
+        close_deadline: kv_close_deadline,
+        is_leader: is_leader_gate,
+        node_id: 0,
+        messaging: None,
+        shared_authz,
+        cluster_rate_limit_kv,
+        deployment: boatramp_server::s3_ingress::config::Deployment::SingleNode,
+        registry_fence,
+        mesh_control_builder: None,
+        startup_blob_backend: Some(blob_args.blobs),
+        #[cfg(feature = "acme-dns")]
+        cert_refresh,
+        #[cfg(feature = "acme-dns")]
+        on_demand,
+        #[cfg(any(
+            feature = "blob-upload-aws",
+            feature = "blob-upload-gcs",
+            feature = "blob-upload-azure"
+        ))]
+        cloud_blob_upload,
+        raft_shutdown: None,
+        on_pre_close,
+        on_post_close,
+    })
+    .await
+}
+
+/// The deferred cluster mesh-control builder: `options.mesh_control` is built from the
+/// post-`configure_auth` issuer, which only exists inside [`serve_assembled`], so the cluster path
+/// hands in a builder closure over its `node` instead of a finished value.
+type MeshControlBuilder = Box<
+    dyn FnOnce(&boatramp_server::ServerOptions) -> Arc<dyn boatramp_server::MeshControl> + Send,
+>;
+/// A graceful-shutdown hook run BEFORE the shared `quiesce_and_close` (single-node: close-in-progress
+/// breadcrumb + leader-lease resign).
+type ShutdownHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+/// A graceful-shutdown hook run AFTER `quiesce_and_close`, given the clean-close flag (single-node:
+/// clear the breadcrumb on a clean close).
+type ShutdownHookClean =
+    Box<dyn FnOnce(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// The forked serve SUBSTRATE threaded into the ONE shared serve tail [`serve_assembled`]. `run` builds
+/// the single-node values (local KV, always-`|| true` leader, no messaging, filesystem cert refresh,
+/// `SingleNode`); `run_cluster` builds the cluster values (replicated KV, Raft leader + messaging,
+/// replicated cert refresh, `MultiNode`). Every genuine single-vs-cluster divergence is one of these
+/// fields — so a capability can never again be wired on one serve path and silently omitted from the
+/// other, because there is exactly ONE tail. `per_project_blob_backends` + `deployment` are carried as
+/// INPUTS so the sequenced Stage-C cluster lift populates them without re-forking the tail.
+struct SharedServe<'a> {
+    addr: SocketAddr,
+    config: &'a ServerConfig,
+    data_dir: PathBuf,
+    args: ServeArgs,
+    options: boatramp_server::ServerOptions,
+    built_blobs: boatramp_node::blobs::BuiltBlobs,
+    per_project_blob_backends: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>>,
+    kv: Arc<dyn KvStore>,
+    /// The handle used to close the store cleanly on graceful shutdown (the single-node cached `kv`
+    /// clone, or the cluster node-local durable Raft store).
+    kv_handle: Arc<dyn KvStore>,
+    close_deadline: std::time::Duration,
+    is_leader: boatramp_server::CronLeaderGate,
+    node_id: u64,
+    messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
+    shared_authz: Option<boatramp_node::auth::SharedAuthz>,
+    /// Already resolved per path: `Some(store)` ⇒ set `options.cluster_rate_limit_kv` (the uncached
+    /// single-node backend, or the replicated RaftKv); `None` ⇒ leave it unset.
+    cluster_rate_limit_kv: Option<Arc<dyn KvStore>>,
+    deployment: boatramp_server::s3_ingress::config::Deployment,
+    /// Single-node multi-writer only: wire the GraphQL registry fence (+ uncached backing) into the
+    /// handler runtime after assembly. `None` on cluster / single-writer.
+    registry_fence: Option<(
+        Arc<dyn KvStore>,
+        Arc<boatramp_core::cache_coherence::AuthzFence>,
+    )>,
+    /// Cluster only: builds `options.mesh_control` from the post-`configure_auth` issuer.
+    mesh_control_builder: Option<MeshControlBuilder>,
+    /// `Some(backend)` ⇒ the single-node "starting boatramp" startup log (naming the effective blob
+    /// backend); `None` ⇒ the cluster "serving public traffic" log.
+    startup_blob_backend: Option<BlobBackend>,
+    #[cfg(feature = "acme-dns")]
+    cert_refresh: CertRefresh,
+    #[cfg(feature = "acme-dns")]
+    on_demand: Option<OnDemandBuild>,
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    cloud_blob_upload: Option<CloudBlobUpload>,
+    /// Cluster only: shut down Raft BEFORE the store close (coordination correctness).
+    raft_shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    /// Single-node only: run BEFORE `quiesce_and_close`.
+    on_pre_close: Option<ShutdownHook>,
+    /// Single-node only: run AFTER `quiesce_and_close` with the clean-close flag.
+    on_post_close: Option<ShutdownHookClean>,
+}
+
+/// The ONE forward serve tail shared by `run` (single-node) and `run_cluster`: rate-limit KV → SIGHUP
+/// → `configure_auth` → OIDC + `enforce_auth_bind` → (cluster) mesh-control → `assemble` → registry
+/// fence → startup banner → listeners / redirect / s3-ingress → (single-node) cloud blob-upload →
+/// `match --tls` (its AcmeDns arm is the unified `serve_acme_dns`, driven by `cert_refresh` +
+/// `on_demand`) → graceful shutdown (`quiesce_and_close`, bracketed by the per-path hooks). The forked
+/// substrate (local vs Raft KV/mesh) stays in each caller; MANDATORY: cluster behavior unchanged.
+#[allow(clippy::too_many_lines)]
+async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
+    let config = s.config;
+    let data_dir = s.data_dir;
+    let args = s.args;
+    let addr = s.addr;
+    let mut options = s.options;
+    let built_blobs = s.built_blobs;
+    let per_project_blob_backends = s.per_project_blob_backends;
+    let kv = s.kv;
+    let kv_handle = s.kv_handle;
+    let close_deadline = s.close_deadline;
+    let is_leader = s.is_leader;
+    let node_id = s.node_id;
+    let messaging = s.messaging;
+    let shared_authz = s.shared_authz;
+    let cluster_rate_limit_kv = s.cluster_rate_limit_kv;
+    let deployment = s.deployment;
+    let registry_fence = s.registry_fence;
+    let mesh_control_builder = s.mesh_control_builder;
+    let startup_blob_backend = s.startup_blob_backend;
+    #[cfg(feature = "acme-dns")]
+    let cert_refresh = s.cert_refresh;
+    #[cfg(feature = "acme-dns")]
+    let on_demand = s.on_demand;
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = s.cloud_blob_upload;
+    let raft_shutdown = s.raft_shutdown;
+    let on_pre_close = s.on_pre_close;
+    let on_post_close = s.on_post_close;
+
+    let serve_cfg = config.serve.clone().unwrap_or_default();
+    let storage = built_blobs.storage.clone();
+
+    // Cluster-wide rate limiting (already resolved per path to the right store).
+    if let Some(rl_kv) = cluster_rate_limit_kv {
+        options.cluster_rate_limit_kv = Some(rl_kv);
+    }
+    // SIGHUP force-reloads the daemon config (the cluster ApplyObserver already handles replicated
+    // `daemon/*` writes; this is the manual override). Both paths set `options.daemon_runtime` above.
+    spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
+    // Control-plane auth. The only per-path difference is `shared_authz` (multi-writer single-node vs
+    // `None` everywhere else), carried as a field.
     let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
         serve_cfg.auth_root_private_key.clone(),
@@ -2014,11 +2283,14 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
     boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
-    // Wire the built store + configured auth/options into a running node graph:
-    // handler runtime, deploy store, compute + domain-verify reconcile loops. This
-    // is the same assembly `boatramp serve` exercises, now a library call so an
-    // embedder / in-process test builds the identical graph (PLAN-node-library N2b.3).
-    // `_reconcile` holds the detached reconcile loops for the server's serving life.
+    // Cluster mesh control hook (`POST /api/cluster/join` + `/rotate-key`): built from the
+    // post-`configure_auth` root signer (`options.issuer`), so the cluster hands in a builder closure.
+    if let Some(build_mesh_control) = mesh_control_builder {
+        options.mesh_control = Some(build_mesh_control(&options));
+    }
+    // Node-graph assembly — the SAME `boatramp_node::assemble` both paths converge on. The cluster
+    // differences are the `NodeInput` fields (Raft messaging, Raft `is_leader`, node id, per-project
+    // blob backends).
     let boatramp_node::RunningNode {
         deploy,
         handlers,
@@ -2036,51 +2308,58 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         serve_addr: Some(addr),
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
-        // Single-node: default messaging, id 0. The leader gate is always-true for a single-writer
-        // backend (one node), or the shared CAS-lease election (C1) for a multi-writer backend — so
-        // exactly ONE of N stateless nodes runs the five leader-gated singletons.
-        messaging: None,
-        is_leader: is_leader_gate,
-        node_id: 0,
+        messaging,
+        is_leader,
+        node_id,
         // `boatramp serve` re-execs itself for compute workers (the child is boatramp).
         worker_exe: None,
     })
     .await?;
 
     // MF-3 (extended) — wire the GraphQL registry fence + uncached backing into the handler runtime
-    // so the edge/resolve registry-version read reads THROUGH the backing when it cannot confirm
-    // currency, and denies if the store is unreachable (closing the stale-`@edgeHidden` hole).
-    // Multi-writer only; single-writer leaves the registry path unchanged.
+    // (single-node multi-writer only; `None` on cluster / single-writer).
     #[cfg(feature = "handlers")]
-    if let Some(fence) = graphql_fence.clone() {
-        handlers.set_registry_fence(kv_backend.clone(), fence);
+    if let Some((backing, fence)) = registry_fence {
+        handlers.set_registry_fence(backing, fence);
+    }
+    #[cfg(not(feature = "handlers"))]
+    let _ = registry_fence;
+
+    // Startup banner (per path: the single-node line names the effective blob backend).
+    match startup_blob_backend {
+        Some(blobs) => tracing::info!(
+            blobs = ?blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
+            auth = !auth.is_disabled(), "starting boatramp"
+        ),
+        None => tracing::info!(tls = ?args.tls, "cluster: serving public traffic"),
     }
 
-    tracing::info!(
-        // Log the EFFECTIVE blob backend (`blob_args.blobs` = `[serve].blobs` overriding the flag),
-        // not the clap default `args.blobs` — the old `args.blobs` here hid a config-vs-flag mismatch
-        // (e.g. logging `Fs` while actually serving S3), which obscured a prod diagnosis.
-        blobs = ?blob_args.blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
-        auth = !auth.is_disabled(), "starting boatramp"
-    );
-    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
-    // `[serve.listeners.<name>]`, gated on the posture. Single-node. Borrows `posture` before the TLS
-    // redirect below consumes it.
+    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound). DEFERRED into the AcmeDns arm (so a
+    // listener that opts in shares the ONE on-demand engine — cap-req 03 #4); spawned here with no
+    // on-demand resolver for every other mode (and every non-acme-dns build).
+    #[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
+    let defer_listeners = matches!(args.tls, TlsMode::AcmeDns);
+    #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
+    let defer_listeners = false;
     #[cfg(feature = "tcp-listener")]
-    // Single-node serve has no on-demand engine (it is cluster-gated — see `on_demand_tls`), so
-    // listeners here serve only their own static cert.
-    spawn_listeners(&serve_cfg.listeners, &posture, &handlers, &deploy, None);
-    // In a TLS mode, optionally bind a second plain-HTTP listener that redirects
-    // to HTTPS. Ignored for `--tls off`.
+    if !defer_listeners {
+        spawn_listeners(
+            &serve_cfg.listeners,
+            &options.posture,
+            &handlers,
+            &deploy,
+            None,
+        );
+    }
+    // In a TLS mode, optionally bind a second plain-HTTP listener that redirects to HTTPS.
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off)
         && let Some(redirect_addr) = serve_cfg.http_redirect_addr
     {
-        spawn_http_redirect(redirect_addr, deploy.clone(), posture);
+        spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
     }
-    // Optionally bind the dedicated local S3-ingress listener (PLAN-blob-s3-ingress, opt-in via
-    // `[serve].s3_ingress_addr`). Single-node here, so the fail-closed multi-node guard always admits;
-    // an explicit `s3_ingress_secret_file` is honored, else an ephemeral per-process root is used.
+    // Optionally bind the dedicated local S3-ingress listener. `deployment` is the per-path field:
+    // single-node always admits (ephemeral root ok); cluster REQUIRES the cluster-uniform secret file.
     if let Some(s3_addr) = serve_cfg.s3_ingress_addr {
         spawn_s3_ingress(
             s3_addr,
@@ -2088,7 +2367,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             &auth,
             &options,
             serve_cfg.s3_ingress_secret_file.clone(),
-            boatramp_server::s3_ingress::config::Deployment::SingleNode,
+            deployment,
             #[cfg(feature = "blob-upload")]
             &handlers,
             #[cfg(feature = "blob-upload")]
@@ -2101,66 +2380,66 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
-    // Cloud brokering (M4): when the node's blob backend is a cloud object store and
-    // `[serve.s3_ingress_cloud]` is set, install a cloud `BlobUploadMinter` (used instead of the local
-    // face) so a minted credential is a native scoped STS/CAB/SAS credential the client redeems
-    // directly against the real store. Independent of the local `s3_ingress_addr` listener — a
-    // cloud-only deployment never needs it. Gated on at least one cloud minter feature being compiled.
+    // Cloud blob-upload minter (M4): single-node populates this; the cluster side is a sequenced
+    // follow-up (Stage C) that fills the SAME input — never a re-fork of this tail.
     #[cfg(any(
         feature = "blob-upload-aws",
         feature = "blob-upload-gcs",
         feature = "blob-upload-azure"
     ))]
-    if let Some(cloud) = serve_cfg.s3_ingress_cloud.clone() {
+    if let Some(cbu) = cloud_blob_upload {
         wire_cloud_blob_upload(
             &handlers,
-            &blob_args,
-            cloud,
-            // #505: the SAME sealed base credential the blob backend uses (if any) so the minter's
-            // STS/presign SDK config signs with the sealed key, not the ambient env chain.
-            sealed_s3_credential.as_ref(),
-            serve_cfg
-                .s3_ingress_mint_max_ttl_secs
-                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
-            serve_cfg.s3_ingress_mint_max_bytes,
+            &cbu.blob_args,
+            cbu.cloud,
+            cbu.sealed_credential.as_ref(),
+            cbu.mint_max_ttl_secs,
+            cbu.mint_max_bytes,
         )
         .await?;
     }
+
+    // TLS dispatch. Off/Custom/Acme/Rpk are identical on both paths; the AcmeDns arm is the ONE
+    // unified `serve_acme_dns` driven by `cert_refresh` (filesystem vs replicated static set) +
+    // `on_demand` (the per-SNI engine ingredients) — the Pair-1 consolidation, single by construction.
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
             .map_err(Error::Serve),
         TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
-        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
+        #[cfg(feature = "acme-dns")]
+        TlsMode::AcmeDns => {
+            serve_acme_dns(
+                &args,
+                addr,
+                deploy,
+                auth,
+                handlers,
+                options,
+                cert_refresh,
+                on_demand,
+                #[cfg(feature = "tcp-listener")]
+                &serve_cfg.listeners,
+            )
+            .await
+        }
+        #[cfg(not(feature = "acme-dns"))]
+        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
-    // Graceful shutdown (Part A): the serve future has returned (and has already quiesced the
-    // scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
-    // variant on its own tail). Now abort+await the reconcile loops and
-    // cleanly CLOSE the control-plane store — not a bare `flush()` (which only pushed the WAL
-    // buffer out, leaving a live store whose next crash could freeze a torn tail), but a real
-    // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
-    // open has an empty WAL replay range. Bounded by the configurable `[serve.kv] close_deadline`
-    // (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
-    // UX C8b: drop a close-in-progress breadcrumb before the close; a clean close clears it, a
-    // cut-short one (fly SIGKILL) leaves it for the next boot's WARN.
-    #[cfg(feature = "slatedb")]
-    if args.kv == boatramp_node::backends::KvBackend::Slatedb {
-        write_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
+
+    // Graceful shutdown (Part A). The single-node breadcrumb/lease epilogue and the cluster Raft
+    // shutdown are the only per-path differences; both run around the ONE `quiesce_and_close`.
+    if let Some(pre) = on_pre_close {
+        pre().await;
     }
-    // Shared-mode (C1): resign the leader lease on graceful shutdown so a successor takes over at
-    // once instead of waiting a full TTL. Best-effort; a lost race / DB blip just lets it expire.
-    if let Some(lease) = &leader_lease {
-        lease.resign().await;
+    let close_clean = quiesce_and_close(kv_handle, reconcile, raft_shutdown, close_deadline).await;
+    if let Some(post) = on_post_close {
+        post(close_clean).await;
+    } else {
+        let _ = close_clean;
     }
-    let close_clean = quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
-    #[cfg(feature = "slatedb")]
-    if close_clean && args.kv == boatramp_node::backends::KvBackend::Slatedb {
-        clear_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
-    }
-    #[cfg(not(feature = "slatedb"))]
-    let _ = close_clean;
     serve_result
 }
 
@@ -2302,26 +2581,11 @@ async fn build_blobs_with_sealed_cred(
     Ok((built, resolved))
 }
 
-/// The cluster-path refusal for per-project blob backends (PLAN-per-project-blob-backend): `Some(msg)`
-/// when `[serve.blob_backends]` is non-empty on a cluster, `None` otherwise. Per-project sealed
-/// `boatramp:` credentials resolve against the REPLICATED control-plane KV, which does not exist at
-/// blob-build time on a cluster (the blob backend is built BEFORE the Raft node) — so rather than
-/// silently ignore an operator's explicit config (which would fall a configured project back to the
-/// global backend, against invariant 4's no-silent-fallback), the serve REFUSES loud. Extracted as a
-/// pure predicate so the fail-closed behavior is unit-testable without standing up a cluster.
-fn cluster_per_project_backend_refusal(
-    configs: &std::collections::BTreeMap<String, boatramp_node::config::BlobBackendConfig>,
-) -> Option<String> {
-    (!configs.is_empty()).then(|| {
-        format!(
-            "[serve.blob_backends] (per-project blob backends) is not supported on the cluster path \
-             in this release ({} project(s) configured): their sealed credentials need the \
-             replicated control-plane KV, which is unavailable at blob-build time on a cluster. \
-             Remove [serve.blob_backends] or run single-node.",
-            configs.len()
-        )
-    })
-}
+// NOTE: `cluster_per_project_backend_refusal` (the old up-front cluster refusal of `[serve.blob_
+// backends]`) was REMOVED in PLAN-serve-single-cluster-parity Stage C — the cluster path now DEFERS the
+// per-project build to `run_cluster`'s post-KV pass (reverse lift #4) instead of refusing. The fail-
+// closed semantics for genuinely-invalid configs (kindless / unresolvable credential) live in
+// `build_per_project_blob_backends` below and run on BOTH paths.
 
 /// Build the per-project blob backends from `[serve.blob_backends]` (PLAN-per-project-blob-backend).
 ///
@@ -3399,15 +3663,12 @@ fn spawn_s3_ingress(
 /// on-demand engine itself, so each opted-in listener mints its own PROJECT-SCOPED resolver from it
 /// (`scoped_resolver`) — one issuance budget, one cluster certreq single-flight, never a second engine
 /// (Security review Finding B: a listener serves only its own project's verified domains). It exists
-/// only where the engine can (`all(acme-dns, cluster)`); every other build degrades it to an
-/// uninhabited `Option` that is always `None`, so the on-demand branch compiles out and every call
-/// site simply passes `None`.
-#[cfg(all(feature = "tcp-listener", feature = "acme-dns", feature = "cluster"))]
+/// only where the engine can (`acme-dns`, single-node or cluster); a build without `acme-dns` degrades
+/// it to an uninhabited `Option` that is always `None`, so the on-demand branch compiles out and every
+/// call site simply passes `None`.
+#[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
 type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandTls>>;
-#[cfg(all(
-    feature = "tcp-listener",
-    not(all(feature = "acme-dns", feature = "cluster"))
-))]
+#[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
 type ListenerOnDemand = Option<std::convert::Infallible>;
 
 #[cfg(feature = "tcp-listener")]
@@ -3424,7 +3685,7 @@ fn spawn_listeners(
 ) {
     // In a build without the on-demand engine the arg is an always-`None` uninhabited `Option`; keep
     // it "used" so `-D warnings` stays green (the on-demand branch below is compiled out there).
-    #[cfg(not(all(feature = "acme-dns", feature = "cluster")))]
+    #[cfg(not(feature = "acme-dns"))]
     let _ = &on_demand;
     if listeners.is_empty() {
         return;
@@ -3465,7 +3726,7 @@ fn spawn_listeners(
                 // for its `server_names` + SNI-less handshakes; the shared engine issues for a verified
                 // custom-domain SNI). Protocol-agnostic: the composite advertises no ALPN and knows
                 // nothing of what speaks over the connection.
-                #[cfg(all(feature = "acme-dns", feature = "cluster"))]
+                #[cfg(feature = "acme-dns")]
                 if t.on_demand
                     && let Some(engine) = on_demand.clone()
                 {
@@ -3863,7 +4124,9 @@ async fn build_mesh_write_gate(
 
 /// Build the configured secrets-at-rest envelope from `[secrets]`,
 /// resolving a Vault token from the environment. `None` ⇒ store cleartext.
-#[cfg(all(feature = "cluster", feature = "acme-dns"))]
+/// Reachable from BOTH serve paths' AcmeDns arm (single-node gained cert-at-rest encryption with the
+/// forward consolidation — PLAN forward gap #3), so it is gated on `acme-dns` alone (not `cluster`).
+#[cfg(feature = "acme-dns")]
 fn build_cert_envelope(
     secrets: Option<&crate::config::SecretsConfig>,
     data_dir: &Path,
@@ -3938,16 +4201,24 @@ async fn run_cluster(
     addr: SocketAddr,
     data_dir: PathBuf,
     built_blobs: boatramp_node::blobs::BuiltBlobs,
+    // The UNDECORATED, uncredentialed base `BlobArgs` (PLAN-serve-single-cluster-parity Stage C): the
+    // post-KV pass rebuilds the SEALED serving backend from it for a `boatramp:` base cred (reverse lift
+    // #6) and wires the cloud minter from it (reverse lift #5), at parity with single-node.
+    base_blob_args: BlobArgs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use boatramp_cluster::node::{ClusterParams, build_node};
 
-    // The blob backend; `built_blobs` also carries the optional FA-5b2 blob-change
-    // watch provider + tier the handler runtime is wired with below. In the cluster path the blob
-    // storage is needed BEFORE the Raft node (it feeds `build_node` for cross-node message payloads),
-    // which is before the replicated control-plane KV exists — so the #505 sealed credential is resolved
-    // up-front in `run` (against the node-local control-plane KV) and folded into `built_blobs` there.
-    let storage = built_blobs.storage.clone();
+    // Cross-node messaging payload-spill store (PLAN-serve-single-cluster-parity, seal-messaging
+    // residual). `build_node` wires this into `RaftMessaging` BEFORE the replicated control-plane KV
+    // (`node.kv`) exists — and the node-level sealed `boatramp:` base S3 credential can only resolve
+    // AFTER that KV is up (the boot chicken-and-egg). So we hand `build_node` a LATE-BOUND handle,
+    // UNBOUND here (no credential wired early — NEVER the uncredentialed/ambient early backend), and
+    // BIND it to the SAME sealed serving backend in the post-KV pass below, strictly before
+    // `serve_assembled` serves and before any messaging traffic can flow. Fail-closed until then: a
+    // spill against the unbound handle errors rather than touching an ambient backend (defensive —
+    // in practice no spill runs before the post-KV bind, since messaging does not serve until then).
+    let messaging_spill = Arc::new(boatramp_cluster::messaging::LateStorage::unbound());
 
     // Node-local durable Raft log/state store (distinct from the *replicated*
     // control plane the cluster serves).
@@ -4234,7 +4505,9 @@ async fn run_cluster(
             // a joiner's membership arrives from the seed. No static voter list.
             voters: std::collections::BTreeSet::new(),
             durable_kv,
-            storage: storage.clone(),
+            // The late-bound messaging payload-spill handle, UNBOUND here; bound to the sealed
+            // serving backend in the post-KV pass below (seal-messaging residual).
+            storage: messaging_spill.clone(),
             mesh: mesh_tls.clone(),
             cluster_write_capability: write_capability,
             extra_observers: vec![daemon_observer],
@@ -4330,6 +4603,115 @@ async fn run_cluster(
     // The control-plane KvStore + messaging are the cluster facades.
     let kv: Arc<dyn KvStore> = node.kv.clone();
 
+    // ── PLAN-serve-single-cluster-parity Stage C: the DEFERRED blob pass ─────────────────────────────
+    // The replicated control-plane KV (`kv` = `node.kv`) is now up — a real joined/bootstrapped store.
+    // This is the ONLY point sealed `boatramp:` creds can resolve on a cluster, and it is strictly BEFORE
+    // `serve_assembled` serves, so no blob backend built with an unresolved/placeholder cred is ever
+    // reachable for SERVING. It mirrors the exact single-node (`run`) calls, now fed `node.kv`.
+    let serve_cfg = config.serve.clone().unwrap_or_default();
+    // Reverse lift #6 — node-level sealed base S3 credential via a `boatramp:` KV-ref. The early
+    // (pre-`build_node`) pass built an UNCREDENTIALED base backend for a `boatramp:` ref (it backs only
+    // the cross-node messaging payload store `build_node` constructed); here we resolve the sealed cred
+    // against `node.kv` and REBUILD the guest-serving backend with it — FAIL CLOSED on a missing key /
+    // bad envelope (the `?`), never an unsealed/empty fallback (matching single-node). `env:`/bare/absent
+    // base creds were already resolved + built early (unchanged); for them we only RE-RESOLVE the cred
+    // (these forms never touch the KV, so this cannot introduce a new failure mode) to hand the SAME
+    // source to the cloud minter below, at parity with single-node.
+    let base_is_boatramp_ref = serve_cfg.s3_credential.as_ref().is_some_and(|cfg| {
+        boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key).is_some()
+    });
+    let (built_blobs, base_sealed_credential) = if base_is_boatramp_ref {
+        // Build the SEALED serving backend post-KV, mirroring single-node `build_blobs_with_sealed_cred`.
+        // `blob_fallback: None` — the cluster path has never wired `[serve.blob_fallback]` (its early
+        // build used plain `build_blobs`); keeping it `None` preserves that behavior uniformly.
+        build_blobs_with_sealed_cred(
+            &base_blob_args,
+            serve_cfg.s3_credential.as_ref(),
+            None,
+            &data_dir,
+            kv.clone(),
+            config.secrets.as_ref(),
+            options.posture.allow_env_secret_refs,
+            serve_cfg.blob_notify_tier,
+            serve_cfg.blob_notify_account_id.clone(),
+        )
+        .await?
+    } else {
+        let cred = match serve_cfg.s3_credential.as_ref() {
+            Some(cfg) => {
+                let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
+                Some(
+                    boatramp_node::s3_credential::resolve_s3_credential(
+                        cfg,
+                        kv.clone(),
+                        envelope,
+                        options.posture.allow_env_secret_refs,
+                        &boatramp_core::env::SystemEnv,
+                    )
+                    .await
+                    .map_err(|e| Error::S3Ingress(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
+        (built_blobs, cred)
+    };
+    // The serving object backend (REBOUND for a `boatramp:` base cred). Feeds the migration boot-scanner
+    // below + `serve_assembled`'s `NodeInput.storage`.
+    let storage = built_blobs.storage.clone();
+    // Seal-messaging residual: BIND the cross-node messaging payload-spill handle to THIS backend — the
+    // SAME sealed (post-KV-resolved) serving backend — so a `boatramp:` cluster's payload spill uses the
+    // sealed credential exactly like guest serving, NEVER the uncredentialed early backend. For
+    // `env:`/bare/absent base creds `built_blobs` is unchanged from the early build, so this binds the
+    // identical backend those forms already used (no regression). Done HERE — after the sealed
+    // resolution's fail-closed `?` above and BEFORE `serve_assembled` serves / any messaging traffic — so
+    // a resolution failure simply never binds (the handle stays fail-closed), consistent with the serve
+    // refusing on that failure.
+    messaging_spill.bind(storage.clone());
+    // The resolved base credential is consumed ONLY by the cloud blob-upload minter wiring below (gated
+    // on a `blob-upload-*` cloud feature); discard it explicitly otherwise to keep a non-cloud build
+    // warning-free without dropping the fail-closed resolution above.
+    #[cfg(not(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    )))]
+    let _ = &base_sealed_credential;
+    // Reverse lift #4 — per-project blob backends (`[serve.blob_backends]`), resolved against `node.kv`
+    // exactly as single-node does. Empty map (the common case) ⇒ no overrides (byte-identical). FAIL
+    // CLOSED (invariant 4) inside the builder on a kindless or unresolvable backend — never a silent
+    // global fallback. The handler runtime decorates + overlays them on the global default.
+    let per_project_blob_backends = build_per_project_blob_backends(
+        &serve_cfg.blob_backends,
+        kv.clone(),
+        config.secrets.as_ref(),
+        &data_dir,
+        options.posture.allow_env_secret_refs,
+    )
+    .await?;
+    // Reverse lift #5 — cloud blob-upload minter, wired post-KV from the SAME sealed base cred, at parity
+    // with single-node. `serve_assembled` performs the one wiring; `None` ⇒ unchanged (no cloud minter).
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = serve_cfg
+        .s3_ingress_cloud
+        .clone()
+        .map(|cloud| CloudBlobUpload {
+            blob_args: base_blob_args.clone(),
+            cloud,
+            // The SAME sealed base credential the serving backend uses (if any), or `None` ⇒ the ambient
+            // AWS env chain (unchanged).
+            sealed_credential: base_sealed_credential.clone(),
+            mint_max_ttl_secs: serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            mint_max_bytes: serve_cfg.s3_ingress_mint_max_bytes,
+        });
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────
+
     // Migration-safety (Finding-8 rewrite), cluster path — the same non-exiting discipline the
     // single-node path applies: `serve` NEVER re-homes on boot and NEVER exits on a below-version
     // store. A store below the current schema version is served on its EXISTING layout via the
@@ -4371,144 +4753,46 @@ async fn run_cluster(
     // no-op here and stays a documented operator step.)
     default_scope_libsql_notice(config, &data_dir, kv.as_ref()).await;
 
-    // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
-    if config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
-        options.cluster_rate_limit_kv = Some(kv.clone());
-    }
-    // SIGHUP also force-reloads the daemon config (the ApplyObserver already
-    // handles replicated `daemon/*` writes; this is the manual override).
-    spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
-    let cluster_serve_cfg = config.serve.clone().unwrap_or_default();
-    let auth = boatramp_node::auth::configure_auth(
-        cluster_serve_cfg.signer.as_ref(),
-        cluster_serve_cfg.auth_root_private_key.clone(),
-        cluster_serve_cfg.auth_root_public_key.clone(),
-        &mut options,
-        kv.clone(),
-        // Raft cluster = single-writer over a node-local store (replication keeps every node
-        // current); no shared-mode authz guard — the authz path is unchanged.
-        None,
-    )
-    .await?;
-    configure_oidc(&args, &mut options).await?;
-    // Fail-closed: don't expose an unauthenticated control plane on a public bind.
-    boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
+    // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes. Resolved here into the
+    // SharedServe `cluster_rate_limit_kv` input; `serve_assembled` sets it on `options`.
+    let cluster_rate_limit_kv: Option<Arc<dyn KvStore>> = config
+        .serve
+        .as_ref()
+        .is_some_and(|s| s.cluster_rate_limit)
+        .then(|| kv.clone());
 
-    // The mesh control hook: `POST /api/cluster/join` + `/rotate-key` reach the
-    // cluster runtime through it. Constructed after `configure_auth` so it carries
-    // the control-plane root signer (`options.issuer`) — the join flow mints
-    // root-signed member assertions with it.
-    options.mesh_control = Some(Arc::new(ClusterMeshControl {
-        node: node.clone(),
-        issuer: options.issuer.clone(),
-    }));
-    // Node-graph assembly, shared with the single-node path (`boatramp_node::assemble`):
-    // handler runtime, deploy store (+ reserved `default` project), compute + domain-
-    // verify reconcile loops. The cluster differences are threaded as `NodeInput`
-    // fields: the Raft messaging substrate, a Raft `is_leader` gate (cron firing +
-    // both reconcile loops run only on the leader), and this node's compute id.
+    // The Raft `is_leader` gate (cron firing + both reconcile loops run only on the leader).
     let leader_raft = node.raft.clone();
     let leader_node_id = node.node_id;
     let is_leader: boatramp_server::CronLeaderGate =
         Arc::new(move || boatramp_cluster::raft::is_leader(&leader_raft, leader_node_id));
-    let boatramp_node::RunningNode {
-        deploy,
-        handlers,
-        auth,
-        options,
-        reconcile,
-    } = boatramp_node::assemble(boatramp_node::NodeInput {
-        config,
-        data_dir: data_dir.as_path(),
-        storage,
-        // PLAN-per-project-blob-backend: the cluster path refused a non-empty `[serve.blob_backends]`
-        // up front (their sealed credentials need the replicated KV, unavailable at blob-build time),
-        // so there are never per-project backends here.
-        per_project_blob_backends: std::collections::HashMap::new(),
-        kv,
-        auth,
-        options,
-        serve_addr: Some(addr),
-        watch_provider: built_blobs.watch_provider.clone(),
-        provision_tier: built_blobs.provision_tier,
-        messaging: Some(node.messaging.clone()),
-        is_leader,
-        node_id: node.node_id,
-        worker_exe: None,
-    })
-    .await?;
 
-    tracing::info!(tls = ?args.tls, "cluster: serving public traffic");
-    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
-    // `[serve.listeners.<name>]`, gated on the posture. Cluster path. Borrows `options.posture` before
-    // the TLS redirect below consumes it.
-    //
-    // DEFERRAL (cap-req 03 #4): when this node serves cluster-managed ACME certs (`TlsMode::AcmeDns`)
-    // in an `acme-dns` build, the spawn is deferred into `serve_cluster_acme_dns`, which builds the one
-    // on-demand engine (DNS provider + cert store in hand) and spawns the listeners with its shared
-    // resolver — so a listener that opts into on-demand issues through the *same* engine as the edge.
-    // Every other mode (and every `not(acme-dns)` build, where the `AcmeDns` arm calls `serve_acme_dns`
-    // which does NOT spawn listeners) spawns here with no on-demand resolver.
-    #[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
-    let defer_listeners = matches!(args.tls, TlsMode::AcmeDns);
-    #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
-    let defer_listeners = false;
-    #[cfg(feature = "tcp-listener")]
-    if !defer_listeners {
-        spawn_listeners(
-            &cluster_serve_cfg.listeners,
-            &options.posture,
-            &handlers,
-            &deploy,
-            None,
-        );
-    }
-    #[cfg(feature = "tls")]
-    if !matches!(args.tls, TlsMode::Off) {
-        let redirect = config.serve.as_ref().and_then(|s| s.http_redirect_addr);
-        if let Some(redirect_addr) = redirect {
-            spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
-        }
-    }
-    // Optionally bind the dedicated local S3-ingress listener. In cluster mode the deployment is
-    // treated as MULTI-NODE — so the fail-closed guard REQUIRES an explicitly configured, cluster-
-    // uniform `s3_ingress_secret_file` (never a per-node auto-generated key, which would make
-    // credentials un-verifiable across nodes).
-    if let Some(s3_addr) = cluster_serve_cfg.s3_ingress_addr {
-        spawn_s3_ingress(
-            s3_addr,
-            deploy.clone(),
-            &auth,
-            &options,
-            cluster_serve_cfg.s3_ingress_secret_file.clone(),
-            boatramp_server::s3_ingress::config::Deployment::MultiNode,
-            #[cfg(feature = "blob-upload")]
-            &handlers,
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg.s3_ingress_public_url.clone(),
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg
-                .s3_ingress_mint_max_ttl_secs
-                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg.s3_ingress_mint_max_bytes,
-        )?;
-    }
-    let serve_result = match args.tls {
-        TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
-            .await
-            .map_err(Error::Serve),
-        TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
-        TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
-        // Raw-public-key control channel: a self-signed RPK identity the client
-        // pins — no cluster cert management needed, so it serves like single-node.
-        TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
-        // Cluster-managed certs: the leader issues + stores in the
-        // replicated control plane; every node serves the replicated cert.
-        #[cfg(feature = "acme-dns")]
-        TlsMode::AcmeDns => {
-            // Wrap replicated cert private keys at rest when `[secrets]` is set. The envelope is also
-            // reused to wrap the on-demand ACME account credentials (cap-req 03 #2).
+    // The mesh control hook (`POST /api/cluster/join` + `/rotate-key`): built from the post-
+    // `configure_auth` root signer (`options.issuer`), which only exists inside `serve_assembled`, so
+    // hand in a builder closure over this node. The join flow mints root-signed member assertions.
+    let mesh_node = node.clone();
+    let mesh_control_builder: Option<MeshControlBuilder> = Some(Box::new(
+        move |opts: &boatramp_server::ServerOptions| -> Arc<dyn boatramp_server::MeshControl> {
+            Arc::new(ClusterMeshControl {
+                node: mesh_node.clone(),
+                issuer: opts.issuer.clone(),
+            })
+        },
+    ));
+
+    // Cluster cert refresh (replicated, leader-gated) + the on-demand engine ingredients (cap-req 03).
+    // The cert store/envelope are built ONLY for `--tls acme-dns` (so a non-AcmeDns cluster with a
+    // misconfigured `[secrets.vault]` does not fail at startup); for every other mode a throwaway
+    // `KvCertStore` (no envelope read) fills the field, which the non-AcmeDns serve arm never touches.
+    #[cfg(feature = "acme-dns")]
+    let (cert_refresh, on_demand) = {
+        let cert_raft = node.raft.clone();
+        let cert_node_id = node.node_id;
+        let is_leader_certs: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id));
+        if matches!(args.tls, TlsMode::AcmeDns) {
+            // Wrap replicated cert private keys at rest when `[secrets]` is set; the envelope is reused
+            // to wrap the on-demand ACME account credentials (cap-req 03 #2).
             let cert_envelope = build_cert_envelope(config.secrets.as_ref(), &data_dir)?;
             let cert_store: Arc<dyn boatramp_core::cert::CertStore> = match &cert_envelope {
                 Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
@@ -4517,44 +4801,40 @@ async fn run_cluster(
                 )),
                 None => Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
             };
-            let cert_raft = node.raft.clone();
-            let cert_node_id = node.node_id;
-            // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. The
-            // engine is built INSIDE `serve_cluster_acme_dns` (where the ACME DNS provider is in scope,
-            // so `dns-01` on-demand works too) and held alive across the serve. The replicated KV +
-            // envelope persist the ACME account across restarts/replicas (#2).
-            let on_demand_cfg = config.serve.as_ref().and_then(|s| s.on_demand_tls.clone());
-            serve_cluster_acme_dns(
-                &args,
-                addr,
-                deploy,
-                auth,
-                handlers,
-                options,
-                cert_store,
-                move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id),
-                on_demand_cfg,
-                node.kv.clone(),
-                cert_envelope,
-                // Deferred listener spawn (cap-req 03 #4): these bind inside, with the on-demand engine.
-                #[cfg(feature = "tcp-listener")]
-                &cluster_serve_cfg.listeners,
+            let on_demand = config
+                .serve
+                .as_ref()
+                .and_then(|s| s.on_demand_tls.clone())
+                .map(|cfg| OnDemandBuild {
+                    cfg,
+                    cert_store: cert_store.clone(),
+                    is_leader: is_leader_certs.clone(),
+                    account_kv: node.kv.clone(),
+                    account_envelope: cert_envelope,
+                });
+            (
+                CertRefresh::Replicated {
+                    cert_store,
+                    is_leader: is_leader_certs,
+                },
+                on_demand,
             )
-            .await
+        } else {
+            (
+                CertRefresh::Replicated {
+                    cert_store: Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
+                    is_leader: is_leader_certs,
+                },
+                None,
+            )
         }
-        #[cfg(not(feature = "acme-dns"))]
-        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
 
-    // Graceful shutdown (Part A, cluster): the serve future has returned (and has already quiesced
-    // the scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
-    // variant on its own tail). Abort+await the reconcile loops,
-    // THEN shut down Raft, THEN cleanly CLOSE the node-local durable Raft store. The Raft shutdown
-    // MUST precede the store close: a write/apply after the store is marked closed would lose a
-    // committed log/state entry or desync the log vs the state machine (the cluster's correctness
-    // boundary). `close()` (not the old bare `flush()`) then advances the durable frontier so the
-    // next cold open replays an empty WAL range. Bounded by the configurable `[serve.kv]
-    // close_deadline` (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
+    // Graceful shutdown (Part A, cluster): shut down Raft BEFORE the node-local durable store close —
+    // a write/apply after the store is marked closed would lose a committed log/state entry or desync
+    // the log vs the state machine (the cluster's correctness boundary). `quiesce_and_close` (inside
+    // `serve_assembled`) runs this before the close; `close()` then advances the durable frontier so
+    // the next cold open replays an empty WAL range.
     let raft = node.raft.clone();
     let raft_shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(async move {
@@ -4564,262 +4844,154 @@ async fn run_cluster(
                 tracing::info!("cluster: raft shut down on graceful stop");
             }
         });
-    quiesce_and_close(
-        durable_kv_handle,
-        reconcile,
-        Some(raft_shutdown),
-        kv_close_deadline,
-    )
-    .await;
-    serve_result
+
+    // ONE shared serve tail. The forked cluster SUBSTRATE (Raft KV/log, mesh identity + trust, join/
+    // bootstrap, key rotation) was built above + migration/default-scope already ran; every genuine
+    // cluster-vs-single-node difference below is a SharedServe field. `per_project_blob_backends` + the
+    // cloud minter are now POPULATED by the Stage-C deferred blob pass above (reverse lifts #4/#5/#6).
+    serve_assembled(SharedServe {
+        addr,
+        config,
+        data_dir,
+        args,
+        options,
+        built_blobs,
+        // PLAN-serve-single-cluster-parity Stage C (reverse lift #4): built in the post-KV pass above,
+        // resolved against the replicated control-plane KV (empty map ⇒ no overrides, unchanged).
+        per_project_blob_backends,
+        kv,
+        kv_handle: durable_kv_handle,
+        close_deadline: kv_close_deadline,
+        is_leader,
+        node_id: node.node_id,
+        messaging: Some(node.messaging.clone()),
+        // Raft cluster = single-writer over a node-local store; no shared-mode authz guard.
+        shared_authz: None,
+        cluster_rate_limit_kv,
+        deployment: boatramp_server::s3_ingress::config::Deployment::MultiNode,
+        registry_fence: None,
+        mesh_control_builder,
+        // `None` ⇒ the cluster "serving public traffic" startup log.
+        startup_blob_backend: None,
+        #[cfg(feature = "acme-dns")]
+        cert_refresh,
+        #[cfg(feature = "acme-dns")]
+        on_demand,
+        // Cloud blob-upload minter (reverse lift #5): built in the post-KV pass above from the sealed
+        // base cred; `None` ⇒ unchanged (no cloud minter configured).
+        #[cfg(any(
+            feature = "blob-upload-aws",
+            feature = "blob-upload-gcs",
+            feature = "blob-upload-azure"
+        ))]
+        cloud_blob_upload,
+        raft_shutdown: Some(raft_shutdown),
+        on_pre_close: None,
+        on_post_close: None,
+    })
+    .await
 }
 
-/// Serve HTTPS with **cluster-managed** ACME DNS-01 certs:
-/// the leader issues each cert (sole writer of the DNS-01 TXT — no races) and
-/// stores it in the replicated control plane; every node loads the stored cert
-/// and serves it, hot-swapping on renewal. The live CA round-trip needs
-/// live-platform validation; the store↔serve bridge + leader-gating are unit-tested
-/// (`crate::cluster_tls`).
-#[cfg(all(feature = "cluster", feature = "acme-dns"))]
-#[allow(clippy::too_many_arguments)]
-async fn serve_cluster_acme_dns(
-    args: &ServeArgs,
-    addr: SocketAddr,
-    deploy: DeployStore,
-    auth: boatramp_server::Auth,
-    handlers: boatramp_server::HandlerRuntime,
-    options: boatramp_server::ServerOptions,
+/// How the STATIC (wildcard/domain) cert set is refreshed by the unified AcmeDns serve arm — the
+/// Pair-1 consolidation seam. Used by BOTH the init pass and the 6h renewal loop.
+#[cfg(feature = "acme-dns")]
+#[derive(Clone)]
+enum CertRefresh {
+    /// Single-node: obtain + cache each cert on the local FILESYSTEM (`obtain_all`). One node, so
+    /// every pass issues directly (always the leader); the DNS-reconcile gate is `|| true`.
+    Local,
+    /// Cluster: the leader issues + stores each cert in the REPLICATED cert store; every node loads
+    /// whatever is stored (`cluster_refresh_certs`, leader-gated). A follower awaiting the leader sees
+    /// an empty set and serves nothing yet (unless on-demand fronts it); the reconcile gate is the
+    /// Raft `is_leader`.
+    #[cfg(feature = "cluster")]
+    Replicated {
+        cert_store: Arc<dyn boatramp_core::cert::CertStore>,
+        is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+    },
+}
+
+#[cfg(feature = "acme-dns")]
+impl CertRefresh {
+    /// One refresh pass over `domains`: issue (or load) the static certs, returning the `(SNI, cert)`
+    /// entries to serve. Shared by the init pass and the renewal loop.
+    async fn run(
+        &self,
+        domains: &[String],
+        base: &boatramp_acme::acme::CertRequest,
+        provider: &Arc<dyn boatramp_acme::dns::DnsProvider>,
+        cache: &Path,
+    ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
+        match self {
+            Self::Local => obtain_all(domains, base, provider.as_ref(), cache).await,
+            #[cfg(feature = "cluster")]
+            Self::Replicated {
+                cert_store,
+                is_leader,
+            } => {
+                cluster_refresh_certs(cert_store, domains, is_leader(), provider, base, cache).await
+            }
+        }
+    }
+
+    /// The leader gate for the custom-domain DNS reconcile loop: single-node is always the sole writer
+    /// (`|| true`); a cluster gates on the Raft leader so only one node ever writes a zone.
+    fn reconcile_gate(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        match self {
+            Self::Local => Arc::new(|| true),
+            #[cfg(feature = "cluster")]
+            Self::Replicated { is_leader, .. } => is_leader.clone(),
+        }
+    }
+}
+
+/// The single-node on-demand-TLS build decision (anti-inert guard). The per-SNI engine is built only
+/// for `--tls acme-dns` AND an enabled `[serve.on_demand_tls]`. Extracted so the decision that was once
+/// silently hardcoded to "never" — a `None` handed to `spawn_listeners` on the single-node path — is
+/// unit-tested and can never regress back to inert.
+#[cfg(feature = "acme-dns")]
+fn single_node_on_demand_enabled(
+    tls: TlsMode,
+    cfg: Option<&boatramp_node::config::OnDemandTlsConfig>,
+) -> bool {
+    matches!(tls, TlsMode::AcmeDns) && cfg.is_some_and(|c| c.enabled)
+}
+
+/// Whether an empty STATIC cert set is fatal for the AcmeDns serve arm: it is, UNLESS an on-demand
+/// engine is serving per-SNI issuance (then the empty static set is served purely on-demand). This
+/// preserves the cluster follower-awaiting-leader semantics (no on-demand ⇒ bail with `NoCertsYet`)
+/// while allowing a serve-purely-on-demand node.
+#[cfg(feature = "acme-dns")]
+fn no_static_certs_is_fatal(entries_empty: bool, has_on_demand: bool) -> bool {
+    entries_empty && !has_on_demand
+}
+
+/// The ingredients the unified AcmeDns serve arm needs to build the on-demand per-SNI engine (cap-req
+/// 03) where the DNS provider is in scope. Single-node: a `KvCertStore` over the control-plane `kv` +
+/// an always-`|| true` leader; cluster: the replicated cert store + the Raft leader (the SAME
+/// `cert_store`/`is_leader` the `Replicated` refresh uses). `None` ⇒ no on-demand issuance.
+#[cfg(feature = "acme-dns")]
+struct OnDemandBuild {
+    cfg: boatramp_node::config::OnDemandTlsConfig,
     cert_store: Arc<dyn boatramp_core::cert::CertStore>,
-    is_leader: impl Fn() -> bool + Send + Sync + Clone + 'static,
-    on_demand_cfg: Option<boatramp_node::config::OnDemandTlsConfig>,
+    is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
     account_kv: Arc<dyn boatramp_core::kv::KvStore>,
     account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
-    // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
-    // the on-demand engine built below. Spawned once the resolver exists.
-    #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
-        String,
-        boatramp_node::config::ListenerConfig,
-    >,
-) -> Result<()> {
-    use boatramp_acme::acme::CertRequest;
-    use std::time::Duration;
+}
 
-    if args.acme_domain.is_empty() {
-        return Err(Error::NoAcmeDomainDns);
-    }
-    install_crypto_provider();
-
-    let kind = parse_dns_provider(&args.acme_dns_provider)?;
-    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
-        crate::acme_dns::build_provider(kind).await?.into();
-    // On-demand per-SNI issuance (cap-req 03): build the engine here, where the ACME DNS provider is
-    // in hand (so a `dns-01` challenge works), with the #02 allowlist (`deploy`), the replicated cert
-    // store, and the leader gate. `on_demand_engine` is held for the whole serve; `on_demand` is its
-    // resolver, composed with the static wildcard resolver at every config (re)build below.
-    let on_demand_engine: Option<Arc<crate::on_demand_tls::OnDemandTls>> = on_demand_cfg
-        .and_then(|cfg| {
-            crate::on_demand_tls::from_serve_config(
-                &cfg,
-                deploy.clone(),
-                cert_store.clone(),
-                Arc::new(is_leader.clone()),
-                Some(provider.clone()),
-                account_kv.clone(),
-                account_envelope.clone(),
-                args.acme_ca_cert.clone(),
-            )
-        })
-        .map(Arc::new);
-    // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
-    // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
-    let on_demand = on_demand_engine.as_ref().map(|e| e.resolver());
-    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists, bind the
-    // host-owned inbound-TCP listeners sharing it — a listener that opts in issues per-SNI through
-    // this same engine (one budget, one certreq single-flight). `on_demand.clone()` is `None` when
-    // on-demand TLS is disabled, so listeners then serve only their own static cert, exactly as the
-    // non-AcmeDns path would. (Spawned below, after the edge-cert readiness guard, so a node that bails
-    // with `NoCertsYet` never briefly binds listeners.)
-    let base = CertRequest {
-        directory_url: args.acme_directory.clone(),
-        contact_email: args.acme_contact.clone(),
-        domains: Vec::new(),
-        dns_ttl: 60,
-        propagation_wait: Duration::from_secs(args.acme_propagation_wait_secs),
-        propagation_poll_interval: Duration::from_secs(args.acme_propagation_poll_interval_secs),
-        timeout: Duration::from_secs(120),
-        extra_root_ca: args.acme_ca_cert.clone(),
-    };
-    let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
-    let cache = args.acme_cache.clone();
-
-    // Initial pass: the leader issues any missing cert + stores it; all nodes
-    // load whatever is in the replicated store.
-    let entries =
-        cluster_refresh_certs(&cert_store, &domains, is_leader(), &provider, &base, &cache).await?;
-    if entries.is_empty() {
-        return Err(Error::NoCertsYet);
-    }
-    // Deferred listener spawn (cap-req 03 #4): the on-demand resolver exists and the edge cert is
-    // ready, so bind the host-owned inbound-TCP listeners sharing that resolver — a listener that opts
-    // in issues per-SNI through this same engine (one budget, one certreq single-flight). `on_demand`
-    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
-    // exactly as the non-AcmeDns path would. Done before `options`/`handlers`/`deploy` are consumed by
-    // the serve below.
-    #[cfg(feature = "tcp-listener")]
-    spawn_listeners(
-        listeners,
-        &options.posture,
-        &handlers,
-        &deploy,
-        on_demand_engine.clone(),
-    );
-    // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same
-    // ACME certs (build_server_configs gives a `h3`-ALPN config off one resolver);
-    // its cert is hot-swapped on renewal below, exactly as the TCP path reloads.
-    // When on-demand TLS is enabled, the config composes the static wildcard certs with the
-    // per-SNI on-demand resolver (cap-req 03); otherwise it is the static resolver alone (unchanged).
-    #[cfg(feature = "http3")]
-    let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) = crate::acme_dns::build_server_configs_maybe(entries, on_demand.clone())?;
-        let endpoint =
-            boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
-        (tcp, Some(endpoint))
-    } else {
-        (
-            crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?,
-            None,
-        )
-    };
-    #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?;
-    let tls = boatramp_server::ReloadableTls::new(config);
-
-    // Background renewal: re-run the leader-gated pass and hot-swap (TCP + h3).
-    {
-        let (tls, cert_store, provider, base, cache, domains, is_leader, on_demand) = (
-            tls.clone(),
-            cert_store.clone(),
-            provider.clone(),
-            base.clone(),
-            cache.clone(),
-            domains.clone(),
-            is_leader.clone(),
-            on_demand.clone(),
-        );
-        #[cfg(feature = "http3")]
-        let h3_renew = h3_endpoint.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                match cluster_refresh_certs(
-                    &cert_store,
-                    &domains,
-                    is_leader(),
-                    &provider,
-                    &base,
-                    &cache,
-                )
-                .await
-                {
-                    Ok(entries) if !entries.is_empty() => {
-                        #[cfg(feature = "http3")]
-                        if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs_maybe(
-                                entries,
-                                on_demand.clone(),
-                            ) {
-                                Ok((tcp, h3)) => {
-                                    tls.reload(tcp);
-                                    match boatramp_server::quinn_server_config(h3) {
-                                        Ok(qc) => endpoint.set_server_config(Some(qc)),
-                                        Err(err) => {
-                                            tracing::error!(%err, "cluster acme-dns: rebuilding h3 config failed");
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                                }
-                            }
-                        } else {
-                            match crate::acme_dns::build_server_config_maybe(
-                                entries,
-                                on_demand.clone(),
-                            ) {
-                                Ok(config) => tls.reload(config),
-                                Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                                }
-                            }
-                        }
-                        #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())
-                        {
-                            Ok(config) => tls.reload(config),
-                            Err(err) => {
-                                tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                            }
-                        }
-                    }
-                    Ok(_) => {} // nothing stored yet (follower awaiting the leader)
-                    Err(err) => tracing::error!(%err, "cluster acme-dns: renewal failed"),
-                }
-            }
-        });
-    }
-
-    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
-    // "unwired core": `plan_reconcile` existed with zero live callers). Leader-gated
-    // with the SAME `is_leader` + provider as the cert renewal above, so only the
-    // Raft leader ever writes a zone — no split-brain double-writes. Opt-in via
-    // `--dns-target`; unset leaves this inert and `dns configure-domain` remains the
-    // manual, one-shot path.
-    if let Some(target) = args.dns_target.as_deref() {
-        crate::acme_dns::spawn_dns_reconcile(
-            deploy.clone(),
-            provider.clone(),
-            args.acme_dns_provider.clone(),
-            crate::dns::parse_target(target),
-            args.dns_reconcile_ttl,
-            is_leader.clone(),
-            Duration::from_secs(args.dns_reconcile_tick_secs),
-        );
-    }
-
-    tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses (on the
-    // bypass too, so a hot-path response advertises h3 identically to the router).
-    #[cfg(feature = "http3")]
-    let (app, fast) = if let Some(endpoint) = h3_endpoint {
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
-                tracing::error!(%err, "cluster acme-dns: HTTP/3 listener failed");
-            }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
-    } else {
-        (app, fast)
-    };
-    let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
-            .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+/// The cloud blob-upload minter wiring (M4), carried as a SharedServe input so the single-node path
+/// (today) and the sequenced cluster lift (Stage C) share ONE wiring site in `serve_assembled`.
+#[cfg(any(
+    feature = "blob-upload-aws",
+    feature = "blob-upload-gcs",
+    feature = "blob-upload-azure"
+))]
+struct CloudBlobUpload {
+    blob_args: BlobArgs,
+    cloud: boatramp_node::config::S3IngressCloud,
+    sealed_credential: Option<boatramp_node::s3_credential::SealedS3Credential>,
+    mint_max_ttl_secs: u64,
+    mint_max_bytes: Option<u64>,
 }
 
 /// One leader-gated refresh pass: per domain, the leader issues (live CA, via
@@ -4873,12 +5045,16 @@ pub(crate) fn parse_dns_provider(value: &str) -> Result<crate::acme_dns::DnsProv
         .map_err(|_| Error::UnknownDnsProvider(value.to_string()))
 }
 
-/// Serve HTTPS with ACME **DNS-01** certificates (wildcards included). Obtains
-/// each `--acme-domain` (and, with `--acme-wildcard-preview`, its
-/// `*.deploy.<domain>`) via the configured DNS provider, serves them by SNI,
-/// and renews in the background. The live CA + DNS round-trip is the
+/// Serve HTTPS with ACME **DNS-01** certificates (wildcards included) — the ONE handler for single-
+/// node AND cluster (the Pair-1 consolidation of the old `serve_acme_dns` + `serve_cluster_acme_dns`).
+/// Obtains each `--acme-domain` (and, with `--acme-wildcard-preview`, its `*.deploy.<domain>`) via the
+/// configured DNS provider, serves them by SNI, renews in the background, and — when `on_demand` is set
+/// — fronts per-SNI on-demand issuance (cap-req 03) through ONE shared engine (edge resolver + opted-in
+/// listeners). `cert_refresh` drives the static set: `Local` on single-node (filesystem `obtain_all`),
+/// `Replicated` on a cluster (the leader-gated replicated store). The live CA + DNS round-trip is the
 /// integration seam (validated against a Pebble/staging directory + real zone).
 #[cfg(feature = "acme-dns")]
+#[allow(clippy::too_many_arguments)]
 async fn serve_acme_dns(
     args: &ServeArgs,
     addr: SocketAddr,
@@ -4886,10 +5062,17 @@ async fn serve_acme_dns(
     auth: boatramp_server::Auth,
     handlers: boatramp_server::HandlerRuntime,
     options: boatramp_server::ServerOptions,
+    cert_refresh: CertRefresh,
+    on_demand: Option<OnDemandBuild>,
+    // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
+    // the on-demand engine built below. Spawned once the resolver exists.
+    #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
+        String,
+        boatramp_node::config::ListenerConfig,
+    >,
 ) -> Result<()> {
-    use std::time::Duration;
-
     use boatramp_acme::acme::CertRequest;
+    use std::time::Duration;
 
     if args.acme_domain.is_empty() {
         return Err(Error::NoAcmeDomainDns);
@@ -4897,7 +5080,30 @@ async fn serve_acme_dns(
     install_crypto_provider();
 
     let kind = parse_dns_provider(&args.acme_dns_provider)?;
-    let provider = crate::acme_dns::build_provider(kind).await?;
+    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
+        crate::acme_dns::build_provider(kind).await?.into();
+    // On-demand per-SNI issuance (cap-req 03): build the engine HERE, where the ACME DNS provider is in
+    // hand (so a `dns-01` challenge works), from the ingredients the serve path chose (single-node: a
+    // KvCertStore over the local kv + an always-`|| true` leader; cluster: the replicated store + the
+    // Raft leader). `on_demand_engine` is held for the whole serve; `on_demand_resolver` is its edge
+    // resolver, composed with the static resolver at every config (re)build below.
+    let on_demand_engine: Option<Arc<crate::on_demand_tls::OnDemandTls>> = on_demand
+        .and_then(|od| {
+            crate::on_demand_tls::from_serve_config(
+                &od.cfg,
+                deploy.clone(),
+                od.cert_store,
+                od.is_leader,
+                Some(provider.clone()),
+                od.account_kv,
+                od.account_envelope,
+                args.acme_ca_cert.clone(),
+            )
+        })
+        .map(Arc::new);
+    // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
+    // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
+    let on_demand_resolver = on_demand_engine.as_ref().map(|e| e.resolver());
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),
@@ -4909,40 +5115,73 @@ async fn serve_acme_dns(
         extra_root_ca: args.acme_ca_cert.clone(),
     };
     let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
+    let cache = args.acme_cache.clone();
 
-    // Obtain (or load cached) certs for every domain up front.
-    let entries = obtain_all(&domains, &base, provider.as_ref(), &args.acme_cache).await?;
-    // HTTP/3: a QUIC endpoint sharing the same ACME certs, hot-swapped on
-    // renewal below.
+    // Initial pass: obtain/load the static set (cluster: the leader issues + stores; every node loads).
+    let entries = cert_refresh.run(&domains, &base, &provider, &cache).await?;
+    // An empty static set with NO on-demand engine means there is nothing to serve yet — the cluster
+    // follower "awaiting the leader to issue" semantics (preserved). With an on-demand engine, serve
+    // purely on-demand (per-SNI issuance fronts the empty static set).
+    if no_static_certs_is_fatal(entries.is_empty(), on_demand_engine.is_some()) {
+        return Err(Error::NoCertsYet);
+    }
+    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists and the edge cert
+    // is ready, bind the host-owned inbound-TCP listeners sharing that engine — a listener that opts in
+    // issues per-SNI through this SAME engine (one budget, one certreq single-flight). `on_demand_engine`
+    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
+    // exactly as the non-AcmeDns path would.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(
+        listeners,
+        &options.posture,
+        &handlers,
+        &deploy,
+        on_demand_engine.clone(),
+    );
+    // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same certs (hot-swapped on renewal
+    // below). When on-demand TLS is enabled, the config composes the static certs with the per-SNI
+    // on-demand resolver (cap-req 03); otherwise it is the static resolver alone (`_maybe(_, None)`).
     #[cfg(feature = "http3")]
     let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) = crate::acme_dns::build_server_configs(entries)?;
+        let (tcp, h3) =
+            crate::acme_dns::build_server_configs_maybe(entries, on_demand_resolver.clone())?;
         let endpoint =
             boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
         (tcp, Some(endpoint))
     } else {
-        (crate::acme_dns::build_server_config(entries)?, None)
+        (
+            crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?,
+            None,
+        )
     };
     #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config(entries)?;
+    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?;
     let tls = boatramp_server::ReloadableTls::new(config);
 
-    // Background renewal: re-load (reissuing any near-expiry cert) and hot-swap
-    // the served config (TCP + h3), so the process never needs a restart to renew.
+    // Background renewal: re-run the refresh pass and hot-swap the served config (TCP + h3).
     {
-        let (tls, base, cache) = (tls.clone(), base.clone(), args.acme_cache.clone());
-        let domains = domains.clone();
-        let provider = crate::acme_dns::build_provider(kind).await?;
+        let (tls, provider, base, cache, domains, on_demand_resolver, renew_refresh) = (
+            tls.clone(),
+            provider.clone(),
+            base.clone(),
+            cache.clone(),
+            domains.clone(),
+            on_demand_resolver.clone(),
+            cert_refresh.clone(),
+        );
         #[cfg(feature = "http3")]
         let h3_renew = h3_endpoint.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                match obtain_all(&domains, &base, provider.as_ref(), &cache).await {
-                    Ok(entries) => {
+                match renew_refresh.run(&domains, &base, &provider, &cache).await {
+                    Ok(entries) if !entries.is_empty() => {
                         #[cfg(feature = "http3")]
                         if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs(entries) {
+                            match crate::acme_dns::build_server_configs_maybe(
+                                entries,
+                                on_demand_resolver.clone(),
+                            ) {
                                 Ok((tcp, h3)) => {
                                     tls.reload(tcp);
                                     match boatramp_server::quinn_server_config(h3) {
@@ -4957,7 +5196,10 @@ async fn serve_acme_dns(
                                 }
                             }
                         } else {
-                            match crate::acme_dns::build_server_config(entries) {
+                            match crate::acme_dns::build_server_config_maybe(
+                                entries,
+                                on_demand_resolver.clone(),
+                            ) {
                                 Ok(config) => tls.reload(config),
                                 Err(err) => {
                                     tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
@@ -4965,75 +5207,49 @@ async fn serve_acme_dns(
                             }
                         }
                         #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config(entries) {
+                        match crate::acme_dns::build_server_config_maybe(
+                            entries,
+                            on_demand_resolver.clone(),
+                        ) {
                             Ok(config) => tls.reload(config),
                             Err(err) => {
                                 tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                             }
                         }
                     }
+                    Ok(_) => {} // nothing stored yet (cluster follower awaiting the leader)
                     Err(err) => tracing::error!(%err, "acme-dns: renewal failed"),
                 }
             }
         });
     }
 
-    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
-    // "unwired core": `plan_reconcile` existed with zero live callers). Single-node
-    // is always the sole writer (no cluster, no leader lease to race), so the gate
-    // here is simply `|| true` — the same shape `serve_cluster_acme_dns` gates on its
-    // real `is_leader`. Opt-in via `--dns-target`; unset leaves this inert and `dns
-    // configure-domain` remains the manual, one-shot path.
+    // Custom-domain DNS reconcile (capability #24 Stage 6): leader-gated with the SAME gate the cert
+    // refresh uses (single-node `|| true`; cluster the Raft leader) so only one node ever writes a
+    // zone — no split-brain double-writes. Opt-in via `--dns-target`; unset leaves this inert and
+    // `dns configure-domain` remains the manual, one-shot path.
     if let Some(target) = args.dns_target.as_deref() {
-        let dns_provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
-            crate::acme_dns::build_provider(kind).await?.into();
+        let gate = cert_refresh.reconcile_gate();
         crate::acme_dns::spawn_dns_reconcile(
             deploy.clone(),
-            dns_provider,
+            provider.clone(),
             args.acme_dns_provider.clone(),
             crate::dns::parse_target(target),
             args.dns_reconcile_ttl,
-            || true,
+            move || gate(),
             Duration::from_secs(args.dns_reconcile_tick_secs),
         );
     }
 
     tracing::info!(%addr, domains = ?domains, "serving HTTPS (ACME DNS-01)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    #[cfg(feature = "http3")]
-    let (app, fast) = if let Some(endpoint) = h3_endpoint {
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
-                tracing::error!(%err, "acme-dns: HTTP/3 listener failed");
-            }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
-    } else {
-        (app, fast)
-    };
-    let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
-            .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    serve_router_over_tls(
+        addr,
+        tls,
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        h3_endpoint,
+    )
+    .await
 }
 
 /// Obtain (or load) every domain's cert, returning `(SNI-pattern, cert)` pairs.
@@ -5117,6 +5333,67 @@ async fn configure_oidc(
     Ok(())
 }
 
+/// The shared tail of every TLS serve variant (`serve_custom` / `serve_acme` / `serve_rpk` + the
+/// unified AcmeDns arm): spawn the background scheduler, build the router (+ fast path), optionally
+/// stand up + advertise HTTP/3 over a prepared QUIC endpoint, serve over `tls` until shutdown, then
+/// fully quiesce the scheduler BEFORE the caller's `quiesce_and_close` closes the store (Part A — no
+/// scheduler task may land a KV write into a fresh WAL segment after `close()`). Extracting this kills
+/// the exact five-copy drift class that once let on-demand TLS be silently omitted from one serve path.
+/// `http3_endpoint` is a prepared [`boatramp_server::Http3Endpoint`] (so an ACME path can hot-swap its
+/// cert on the SAME endpoint via `set_server_config`), or `None` to serve TCP only.
+#[cfg(feature = "tls")]
+async fn serve_router_over_tls(
+    addr: SocketAddr,
+    tls: boatramp_server::ReloadableTls,
+    serve: (
+        DeployStore,
+        boatramp_server::Auth,
+        boatramp_server::HandlerRuntime,
+        boatramp_server::ServerOptions,
+    ),
+    #[cfg(feature = "http3")] http3_endpoint: Option<boatramp_server::Http3Endpoint>,
+) -> Result<()> {
+    let (deploy, auth, handlers, options) = serve;
+    // Background scheduler (consumers/crons) — must run under TLS too, not only `--tls off`; in cluster
+    // mode its cron tick is gated on `is_leader`. The handle is fully quiesced on graceful shutdown
+    // (below) so no scheduler task can issue a KV write after the store is closed (Part A).
+    #[cfg(feature = "handlers")]
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
+    // Serve h3 over the prepared QUIC endpoint (sharing the port + the same router) and advertise it
+    // (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 — without the header the h3 listener
+    // is never discovered. The bypass gets the same Alt-Svc so a hot-path response advertises h3
+    // identically to the router.
+    #[cfg(feature = "http3")]
+    let (app, fast) = if let Some(endpoint) = http3_endpoint {
+        let app_h3 = app.clone();
+        tokio::spawn(async move {
+            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
+                tracing::error!(%err, "HTTP/3 listener failed");
+            }
+        });
+        (
+            boatramp_server::advertise_http3(app, addr.port()),
+            fast.advertise_http3(addr.port()),
+        )
+    } else {
+        (app, fast)
+    };
+    let serve_result =
+        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
+            .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
+    Ok(())
+}
+
 #[cfg(feature = "tls")]
 async fn serve_custom(
     args: &ServeArgs,
@@ -5136,52 +5413,43 @@ async fn serve_custom(
         .with_single_cert(certs, private_key)?;
     config.alpn_protocols = boatramp_server::alpn_h1_h2();
     tracing::info!(%addr, "serving HTTPS (custom certificate)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-
-    // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
-    // advertise it (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 —
-    // without the header the h3 listener is never discovered. The bypass gets the same
-    // Alt-Svc so a hot-path response advertises h3 identically.
+    // Optionally serve HTTP/3 on the same UDP port, feeding the same router. The `--tls custom` path
+    // uses a STATIC cert (no renewal), so the QUIC endpoint is prepared here from the SAME cert/key and
+    // handed to the shared tail, which advertises + serves it exactly as the ACME paths do. A failed
+    // h3 setup is logged and serving continues over TCP (never a hard serve failure), matching the
+    // prior in-task `serve_http3` error handling.
     #[cfg(feature = "http3")]
-    let (app, fast) = if args.http3 {
-        let (certs, key) = load_cert_chain_and_key(&cert, &key)?;
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3(addr, certs, key, app_h3).await {
+    let h3_endpoint = if args.http3 {
+        let build = || -> Result<boatramp_server::Http3Endpoint> {
+            let (h3_certs, h3_key) = load_cert_chain_and_key(&cert, &key)?;
+            let mut h3_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(h3_certs, h3_key)?;
+            // QUIC mandates exactly the `h3` ALPN on this listener.
+            h3_tls.alpn_protocols = vec![b"h3".to_vec()];
+            Ok(boatramp_server::http3_endpoint(
+                addr,
+                boatramp_server::quinn_server_config(h3_tls)?,
+            )?)
+        };
+        match build() {
+            Ok(endpoint) => Some(endpoint),
+            Err(err) => {
                 tracing::error!(%err, "HTTP/3 listener failed");
+                None
             }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
+        }
     } else {
-        (app, fast)
+        None
     };
-
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        h3_endpoint,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Serve the control-plane over **RFC 7250 raw-public-key TLS** (`--tls rpk`):
@@ -5253,26 +5521,14 @@ async fn serve_rpk(
         "control-plane RPK TLS identity — pin the client with:\n  --server-pubkey {fingerprint}"
     );
 
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        None,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Load a PEM cert chain + private key as DER — for the rustls `ServerConfig`
@@ -5347,30 +5603,14 @@ async fn serve_acme(
     });
 
     tracing::info!(%addr, domains = ?args.acme_domain, "serving HTTPS (ACME)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         rustls_config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        None,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Install a process-wide default rustls crypto provider (rustls 0.23 requires
@@ -5445,7 +5685,7 @@ mod tests {
         multi_writer_cluster_refusal,
     };
     // Per-project blob-backend fail-closed gates (PLAN-per-project-blob-backend) — NOT cluster-gated.
-    use super::{Error, build_per_project_blob_backends, cluster_per_project_backend_refusal};
+    use super::{Error, build_per_project_blob_backends};
     use boatramp_core::kv::WriterModel;
     use boatramp_node::backends::KvBackend;
     use boatramp_node::config::SqlKvConfig;
@@ -5454,6 +5694,90 @@ mod tests {
         SqlKvConfig {
             kind: kind.to_string(),
             ..Default::default()
+        }
+    }
+
+    /// Forward serve-path consolidation (PLAN Stage AB2): the decision guards + `CertRefresh`.
+    #[cfg(feature = "acme-dns")]
+    mod consolidation {
+        use super::super::{
+            CertRefresh, TlsMode, no_static_certs_is_fatal, single_node_on_demand_enabled,
+        };
+        use boatramp_node::config::OnDemandTlsConfig;
+
+        fn od(enabled: bool) -> OnDemandTlsConfig {
+            OnDemandTlsConfig {
+                enabled,
+                ..Default::default()
+            }
+        }
+
+        /// ANTI-INERT guard: single-node MUST build the on-demand engine for `--tls acme-dns` + an
+        /// enabled `[serve.on_demand_tls]` (the omission that produced the inert `None` to
+        /// `spawn_listeners`), and MUST NOT otherwise.
+        #[test]
+        fn single_node_on_demand_decision() {
+            assert!(
+                single_node_on_demand_enabled(TlsMode::AcmeDns, Some(&od(true))),
+                "acme-dns + enabled ⇒ engine is built (not inert None)"
+            );
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::AcmeDns,
+                Some(&od(false))
+            ));
+            assert!(!single_node_on_demand_enabled(TlsMode::AcmeDns, None));
+            // A non-acme-dns TLS mode never builds the on-demand engine.
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::Off,
+                Some(&od(true))
+            ));
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::Custom,
+                Some(&od(true))
+            ));
+        }
+
+        /// An empty static cert set is fatal ONLY without an on-demand engine (preserving the cluster
+        /// follower-awaiting-leader `NoCertsYet`); with on-demand, serve purely on-demand.
+        #[test]
+        fn empty_static_set_fatal_only_without_on_demand() {
+            assert!(
+                no_static_certs_is_fatal(true, false),
+                "empty + no on-demand ⇒ NoCertsYet (follower awaiting leader)"
+            );
+            assert!(
+                !no_static_certs_is_fatal(true, true),
+                "empty + on-demand ⇒ serve purely on-demand (not fatal)"
+            );
+            assert!(!no_static_certs_is_fatal(false, false));
+            assert!(!no_static_certs_is_fatal(false, true));
+        }
+
+        /// `CertRefresh::Local` (single-node) is always the sole writer, so its DNS-reconcile gate is
+        /// unconditionally `true`.
+        #[test]
+        fn local_reconcile_gate_is_always_leader() {
+            assert!(CertRefresh::Local.reconcile_gate()());
+        }
+
+        /// `CertRefresh::Replicated` (cluster) reflects the Raft `is_leader` through its reconcile gate.
+        #[cfg(feature = "cluster")]
+        #[test]
+        fn replicated_reconcile_gate_tracks_is_leader() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let leader = Arc::new(AtomicBool::new(false));
+            let seen = leader.clone();
+            let refresh = CertRefresh::Replicated {
+                cert_store: Arc::new(boatramp_core::cert::KvCertStore::new(Arc::new(
+                    boatramp_core::kv::MemoryKv::new(),
+                ))),
+                is_leader: Arc::new(move || seen.load(Ordering::SeqCst)),
+            };
+            let gate = refresh.reconcile_gate();
+            assert!(!gate(), "follower: not the writer");
+            leader.store(true, Ordering::SeqCst);
+            assert!(gate(), "leader: the reconcile gate tracks is_leader");
         }
     }
 
@@ -5527,24 +5851,51 @@ mod tests {
         );
     }
 
-    /// PLAN-per-project-blob-backend: a non-empty `[serve.blob_backends]` on the CLUSTER path is refused
-    /// LOUD (its sealed creds need the replicated KV, absent at blob-build time) — never silently
-    /// ignored into a global-backend fallback. An empty map proceeds (no refusal).
-    #[test]
-    fn cluster_refuses_per_project_backends() {
+    /// PLAN-serve-single-cluster-parity Stage C (reverse lift #4): a non-empty `[serve.blob_backends]` is
+    /// no longer REFUSED up front on the cluster path — it is DEFERRED to `run_cluster`'s post-KV pass,
+    /// where `build_per_project_blob_backends` resolves each backend against the now-up replicated KV and
+    /// populates the map (exactly as single-node). This asserts the exact call the deferred pass makes:
+    /// a valid per-project backend yields a POPULATED map (no up-front error), while an empty map is a
+    /// no-op. (The genuinely-invalid fail-closed cases are covered by the two tests above, which run the
+    /// same builder on both paths.)
+    #[tokio::test]
+    async fn cluster_defers_per_project_backends_and_builds_post_kv() {
         use boatramp_node::config::BlobBackendConfig;
+        let kv: std::sync::Arc<dyn boatramp_core::kv::KvStore> =
+            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // Empty map ⇒ no overrides, no error (byte-identical to a cluster without the section).
         let empty = std::collections::BTreeMap::new();
+        let built = build_per_project_blob_backends(
+            &empty,
+            kv.clone(),
+            None,
+            std::path::Path::new("/tmp"),
+            true,
+        )
+        .await
+        .expect("an empty [serve.blob_backends] builds an empty map, never an error");
         assert!(
-            cluster_per_project_backend_refusal(&empty).is_none(),
-            "an empty [serve.blob_backends] must NOT be refused on the cluster path"
+            built.is_empty(),
+            "no projects configured ⇒ empty override map"
         );
+
+        // A valid per-project backend (fs, no sealed cred) is now BUILT on the cluster path (deferred),
+        // not refused — the map is populated with the project's backend.
         let mut configs = std::collections::BTreeMap::new();
-        configs.insert("acme".to_string(), BlobBackendConfig::default());
-        let msg = cluster_per_project_backend_refusal(&configs)
-            .expect("a non-empty [serve.blob_backends] must be refused on the cluster path");
+        configs.insert(
+            "acme".to_string(),
+            BlobBackendConfig {
+                blobs: Some(boatramp_node::backends::BlobBackend::Fs),
+                ..Default::default()
+            },
+        );
+        let built = build_per_project_blob_backends(&configs, kv, None, std::path::Path::new("/tmp"), true)
+            .await
+            .expect("a valid per-project backend builds post-KV on the cluster path (deferred, not refused)");
         assert!(
-            msg.contains("cluster") && msg.contains("blob_backends"),
-            "the cluster refusal must name the cluster + the offending section; got: {msg}"
+            built.contains_key("acme") && built.len() == 1,
+            "the deferred post-KV pass populates the per-project override map"
         );
     }
 
@@ -5942,49 +6293,111 @@ mod tests {
         assert_eq!(parse_rotation_interval(""), None);
     }
 
-    /// #505 (MEDIUM-1): on the cluster serve path a `boatramp:<name>` node-cred is refused
-    /// STRUCTURALLY by the up-front scheme check (`boatramp_ref_name` ⇒ `BoatrampRefOnCluster`), NOT by
-    /// an incidental empty-store miss, while a legitimate `env:` misconfig resolves normally and
-    /// surfaces its OWN error — never the misleading cluster "use `env:`" suffix. This asserts the exact
-    /// composition the cluster branch performs (the branch itself needs a full Raft bring-up).
+    /// PLAN-serve-single-cluster-parity Stage C (reverse lift #6): on the cluster serve path a
+    /// `boatramp:<name>` base S3 cred is no longer REFUSED — it is DEFERRED by the up-front scheme check
+    /// (`boatramp_ref_name`) to `run_cluster`'s post-KV pass, which resolves it against `node.kv`. This
+    /// asserts the exact composition that pass performs (the branch itself needs a full Raft bring-up):
+    /// (1) the sealed secret unseals from the now-up KV; (1b) an ABSENT secret FAILS CLOSED (no unsealed
+    /// fallback); (2) a legitimate `env:` misconfig still resolves on the EARLY path and surfaces its OWN
+    /// error unwrapped.
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn cluster_path_refuses_boatramp_ref_structurally_and_surfaces_env_errors_unwrapped() {
+    async fn cluster_path_defers_boatramp_base_cred_resolves_post_kv_and_surfaces_env_errors() {
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
         use boatramp_node::config::S3CredentialConfig;
         use boatramp_node::s3_credential::{
             S3CredentialError, boatramp_ref_name, resolve_s3_credential,
         };
+        use std::sync::Arc;
 
-        // (1) STRUCTURAL refusal: the scheme check fires for a `boatramp:` ref, yielding the dedicated
-        // error, BEFORE any resolve touches a store. The cluster branch returns exactly this.
+        // A passthrough envelope: seal/unseal are identity, so a `SecretStore` round-trip exercises the
+        // KV keying + the resolver's unseal path without a real KEK.
+        struct IdentityEnvelope;
+        #[async_trait::async_trait]
+        impl boatramp_core::envelope::KeyEnvelope for IdentityEnvelope {
+            async fn wrap(
+                &self,
+                pt: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(pt.to_vec())
+            }
+            async fn unwrap(
+                &self,
+                ct: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(ct.to_vec())
+            }
+        }
+
         let cfg = S3CredentialConfig {
             access_key_id: "AKID-PUBLIC".to_string(),
             secret_access_key: "boatramp:tigris-key".to_string(),
         };
-        let name = boatramp_ref_name(&cfg.secret_access_key)
-            .expect("a boatramp: ref is detected by the scheme check");
-        let cluster_err =
-            Error::S3Ingress(S3CredentialError::BoatrampRefOnCluster(name.to_string()).to_string())
-                .to_string();
-        assert!(
-            cluster_err.contains("not supported on a cluster"),
-            "the dedicated cluster refusal message: {cluster_err}"
+        // (0) The scheme check DETECTS the `boatramp:` ref — this is how the early (`run`) path decides to
+        // DEFER it (rather than the old structural refusal) and how `run_cluster` picks the post-KV pass.
+        assert_eq!(
+            boatramp_ref_name(&cfg.secret_access_key),
+            Some("tigris-key"),
+            "a boatramp: ref is detected by the scheme check (⇒ deferred to the post-KV pass)"
         );
 
-        // (2) An `env:` misconfig on the cluster path (unset var) resolves normally — an empty
-        // in-memory stand-in KV is correct because `env:` never touches the store — and surfaces its
-        // OWN error UNWRAPPED (mapped via `Error::S3Ingress(e.to_string())`), NOT the cluster suffix.
-        let cfg = S3CredentialConfig {
+        // (1) POST-KV resolution SUCCESS: with the replicated KV up + the secret sealed under the DEFAULT
+        // (operator/node) project, the post-KV pass resolves the SEALED value — exactly what single-node
+        // `build_blobs_with_sealed_cred` does, now fed `node.kv`.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        SecretStore::new(kv.clone(), Arc::new(IdentityEnvelope))
+            .set(ProjectRef::DEFAULT, "tigris-key", b"SEALED-SECRET-VALUE")
+            .await
+            .expect("seal the base S3 secret into the (fake) replicated KV");
+        let resolved = resolve_s3_credential(
+            &cfg,
+            kv.clone(),
+            Some(Arc::new(IdentityEnvelope)),
+            false, // allow_env_secret_refs: irrelevant for a boatramp: ref (it never reads host env)
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect("a boatramp: base cred resolves against the now-up replicated KV");
+        assert_eq!(resolved.access_key_id(), "AKID-PUBLIC");
+        assert_eq!(
+            resolved.secret_access_key(),
+            "SEALED-SECRET-VALUE",
+            "the SEALED value is used (not the ambient env) — the post-KV pass honors the sealed source"
+        );
+
+        // (1b) FAIL CLOSED: the SAME ref against a KV that does NOT hold the secret errors
+        // (`MissingBoatrampSecret`) — the post-KV pass REFUSES to serve, never an unsealed/empty fallback.
+        let empty_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let err = resolve_s3_credential(
+            &cfg,
+            empty_kv,
+            Some(Arc::new(IdentityEnvelope)),
+            false,
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect_err("a boatramp: base cred with no sealed secret must fail closed post-KV");
+        assert!(
+            matches!(err, S3CredentialError::MissingBoatrampSecret(_)),
+            "an absent sealed secret must refuse the serve (no unsealed fallback); got: {err}"
+        );
+
+        // (2) An `env:` misconfig (unset var) still resolves on the EARLY path — an empty in-memory
+        // stand-in KV is correct because `env:` never touches the store — and surfaces its OWN error
+        // UNWRAPPED (mapped via `Error::S3Ingress(e.to_string())`).
+        let env_cfg = S3CredentialConfig {
             access_key_id: "AKID-PUBLIC".to_string(),
             secret_access_key: "env:UNSET_S3_SECRET_FOR_TEST".to_string(),
         };
         assert!(
-            boatramp_ref_name(&cfg.secret_access_key).is_none(),
-            "an env: ref is NOT caught by the boatramp scheme check"
+            boatramp_ref_name(&env_cfg.secret_access_key).is_none(),
+            "an env: ref is NOT caught by the boatramp scheme check (⇒ resolved on the early path)"
         );
         let err = resolve_s3_credential(
-            &cfg,
-            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new()),
+            &env_cfg,
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
             None,
             true, // allow_env_secret_refs: the dev posture, so it gets past the posture gate to `unset`
             &boatramp_core::env::MapEnv::new(),
@@ -6000,9 +6413,738 @@ mod tests {
             mapped.contains("is not set"),
             "the env error surfaces its own message: {mapped}"
         );
+    }
+
+    /// PLAN-serve-single-cluster-parity (seal-messaging residual): the cross-node messaging payload-spill
+    /// store must be bound to the SAME sealed backend as guest serving (not the uncredentialed early
+    /// backend). This asserts the exact composition `run_cluster`'s post-KV pass performs — it does not
+    /// need a full Raft bring-up: (1) a `boatramp:` base cred resolves against the now-up KV to a SEALED
+    /// backend; (2) the spill handle (`LateStorage`) that `build_node` wired UNBOUND fails closed before
+    /// the bind; (3) binding it to that sealed backend (what the pass does with `storage.clone()`) makes
+    /// the spill land in the sealed backend; (4) when the sealed secret is ABSENT the resolver errors so
+    /// the serve REFUSES — the handle is never bound and stays fail-closed (never an ambient fallback).
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_post_kv_binds_messaging_spill_to_sealed_backend_and_fails_closed_when_absent()
+    {
+        use boatramp_cluster::messaging::LateStorage;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+        use boatramp_node::config::S3CredentialConfig;
+        use boatramp_node::s3_credential::{S3CredentialError, resolve_s3_credential};
+        use futures::StreamExt;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        // A passthrough envelope (identity seal/unseal) — exercises the KV keying + unseal path.
+        struct IdentityEnvelope;
+        #[async_trait::async_trait]
+        impl boatramp_core::envelope::KeyEnvelope for IdentityEnvelope {
+            async fn wrap(
+                &self,
+                pt: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(pt.to_vec())
+            }
+            async fn unwrap(
+                &self,
+                ct: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(ct.to_vec())
+            }
+        }
+
+        // A minimal in-memory object backend — stands in for the SEALED serving backend
+        // `build_blobs_with_sealed_cred` returns in the post-KV pass.
+        #[derive(Default)]
+        struct MemBlob {
+            objects: StdMutex<HashMap<String, Vec<u8>>>,
+        }
+        #[async_trait::async_trait]
+        impl Storage for MemBlob {
+            async fn get(&self, key: &str) -> std::result::Result<GetObject, StorageError> {
+                let bytes = self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                let size = bytes.len() as u64;
+                let body: ByteStream =
+                    futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+                Ok(GetObject {
+                    meta: ObjectMeta {
+                        key: key.to_string(),
+                        size: Some(size),
+                        ..Default::default()
+                    },
+                    body,
+                })
+            }
+            async fn get_range(
+                &self,
+                key: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> std::result::Result<GetObject, StorageError> {
+                self.get(key).await
+            }
+            async fn put(
+                &self,
+                key: &str,
+                mut body: ByteStream,
+                _: PutMeta,
+            ) -> std::result::Result<ObjectMeta, StorageError> {
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                self.objects.lock().unwrap().insert(key.to_string(), buf);
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    ..Default::default()
+                })
+            }
+            async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StorageError> {
+                let map = self.objects.lock().unwrap();
+                let bytes = map
+                    .get(key)
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    size: Some(bytes.len() as u64),
+                    ..Default::default()
+                })
+            }
+            async fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+                self.objects.lock().unwrap().remove(key);
+                Ok(())
+            }
+            async fn list(
+                &self,
+                prefix: &str,
+            ) -> std::result::Result<Vec<ObjectMeta>, StorageError> {
+                Ok(self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        ..Default::default()
+                    })
+                    .collect())
+            }
+        }
+
+        let cfg = S3CredentialConfig {
+            access_key_id: "AKID-PUBLIC".to_string(),
+            secret_access_key: "boatramp:tigris-key".to_string(),
+        };
+
+        // (1) SEALED resolution SUCCESS against the now-up replicated KV (the post-KV pass's input).
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        SecretStore::new(kv.clone(), Arc::new(IdentityEnvelope))
+            .set(ProjectRef::DEFAULT, "tigris-key", b"SEALED-SECRET-VALUE")
+            .await
+            .expect("seal the base S3 secret into the (fake) replicated KV");
+        let resolved = resolve_s3_credential(
+            &cfg,
+            kv.clone(),
+            Some(Arc::new(IdentityEnvelope)),
+            false,
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect("a boatramp: base cred resolves against the now-up replicated KV");
+        assert_eq!(resolved.secret_access_key(), "SEALED-SECRET-VALUE");
+
+        // (2) The spill handle `build_node` wired UNBOUND fails closed BEFORE the post-KV bind.
+        let spill = Arc::new(LateStorage::unbound());
+        assert!(!spill.is_bound());
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"p")) }).boxed();
         assert!(
-            !mapped.contains("not supported on a cluster"),
-            "the env error must NOT carry the misleading cluster suffix: {mapped}"
+            spill
+                .put("mqp/t/1", body, PutMeta::default())
+                .await
+                .is_err(),
+            "the unbound spill handle fails closed — never an ambient/uncredentialed fallback"
         );
+
+        // (3) BIND the handle to the SEALED serving backend (what the post-KV pass does with
+        // `messaging_spill.bind(storage.clone())`) → the spill now lands in the sealed backend.
+        let sealed_backend = Arc::new(MemBlob::default());
+        spill.bind(sealed_backend.clone());
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"payload")) }).boxed();
+        spill
+            .put("mqp/orders/1", body, PutMeta::default())
+            .await
+            .expect("a bound spill put lands in the sealed backend");
+        assert!(
+            sealed_backend
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("mqp/orders/1"),
+            "the spill used the SEALED backend, exactly like guest serving"
+        );
+
+        // (4) ABSENT secret: the resolver errors (`MissingBoatrampSecret`) ⇒ the serve REFUSES, so the
+        // post-KV pass never runs the bind ⇒ the handle stays fail-closed (never an ambient fallback).
+        let empty_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let err = resolve_s3_credential(
+            &cfg,
+            empty_kv,
+            Some(Arc::new(IdentityEnvelope)),
+            false,
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect_err("a boatramp: base cred with no sealed secret must fail closed post-KV");
+        assert!(
+            matches!(err, S3CredentialError::MissingBoatrampSecret(_)),
+            "an absent sealed secret refuses the serve (no unsealed fallback); got: {err}"
+        );
+        let unbound = Arc::new(LateStorage::unbound());
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"p")) }).boxed();
+        assert!(
+            unbound
+                .put("mqp/t/1", body, PutMeta::default())
+                .await
+                .is_err(),
+            "on a refused serve the spill handle is never bound and stays fail-closed"
+        );
+    }
+
+    /// The live S3/MinIO coordinates the two cluster live gates read from the ENVIRONMENT (so the live
+    /// lane injects them and the tests never hardcode a box path). `None` when any required var is unset
+    /// — the caller SKIPS with a clear message, never a silent pass.
+    #[cfg(feature = "cluster")]
+    struct LiveS3Env {
+        endpoint: String,
+        access_key_id: String,
+        secret_access_key: String,
+        bucket: String,
+        region: String,
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_live_s3_env() -> Option<LiveS3Env> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Some(LiveS3Env {
+            endpoint: var("BOATRAMP_TEST_S3_ENDPOINT")?,
+            access_key_id: var("BOATRAMP_TEST_S3_ACCESS_KEY")?,
+            secret_access_key: var("BOATRAMP_TEST_S3_SECRET")?,
+            bucket: var("BOATRAMP_TEST_S3_BUCKET")?,
+            region: var("BOATRAMP_TEST_S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+        })
+    }
+
+    /// PLAN-serve-single-cluster-parity Stage C — **LIVE GATE** (`#[ignore]`; run on lighthouse / the
+    /// live lane). The REAL-backend counterpart of the in-memory mechanism tests
+    /// [`cluster_defers_per_project_backends_and_builds_post_kv`] /
+    /// [`cluster_post_kv_binds_messaging_spill_to_sealed_backend_and_fails_closed_when_absent`]: it
+    /// swaps the `MemBlob`/`IdentityEnvelope` fakes for a REAL S3 (MinIO) backend + a REAL `[secrets]`
+    /// `local`-KEK sealed store, and actually performs the per-project blob op over MinIO.
+    ///
+    /// It drives the production post-KV functions directly (the same ones `run_cluster` calls — a full
+    /// `--cluster-init` serve in-process is impractical, so this is the smallest faithful REAL shape):
+    ///   1. a REAL `local`-KEK `[secrets]` envelope (generated in a temp data dir) seals the per-project
+    ///      MinIO secret into the control-plane KV under project `acme` — exactly what
+    ///      `boatramp secret set` does before serve;
+    ///   2. [`build_per_project_blob_backends`] resolves THAT sealed credential against the (now-up) KV
+    ///      and builds the project's S3 (MinIO) backend — invariant 1, authority bound to the project;
+    ///   3. a blob is written + read back THROUGH that project backend — a REAL MinIO round-trip under
+    ///      the sealed cred (if the sealed secret were wrong, the authenticated PUT would fail) — then
+    ///      asserted PRESENT in the project's bucket yet ABSENT from a DISTINCT default backend
+    ///      (routing isolation: the object went to the project's bucket, not the global default);
+    ///   4. a per-project `boatramp:` ref whose sealed secret is ABSENT FAILS CLOSED (no silent fallback).
+    /// Emits `CLUSTER PER-PROJECT BLOB OK` only after all of the above pass.
+    ///
+    /// Live-lane env (SKIP-with-message if unset — never a silent pass): `BOATRAMP_TEST_S3_ENDPOINT`,
+    /// `BOATRAMP_TEST_S3_ACCESS_KEY`, `BOATRAMP_TEST_S3_SECRET`, `BOATRAMP_TEST_S3_BUCKET` (+ optional
+    /// `BOATRAMP_TEST_S3_REGION`, default `us-east-1`). Run on lighthouse:
+    /// `cargo test -p boatramp --features cluster cluster_per_project_blob_live_gate -- --ignored --nocapture`
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    #[ignore = "live gate: needs a real S3/MinIO via BOATRAMP_TEST_S3_* env (run on lighthouse)"]
+    async fn cluster_per_project_blob_live_gate() {
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+        use boatramp_node::backends::BlobBackend;
+        use boatramp_node::config::{BlobBackendConfig, S3CredentialConfig, SecretsConfig};
+        use futures::StreamExt;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let Some(s3) = cluster_live_s3_env() else {
+            eprintln!(
+                "skipping cluster_per_project_blob_live_gate: set BOATRAMP_TEST_S3_ENDPOINT / \
+                 _ACCESS_KEY / _SECRET / _BUCKET to run against a real S3/MinIO (run on lighthouse)"
+            );
+            return;
+        };
+
+        // A DISTINCT in-memory DEFAULT backend stand-in (same role `MemBlob` plays in the mechanism
+        // test; here the PER-PROJECT backend is the REAL one). It is observably different from the MinIO
+        // project backend, so asserting the written key is NOT in it proves the per-project routing
+        // landed the object in the project's bucket, not the global default.
+        #[derive(Default)]
+        struct MemBlob {
+            objects: StdMutex<HashMap<String, Vec<u8>>>,
+        }
+        #[async_trait::async_trait]
+        impl Storage for MemBlob {
+            async fn get(&self, key: &str) -> std::result::Result<GetObject, StorageError> {
+                let bytes = self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                let size = bytes.len() as u64;
+                let body: ByteStream =
+                    futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+                Ok(GetObject {
+                    meta: ObjectMeta {
+                        key: key.to_string(),
+                        size: Some(size),
+                        ..Default::default()
+                    },
+                    body,
+                })
+            }
+            async fn get_range(
+                &self,
+                key: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> std::result::Result<GetObject, StorageError> {
+                self.get(key).await
+            }
+            async fn put(
+                &self,
+                key: &str,
+                mut body: ByteStream,
+                _: PutMeta,
+            ) -> std::result::Result<ObjectMeta, StorageError> {
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                self.objects.lock().unwrap().insert(key.to_string(), buf);
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    ..Default::default()
+                })
+            }
+            async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StorageError> {
+                let map = self.objects.lock().unwrap();
+                let bytes = map
+                    .get(key)
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    size: Some(bytes.len() as u64),
+                    ..Default::default()
+                })
+            }
+            async fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+                self.objects.lock().unwrap().remove(key);
+                Ok(())
+            }
+            async fn list(
+                &self,
+                prefix: &str,
+            ) -> std::result::Result<Vec<ObjectMeta>, StorageError> {
+                Ok(self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        ..Default::default()
+                    })
+                    .collect())
+            }
+        }
+
+        // A REAL `[secrets]` local-KEK envelope in a temp data dir — the same source `run_cluster` uses.
+        let data_dir =
+            std::env::temp_dir().join(format!("br-cluster-blob-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("create the temp data dir");
+        let secrets_cfg = SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: None,
+            vault: None,
+        };
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // SEAL the per-project MinIO secret under project `acme` — exactly what `boatramp secret set`
+        // does; `build_per_project_blob_backends` rebuilds the SAME KEK from the same file and unseals it.
+        let envelope = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        SecretStore::new(kv.clone(), envelope)
+            .set(
+                ProjectRef::new("acme"),
+                "minio-key",
+                s3.secret_access_key.as_bytes(),
+            )
+            .await
+            .expect("seal the per-project MinIO secret into the control-plane KV");
+
+        // (1) Build the per-project S3 (MinIO) backend via the PRODUCTION post-KV function — its sealed
+        // `boatramp:` cred resolves against the now-up KV (invariant 1).
+        let blob_backend_cfg = |secret_ref: &str| BlobBackendConfig {
+            blobs: Some(BlobBackend::S3),
+            s3_bucket: Some(s3.bucket.clone()),
+            s3_endpoint: Some(s3.endpoint.clone()),
+            s3_region: Some(s3.region.clone()),
+            s3_path_style: true,
+            s3_credential: Some(S3CredentialConfig {
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: secret_ref.to_string(),
+            }),
+        };
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert("acme".to_string(), blob_backend_cfg("boatramp:minio-key"));
+        let built = match build_per_project_blob_backends(
+            &configs,
+            kv.clone(),
+            Some(&secrets_cfg),
+            &data_dir,
+            false,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => panic!("the per-project MinIO backend must build from the sealed cred: {e}"),
+        };
+        let acme = built
+            .get("acme")
+            .expect("the acme per-project backend was built")
+            .clone();
+        let default: Arc<dyn Storage> = Arc::new(MemBlob::default());
+
+        // (2) A REAL MinIO round-trip THROUGH the per-project backend under the sealed cred.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("boatramp-live-gate/per-project/{uniq}");
+        let payload = b"per-project-sealed-minio-roundtrip".to_vec();
+        let body: ByteStream = futures::stream::once({
+            let p = payload.clone();
+            async move { Ok(bytes::Bytes::from(p)) }
+        })
+        .boxed();
+        acme.put(&key, body, PutMeta::default()).await.expect(
+            "write a blob THROUGH the per-project MinIO backend (authenticated by the sealed cred)",
+        );
+        let got = acme
+            .get(&key)
+            .await
+            .expect("read the blob back THROUGH the per-project MinIO backend");
+        let mut read_body = got.body;
+        let mut buf = Vec::new();
+        while let Some(chunk) = read_body.next().await {
+            buf.extend_from_slice(&chunk.expect("read a chunk of the per-project blob"));
+        }
+        assert_eq!(
+            buf, payload,
+            "the per-project MinIO backend round-trips the blob under the sealed cred"
+        );
+        acme.head(&key)
+            .await
+            .expect("the blob is PRESENT in the project's MinIO bucket");
+        // (3) Routing isolation: the object landed in the project's bucket, NOT the global default.
+        assert!(
+            matches!(default.get(&key).await, Err(StorageError::NotFound(_))),
+            "the blob went to the PROJECT's bucket, not the distinct global default backend"
+        );
+        let _ = acme.delete(&key).await; // keep the live MinIO bucket clean across reruns
+
+        // (4) FAIL CLOSED: the SAME per-project backend with a `boatramp:` ref whose secret is NOT sealed
+        // must refuse the serve (never a silent fallback to the ambient chain or another backend).
+        let mut absent = std::collections::BTreeMap::new();
+        absent.insert(
+            "acme".to_string(),
+            blob_backend_cfg("boatramp:no-such-sealed-secret"),
+        );
+        let err = match build_per_project_blob_backends(
+            &absent,
+            kv.clone(),
+            Some(&secrets_cfg),
+            &data_dir,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a per-project backend with an ABSENT sealed secret must fail closed"),
+        };
+        assert!(
+            matches!(err, Error::S3Ingress(_)) && err.to_string().contains("acme"),
+            "an absent sealed secret refuses the serve, naming the project; got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        println!("CLUSTER PER-PROJECT BLOB OK");
+    }
+
+    /// PLAN-serve-single-cluster-parity (seal-messaging residual) — **LIVE GATE** (`#[ignore]`; run on
+    /// lighthouse / the live lane). The REAL-backend counterpart of the in-memory mechanism test
+    /// [`cluster_post_kv_binds_messaging_spill_to_sealed_backend_and_fails_closed_when_absent`]: it
+    /// swaps the `MemBlob`/`IdentityEnvelope` fakes for a REAL S3 (MinIO) backend + a REAL `local`-KEK
+    /// sealed store and actually PERFORMS a messaging payload SPILL over MinIO with NO ambient AWS env.
+    ///
+    /// It drives the production post-KV composition directly (the same functions `run_cluster` calls;
+    /// `RaftMessaging::new` needs boatramp-cluster's `#[cfg(test)]`-only Raft harness, unreachable from
+    /// this crate, so the spill is driven through [`boatramp_core::messaging::LogMessaging`] — whose
+    /// payload-spill path over [`Storage`] is byte-for-byte the same one `RaftMessaging` uses; the
+    /// cluster-specific seam under test is the [`boatramp_cluster::messaging::LateStorage`] late-bind to
+    /// the SEALED backend, which IS exercised here):
+    ///   1. a REAL `local`-KEK envelope seals the base MinIO secret into the KV (what `boatramp secret
+    ///      set` does), and [`build_blobs_with_sealed_cred`] resolves it + builds the SEALED S3 backend;
+    ///   2. the process env is SCRUBBED of the `AWS_*` credential chain — so a successful spill could
+    ///      ONLY have authenticated via the sealed cred, never an ambient/uncredentialed fallback;
+    ///   3. a `LateStorage` is bound to that sealed backend (what the post-KV pass does), and a
+    ///      fan-out (consumer-group) message with a payload > `INLINE_MAX` is published → it SPILLS to
+    ///      the sealed MinIO backend → it is consumed back successfully → its spill object is asserted
+    ///      PRESENT in the MinIO bucket;
+    ///   4. an UNBOUND `LateStorage` spill fails closed, and an ABSENT sealed secret fails closed.
+    /// Emits `CLUSTER SEALED MESSAGING OK` only after all of the above pass.
+    ///
+    /// Live-lane env (SKIP-with-message if unset — never a silent pass): `BOATRAMP_TEST_S3_ENDPOINT`,
+    /// `BOATRAMP_TEST_S3_ACCESS_KEY`, `BOATRAMP_TEST_S3_SECRET`, `BOATRAMP_TEST_S3_BUCKET` (+ optional
+    /// `BOATRAMP_TEST_S3_REGION`). This gate REMOVES the `AWS_*` credential vars from the process env
+    /// (a process-global mutation), so run it isolated — as its `--ignored` live-lane invocation does:
+    /// `cargo test -p boatramp --features cluster cluster_sealed_messaging_live_gate -- --ignored --nocapture`
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    #[ignore = "live gate: needs a real S3/MinIO via BOATRAMP_TEST_S3_* env + scrubs AWS_* from the process env (run on lighthouse)"]
+    async fn cluster_sealed_messaging_live_gate() {
+        use boatramp_cluster::messaging::LateStorage;
+        use boatramp_core::messaging::{
+            INLINE_MAX, LogMessaging, Messaging, StartPosition, payload_key,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use boatramp_core::{PutMeta, Storage};
+        use boatramp_node::config::{S3CredentialConfig, SecretsConfig};
+        use boatramp_node::s3_credential::{S3CredentialError, resolve_s3_credential};
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let Some(s3) = cluster_live_s3_env() else {
+            eprintln!(
+                "skipping cluster_sealed_messaging_live_gate: set BOATRAMP_TEST_S3_ENDPOINT / \
+                 _ACCESS_KEY / _SECRET / _BUCKET to run against a real S3/MinIO (run on lighthouse)"
+            );
+            return;
+        };
+
+        // SCRUB the ambient AWS credential chain from the PROCESS env BEFORE building the backend: with
+        // no ambient creds, a successful S3 spill round-trip can ONLY have authenticated via the SEALED
+        // cred the post-KV pass bound — the exact property this gate exists to prove. Process-global;
+        // this `#[ignore]` gate runs isolated on the live lane (see the run recipe above).
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ] {
+            // SAFETY: single-threaded setup phase of an isolated `#[ignore]` live-lane test; no other
+            // thread is reading the environment concurrently.
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+
+        let data_dir =
+            std::env::temp_dir().join(format!("br-cluster-sealed-msg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("create the temp data dir");
+        let secrets_cfg = SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: None,
+            vault: None,
+        };
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // SEAL the base MinIO secret under the DEFAULT (operator/node) project — what `boatramp secret
+        // set` does; `build_blobs_with_sealed_cred` rebuilds the same KEK and unseals it post-KV.
+        let envelope = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        SecretStore::new(kv.clone(), envelope)
+            .set(
+                ProjectRef::DEFAULT,
+                "minio-msg-key",
+                s3.secret_access_key.as_bytes(),
+            )
+            .await
+            .expect("seal the base MinIO secret into the control-plane KV");
+
+        // (1) Build the SEALED S3 (MinIO) serving backend via the PRODUCTION post-KV function — the same
+        // sealed base backend `run_cluster` binds the messaging spill to.
+        let base_cred = S3CredentialConfig {
+            access_key_id: s3.access_key_id.clone(),
+            secret_access_key: "boatramp:minio-msg-key".to_string(),
+        };
+        let blob_args = BlobArgs {
+            blobs: boatramp_node::backends::BlobBackend::S3,
+            s3_bucket: Some(s3.bucket.clone()),
+            s3_endpoint: Some(s3.endpoint.clone()),
+            s3_region: Some(s3.region.clone()),
+            s3_path_style: true,
+            s3_credential: None,
+            gcs_bucket: None,
+            gcs_endpoint: None,
+            gcs_anonymous: false,
+            azure_account: None,
+            azure_container: None,
+            azure_access_key: None,
+            azure_emulator: false,
+        };
+        let (built, resolved) = build_blobs_with_sealed_cred(
+            &blob_args,
+            Some(&base_cred),
+            None,
+            &data_dir,
+            kv.clone(),
+            Some(&secrets_cfg),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("build the SEALED S3 (MinIO) serving backend post-KV");
+        assert!(
+            resolved.is_some(),
+            "the base boatramp: cred resolved to a sealed credential"
+        );
+        let sealed_backend = built.storage;
+
+        // (2) The `LateStorage` `build_node` wires UNBOUND fails closed BEFORE the post-KV bind.
+        let spill = Arc::new(LateStorage::unbound());
+        let probe: boatramp_core::ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"x")) }).boxed();
+        assert!(
+            spill
+                .put("mqp/probe/0", probe, PutMeta::default())
+                .await
+                .is_err(),
+            "the UNBOUND spill handle fails closed (never an ambient/uncredentialed fallback)"
+        );
+        // Bind it to the SEALED backend — exactly what `run_cluster`'s post-KV pass does.
+        spill.bind(sealed_backend.clone());
+        assert!(spill.is_bound());
+
+        // (3) A REAL fan-out spill round-trip over MinIO, driven through the LateStorage-bound spill store.
+        let mq_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let spill_store: Arc<dyn Storage> = spill.clone();
+        let mq = LogMessaging::new(spill_store, mq_kv);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let topic = format!("boatramp-live-gate/sealed-msg/{uniq}");
+        // Register the consumer group (fan-out / retain) at the earliest position.
+        assert!(
+            mq.claim_grouped(
+                &topic,
+                "gate-consumer",
+                StartPosition::Earliest,
+                Duration::from_secs(60),
+                10,
+                5
+            )
+            .await
+            .expect("register the fan-out consumer group")
+            .is_empty(),
+            "no messages published yet"
+        );
+        // Publish a payload > INLINE_MAX onto the grouped (retain) topic ⇒ it SPILLS to the sealed MinIO
+        // backend via the bound LateStorage (grouped AND over-size both force the object-store path).
+        let big = vec![0xA5u8; INLINE_MAX + 1];
+        mq.publish(&topic, &big)
+            .await
+            .expect("publish a spilling fan-out message onto the sealed-backed spill store");
+        // Consume it back — the payload is read from the sealed MinIO backend under the sealed cred.
+        let got = mq
+            .claim_grouped(
+                &topic,
+                "gate-consumer",
+                StartPosition::Earliest,
+                Duration::from_secs(60),
+                10,
+                5,
+            )
+            .await
+            .expect("consume the spilled fan-out message back");
+        assert_eq!(
+            got.len(),
+            1,
+            "the fan-out consumer reads the published message"
+        );
+        assert_eq!(
+            got[0].payload, big,
+            "the spilled payload round-trips through the sealed MinIO backend (sealed cred used)"
+        );
+        assert!(
+            !got[0].inline,
+            "a > INLINE_MAX grouped payload took the object-store (spill) path, not the inline path"
+        );
+        // The spill object is PHYSICALLY present in the MinIO bucket.
+        let spill_key = payload_key(&topic, &got[0].id);
+        sealed_backend
+            .head(&spill_key)
+            .await
+            .expect("the spilled payload object is present in the sealed MinIO bucket");
+        let _ = sealed_backend.delete(&spill_key).await; // keep the live bucket clean across reruns
+
+        // (4) FAIL CLOSED: the SAME base ref against a KV with no sealed secret must refuse (the serve
+        // would then never bind the spill handle — it stays fail-closed, never an ambient fallback).
+        let empty_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let envelope2 = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        let err = resolve_s3_credential(
+            &base_cred,
+            empty_kv,
+            Some(envelope2),
+            false,
+            &boatramp_core::env::SystemEnv,
+        )
+        .await
+        .expect_err("an absent sealed base secret must fail closed");
+        assert!(
+            matches!(err, S3CredentialError::MissingBoatrampSecret(_)),
+            "an absent sealed secret refuses the serve (no ambient fallback); got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        println!("CLUSTER SEALED MESSAGING OK");
     }
 }
