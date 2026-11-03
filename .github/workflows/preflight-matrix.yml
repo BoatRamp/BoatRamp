@@ -331,8 +331,8 @@ jobs:
           # AND every one of the file's success markers below. (The libsql true-delta + its CHAIN
           # gate are `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features
           # project-export` build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 19 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 19 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 20 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 20 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
