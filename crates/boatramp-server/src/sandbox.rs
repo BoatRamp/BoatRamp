@@ -22,12 +22,14 @@
 //!      `SECCOMP_RET_KILL_PROCESS` action, so an RCE that lands in the server address
 //!      space cannot spawn a shell or a new binary: it is killed hard (not merely
 //!      `EPERM`'d) and is alertable. A benign allow-list *miss* still degrades to
-//!      `EPERM` (soft). (`fork`/`vfork` are also killed, but as DEFENSE-IN-DEPTH only,
-//!      NOT a guarantee that process creation is blocked: musl's `fork()` is issued as
-//!      `clone` — which stays allowed because the tokio runtime creates its threads with
-//!      it — so on a musl build the `fork`/`vfork` syscall kills are inert. The
-//!      load-bearing barrier is the exec family: a child without `exec` cannot become a
-//!      new program.)
+//!      `EPERM` (soft). (`fork`/`vfork` are also killed. This is NOT merely inert
+//!      defense-in-depth: while the tokio runtime creates its THREADS via `clone` (allowed),
+//!      a `std::process::Command` with a `pre_exec` hook cannot use `posix_spawn`, so Rust's
+//!      fork+exec path issues a BARE `fork(2)` — which the kill-surface `SIGSYS`-kills. So the
+//!      fork-kill really does block process creation here, and an `exec.compute` instance that
+//!      legitimately forks children at serve time has `fork`/`vfork` un-killed in its derived
+//!      profile ([`FORK_SPAWN`]). The other load-bearing barrier is the exec family: a child
+//!      without `exec` cannot become a new program.)
 //!   2. **Landlock** confines the process's filesystem view to the node's `data_dir`
 //!      (+ the system temp dirs) for writes, and a conservative set of system read
 //!      roots (so the server can still read `/etc/resolv.conf`, load shared objects,
@@ -99,6 +101,14 @@ pub struct SandboxPolicy {
     /// Filesystem roots the process may **read and write** (recursively). Non-existent
     /// paths are skipped at install time.
     pub read_write_paths: Vec<PathBuf>,
+    /// Filesystem paths this process may **execute** (`execve`), in addition to reading them —
+    /// the execute-pin. `AccessFs::from_read` (which [`linux::build_ruleset`] grants the general
+    /// read/write roots) INCLUDES `Execute`, so Execute is STRIPPED from those general grants and
+    /// re-granted ONLY on this list. EMPTY for every instance whose `execve` is seccomp-killed
+    /// (which is all of them except the `exec.compute` router + the root supervisor, each of which
+    /// pins EXACTLY its own binary so a fork can only re-exec that one trusted path). Non-existent
+    /// paths are skipped at install time.
+    pub execute_paths: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -125,6 +135,9 @@ impl SandboxPolicy {
             data_dir,
             read_only_paths,
             read_write_paths,
+            // The monolith never `execve`s once serving (its exec family is seccomp-killed), so it
+            // pins nothing executable — Execute is confined to the (empty) list.
+            execute_paths: Vec::new(),
         }
     }
 
@@ -197,10 +210,13 @@ pub const DENIED: &[&str] = &[
 /// alertable crash. (Everything else not in the allow-list still returns `EPERM`, so a
 /// benign allow-list bug degrades softly.)
 ///
-/// `fork`/`vfork` are listed as DEFENSE-IN-DEPTH, not a guarantee that process creation is
-/// blocked: musl issues `fork()` as `clone` (allowed for the tokio runtime's threads), so on a
-/// musl build these two kills are inert. The load-bearing barrier is `execve`/`execveat` — a
-/// forked child that cannot `exec` cannot become a new program.
+/// `fork`/`vfork` are killed too, and NOT merely inert: the tokio runtime makes its threads via
+/// `clone` (allowed), but a `std::process::Command` with a `pre_exec` hook takes Rust's fork+exec
+/// path, which issues a BARE `fork(2)` — so this kill really does stop process creation (a real,
+/// audited `SIGSYS` when the per-tenant router tries to spawn). The exec family
+/// (`execve`/`execveat`) is the other barrier — a forked child that cannot `exec` cannot become a
+/// new program. An `exec.compute` instance, which legitimately forks+execs children, has BOTH
+/// families un-killed in its derived profile ([`EXEC_SPAWN`] + [`FORK_SPAWN`]).
 pub const KILL_SURFACE: &[&str] = &[
     "execve",
     "execveat",
@@ -490,6 +506,49 @@ const KEY_LOCK: &[&str] = &["mlock", "munlock"];
 /// kill-list (hard `SIGSYS`, inherited from Phase 0).
 const EXEC_SPAWN: &[&str] = &["execve", "execveat"];
 
+/// The process-CREATION syscalls an `exec.compute` instance needs to fork a child BEFORE it
+/// `execve`s it. Allowed ONLY for an `exec.compute` instance; killed (hard `SIGSYS`) for every
+/// other. These were previously assumed inert on the fork-kill (the belief that libc routes
+/// `fork()` through `clone`, which stays allowed for the tokio runtime's threads) — but that is
+/// FALSE for the per-tenant router's spawn: `std::process::Command` with a `pre_exec` hook cannot
+/// use `posix_spawn`, so Rust's fork+exec path issues a BARE `fork(2)` (syscall 57), which the
+/// kill-surface `SIGSYS`-kills. A per-tenant router (`exec.compute`) forks children at SERVE time
+/// UNDER its installed sandbox (unlike the root, which forks at boot while still UNCONFINED), so it
+/// must be allowed to `fork`/`vfork`. Bounded: the Landlock view EXECUTE-pins ONLY its own binary
+/// — [`linux::build_ruleset`] STRIPS `Execute` from the general read/write grants (which otherwise
+/// carry it via `AccessFs::from_read`, including on the WRITABLE `backend.kv` state subtree) and
+/// re-grants it ONLY on [`SandboxPolicy::execute_paths`], populated with this router's own binary
+/// alone. So a fork can `execve` that ONE path and nothing else — not a shell, not an ELF dropped
+/// into writable state — and WS-C's cold-start admission (token bucket + backoff) caps the spawn
+/// rate, so this does not open a fork-bomb or an arbitrary-exec surface.
+const FORK_SPAWN: &[&str] = &["fork", "vfork"];
+
+/// The syscalls that INSTALL a per-instance sandbox — the seccomp filter + the Landlock ruleset.
+/// Allowed ONLY for an `exec.compute` instance (the per-tenant router); every other instance keeps
+/// them default-denied (`EPERM`).
+///
+/// **Why only exec.compute needs these, and why it is SAFE.** A per-tenant child is `fork`ed from
+/// the already-confined router (not from the UNCONFINED root, the way boot-forked instances are),
+/// so it INHERITS the router's seccomp filter before it can install its OWN nested per-instance
+/// profile. The router's derived allow-list does not list these install syscalls, so the inherited
+/// filter `EPERM`s the child's attempt to confine itself — and the node refuses closed, serving no
+/// tenant. Two symptoms, ONE cause: (1) `seccomp(2)` is `EPERM`'d, so the child cannot apply its own
+/// seccomp filter; (2) the child's Landlock ABI probe ([`linux::landlock_kernel_abi`], a
+/// `landlock_create_ruleset` version query) is `EPERM`'d and returns `-1`, which
+/// [`linux::handled_fs_abi`] maps to `ABI::Unsupported`, whose `AccessFs::from_all` is EMPTY — so
+/// `handle_access` rejects it as `empty access-right` and the child's whole FS confinement fails.
+/// Permitting these four on the router un-blocks the child's install of its own, STRICTLY TIGHTER
+/// nested sandbox. seccomp + Landlock are MONOTONIC (a child can only ADD restrictions across the
+/// inherited layers, never drop one), so allowing the install syscalls cannot be used to escape:
+/// the router's own confinement still bounds every child, and each child only narrows further.
+/// `prctl` (the `no_new_privs` precondition) is already in [`ALLOWED`], so it is not repeated here.
+const SANDBOX_INSTALL: &[&str] = &[
+    "seccomp",
+    "landlock_create_ruleset",
+    "landlock_add_rule",
+    "landlock_restrict_self",
+];
+
 /// The conservative system read roots every instance (and the monolith) needs so the process
 /// keeps working (shared-object loading, `/etc/resolv.conf` + CA bundle, `/proc`). Single
 /// source of truth for [`SandboxPolicy::for_server`] and [`SandboxDerivationInputs`].
@@ -554,8 +613,9 @@ fn holds_exec_spawn(caps: &BTreeSet<HostAuthority>) -> bool {
 ///
 /// Invariant (regression-guarded cross-platform): for the full monolith set
 /// [`HostAuthority::ALL`] this returns a SUPERSET of [`whole_process_allowlist`] (so the
-/// `all`-composition never loses a syscall the monolith needs); the ONLY extra it adds is
-/// [`EXEC_SPAWN`], present solely because `ALL` includes `exec.compute`.
+/// `all`-composition never loses a syscall the monolith needs); the ONLY extras it adds are
+/// [`EXEC_SPAWN`] + [`FORK_SPAWN`] + [`SANDBOX_INSTALL`], present solely because `ALL` includes
+/// `exec.compute`.
 pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     let gated = capability_gated_syscalls();
     let mut set: BTreeSet<String> = ALLOWED
@@ -575,20 +635,33 @@ pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     }
     if holds_exec_spawn(caps) {
         set.extend(EXEC_SPAWN.iter().copied().map(str::to_string));
+        // An exec.compute instance forks its child (musl's `Command`+`pre_exec` uses bare `fork`)
+        // before `execve`ing it — allow the fork family too, or the per-tenant router dies with
+        // `SIGSYS` on `fork(2)` the instant it tries to cold-start a tenant. See [`FORK_SPAWN`].
+        set.extend(FORK_SPAWN.iter().copied().map(str::to_string));
+        // ...and the sandbox-install syscalls: a per-tenant child is forked from THIS already-
+        // confined router, so it inherits this filter and must be able to `seccomp`/`landlock_*`
+        // its OWN nested (strictly tighter) profile over the inherited one. Without these the child
+        // is `EPERM`'d — its seccomp install fails AND its Landlock ABI probe returns `-1` →
+        // `ABI::Unsupported` → an EMPTY access set → `empty access-right`. Monotonic, so safe. See
+        // [`SANDBOX_INSTALL`].
+        set.extend(SANDBOX_INSTALL.iter().copied().map(str::to_string));
     }
     set.into_iter().collect()
 }
 
 /// Derive the per-instance seccomp KILL-set (hard `SECCOMP_RET_KILL_PROCESS`): the Phase-0
 /// [`KILL_SURFACE`], EXCEPT that an `exec.compute` instance does NOT kill `execve`/`execveat`
-/// (it re-execs the compute workers). Every non-`exec.compute` instance kills the exec family
-/// — the load-bearing containment for a dropped execution authority. Sorted + de-duplicated.
+/// (it re-execs the compute workers) NOR `fork`/`vfork` (it must fork the child first — see
+/// [`FORK_SPAWN`]; the per-tenant router's `fork(2)` is a real, audited `SIGSYS` without this).
+/// Every non-`exec.compute` instance kills the exec + fork family — the load-bearing containment
+/// for a dropped execution authority. Sorted + de-duplicated.
 pub fn derive_seccomp_killlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     let exec_spawner = holds_exec_spawn(caps);
     let set: BTreeSet<String> = KILL_SURFACE
         .iter()
         .copied()
-        .filter(|s| !(exec_spawner && EXEC_SPAWN.contains(s)))
+        .filter(|s| !(exec_spawner && (EXEC_SPAWN.contains(s) || FORK_SPAWN.contains(s))))
         .map(str::to_string)
         .collect();
     set.into_iter().collect()
@@ -685,9 +758,14 @@ pub fn root_supervisor_allowlist() -> Vec<String> {
 /// would break it; instead it is Landlock-pinned to its own binary (see [`root_supervisor_policy`])
 /// — a compromised root can re-exec ONLY its own fixed, trusted path, never a shell or arbitrary
 /// binary. The rest of the escape surface (`ptrace`/`mount`/`pivot_root`/`setns`/`unshare`/`bpf`/
-/// the module-load + `keyctl` + `kexec` primitives, and `fork`/`vfork` — inert on glibc/musl,
-/// which route `fork()` through `clone`, but kept as defence-in-depth) stays hard-killed. Sorted
-/// + de-duplicated.
+/// the module-load + `keyctl` + `kexec` primitives, and `fork`/`vfork`) stays hard-killed. The
+/// root does its boot fork+exec of every instance while still UNCONFINED (the self-profile is
+/// installed AFTER that loop), so killing `fork` here does not block boot; it is defence-in-depth
+/// against a post-boot RCE. NOTE: a `fork` kill is NOT inert (a `Command`+`pre_exec` spawn issues a
+/// bare `fork(2)`, as the per-tenant router's audited `SIGSYS` proved) — so IF a future wired
+/// root-side RESTART ever re-execs an instance AFTER the self-profile is up, it must un-kill
+/// [`FORK_SPAWN`] here too (today restart is not that path; the Phase-4 WS-C per-tenant spawn forks
+/// inside the exec.compute ROUTER, not the root). Sorted + de-duplicated.
 pub fn root_supervisor_killlist() -> Vec<String> {
     let set: BTreeSet<String> = KILL_SURFACE
         .iter()
@@ -698,18 +776,24 @@ pub fn root_supervisor_killlist() -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// The root supervisor's Landlock FS policy (design §4.3): READ (which, via
-/// [`landlock::AccessFs::from_read`], includes EXECUTE) on the root's OWN binary — so it can
-/// re-exec `boatramp __instance` — plus READ on the config FILE, and NOTHING else. No §1.2 key
-/// input path (KEK / signer key / overlay seed / s3ingress root / cluster root / cert key), no
-/// `data_dir`, no instance state is in the FS view, so the root cannot open a crown-jewel key
-/// file even by accident (design F1/F11-A). The config FILE is granted (not its parent DIR — the
-/// WS-C config-file-grant lesson: a config dir containing `data_dir` would be an over-broad grant).
+/// The root supervisor's Landlock FS policy (design §4.3): READ on the root's OWN binary +
+/// EXECUTE on it (so it can re-exec `boatramp __instance`) plus READ on the config FILE, and
+/// NOTHING else. The EXECUTE right is carried on [`SandboxPolicy::execute_paths`] (the own binary
+/// ALONE), NOT on the general read grant: [`linux::build_ruleset`] STRIPS `Execute` from the
+/// read/write roots (which `AccessFs::from_read`/`from_all` would otherwise grant it) and
+/// re-grants it only on `execute_paths` — so a compromised root can `execve` ONLY its own fixed,
+/// trusted path, never the config file nor anything else readable. No §1.2 key input path (KEK /
+/// signer key / overlay seed / s3ingress root / cluster root / cert key), no `data_dir`, no
+/// instance state is in the FS view, so the root cannot open a crown-jewel key file even by
+/// accident (design F1/F11-A). The config FILE is granted (not its parent DIR — the WS-C
+/// config-file-grant lesson: a config dir containing `data_dir` would be an over-broad grant).
 ///
 /// Both paths MUST already be made absolute + normalized by the caller (the WS-C contract:
 /// [`lexically_normalize`] / `fs::canonicalize`) so the fd-based install grants the real paths.
-/// `read_write_paths` is empty — the root writes nothing. `data_dir` here is INFORMATIONAL only
-/// (carried on [`SandboxPolicy`]; [`install_derived`] grants only `read_only`/`read_write`), set to
+/// `read_write_paths` is empty — the root writes nothing. The own binary appears in BOTH
+/// `read_only_paths` (its read grant) and `execute_paths` (its execute grant); Landlock unions the
+/// two rules to read+execute on that one path. `data_dir` here is INFORMATIONAL only (carried on
+/// [`SandboxPolicy`]; [`install_derived`] grants only `read_only`/`read_write`/`execute`), set to
 /// the config file so the log line reflects "the root only reads its own config".
 ///
 /// NOTE: the EXECUTE-pin is sufficient for a STATICALLY-linked binary (the musl release build) to
@@ -722,6 +806,9 @@ pub fn root_supervisor_policy(current_exe: &Path, config_file: &Path) -> Sandbox
         data_dir: config_file.to_path_buf(),
         read_only_paths: vec![current_exe.to_path_buf(), config_file.to_path_buf()],
         read_write_paths: Vec::new(),
+        // The execute-pin: the root re-execs its own binary (and ONLY it) — read+EXECUTE on this
+        // one path, while the general read grant above no longer carries Execute.
+        execute_paths: vec![current_exe.to_path_buf()],
     }
 }
 
@@ -871,6 +958,13 @@ pub struct SandboxDerivationInputs {
     /// single instance's view. Phase-1-as-merged is safe only because serving is not wired
     /// (`run_instance` fail-closes before any derivation/install and WS-B supplies no grants).
     pub authority_state_dirs: BTreeMap<HostAuthority, Vec<PathBuf>>,
+    /// The execute-pin: paths this instance may `execve` (read + EXECUTE). WS-C populates it with
+    /// the instance's OWN binary ONLY for the `exec.compute` holder (the per-tenant router that
+    /// forks+re-execs itself); EMPTY for every other instance (whose `execve` is seccomp-killed).
+    /// Carried verbatim into [`SandboxPolicy::execute_paths`] by [`derive_profile`] (and
+    /// leak-checked like any other readable grant); [`linux::build_ruleset`] grants Execute ONLY
+    /// here, having stripped it from the general read/write roots.
+    pub execute_paths: Vec<PathBuf>,
 }
 
 impl SandboxDerivationInputs {
@@ -902,6 +996,8 @@ impl SandboxDerivationInputs {
             shared_temp,
             keys: KeyInputPaths::default(),
             authority_state_dirs: BTreeMap::new(),
+            // No execute-pin by default; WS-C adds the own binary for an `exec.compute` holder.
+            execute_paths: Vec::new(),
         }
     }
 
@@ -949,6 +1045,7 @@ impl SandboxDerivationInputs {
                 .iter()
                 .map(|(a, dirs)| (*a, norm_vec(dirs)))
                 .collect(),
+            execute_paths: norm_vec(&self.execute_paths),
         }
     }
 }
@@ -1110,6 +1207,9 @@ pub fn derive_profile(
 ) -> Result<DerivedProfile, ProfileDerivationError> {
     let mut read_only = inputs.base_read_only.clone();
     let mut read_write = inputs.base_read_write.clone();
+    // The execute-pin (read + EXECUTE). Carried verbatim into the policy; also leak-checked below
+    // like any other readable grant (an execute path IS readable — `AccessFs::from_read`).
+    let execute = inputs.execute_paths.clone();
     // The shared system temp dirs are a `Derived`/`Off` convenience; `Strict` drops them.
     if posture != SandboxPosture::Strict {
         read_write.extend(inputs.shared_temp.iter().cloned());
@@ -1125,6 +1225,7 @@ pub fn derive_profile(
         .base_read_only
         .iter()
         .chain(inputs.base_read_write.iter())
+        .chain(inputs.execute_paths.iter())
     {
         if path_contains(granted, &inputs.data_dir) {
             return Err(ProfileDerivationError::OverbroadStateGrant {
@@ -1170,7 +1271,11 @@ pub fn derive_profile(
         if caps.contains(&authority) {
             continue; // the holder legitimately reaches its own key
         }
-        for granted in read_only.iter().chain(read_write.iter()) {
+        for granted in read_only
+            .iter()
+            .chain(read_write.iter())
+            .chain(execute.iter())
+        {
             if path_contains(granted, key_path) {
                 return Err(ProfileDerivationError::CrownJewelKeyLeak {
                     authority,
@@ -1200,6 +1305,7 @@ pub fn derive_profile(
             data_dir: inputs.data_dir.clone(),
             read_only_paths: read_only,
             read_write_paths: read_write,
+            execute_paths: execute,
         },
     })
 }
@@ -1222,14 +1328,20 @@ pub fn derive_profile(
 /// from another's. Non-backend authorities return `None` (crown-jewel keys are handled separately
 /// by [`KeyInputPaths`]; listeners/exec/control hold no node-base state subtree here).
 ///
-/// Phase-1 canonical layout. `backend.kv` maps to `<data_dir>/kv`, matching the control-plane KV
-/// store's real on-disk location; `sql`/`blob`/`messaging` are the canonical privsep names whose
+/// Phase-1 canonical layout. `backend.kv` maps to `<data_dir>/kv-slate` — the control-plane
+/// SlateDB store's REAL on-disk location (`SlateKv::open_local_with_flush_policy(data_dir.join(
+/// "kv-slate"))` in `boatramp_node::backends::build_slatedb_kv`). This MUST match the store path:
+/// a mismatch Landlock-EACCES-denies the store open, and SlateDB's retrying object store then
+/// spins on the permission error forever — a SILENT HANG, not a loud failure. The WS-C per-tenant
+/// router (the first privsep instance to actually OPEN `backend.kv` under the Derived sandbox) was
+/// bitten by exactly this when this mapped to the sibling `<data_dir>/kv`. `sql`/`blob`/`messaging`
+/// are the canonical privsep names whose
 /// reconciliation with each monolith backend's exact open path is part of the authority-serve
 /// follow-on (the SECURITY property — a non-inert, disjoint cross-authority map — holds regardless
 /// of the exact leaf names, because every backend authority maps to a distinct subtree).
 pub const fn backend_state_subdir(authority: HostAuthority) -> Option<&'static str> {
     match authority {
-        HostAuthority::BackendKv => Some("kv"),
+        HostAuthority::BackendKv => Some("kv-slate"),
         HostAuthority::BackendSql => Some("sql"),
         HostAuthority::BackendBlob => Some("blob"),
         HostAuthority::BackendMessaging => Some("messaging"),
@@ -1610,26 +1722,46 @@ pub mod linux {
             .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
     }
 
-    /// Build a Landlock ruleset confining reads to `read_only` (+ `read_write`) and
-    /// writes to `read_write`. Non-existent paths are skipped (best-effort).
+    /// Build a Landlock ruleset confining reads to `read_only` (+ `read_write`), writes to
+    /// `read_write`, and EXECUTE to `execute` ONLY. Non-existent paths are skipped (best-effort).
     /// `CompatLevel::BestEffort` degrades gracefully on a kernel without full Landlock.
+    ///
+    /// **Execute-pin (SECURITY-CRITICAL).** `AccessFs::from_read` includes [`AccessFs::Execute`]
+    /// (`Execute | ReadFile | ReadDir`) and `from_all ⊇ from_read`, so granting them verbatim would
+    /// make EVERY read-only AND read-write root `execve`-able — including the WRITABLE backend-state
+    /// subtrees (e.g. `kv-slate`). An `exec.compute` router (whose seccomp permits `execve`+`fork`)
+    /// could then write an ELF into writable state and run it, defeating the own-binary execute-pin
+    /// the fork-grant's safety argument depends on ([`FORK_SPAWN`]). So Execute is STRIPPED from the
+    /// general read/write grants here and re-granted ONLY on `execute` — the caller's explicit
+    /// execute-pin list (the own binary for an `exec.compute` router / the root supervisor; EMPTY
+    /// for every other instance, whose `execve` is seccomp-killed regardless). `handle_access` still
+    /// governs the FULL FS vocabulary (`from_all`, Execute included), so a path NOT in `execute` is
+    /// DENIED execute.
     fn build_ruleset(
         read_only: &[PathBuf],
         read_write: &[PathBuf],
+        execute: &[PathBuf],
     ) -> Result<RulesetCreated, SandboxError> {
         // Handle the FS rights the RUNNING kernel supports (clamped to the crate's max), not a
         // fixed ABI — so every FS right the kernel has is governed and `restrict_self` reports
         // `FullyEnforced` on a kernel the crate fully knows (see [`handled_fs_abi`]).
         let abi = handled_fs_abi(landlock_kernel_abi());
-        let ro_access = AccessFs::from_read(abi);
-        let rw_access = AccessFs::from_all(abi);
+        // Execute STRIPPED from the general grants; re-granted below ONLY on the `execute` pin.
+        let ro_access = AccessFs::from_read(abi) & !AccessFs::Execute;
+        let rw_access = AccessFs::from_all(abi) & !AccessFs::Execute;
+        // The execute-pin access: read + EXECUTE (so the pinned binary is readable AND runnable).
+        let exec_access = AccessFs::from_read(abi);
         let mut created = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(abi))
             .map_err(|e| SandboxError::Landlock(e.to_string()))?
             .create()
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
-        for (paths, access) in [(read_only, ro_access), (read_write, rw_access)] {
+        for (paths, access) in [
+            (read_only, ro_access),
+            (read_write, rw_access),
+            (execute, exec_access),
+        ] {
             for p in paths {
                 if !p.exists() {
                     continue;
@@ -1755,13 +1887,15 @@ pub mod linux {
         Ok(PreparedSeccomp { kill, allow })
     }
 
-    /// Build the Landlock ruleset for the given read-only / read-write roots.
+    /// Build the Landlock ruleset for the given read-only / read-write roots + the execute-pin
+    /// paths (read + EXECUTE; see [`build_ruleset`] — Execute is stripped from the general roots).
     pub fn prepare_landlock(
         read_only: &[PathBuf],
         read_write: &[PathBuf],
+        execute: &[PathBuf],
     ) -> Result<PreparedLandlock, SandboxError> {
         Ok(PreparedLandlock {
-            created: build_ruleset(read_only, read_write)?,
+            created: build_ruleset(read_only, read_write, execute)?,
         })
     }
 
@@ -1781,8 +1915,12 @@ pub mod linux {
         set_no_new_privs()?;
 
         // Landlock (independent). A genuine error is captured, logged, and does NOT skip seccomp.
-        let landlock = match prepare_landlock(&policy.read_only_paths, &policy.read_write_paths)
-            .and_then(PreparedLandlock::apply)
+        let landlock = match prepare_landlock(
+            &policy.read_only_paths,
+            &policy.read_write_paths,
+            &policy.execute_paths,
+        )
+        .and_then(PreparedLandlock::apply)
         {
             Ok(status) => Some(status),
             Err(e) => {
@@ -1877,6 +2015,7 @@ pub mod linux {
         let landlock = match prepare_landlock(
             &profile.policy.read_only_paths,
             &profile.policy.read_write_paths,
+            &profile.policy.execute_paths,
         )
         .and_then(PreparedLandlock::apply)
         {
@@ -2025,6 +2164,13 @@ pub mod linux {
                 "execve",
                 "setns",
                 "mount",
+                // The exec.compute sandbox-install family (Fix A / [`SANDBOX_INSTALL`]): a typo'd
+                // name is silently skipped at install, so the per-tenant child would fail to confine
+                // itself and refuse closed — guard the exact names the kernel/arch must know.
+                "seccomp",
+                "landlock_create_ruleset",
+                "landlock_add_rule",
+                "landlock_restrict_self",
             ] {
                 assert!(
                     name.parse::<syscalls::Sysno>().is_ok(),
@@ -2174,6 +2320,19 @@ mod privsep_derivation_tests {
         );
         // No exec.compute ⇒ execve is NOT in the allow-list AND is KILLED.
         assert!(!has(&allow, "execve") && !has(&allow, "execveat"));
+        // ...and the sandbox-install syscalls stay DENIED: only the per-tenant router (exec.compute),
+        // which forks children that must self-confine, is granted these (Fix A is scoped).
+        for s in [
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            assert!(
+                !has(&allow, s),
+                "a non-exec.compute instance must NOT be granted the sandbox-install syscall {s}"
+            );
+        }
         let kill = derive_seccomp_killlist(&frontend());
         assert!(
             has(&kill, "execve") && has(&kill, "execveat"),
@@ -2222,26 +2381,53 @@ mod privsep_derivation_tests {
     }
 
     #[test]
-    fn exec_compute_allows_execve_and_drops_it_from_the_kill_list() {
+    fn exec_compute_allows_the_spawn_family_and_drops_it_from_the_kill_list() {
         let set = caps(&[HostAuthority::ExecCompute]);
         let allow = derive_seccomp_allowlist(&set);
         assert!(
             has(&allow, "execve") && has(&allow, "execveat"),
             "the compute-supervisor must be able to re-exec its workers"
         );
+        // ...and `fork`/`vfork`: the per-tenant router forks the child (musl `Command`+`pre_exec`
+        // issues a BARE `fork(2)`) UNDER its installed sandbox before it `execve`s — without this it
+        // dies with a real `SIGSYS` on `fork(2)` at cold-start (regression against the audited bug).
+        assert!(
+            has(&allow, "fork") && has(&allow, "vfork"),
+            "the compute-supervisor must be able to fork its child before exec"
+        );
+        // ...and the sandbox-install syscalls: a per-tenant child forked from this confined router
+        // inherits THIS filter and must be able to install its own nested seccomp + Landlock profile
+        // over it (else its `seccomp` install is `EPERM`'d AND its Landlock ABI probe degrades to an
+        // empty access set → `empty access-right`). Monotonic, so safe. See [`SANDBOX_INSTALL`].
+        for s in [
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            assert!(
+                has(&allow, s),
+                "the compute-supervisor must be able to install its child's nested sandbox: {s}"
+            );
+        }
         let kill = derive_seccomp_killlist(&set);
         assert!(
             !has(&kill, "execve") && !has(&kill, "execveat"),
             "exec.compute must NOT kill the exec family it legitimately uses"
         );
-        // Every OTHER instance still kills it — proven by the frontend/signer/storage tests.
+        assert!(
+            !has(&kill, "fork") && !has(&kill, "vfork"),
+            "exec.compute must NOT kill the fork family it legitimately uses"
+        );
+        // Every OTHER instance still kills both — proven by the frontend/signer/storage tests.
     }
 
     #[test]
     fn monolith_derivation_is_a_superset_of_the_phase0_allowlist() {
         // The `all` composition (design §5.5 default-monolith invariant) must never LOSE a
-        // syscall the released Phase-0 monolith allow-list has; the ONLY extra it adds is the
-        // exec family, present solely because `all` includes exec.compute.
+        // syscall the released Phase-0 monolith allow-list has; the ONLY extras it adds are the
+        // exec + fork spawn families and the sandbox-install syscalls, present solely because `all`
+        // includes exec.compute.
         let allow: BTreeSet<String> = derive_seccomp_allowlist(&all_caps()).into_iter().collect();
         let phase0: BTreeSet<String> = whole_process_allowlist().into_iter().collect();
         assert!(
@@ -2250,13 +2436,23 @@ mod privsep_derivation_tests {
             phase0.difference(&allow).collect::<Vec<_>>()
         );
         let extra: BTreeSet<String> = allow.difference(&phase0).cloned().collect();
-        let expected: BTreeSet<String> = ["execve", "execveat"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let expected: BTreeSet<String> = [
+            "execve",
+            "execveat",
+            "fork",
+            "vfork",
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         assert_eq!(
             extra, expected,
-            "derive(ALL) adds exactly the exec family over Phase-0 (exec.compute ∈ ALL)"
+            "derive(ALL) adds exactly the exec + fork spawn families + the sandbox-install syscalls \
+             over Phase-0 (exec.compute ∈ ALL)"
         );
     }
 
@@ -2330,6 +2526,57 @@ mod privsep_derivation_tests {
                 "the signer must hold its own key {ro} read-only"
             );
         }
+    }
+
+    #[test]
+    fn execute_is_confined_to_the_execute_pin_not_the_general_grants() {
+        // An exec.compute router: SYSTEM_READ_ROOTS read-only, a kv-slate backend subtree
+        // read-write, and its OWN binary as the execute-pin. The derived policy must carry Execute
+        // ONLY on the own binary — NEVER on a system read root, NEVER on the writable kv-slate.
+        let exe = PathBuf::from("/opt/boatramp/bin/boatramp");
+        let kv_slate = PathBuf::from("/data/kv-slate");
+        let mut inp = SandboxDerivationInputs::for_instance("/data", None);
+        inp.base_read_write = vec![kv_slate.clone()];
+        inp.execute_paths = vec![exe.clone()];
+        let profile = derive_profile(
+            &caps(&[HostAuthority::ExecCompute]),
+            SandboxPosture::Derived,
+            &inp,
+        )
+        .expect("exec.compute router derives a clean profile");
+
+        // The execute-pin is EXACTLY the own binary.
+        assert_eq!(
+            profile.policy.execute_paths,
+            vec![exe.clone()],
+            "Execute is pinned to the own binary alone"
+        );
+        // NOT the system read roots.
+        for root in SYSTEM_READ_ROOTS {
+            assert!(
+                !profile.policy.execute_paths.contains(&PathBuf::from(root)),
+                "a system read root ({root}) must NOT be executable"
+            );
+        }
+        // NOT the writable kv-slate backend state (the finding's core: no ELF-drop-then-exec).
+        assert!(
+            !profile.policy.execute_paths.contains(&kv_slate),
+            "the writable kv-slate backend state must NOT be executable"
+        );
+
+        // A non-exec.compute instance (no execute-pin supplied) gets Execute NOWHERE.
+        let mut backend = SandboxDerivationInputs::for_instance("/data", None);
+        backend.base_read_write = vec![kv_slate.clone()];
+        let backend_profile = derive_profile(
+            &caps(&[HostAuthority::BackendKv]),
+            SandboxPosture::Derived,
+            &backend,
+        )
+        .expect("backend derives a clean profile");
+        assert!(
+            backend_profile.policy.execute_paths.is_empty(),
+            "a non-exec.compute instance has Execute granted NOWHERE"
+        );
     }
 
     #[test]
@@ -2764,6 +3011,18 @@ mod privsep_derivation_tests {
         // is read-write — the root writes nothing.
         assert_eq!(policy.read_only_paths, vec![exe.clone(), config.clone()]);
         assert!(policy.read_write_paths.is_empty());
+
+        // EXECUTE is pinned to the own binary ALONE (never the config file): `build_ruleset`
+        // strips Execute from the read grant and re-grants it only on `execute_paths`.
+        assert_eq!(
+            policy.execute_paths,
+            vec![exe.clone()],
+            "the root's EXECUTE pin is its own binary and nothing else"
+        );
+        assert!(
+            !policy.execute_paths.contains(&config),
+            "the config file must never be executable"
+        );
 
         // No §1.2 key input path, no data_dir, no instance state is anywhere in the view — the
         // root cannot open a crown-jewel key file even by accident (design F1/F11-A).

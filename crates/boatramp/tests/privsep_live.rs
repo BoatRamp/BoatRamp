@@ -436,6 +436,235 @@ fn privsep_frontend_inversion_serves_end_to_end() {
     println!("PRIVSEP FRONTEND INVERSION LIVE OK");
 }
 
+/// Live end-to-end gate for the privsep **per-tenant wasm instantiation** (Phase-4 WS-C): a
+/// `[privsep]` composition with a `lifecycle: PerTenantTemplate` instance actually SERVES — one
+/// isolated `{exec.wasmtime}` OS process per project (tenant), instantiated on demand by the
+/// per-tenant ROUTER and wired to it over a lazily-created `socketpair`.
+///
+/// Composition: `router` (listen.public-tls + listen.http-parse + backend.kv — the sole KV opener,
+/// so it resolves Host→project without a double-open) + `tenant-wasm` (the per-tenant template, NOT
+/// boot-forked) + `core` (crown jewels + the other backends) + `aux` (the other listeners +
+/// exec.compute + control). The test PRE-SEEDS the control-plane KV with TWO `domain/<host>` →
+/// `(project, site)` mappings, then CLOSES it before the node opens it as the sole writer.
+///
+/// Drives TWO hosts (`tenant-a.test` → project `acme`, `tenant-b.test` → project `globex`): the
+/// router resolves each Host (Stage-0, MSG_PEEK — consuming nothing), instantiates that tenant's
+/// `exec.wasmtime` instance (lazy socketpair + fork via the root's OWN primitive, scope wired via
+/// `BOATRAMP_PRIVSEP_TENANT_SCOPE`, NO secret inherited), and relays the client fd. Each per-tenant
+/// backend establishes its UNFORGEABLE wired identity (fail-closed) and serves a body keyed by its
+/// scope — so the TWO hosts return TWO DISTINCT bodies (`project=acme` vs `project=globex`), proving
+/// two distinct per-tenant instances. Greps the `PRIVSEP PER-TENANT OK` marker.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]`: it forks the real binary +
+/// installs per-instance sandboxes against the live kernel, so it compiles + runs ONLY on Linux with
+/// the `sandbox` feature. The CI `live gate (privsep)` job runs it via `--include-ignored` and greps
+/// the marker + the pass count.
+///
+/// NOTE (WS-D dependency, flagged): the per-tenant ROUTER forks per-tenant children, so its derived
+/// seccomp/Landlock profile must permit `clone`/`execve` of its own binary (today only the ROOT
+/// retains `execve`). Extending the per-capability profile derivation to grant a per-tenant router
+/// that is a WS-D profile change; until it lands this gate stands up fail-closed (the router cannot
+/// spawn) rather than serving — which is the correct fail-closed behavior, not a WS-C regression.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a per-tenant template composition; the router resolves \
+            two Hosts, instantiates two per-tenant exec.wasmtime instances (lazy socketpair + \
+            root fork+exec, scope-wired) + serves two distinct scoped bodies (Linux + `sandbox`); \
+            run via --include-ignored in the `live gate (privsep)` job"]
+fn privsep_per_tenant_serves_end_to_end() {
+    use boatramp_core::kv::KvOpenPolicy;
+    use boatramp_core::project::DomainOwner;
+    use boatramp_node::backends::{KvBackend, build_kv};
+
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-per-tenant-{}",
+        std::process::id()
+    ));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // PRE-SEED the control-plane KV with two host→(project, site) domain mappings, exactly as the
+    // running router will read them (`domain/<canon-host>` → DomainOwner JSON), then CLOSE it so the
+    // node opens the SAME SlateDB store as its sole writer (no concurrent open — the router is the
+    // only `backend.kv` holder). Done in a dedicated current-thread runtime, mirroring the unseal
+    // gate's pre-seal.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime to seed the control-plane KV");
+        rt.block_on(async {
+            let kv = build_kv(
+                KvBackend::Slatedb,
+                &data_dir,
+                None,
+                KvOpenPolicy::SelfHeal,
+                None,
+            )
+            .await
+            .expect("open the control-plane KV to seed domains");
+            kv.put(
+                "domain/tenant-a.test",
+                DomainOwner::new("acme", "shop").to_bytes(),
+            )
+            .await
+            .expect("seed tenant-a → acme");
+            kv.put(
+                "domain/tenant-b.test",
+                DomainOwner::new("globex", "shop").to_bytes(),
+            )
+            .await
+            .expect("seed tenant-b → globex");
+            // Flush + close so the store's lock is released before the node opens it.
+            kv.close().await.expect("close the seeded control-plane KV");
+        });
+    }
+
+    // The per-tenant composition (union == ALL; no crown co-resident with a listener/exec/control;
+    // exec.wasmtime lives ONLY on the per-tenant template):
+    //   - `router`      = listen.public-tls + listen.http-parse + backend.kv — the per-tenant ROUTER
+    //                     (sole KV opener: resolves Host→project, instantiates + relays per tenant);
+    //   - `tenant-wasm` = ONLY exec.wasmtime, `lifecycle: PerTenantTemplate` — NOT boot-forked;
+    //   - `core`        = every crown jewel + the other backends (A ∪ B∖{kv});
+    //   - `aux`         = the other listeners + exec.compute + control (closes the union).
+    //   - `to-tenant`   = the router↔template Relay link (socketpaired per tenant at instantiation).
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "router": (
+                capabilities: ["listen.public-tls", "listen.http-parse", "backend.kv", "exec.compute"],
+                sandbox: Derived,
+                links: ["to-tenant"],
+            ),
+            "tenant-wasm": (
+                capabilities: ["exec.wasmtime"],
+                lifecycle: PerTenantTemplate,
+                sandbox: Derived,
+                links: ["to-tenant"],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay", "listen.s3ingress",
+                    "listen.inbound-tcp", "listen.gateway",
+                    "control.admin-api", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+        }},
+        links: {{ "to-tenant": (from: "router", to: "tenant-wasm", transport: Local, purpose: Relay) }},
+        per_tenant: ( idle_eviction_secs: 300, max_instances: 64 ),
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    // Drive the TWO hosts; each must return a body naming ITS OWN project (two distinct instances).
+    let want = [
+        ("tenant-a.test", "project=acme"),
+        ("tenant-b.test", "project=globex"),
+    ];
+    let mut got: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+    loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!("the per-tenant node did not serve both tenants within 25s; got: {got:?}");
+        }
+        if let Ok(Some(status)) = root.try_wait() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the per-tenant composition failed to \
+                 stand up (sandbox not Enforced? the router could not fork a per-tenant instance — \
+                 the flagged WS-D execve-grant dependency? link/listener wiring?)"
+            );
+        }
+        for (host, marker) in want {
+            if got.contains_key(host) {
+                continue;
+            }
+            if let Ok(resp) = try_http_get_host(&addr, host)
+                && resp.contains("200")
+                && resp.contains(marker)
+            {
+                got.insert(host, resp);
+            }
+        }
+        if got.len() == want.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let _ = root.kill();
+    let _ = root.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Two DISTINCT per-tenant bodies ⇒ two DISTINCT per-tenant instances, each scoped by its own
+    // unforgeable wired identity (artifact #2). Spoof-proof: the project came from the routed Host,
+    // never a guest field.
+    let a = &got["tenant-a.test"];
+    let b = &got["tenant-b.test"];
+    assert!(
+        a.contains("project=acme") && b.contains("project=globex"),
+        "each Host must route to its OWN tenant's scoped instance; a={a}\nb={b}"
+    );
+    assert!(
+        a.contains("boatramp privsep per-tenant backend")
+            && b.contains("boatramp privsep per-tenant backend"),
+        "both responses must come from the per-tenant backend handler"
+    );
+
+    // The marker the CI gate greps — only reached after BOTH tenants served a distinct scoped body,
+    // which under fail-closed semantics requires two per-tenant instances to have established their
+    // wired identities and served scope-keyed.
+    println!("PRIVSEP PER-TENANT OK");
+}
+
+/// One blocking HTTP/1.1 `GET /` to `addr` with an explicit `Host`, returning the raw response text
+/// (the router routes on this Host).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn try_http_get_host(addr: &str, host: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// One blocking HTTP/1.1 `GET /` with `Connection: close`, returning the raw response text.
 fn try_http_get(addr: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(addr)?;

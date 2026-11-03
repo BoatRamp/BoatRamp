@@ -474,6 +474,13 @@ pub struct PrivsepConfig {
     /// Optional supervisor posture (listener-fd ownership + crown-jewel crash policy, design
     /// §4). Carried as a WS-A placeholder; WS-B consumes it.
     pub supervisor: Option<PrivsepSupervisorConfig>,
+    /// The per-tenant TEMPLATE scale-to-zero policy (design §Phase-4 WS-C): the idle-eviction
+    /// window + the concurrency ceiling the per-tenant router applies to the on-demand
+    /// `exec.wasmtime` instances it instantiates. The struct-level `#[serde(default)]` supplies
+    /// [`PerTenantPolicy::default`] for a config that omits it, and it is CONSULTED only when the
+    /// composition defines a [`InstanceLifecycle::PerTenantTemplate`] (a no-template composition
+    /// never reads it), so every pre-Phase-4 composition is byte-unchanged.
+    pub per_tenant: PerTenantPolicy,
 }
 
 /// One composed instance (design §1.3): the fine-grained authority SUBSET it materializes,
@@ -935,6 +942,136 @@ pub enum CrownJewelCrashPolicy {
     /// Restart the crashed instance from the SAME on-disk topology (design §4.1). WS-B owns
     /// the semantics.
     Restart,
+}
+
+/// The per-tenant TEMPLATE **scale-to-zero policy** (design §Phase-4 WS-C): operator-tunable, with
+/// fail-closed defaults. It governs how the per-tenant router (the frontend) POOLS the on-demand
+/// `exec.wasmtime` instances it instantiates per tenant — how long an idle instance lives before it
+/// is evicted (scale-to-zero), and the hard ceiling on how many may run at once. It lives in the
+/// `[privsep]` config (restart-class, like the rest of the composition — §5 F4), and it matters
+/// ONLY when the composition declares a [`InstanceLifecycle::PerTenantTemplate`]: a no-template
+/// composition never reads it, so the defaults carried for every pre-Phase-4 composition change
+/// nothing.
+///
+/// **Defaults (owner-ratified):** `idle_eviction_secs = 300`, `max_instances = 64`. The cold-start
+/// admission knobs (`cold_start_*`) default to a generous-but-bounded budget that is a no-op for a
+/// healthy node and only dampens crash-loop / cross-tenant-spray fork churn. **Fail-closed:** a
+/// misconfigured policy (`max_instances == 0`) is REFUSED at the root's authorization gate before
+/// any spawn ([`validate`](PerTenantPolicy::validate)) rather than silently serving no tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PerTenantPolicy {
+    /// Idle-eviction window in SECONDS: a per-tenant instance with no routed connection for at
+    /// least this long is evicted (its process killed, its link dropped) — the scale-to-zero knob.
+    /// Default `300`. `0` DISABLES idle eviction (an instance then lives until the concurrency cap
+    /// forces a least-recently-used eviction).
+    pub idle_eviction_secs: u64,
+    /// The hard ceiling on concurrently-live per-tenant instances. Default `64`. A new tenant beyond
+    /// the cap first triggers an idle sweep, then (if still at the cap) evicts the LEAST-recently-used
+    /// live instance to make room — it never exceeds the cap and never silently refuses a valid
+    /// tenant. Fail-closed: `0` is a misconfiguration ([`PerTenantPolicyError::ZeroMaxInstances`]).
+    pub max_instances: u32,
+    /// Cold-start crash-loop guard (milliseconds): a per-tenant child that dies within this window
+    /// of its fork is treated as a FAILED cold start and its tenant is backed off, so a tenant whose
+    /// child keeps crashing is not re-forked on every request. Default `1000`. `0` DISABLES
+    /// crash-loop backoff (a fork FAILURE still backs off). Fail-closed: a backed-off tenant is
+    /// refused (`NotReady`), never served from another tenant's instance.
+    pub cold_start_min_healthy_ms: u64,
+    /// The base backoff delay (milliseconds) after the first failed / crash-looping cold start; it
+    /// doubles per consecutive failure up to [`cold_start_backoff_max_ms`](Self::cold_start_backoff_max_ms).
+    /// Default `500`.
+    pub cold_start_backoff_base_ms: u64,
+    /// The ceiling (milliseconds) on the exponential cold-start backoff. Default `30000` (30s).
+    pub cold_start_backoff_max_ms: u64,
+    /// Node-wide cold-start admission rate (forks PER SECOND): the refill rate of the cold-start
+    /// token bucket. It bounds how fast NEW per-tenant instances are forked so a request spray across
+    /// more tenants than [`max_instances`](Self::max_instances) cannot force continuous evict+fork
+    /// churn that evicts warm instances for free. Default `50`. `0` DISABLES cold-start rate limiting.
+    pub cold_start_rate_per_sec: u32,
+    /// The cold-start token-bucket burst (capacity): how many cold starts may happen back-to-back
+    /// before the per-second rate applies (e.g. a cold node waking many tenants at once). Default
+    /// `100`. Clamped to at least `1` so a node can always make progress.
+    pub cold_start_burst: u32,
+}
+
+impl Default for PerTenantPolicy {
+    fn default() -> Self {
+        Self {
+            idle_eviction_secs: 300,
+            max_instances: 64,
+            cold_start_min_healthy_ms: 1000,
+            cold_start_backoff_base_ms: 500,
+            cold_start_backoff_max_ms: 30000,
+            cold_start_rate_per_sec: 50,
+            cold_start_burst: 100,
+        }
+    }
+}
+
+/// A misconfigured [`PerTenantPolicy`] — a fail-closed REFUSAL the root surfaces before any spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerTenantPolicyError {
+    /// `max_instances == 0` — a template composition that could never instantiate any tenant
+    /// instance. Fail-closed: refuse rather than silently serve no tenant.
+    ZeroMaxInstances,
+}
+
+impl std::fmt::Display for PerTenantPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMaxInstances => f.write_str(
+                "[privsep].per_tenant.max_instances is 0 — a per-tenant template composition could \
+                 never instantiate any tenant instance; set it to at least 1 (default 64)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PerTenantPolicyError {}
+
+impl PerTenantPolicy {
+    /// Fail-closed validation (design §Phase-4 WS-C) — the root runs it before any spawn when the
+    /// composition declares a per-tenant template, refusing a policy that could never serve.
+    pub fn validate(&self) -> Result<(), PerTenantPolicyError> {
+        if self.max_instances == 0 {
+            return Err(PerTenantPolicyError::ZeroMaxInstances);
+        }
+        Ok(())
+    }
+
+    /// The idle-eviction window as a [`std::time::Duration`], or `None` when eviction is disabled
+    /// (`idle_eviction_secs == 0`).
+    pub fn idle_eviction(&self) -> Option<std::time::Duration> {
+        (self.idle_eviction_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.idle_eviction_secs))
+    }
+
+    /// The crash-loop min-healthy window: a child that dies within this of its fork is treated as a
+    /// failed cold start (and its tenant backed off). `0` ⇒ zero window ⇒ crash-loop backoff is
+    /// disabled (a child is never "too short-lived").
+    #[must_use]
+    pub fn cold_start_min_healthy(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cold_start_min_healthy_ms)
+    }
+
+    /// The exponential, capped cold-start backoff delay after `failures` consecutive failed /
+    /// crash-looping cold starts (`failures >= 1`): `base * 2^(failures - 1)`, clamped to the
+    /// configured max. Overflow-safe (the doubling shift is capped).
+    #[must_use]
+    pub fn cold_start_backoff(&self, failures: u32) -> std::time::Duration {
+        let base = self.cold_start_backoff_base_ms.max(1);
+        let max = self.cold_start_backoff_max_ms.max(base);
+        // Cap the shift so `1 << shift` can never overflow; by ~20 doublings we are already clamped.
+        let shift = failures.saturating_sub(1).min(20);
+        let delay = base.saturating_mul(1u64 << shift).min(max);
+        std::time::Duration::from_millis(delay)
+    }
+
+    /// The cold-start token-bucket capacity (burst), always `>= 1` so a node can always cold-start.
+    #[must_use]
+    pub fn cold_start_burst_capacity(&self) -> f64 {
+        f64::from(self.cold_start_burst.max(1))
+    }
 }
 
 // =============================================================================
@@ -1768,6 +1905,7 @@ mod tests {
             instances,
             links: BTreeMap::new(),
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }
     }
 
@@ -1961,6 +2099,7 @@ mod tests {
             instances,
             links: BTreeMap::new(),
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         };
         let report = check_composition_closure(&cfg).expect("F8 is a flag, not a refusal");
         assert!(report.warnings.iter().any(|w| matches!(
@@ -2098,6 +2237,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }
     }
 
@@ -2218,6 +2358,7 @@ mod tests {
             instances,
             links,
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         };
         let authorityserve_fault = |cfg: &PrivsepConfig| {
             check_composition_closure(cfg).err().is_some_and(|e| {
@@ -2356,6 +2497,7 @@ mod tests {
             instances,
             links: BTreeMap::new(),
             supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
         }
     }
 
@@ -2678,6 +2820,102 @@ mod tests {
         ));
         // The env var name is the non-secret BOATRAMP_* spelling.
         assert_eq!(PRIVSEP_TENANT_SCOPE_ENV, "BOATRAMP_PRIVSEP_TENANT_SCOPE");
+    }
+
+    // ---- per-tenant scale-to-zero policy (Phase-4 WS-C) ----
+
+    #[test]
+    fn per_tenant_policy_defaults_are_the_owner_ratified_values() {
+        let p = PerTenantPolicy::default();
+        assert_eq!(p.idle_eviction_secs, 300);
+        assert_eq!(p.max_instances, 64);
+        assert_eq!(p.idle_eviction(), Some(std::time::Duration::from_secs(300)));
+        // A config that omits `[privsep].per_tenant` gets the defaults (byte-compat).
+        assert_eq!(
+            PrivsepConfig::default().per_tenant,
+            PerTenantPolicy::default()
+        );
+    }
+
+    #[test]
+    fn per_tenant_policy_validate_is_fail_closed_on_zero_max() {
+        assert_eq!(PerTenantPolicy::default().validate(), Ok(()));
+        let bad = PerTenantPolicy {
+            idle_eviction_secs: 300,
+            max_instances: 0,
+            ..PerTenantPolicy::default()
+        };
+        assert_eq!(
+            bad.validate(),
+            Err(PerTenantPolicyError::ZeroMaxInstances),
+            "a 0 concurrency cap is a fail-closed misconfiguration"
+        );
+        // idle_eviction_secs == 0 is valid (disables idle eviction).
+        let no_evict = PerTenantPolicy {
+            idle_eviction_secs: 0,
+            max_instances: 8,
+            ..PerTenantPolicy::default()
+        };
+        assert_eq!(no_evict.validate(), Ok(()));
+        assert_eq!(no_evict.idle_eviction(), None);
+    }
+
+    #[test]
+    fn cold_start_backoff_is_exponential_and_capped() {
+        let p = PerTenantPolicy {
+            cold_start_backoff_base_ms: 500,
+            cold_start_backoff_max_ms: 30_000,
+            ..PerTenantPolicy::default()
+        };
+        assert_eq!(
+            p.cold_start_backoff(1),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            p.cold_start_backoff(2),
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            p.cold_start_backoff(3),
+            std::time::Duration::from_millis(2000)
+        );
+        // Climbs geometrically but never exceeds the cap — even for an absurd failure count
+        // (the shift is bounded, so there is no overflow / wrap).
+        assert_eq!(
+            p.cold_start_backoff(100),
+            std::time::Duration::from_millis(30_000)
+        );
+        assert_eq!(p.cold_start_burst_capacity(), 100.0);
+        assert_eq!(
+            p.cold_start_min_healthy(),
+            std::time::Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn per_tenant_policy_round_trips_through_ron_and_defaults_when_omitted() {
+        // Explicit policy round-trips.
+        let ron = r#"(
+            instances: { "tenant-wasm": ( capabilities: ["exec.wasmtime"], lifecycle: PerTenantTemplate ) },
+            per_tenant: ( idle_eviction_secs: 120, max_instances: 8 ),
+        )"#;
+        let cfg: PrivsepConfig = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(ron)
+            .expect("parse privsep RON with a per_tenant policy");
+        assert_eq!(cfg.per_tenant.idle_eviction_secs, 120);
+        assert_eq!(cfg.per_tenant.max_instances, 8);
+        // Omitted ⇒ the defaults (byte-compat with pre-WS-C configs).
+        let ron2 = r#"( instances: { "edge": ( capabilities: ["listen.http-parse"] ) } )"#;
+        let cfg2: PrivsepConfig = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(ron2)
+            .expect("parse privsep RON without a per_tenant policy");
+        assert_eq!(cfg2.per_tenant, PerTenantPolicy::default());
+        // serde value → JSON → value is stable.
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: PrivsepConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
     }
 
     #[test]

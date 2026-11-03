@@ -534,6 +534,12 @@ async-trait.workspace = true
 boatramp-server.workspace = true
 boatramp-core = { workspace = true, features = ["authz"] }
 tokio = { workspace = true, features = ["rt"] }
+# The privsep per-tenant live gate (`privsep_live.rs`) SEEDS the control-plane KV with two
+# `domain/<host>` → `(project, site)` mappings so the router resolves two Hosts to two tenants,
+# then CLOSES it before the node opens it as the sole writer. `build_kv` (SlateDB) lives in
+# `boatramp-node::backends`; it is already a regular dep of this crate (cargo unifies — no new
+# compile cost), surfaced to the integration test harness here.
+boatramp-node.workspace = true
 # Substrate 1 (fd-pass) drives the REAL Phase-1 `local` transport
 # (`boatramp_server::privsep_link::LinkEndpoint`), already a dep via `boatramp-server` above — no
 # new dep. Substrates 3 (namespace) and 4 (`AF_VSOCK`) hand-roll their own raw syscalls
