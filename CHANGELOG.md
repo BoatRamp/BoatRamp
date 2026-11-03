@@ -9,6 +9,62 @@ versions.
 
 Nothing yet.
 
+## [0.53.0] - 2026-11-03
+
+This release closes the **single-node / cluster capability gap**: the full guest-serving path is now
+shared code, so an operator gets the same capabilities on a single-node edge as in a replicated
+cluster — the only axis that differs is what is *allowed by default* for a single-tenant vs
+multi-tenant posture, which has nothing to do with the level of clustering. On the way there, the two
+previously-divergent serve tails (`run` and `run_cluster`) were **consolidated into one
+`serve_assembled`** path, so the behaviours cannot drift apart again. It also hardens two
+credential/tenancy surfaces — **managed-DB credential fencing** (opt-in Postgres row-level-security
+session scoping) and the **cluster messaging payload-spill store**, now sealed to the same
+operator-selected backend as the rest of serve instead of falling back to ambient credentials — and
+makes **streaming clone/import/export** robust to partial failures without ever spooling to local
+disk. Finally, the **documentation is restructured** end-to-end (Diátaxis how-to taxonomy, generated
+reference, and a CI drift gate).
+
+### Added
+
+- **On-demand per-SNI TLS on a single node.** On-demand certificate issuance for a newly-added custom
+  domain (ACME, per-SNI) is no longer gated behind cluster mode — it runs on a single-node edge under
+  the `acme-dns` feature, with the cross-node certificate-request queue simply inert when there is one
+  node. Adding a domain to a running single-node serve no longer requires a wildcard or a restart.
+- **Managed-DB Postgres row-level-security fencing (opt-in `rls_session`).** When enabled for a
+  managed Postgres, the dynamic per-workload role carries a role-default tenant GUC
+  (`ALTER ROLE … SET`) and a `SECURITY DEFINER` event trigger upgrades **only** the tables that have
+  already opted into row-level security (`ENABLE` → `FORCE`), surgically and without touching tables
+  that have not. Off by default; a defence-in-depth layer, not a replacement for the structural
+  tenant predicate.
+- **Clone/import robustness flags.** `import --clone-from` and `export` gained `--continue-on-error`
+  (optionally scoped by member kind, e.g. `--continue-on-error=blobs`; the default remains a hard
+  fail on the first error), `--only-blobs` to re-stream just the blob members of an existing target,
+  and HEAD-recovery plus skip-manifest handling so an interrupted streaming clone can resume. All of
+  this stays **streaming-only** — there is no local spool at any point.
+
+### Changed
+
+- **Serve path consolidated (`serve_assembled`).** `run` and `run_cluster` now share a single
+  assembled-serve tail; clustering injects only the leader predicate and the certificate-refresh
+  strategy (`Local` vs `Replicated`). The guest-serving capability surface — per-project blob
+  backends, the cloud blob minter and sealed base credential, on-demand TLS, and the certificate
+  store — is identical on one node and on many.
+- **Documentation restructured.** The how-to guides were reorganised from a flat list of ~62 pages
+  into 11 task-oriented groups (Diátaxis), the CLI/config/endpoint reference is now generated
+  (`cargo xtask gen-docs`) and guarded by a CI drift check (`gen-docs --check`), and the crate was
+  split bin → lib (`boatramp::main_entry()`) so the reference generator and tests can call into it.
+  Adds an upgrade guide and an on-demand-TLS how-to.
+
+### Fixed
+
+- **Cluster messaging payload-spill store is now sealed.** The cross-node messaging payload-spill
+  store previously fell back to ambient credentials because the serving node needs a storage backend
+  before the sealed credential vault exists (a boot ordering gap). It is now **late-bound**: the store
+  is created unbound and fails closed until it is wired, post-KV, to the same sealed, operator-selected
+  backend as the rest of serve. No guest-facing store reaches ambient credentials.
+- **Managed-DB credential handling hardened** across several lower-severity findings from the security
+  review, and the managed-DB **migration DSN is now opt-in** rather than always injected.
+
 ## [0.52.0] - 2026-11-02
 
 This release delivers **Connect / gRPC-web** as a first-class transport — typed-protobuf unary and
