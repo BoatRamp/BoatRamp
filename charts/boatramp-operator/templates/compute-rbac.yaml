@@ -30,11 +30,19 @@ metadata:
 ---
 {{- end }}
 # Least-privilege Role for the serve pod's compute backend, scoped to THIS namespace.
-# The exact resources/verbs the kubernetes backend applies (StatefulSet + Service + PVC
-# for a managed DB) and reads (pods / readiness); pods/exec + pods/log + deployments are
-# included for the Phase-2 generic-workload + exec/logs surfaces. No wildcards; no
-# cluster-scoped grants (a boatramp-owned expandable StorageClass, being cluster-scoped,
-# is intentionally NOT granted here — it is an explicit operator step).
+# Covers the exact resources/verbs the kubernetes backend applies + reads:
+#   - apps/statefulsets + apps/deployments: the managed-DB (stateful) + generic (stateless)
+#     workloads the backend server-side-applies.
+#   - services + persistentvolumeclaims: the per-workload routing Service + the data PVC
+#     (list/delete back the Phase-2 PVC volume-management + reaper surfaces).
+#   - pods + pods/log: pod readiness/liveness reads + the Phase-2 pod-log stream.
+#   - pods/exec: the Phase-2 `ComputeExec` (run a command inside a running pod).
+#   - snapshot.storage.k8s.io/volumesnapshots: the Phase-2 CSI VolumeSnapshot backup /
+#     restore (gated on a configured VolumeSnapshotClass; a no-op grant if unused).
+# No wildcards; no cluster-scoped (ClusterRole) grants — a boatramp-owned expandable
+# StorageClass or a VolumeSnapshotClass, being cluster-scoped, is intentionally NOT granted
+# here (an explicit operator step), and NO `secrets` verb (the imagePullSecret is managed
+# out-of-band). Non-helm installs: apply the equivalent Role below by hand.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -54,6 +62,11 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods/exec"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # CSI VolumeSnapshot backup / restore (Phase 2). Namespace-scoped; the cluster-scoped
+  # VolumeSnapshotClass is NOT granted (an operator step).
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
