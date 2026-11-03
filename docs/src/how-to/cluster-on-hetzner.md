@@ -1,5 +1,7 @@
 # Bring up a boatramp cluster on Hetzner
 
+**For: operators**
+
 Standing up a Kubernetes cluster, getting a `kubectl` context, and installing the
 boatramp operator onto it is the same for **every** boatramp deployment — it is not
 app-specific. So the generic bring-up tooling lives with the platform, in boatramp's

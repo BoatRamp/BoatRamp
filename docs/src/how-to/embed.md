@@ -1,5 +1,7 @@
 # Embed boatramp as a library
 
+**For: app developers**
+
 boatramp is normally a single binary (server + CLI), but the server is a
 **backend-agnostic library crate** you can embed in your own Rust application:
 mount its HTTP surface into an existing `axum` app, or run it as a managed

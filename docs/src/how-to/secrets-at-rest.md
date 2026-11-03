@@ -1,5 +1,7 @@
 # Encrypt secrets at rest
 
+**For: operators**
+
 The control plane stores cluster-managed certificate private keys. By default
 they sit cleartext in the (replicated) KV. Envelope encryption wraps each key
 with a key-encryption key (KEK) so the stored bytes are ciphertext; only a node

@@ -1,5 +1,7 @@
 # Enable compression
 
+**For: operators**
+
 boatramp negotiates compression per request from the client's `Accept-Encoding`.
 Precompressed sibling variants are preferred over on-the-fly compression because
 they cost no per-request CPU. This page covers both. For how compression

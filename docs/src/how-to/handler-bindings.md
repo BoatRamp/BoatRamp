@@ -1,5 +1,7 @@
 # Use kv / sql / blobstore / messaging
 
+**For: app developers**
+
 A handler is a WebAssembly component that runs a dynamic route. It imports only
 the host interfaces it declares, intersected with what the site grants — deny by
 default. This page covers the four data bindings an operator wires up:

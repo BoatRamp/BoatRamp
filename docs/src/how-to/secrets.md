@@ -1,5 +1,7 @@
 # Give handlers & functions secrets
 
+**For: operators & app developers**
+
 A site handler or a function often needs a secret — a third-party API key, a
 database URL, a signing token — that must **not** live in the committed config.
 boatramp handles this with a `secrets` map whose values are *references*, not

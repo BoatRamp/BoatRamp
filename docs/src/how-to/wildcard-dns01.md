@@ -1,5 +1,7 @@
 # Wildcard certs with DNS-01
 
+**For: operators**
+
 Issue a `*.example.com` certificate by proving control of the domain through a
 DNS TXT record instead of an HTTP path.
 

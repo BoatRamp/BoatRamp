@@ -1,5 +1,7 @@
 # Restrict visitor access
 
+**For: operators**
+
 Control who can reach a site's public content: password-protect a staging site,
 allow or deny by IP, and cap request rate. These controls are per-site and apply
 before any content is read, so a blocked request never stalls a response in

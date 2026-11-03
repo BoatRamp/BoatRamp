@@ -1,5 +1,7 @@
 # Isolate tenants within a project
 
+**For: operators**
+
 boatramp has **two** tenant boundaries, and they stack:
 
 1. **Project = database.** A [project](./projects.md) maps 1:1 to its own managed

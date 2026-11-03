@@ -1,5 +1,7 @@
 # Author configs in RON or JSON
 
+**For: operators & app developers**
+
 boatramp's config files — the `apply` manifest, `boatramp.cfg`, a site's
 `project.cfg` — are written in **RON** (Rusty Object Notation). RON is the native,
 primary format: it maps directly onto boatramp's typed Rust schema, supports

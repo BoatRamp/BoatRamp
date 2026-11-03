@@ -1,5 +1,7 @@
 # Declare a managed database
 
+**For: operators & app developers**
+
 A project handler that opens a `sql` / `orm` binding needs a database behind it.
 boatramp can **provision and fully manage** that database for you — mint its
 credential, seal it, follow the workload across restarts — driven entirely from

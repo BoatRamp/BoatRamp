@@ -1,5 +1,7 @@
 # Enable the embedded web console
 
+**For: operators**
+
 boatramp ships a small web **management console** — a WebAssembly single-page app
 that drives the control-plane `/api` (sites, deployments, tokens, config,
 observability, the overlay directory + flow policy). It is **baked into the binary** and served,

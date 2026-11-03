@@ -1,5 +1,7 @@
 # Let an app configure its own project
 
+**For: app developers**
+
 Some apps need to reconfigure **their own project** from inside the sandbox — a SaaS
 adding a customer's custom domain, a setup wizard writing its own SMTP profile, an
 installer rotating a secret. The usual way is to embed a `project_admin` bearer token
