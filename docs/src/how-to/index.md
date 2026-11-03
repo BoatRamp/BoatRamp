@@ -66,6 +66,7 @@ security posture, and manage secrets.
 - [Make a scoped CI deploy token](./ci-token.md)
 - [PoP-bind a control-plane token (DPoP)](./pop-tokens.md)
 - [Hold the signing key in a KMS/HSM/Vault](./external-signer.md)
+- [Rotate the root key](./rotate-root-key.md)
 - [Mint a delegated capability](./delegated-capabilities.md)
 - [Restrict visitor access](./visitor-access.md)
 - [Choose & inspect a security posture](./security-posture.md)
@@ -94,6 +95,9 @@ Declare managed stores, run schema migrations, and ingest large blobs.
 - [Run owner-gated schema migrations](./in-app-migrations.md)
 - [Ingest large uploads over S3 (blob-ingress)](./blob-ingress.md)
 
+> Switching the blob *backend* is an operator task — see [Switch the blob backend
+> with zero downtime](./blob-backend-migration.md) under [Operations, backup & data movement](#operations-backup--data-movement).
+
 ### Containers & microVMs
 
 Run OCI containers and Firecracker microVMs behind a route.
@@ -111,9 +115,11 @@ Reverse-proxy upstreams, tune caching and compression, and reach private service
 - [Enable compression](./compression.md)
 - [Reach services over the overlay (service tunneler)](./service-tunneler.md)
 
-### Deployment & clustering
+### Run boatramp in production
 
-Put boatramp into production — one node, a cluster, Kubernetes, or Cloudflare.
+Install the boatramp **server** into a production topology — one node, a cluster,
+Kubernetes, or Cloudflare. (To deploy your *site*, see [Sites](#sites-publish--configure);
+to deploy your *handler or function*, see [Functions, handlers & workflows](#functions-handlers--workflows).)
 
 - [Deploy a single node in production](./deploy-single-node.md)
 - [Deploy a self-hosted cluster](./deploy-cluster.md)
@@ -137,7 +143,6 @@ Plus the rest of the operations toolkit:
 - [Garbage-collect & verify integrity](./prune-scrub.md)
 - [Switch the blob backend with zero downtime](./blob-backend-migration.md)
 - [Upgrade a store to project scoping](./upgrade-store-to-projects.md)
-- [Rotate the root key](./rotate-root-key.md)
 
 ### Integrations & tooling
 
