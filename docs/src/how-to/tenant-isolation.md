@@ -192,7 +192,7 @@ Cross-tenant is **default-deny**:
 > **Base-vs-override reads (`own_first()`).** A common `own_or_null` shape is a two-layer table: a
 > shared **base** row (`tenant_id IS NULL`) plus an optional per-tenant **override**, where a lookup
 > wants *the override if present, else the base*. Since the tenant column is host-injected and
-> hidden, the [`orm` builder](./handler-bindings.md#typed-queries-with-the-orm-builder) exposes
+> hidden, the [`orm` builder](./handler-binding-sql.md#typed-queries-with-the-orm-builder) exposes
 > `own_first()` (sort own rows ahead of base — `ORDER BY is_own DESC`) and `is_own()` (a `0`/`1`
 > own-ness expression) so you can express this without naming `tenant_id`. Host-resolved from the
 > same scope, fail-closed off an own-tenant read; needs the `orm-own-pref` capability. Raw SQL keeps
@@ -295,7 +295,7 @@ greppable in one place.
 
 Whichever way a handler queries, the host applies the **same** tenant predicate:
 
-- **The [`orm`](./handler-bindings.md#typed-queries-with-the-orm-builder) builder** folds
+- **The [`orm`](./handler-binding-sql.md#typed-queries-with-the-orm-builder) builder** folds
   the scope in **structurally** — into `WHERE`/`HAVING`, every joined table (qualified per
   alias), `INSERT` rows and `INSERT … SELECT` sources, `RETURNING`, `UNION` branches, and
   narrow subqueries. You write the query; the tenant clause appears in the SQL by

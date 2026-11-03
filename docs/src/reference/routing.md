@@ -229,7 +229,7 @@ rejected at validate.
 | `wasi:blobstore` | Per-site blob store. |
 | `wasi:messaging` | Publish / subscribe on topics. |
 | `sql` | The **default** per-site SQL database (managed libsql), opened as `sql.open("")`. |
-| `sql:<name>` | A specific operator-configured [named database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql) (e.g. `sql:analytics`), opened as `sql.open("<name>")` — its own connection + role, for least-privilege isolation. |
+| `sql:<name>` | A specific operator-configured [named database](../how-to/handler-binding-sql.md#bring-your-own-database-external-postgres--mysql) (e.g. `sql:analytics`), opened as `sql.open("<name>")` — its own connection + role, for least-privilege isolation. |
 | `sql:*` | Every named database the site exposes (a convenience grant; the site's `allow_imports` is still the hard ceiling). |
 | `admin:domains` / `admin:email` / `admin:site` / `admin:secrets` | A guest project-self-config surface via `boatramp:handlers/admin`. Each is a **specific** surface grant (a bare `admin` and `admin:*` are deliberately not accepted — deny-by-default, least-privilege) and is additionally gated by the matching `allow_guest_admin_*` posture knob (all off under `multi-tenant`). |
 | `session` | A duplex/resumable [session](#sessions) route's per-frame session binding. Accepted in `imports` but advertised only when the host is built with the `session` feature (the `requires` ABI gate enforces host support at activation). |
