@@ -41,6 +41,10 @@ members = [
   "crates/boatramp-mcp",
   "crates/boatramp-node",
   "crates/boatramp",
+  # The workspace dev-tool runner (`cargo xtask …`): houses `gen-docs`, the generated-docs
+  # harness + CI drift gate. `publish = false` (a build/CI tool, never shipped); deliberately
+  # NOT in the justfile `crate_order`.
+  "crates/xtask",
 ]
 # WebAssembly guest examples/fixtures target wasm32-wasip2, not the host triple,
 # so they are built separately — not workspace members.

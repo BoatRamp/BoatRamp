@@ -182,6 +182,25 @@ jobs:
           fi
           echo "relaxed-durability sole-caller guard OK"
 
+  # The generated reference docs (PLAN-docs-structure Lever 2) must match the code source of
+  # truth. `cargo xtask gen-docs --check` regenerates each generated `reference/*.md` page (today
+  # just `cli-reference.md`, from boatramp's clap command tree) to a temp file and `diff`s it
+  # against the committed copy, failing on any drift — the automated replacement for the manual
+  # pre-release docs-drift audit. Cheap: it compiles the boatramp crate (default/batteries-included
+  # features) ONLY to introspect clap, not to run anything, and the dep closure is rust-cached. On a
+  # failure the step itself prints the diff + the fix (`cargo xtask gen-docs` and commit).
+  docs-drift:
+    name: docs drift (generated reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs-drift
+      - name: Generated reference docs match the code
+        run: cargo xtask gen-docs --check
+
   # TIER 1 compile guarantee. Clippy the SHIPPED config — `--all-features --all-targets`
   # on the musl target the release binary + OCI images ship — via the crane-cached nix
   # check. `--all-targets` COMPILES every feature-gated test target (sql live tests,

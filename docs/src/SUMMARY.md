@@ -109,6 +109,7 @@
 # Reference
 
 - [CLI](./reference/cli.md)
+- [CLI reference (generated)](./reference/cli-reference.md)
 - [project.cfg schema](./reference/project-cfg.md)
 - [boatramp.cfg schema](./reference/boatramp-cfg.md)
 - [Dynamic daemon config](./reference/daemon-config.md)
