@@ -6,7 +6,9 @@ A handler is a WebAssembly component that runs a dynamic route. It imports only
 the host interfaces it declares, intersected with what the site grants — deny by
 default. This page covers the four data bindings an operator wires up:
 `wasi:keyvalue`, `sql`, `wasi:blobstore`, and `wasi:messaging`. To ship a
-component, see [Deploy a handler](./deploy-handler.md).
+component, see [Deploy a handler](./deploy-handler.md). For the other thing a
+handler is granted — API keys, database URLs, and the like — see [Give handlers &
+functions secrets](./secrets.md).
 
 ## Grant a binding
 

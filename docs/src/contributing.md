@@ -53,6 +53,18 @@ This documentation site (`docs/src/`) is built with
 [mdBook](https://rust-lang.github.io/mdBook/): `mdbook serve docs` to preview,
 `mdbook build docs` to render.
 
+### Adding a how-to guide
+
+A how-to guide is reached through **three** parallel views — update all of them in
+the same change, or they drift apart:
+
+- **`SUMMARY.md`** — the sidebar nav; add the guide under its section.
+- **[`how-to/index.md`](./how-to/index.md)** — the browsable index; add it to the right
+  topic group (and, if it is a task most readers hit early, the *Most common tasks*
+  shortlist).
+- **The audience reading-path** it belongs to — [`how-to/operators.md`](./how-to/operators.md)
+  or [`how-to/app-developers.md`](./how-to/app-developers.md).
+
 ## What's validated where
 
 Most behavior is unit- and integration-tested natively. Capabilities that need

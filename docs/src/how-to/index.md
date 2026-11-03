@@ -15,10 +15,10 @@ Not sure where to start? Pick your reading path:
 - [Publish, roll back, and alias a site](./publish.md)
 - [Attach a custom domain](./custom-domain.md) and [get an automatic certificate](./acme-cert.md)
 - [Deploy a handler](./deploy-handler.md) or [deploy & invoke a function](./functions.md)
+- [Use kv / sql / blobstore / messaging](./handler-bindings.md)
 - [Declare a managed database](./managed-databases.md)
 - [Bootstrap authentication & mint tokens](./auth-bootstrap.md)
 - [Deploy a single node in production](./deploy-single-node.md)
-- [Deploy a self-hosted cluster](./deploy-cluster.md)
 - [Back up & restore](./backup.md)
 - [Run a container or microVM](./compute.md)
 
@@ -60,17 +60,25 @@ Attach hostnames, get certificates, and automate DNS.
 Bootstrap the control plane, mint and scope tokens, sign in with OIDC, pick a
 security posture, and manage secrets.
 
+#### Bootstrap & sign in
+
 - [Bootstrap authentication & mint tokens](./auth-bootstrap.md)
 - [Reach the control plane on day zero (RPK TLS)](./bootstrap-tls.md)
 - [Sign in with OIDC](./oidc.md)
+
+#### Tokens & capabilities
+
 - [Make a scoped CI deploy token](./ci-token.md)
 - [PoP-bind a control-plane token (DPoP)](./pop-tokens.md)
+- [Mint a delegated capability](./delegated-capabilities.md)
+
+#### Keys, secrets & posture
+
 - [Hold the signing key in a KMS/HSM/Vault](./external-signer.md)
 - [Rotate the root key](./rotate-root-key.md)
-- [Mint a delegated capability](./delegated-capabilities.md)
-- [Restrict visitor access](./visitor-access.md)
-- [Choose & inspect a security posture](./security-posture.md)
 - [Encrypt secrets at rest](./secrets-at-rest.md)
+- [Choose & inspect a security posture](./security-posture.md)
+- [Restrict visitor access](./visitor-access.md)
 - [Give handlers & functions secrets](./secrets.md)
 
 ### Functions, handlers & workflows
@@ -127,19 +135,28 @@ to deploy your *handler or function*, see [Functions, handlers & workflows](#fun
 - [Run on Kubernetes (the in-binary operator)](./kubernetes.md)
 - [Deploy on Cloudflare Containers](./deploy-cloudflare.md)
 
+> Managing TLS for a cluster? Cluster certificates live under [Domains, DNS &
+> TLS](#domains-dns--tls) — see [Manage certificates in a cluster](./cluster-certs.md).
+
 ### Operations, backup & data movement
 
-Observe, alert, and move data. Backup, export, and clone are one family — pick
-the one that matches your goal:
+Observe, alert, and move data between servers, and keep a node healthy over time.
+
+#### Back up, export & clone
+
+Backup, export, and clone are one family — pick the one that matches your goal:
 
 - [Back up & restore](./backup.md) — snapshot a node and restore it.
 - [Export, import & clone a project](./clone-project.md) — move a whole project between servers.
 - [Incremental & true-delta export](./delta-export.md) — repeatable, delta-only exports.
 
-Plus the rest of the operations toolkit:
+#### Observe & alert
 
 - [Observe: logs, metrics, health, stats](./observe.md)
 - [Alert on node & system health](./node-health-alerting.md)
+
+#### Maintain & migrate
+
 - [Garbage-collect & verify integrity](./prune-scrub.md)
 - [Switch the blob backend with zero downtime](./blob-backend-migration.md)
 - [Upgrade a store to project scoping](./upgrade-store-to-projects.md)
