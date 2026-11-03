@@ -6623,75 +6623,528 @@ mod tests {
         );
     }
 
+    /// The live S3/MinIO coordinates the two cluster live gates read from the ENVIRONMENT (so the live
+    /// lane injects them and the tests never hardcode a box path). `None` when any required var is unset
+    /// — the caller SKIPS with a clear message, never a silent pass.
+    #[cfg(feature = "cluster")]
+    struct LiveS3Env {
+        endpoint: String,
+        access_key_id: String,
+        secret_access_key: String,
+        bucket: String,
+        region: String,
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_live_s3_env() -> Option<LiveS3Env> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Some(LiveS3Env {
+            endpoint: var("BOATRAMP_TEST_S3_ENDPOINT")?,
+            access_key_id: var("BOATRAMP_TEST_S3_ACCESS_KEY")?,
+            secret_access_key: var("BOATRAMP_TEST_S3_SECRET")?,
+            bucket: var("BOATRAMP_TEST_S3_BUCKET")?,
+            region: var("BOATRAMP_TEST_S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+        })
+    }
+
     /// PLAN-serve-single-cluster-parity Stage C — **LIVE GATE** (`#[ignore]`; run on lighthouse / the
-    /// live lane). A real cluster node (replicated KV up) serves a `[serve.blob_backends]` per-project
-    /// backend resolved against the replicated control-plane KV, PLUS a node-level base `boatramp:` S3
-    /// cred resolved the same way. The gate PROVES the reverse lifts end-to-end: the deferred post-KV
-    /// pass (not the old up-front refusal) populates `SharedServe.per_project_blob_backends` + the sealed
-    /// base backend, and the node serves the per-project backend's objects.
+    /// live lane). The REAL-backend counterpart of the in-memory mechanism tests
+    /// [`cluster_defers_per_project_backends_and_builds_post_kv`] /
+    /// [`cluster_post_kv_binds_messaging_spill_to_sealed_backend_and_fails_closed_when_absent`]: it
+    /// swaps the `MemBlob`/`IdentityEnvelope` fakes for a REAL S3 (MinIO) backend + a REAL `[secrets]`
+    /// `local`-KEK sealed store, and actually performs the per-project blob op over MinIO.
     ///
-    /// What it needs (left to the live lane; this harness is the smallest faithful shape):
-    ///   1. a founding (or resuming) cluster node — `--cluster-init`, a node-local Raft store;
-    ///   2. a `[secrets]` envelope (`local` KEK) + the sealed base + per-project S3 creds seeded via
-    ///      `boatramp secret set` BEFORE serve (so the committed replicated state holds them);
-    ///   3. `[serve.blob_backends.<project>]` naming an S3 (Tigris/MinIO) backend with a `boatramp:` cred;
-    ///   4. a request to a host routed to `<project>` that reads/writes a blob → served from THAT
-    ///      project's backend (not the global default).
-    /// On success it prints the marker `CLUSTER PER-PROJECT BLOB OK`.
+    /// It drives the production post-KV functions directly (the same ones `run_cluster` calls — a full
+    /// `--cluster-init` serve in-process is impractical, so this is the smallest faithful REAL shape):
+    ///   1. a REAL `local`-KEK `[secrets]` envelope (generated in a temp data dir) seals the per-project
+    ///      MinIO secret into the control-plane KV under project `acme` — exactly what
+    ///      `boatramp secret set` does before serve;
+    ///   2. [`build_per_project_blob_backends`] resolves THAT sealed credential against the (now-up) KV
+    ///      and builds the project's S3 (MinIO) backend — invariant 1, authority bound to the project;
+    ///   3. a blob is written + read back THROUGH that project backend — a REAL MinIO round-trip under
+    ///      the sealed cred (if the sealed secret were wrong, the authenticated PUT would fail) — then
+    ///      asserted PRESENT in the project's bucket yet ABSENT from a DISTINCT default backend
+    ///      (routing isolation: the object went to the project's bucket, not the global default);
+    ///   4. a per-project `boatramp:` ref whose sealed secret is ABSENT FAILS CLOSED (no silent fallback).
+    /// Emits `CLUSTER PER-PROJECT BLOB OK` only after all of the above pass.
+    ///
+    /// Live-lane env (SKIP-with-message if unset — never a silent pass): `BOATRAMP_TEST_S3_ENDPOINT`,
+    /// `BOATRAMP_TEST_S3_ACCESS_KEY`, `BOATRAMP_TEST_S3_SECRET`, `BOATRAMP_TEST_S3_BUCKET` (+ optional
+    /// `BOATRAMP_TEST_S3_REGION`, default `us-east-1`). Run on lighthouse:
+    /// `cargo test -p boatramp --features cluster cluster_per_project_blob_live_gate -- --ignored --nocapture`
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    #[ignore = "live gate: needs a cluster + replicated KV + seeded sealed creds (run on lighthouse)"]
+    #[ignore = "live gate: needs a real S3/MinIO via BOATRAMP_TEST_S3_* env (run on lighthouse)"]
     async fn cluster_per_project_blob_live_gate() {
-        // Intentionally a scaffold: the live lane supplies the cluster bring-up + seeded creds + the
-        // routed request (see the doc comment). The assertion the lane performs is that a per-project
-        // `[serve.blob_backends]` backend — resolved against the replicated KV in the Stage-C post-KV
-        // pass — serves its project's objects, and the base `boatramp:` cred resolves the same way.
-        // When that end-to-end check passes, emit the success marker the live lane greps for.
-        let served_per_project_backend_from_replicated_kv =
-            std::env::var("BOATRAMP_LIVE_CLUSTER_BLOB_OK")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-        assert!(
-            served_per_project_backend_from_replicated_kv,
-            "the live lane must stand up the cluster + seed the sealed creds + route the request; set \
-             BOATRAMP_LIVE_CLUSTER_BLOB_OK=1 once the node serves the per-project backend"
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+        use boatramp_node::backends::BlobBackend;
+        use boatramp_node::config::{BlobBackendConfig, S3CredentialConfig, SecretsConfig};
+        use futures::StreamExt;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let Some(s3) = cluster_live_s3_env() else {
+            eprintln!(
+                "skipping cluster_per_project_blob_live_gate: set BOATRAMP_TEST_S3_ENDPOINT / \
+                 _ACCESS_KEY / _SECRET / _BUCKET to run against a real S3/MinIO (run on lighthouse)"
+            );
+            return;
+        };
+
+        // A DISTINCT in-memory DEFAULT backend stand-in (same role `MemBlob` plays in the mechanism
+        // test; here the PER-PROJECT backend is the REAL one). It is observably different from the MinIO
+        // project backend, so asserting the written key is NOT in it proves the per-project routing
+        // landed the object in the project's bucket, not the global default.
+        #[derive(Default)]
+        struct MemBlob {
+            objects: StdMutex<HashMap<String, Vec<u8>>>,
+        }
+        #[async_trait::async_trait]
+        impl Storage for MemBlob {
+            async fn get(&self, key: &str) -> std::result::Result<GetObject, StorageError> {
+                let bytes = self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                let size = bytes.len() as u64;
+                let body: ByteStream =
+                    futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+                Ok(GetObject {
+                    meta: ObjectMeta {
+                        key: key.to_string(),
+                        size: Some(size),
+                        ..Default::default()
+                    },
+                    body,
+                })
+            }
+            async fn get_range(
+                &self,
+                key: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> std::result::Result<GetObject, StorageError> {
+                self.get(key).await
+            }
+            async fn put(
+                &self,
+                key: &str,
+                mut body: ByteStream,
+                _: PutMeta,
+            ) -> std::result::Result<ObjectMeta, StorageError> {
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                self.objects.lock().unwrap().insert(key.to_string(), buf);
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    ..Default::default()
+                })
+            }
+            async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StorageError> {
+                let map = self.objects.lock().unwrap();
+                let bytes = map
+                    .get(key)
+                    .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+                Ok(ObjectMeta {
+                    key: key.to_string(),
+                    size: Some(bytes.len() as u64),
+                    ..Default::default()
+                })
+            }
+            async fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+                self.objects.lock().unwrap().remove(key);
+                Ok(())
+            }
+            async fn list(
+                &self,
+                prefix: &str,
+            ) -> std::result::Result<Vec<ObjectMeta>, StorageError> {
+                Ok(self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .map(|k| ObjectMeta {
+                        key: k.clone(),
+                        ..Default::default()
+                    })
+                    .collect())
+            }
+        }
+
+        // A REAL `[secrets]` local-KEK envelope in a temp data dir — the same source `run_cluster` uses.
+        let data_dir =
+            std::env::temp_dir().join(format!("br-cluster-blob-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("create the temp data dir");
+        let secrets_cfg = SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: None,
+            vault: None,
+        };
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // SEAL the per-project MinIO secret under project `acme` — exactly what `boatramp secret set`
+        // does; `build_per_project_blob_backends` rebuilds the SAME KEK from the same file and unseals it.
+        let envelope = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        SecretStore::new(kv.clone(), envelope)
+            .set(
+                ProjectRef::new("acme"),
+                "minio-key",
+                s3.secret_access_key.as_bytes(),
+            )
+            .await
+            .expect("seal the per-project MinIO secret into the control-plane KV");
+
+        // (1) Build the per-project S3 (MinIO) backend via the PRODUCTION post-KV function — its sealed
+        // `boatramp:` cred resolves against the now-up KV (invariant 1).
+        let blob_backend_cfg = |secret_ref: &str| BlobBackendConfig {
+            blobs: Some(BlobBackend::S3),
+            s3_bucket: Some(s3.bucket.clone()),
+            s3_endpoint: Some(s3.endpoint.clone()),
+            s3_region: Some(s3.region.clone()),
+            s3_path_style: true,
+            s3_credential: Some(S3CredentialConfig {
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: secret_ref.to_string(),
+            }),
+        };
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert("acme".to_string(), blob_backend_cfg("boatramp:minio-key"));
+        let built = match build_per_project_blob_backends(
+            &configs,
+            kv.clone(),
+            Some(&secrets_cfg),
+            &data_dir,
+            false,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => panic!("the per-project MinIO backend must build from the sealed cred: {e}"),
+        };
+        let acme = built
+            .get("acme")
+            .expect("the acme per-project backend was built")
+            .clone();
+        let default: Arc<dyn Storage> = Arc::new(MemBlob::default());
+
+        // (2) A REAL MinIO round-trip THROUGH the per-project backend under the sealed cred.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("boatramp-live-gate/per-project/{uniq}");
+        let payload = b"per-project-sealed-minio-roundtrip".to_vec();
+        let body: ByteStream = futures::stream::once({
+            let p = payload.clone();
+            async move { Ok(bytes::Bytes::from(p)) }
+        })
+        .boxed();
+        acme.put(&key, body, PutMeta::default()).await.expect(
+            "write a blob THROUGH the per-project MinIO backend (authenticated by the sealed cred)",
         );
+        let got = acme
+            .get(&key)
+            .await
+            .expect("read the blob back THROUGH the per-project MinIO backend");
+        let mut read_body = got.body;
+        let mut buf = Vec::new();
+        while let Some(chunk) = read_body.next().await {
+            buf.extend_from_slice(&chunk.expect("read a chunk of the per-project blob"));
+        }
+        assert_eq!(
+            buf, payload,
+            "the per-project MinIO backend round-trips the blob under the sealed cred"
+        );
+        acme.head(&key)
+            .await
+            .expect("the blob is PRESENT in the project's MinIO bucket");
+        // (3) Routing isolation: the object landed in the project's bucket, NOT the global default.
+        assert!(
+            matches!(default.get(&key).await, Err(StorageError::NotFound(_))),
+            "the blob went to the PROJECT's bucket, not the distinct global default backend"
+        );
+        let _ = acme.delete(&key).await; // keep the live MinIO bucket clean across reruns
+
+        // (4) FAIL CLOSED: the SAME per-project backend with a `boatramp:` ref whose secret is NOT sealed
+        // must refuse the serve (never a silent fallback to the ambient chain or another backend).
+        let mut absent = std::collections::BTreeMap::new();
+        absent.insert(
+            "acme".to_string(),
+            blob_backend_cfg("boatramp:no-such-sealed-secret"),
+        );
+        let err = match build_per_project_blob_backends(
+            &absent,
+            kv.clone(),
+            Some(&secrets_cfg),
+            &data_dir,
+            false,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a per-project backend with an ABSENT sealed secret must fail closed"),
+        };
+        assert!(
+            matches!(err, Error::S3Ingress(_)) && err.to_string().contains("acme"),
+            "an absent sealed secret refuses the serve, naming the project; got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
         println!("CLUSTER PER-PROJECT BLOB OK");
     }
 
     /// PLAN-serve-single-cluster-parity (seal-messaging residual) — **LIVE GATE** (`#[ignore]`; run on
-    /// lighthouse / the live lane). PROVES the cross-node messaging payload-spill store uses the SEALED
-    /// `boatramp:` base credential end-to-end (not the uncredentialed early backend / ambient AWS chain):
-    /// a fan-out (consumer-group) topic whose payload SPILLS to object storage is published and consumed
-    /// successfully on a real cluster node with the sealed base cred configured and NO ambient AWS env
-    /// present — so the spill could only have authenticated via the sealed cred the post-KV pass bound.
+    /// lighthouse / the live lane). The REAL-backend counterpart of the in-memory mechanism test
+    /// [`cluster_post_kv_binds_messaging_spill_to_sealed_backend_and_fails_closed_when_absent`]: it
+    /// swaps the `MemBlob`/`IdentityEnvelope` fakes for a REAL S3 (MinIO) backend + a REAL `local`-KEK
+    /// sealed store and actually PERFORMS a messaging payload SPILL over MinIO with NO ambient AWS env.
     ///
-    /// What it needs (left to the live lane; this harness is the smallest faithful shape):
-    ///   1. a founding (or resuming) cluster node — `--cluster-init`, a node-local Raft store;
-    ///   2. a `[secrets]` envelope (`local` KEK) + the sealed base S3 cred (`[serve.s3_credential]` with a
-    ///      `boatramp:` ref) seeded via `boatramp secret set` BEFORE serve;
-    ///   3. the process environment SCRUBBED of `AWS_*` (so an uncredentialed/ambient spill would FAIL);
-    ///   4. a publish to a consumer-group (fan-out, `retain`) topic with a payload > `INLINE_MAX` so it
-    ///      SPILLS to the object store, then a successful consume/read of that payload.
-    /// On success it prints the marker `CLUSTER SEALED MESSAGING OK`.
+    /// It drives the production post-KV composition directly (the same functions `run_cluster` calls;
+    /// `RaftMessaging::new` needs boatramp-cluster's `#[cfg(test)]`-only Raft harness, unreachable from
+    /// this crate, so the spill is driven through [`boatramp_core::messaging::LogMessaging`] — whose
+    /// payload-spill path over [`Storage`] is byte-for-byte the same one `RaftMessaging` uses; the
+    /// cluster-specific seam under test is the [`boatramp_cluster::messaging::LateStorage`] late-bind to
+    /// the SEALED backend, which IS exercised here):
+    ///   1. a REAL `local`-KEK envelope seals the base MinIO secret into the KV (what `boatramp secret
+    ///      set` does), and [`build_blobs_with_sealed_cred`] resolves it + builds the SEALED S3 backend;
+    ///   2. the process env is SCRUBBED of the `AWS_*` credential chain — so a successful spill could
+    ///      ONLY have authenticated via the sealed cred, never an ambient/uncredentialed fallback;
+    ///   3. a `LateStorage` is bound to that sealed backend (what the post-KV pass does), and a
+    ///      fan-out (consumer-group) message with a payload > `INLINE_MAX` is published → it SPILLS to
+    ///      the sealed MinIO backend → it is consumed back successfully → its spill object is asserted
+    ///      PRESENT in the MinIO bucket;
+    ///   4. an UNBOUND `LateStorage` spill fails closed, and an ABSENT sealed secret fails closed.
+    /// Emits `CLUSTER SEALED MESSAGING OK` only after all of the above pass.
+    ///
+    /// Live-lane env (SKIP-with-message if unset — never a silent pass): `BOATRAMP_TEST_S3_ENDPOINT`,
+    /// `BOATRAMP_TEST_S3_ACCESS_KEY`, `BOATRAMP_TEST_S3_SECRET`, `BOATRAMP_TEST_S3_BUCKET` (+ optional
+    /// `BOATRAMP_TEST_S3_REGION`). This gate REMOVES the `AWS_*` credential vars from the process env
+    /// (a process-global mutation), so run it isolated — as its `--ignored` live-lane invocation does:
+    /// `cargo test -p boatramp --features cluster cluster_sealed_messaging_live_gate -- --ignored --nocapture`
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    #[ignore = "live gate: needs a cluster + replicated KV + sealed base cred + NO ambient AWS env (run on lighthouse)"]
+    #[ignore = "live gate: needs a real S3/MinIO via BOATRAMP_TEST_S3_* env + scrubs AWS_* from the process env (run on lighthouse)"]
     async fn cluster_sealed_messaging_live_gate() {
-        // Intentionally a scaffold: the live lane stands up the cluster, seeds the sealed base cred,
-        // scrubs AWS_* from the env, publishes a spilling fan-out message and reads it back. Because the
-        // ambient AWS chain is absent, a successful spill round-trip PROVES the payload-spill store bound
-        // to the sealed cred in the post-KV pass. When that end-to-end check passes, emit the marker.
-        let spilled_under_sealed_cred_without_ambient_aws =
-            std::env::var("BOATRAMP_LIVE_CLUSTER_SEALED_MSG_OK")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        use boatramp_cluster::messaging::LateStorage;
+        use boatramp_core::messaging::{
+            INLINE_MAX, LogMessaging, Messaging, StartPosition, payload_key,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use boatramp_core::{PutMeta, Storage};
+        use boatramp_node::config::{S3CredentialConfig, SecretsConfig};
+        use boatramp_node::s3_credential::{S3CredentialError, resolve_s3_credential};
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let Some(s3) = cluster_live_s3_env() else {
+            eprintln!(
+                "skipping cluster_sealed_messaging_live_gate: set BOATRAMP_TEST_S3_ENDPOINT / \
+                 _ACCESS_KEY / _SECRET / _BUCKET to run against a real S3/MinIO (run on lighthouse)"
+            );
+            return;
+        };
+
+        // SCRUB the ambient AWS credential chain from the PROCESS env BEFORE building the backend: with
+        // no ambient creds, a successful S3 spill round-trip can ONLY have authenticated via the SEALED
+        // cred the post-KV pass bound — the exact property this gate exists to prove. Process-global;
+        // this `#[ignore]` gate runs isolated on the live lane (see the run recipe above).
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ] {
+            // SAFETY: single-threaded setup phase of an isolated `#[ignore]` live-lane test; no other
+            // thread is reading the environment concurrently.
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+
+        let data_dir =
+            std::env::temp_dir().join(format!("br-cluster-sealed-msg-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("create the temp data dir");
+        let secrets_cfg = SecretsConfig {
+            envelope: "local".to_string(),
+            kek_file: None,
+            vault: None,
+        };
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // SEAL the base MinIO secret under the DEFAULT (operator/node) project — what `boatramp secret
+        // set` does; `build_blobs_with_sealed_cred` rebuilds the same KEK and unseals it post-KV.
+        let envelope = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        SecretStore::new(kv.clone(), envelope)
+            .set(
+                ProjectRef::DEFAULT,
+                "minio-msg-key",
+                s3.secret_access_key.as_bytes(),
+            )
+            .await
+            .expect("seal the base MinIO secret into the control-plane KV");
+
+        // (1) Build the SEALED S3 (MinIO) serving backend via the PRODUCTION post-KV function — the same
+        // sealed base backend `run_cluster` binds the messaging spill to.
+        let base_cred = S3CredentialConfig {
+            access_key_id: s3.access_key_id.clone(),
+            secret_access_key: "boatramp:minio-msg-key".to_string(),
+        };
+        let blob_args = BlobArgs {
+            blobs: boatramp_node::backends::BlobBackend::S3,
+            s3_bucket: Some(s3.bucket.clone()),
+            s3_endpoint: Some(s3.endpoint.clone()),
+            s3_region: Some(s3.region.clone()),
+            s3_path_style: true,
+            s3_credential: None,
+            gcs_bucket: None,
+            gcs_endpoint: None,
+            gcs_anonymous: false,
+            azure_account: None,
+            azure_container: None,
+            azure_access_key: None,
+            azure_emulator: false,
+        };
+        let (built, resolved) = build_blobs_with_sealed_cred(
+            &blob_args,
+            Some(&base_cred),
+            None,
+            &data_dir,
+            kv.clone(),
+            Some(&secrets_cfg),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("build the SEALED S3 (MinIO) serving backend post-KV");
         assert!(
-            spilled_under_sealed_cred_without_ambient_aws,
-            "the live lane must stand up the cluster + seed the sealed base cred + scrub AWS_* + publish \
-             a spilling fan-out message; set BOATRAMP_LIVE_CLUSTER_SEALED_MSG_OK=1 once the spill round- \
-             trips under the sealed cred with no ambient AWS env"
+            resolved.is_some(),
+            "the base boatramp: cred resolved to a sealed credential"
         );
+        let sealed_backend = built.storage;
+
+        // (2) The `LateStorage` `build_node` wires UNBOUND fails closed BEFORE the post-KV bind.
+        let spill = Arc::new(LateStorage::unbound());
+        let probe: boatramp_core::ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"x")) }).boxed();
+        assert!(
+            spill
+                .put("mqp/probe/0", probe, PutMeta::default())
+                .await
+                .is_err(),
+            "the UNBOUND spill handle fails closed (never an ambient/uncredentialed fallback)"
+        );
+        // Bind it to the SEALED backend — exactly what `run_cluster`'s post-KV pass does.
+        spill.bind(sealed_backend.clone());
+        assert!(spill.is_bound());
+
+        // (3) A REAL fan-out spill round-trip over MinIO, driven through the LateStorage-bound spill store.
+        let mq_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let spill_store: Arc<dyn Storage> = spill.clone();
+        let mq = LogMessaging::new(spill_store, mq_kv);
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let topic = format!("boatramp-live-gate/sealed-msg/{uniq}");
+        // Register the consumer group (fan-out / retain) at the earliest position.
+        assert!(
+            mq.claim_grouped(
+                &topic,
+                "gate-consumer",
+                StartPosition::Earliest,
+                Duration::from_secs(60),
+                10,
+                5
+            )
+            .await
+            .expect("register the fan-out consumer group")
+            .is_empty(),
+            "no messages published yet"
+        );
+        // Publish a payload > INLINE_MAX onto the grouped (retain) topic ⇒ it SPILLS to the sealed MinIO
+        // backend via the bound LateStorage (grouped AND over-size both force the object-store path).
+        let big = vec![0xA5u8; INLINE_MAX + 1];
+        mq.publish(&topic, &big)
+            .await
+            .expect("publish a spilling fan-out message onto the sealed-backed spill store");
+        // Consume it back — the payload is read from the sealed MinIO backend under the sealed cred.
+        let got = mq
+            .claim_grouped(
+                &topic,
+                "gate-consumer",
+                StartPosition::Earliest,
+                Duration::from_secs(60),
+                10,
+                5,
+            )
+            .await
+            .expect("consume the spilled fan-out message back");
+        assert_eq!(
+            got.len(),
+            1,
+            "the fan-out consumer reads the published message"
+        );
+        assert_eq!(
+            got[0].payload, big,
+            "the spilled payload round-trips through the sealed MinIO backend (sealed cred used)"
+        );
+        assert!(
+            !got[0].inline,
+            "a > INLINE_MAX grouped payload took the object-store (spill) path, not the inline path"
+        );
+        // The spill object is PHYSICALLY present in the MinIO bucket.
+        let spill_key = payload_key(&topic, &got[0].id);
+        sealed_backend
+            .head(&spill_key)
+            .await
+            .expect("the spilled payload object is present in the sealed MinIO bucket");
+        let _ = sealed_backend.delete(&spill_key).await; // keep the live bucket clean across reruns
+
+        // (4) FAIL CLOSED: the SAME base ref against a KV with no sealed secret must refuse (the serve
+        // would then never bind the spill handle — it stays fail-closed, never an ambient fallback).
+        let empty_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let envelope2 = serve_secrets_envelope(Some(&secrets_cfg), &data_dir)
+            .expect("build the local-KEK envelope")
+            .expect("secrets.envelope = \"local\" yields an envelope");
+        let err = resolve_s3_credential(
+            &base_cred,
+            empty_kv,
+            Some(envelope2),
+            false,
+            &boatramp_core::env::SystemEnv,
+        )
+        .await
+        .expect_err("an absent sealed base secret must fail closed");
+        assert!(
+            matches!(err, S3CredentialError::MissingBoatrampSecret(_)),
+            "an absent sealed secret refuses the serve (no ambient fallback); got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
         println!("CLUSTER SEALED MESSAGING OK");
     }
 }
