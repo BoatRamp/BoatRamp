@@ -36,11 +36,18 @@ and typos.
 
 ## Design docs
 
-The `docs/*.md` files (outside `src/`) are the design record:
+The engineering/design record lives in `docs/design-notes/` (outside `src/`, so
+it never renders on the docs site):
 
-- `ARCHITECTURE-kv.md` — the KV stack and shared-mode coherence.
-- `KEYSPACE.md`, `OPERATING.md` — the keyspace and the operator guide.
-- `CLOUDFLARE.md` — the Cloudflare deployment design.
+- `design-notes/ARCHITECTURE-kv.md` — the KV stack and shared-mode coherence.
+- `design-notes/CLOUDFLARE.md` — the Cloudflare deployment design.
+- `design-notes/config-figment-migration.md`, `design-notes/default-scope-migration.md`
+  — config and default-scope migration records.
+- `design-notes/rust-idiomaticity-catalog.md` — the idiomatic-Rust catalog.
+
+The keyspace and the operator guide are no longer loose design docs — they are
+part of the book: see [KV keyspace](./reference/keyspace.md) and
+[Start here: operators](./how-to/operators.md).
 
 This documentation site (`docs/src/`) is built with
 [mdBook](https://rust-lang.github.io/mdBook/): `mdbook serve docs` to preview,
