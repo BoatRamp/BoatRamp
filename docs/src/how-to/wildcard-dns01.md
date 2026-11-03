@@ -98,8 +98,11 @@ worse than a recursive-only check.
   (UDP) — useful when the container's own resolver caches negative answers
   aggressively; e.g. `BOATRAMP_ACME_PROPAGATION_RESOLVER=1.1.1.1,8.8.8.8`.
 
-For the on-demand per-SNI issuer, the same knobs live under
-`[serve.on_demand_tls]` as `propagation_wait_secs` / `propagation_poll_interval_secs`.
+These same propagation knobs apply to the on-demand per-SNI issuer when it uses
+the DNS-01 challenge, as `propagation_wait_secs` / `propagation_poll_interval_secs`
+under `[serve.on_demand_tls]` — see [Issue certificates on-demand](./on-demand-tls.md)
+for issuing a certificate per verified domain at the first handshake, instead of
+enumerating every name here.
 
 ## Publish the TXT record by hand
 

@@ -23,6 +23,7 @@ the full menu, see the [how-to index](./index.md).
 
 - [Attach a custom domain](./custom-domain.md)
 - [Get an automatic certificate](./acme-cert.md), [wildcard certs with DNS-01](./wildcard-dns01.md)
+- [Issue certificates on-demand](./on-demand-tls.md)
 - [Automate DNS with a provider](./auto-dns.md)
 
 ## 4. Provision what apps need
