@@ -5,6 +5,12 @@ page documents each command. Any command also prints its own flags with
 `boatramp <command> --help`, and group commands list their sub-actions with
 `boatramp <command> help`.
 
+> **Looking for the exhaustive flag list?** This page is the hand-written *guide* —
+> curated grouping, worked examples and cross-links. For the complete, always-current
+> reference of **every** command, subcommand, flag, environment variable and default,
+> see the [generated CLI reference](./cli-reference.md), which is produced from the code
+> (`cargo xtask gen-docs`) and verified against drift in CI.
+
 Precedence for any overridable value: **explicit CLI flag > environment variable > config
 file > built-in default** (one layered resolver — see [the configuration
 model](../explanation/config-model.md)). Project commands read `project.cfg`; `serve` and the
