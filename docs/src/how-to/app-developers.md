@@ -16,7 +16,7 @@ Read the Functions, handlers & workflows group (in the [how-to index](./index.md
 roughly in order:
 
 - [Deploy a handler](./deploy-handler.md) — put a function behind a route.
-- [Use kv / sql / blobstore / messaging](./handler-bindings.md) — data bindings.
+- [Use handler bindings](./handler-bindings.md) — data bindings ([kv](./handler-binding-kv.md), [sql & orm](./handler-binding-sql.md), [blobstore](./handler-binding-blob.md), [messaging](./handler-binding-messaging.md)).
 - [Compose components into one handler](./compose.md)
 - [Run consumers, crons, and streams](./background-work.md)
 - [Orchestrate functions with workflows](./workflows.md)

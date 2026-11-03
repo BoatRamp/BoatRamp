@@ -295,7 +295,7 @@ boatramp compute set pg --image postgres:16 --port 5432 \
 ```
 
 **Managed databases do this for you.** When a handler `sql` binding is sourced from a
-database boatramp runs (see [Managed SQL](./handler-bindings.md)), boatramp applies a
+database boatramp runs (see [Managed SQL](./handler-binding-sql.md#managed-sql-on-a-database-boatramp-runs)), boatramp applies a
 privilege strategy automatically — no `--user`/`--cap-add` needed. The strategy is
 `[compute].managed_db_privilege`: `rootless` (the default — run as the image's DB user
 against its pre-owned volume, no capabilities, any posture) or `caps` (add the minimal
