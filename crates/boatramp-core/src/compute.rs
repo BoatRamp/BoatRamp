@@ -1489,7 +1489,7 @@ pub struct SurfaceContribution {
 impl SurfaceContribution {
     /// Fold another contribution into this one (the chain merge): extend the var map
     /// (later keys win) and concatenate the defaults.
-    pub fn merge(&mut self, other: SurfaceContribution) {
+    pub fn merge(&mut self, other: Self) {
         self.vars.extend(other.vars);
         self.defaults.extend(other.defaults);
     }
@@ -1796,17 +1796,22 @@ pub trait ManagedDbEnvResolver: Send + Sync {
     /// on a transient DB outage) from leaking an operates-as-owner login role + its sealed
     /// password INDEFINITELY. Enumerates the sealed dynamic-cred keys and DROPS (revoke DDL +
     /// delete the sealed password) every one whose owning replica is **gone**:
-    /// `live_instance_ids` is the set of [`compute_instance_id`] for every PERSISTED replica
-    /// record (the reaper gathers it in the same pass), and a cred whose `instance_id` is in
-    /// that set is KEPT — so the sweep is tenant-correct (it drops only a cred whose owning
-    /// replica no longer exists, never one belonging to a live or parked replica, even on
-    /// another node). Idempotent (the underlying revoke is: an already-gone role + an
+    /// `live` is the set of `(consumer_project, compute_instance_id)` PAIRS for every PERSISTED
+    /// replica record (the reaper gathers it in the same pass), and a cred whose
+    /// `(consumer_project, instance_id)` pair is in that set is KEPT — so the sweep is
+    /// tenant-correct (it drops only a cred whose owning replica no longer exists, never one
+    /// belonging to a live or parked replica, even on another node). The pair — not the bare
+    /// `instance_id` — is the key because [`compute_instance_id`]'s hyphen-join aliases across
+    /// project/workload splits (`("acme-web","api")` and `("acme","web-api")` both yield
+    /// `acme-web-api`), so a bare-id live set could let one tenant's live replica mask another
+    /// tenant's orphan; pairing with the (raw, un-joined) consumer project disambiguates.
+    /// Idempotent (the underlying revoke is: an already-gone role + an
     /// already-deleted password are no-ops). `dry_run` identifies the orphans and returns them
     /// with `dropped = false` WITHOUT touching anything. Hooked into the orphan reaper's `All`
     /// pass. Defaulted no-op so a resolver that does not implement phase 2 is unaffected.
     async fn sweep_orphan_dynamic_db_creds(
         &self,
-        _live_instance_ids: &std::collections::HashSet<String>,
+        _live: &std::collections::HashSet<(String, String)>,
         _dry_run: bool,
     ) -> Result<Vec<SweptDynamicCred>, String> {
         Ok(Vec::new())

@@ -200,18 +200,20 @@ pub struct BlobShimResolver {
     /// The optional **direct-S3 STS minter** (PLAN-compute-managed-resources Phase 3) + its
     /// lease TTL (seconds). `Some` ⇒ a `--bind blob:<container>` ALSO gets short-lived
     /// `TempCredentials` so an off-the-shelf S3 client talks DIRECTLY to R2/Tigris (`AWS_*` env
-    /// + `{{blob.*}}` STS vars), KEEPING the HMAC shim as the full-R/W fallback. `None` (always,
+    /// plus `{{blob.*}}` STS vars), KEEPING the HMAC shim as the full-R/W fallback. `None` (always,
     /// in a build without `blob-upload`, or on a backend with no real STS) ⇒ the HMAC shim only.
     /// Feature-gated because `boatramp_handlers` (the `BlobUploadMinter` seam) is an optional dep.
     #[cfg(feature = "blob-upload")]
-    blob_minter: Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64)>,
+    blob_minter: Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64, Option<u64>)>,
 }
 
-/// The direct-S3 STS minter slot [`spawn_blob_shim`] takes: `Some((minter, max_ttl_secs))` wires
-/// direct-to-R2/Tigris `TempCredentials`; `None` (and the always-`()` variant without the
-/// `blob-upload` feature) ⇒ the HMAC shim only. Keeps the node's call site feature-independent.
+/// The direct-S3 STS minter slot [`spawn_blob_shim`] takes:
+/// `Some((minter, max_ttl_secs, max_bytes_ceiling))` wires direct-to-R2/Tigris
+/// `TempCredentials`; `None` (and the always-`()` variant without the `blob-upload` feature) ⇒
+/// the HMAC shim only. `max_bytes_ceiling` is the operator per-object size ceiling (the SAME
+/// one the guest mint path clamps to). Keeps the node's call site feature-independent.
 #[cfg(feature = "blob-upload")]
-pub type BlobMintSlot = Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64)>;
+pub type BlobMintSlot = Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64, Option<u64>)>;
 /// See the feature-on variant: without `blob-upload` there is no minter type, so the slot is unit.
 #[cfg(not(feature = "blob-upload"))]
 pub type BlobMintSlot = ();
@@ -235,14 +237,16 @@ impl BlobShimResolver {
         }
     }
 
-    /// Attach the direct-S3 STS minter + its lease TTL. Builder used by [`spawn_blob_shim`].
+    /// Attach the direct-S3 STS minter + its lease TTL + the operator per-object size ceiling.
+    /// Builder used by [`spawn_blob_shim`].
     #[cfg(feature = "blob-upload")]
     pub fn with_blob_minter(
         mut self,
         minter: Option<Arc<dyn boatramp_handlers::BlobUploadMinter>>,
         max_ttl_secs: u64,
+        max_bytes_ceiling: Option<u64>,
     ) -> Self {
-        self.blob_minter = minter.map(|m| (m, max_ttl_secs));
+        self.blob_minter = minter.map(|m| (m, max_ttl_secs, max_bytes_ceiling));
         self
     }
 
@@ -427,7 +431,7 @@ impl BlobShimResolver {
             MintScope, MintedCredentials, TempCredentials, UploadConstraints, UploadPerm,
             UploadTarget, screen_upload_target,
         };
-        let Some((minter, max_ttl_secs)) = &self.blob_minter else {
+        let Some((minter, max_ttl_secs, max_bytes_ceiling)) = &self.blob_minter else {
             return;
         };
         // Posture-off kill switch: a `0` TTL ceiling disables direct-S3 minting entirely — mirror
@@ -461,10 +465,18 @@ impl BlobShimResolver {
             target,
             // Direct-S3 is WRITE-scoped (PUT + multipart); the HMAC shim covers reads (GET).
             perms: vec![UploadPerm::Put, UploadPerm::Multipart],
-            constraints: UploadConstraints::default(),
+            // Clamp per-object size to the operator ceiling (the SAME ceiling the guest mint
+            // path applies) so a compromised/greedy replica cannot write unbounded objects on
+            // the direct-S3 path. `None` ⇒ no operator ceiling configured (unbounded, as before).
+            constraints: UploadConstraints {
+                max_bytes: *max_bytes_ceiling,
+                ..UploadConstraints::default()
+            },
             // Leased to the replica by a generous wall-clock TTL (the operator ceiling): off-the-
             // shelf apps read creds once at startup, so a short TTL would break them. A relaunch
-            // mints fresh creds; the creds let-expire on stop (STS cannot be actively revoked).
+            // mints fresh creds; the creds LET-EXPIRE on stop — an STS lease CANNOT be actively
+            // revoked, so the operator `max_ttl_secs` ceiling IS the containment window: keep it
+            // short. (revoke-on-stop cuts the HMAC token + the dynamic DB role, not this lease.)
             ttl_secs: *max_ttl_secs,
         };
         let creds: TempCredentials = match minter.mint(&scope).await {
@@ -578,11 +590,11 @@ pub async fn spawn_blob_shim(
     // the `blob-upload` feature `mint_slot` is `()` and there is no minter to attach.
     #[cfg(feature = "blob-upload")]
     let resolver = {
-        let (minter, max_ttl_secs) = match mint_slot {
-            Some((m, ttl)) => (Some(m), ttl),
-            None => (None, 0),
+        let (minter, max_ttl_secs, max_bytes_ceiling) = match mint_slot {
+            Some((m, ttl, ceil)) => (Some(m), ttl, ceil),
+            None => (None, 0, None),
         };
-        resolver.with_blob_minter(minter, max_ttl_secs)
+        resolver.with_blob_minter(minter, max_ttl_secs, max_bytes_ceiling)
     };
     #[cfg(not(feature = "blob-upload"))]
     let _ = mint_slot;
@@ -1155,7 +1167,7 @@ mod tests {
         let token = c.vars.get("blob.token").expect("blob.token var").clone();
         assert_eq!(c.vars.get("blob.assets.token"), Some(&token));
         // No direct-S3 creds without a minter.
-        assert!(c.vars.get("blob.endpoint").is_none());
+        assert!(!c.vars.contains_key("blob.endpoint"));
         assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
         // Revoke-on-stop: the HMAC token the var carries is invalidated by release.
         let (status, _) = request(&shim, "PUT", "/assets/x", Some(&token), b"z").await;
@@ -1434,7 +1446,7 @@ mod tests {
             "http://10.0.0.1:8082".to_string(),
             [9u8; 32],
         )
-        .with_blob_minter(Some(Arc::new(FakeBlobMinter)), 3600)
+        .with_blob_minter(Some(Arc::new(FakeBlobMinter)), 3600, Some(8 * 1024 * 1024))
     }
 
     /// Phase 3: a `--bind blob:<container>` with a wired minter ALSO gets direct-S3 `TempCredentials`
@@ -1496,7 +1508,7 @@ mod tests {
         assert_eq!(def("BOATRAMP_BLOB_BUCKET"), Some("assets"));
         // The HMAC shim env is STILL present (back-compat full R/W).
         assert!(def("BOATRAMP_BLOB_URL").is_some());
-        assert!(c.vars.get("blob.token").is_some());
+        assert!(c.vars.contains_key("blob.token"));
     }
 
     /// **Live gate** (PLAN-compute-managed-resources Phase 3, marker `PHASE3 BLOB STS DIRECT-R2 OK`).
@@ -1542,10 +1554,10 @@ mod tests {
             .contribute("acme", "api", 0, &[blob_binding("")], &BTreeMap::new())
             .await;
         assert!(
-            c.vars.get("blob.endpoint").is_none(),
+            !c.vars.contains_key("blob.endpoint"),
             "no STS for a bare binding"
         );
         assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
-        assert!(c.vars.get("blob.url").is_some(), "HMAC var still present");
+        assert!(c.vars.contains_key("blob.url"), "HMAC var still present");
     }
 }

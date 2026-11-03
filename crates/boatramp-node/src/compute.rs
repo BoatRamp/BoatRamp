@@ -1004,13 +1004,19 @@ impl NodeComputeReaper {
                 return;
             }
         };
-        let live: std::collections::HashSet<String> = states
+        // `(consumer_project, instance_id)` PAIRS, not bare instance_ids: `compute_instance_id`'s
+        // hyphen-join aliases across project/workload splits, so the raw project must ride
+        // alongside to keep the sweep's keep/drop decision injective (see the sweep's doc).
+        let live: std::collections::HashSet<(String, String)> = states
             .iter()
             .map(|s| {
-                boatramp_core::compute::compute_instance_id(
-                    &s.handle.project,
-                    &s.handle.workload,
-                    s.handle.replica,
+                (
+                    s.handle.project.clone(),
+                    boatramp_core::compute::compute_instance_id(
+                        &s.handle.project,
+                        &s.handle.workload,
+                        s.handle.replica,
+                    ),
                 )
             })
             .collect();

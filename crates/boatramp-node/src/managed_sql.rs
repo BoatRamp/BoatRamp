@@ -720,7 +720,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
 
     async fn sweep_orphan_dynamic_db_creds(
         &self,
-        live_instance_ids: &std::collections::HashSet<String>,
+        live: &std::collections::HashSet<(String, String)>,
         dry_run: bool,
     ) -> Result<Vec<boatramp_core::compute::SweptDynamicCred>, String> {
         use crate::dynamic_creds::{parse_dynamic_cred_key, revoke_dynamic_role};
@@ -735,10 +735,17 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
             };
             // Tenant-correctness: KEEP the cred while its owning replica still has a persisted
             // record (Running or parked — any phase). Only a cred whose replica is entirely
-            // gone is an orphan. The `instance_id` encodes (project, workload, replica), and
-            // the reaper's live set spans the whole cluster, so a replica live on another node
-            // protects its cred too.
-            if live_instance_ids.contains(&parsed.instance_id) {
+            // gone is an orphan. The reaper's live set spans the whole cluster, so a replica
+            // live on another node protects its cred too.
+            //
+            // The key is the `(consumer_project, instance_id)` PAIR, NOT the bare instance_id:
+            // `compute_instance_id` is a hyphen-join `"{project}-{workload}-{replica}"` that
+            // aliases across project/workload splits (`("acme-web","api",0)` and
+            // `("acme","web-api",0)` both yield `"acme-web-api-0"`), so a bare-id live set
+            // could let tenant X's live replica mask tenant Y's orphaned cred and KEEP it
+            // indefinitely — the exact leak this HIGH-severity sweep exists to prevent. Pairing
+            // with the raw (un-joined) consumer project the key carries disambiguates them.
+            if live.contains(&(parsed.consumer_project.clone(), parsed.instance_id.clone())) {
                 continue;
             }
             // Rebuild the binding shape (kind / user / database / isolation) for this
@@ -3306,8 +3313,10 @@ mod tests {
         );
 
         // Live set holds only replica -1 → only -0 is an orphan.
-        let live: std::collections::HashSet<String> =
-            ["acme-web-1".to_string()].into_iter().collect();
+        let live: std::collections::HashSet<(String, String)> =
+            [("acme".to_string(), "acme-web-1".to_string())]
+                .into_iter()
+                .collect();
         let swept = env
             .sweep_orphan_dynamic_db_creds(&live, true)
             .await
@@ -3328,10 +3337,12 @@ mod tests {
         );
 
         // With BOTH replicas live, nothing is swept (a cred with a live replica is left).
-        let both: std::collections::HashSet<String> =
-            ["acme-web-0".to_string(), "acme-web-1".to_string()]
-                .into_iter()
-                .collect();
+        let both: std::collections::HashSet<(String, String)> = [
+            ("acme".to_string(), "acme-web-0".to_string()),
+            ("acme".to_string(), "acme-web-1".to_string()),
+        ]
+        .into_iter()
+        .collect();
         assert!(
             env.sweep_orphan_dynamic_db_creds(&both, true)
                 .await
@@ -3342,12 +3353,71 @@ mod tests {
 
         // With NEITHER live, both dynamic creds are orphans — and the superuser key is never
         // mistaken for one.
-        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let none: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         let all = env
             .sweep_orphan_dynamic_db_creds(&none, true)
             .await
             .unwrap();
         assert_eq!(all.len(), 2, "both dynamic creds are orphans: {all:?}");
+    }
+
+    /// MEDIUM-1 (security review): the sweep keys keep/drop on the `(consumer_project,
+    /// instance_id)` PAIR, so a live replica in a DIFFERENT project whose `compute_instance_id`
+    /// hyphen-join ALIASES an orphan's id cannot mask (and indefinitely preserve) that orphan.
+    /// `compute_instance_id` joins `"{project}-{workload}-{replica}"`, so project `acme` +
+    /// workload `web-api` and project `acme-web` + workload `api` both yield `"acme-web-api-0"`;
+    /// a bare-id live set would KEEP the `acme` orphan forever. The pair set drops it.
+    #[tokio::test]
+    async fn dynamic_cred_sweep_pair_key_defeats_instance_id_aliasing() {
+        use crate::dynamic_creds::dynamic_cred_workload_key;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+
+        // An orphaned dynamic cred for project `acme`, replica id `acme-web-api-0`
+        // (project `acme` + workload `web-api` + replica 0 — its owning replica is GONE).
+        let seed = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
+        seed.password("acme", &dynamic_cred_workload_key("pg", "acme", "acme-web-api-0"))
+            .await
+            .unwrap();
+
+        let mut binding = db("postgres", Some("pg"), "", None);
+        binding.tenant = crate::config::TenantIsolation::Shared;
+        binding.tenant_scope = crate::config::TenantScope::Project;
+        let mut dbs = BTreeMap::new();
+        dbs.insert("app".to_string(), binding);
+        let env = ManagedDbEnv::from_config(
+            &dbs,
+            ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope)),
+            ManagedDbPrivilege::default(),
+            deploy,
+        );
+
+        // Precondition: the two (project, workload) splits DO alias on one instance_id.
+        assert_eq!(
+            boatramp_core::compute::compute_instance_id("acme-web", "api", 0),
+            boatramp_core::compute::compute_instance_id("acme", "web-api", 0),
+            "the two (project,workload) splits must alias for this test to be meaningful"
+        );
+
+        // A DIFFERENT project's LIVE replica whose id ALIASES the orphan's: project `acme-web`
+        // + workload `api` + replica 0 → `"acme-web-api-0"`. Under the OLD bare-id check this
+        // masked the `acme` orphan and KEPT it; under the pair check it does not.
+        let live: std::collections::HashSet<(String, String)> =
+            [("acme-web".to_string(), "acme-web-api-0".to_string())]
+                .into_iter()
+                .collect();
+        let swept = env
+            .sweep_orphan_dynamic_db_creds(&live, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            swept.len(),
+            1,
+            "the aliasing live replica in a different project must NOT mask the orphan: {swept:?}"
+        );
+        assert_eq!(swept[0].project, "acme");
+        assert_eq!(swept[0].instance_id, "acme-web-api-0");
     }
 
     #[tokio::test]

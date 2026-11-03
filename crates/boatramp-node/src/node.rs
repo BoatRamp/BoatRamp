@@ -618,10 +618,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         // ALSO gets short-lived `TempCredentials` + `AWS_*` env so an off-the-shelf S3 client talks
         // DIRECTLY to R2/Tigris — the HMAC shim stays the full-R/W fallback. `()` (no minter) in a
         // build without `blob-upload`; `None` when minting is not offered ⇒ the HMAC shim only.
+        // The slot is `(minter, max_ttl_secs, max_bytes_ceiling)` — exactly what the minter
+        // accessor returns (the operator ceilings ride through to the direct-S3 STS mint).
         #[cfg(feature = "blob-upload")]
-        let mint_slot = handlers
-            .blob_upload_minter()
-            .map(|(minter, max_ttl_secs, _max_bytes)| (minter, max_ttl_secs));
+        let mint_slot = handlers.blob_upload_minter();
         #[cfg(not(feature = "blob-upload"))]
         let mint_slot = ();
         boatramp_server::blob_shim::spawn_blob_shim(

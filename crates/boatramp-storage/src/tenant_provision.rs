@@ -265,10 +265,18 @@ pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
 /// or the database name even when the cosmetic marker is truncated for a long tenant.
 ///
 /// This is the non-superuser role that **owns the tenant's schema objects** and runs
-/// schema migrations (owner-authority DDL), kept separate from the runtime login role
-/// so the runtime role stays a non-owner and row-level security is still enforced
-/// against it, and separate from the cluster superuser so a migration can never reach
-/// beyond this tenant's own database (the superuser only ever provisions the shells).
+/// schema migrations (owner-authority DDL), kept separate from the cluster superuser so a
+/// migration can never reach beyond this tenant's own database (the superuser only ever
+/// provisions the shells).
+///
+/// Phase-2 posture note: the per-replica DYNAMIC runtime role is a member of THIS owner and
+/// connects with `SET role = <owner>` (see [`mint_dynamic_role_ddl`]), so at RUNTIME the
+/// session operates AS this owner. That is deliberate — it is how an ORM can auto-migrate on
+/// its single DSN without orphaning object ownership across replica rotation. The consequence
+/// is that the runtime session has the owner's DDL authority, and that PostgreSQL does NOT
+/// enforce a table's `ENABLE ROW LEVEL SECURITY` policies against that table's owner — a
+/// managed tenant table needs `FORCE ROW LEVEL SECURITY` for RLS to bind the runtime. (This
+/// corrects an earlier claim here that the runtime stayed a non-owner with RLS enforced.)
 pub fn tenant_owner_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident_capped(&format!("{base}_{tenant_ident}_owner"), MAX_ROLE_IDENT_LEN)
 }
@@ -910,6 +918,11 @@ pub fn mint_dynamic_role_ddl(
 /// they MUST run connected to the tenant DB, where all of the dynamic role's privileges and
 /// any (escaped) objects live; `DROP ROLE` is cluster-global and runs fine from that same
 /// connection:
+/// 0. `SELECT pg_terminate_backend(pid) … WHERE usename = '<dyn>'` — **evict live sessions
+///    first**: `DROP ROLE` does NOT close an existing connection, and a session that already
+///    ran `SET role = <owner>` would otherwise retain owner authority after the drop. Targets
+///    the dynamic role's own backends by its authenticating `usename`. Defense-in-depth
+///    independent of the caller having stopped the container first.
 /// 1. `REASSIGN OWNED BY <dyn> TO <owner>` — **safety net**: the dynamic role normally owns
 ///    nothing (it operates as `<owner>`), but if an app did `SET ROLE NONE` and created
 ///    objects as the raw role, this moves them to the STABLE OWNER — no orphan, no data
@@ -936,7 +949,14 @@ pub fn drop_dynamic_role_ddl(
     match kind {
         ExternalSqlKind::Postgres => {
             let owner_id = quote_ident(kind, owner_role);
+            let dyn_lit = quote_literal(kind, dyn_role);
             vec![
+                // Evict any live sessions this role still holds FIRST: `DROP ROLE` does NOT
+                // close an existing connection, and a session that already ran `SET role =
+                // <owner>` keeps owner authority after the drop. `usename` is the authenticating
+                // (session) role — the dynamic role — so this terminates exactly its backends.
+                // Defense-in-depth independent of the caller stopping the container first.
+                format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {dyn_lit};"),
                 format!("REASSIGN OWNED BY {dyn_id} TO {owner_id};"),
                 format!("DROP OWNED BY {dyn_id};"),
                 format!("DROP ROLE IF EXISTS {dyn_id};"),
@@ -1884,10 +1904,13 @@ mod tests {
         assert!(idx("SET role =") < idx("GRANT CONNECT ON DATABASE"));
     }
 
-    /// Postgres clean-drop DDL: `REASSIGN OWNED … TO <owner>` (safety net, to the STABLE
-    /// OWNER — NOT the superuser), then `DROP OWNED`, then `DROP ROLE IF EXISTS`, in that
-    /// order, quoted. MUTATION: dropping the REASSIGN step, or reassigning to the superuser
-    /// instead of the owner, changes this structure and fails the ordering/owner asserts.
+    /// Postgres clean-drop DDL: evict the role's live sessions first
+    /// (`pg_terminate_backend … WHERE usename = <dyn>`, so a session that already ran
+    /// `SET role = <owner>` cannot retain owner access past the drop), then
+    /// `REASSIGN OWNED … TO <owner>` (safety net, to the STABLE OWNER — NOT the superuser),
+    /// then `DROP OWNED`, then `DROP ROLE IF EXISTS`, in that order, quoted. MUTATION: dropping
+    /// the terminate or the REASSIGN step, or reassigning to the superuser instead of the
+    /// owner, changes this structure and fails the ordering/owner asserts.
     #[test]
     fn drop_dynamic_role_postgres_reassigns_to_owner_then_drops_cleanly() {
         let stmts = drop_dynamic_role_ddl(
@@ -1898,16 +1921,24 @@ mod tests {
         assert_eq!(
             stmts,
             vec![
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE usename = 'appdb_acme_d_acme_web_0';"
+                    .to_string(),
                 "REASSIGN OWNED BY \"appdb_acme_d_acme_web_0\" TO \"appdb_acme_owner\";"
                     .to_string(),
                 "DROP OWNED BY \"appdb_acme_d_acme_web_0\";".to_string(),
                 "DROP ROLE IF EXISTS \"appdb_acme_d_acme_web_0\";".to_string(),
             ]
         );
+        // Live sessions are evicted FIRST (the role may already have `SET role = <owner>`).
+        assert!(
+            stmts[0].contains("pg_terminate_backend") && stmts[0].contains("usename ="),
+            "must terminate the dynamic role's backends before dropping it"
+        );
         // The safety net reassigns to the OWNER, never the superuser (CURRENT_USER) — so an
         // escaped object lands with the stable owner, not the cluster superuser.
         assert!(
-            !stmts[0].contains("CURRENT_USER"),
+            !stmts[1].contains("CURRENT_USER") && stmts[1].contains("REASSIGN OWNED"),
             "must reassign to the owner, not the superuser"
         );
     }
