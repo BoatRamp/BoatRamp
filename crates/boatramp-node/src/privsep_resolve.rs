@@ -783,11 +783,14 @@ pub fn resolve_key_input_paths(cfg: &ServerConfig, data_dir: &Path) -> KeyInputP
 ///
 /// `exec_self` is the per-tenant-router self-exec pin: for the `exec.compute` holder (the compute
 /// -plane spawner / per-tenant router) ONLY, the caller passes this instance's own executable so it
-/// lands read+EXECUTE in the Landlock view and the router can re-exec the boatramp binary to fork
-/// per-tenant children — mirroring the root's execute-pin ([`boatramp_server::sandbox::root_supervisor_policy`]).
-/// The caller resolves it via `std::env::current_exe()` and fails closed on a resolve error exactly
-/// as the root does; it passes `None` for every non-`exec.compute` instance, and the gate below
-/// also keys on the capability, so a non-router's execute grant is never widened.
+/// lands on the dedicated `execute_paths` pin (read + EXECUTE) and the router can re-exec the
+/// boatramp binary to fork per-tenant children — mirroring the root's execute-pin
+/// ([`boatramp_server::sandbox::root_supervisor_policy`]). Execute is carried ONLY on that pin;
+/// `build_ruleset` strips it from the general read/write roots, so no other readable or writable
+/// path (the system roots, the `kv-slate` backend state) is executable. The caller resolves the exe
+/// via `std::env::current_exe()` and fails closed on a resolve error exactly as the root does; it
+/// passes `None` for every non-`exec.compute` instance, and the gate below also keys on the
+/// capability, so a non-router's execute grant is never widened.
 #[must_use]
 pub fn build_instance_sandbox_inputs(
     cfg: &ServerConfig,
@@ -818,17 +821,22 @@ pub fn build_instance_sandbox_inputs(
 
     // WS-C exec.compute self-exec pin. A per-tenant router (the `exec.compute` holder) forks its
     // per-tenant children by re-execing THIS boatramp binary, so — exactly like the privsep root
-    // ([`boatramp_server::sandbox::root_supervisor_policy`]) — it needs its OWN executable in its
-    // Landlock read view, which is installed via `landlock::AccessFs::from_read` and so ALSO carries
-    // EXECUTE. Granted ONLY to an `exec.compute` holder (the same capability the seccomp `EXEC_SPAWN`
-    // allow keys off); every other instance keeps `execve` seccomp-killed AND Landlock-blocked, so
-    // the default is never widened. `exec_self` is the raw `std::env::current_exe()` the caller
-    // resolved + fail-closed just as the root does — it is normalized here by `into_normalized`, the
-    // SAME transform the root applies to its own binary via `normalize_for_landlock`.
+    // ([`boatramp_server::sandbox::root_supervisor_policy`]) — it needs its OWN executable
+    // read+EXECUTE in its Landlock view. That EXECUTE right is carried on the dedicated
+    // `execute_paths` pin, NOT the general read grant: `build_ruleset` STRIPS `Execute` from the
+    // read/write roots (`AccessFs::from_read`/`from_all` would otherwise grant it on every root,
+    // including the WRITABLE backend state) and re-grants it ONLY on `execute_paths`. The exe is
+    // ALSO kept in `base_read_only` (its read grant; Landlock unions the two rules to read+execute
+    // on that one path). Granted ONLY to an `exec.compute` holder (the same capability the seccomp
+    // `EXEC_SPAWN` allow keys off); every other instance keeps `execve` seccomp-killed AND
+    // Landlock-blocked (empty pin), so the default is never widened. `exec_self` is the raw
+    // `std::env::current_exe()` the caller resolved + fail-closed just as the root does — it is
+    // normalized here by `into_normalized`, the SAME transform the root applies to its own binary.
     if held.contains(&HostAuthority::ExecCompute)
         && let Some(exe) = exec_self
     {
         inputs.base_read_only.push(exe.to_path_buf());
+        inputs.execute_paths.push(exe.to_path_buf());
     }
 
     inputs.into_normalized(cwd)
@@ -1593,9 +1601,16 @@ mod tests {
         );
         assert!(
             router_inputs.base_read_only.contains(&exe),
-            "an exec.compute router pins its own executable read+EXECUTE"
+            "an exec.compute router keeps its own executable readable"
         );
-        // ...and it survives into the derived Landlock policy's read_only_paths (the execute grant).
+        // ...and the EXECUTE right is carried on the dedicated execute-pin (NOT the general read
+        // grant, from which `build_ruleset` strips Execute) — exactly the own binary, nothing else.
+        assert_eq!(
+            router_inputs.execute_paths,
+            vec![exe.clone()],
+            "an exec.compute router's EXECUTE pin is its own binary alone"
+        );
+        // ...and both survive into the derived Landlock policy.
         let router_held: std::collections::BTreeSet<HostAuthority> =
             router_caps.iter().copied().collect();
         let router_profile =
@@ -1603,8 +1618,28 @@ mod tests {
                 .expect("router inputs derive a clean profile");
         assert!(
             router_profile.policy.read_only_paths.contains(&exe),
-            "the router's own binary is in the installed read+EXECUTE view"
+            "the router's own binary is readable in the installed view"
         );
+        assert_eq!(
+            router_profile.policy.execute_paths,
+            vec![exe.clone()],
+            "the router's EXECUTE is pinned to its own binary in the derived policy"
+        );
+        // A system read root (readable) is NEVER executable...
+        assert!(
+            !router_profile
+                .policy
+                .execute_paths
+                .contains(&PathBuf::from("/usr")),
+            "a system read root (/usr) must NOT be executable"
+        );
+        // ...and NO writable backend-state grant (the kv-slate finding) is executable.
+        for w in &router_profile.policy.read_write_paths {
+            assert!(
+                !router_profile.policy.execute_paths.contains(w),
+                "a writable backend-state grant {w:?} must NOT be executable"
+            );
+        }
 
         // A non-exec.compute instance must NOT get an execute grant on the binary — EVEN if a path is
         // (mistakenly) supplied: the gate keys on the capability, so the default is never widened.
@@ -1618,7 +1653,11 @@ mod tests {
         );
         assert!(
             !backend_inputs.base_read_only.contains(&exe),
-            "a non-exec.compute instance never gets an execute grant on the binary"
+            "a non-exec.compute instance never gets the binary in its read view"
+        );
+        assert!(
+            backend_inputs.execute_paths.is_empty(),
+            "a non-exec.compute instance has Execute granted NOWHERE"
         );
 
         // An exec.compute instance whose caller could not resolve its exe (`None`) simply has no pin
@@ -1633,6 +1672,10 @@ mod tests {
         assert!(
             !no_exe.base_read_only.contains(&exe),
             "no exe supplied ⇒ no pin (the caller fail-closes the node instead)"
+        );
+        assert!(
+            no_exe.execute_paths.is_empty(),
+            "no exe supplied ⇒ no execute pin"
         );
     }
 }

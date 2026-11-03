@@ -101,6 +101,14 @@ pub struct SandboxPolicy {
     /// Filesystem roots the process may **read and write** (recursively). Non-existent
     /// paths are skipped at install time.
     pub read_write_paths: Vec<PathBuf>,
+    /// Filesystem paths this process may **execute** (`execve`), in addition to reading them —
+    /// the execute-pin. `AccessFs::from_read` (which [`linux::build_ruleset`] grants the general
+    /// read/write roots) INCLUDES `Execute`, so Execute is STRIPPED from those general grants and
+    /// re-granted ONLY on this list. EMPTY for every instance whose `execve` is seccomp-killed
+    /// (which is all of them except the `exec.compute` router + the root supervisor, each of which
+    /// pins EXACTLY its own binary so a fork can only re-exec that one trusted path). Non-existent
+    /// paths are skipped at install time.
+    pub execute_paths: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -127,6 +135,9 @@ impl SandboxPolicy {
             data_dir,
             read_only_paths,
             read_write_paths,
+            // The monolith never `execve`s once serving (its exec family is seccomp-killed), so it
+            // pins nothing executable — Execute is confined to the (empty) list.
+            execute_paths: Vec::new(),
         }
     }
 
@@ -504,8 +515,12 @@ const EXEC_SPAWN: &[&str] = &["execve", "execveat"];
 /// kill-surface `SIGSYS`-kills. A per-tenant router (`exec.compute`) forks children at SERVE time
 /// UNDER its installed sandbox (unlike the root, which forks at boot while still UNCONFINED), so it
 /// must be allowed to `fork`/`vfork`. Bounded: the Landlock view EXECUTE-pins ONLY its own binary
-/// (so a fork can only `execve` that one path) and WS-C's cold-start admission (token bucket +
-/// backoff) caps the spawn rate, so this does not open a fork-bomb or an arbitrary-exec surface.
+/// — [`linux::build_ruleset`] STRIPS `Execute` from the general read/write grants (which otherwise
+/// carry it via `AccessFs::from_read`, including on the WRITABLE `backend.kv` state subtree) and
+/// re-grants it ONLY on [`SandboxPolicy::execute_paths`], populated with this router's own binary
+/// alone. So a fork can `execve` that ONE path and nothing else — not a shell, not an ELF dropped
+/// into writable state — and WS-C's cold-start admission (token bucket + backoff) caps the spawn
+/// rate, so this does not open a fork-bomb or an arbitrary-exec surface.
 const FORK_SPAWN: &[&str] = &["fork", "vfork"];
 
 /// The syscalls that INSTALL a per-instance sandbox — the seccomp filter + the Landlock ruleset.
@@ -761,18 +776,24 @@ pub fn root_supervisor_killlist() -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// The root supervisor's Landlock FS policy (design §4.3): READ (which, via
-/// [`landlock::AccessFs::from_read`], includes EXECUTE) on the root's OWN binary — so it can
-/// re-exec `boatramp __instance` — plus READ on the config FILE, and NOTHING else. No §1.2 key
-/// input path (KEK / signer key / overlay seed / s3ingress root / cluster root / cert key), no
-/// `data_dir`, no instance state is in the FS view, so the root cannot open a crown-jewel key
-/// file even by accident (design F1/F11-A). The config FILE is granted (not its parent DIR — the
-/// WS-C config-file-grant lesson: a config dir containing `data_dir` would be an over-broad grant).
+/// The root supervisor's Landlock FS policy (design §4.3): READ on the root's OWN binary +
+/// EXECUTE on it (so it can re-exec `boatramp __instance`) plus READ on the config FILE, and
+/// NOTHING else. The EXECUTE right is carried on [`SandboxPolicy::execute_paths`] (the own binary
+/// ALONE), NOT on the general read grant: [`linux::build_ruleset`] STRIPS `Execute` from the
+/// read/write roots (which `AccessFs::from_read`/`from_all` would otherwise grant it) and
+/// re-grants it only on `execute_paths` — so a compromised root can `execve` ONLY its own fixed,
+/// trusted path, never the config file nor anything else readable. No §1.2 key input path (KEK /
+/// signer key / overlay seed / s3ingress root / cluster root / cert key), no `data_dir`, no
+/// instance state is in the FS view, so the root cannot open a crown-jewel key file even by
+/// accident (design F1/F11-A). The config FILE is granted (not its parent DIR — the WS-C
+/// config-file-grant lesson: a config dir containing `data_dir` would be an over-broad grant).
 ///
 /// Both paths MUST already be made absolute + normalized by the caller (the WS-C contract:
 /// [`lexically_normalize`] / `fs::canonicalize`) so the fd-based install grants the real paths.
-/// `read_write_paths` is empty — the root writes nothing. `data_dir` here is INFORMATIONAL only
-/// (carried on [`SandboxPolicy`]; [`install_derived`] grants only `read_only`/`read_write`), set to
+/// `read_write_paths` is empty — the root writes nothing. The own binary appears in BOTH
+/// `read_only_paths` (its read grant) and `execute_paths` (its execute grant); Landlock unions the
+/// two rules to read+execute on that one path. `data_dir` here is INFORMATIONAL only (carried on
+/// [`SandboxPolicy`]; [`install_derived`] grants only `read_only`/`read_write`/`execute`), set to
 /// the config file so the log line reflects "the root only reads its own config".
 ///
 /// NOTE: the EXECUTE-pin is sufficient for a STATICALLY-linked binary (the musl release build) to
@@ -785,6 +806,9 @@ pub fn root_supervisor_policy(current_exe: &Path, config_file: &Path) -> Sandbox
         data_dir: config_file.to_path_buf(),
         read_only_paths: vec![current_exe.to_path_buf(), config_file.to_path_buf()],
         read_write_paths: Vec::new(),
+        // The execute-pin: the root re-execs its own binary (and ONLY it) — read+EXECUTE on this
+        // one path, while the general read grant above no longer carries Execute.
+        execute_paths: vec![current_exe.to_path_buf()],
     }
 }
 
@@ -934,6 +958,13 @@ pub struct SandboxDerivationInputs {
     /// single instance's view. Phase-1-as-merged is safe only because serving is not wired
     /// (`run_instance` fail-closes before any derivation/install and WS-B supplies no grants).
     pub authority_state_dirs: BTreeMap<HostAuthority, Vec<PathBuf>>,
+    /// The execute-pin: paths this instance may `execve` (read + EXECUTE). WS-C populates it with
+    /// the instance's OWN binary ONLY for the `exec.compute` holder (the per-tenant router that
+    /// forks+re-execs itself); EMPTY for every other instance (whose `execve` is seccomp-killed).
+    /// Carried verbatim into [`SandboxPolicy::execute_paths`] by [`derive_profile`] (and
+    /// leak-checked like any other readable grant); [`linux::build_ruleset`] grants Execute ONLY
+    /// here, having stripped it from the general read/write roots.
+    pub execute_paths: Vec<PathBuf>,
 }
 
 impl SandboxDerivationInputs {
@@ -965,6 +996,8 @@ impl SandboxDerivationInputs {
             shared_temp,
             keys: KeyInputPaths::default(),
             authority_state_dirs: BTreeMap::new(),
+            // No execute-pin by default; WS-C adds the own binary for an `exec.compute` holder.
+            execute_paths: Vec::new(),
         }
     }
 
@@ -1012,6 +1045,7 @@ impl SandboxDerivationInputs {
                 .iter()
                 .map(|(a, dirs)| (*a, norm_vec(dirs)))
                 .collect(),
+            execute_paths: norm_vec(&self.execute_paths),
         }
     }
 }
@@ -1173,6 +1207,9 @@ pub fn derive_profile(
 ) -> Result<DerivedProfile, ProfileDerivationError> {
     let mut read_only = inputs.base_read_only.clone();
     let mut read_write = inputs.base_read_write.clone();
+    // The execute-pin (read + EXECUTE). Carried verbatim into the policy; also leak-checked below
+    // like any other readable grant (an execute path IS readable — `AccessFs::from_read`).
+    let execute = inputs.execute_paths.clone();
     // The shared system temp dirs are a `Derived`/`Off` convenience; `Strict` drops them.
     if posture != SandboxPosture::Strict {
         read_write.extend(inputs.shared_temp.iter().cloned());
@@ -1188,6 +1225,7 @@ pub fn derive_profile(
         .base_read_only
         .iter()
         .chain(inputs.base_read_write.iter())
+        .chain(inputs.execute_paths.iter())
     {
         if path_contains(granted, &inputs.data_dir) {
             return Err(ProfileDerivationError::OverbroadStateGrant {
@@ -1233,7 +1271,11 @@ pub fn derive_profile(
         if caps.contains(&authority) {
             continue; // the holder legitimately reaches its own key
         }
-        for granted in read_only.iter().chain(read_write.iter()) {
+        for granted in read_only
+            .iter()
+            .chain(read_write.iter())
+            .chain(execute.iter())
+        {
             if path_contains(granted, key_path) {
                 return Err(ProfileDerivationError::CrownJewelKeyLeak {
                     authority,
@@ -1263,6 +1305,7 @@ pub fn derive_profile(
             data_dir: inputs.data_dir.clone(),
             read_only_paths: read_only,
             read_write_paths: read_write,
+            execute_paths: execute,
         },
     })
 }
@@ -1679,26 +1722,46 @@ pub mod linux {
             .map_err(|e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string()))
     }
 
-    /// Build a Landlock ruleset confining reads to `read_only` (+ `read_write`) and
-    /// writes to `read_write`. Non-existent paths are skipped (best-effort).
+    /// Build a Landlock ruleset confining reads to `read_only` (+ `read_write`), writes to
+    /// `read_write`, and EXECUTE to `execute` ONLY. Non-existent paths are skipped (best-effort).
     /// `CompatLevel::BestEffort` degrades gracefully on a kernel without full Landlock.
+    ///
+    /// **Execute-pin (SECURITY-CRITICAL).** `AccessFs::from_read` includes [`AccessFs::Execute`]
+    /// (`Execute | ReadFile | ReadDir`) and `from_all ⊇ from_read`, so granting them verbatim would
+    /// make EVERY read-only AND read-write root `execve`-able — including the WRITABLE backend-state
+    /// subtrees (e.g. `kv-slate`). An `exec.compute` router (whose seccomp permits `execve`+`fork`)
+    /// could then write an ELF into writable state and run it, defeating the own-binary execute-pin
+    /// the fork-grant's safety argument depends on ([`FORK_SPAWN`]). So Execute is STRIPPED from the
+    /// general read/write grants here and re-granted ONLY on `execute` — the caller's explicit
+    /// execute-pin list (the own binary for an `exec.compute` router / the root supervisor; EMPTY
+    /// for every other instance, whose `execve` is seccomp-killed regardless). `handle_access` still
+    /// governs the FULL FS vocabulary (`from_all`, Execute included), so a path NOT in `execute` is
+    /// DENIED execute.
     fn build_ruleset(
         read_only: &[PathBuf],
         read_write: &[PathBuf],
+        execute: &[PathBuf],
     ) -> Result<RulesetCreated, SandboxError> {
         // Handle the FS rights the RUNNING kernel supports (clamped to the crate's max), not a
         // fixed ABI — so every FS right the kernel has is governed and `restrict_self` reports
         // `FullyEnforced` on a kernel the crate fully knows (see [`handled_fs_abi`]).
         let abi = handled_fs_abi(landlock_kernel_abi());
-        let ro_access = AccessFs::from_read(abi);
-        let rw_access = AccessFs::from_all(abi);
+        // Execute STRIPPED from the general grants; re-granted below ONLY on the `execute` pin.
+        let ro_access = AccessFs::from_read(abi) & !AccessFs::Execute;
+        let rw_access = AccessFs::from_all(abi) & !AccessFs::Execute;
+        // The execute-pin access: read + EXECUTE (so the pinned binary is readable AND runnable).
+        let exec_access = AccessFs::from_read(abi);
         let mut created = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(abi))
             .map_err(|e| SandboxError::Landlock(e.to_string()))?
             .create()
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
-        for (paths, access) in [(read_only, ro_access), (read_write, rw_access)] {
+        for (paths, access) in [
+            (read_only, ro_access),
+            (read_write, rw_access),
+            (execute, exec_access),
+        ] {
             for p in paths {
                 if !p.exists() {
                     continue;
@@ -1824,13 +1887,15 @@ pub mod linux {
         Ok(PreparedSeccomp { kill, allow })
     }
 
-    /// Build the Landlock ruleset for the given read-only / read-write roots.
+    /// Build the Landlock ruleset for the given read-only / read-write roots + the execute-pin
+    /// paths (read + EXECUTE; see [`build_ruleset`] — Execute is stripped from the general roots).
     pub fn prepare_landlock(
         read_only: &[PathBuf],
         read_write: &[PathBuf],
+        execute: &[PathBuf],
     ) -> Result<PreparedLandlock, SandboxError> {
         Ok(PreparedLandlock {
-            created: build_ruleset(read_only, read_write)?,
+            created: build_ruleset(read_only, read_write, execute)?,
         })
     }
 
@@ -1850,8 +1915,12 @@ pub mod linux {
         set_no_new_privs()?;
 
         // Landlock (independent). A genuine error is captured, logged, and does NOT skip seccomp.
-        let landlock = match prepare_landlock(&policy.read_only_paths, &policy.read_write_paths)
-            .and_then(PreparedLandlock::apply)
+        let landlock = match prepare_landlock(
+            &policy.read_only_paths,
+            &policy.read_write_paths,
+            &policy.execute_paths,
+        )
+        .and_then(PreparedLandlock::apply)
         {
             Ok(status) => Some(status),
             Err(e) => {
@@ -1946,6 +2015,7 @@ pub mod linux {
         let landlock = match prepare_landlock(
             &profile.policy.read_only_paths,
             &profile.policy.read_write_paths,
+            &profile.policy.execute_paths,
         )
         .and_then(PreparedLandlock::apply)
         {
@@ -2459,6 +2529,57 @@ mod privsep_derivation_tests {
     }
 
     #[test]
+    fn execute_is_confined_to_the_execute_pin_not_the_general_grants() {
+        // An exec.compute router: SYSTEM_READ_ROOTS read-only, a kv-slate backend subtree
+        // read-write, and its OWN binary as the execute-pin. The derived policy must carry Execute
+        // ONLY on the own binary — NEVER on a system read root, NEVER on the writable kv-slate.
+        let exe = PathBuf::from("/opt/boatramp/bin/boatramp");
+        let kv_slate = PathBuf::from("/data/kv-slate");
+        let mut inp = SandboxDerivationInputs::for_instance("/data", None);
+        inp.base_read_write = vec![kv_slate.clone()];
+        inp.execute_paths = vec![exe.clone()];
+        let profile = derive_profile(
+            &caps(&[HostAuthority::ExecCompute]),
+            SandboxPosture::Derived,
+            &inp,
+        )
+        .expect("exec.compute router derives a clean profile");
+
+        // The execute-pin is EXACTLY the own binary.
+        assert_eq!(
+            profile.policy.execute_paths,
+            vec![exe.clone()],
+            "Execute is pinned to the own binary alone"
+        );
+        // NOT the system read roots.
+        for root in SYSTEM_READ_ROOTS {
+            assert!(
+                !profile.policy.execute_paths.contains(&PathBuf::from(root)),
+                "a system read root ({root}) must NOT be executable"
+            );
+        }
+        // NOT the writable kv-slate backend state (the finding's core: no ELF-drop-then-exec).
+        assert!(
+            !profile.policy.execute_paths.contains(&kv_slate),
+            "the writable kv-slate backend state must NOT be executable"
+        );
+
+        // A non-exec.compute instance (no execute-pin supplied) gets Execute NOWHERE.
+        let mut backend = SandboxDerivationInputs::for_instance("/data", None);
+        backend.base_read_write = vec![kv_slate.clone()];
+        let backend_profile = derive_profile(
+            &caps(&[HostAuthority::BackendKv]),
+            SandboxPosture::Derived,
+            &backend,
+        )
+        .expect("backend derives a clean profile");
+        assert!(
+            backend_profile.policy.execute_paths.is_empty(),
+            "a non-exec.compute instance has Execute granted NOWHERE"
+        );
+    }
+
+    #[test]
     fn a_granted_subtree_that_would_expose_a_non_held_key_is_fail_closed() {
         // A frontend granted `/data/shared` (a narrow subtree under data_dir) while a sibling's
         // KEK lives UNDER it would transitively expose it — the derivation REFUSES (design §2
@@ -2890,6 +3011,18 @@ mod privsep_derivation_tests {
         // is read-write — the root writes nothing.
         assert_eq!(policy.read_only_paths, vec![exe.clone(), config.clone()]);
         assert!(policy.read_write_paths.is_empty());
+
+        // EXECUTE is pinned to the own binary ALONE (never the config file): `build_ruleset`
+        // strips Execute from the read grant and re-grants it only on `execute_paths`.
+        assert_eq!(
+            policy.execute_paths,
+            vec![exe.clone()],
+            "the root's EXECUTE pin is its own binary and nothing else"
+        );
+        assert!(
+            !policy.execute_paths.contains(&config),
+            "the config file must never be executable"
+        );
 
         // No §1.2 key input path, no data_dir, no instance state is anywhere in the view — the
         // root cannot open a crown-jewel key file even by accident (design F1/F11-A).

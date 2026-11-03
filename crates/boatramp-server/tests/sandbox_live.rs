@@ -152,7 +152,9 @@ fn probe_exec(install: bool) -> i32 {
 fn probe_fs(install: bool, data_dir: &str, inside: &CString, outside: &CString) -> i32 {
     let prepared = if install {
         let roots = vec![PathBuf::from(data_dir)];
-        Some(sandbox::linux::prepare_landlock(&roots, &roots).expect("build Landlock ruleset"))
+        // No execute-pin: this probe exercises read/write confinement only (the exec* KILL is the
+        // seccomp probe above), so Execute is granted nowhere.
+        Some(sandbox::linux::prepare_landlock(&roots, &roots, &[]).expect("build Landlock ruleset"))
     } else {
         None
     };
