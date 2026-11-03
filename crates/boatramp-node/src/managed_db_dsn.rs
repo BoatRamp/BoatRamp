@@ -258,12 +258,20 @@ impl ManagedDbDsnResolver {
             }
         }
 
-        // 3. Defaults (simple case): `url_env`=runtime DSN + `migration_url_env`=DDL DSN for each
-        // managed binding — the render stage injects each only for a key the operator did not set.
+        // 3. Defaults (simple case): the runtime `url_env` DSN is ALWAYS injected — a self-migrating
+        // app (WordPress-style) uses it, since the phase-2 runtime role operates AS the owner and can
+        // CREATE/ALTER its own schema, and because that is the per-replica dynamic role, revoke-on-stop
+        // cuts a stopped/compromised replica off. The separate owner-login MIGRATION DSN is OPT-IN:
+        // injected ONLY when the workload EXPLICITLY names its `migration_url_env` (i.e. declares it
+        // runs a distinct migration step). Off by default (MEDIUM-2) so a never-revoked owner login is
+        // not left sitting in every long-running serving replica's env. The render stage still injects
+        // each only for a key the operator did not already set.
         for m in &managed {
             out.defaults.push((m.binding.url_env(), m.runtime.dsn()));
-            out.defaults
-                .push((m.binding.migration_url_env(), m.migration.dsn()));
+            if m.binding.migration_url_env.is_some() {
+                out.defaults
+                    .push((m.binding.migration_url_env(), m.migration.dsn()));
+            }
         }
 
         // 4. Merge the wrapped sql-shim's contribution for every shim-owned `sql` binding (per-site
@@ -561,9 +569,12 @@ mod tests {
         assert!(default_url.starts_with("postgres://app:"));
         assert!(default_url.contains("@pg-acme"));
         assert!(default_url.ends_with(":5432/appdb"));
+        // MEDIUM-2: the separate owner-login migration DSN is OPT-IN (this binding leaves
+        // `migration_url_env` unset), so it is NOT injected by default — the runtime DSN above
+        // serves a self-migrating app (operate-as-owner), and revoke-on-stop cuts it off.
         assert!(
-            get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_some(),
-            "the migration DSN default is injected"
+            get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_none(),
+            "the migration DSN is opt-in; an unset migration_url_env must NOT inject it"
         );
         // The managed binding was NEVER delegated to the shim.
         assert!(shim.seen.lock().unwrap().is_empty());
@@ -585,7 +596,35 @@ mod tests {
         let url = get(&out, "BOATRAMP_SQL_URL").expect("default DSN injected");
         assert!(url.contains("@pg-acme"));
         assert!(url.ends_with(":5432/appdb"));
-        assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_some());
+        // MEDIUM-2: migration DSN is opt-in; unset `migration_url_env` ⇒ not injected by default.
+        assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_none());
+    }
+
+    /// MEDIUM-2 opt-in: a workload that declares a distinct migration step by NAMING its
+    /// `migration_url_env` DOES get the separate owner-login migration DSN injected (under that
+    /// name). A self-migrating app leaves it unset (covered above) and uses the runtime DSN.
+    #[tokio::test]
+    async fn managed_pg_injects_migration_dsn_only_when_opted_in() {
+        let (_shim, resolver) = resolver();
+        let binding = ComputeBinding {
+            kind: BindingKind::Sql,
+            name: "app".to_string(),
+            url_env: None,
+            migration_url_env: Some("APP_MIGRATE_URL".to_string()),
+        };
+        let out = resolver
+            .resolve_with_env("acme", "simertec", 0, &[binding], &BTreeMap::new())
+            .await;
+        // Runtime DSN still injected unconditionally.
+        assert!(get(&out, "BOATRAMP_SQL_URL").is_some());
+        // The migration DSN is now injected, under the workload's declared env var name.
+        let migrate = get(&out, "APP_MIGRATE_URL").expect("opted-in migration DSN injected");
+        assert!(
+            migrate.contains("@pg-acme"),
+            "migration DSN points at the managed DB workload: {migrate}"
+        );
+        // The derived default name is NOT used (the workload named its own).
+        assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_none());
     }
 
     /// No-regression: a `sql` binding that is NOT a managed co-located pg/mysql DB (here an
@@ -626,14 +665,15 @@ mod tests {
             get(&out, "BOATRAMP_SQL_URL").is_none(),
             "a literal must not be clobbered by the default DSN"
         );
-        // The migration default (a key the operator did not set) is still injected.
-        assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_some());
+        // MEDIUM-2: the migration DSN is opt-in (this binding leaves migration_url_env unset) ⇒
+        // not injected by default; the literal-not-clobbered behavior above is what this asserts.
+        assert!(get(&out, "BOATRAMP_SQL_URL_MIGRATION").is_none());
     }
 
     /// Phase 2: once a per-replica dynamic role is minted (here sealed mint-minus-DDL), the RUNTIME
     /// DSN carries IT instead of the static per-tenant credential — and a replica with no minted
-    /// role keeps the static identity (fall-back). The migration default still injects (its owner-
-    /// role identity does not rotate).
+    /// role keeps the static identity (fall-back). (MEDIUM-2: the separate migration DSN is opt-in —
+    /// this binding leaves `migration_url_env` unset, so it is not injected here.)
     #[tokio::test]
     async fn dynamic_cred_rotates_the_runtime_dsn_identity() {
         let (resolver, kv, envelope) = shared_resolver();
@@ -684,9 +724,11 @@ mod tests {
             static_url, dyn_url,
             "the runtime identity must rotate to the dynamic role"
         );
+        // MEDIUM-2: the migration DSN is opt-in (this binding leaves migration_url_env unset), so it
+        // is NOT injected — the dynamic-role rotation of the RUNTIME DSN above is what this asserts.
         assert!(
-            get(&after, "BOATRAMP_SQL_URL_MIGRATION").is_some(),
-            "the migration default (static owner-role identity) is still injected"
+            get(&after, "BOATRAMP_SQL_URL_MIGRATION").is_none(),
+            "the migration DSN is opt-in; an unset migration_url_env must not inject it"
         );
 
         // A DIFFERENT replica has no sealed cred → it keeps the static identity (fall-back).
