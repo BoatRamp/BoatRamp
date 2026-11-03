@@ -5866,10 +5866,15 @@ mod tests {
 
         // Empty map ⇒ no overrides, no error (byte-identical to a cluster without the section).
         let empty = std::collections::BTreeMap::new();
-        let built =
-            build_per_project_blob_backends(&empty, kv.clone(), None, Path::new("/tmp"), true)
-                .await
-                .expect("an empty [serve.blob_backends] builds an empty map, never an error");
+        let built = build_per_project_blob_backends(
+            &empty,
+            kv.clone(),
+            None,
+            std::path::Path::new("/tmp"),
+            true,
+        )
+        .await
+        .expect("an empty [serve.blob_backends] builds an empty map, never an error");
         assert!(
             built.is_empty(),
             "no projects configured ⇒ empty override map"
@@ -5885,7 +5890,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let built = build_per_project_blob_backends(&configs, kv, None, Path::new("/tmp"), true)
+        let built = build_per_project_blob_backends(&configs, kv, None, std::path::Path::new("/tmp"), true)
             .await
             .expect("a valid per-project backend builds post-KV on the cluster path (deferred, not refused)");
         assert!(
