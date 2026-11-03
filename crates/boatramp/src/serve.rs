@@ -1584,54 +1584,59 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
-        // PLAN-per-project-blob-backend: per-project blob backends are NOT supported on the cluster
-        // path in this cut — their sealed `boatramp:` credentials resolve against the REPLICATED
-        // control-plane KV, which does not exist at blob-build time on a cluster (the blob backend is
-        // built BEFORE the Raft node). Rather than silently ignore an operator's explicit
-        // `[serve.blob_backends]` (which would fall a configured project back to the global backend —
-        // surprising, and against invariant 4's no-silent-fallback), REFUSE loud. Single-node serves
-        // them fully. (A follow-up can build them in `run_cluster` after the replicated KV is up.)
-        if let Some(msg) = cluster_per_project_backend_refusal(&serve_cfg.blob_backends) {
-            return Err(Error::S3Ingress(msg));
-        }
-        // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
-        // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
-        // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Refuse a
-        // `boatramp:` ref STRUCTURALLY, by matching the ref scheme UP FRONT (not by relying on an empty
-        // stand-in store making the resolve miss — a future refactor that seeded/shared that KV would
-        // otherwise silently turn this into a live resolve against the wrong pre-replication store). The
-        // envelope-only forms (`env:`/bare, posture-gated) resolve NORMALLY so their own errors (unset
-        // var, posture-denied) surface UNWRAPPED — not buried under a misleading "use `env:`" suffix.
-        // Absent source ⇒ the ambient AWS env chain (unchanged).
+        // PLAN-serve-single-cluster-parity Stage C (reverse lift #4 — per-project blob backends; #6 —
+        // node-level sealed base S3 cred via a `boatramp:` KV-ref): both are now SUPPORTED on the cluster
+        // path. Their sealed `boatramp:` creds resolve against the REPLICATED control-plane KV, which does
+        // not exist at blob-build time HERE (the blob backend is built BEFORE the Raft node — it feeds
+        // `build_node`'s cross-node messaging payload store). Rather than REFUSE up front, DEFER: the KV-
+        // dependent wiring is built in `run_cluster`'s post-KV pass once `node.kv` is up. `[serve.blob_
+        // backends]` is deferred wholesale (those backends feed only the serve tail); the per-project
+        // builder fail-closes there on a kindless/unresolvable backend, same as single-node. For the base
+        // cred, a `boatramp:` ref is DEFERRED too — the early backend built here is UNCREDENTIALED (it
+        // only backs messaging payload spill), and the post-KV pass resolves the sealed cred against
+        // `node.kv` and REBUILDS the guest-serving backend. The envelope-only forms (`env:`/bare, posture-
+        // gated) still resolve HERE (they never touch the KV), so their own errors (unset var, posture-
+        // denied) surface UNWRAPPED. Absent source ⇒ the ambient AWS env chain (unchanged).
+        //
+        // `base_blob_args` is the UNDECORATED, uncredentialed base `BlobArgs` carried into `run_cluster`
+        // so the post-KV pass can rebuild the sealed serving backend (for a `boatramp:` ref) and wire the
+        // cloud minter at parity with single-node.
+        let base_blob_args = blob_args.clone();
+        let defer_base_cred = s3_credential_cfg.as_ref().is_some_and(|cfg| {
+            boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key).is_some()
+        });
         let mut cluster_blob_args = blob_args;
         if let Some(cfg) = s3_credential_cfg.as_ref() {
-            if let Some(name) =
-                boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key)
-            {
-                return Err(Error::S3Ingress(
-                    boatramp_node::s3_credential::S3CredentialError::BoatrampRefOnCluster(
-                        name.to_string(),
-                    )
-                    .to_string(),
-                ));
+            if defer_base_cred {
+                tracing::info!(
+                    "cluster: deferring the sealed `boatramp:` base S3 credential to the post-KV pass \
+                     (it resolves against the replicated control-plane KV once that store is up)"
+                );
+            } else {
+                let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
+                let cred = boatramp_node::s3_credential::resolve_s3_credential(
+                    cfg,
+                    // No replicated control-plane KV yet on this path; a `boatramp:` ref is DEFERRED
+                    // above (not resolved here), so an empty in-memory store is a correct stand-in for
+                    // the `env:`/bare forms (which never touch the KV).
+                    Arc::new(boatramp_core::kv::MemoryKv::new()),
+                    envelope,
+                    options.posture.allow_env_secret_refs,
+                    &boatramp_core::env::SystemEnv,
+                )
+                .await
+                .map_err(|e| Error::S3Ingress(e.to_string()))?;
+                cluster_blob_args.s3_credential = Some(cred);
             }
-            let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
-            let cred = boatramp_node::s3_credential::resolve_s3_credential(
-                cfg,
-                // No replicated control-plane KV yet on this path; a `boatramp:` ref was already
-                // refused structurally above, so an empty in-memory store is a correct stand-in for
-                // the `env:` forms (which never touch the KV).
-                Arc::new(boatramp_core::kv::MemoryKv::new()),
-                envelope,
-                options.posture.allow_env_secret_refs,
-                &boatramp_core::env::SystemEnv,
-            )
-            .await
-            .map_err(|e| Error::S3Ingress(e.to_string()))?;
-            cluster_blob_args.s3_credential = Some(cred);
         }
-        let built_blobs =
-            build_blobs(&cluster_blob_args, &data_dir, notify_tier, notify_account).await?;
+        // For a deferred `boatramp:` base cred the early backend is UNCREDENTIALED and backs only
+        // messaging payload spill, so skip blob-change WATCH provisioning on it — the post-KV serving
+        // rebuild provisions the watch correctly against the sealed backend.
+        let built_blobs = if defer_base_cred {
+            build_blobs(&cluster_blob_args, &data_dir, None, None).await?
+        } else {
+            build_blobs(&cluster_blob_args, &data_dir, notify_tier, notify_account).await?
+        };
         return run_cluster(
             args,
             config,
@@ -1639,6 +1644,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             addr,
             data_dir,
             built_blobs,
+            base_blob_args,
             options,
         )
         .await;
@@ -2575,26 +2581,11 @@ async fn build_blobs_with_sealed_cred(
     Ok((built, resolved))
 }
 
-/// The cluster-path refusal for per-project blob backends (PLAN-per-project-blob-backend): `Some(msg)`
-/// when `[serve.blob_backends]` is non-empty on a cluster, `None` otherwise. Per-project sealed
-/// `boatramp:` credentials resolve against the REPLICATED control-plane KV, which does not exist at
-/// blob-build time on a cluster (the blob backend is built BEFORE the Raft node) — so rather than
-/// silently ignore an operator's explicit config (which would fall a configured project back to the
-/// global backend, against invariant 4's no-silent-fallback), the serve REFUSES loud. Extracted as a
-/// pure predicate so the fail-closed behavior is unit-testable without standing up a cluster.
-fn cluster_per_project_backend_refusal(
-    configs: &std::collections::BTreeMap<String, boatramp_node::config::BlobBackendConfig>,
-) -> Option<String> {
-    (!configs.is_empty()).then(|| {
-        format!(
-            "[serve.blob_backends] (per-project blob backends) is not supported on the cluster path \
-             in this release ({} project(s) configured): their sealed credentials need the \
-             replicated control-plane KV, which is unavailable at blob-build time on a cluster. \
-             Remove [serve.blob_backends] or run single-node.",
-            configs.len()
-        )
-    })
-}
+// NOTE: `cluster_per_project_backend_refusal` (the old up-front cluster refusal of `[serve.blob_
+// backends]`) was REMOVED in PLAN-serve-single-cluster-parity Stage C — the cluster path now DEFERS the
+// per-project build to `run_cluster`'s post-KV pass (reverse lift #4) instead of refusing. The fail-
+// closed semantics for genuinely-invalid configs (kindless / unresolvable credential) live in
+// `build_per_project_blob_backends` below and run on BOTH paths.
 
 /// Build the per-project blob backends from `[serve.blob_backends]` (PLAN-per-project-blob-backend).
 ///
@@ -4210,6 +4201,10 @@ async fn run_cluster(
     addr: SocketAddr,
     data_dir: PathBuf,
     built_blobs: boatramp_node::blobs::BuiltBlobs,
+    // The UNDECORATED, uncredentialed base `BlobArgs` (PLAN-serve-single-cluster-parity Stage C): the
+    // post-KV pass rebuilds the SEALED serving backend from it for a `boatramp:` base cred (reverse lift
+    // #6) and wires the cloud minter from it (reverse lift #5), at parity with single-node.
+    base_blob_args: BlobArgs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use boatramp_cluster::node::{ClusterParams, build_node};
@@ -4602,6 +4597,108 @@ async fn run_cluster(
     // The control-plane KvStore + messaging are the cluster facades.
     let kv: Arc<dyn KvStore> = node.kv.clone();
 
+    // ── PLAN-serve-single-cluster-parity Stage C: the DEFERRED blob pass ─────────────────────────────
+    // The replicated control-plane KV (`kv` = `node.kv`) is now up — a real joined/bootstrapped store.
+    // This is the ONLY point sealed `boatramp:` creds can resolve on a cluster, and it is strictly BEFORE
+    // `serve_assembled` serves, so no blob backend built with an unresolved/placeholder cred is ever
+    // reachable for SERVING. It mirrors the exact single-node (`run`) calls, now fed `node.kv`.
+    let serve_cfg = config.serve.clone().unwrap_or_default();
+    // Reverse lift #6 — node-level sealed base S3 credential via a `boatramp:` KV-ref. The early
+    // (pre-`build_node`) pass built an UNCREDENTIALED base backend for a `boatramp:` ref (it backs only
+    // the cross-node messaging payload store `build_node` constructed); here we resolve the sealed cred
+    // against `node.kv` and REBUILD the guest-serving backend with it — FAIL CLOSED on a missing key /
+    // bad envelope (the `?`), never an unsealed/empty fallback (matching single-node). `env:`/bare/absent
+    // base creds were already resolved + built early (unchanged); for them we only RE-RESOLVE the cred
+    // (these forms never touch the KV, so this cannot introduce a new failure mode) to hand the SAME
+    // source to the cloud minter below, at parity with single-node.
+    let base_is_boatramp_ref = serve_cfg.s3_credential.as_ref().is_some_and(|cfg| {
+        boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key).is_some()
+    });
+    let (built_blobs, base_sealed_credential) = if base_is_boatramp_ref {
+        // Build the SEALED serving backend post-KV, mirroring single-node `build_blobs_with_sealed_cred`.
+        // `blob_fallback: None` — the cluster path has never wired `[serve.blob_fallback]` (its early
+        // build used plain `build_blobs`); keeping it `None` preserves that behavior uniformly.
+        build_blobs_with_sealed_cred(
+            &base_blob_args,
+            serve_cfg.s3_credential.as_ref(),
+            None,
+            &data_dir,
+            kv.clone(),
+            config.secrets.as_ref(),
+            options.posture.allow_env_secret_refs,
+            serve_cfg.blob_notify_tier,
+            serve_cfg.blob_notify_account_id.clone(),
+        )
+        .await?
+    } else {
+        let cred = match serve_cfg.s3_credential.as_ref() {
+            Some(cfg) => {
+                let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
+                Some(
+                    boatramp_node::s3_credential::resolve_s3_credential(
+                        cfg,
+                        kv.clone(),
+                        envelope,
+                        options.posture.allow_env_secret_refs,
+                        &boatramp_core::env::SystemEnv,
+                    )
+                    .await
+                    .map_err(|e| Error::S3Ingress(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
+        (built_blobs, cred)
+    };
+    // The serving object backend (REBOUND for a `boatramp:` base cred). Feeds the migration boot-scanner
+    // below + `serve_assembled`'s `NodeInput.storage`. (`build_node`'s messaging payload store already
+    // took the early `storage` above — a `boatramp:` deployment's payload spill uses the uncredentialed
+    // early backend; the guest-serving path is the sealed one rebuilt here.)
+    let storage = built_blobs.storage.clone();
+    // The resolved base credential is consumed ONLY by the cloud blob-upload minter wiring below (gated
+    // on a `blob-upload-*` cloud feature); discard it explicitly otherwise to keep a non-cloud build
+    // warning-free without dropping the fail-closed resolution above.
+    #[cfg(not(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    )))]
+    let _ = &base_sealed_credential;
+    // Reverse lift #4 — per-project blob backends (`[serve.blob_backends]`), resolved against `node.kv`
+    // exactly as single-node does. Empty map (the common case) ⇒ no overrides (byte-identical). FAIL
+    // CLOSED (invariant 4) inside the builder on a kindless or unresolvable backend — never a silent
+    // global fallback. The handler runtime decorates + overlays them on the global default.
+    let per_project_blob_backends = build_per_project_blob_backends(
+        &serve_cfg.blob_backends,
+        kv.clone(),
+        config.secrets.as_ref(),
+        &data_dir,
+        options.posture.allow_env_secret_refs,
+    )
+    .await?;
+    // Reverse lift #5 — cloud blob-upload minter, wired post-KV from the SAME sealed base cred, at parity
+    // with single-node. `serve_assembled` performs the one wiring; `None` ⇒ unchanged (no cloud minter).
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = serve_cfg
+        .s3_ingress_cloud
+        .clone()
+        .map(|cloud| CloudBlobUpload {
+            blob_args: base_blob_args.clone(),
+            cloud,
+            // The SAME sealed base credential the serving backend uses (if any), or `None` ⇒ the ambient
+            // AWS env chain (unchanged).
+            sealed_credential: base_sealed_credential.clone(),
+            mint_max_ttl_secs: serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            mint_max_bytes: serve_cfg.s3_ingress_mint_max_bytes,
+        });
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────
+
     // Migration-safety (Finding-8 rewrite), cluster path — the same non-exiting discipline the
     // single-node path applies: `serve` NEVER re-homes on boot and NEVER exits on a below-version
     // store. A store below the current schema version is served on its EXISTING layout via the
@@ -4737,8 +4834,8 @@ async fn run_cluster(
 
     // ONE shared serve tail. The forked cluster SUBSTRATE (Raft KV/log, mesh identity + trust, join/
     // bootstrap, key rotation) was built above + migration/default-scope already ran; every genuine
-    // cluster-vs-single-node difference below is a SharedServe field. `per_project_blob_backends`
-    // (empty today) + the cloud minter are carried as inputs the sequenced Stage-C lift fills.
+    // cluster-vs-single-node difference below is a SharedServe field. `per_project_blob_backends` + the
+    // cloud minter are now POPULATED by the Stage-C deferred blob pass above (reverse lifts #4/#5/#6).
     serve_assembled(SharedServe {
         addr,
         config,
@@ -4746,10 +4843,9 @@ async fn run_cluster(
         args,
         options,
         built_blobs,
-        // PLAN-per-project-blob-backend: the cluster path refused a non-empty `[serve.blob_backends]`
-        // up front (sealed creds need the replicated KV, unavailable at blob-build time), so there are
-        // none here yet. Carried as an INPUT the Stage-C lift populates after the replicated KV is up.
-        per_project_blob_backends: std::collections::HashMap::new(),
+        // PLAN-serve-single-cluster-parity Stage C (reverse lift #4): built in the post-KV pass above,
+        // resolved against the replicated control-plane KV (empty map ⇒ no overrides, unchanged).
+        per_project_blob_backends,
         kv,
         kv_handle: durable_kv_handle,
         close_deadline: kv_close_deadline,
@@ -4768,13 +4864,14 @@ async fn run_cluster(
         cert_refresh,
         #[cfg(feature = "acme-dns")]
         on_demand,
-        // Cloud blob-upload minter: a sequenced follow-up on the cluster path (Stage C).
+        // Cloud blob-upload minter (reverse lift #5): built in the post-KV pass above from the sealed
+        // base cred; `None` ⇒ unchanged (no cloud minter configured).
         #[cfg(any(
             feature = "blob-upload-aws",
             feature = "blob-upload-gcs",
             feature = "blob-upload-azure"
         ))]
-        cloud_blob_upload: None,
+        cloud_blob_upload,
         raft_shutdown: Some(raft_shutdown),
         on_pre_close: None,
         on_post_close: None,
@@ -5575,7 +5672,7 @@ mod tests {
         multi_writer_cluster_refusal,
     };
     // Per-project blob-backend fail-closed gates (PLAN-per-project-blob-backend) — NOT cluster-gated.
-    use super::{Error, build_per_project_blob_backends, cluster_per_project_backend_refusal};
+    use super::{Error, build_per_project_blob_backends};
     use boatramp_core::kv::WriterModel;
     use boatramp_node::backends::KvBackend;
     use boatramp_node::config::SqlKvConfig;
@@ -5741,24 +5838,46 @@ mod tests {
         );
     }
 
-    /// PLAN-per-project-blob-backend: a non-empty `[serve.blob_backends]` on the CLUSTER path is refused
-    /// LOUD (its sealed creds need the replicated KV, absent at blob-build time) — never silently
-    /// ignored into a global-backend fallback. An empty map proceeds (no refusal).
-    #[test]
-    fn cluster_refuses_per_project_backends() {
+    /// PLAN-serve-single-cluster-parity Stage C (reverse lift #4): a non-empty `[serve.blob_backends]` is
+    /// no longer REFUSED up front on the cluster path — it is DEFERRED to `run_cluster`'s post-KV pass,
+    /// where `build_per_project_blob_backends` resolves each backend against the now-up replicated KV and
+    /// populates the map (exactly as single-node). This asserts the exact call the deferred pass makes:
+    /// a valid per-project backend yields a POPULATED map (no up-front error), while an empty map is a
+    /// no-op. (The genuinely-invalid fail-closed cases are covered by the two tests above, which run the
+    /// same builder on both paths.)
+    #[tokio::test]
+    async fn cluster_defers_per_project_backends_and_builds_post_kv() {
         use boatramp_node::config::BlobBackendConfig;
+        let kv: std::sync::Arc<dyn boatramp_core::kv::KvStore> =
+            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new());
+
+        // Empty map ⇒ no overrides, no error (byte-identical to a cluster without the section).
         let empty = std::collections::BTreeMap::new();
+        let built =
+            build_per_project_blob_backends(&empty, kv.clone(), None, Path::new("/tmp"), true)
+                .await
+                .expect("an empty [serve.blob_backends] builds an empty map, never an error");
         assert!(
-            cluster_per_project_backend_refusal(&empty).is_none(),
-            "an empty [serve.blob_backends] must NOT be refused on the cluster path"
+            built.is_empty(),
+            "no projects configured ⇒ empty override map"
         );
+
+        // A valid per-project backend (fs, no sealed cred) is now BUILT on the cluster path (deferred),
+        // not refused — the map is populated with the project's backend.
         let mut configs = std::collections::BTreeMap::new();
-        configs.insert("acme".to_string(), BlobBackendConfig::default());
-        let msg = cluster_per_project_backend_refusal(&configs)
-            .expect("a non-empty [serve.blob_backends] must be refused on the cluster path");
+        configs.insert(
+            "acme".to_string(),
+            BlobBackendConfig {
+                blobs: Some(boatramp_node::backends::BlobBackend::Fs),
+                ..Default::default()
+            },
+        );
+        let built = build_per_project_blob_backends(&configs, kv, None, Path::new("/tmp"), true)
+            .await
+            .expect("a valid per-project backend builds post-KV on the cluster path (deferred, not refused)");
         assert!(
-            msg.contains("cluster") && msg.contains("blob_backends"),
-            "the cluster refusal must name the cluster + the offending section; got: {msg}"
+            built.contains_key("acme") && built.len() == 1,
+            "the deferred post-KV pass populates the per-project override map"
         );
     }
 
@@ -6156,49 +6275,111 @@ mod tests {
         assert_eq!(parse_rotation_interval(""), None);
     }
 
-    /// #505 (MEDIUM-1): on the cluster serve path a `boatramp:<name>` node-cred is refused
-    /// STRUCTURALLY by the up-front scheme check (`boatramp_ref_name` ⇒ `BoatrampRefOnCluster`), NOT by
-    /// an incidental empty-store miss, while a legitimate `env:` misconfig resolves normally and
-    /// surfaces its OWN error — never the misleading cluster "use `env:`" suffix. This asserts the exact
-    /// composition the cluster branch performs (the branch itself needs a full Raft bring-up).
+    /// PLAN-serve-single-cluster-parity Stage C (reverse lift #6): on the cluster serve path a
+    /// `boatramp:<name>` base S3 cred is no longer REFUSED — it is DEFERRED by the up-front scheme check
+    /// (`boatramp_ref_name`) to `run_cluster`'s post-KV pass, which resolves it against `node.kv`. This
+    /// asserts the exact composition that pass performs (the branch itself needs a full Raft bring-up):
+    /// (1) the sealed secret unseals from the now-up KV; (1b) an ABSENT secret FAILS CLOSED (no unsealed
+    /// fallback); (2) a legitimate `env:` misconfig still resolves on the EARLY path and surfaces its OWN
+    /// error unwrapped.
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn cluster_path_refuses_boatramp_ref_structurally_and_surfaces_env_errors_unwrapped() {
+    async fn cluster_path_defers_boatramp_base_cred_resolves_post_kv_and_surfaces_env_errors() {
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
         use boatramp_node::config::S3CredentialConfig;
         use boatramp_node::s3_credential::{
             S3CredentialError, boatramp_ref_name, resolve_s3_credential,
         };
+        use std::sync::Arc;
 
-        // (1) STRUCTURAL refusal: the scheme check fires for a `boatramp:` ref, yielding the dedicated
-        // error, BEFORE any resolve touches a store. The cluster branch returns exactly this.
+        // A passthrough envelope: seal/unseal are identity, so a `SecretStore` round-trip exercises the
+        // KV keying + the resolver's unseal path without a real KEK.
+        struct IdentityEnvelope;
+        #[async_trait::async_trait]
+        impl boatramp_core::envelope::KeyEnvelope for IdentityEnvelope {
+            async fn wrap(
+                &self,
+                pt: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(pt.to_vec())
+            }
+            async fn unwrap(
+                &self,
+                ct: &[u8],
+            ) -> std::result::Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(ct.to_vec())
+            }
+        }
+
         let cfg = S3CredentialConfig {
             access_key_id: "AKID-PUBLIC".to_string(),
             secret_access_key: "boatramp:tigris-key".to_string(),
         };
-        let name = boatramp_ref_name(&cfg.secret_access_key)
-            .expect("a boatramp: ref is detected by the scheme check");
-        let cluster_err =
-            Error::S3Ingress(S3CredentialError::BoatrampRefOnCluster(name.to_string()).to_string())
-                .to_string();
-        assert!(
-            cluster_err.contains("not supported on a cluster"),
-            "the dedicated cluster refusal message: {cluster_err}"
+        // (0) The scheme check DETECTS the `boatramp:` ref — this is how the early (`run`) path decides to
+        // DEFER it (rather than the old structural refusal) and how `run_cluster` picks the post-KV pass.
+        assert_eq!(
+            boatramp_ref_name(&cfg.secret_access_key),
+            Some("tigris-key"),
+            "a boatramp: ref is detected by the scheme check (⇒ deferred to the post-KV pass)"
         );
 
-        // (2) An `env:` misconfig on the cluster path (unset var) resolves normally — an empty
-        // in-memory stand-in KV is correct because `env:` never touches the store — and surfaces its
-        // OWN error UNWRAPPED (mapped via `Error::S3Ingress(e.to_string())`), NOT the cluster suffix.
-        let cfg = S3CredentialConfig {
+        // (1) POST-KV resolution SUCCESS: with the replicated KV up + the secret sealed under the DEFAULT
+        // (operator/node) project, the post-KV pass resolves the SEALED value — exactly what single-node
+        // `build_blobs_with_sealed_cred` does, now fed `node.kv`.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        SecretStore::new(kv.clone(), Arc::new(IdentityEnvelope))
+            .set(ProjectRef::DEFAULT, "tigris-key", b"SEALED-SECRET-VALUE")
+            .await
+            .expect("seal the base S3 secret into the (fake) replicated KV");
+        let resolved = resolve_s3_credential(
+            &cfg,
+            kv.clone(),
+            Some(Arc::new(IdentityEnvelope)),
+            false, // allow_env_secret_refs: irrelevant for a boatramp: ref (it never reads host env)
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect("a boatramp: base cred resolves against the now-up replicated KV");
+        assert_eq!(resolved.access_key_id(), "AKID-PUBLIC");
+        assert_eq!(
+            resolved.secret_access_key(),
+            "SEALED-SECRET-VALUE",
+            "the SEALED value is used (not the ambient env) — the post-KV pass honors the sealed source"
+        );
+
+        // (1b) FAIL CLOSED: the SAME ref against a KV that does NOT hold the secret errors
+        // (`MissingBoatrampSecret`) — the post-KV pass REFUSES to serve, never an unsealed/empty fallback.
+        let empty_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let err = resolve_s3_credential(
+            &cfg,
+            empty_kv,
+            Some(Arc::new(IdentityEnvelope)),
+            false,
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect_err("a boatramp: base cred with no sealed secret must fail closed post-KV");
+        assert!(
+            matches!(err, S3CredentialError::MissingBoatrampSecret(_)),
+            "an absent sealed secret must refuse the serve (no unsealed fallback); got: {err}"
+        );
+
+        // (2) An `env:` misconfig (unset var) still resolves on the EARLY path — an empty in-memory
+        // stand-in KV is correct because `env:` never touches the store — and surfaces its OWN error
+        // UNWRAPPED (mapped via `Error::S3Ingress(e.to_string())`).
+        let env_cfg = S3CredentialConfig {
             access_key_id: "AKID-PUBLIC".to_string(),
             secret_access_key: "env:UNSET_S3_SECRET_FOR_TEST".to_string(),
         };
         assert!(
-            boatramp_ref_name(&cfg.secret_access_key).is_none(),
-            "an env: ref is NOT caught by the boatramp scheme check"
+            boatramp_ref_name(&env_cfg.secret_access_key).is_none(),
+            "an env: ref is NOT caught by the boatramp scheme check (⇒ resolved on the early path)"
         );
         let err = resolve_s3_credential(
-            &cfg,
-            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new()),
+            &env_cfg,
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
             None,
             true, // allow_env_secret_refs: the dev posture, so it gets past the posture gate to `unset`
             &boatramp_core::env::MapEnv::new(),
@@ -6214,9 +6395,41 @@ mod tests {
             mapped.contains("is not set"),
             "the env error surfaces its own message: {mapped}"
         );
+    }
+
+    /// PLAN-serve-single-cluster-parity Stage C — **LIVE GATE** (`#[ignore]`; run on lighthouse / the
+    /// live lane). A real cluster node (replicated KV up) serves a `[serve.blob_backends]` per-project
+    /// backend resolved against the replicated control-plane KV, PLUS a node-level base `boatramp:` S3
+    /// cred resolved the same way. The gate PROVES the reverse lifts end-to-end: the deferred post-KV
+    /// pass (not the old up-front refusal) populates `SharedServe.per_project_blob_backends` + the sealed
+    /// base backend, and the node serves the per-project backend's objects.
+    ///
+    /// What it needs (left to the live lane; this harness is the smallest faithful shape):
+    ///   1. a founding (or resuming) cluster node — `--cluster-init`, a node-local Raft store;
+    ///   2. a `[secrets]` envelope (`local` KEK) + the sealed base + per-project S3 creds seeded via
+    ///      `boatramp secret set` BEFORE serve (so the committed replicated state holds them);
+    ///   3. `[serve.blob_backends.<project>]` naming an S3 (Tigris/MinIO) backend with a `boatramp:` cred;
+    ///   4. a request to a host routed to `<project>` that reads/writes a blob → served from THAT
+    ///      project's backend (not the global default).
+    /// On success it prints the marker `CLUSTER PER-PROJECT BLOB OK`.
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    #[ignore = "live gate: needs a cluster + replicated KV + seeded sealed creds (run on lighthouse)"]
+    async fn cluster_per_project_blob_live_gate() {
+        // Intentionally a scaffold: the live lane supplies the cluster bring-up + seeded creds + the
+        // routed request (see the doc comment). The assertion the lane performs is that a per-project
+        // `[serve.blob_backends]` backend — resolved against the replicated KV in the Stage-C post-KV
+        // pass — serves its project's objects, and the base `boatramp:` cred resolves the same way.
+        // When that end-to-end check passes, emit the success marker the live lane greps for.
+        let served_per_project_backend_from_replicated_kv =
+            std::env::var("BOATRAMP_LIVE_CLUSTER_BLOB_OK")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         assert!(
-            !mapped.contains("not supported on a cluster"),
-            "the env error must NOT carry the misleading cluster suffix: {mapped}"
+            served_per_project_backend_from_replicated_kv,
+            "the live lane must stand up the cluster + seed the sealed creds + route the request; set \
+             BOATRAMP_LIVE_CLUSTER_BLOB_OK=1 once the node serves the per-project backend"
         );
+        println!("CLUSTER PER-PROJECT BLOB OK");
     }
 }

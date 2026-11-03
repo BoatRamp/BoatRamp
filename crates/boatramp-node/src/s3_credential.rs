@@ -333,11 +333,12 @@ pub async fn resolve_s3_credential_for_project(
 }
 
 /// Whether `secret_ref` is a `boatramp:<name>` sealed-store reference. The cluster serve path uses this
-/// for a STRUCTURAL up-front refusal ([`S3CredentialError::BoatrampRefOnCluster`]) — the replicated
-/// control-plane KV that backs the sealed store does not exist at blob-build time on a cluster, so a
-/// `boatramp:` ref must be rejected by a scheme check (not left to fail incidentally against an empty
-/// stand-in store). `env:`/bare refs return `None` here so they resolve normally and surface their own
-/// errors unwrapped.
+/// STRUCTURAL scheme check to DEFER a `boatramp:` base cred (PLAN-serve-single-cluster-parity Stage C):
+/// the replicated control-plane KV that backs the sealed store does not exist at blob-build time on a
+/// cluster, so a `boatramp:` ref cannot be resolved up front — `run_cluster` resolves it against
+/// `node.kv` in a post-KV pass instead (reverse lift #6). `env:`/bare refs return `None` here so they
+/// resolve on the early path and surface their own errors unwrapped. (The older behavior rejected a
+/// `boatramp:` ref outright via [`S3CredentialError::BoatrampRefOnCluster`]; that refusal is retired.)
 pub fn boatramp_ref_name(secret_ref: &str) -> Option<&str> {
     match parse_secret_ref(secret_ref) {
         SecretRef::Boatramp(name) => Some(name),
