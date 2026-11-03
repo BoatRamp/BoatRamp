@@ -20,7 +20,7 @@ scrub` re-hashes each to detect drift.
 ## KV (control plane)
 
 Since 0.2.0 the keyspace splits three ways under the [project](../how-to/projects.md)
-re-keying (a migration — see [Upgrade a store to project scoping](../how-to/migrate-to-projects.md)):
+re-keying (a migration — see [Upgrade a store to project scoping](../how-to/upgrade-store-to-projects.md)):
 
 - **Project-scoped** — every mutable per-name record lives under
   `project/<proj>/…`. Pre-project resources migrate to the reserved `default`

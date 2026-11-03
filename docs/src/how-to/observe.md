@@ -1,5 +1,7 @@
 # Observe a running server
 
+**For: operators**
+
 This page covers the four ways to watch a running boatramp server: the JSON
 access log, the health endpoints, the Prometheus metrics endpoint, and the
 per-site CLI (`logs` and `stats`). Each is one command or one endpoint away.

@@ -1,5 +1,7 @@
 # Run owner-gated schema migrations
 
+**For: app developers**
+
 Your handlers own their **rows**; you also need to evolve the **schema** they run
 against — add a table, an index, an RLS policy, a column — and sometimes run a real
 **data** migration (backfill a column, sync an external source, verify an invariant).

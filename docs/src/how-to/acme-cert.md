@@ -1,5 +1,7 @@
 # Get an automatic certificate
 
+**For: operators**
+
 Issue a certificate for one domain from Let's Encrypt and serve it over HTTPS.
 boatramp requests the certificate on first start, caches it, and renews it before
 expiry — no cron, no manual `certbot`.

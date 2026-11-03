@@ -1,5 +1,7 @@
 # Hold the signing key in a KMS/HSM/Vault
 
+**For: operators**
+
 Keep the token root signing key outside the boatramp process so it never sits in
 process memory. The server resolves the key's public half at startup — the trust
 anchor — and calls the backend to sign each minted token; the private key stays

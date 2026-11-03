@@ -1,5 +1,7 @@
 # Control caching
 
+**For: operators & app developers**
+
 boatramp already sets a sensible `Cache-Control` on every file it serves, adds a
 strong `ETag`, answers conditional requests with `304`, and honors `Range` — you
 do not configure any of that. This page covers the one thing you do control:

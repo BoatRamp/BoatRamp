@@ -1,5 +1,7 @@
 # Generate a Connect / gRPC-web client
 
+**For: app developers**
+
 A boatramp function can serve a [Connect](https://connectrpc.com/) / gRPC-web RPC service — a
 protobuf `service` reachable over plain HTTP, no HTTP/2 trailers required (the serving side is the
 `boatramp-connect` shim). This guide is the other half: how to **generate a client** from that

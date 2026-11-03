@@ -1,5 +1,7 @@
 # Automate DNS with a provider
 
+**For: operators**
+
 boatramp can drive your managed-DNS provider directly, so pointing a verified
 custom domain and proving ownership become single commands instead of manual
 zone edits. This page covers both tasks. For custom-domain concepts, see

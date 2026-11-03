@@ -1,5 +1,7 @@
 # Organize sites into a project
 
+**For: operators & app developers**
+
 A **project** is boatramp's owning + tenant boundary. It groups many sites together
 with their functions and compute, and it is the tenant a managed handler's row-level
 scope resolves to. Every resource belongs to exactly one project; a reserved
@@ -15,7 +17,7 @@ including their names. Two projects can each own a site called `blog`.
 - A boatramp server and an admin token. See
   [Bootstrap authentication & mint tokens](./auth-bootstrap.md).
 - On an existing (pre-0.2.0) store, migrate it first — see
-  [Upgrade a store to project scoping](./migrate-to-projects.md).
+  [Upgrade a store to project scoping](./upgrade-store-to-projects.md).
 
 ## 1. Create a project
 
@@ -108,5 +110,5 @@ tokens keep working against the `default` project. See
 ## See also
 
 - [Declare a project with `apply`](./apply.md)
-- [Upgrade a store to project scoping](./migrate-to-projects.md)
+- [Upgrade a store to project scoping](./upgrade-store-to-projects.md)
 - [Core concepts & the deployment model](../explanation/concepts.md)

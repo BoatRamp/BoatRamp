@@ -1,5 +1,7 @@
 # Make a scoped CI deploy token
 
+**For: operators & app developers**
+
 Give a CI job a token that can deploy exactly one site and nothing else. You mint
 a site-scoped `publisher` token, store it as a CI secret, and — if you hand it
 onward — narrow it further offline first.

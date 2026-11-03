@@ -1,5 +1,7 @@
 # Diagnose & work around compute issues
 
+**For: operators & app developers**
+
 When a co-located workload or managed database misbehaves — a database that is
 reachable but "has no healthy replica", a container stuck after launch, two
 replicas fighting over one IP — you need to *see* what the reconcile plane

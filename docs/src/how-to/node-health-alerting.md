@@ -1,5 +1,7 @@
 # Alert on node & system health
 
+**For: operators**
+
 A slow-building node failure — a `/data` volume quietly filling to 100%, a managed
 Postgres replica stuck `HEALTHY=NO`, replicas the reconcile plane has stranded — should
 be caught *early*, not discovered as an outage. boatramp's node/system-health alerting is

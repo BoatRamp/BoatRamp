@@ -1,5 +1,7 @@
 # Deploy a self-hosted cluster
 
+**For: operators**
+
 A cluster replicates the control plane with Raft. Writes go to the leader and
 commit to a replicated log; every node serves reads from its local applied
 state. It is the same binary and the same commands as a single node — clustering
@@ -157,7 +159,7 @@ plane; every node serves the replicated cert and hot-swaps it on renewal. See
 ## Migrating the root key
 
 Because a cluster is its root key, moving custody (local ⇄ KMS/HSM/Vault) is a
-first-class operation — see [Migrate the root key](./migrate-root-key.md).
+first-class operation — see [Rotate the root key](./rotate-root-key.md).
 
 ## Reference
 

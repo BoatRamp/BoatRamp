@@ -1,5 +1,7 @@
 # Build from source
 
+**For: operators & app developers**
+
 Compile the `boatramp` binary (server + CLI) yourself. The default build is
 batteries-included — it enables every non-conflicting feature — so a plain
 `cargo build` gives you the full capability set. For a smaller binary you can opt
