@@ -1822,6 +1822,26 @@ mod tests {
         );
         let proj = ProjectRef::new("shop");
         let site = SiteName::new("storefront");
+        // Seed order mirrors the PASSING offline gate test `deploy_gate_requires_verification_not_mere_attachment`:
+        // (1) write the merely-ATTACHED, UNVERIFIED name FIRST via a plain whole-config PUT (so it
+        // resolves but is never verified), THEN (2) verify+attach the VERIFIED domain additively.
+        // Order matters: a plain `set_site_config` prunes stale `domain/<host>` index keys, so it must
+        // NOT run AFTER the verified domain is attached (that self-clobbered `www.deploy.test` — the
+        // bug this gate first caught). `attach_verified_domain` is additive and leaves the earlier
+        // `evil.deploy.test` resolvable-but-unverified. (A cooperative PUT does NOT rescue a displaced
+        // verified PRIMARY — it preserves verified ALIASES only — so reordering, not cooperation, is
+        // the fix.)
+        let cfg = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some("evil.deploy.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(proj, "storefront", &cfg)
+            .await
+            .unwrap();
         deploy
             .start_domain_verification(
                 proj,
@@ -1838,23 +1858,6 @@ mod tests {
             .unwrap();
         deploy
             .attach_verified_domain(proj, &site, "www.deploy.test")
-            .await
-            .unwrap();
-        // An attached-but-UNVERIFIED name: written so it resolves, never verified. Use the
-        // COOPERATIVE PUT — the realistic apply/operator/guest whole-config path — so the already
-        // attached+VERIFIED `www.deploy.test` (which this config omits) SURVIVES. A non-cooperative
-        // `set_site_config` here would prune the verified domain's `domain/www.deploy.test` index key,
-        // leaving BOTH hosts unresolvable: the gate would then deny `www` too and issuance would never
-        // run, so the "verified issues / unverified refused" property would go untested.
-        let cfg = boatramp_core::config::SiteConfig {
-            domains: boatramp_core::config::DomainConfig {
-                primary: Some("evil.deploy.test".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        deploy
-            .set_site_config_cooperative(proj, "storefront", &cfg)
             .await
             .unwrap();
 
