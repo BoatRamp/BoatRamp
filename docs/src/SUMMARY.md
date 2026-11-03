@@ -30,6 +30,7 @@
   - [Attach a custom domain](./how-to/custom-domain.md)
   - [Get an automatic certificate](./how-to/acme-cert.md)
   - [Wildcard certs with DNS-01](./how-to/wildcard-dns01.md)
+  - [Issue certificates on-demand](./how-to/on-demand-tls.md)
   - [Automate DNS with a provider](./how-to/auto-dns.md)
   - [Manage certificates in a cluster](./how-to/cluster-certs.md)
 - [Auth, identity & secrets]()

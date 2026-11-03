@@ -52,6 +52,7 @@ Attach hostnames, get certificates, and automate DNS.
 - [Attach a custom domain](./custom-domain.md)
 - [Get an automatic certificate](./acme-cert.md)
 - [Wildcard certs with DNS-01](./wildcard-dns01.md)
+- [Issue certificates on-demand](./on-demand-tls.md)
 - [Automate DNS with a provider](./auto-dns.md)
 - [Manage certificates in a cluster](./cluster-certs.md)
 
