@@ -1920,6 +1920,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "boatramp-k8s"
+version = "0.52.0"
+dependencies = [
+ "async-trait",
+ "boatramp-core",
+ "k8s-openapi",
+ "kube",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "boatramp-mcp"
 version = "0.52.0"
 dependencies = [
@@ -1949,6 +1964,7 @@ dependencies = [
  "boatramp-docker",
  "boatramp-firecracker",
  "boatramp-handlers",
+ "boatramp-k8s",
  "boatramp-server",
  "boatramp-storage",
  "boatramp-vz",

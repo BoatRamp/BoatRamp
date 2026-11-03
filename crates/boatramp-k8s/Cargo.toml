@@ -1,0 +1,44 @@
+[package]
+name = "boatramp-k8s"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Kubernetes compute backend for boatramp: run a managed database (and, later, generic workloads) as native k8s resources (StatefulSet + Service + PVC) through the in-cluster API (kube-rs). Default-inert unless selected/auto-detected."
+
+[dependencies]
+boatramp-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The kube-rs client + the typed k8s-openapi resource objects + the rustls crypto
+# provider the client's TLS needs — all OPTIONAL and gated behind `k8s-backend`, so a
+# build that never turns the feature on is an inert shell and pulls none of the tree
+# (mirrors how the `boatramp` crate gates the operator behind `dep:kube`/`dep:k8s-openapi`).
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# ON by default so `cargo test -p boatramp-k8s` exercises the pure resource planner +
+# its unit tests, and anything that depends on this crate (only `boatramp-node` under its
+# own `k8s-backend` feature) gets the real backend. `--no-default-features` yields the
+# inert shell (no kube tree), for a size-sensitive probe build.
+default = ["k8s-backend"]
+# The in-cluster Kubernetes compute backend: the kube-rs client surface + the typed
+# k8s-openapi objects the resource planner builds.
+k8s-backend = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+
+[lints]
+workspace = true

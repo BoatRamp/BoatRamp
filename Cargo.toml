@@ -37,6 +37,11 @@ members = [
   "crates/boatramp-container",
   "crates/boatramp-docker",
   "crates/boatramp-vz",
+  # The Kubernetes compute backend (mailroom #26): managed compute as native k8s
+  # resources (StatefulSet/Service/PVC) via the in-cluster API. Gated behind its own
+  # `k8s-backend` feature so a non-k8s build pulls none of the kube-rs tree. Its OWN
+  # dedicated release — add it to `just publish` `crate_order` at cut time.
+  "crates/boatramp-k8s",
   "crates/boatramp-cloudflare",
   "crates/boatramp-mcp",
   "crates/boatramp-node",
@@ -131,6 +136,7 @@ boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.52.0
 boatramp-container = { path = "crates/boatramp-container", version = "0.52.0" }
 boatramp-docker = { path = "crates/boatramp-docker", version = "0.52.0" }
 boatramp-vz = { path = "crates/boatramp-vz", version = "0.52.0" }
+boatramp-k8s = { path = "crates/boatramp-k8s", version = "0.52.0" }
 boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.52.0" }
 boatramp-node = { path = "crates/boatramp-node", version = "0.52.0" }
 boatramp-http = { path = "crates/boatramp-http", version = "0.52.0" }

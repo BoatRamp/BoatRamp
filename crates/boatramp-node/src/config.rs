@@ -1111,6 +1111,32 @@ pub enum ManagedDbPrivilege {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComputeConfig {
+    /// **Compute backend selection** (mailroom #26). `Some("kubernetes")` pins the
+    /// Kubernetes backend (managed compute as native k8s StatefulSet/Service/PVC via the
+    /// in-cluster API) and suppresses the capability-detected docker / native-container /
+    /// VMM backends — for boatramp running AS a pod on k8s/k3s. `None` (default) keeps the
+    /// capability-detected behavior, BUT the node still auto-detects an in-cluster
+    /// environment (`KUBERNETES_SERVICE_HOST` + a mounted ServiceAccount token) and
+    /// defaults to the Kubernetes backend there. Set via `[compute] backend: "kubernetes"`,
+    /// env `BOATRAMP_COMPUTE_BACKEND`, or `--compute-backend kubernetes`. Consumed only when
+    /// the binary is built with the `k8s-backend` feature; an unknown value is ignored
+    /// (falls back to capability detection). Other backend ids are selected by capability,
+    /// not pinned here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// PVC `StorageClass` for the Kubernetes backend's managed-database data volumes.
+    /// `None` (default) ⇒ no `storageClassName` on the PVC, so the cluster's **default**
+    /// StorageClass is used (it must allow volume expansion for grow-in-place). Only read
+    /// by the `kubernetes` backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_storage_class: Option<String>,
+    /// Whether the Kubernetes backend RETAINS a managed database's PVC on `stop` (default
+    /// `true` — a database's data must survive a routine teardown; an explicit destroy
+    /// deletes it). Only read by the `kubernetes` backend.
+    #[serde(default = "default_k8s_retain_pvc")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_retain_pvc: bool,
     /// Bridge the container veths / VM taps attach to (default `br-boatramp`).
     pub bridge: String,
     /// Guest IP subnet (default `10.0.0.0/24`).
@@ -1307,6 +1333,11 @@ fn default_internal_dns() -> bool {
     true
 }
 
+/// Default for [`ComputeConfig::k8s_retain_pvc`] — retain a managed DB's PVC on stop.
+fn default_k8s_retain_pvc() -> bool {
+    true
+}
+
 /// Default upstream resolver for [`ComputeConfig::dns_upstream`].
 fn default_dns_upstream() -> String {
     "1.1.1.1:53".to_string()
@@ -1380,6 +1411,9 @@ fn default_allowed_kernel_hashes() -> Vec<String> {
 impl Default for ComputeConfig {
     fn default() -> Self {
         Self {
+            backend: None,
+            k8s_storage_class: None,
+            k8s_retain_pvc: default_k8s_retain_pvc(),
             bridge: "br-boatramp".to_string(),
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,

@@ -1,0 +1,74 @@
+{{- /*
+Kubernetes COMPUTE-BACKEND RBAC (mailroom #26).
+
+When boatramp runs AS a pod and uses the `kubernetes` compute backend, the serve pod
+manages its own managed compute (managed databases now; generic workloads in Phase 2) as
+native k8s objects in its OWN namespace. This ships a LEAST-PRIVILEGE, NAMESPACE-SCOPED
+Role (never a ClusterRole) + a RoleBinding (and, by default, the ServiceAccount) for that
+pod. Gated on `.Values.computeBackend.kubernetes.enabled` so a non-k8s-backend install
+grants nothing.
+
+Point the serve pod's `serviceAccountName` at `.Values.computeBackend.kubernetes.serviceAccountName`.
+
+Non-helm installs: apply the equivalent Role/RoleBinding below to the serve pod's
+namespace + ServiceAccount by hand.
+*/ -}}
+{{- if .Values.computeBackend.kubernetes.enabled }}
+{{- $sa := .Values.computeBackend.kubernetes.serviceAccountName }}
+{{- if .Values.computeBackend.kubernetes.createServiceAccount }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+# Least-privilege Role for the serve pod's compute backend, scoped to THIS namespace.
+# The exact resources/verbs the kubernetes backend applies (StatefulSet + Service + PVC
+# for a managed DB) and reads (pods / readiness); pods/exec + pods/log + deployments are
+# included for the Phase-2 generic-workload + exec/logs surfaces. No wildcards; no
+# cluster-scoped grants (a boatramp-owned expandable StorageClass, being cluster-scoped,
+# is intentionally NOT granted here — it is an explicit operator step).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -44,6 +44,21 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# Kubernetes COMPUTE BACKEND (mailroom #26). When boatramp serve runs AS a pod and uses
+# the `kubernetes` compute backend (`[compute].backend: kubernetes` / in-cluster
+# auto-detect), it manages its own managed compute (managed DBs → StatefulSet + Service +
+# PVC) as native k8s objects in its OWN namespace. Enable this to ship the least-privilege,
+# namespace-scoped Role + RoleBinding (+ ServiceAccount) that lets the serve pod do so. No
+# ClusterRole is granted. Off by default — a plain operator install needs none of it.
+computeBackend:
+  kubernetes:
+    enabled: false
+    # The ServiceAccount the serve pod runs as; the Role is bound to it. Point the serve
+    # pod's `serviceAccountName` at this value.
+    serviceAccountName: boatramp-compute
+    # Create the ServiceAccount here (set false to bind a pre-existing one).
+    createServiceAccount: true
+
 # Extra labels/annotations applied to operator resources.
 commonLabels: {}
 commonAnnotations: {}
