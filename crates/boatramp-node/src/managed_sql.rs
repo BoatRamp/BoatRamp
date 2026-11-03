@@ -3377,9 +3377,12 @@ mod tests {
         // An orphaned dynamic cred for project `acme`, replica id `acme-web-api-0`
         // (project `acme` + workload `web-api` + replica 0 — its owning replica is GONE).
         let seed = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
-        seed.password("acme", &dynamic_cred_workload_key("pg", "acme", "acme-web-api-0"))
-            .await
-            .unwrap();
+        seed.password(
+            "acme",
+            &dynamic_cred_workload_key("pg", "acme", "acme-web-api-0"),
+        )
+        .await
+        .unwrap();
 
         let mut binding = db("postgres", Some("pg"), "", None);
         binding.tenant = crate::config::TenantIsolation::Shared;

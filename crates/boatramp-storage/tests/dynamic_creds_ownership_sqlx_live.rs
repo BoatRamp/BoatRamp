@@ -428,9 +428,7 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
         DYN_A,
         "positive control: the authenticating session role on DB_A is indeed DYN_A"
     );
-    eprintln!(
-        "xtenant positive control: DYN_A -> DB_A trivial query OK (session_user = {DYN_A})"
-    );
+    eprintln!("xtenant positive control: DYN_A -> DB_A trivial query OK (session_user = {DYN_A})");
 
     // NEGATIVE 3a (LEAK CHECK — cross-tenant CONNECT): DYN_A was granted CONNECT on
     // DB_A only; tenant B revoked CONNECT from PUBLIC and admitted only B's own

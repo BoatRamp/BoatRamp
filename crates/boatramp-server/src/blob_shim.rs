@@ -204,7 +204,11 @@ pub struct BlobShimResolver {
     /// in a build without `blob-upload`, or on a backend with no real STS) ⇒ the HMAC shim only.
     /// Feature-gated because `boatramp_handlers` (the `BlobUploadMinter` seam) is an optional dep.
     #[cfg(feature = "blob-upload")]
-    blob_minter: Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64, Option<u64>)>,
+    blob_minter: Option<(
+        Arc<dyn boatramp_handlers::BlobUploadMinter>,
+        u64,
+        Option<u64>,
+    )>,
 }
 
 /// The direct-S3 STS minter slot [`spawn_blob_shim`] takes:
@@ -213,7 +217,11 @@ pub struct BlobShimResolver {
 /// the HMAC shim only. `max_bytes_ceiling` is the operator per-object size ceiling (the SAME
 /// one the guest mint path clamps to). Keeps the node's call site feature-independent.
 #[cfg(feature = "blob-upload")]
-pub type BlobMintSlot = Option<(Arc<dyn boatramp_handlers::BlobUploadMinter>, u64, Option<u64>)>;
+pub type BlobMintSlot = Option<(
+    Arc<dyn boatramp_handlers::BlobUploadMinter>,
+    u64,
+    Option<u64>,
+)>;
 /// See the feature-on variant: without `blob-upload` there is no minter type, so the slot is unit.
 #[cfg(not(feature = "blob-upload"))]
 pub type BlobMintSlot = ();

@@ -956,7 +956,9 @@ pub fn drop_dynamic_role_ddl(
                 // <owner>` keeps owner authority after the drop. `usename` is the authenticating
                 // (session) role — the dynamic role — so this terminates exactly its backends.
                 // Defense-in-depth independent of the caller stopping the container first.
-                format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {dyn_lit};"),
+                format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {dyn_lit};"
+                ),
                 format!("REASSIGN OWNED BY {dyn_id} TO {owner_id};"),
                 format!("DROP OWNED BY {dyn_id};"),
                 format!("DROP ROLE IF EXISTS {dyn_id};"),
