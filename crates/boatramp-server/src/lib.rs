@@ -356,7 +356,7 @@ mod workflow;
 pub use auth::{Auth, require_auth};
 #[cfg(feature = "http3")]
 pub use http3::{
-    Http3Error, advertise_http3, http3_endpoint, quinn_server_config, serve_http3,
+    Http3Endpoint, Http3Error, advertise_http3, http3_endpoint, quinn_server_config, serve_http3,
     serve_http3_endpoint,
 };
 pub use limits::{ServerLimits, UploadGuard};

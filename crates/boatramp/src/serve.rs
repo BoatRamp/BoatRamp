@@ -4784,39 +4784,14 @@ async fn serve_cluster_acme_dns(
     }
 
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses (on the
-    // bypass too, so a hot-path response advertises h3 identically to the router).
-    #[cfg(feature = "http3")]
-    let (app, fast) = if let Some(endpoint) = h3_endpoint {
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
-                tracing::error!(%err, "cluster acme-dns: HTTP/3 listener failed");
-            }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
-    } else {
-        (app, fast)
-    };
-    let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
-            .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    serve_router_over_tls(
+        addr,
+        tls,
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        h3_endpoint,
+    )
+    .await
 }
 
 /// One leader-gated refresh pass: per domain, the leader issues (live CA, via
@@ -4996,41 +4971,14 @@ async fn serve_acme_dns(
     }
 
     tracing::info!(%addr, domains = ?domains, "serving HTTPS (ACME DNS-01)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    #[cfg(feature = "http3")]
-    let (app, fast) = if let Some(endpoint) = h3_endpoint {
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
-                tracing::error!(%err, "acme-dns: HTTP/3 listener failed");
-            }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
-    } else {
-        (app, fast)
-    };
-    let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
-            .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    serve_router_over_tls(
+        addr,
+        tls,
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        h3_endpoint,
+    )
+    .await
 }
 
 /// Obtain (or load) every domain's cert, returning `(SNI-pattern, cert)` pairs.
@@ -5114,6 +5062,66 @@ async fn configure_oidc(
     Ok(())
 }
 
+/// The shared tail of every TLS serve variant (`serve_custom` / `serve_acme` / `serve_rpk` + the
+/// unified AcmeDns arm): spawn the background scheduler, build the router (+ fast path), optionally
+/// stand up + advertise HTTP/3 over a prepared QUIC endpoint, serve over `tls` until shutdown, then
+/// fully quiesce the scheduler BEFORE the caller's `quiesce_and_close` closes the store (Part A — no
+/// scheduler task may land a KV write into a fresh WAL segment after `close()`). Extracting this kills
+/// the exact five-copy drift class that once let on-demand TLS be silently omitted from one serve path.
+/// `http3_endpoint` is a prepared [`boatramp_server::Http3Endpoint`] (so an ACME path can hot-swap its
+/// cert on the SAME endpoint via `set_server_config`), or `None` to serve TCP only.
+#[cfg(feature = "tls")]
+async fn serve_router_over_tls(
+    addr: SocketAddr,
+    tls: boatramp_server::ReloadableTls,
+    serve: (
+        DeployStore,
+        boatramp_server::Auth,
+        boatramp_server::HandlerRuntime,
+        boatramp_server::ServerOptions,
+    ),
+    #[cfg(feature = "http3")] http3_endpoint: Option<boatramp_server::Http3Endpoint>,
+) -> Result<()> {
+    let (deploy, auth, handlers, options) = serve;
+    // Background scheduler (consumers/crons) — must run under TLS too, not only `--tls off`; in cluster
+    // mode its cron tick is gated on `is_leader`. The handle is fully quiesced on graceful shutdown
+    // (below) so no scheduler task can issue a KV write after the store is closed (Part A).
+    #[cfg(feature = "handlers")]
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
+    // Serve h3 over the prepared QUIC endpoint (sharing the port + the same router) and advertise it
+    // (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 — without the header the h3 listener
+    // is never discovered. The bypass gets the same Alt-Svc so a hot-path response advertises h3
+    // identically to the router.
+    #[cfg(feature = "http3")]
+    let (app, fast) = if let Some(endpoint) = http3_endpoint {
+        let app_h3 = app.clone();
+        tokio::spawn(async move {
+            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
+                tracing::error!(%err, "HTTP/3 listener failed");
+            }
+        });
+        (
+            boatramp_server::advertise_http3(app, addr.port()),
+            fast.advertise_http3(addr.port()),
+        )
+    } else {
+        (app, fast)
+    };
+    let serve_result =
+        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
+    Ok(())
+}
+
 #[cfg(feature = "tls")]
 async fn serve_custom(
     args: &ServeArgs,
@@ -5133,52 +5141,43 @@ async fn serve_custom(
         .with_single_cert(certs, private_key)?;
     config.alpn_protocols = boatramp_server::alpn_h1_h2();
     tracing::info!(%addr, "serving HTTPS (custom certificate)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-
-    // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
-    // advertise it (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 —
-    // without the header the h3 listener is never discovered. The bypass gets the same
-    // Alt-Svc so a hot-path response advertises h3 identically.
+    // Optionally serve HTTP/3 on the same UDP port, feeding the same router. The `--tls custom` path
+    // uses a STATIC cert (no renewal), so the QUIC endpoint is prepared here from the SAME cert/key and
+    // handed to the shared tail, which advertises + serves it exactly as the ACME paths do. A failed
+    // h3 setup is logged and serving continues over TCP (never a hard serve failure), matching the
+    // prior in-task `serve_http3` error handling.
     #[cfg(feature = "http3")]
-    let (app, fast) = if args.http3 {
-        let (certs, key) = load_cert_chain_and_key(&cert, &key)?;
-        let app_h3 = app.clone();
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3(addr, certs, key, app_h3).await {
+    let h3_endpoint = if args.http3 {
+        let build = || -> Result<boatramp_server::Http3Endpoint> {
+            let (h3_certs, h3_key) = load_cert_chain_and_key(&cert, &key)?;
+            let mut h3_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(h3_certs, h3_key)?;
+            // QUIC mandates exactly the `h3` ALPN on this listener.
+            h3_tls.alpn_protocols = vec![b"h3".to_vec()];
+            Ok(boatramp_server::http3_endpoint(
+                addr,
+                boatramp_server::quinn_server_config(h3_tls)?,
+            )?)
+        };
+        match build() {
+            Ok(endpoint) => Some(endpoint),
+            Err(err) => {
                 tracing::error!(%err, "HTTP/3 listener failed");
+                None
             }
-        });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
+        }
     } else {
-        (app, fast)
+        None
     };
-
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        h3_endpoint,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Serve the control-plane over **RFC 7250 raw-public-key TLS** (`--tls rpk`):
@@ -5250,26 +5249,14 @@ async fn serve_rpk(
         "control-plane RPK TLS identity — pin the client with:\n  --server-pubkey {fingerprint}"
     );
 
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        None,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Load a PEM cert chain + private key as DER — for the rustls `ServerConfig`
@@ -5344,30 +5331,14 @@ async fn serve_acme(
     });
 
     tracing::info!(%addr, domains = ?args.acme_domain, "serving HTTPS (ACME)");
-    // Background scheduler (consumers/crons) — must run under TLS too, not only
-    // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
-    // issue a KV write after the store is closed (Part A).
-    #[cfg(feature = "handlers")]
-    let scheduler = handlers.spawn_scheduler(deploy.clone());
-    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    let serve_result = boatramp_server::serve_tls(
+    serve_router_over_tls(
         addr,
         rustls_config.into(),
-        (app, fast),
-        boatramp_server::shutdown_signal(),
+        (deploy, auth, handlers, options),
+        #[cfg(feature = "http3")]
+        None,
     )
-    .await;
-    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
-    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
-    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
-    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
-    #[cfg(feature = "handlers")]
-    if let Some(handle) = scheduler {
-        handle.quiesce().await;
-    }
-    serve_result?;
-    Ok(())
+    .await
 }
 
 /// Install a process-wide default rustls crypto provider (rustls 0.23 requires
