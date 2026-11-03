@@ -508,6 +508,32 @@ const EXEC_SPAWN: &[&str] = &["execve", "execveat"];
 /// backoff) caps the spawn rate, so this does not open a fork-bomb or an arbitrary-exec surface.
 const FORK_SPAWN: &[&str] = &["fork", "vfork"];
 
+/// The syscalls that INSTALL a per-instance sandbox — the seccomp filter + the Landlock ruleset.
+/// Allowed ONLY for an `exec.compute` instance (the per-tenant router); every other instance keeps
+/// them default-denied (`EPERM`).
+///
+/// **Why only exec.compute needs these, and why it is SAFE.** A per-tenant child is `fork`ed from
+/// the already-confined router (not from the UNCONFINED root, the way boot-forked instances are),
+/// so it INHERITS the router's seccomp filter before it can install its OWN nested per-instance
+/// profile. The router's derived allow-list does not list these install syscalls, so the inherited
+/// filter `EPERM`s the child's attempt to confine itself — and the node refuses closed, serving no
+/// tenant. Two symptoms, ONE cause: (1) `seccomp(2)` is `EPERM`'d, so the child cannot apply its own
+/// seccomp filter; (2) the child's Landlock ABI probe ([`linux::landlock_kernel_abi`], a
+/// `landlock_create_ruleset` version query) is `EPERM`'d and returns `-1`, which
+/// [`linux::handled_fs_abi`] maps to `ABI::Unsupported`, whose `AccessFs::from_all` is EMPTY — so
+/// `handle_access` rejects it as `empty access-right` and the child's whole FS confinement fails.
+/// Permitting these four on the router un-blocks the child's install of its own, STRICTLY TIGHTER
+/// nested sandbox. seccomp + Landlock are MONOTONIC (a child can only ADD restrictions across the
+/// inherited layers, never drop one), so allowing the install syscalls cannot be used to escape:
+/// the router's own confinement still bounds every child, and each child only narrows further.
+/// `prctl` (the `no_new_privs` precondition) is already in [`ALLOWED`], so it is not repeated here.
+const SANDBOX_INSTALL: &[&str] = &[
+    "seccomp",
+    "landlock_create_ruleset",
+    "landlock_add_rule",
+    "landlock_restrict_self",
+];
+
 /// The conservative system read roots every instance (and the monolith) needs so the process
 /// keeps working (shared-object loading, `/etc/resolv.conf` + CA bundle, `/proc`). Single
 /// source of truth for [`SandboxPolicy::for_server`] and [`SandboxDerivationInputs`].
@@ -573,7 +599,8 @@ fn holds_exec_spawn(caps: &BTreeSet<HostAuthority>) -> bool {
 /// Invariant (regression-guarded cross-platform): for the full monolith set
 /// [`HostAuthority::ALL`] this returns a SUPERSET of [`whole_process_allowlist`] (so the
 /// `all`-composition never loses a syscall the monolith needs); the ONLY extras it adds are
-/// [`EXEC_SPAWN`] + [`FORK_SPAWN`], present solely because `ALL` includes `exec.compute`.
+/// [`EXEC_SPAWN`] + [`FORK_SPAWN`] + [`SANDBOX_INSTALL`], present solely because `ALL` includes
+/// `exec.compute`.
 pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
     let gated = capability_gated_syscalls();
     let mut set: BTreeSet<String> = ALLOWED
@@ -597,6 +624,13 @@ pub fn derive_seccomp_allowlist(caps: &BTreeSet<HostAuthority>) -> Vec<String> {
         // before `execve`ing it — allow the fork family too, or the per-tenant router dies with
         // `SIGSYS` on `fork(2)` the instant it tries to cold-start a tenant. See [`FORK_SPAWN`].
         set.extend(FORK_SPAWN.iter().copied().map(str::to_string));
+        // ...and the sandbox-install syscalls: a per-tenant child is forked from THIS already-
+        // confined router, so it inherits this filter and must be able to `seccomp`/`landlock_*`
+        // its OWN nested (strictly tighter) profile over the inherited one. Without these the child
+        // is `EPERM`'d — its seccomp install fails AND its Landlock ABI probe returns `-1` →
+        // `ABI::Unsupported` → an EMPTY access set → `empty access-right`. Monotonic, so safe. See
+        // [`SANDBOX_INSTALL`].
+        set.extend(SANDBOX_INSTALL.iter().copied().map(str::to_string));
     }
     set.into_iter().collect()
 }
@@ -2060,6 +2094,13 @@ pub mod linux {
                 "execve",
                 "setns",
                 "mount",
+                // The exec.compute sandbox-install family (Fix A / [`SANDBOX_INSTALL`]): a typo'd
+                // name is silently skipped at install, so the per-tenant child would fail to confine
+                // itself and refuse closed — guard the exact names the kernel/arch must know.
+                "seccomp",
+                "landlock_create_ruleset",
+                "landlock_add_rule",
+                "landlock_restrict_self",
             ] {
                 assert!(
                     name.parse::<syscalls::Sysno>().is_ok(),
@@ -2209,6 +2250,19 @@ mod privsep_derivation_tests {
         );
         // No exec.compute ⇒ execve is NOT in the allow-list AND is KILLED.
         assert!(!has(&allow, "execve") && !has(&allow, "execveat"));
+        // ...and the sandbox-install syscalls stay DENIED: only the per-tenant router (exec.compute),
+        // which forks children that must self-confine, is granted these (Fix A is scoped).
+        for s in [
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            assert!(
+                !has(&allow, s),
+                "a non-exec.compute instance must NOT be granted the sandbox-install syscall {s}"
+            );
+        }
         let kill = derive_seccomp_killlist(&frontend());
         assert!(
             has(&kill, "execve") && has(&kill, "execveat"),
@@ -2271,6 +2325,21 @@ mod privsep_derivation_tests {
             has(&allow, "fork") && has(&allow, "vfork"),
             "the compute-supervisor must be able to fork its child before exec"
         );
+        // ...and the sandbox-install syscalls: a per-tenant child forked from this confined router
+        // inherits THIS filter and must be able to install its own nested seccomp + Landlock profile
+        // over it (else its `seccomp` install is `EPERM`'d AND its Landlock ABI probe degrades to an
+        // empty access set → `empty access-right`). Monotonic, so safe. See [`SANDBOX_INSTALL`].
+        for s in [
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            assert!(
+                has(&allow, s),
+                "the compute-supervisor must be able to install its child's nested sandbox: {s}"
+            );
+        }
         let kill = derive_seccomp_killlist(&set);
         assert!(
             !has(&kill, "execve") && !has(&kill, "execveat"),
@@ -2287,7 +2356,8 @@ mod privsep_derivation_tests {
     fn monolith_derivation_is_a_superset_of_the_phase0_allowlist() {
         // The `all` composition (design §5.5 default-monolith invariant) must never LOSE a
         // syscall the released Phase-0 monolith allow-list has; the ONLY extras it adds are the
-        // exec + fork spawn families, present solely because `all` includes exec.compute.
+        // exec + fork spawn families and the sandbox-install syscalls, present solely because `all`
+        // includes exec.compute.
         let allow: BTreeSet<String> = derive_seccomp_allowlist(&all_caps()).into_iter().collect();
         let phase0: BTreeSet<String> = whole_process_allowlist().into_iter().collect();
         assert!(
@@ -2296,13 +2366,23 @@ mod privsep_derivation_tests {
             phase0.difference(&allow).collect::<Vec<_>>()
         );
         let extra: BTreeSet<String> = allow.difference(&phase0).cloned().collect();
-        let expected: BTreeSet<String> = ["execve", "execveat", "fork", "vfork"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let expected: BTreeSet<String> = [
+            "execve",
+            "execveat",
+            "fork",
+            "vfork",
+            "seccomp",
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         assert_eq!(
             extra, expected,
-            "derive(ALL) adds exactly the exec + fork spawn families over Phase-0 (exec.compute ∈ ALL)"
+            "derive(ALL) adds exactly the exec + fork spawn families + the sandbox-install syscalls \
+             over Phase-0 (exec.compute ∈ ALL)"
         );
     }
 
