@@ -1,0 +1,40 @@
+name: Set up sccache (shared compiler cache)
+description: >-
+  Installs sccache and routes rustc through it with the GitHub Actions cache
+  backend, so every rustc compilation is cached and SHARED across jobs, feature
+  sets, and pushes. The heavy third-party closure (wasmtime, cranelift, cedar,
+  libsql, sqlx, openraft, the aws-sdk/aws-lc crates) compiles ONCE and every
+  other job / step / push substitutes it from the cache; only the workspace
+  crates that actually changed recompile — exactly the "dep layer built once,
+  shared everywhere" outcome the merge gate wants, at rustc-invocation
+  granularity (so it also absorbs the per-job AND intra-job feature churn the
+  clean+mutation gate sub-runs create, which a coarse per-feature-set dep layer
+  cannot).
+
+  Behaviour-neutral: sccache returns byte-identical artifacts to a fresh compile,
+  and a cache MISS just compiles normally — so every test, assertion, exact-count
+  grep and mutation gate runs exactly as before. This caches COMPILES, never
+  changes WHAT runs.
+
+  Requires CARGO_INCREMENTAL=0 (set workspace-wide in ci.yml `env:`), which
+  sccache needs. On a fork PR the Actions cache is read-only, so sccache pulls
+  but does not push — still a win, and never a secret dependency (mirrors the
+  cachix pull-only posture of the crane `shipped-clippy` lane).
+runs:
+  using: composite
+  steps:
+    # Installs the sccache binary and wires the GitHub Actions cache backend
+    # (ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN) into the job environment.
+    - name: Install sccache + enable the Actions cache backend
+      uses: mozilla-actions/sccache-action@v0.0.6
+
+    # Point cargo's rustc invocations at sccache for every subsequent step in the
+    # job. `$GITHUB_ENV` makes these visible to the later cargo / cargo-zigbuild
+    # steps without having to touch each one.
+    - name: Route rustc through sccache
+      shell: bash
+      run: |
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_GHA_ENABLED=true"
+        } >> "$GITHUB_ENV"

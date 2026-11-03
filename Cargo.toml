@@ -404,3 +404,13 @@ serde_yaml = "0.9"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Trim test-profile debuginfo to line tables only. Full DWARF for the test binaries
+# is dead weight in CI (the binaries are never opened in a debugger) and the main
+# codegen/link cost beyond the compile itself — `line-tables-only` keeps panic/test
+# backtraces legible (file:line) for local `cargo test` while cutting the debuginfo
+# emission. CI additionally forces `CARGO_PROFILE_TEST_DEBUG=0` in the workflow env
+# (even leaner there); this profile applies to local runs and the nix sandbox builds,
+# which do not inherit that env var.
+[profile.test]
+debug = "line-tables-only"

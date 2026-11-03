@@ -195,6 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: docs-drift
@@ -259,6 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-musl
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: helm-chart-musl
@@ -296,6 +298,7 @@ jobs:
       # gate that catches a musl-only breakage before it reaches a release tag.
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-musl
@@ -416,6 +419,7 @@ jobs:
       # Compile + run this feature-gated surface on the SHIPPED musl target.
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-server-features-musl
@@ -1593,6 +1597,7 @@ jobs:
       # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-tcp-listener-musl
@@ -1652,6 +1657,7 @@ jobs:
       # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-dns-publish-musl
@@ -1689,6 +1695,7 @@ jobs:
       # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-dns-publish-serve-wiring-musl
@@ -1750,6 +1757,7 @@ jobs:
       # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-connect-unary-musl
@@ -1794,6 +1802,7 @@ jobs:
 
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-connect-server-stream-musl
@@ -1848,6 +1857,7 @@ jobs:
 
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: live-gate-connect-client-musl
@@ -1892,6 +1902,7 @@ jobs:
       # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
       - uses: ./.github/actions/setup-musl
 
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-handlers-musl
@@ -1933,9 +1944,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-slatedb-wal-recovery-host
+      - name: Use the mold linker (faster glibc host linking)
+        shell: bash
+        run: |
+          # mold only helps the glibc HOST lanes — the musl lanes link through zig
+          # (cargo-zigbuild), which mold cannot replace. Robust: only switch the linker
+          # if the install actually succeeds.
+          if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+            echo "RUSTFLAGS=-Clink-arg=-fuse-ld=mold ${RUSTFLAGS:-}" >> "$GITHUB_ENV"
+          else
+            echo "mold install failed; continuing with the default linker"
+          fi
       - name: SlateDB tolerates a frozen empty tail WAL (the incident) on the host toolchain
         run: |
           set -eo pipefail
@@ -2194,6 +2217,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-musl
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-orm-tenancy-musl
@@ -2379,25 +2403,16 @@ jobs:
           grep -q 'MIGRATE LIBSQL PARITY OK' migrate-libsql.log \
             || { echo "::error::migrate libsql parity never reached its marker (a ledger/transactional-rollback/extension-refusal/txn-control-guard/ledger-guard/owner-DDL/baseline regression)" >&2; exit 1; }
 
-  # P0 raw-SQL OWN/SESSION confinement HARD GATE (`RAWSQL OWN-CONFINEMENT AST OK`). The raw-SQL
-  # `{scope}` marker for own/session was string-substituted with no AST check, so a guest OR-escaped
-  # it (`WHERE 1=1 OR {scope}` -> cross-tenant read+write). The fix force-injects the tenant
-  # confinement at the AST level (`boatramp_core::target_sql::rewrite_own_read`/`rewrite_own_write`)
-  # for own/session READ and WRITE, exactly as the target-read path + the ORM already do. This lane
-  # proves the fix BEHAVIORALLY on a REAL embedded libsql engine (victim tenant B's rows unchanged /
-  # not disclosed), then MUTATION-VERIFIES it: it reverts the confinement to the old escapable string
-  # marker (and to no-confinement) via `RAWSQL_CONFINE_MUTATION` and asserts the gate then FAILS
-  # (non-zero) — so a regression that re-opens the hole fails the merge. `#[ignore]`d (heavy libsql
-  # battery, like test-orm-tenancy); run unignored here on the static-musl target (exec-serialization fix).
-  test-rawsql-own-confinement:
-    name: test (raw-SQL own-confinement AST)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-rawsql-own-confinement-musl
+      # --- CI-perf consolidation: the former standalone `test-rawsql-own-confinement` job compiled the
+      # IDENTICAL `boatramp-storage --features sql` slice just to run the P0 raw-SQL OWN/SESSION
+      # confinement HARD GATE (`RAWSQL OWN-CONFINEMENT AST OK`) + its mutation-verify. The `{scope}`
+      # own/session marker was string-substituted with no AST check, so a guest OR-escaped it
+      # (`WHERE 1=1 OR {scope}` -> cross-tenant read+write); the fix force-injects the confinement at the
+      # AST level (`boatramp_core::target_sql::rewrite_own_read`/`rewrite_own_write`), mutation-verified
+      # by reverting to the old escapable string marker (RAWSQL_CONFINE_MUTATION) and asserting the gate
+      # FAILS. Folded into this job verbatim (same crate+features) so the slice compiles once; every test
+      # + assertion is preserved. `#[ignore]`d (heavy libsql battery); run unignored on the static-musl
+      # target (exec-serialization fix).
       - name: Raw-SQL own/session AST confinement on a real libsql engine
         run: |
           set -eo pipefail
@@ -2443,9 +2458,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-name-allowlist-host
+      - name: Use the mold linker (faster glibc host linking)
+        shell: bash
+        run: |
+          # mold only helps the glibc HOST lanes — the musl lanes link through zig
+          # (cargo-zigbuild), which mold cannot replace. Robust: only switch the linker
+          # if the install actually succeeds.
+          if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+            echo "RUSTFLAGS=-Clink-arg=-fuse-ld=mold ${RUSTFLAGS:-}" >> "$GITHUB_ENV"
+          else
+            echo "mold install failed; continuing with the default linker"
+          fi
       # G1–G5 + G7 in the dedicated gate binary; `--features oidc` also runs the OIDC feeder (G2c).
       - name: Name-allowlist gate (G1–G7)
         run: cargo test -p boatramp-server --features oidc --test name_allowlist_gate
@@ -2485,6 +2512,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-musl
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-wildcard-consumer-musl
@@ -2508,22 +2536,31 @@ jobs:
             messaging::tests::dead_letter_quarantines_a_claimed_message_terminally \
             messaging::tests::indexed_topics_enumerates_concrete_topics
 
-  # Stage 5a GraphQL Data Connector TARGET-tenant read isolation HARD GATE. A `@tenant(scope:
-  # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
-  # engine (compile -> SQL -> execute -> shape), returning only B's published+non-deleted rows and
-  # refusing (deny-by-default) any table with no declared public subset. The test is `#[ignore]`d
-  # (the general lane skips this heavy battery; the former static-musl libsql SIGSEGV is fixed — see
-  # test-orm-tenancy), so this lane runs it unignored on the static-musl target and asserts the
-  # success marker — a silent skip OR a target-read isolation breach fails the merge.
-  test-gdc-target:
-    name: test (GDC target-tenant read isolation)
+  # Stage 5a PLAIN-WASM + GDC target-tenant read isolation HARD GATES (CI-perf: the former standalone
+  # `test-gdc-target` job is folded in as the first step — see its comment there — because it compiled
+  # the IDENTICAL `boatramp-server --features handlers,oidc --lib` slice). The plain-wasm half is the
+  # non-federated analog of the GDC gate: a `Tenancy::Target` route's `orm` AND raw-`sql` reads must
+  # both confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql engine
+  # (HostTenancy::target → orm_scope compile+run AND sql_marker splice+run). All `#[ignore]`d (heavy
+  # libsql battery; former static-musl libsql SIGSEGV now fixed — exec-serialization), run here
+  # unignored on the static-musl target + marker-asserted, so a silent skip OR a target-read isolation
+  # breach on either binding fails the merge.
+  test-target-plain-wasm:
+    name: test (target-tenant read isolation — plain-wasm + GDC)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-musl
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-gdc-target-musl
+          key: test-target-plain-wasm-musl
+      # --- CI-perf consolidation: the former standalone `test-gdc-target` job compiled the IDENTICAL
+      # `boatramp-server --features handlers,oidc --lib` slice just to run the Stage 5a GraphQL Data
+      # Connector TARGET-tenant read-isolation gate (a `@tenant(scope: target)` read confines to tenant
+      # B's declared PUBLIC subset on a real libsql engine; deny-by-default for a table with no public
+      # subset). Folded here verbatim (same crate+features) so the slice compiles once; the test +
+      # assertions are preserved. `#[ignore]`d; run unignored on the static-musl target.
       - name: Live GraphQL target-tenant read isolation on a real libsql engine
         run: |
           set -eo pipefail
@@ -2534,22 +2571,6 @@ jobs:
             || { echo "::error::GDC target-tenant read isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GDC TARGET-TENANT ISOLATION OK' gdc-target.log \
             || { echo "::error::GDC target-tenant read never reached its success marker (a target-read isolation breach or a skipped test)" >&2; exit 1; }
-
-  # Stage 5a PLAIN-WASM target-tenant read isolation HARD GATE. The non-federated analog of
-  # test-gdc-target: a `Tenancy::Target` route's `orm` AND raw-`sql` reads must both confine to
-  # another tenant `B`'s declared PUBLIC subset on a REAL libsql engine (HostTenancy::target →
-  # orm_scope compile+run AND sql_marker splice+run). `#[ignore]`d (heavy libsql battery; former
-  # static-musl libsql SIGSEGV now fixed — exec-serialization), run here unignored on the static-musl
-  # target + marker-asserted, so a silent skip OR a target-read isolation breach on either binding fails the merge.
-  test-target-plain-wasm:
-    name: test (plain-wasm target-tenant read isolation)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-target-plain-wasm-musl
       - name: Live plain-wasm target-tenant read + write isolation on a real libsql engine
         run: |
           set -eo pipefail
@@ -2785,6 +2806,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-orm-tenancy-sqlx-host
@@ -3069,6 +3091,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-kv-sql-backend-host
@@ -3331,6 +3354,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-musl
+      - uses: ./.github/actions/setup-sccache
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-cluster-musl
