@@ -3419,10 +3419,33 @@ pub(super) struct ProjectImportQuery {
     /// the louder opt-in. Default `false`.
     #[serde(default)]
     skip_any_blob_mismatch: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): the error-tolerance policy — empty/absent ⇒ Off
+    /// (hard-fail), `all` ⇒ forgive every kind, else a comma-separated kind list
+    /// (`backend,member-mismatch`). An unknown kind is a `400` (fail-closed).
+    #[serde(default)]
+    continue_on_error: Option<String>,
+    /// Clone-robustness (PLAN-clone-robustness #3) REPAIR: a comma-separated list of TARGET blob
+    /// keys to restore EXCLUSIVELY (re-streamed from the body, nothing else applied). Absent ⇒
+    /// restore everything.
+    #[serde(default)]
+    only_blobs: Option<String>,
 }
 
 fn default_identity() -> String {
     "fresh".to_string()
+}
+
+/// Parse a comma-separated list of blob keys (the `only_blobs` query param / repair manifest keys)
+/// into the target-key set `ImportOptions::only_blobs` expects. An absent / all-empty value ⇒ `None`
+/// (restore everything). Blob keys contain `/` but never `,`, so a comma split is unambiguous.
+fn parse_only_blobs(value: Option<&str>) -> Option<std::collections::BTreeSet<String>> {
+    let set: std::collections::BTreeSet<String> = value?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
 }
 
 /// Import a `BRPROJ` bundle (the request body) into a project (`Project·Admin` on the `?project=`
@@ -3498,6 +3521,21 @@ pub(super) async fn project_import(
                 .into_response();
         }
     };
+    let continue_on_error =
+        match boatramp_core::project_export::ContinueOnError::parse(q.continue_on_error.as_deref())
+        {
+            Ok(c) => c,
+            Err(bad) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "continue_on_error: unknown error kind {bad:?} (want \
+                         backend / member-mismatch, or `all`)\n"
+                    ),
+                )
+                    .into_response();
+            }
+        };
     let opts = boatramp_core::project_export::ImportOptions {
         apply: q.apply,
         force: q.force,
@@ -3507,6 +3545,8 @@ pub(super) async fn project_import(
         enumerate_mismatches: q.enumerate_mismatches,
         skip_member_mismatch: q.skip_member_mismatch,
         skip_any_blob_mismatch: q.skip_any_blob_mismatch,
+        continue_on_error,
+        only_blobs: parse_only_blobs(q.only_blobs.as_deref()),
     };
     // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
     // resumable export) named relative to the configured base — no request body. The host
@@ -3737,6 +3777,15 @@ pub(super) struct CloneFromRequest {
     /// the louder opt-in. Default `false`.
     #[serde(default)]
     skip_any_blob_mismatch: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): the error-tolerance policy — absent/empty ⇒ Off
+    /// (hard-fail), `all` ⇒ forgive every kind, else a comma-separated kind list
+    /// (`backend,member-mismatch`). An unknown kind is a `400`.
+    #[serde(default)]
+    continue_on_error: Option<String>,
+    /// Clone-robustness (PLAN-clone-robustness #3) REPAIR: the TARGET blob keys to restore
+    /// EXCLUSIVELY (re-streamed from the source). Empty ⇒ restore everything.
+    #[serde(default)]
+    only_blobs: Vec<String>,
 }
 
 /// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
@@ -3833,6 +3882,30 @@ pub(super) async fn clone_from(
         data_only: req.data_only,
     }) as Arc<dyn CloneSourceTransport>;
 
+    let continue_on_error = match boatramp_core::project_export::ContinueOnError::parse(
+        req.continue_on_error.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(bad) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "continue_on_error: unknown error kind {bad:?} (want \
+                         backend / member-mismatch, or `all`)\n"
+                ),
+            )
+                .into_response();
+        }
+    };
+    let only_blobs = {
+        let set: std::collections::BTreeSet<String> = req
+            .only_blobs
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if set.is_empty() { None } else { Some(set) }
+    };
     orchestrate_clone(
         cap,
         target,
@@ -3846,6 +3919,8 @@ pub(super) async fn clone_from(
             enumerate: req.enumerate_mismatches,
             skip: req.skip_member_mismatch,
             skip_any_blob: req.skip_any_blob_mismatch,
+            continue_on_error,
+            only_blobs,
         },
     )
     .await
@@ -3854,7 +3929,7 @@ pub(super) async fn clone_from(
 /// The clone-robustness member-mismatch knobs (PLAN-clone-robustness #1 + #2) carried from the
 /// clone request into [`orchestrate_clone`] → the target's [`ImportOptions`]. Grouped so a future
 /// knob does not widen the already-long orchestrator signature.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct CloneMismatchPolicy {
     /// Enumerate every mismatch + fail at the end (assess scope).
     enumerate: bool,
@@ -3862,6 +3937,11 @@ struct CloneMismatchPolicy {
     skip: bool,
     /// Broaden the skip to any blob member (never a non-blob one).
     skip_any_blob: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): the error-tolerance policy (backend /
+    /// member-mismatch / all), carried into the target's `ImportOptions`.
+    continue_on_error: boatramp_core::project_export::ContinueOnError,
+    /// Clone-robustness (PLAN-clone-robustness #3) REPAIR: restore ONLY these TARGET blob keys.
+    only_blobs: Option<std::collections::BTreeSet<String>>,
 }
 
 /// How often the `--apply` / `--verify` progress stream emits a transfer heartbeat (bytes pulled +
@@ -4101,6 +4181,8 @@ async fn orchestrate_clone(
         enumerate_mismatches: mismatch.enumerate,
         skip_member_mismatch: mismatch.skip,
         skip_any_blob_mismatch: mismatch.skip_any_blob,
+        continue_on_error: mismatch.continue_on_error.clone(),
+        only_blobs: mismatch.only_blobs.clone(),
     };
     clone_progress_response(cap, target, plan, reader, opts)
 }

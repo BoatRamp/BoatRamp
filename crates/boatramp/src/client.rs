@@ -54,11 +54,11 @@ pub enum CloneOutcome {
     },
 }
 
-/// Clone-robustness member-mismatch knobs (PLAN-clone-robustness #1 + #2) shared by
+/// Clone-robustness knobs (PLAN-clone-robustness #1 + #2 + #3) shared by
 /// [`ApiClient::project_import`] and [`ApiClient::project_clone_from`] — carried to the node's
-/// import as query params (file import) / JSON (clone). All-false (the [`Default`]) is the strict,
+/// import as query params (file import) / JSON (clone). The [`Default`] (all-off) is the strict,
 /// hard-fail-the-first-mismatch behaviour.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MismatchFlags {
     /// Scan ALL members, report EVERY declared≠streamed mismatch in one pass, fail at the end.
     pub enumerate: bool,
@@ -66,6 +66,13 @@ pub struct MismatchFlags {
     pub skip: bool,
     /// Broaden `skip` to ANY blob member (never a non-blob one) — the louder opt-in.
     pub skip_any_blob: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): the raw `--continue-on-error` value — `None`
+    /// ⇒ Off, `Some("all")` ⇒ forgive every kind, `Some("backend,member-mismatch")` ⇒ a kind list.
+    /// Forwarded verbatim; the node parses it fail-closed (an unknown kind is a `400`).
+    pub continue_on_error: Option<String>,
+    /// Clone-robustness (PLAN-clone-robustness #3) REPAIR: the TARGET blob keys to restore
+    /// EXCLUSIVELY (parsed from an `--only-blobs` manifest). Empty ⇒ restore everything.
+    pub only_blobs: Vec<String>,
 }
 
 /// Resolve the API token from `BOATRAMP_TOKEN` or `publish.token`.
@@ -970,19 +977,30 @@ impl ControlPlane {
             .map_err(|e| ClientError::Refused(format!("cannot open {}: {e}", bundle.display())))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
         let bstr = |b: bool| if b { "true" } else { "false" };
+        let mut query: Vec<(&str, String)> = vec![
+            ("project", project.to_string()),
+            ("apply", bstr(apply).into()),
+            ("force", bstr(force).into()),
+            ("allow_schema_skew", bstr(allow_schema_skew).into()),
+            ("overwrite", bstr(overwrite).into()),
+            ("identity", identity.to_string()),
+            ("enumerate_mismatches", bstr(mismatch.enumerate).into()),
+            ("skip_member_mismatch", bstr(mismatch.skip).into()),
+            (
+                "skip_any_blob_mismatch",
+                bstr(mismatch.skip_any_blob).into(),
+            ),
+        ];
+        if let Some(c) = &mismatch.continue_on_error {
+            query.push(("continue_on_error", c.clone()));
+        }
+        if !mismatch.only_blobs.is_empty() {
+            // Blob keys contain `/` but never `,`, so a comma-joined list round-trips unambiguously.
+            query.push(("only_blobs", mismatch.only_blobs.join(",")));
+        }
         let mut req = client
             .post(format!("{server}/api/project-import"))
-            .query(&[
-                ("project", project),
-                ("apply", bstr(apply)),
-                ("force", bstr(force)),
-                ("allow_schema_skew", bstr(allow_schema_skew)),
-                ("overwrite", bstr(overwrite)),
-                ("identity", identity),
-                ("enumerate_mismatches", bstr(mismatch.enumerate)),
-                ("skip_member_mismatch", bstr(mismatch.skip)),
-                ("skip_any_blob_mismatch", bstr(mismatch.skip_any_blob)),
-            ])
+            .query(&query)
             .header("content-type", "application/octet-stream");
         if let Some(key) = &transport_key {
             // Secret → an HTTP header (over TLS), never a query param / command line.
@@ -1052,9 +1070,13 @@ impl ControlPlane {
             "enumerate_mismatches": mismatch.enumerate,
             "skip_member_mismatch": mismatch.skip,
             "skip_any_blob_mismatch": mismatch.skip_any_blob,
+            "only_blobs": mismatch.only_blobs,
         });
         if let Some(sp) = source_project {
             body["source_project"] = serde_json::Value::String(sp.to_string());
+        }
+        if let Some(c) = &mismatch.continue_on_error {
+            body["continue_on_error"] = serde_json::Value::String(c.clone());
         }
         let resp = client
             .post(format!("{server}/api/projects/{target}/clone/from"))
