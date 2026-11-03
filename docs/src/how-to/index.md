@@ -159,6 +159,7 @@ Backup, export, and clone are one family — pick the one that matches your goal
 
 #### Maintain & migrate
 
+- [Upgrade boatramp to a new version](./upgrade-boatramp.md) — pull the new binary/image, roll a cluster, migrate, roll back.
 - [Garbage-collect & verify integrity](./prune-scrub.md)
 - [Switch the blob backend with zero downtime](./blob-backend-migration.md)
 - [Upgrade a store to project scoping](./upgrade-store-to-projects.md)

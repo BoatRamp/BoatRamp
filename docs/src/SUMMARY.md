@@ -86,6 +86,7 @@
   - [Incremental & true-delta export](./how-to/delta-export.md)
   - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)
   - [Switch the blob backend with zero downtime](./how-to/blob-backend-migration.md)
+  - [Upgrade boatramp to a new version](./how-to/upgrade-boatramp.md)
   - [Upgrade a store to project scoping](./how-to/upgrade-store-to-projects.md)
 - [Integrations & tooling]()
   - [Enable the embedded web console](./how-to/web-console.md)

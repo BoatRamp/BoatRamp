@@ -37,6 +37,7 @@ the full menu, see the [how-to index](./index.md).
 - [Observe: logs, metrics, health, stats](./observe.md), [alert on node & system health](./node-health-alerting.md)
 - [Back up & restore](./backup.md), [export, import & clone a project](./clone-project.md)
 - [Garbage-collect & verify integrity](./prune-scrub.md)
+- [Upgrade boatramp to a new version](./upgrade-boatramp.md) — pull the new binary, roll a cluster, migrate, roll back.
 - [Rotate the root key](./rotate-root-key.md), [upgrade a store to project scoping](./upgrade-store-to-projects.md)
 
 ## 6. Scale out
