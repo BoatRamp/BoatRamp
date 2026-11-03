@@ -5,7 +5,8 @@
 The gateway reverse-proxies routes to backends you declare — a compute workload,
 a pool of servers, or a private service — with load balancing, health checks,
 and retries. You declare **upstreams** (backends) and **routes** (path →
-upstream) per site.
+upstream) per site. To proxy to a container or microVM boatramp runs, first
+[run a container or microVM](./compute.md), then point an upstream at it.
 
 ## Proxy a route to one backend
 

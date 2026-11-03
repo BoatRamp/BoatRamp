@@ -24,7 +24,7 @@ node, a self-hosted cluster, or Cloudflare Containers.
 
 ## What boatramp does
 
-| | |
+| Capability | What it does |
 | --- | --- |
 | [Static hosting](./tutorials/first-site.md) | Content-addressed blobs, atomic deploys, instant rollback. |
 | [Domains & TLS](./how-to/custom-domain.md) | Virtualhosts, ownership verification, automatic certificates. |
