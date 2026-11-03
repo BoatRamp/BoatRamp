@@ -128,7 +128,7 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
     }
 
     // --- setup: the REAL provisioning (stable owner role owns the DB). ---
-    for stmt in provision_ddl(k, DB, ROLE, ROLE_PW, OWNER, OWNER_PW) {
+    for stmt in provision_ddl(k, DB, ROLE, ROLE_PW, OWNER, OWNER_PW, false) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("provision `{stmt}`: {e}"));
@@ -142,7 +142,7 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
     // =====================================================================
     // STEP 1: mint DYN1 and prove ownership transfer to the STABLE OWNER.
     // =====================================================================
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN1, DYN1_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN1, DYN1_PW, None) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn1 `{stmt}`: {e}"));
@@ -259,7 +259,7 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
     // =====================================================================
     // STEP 3: a FRESH dynamic role has IDENTICAL access to the owner's objects.
     // =====================================================================
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN2, DYN2_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN2, DYN2_PW, None) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn2 `{stmt}`: {e}"));
@@ -299,7 +299,7 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
     // STEP 4: escape safety net — SET ROLE NONE + create as the raw role (in ONE
     //         session), then the REASSIGN-OWNED safety net still makes the drop clean.
     // =====================================================================
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN3, DYN3_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN3, DYN3_PW, None) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn3 `{stmt}`: {e}"));
@@ -398,13 +398,13 @@ async fn dynamic_cred_is_ownership_safe_on_a_real_postgres() {
     // Provision a SECOND, independent tenant on the SAME engine (the ≥2-tenant
     // fixture): its own owner-owned database + stable owner + runtime role, with
     // CONNECT revoked from PUBLIC and granted only to tenant B's own two roles.
-    for stmt in provision_ddl(k, DB_B, ROLE_B, ROLE_B_PW, OWNER_B, OWNER_B_PW) {
+    for stmt in provision_ddl(k, DB_B, ROLE_B, ROLE_B_PW, OWNER_B, OWNER_B_PW, false) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("provision tenant B `{stmt}`: {e}"));
     }
     // Mint a per-replica dynamic role bound to TENANT A (its DB + its stable owner).
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN_A, DYN_A_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN_A, DYN_A_PW, None) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn_a `{stmt}`: {e}"));

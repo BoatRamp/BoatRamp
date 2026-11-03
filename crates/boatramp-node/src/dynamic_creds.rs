@@ -59,7 +59,7 @@ use boatramp_core::sql::SqlBackend;
 use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
 use boatramp_storage::tenant_provision::{
-    drop_dynamic_role_ddl, dynamic_role_name, mint_dynamic_role_ddl, sanitize_ident,
+    RlsFencing, drop_dynamic_role_ddl, dynamic_role_name, mint_dynamic_role_ddl, sanitize_ident,
 };
 
 use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
@@ -163,6 +163,10 @@ struct DynTarget {
     owner_role: String,
     /// The per-replica dynamic role name.
     dyn_role: String,
+    /// The host-resolved **tenant** value this role is minted for (the raw tenant identity from
+    /// [`tenant_key`] — the consumer's project for `Project` scope). Baked as the role-default RLS
+    /// tenant GUC when the binding opts into container RLS fencing (`rls_session` + `tenant_guc`).
+    tenant_value: String,
     /// The KV project scope for the ephemeral credential (the consumer's project).
     cred_project: String,
     /// The KV workload key for the ephemeral credential.
@@ -213,8 +217,29 @@ fn resolve_target(
         database: names.database,
         owner_role: names.owner_role,
         dyn_role,
+        tenant_value: tenant_ident_raw,
         cred_project: consumer_project.to_string(),
         cred_workload: dynamic_cred_workload_key(compute, &tenant_ident, instance_id),
+    })
+}
+
+/// Build the opt-in container RLS **fencing** config for the mint, or `None` when the binding
+/// does not opt in — no `rls_session`, no `tenant_guc`, or a non-Postgres engine (RLS fencing is
+/// Postgres-only). Bakes ONLY the resolved tenant as a role-default GUC; the session / principal-
+/// class axes are per-request (set by the handler at request time, see
+/// [`RlsGuc`](boatramp_core::sql::RlsGuc)), not a stable role-default, so they are left unset here.
+fn rls_fencing_for(binding: &ExternalDatabaseConfig, t: &DynTarget) -> Option<RlsFencing> {
+    if !binding.rls_session || t.kind != ExternalSqlKind::Postgres {
+        return None;
+    }
+    let tenant_guc = binding.tenant_guc.clone().filter(|s| !s.is_empty())?;
+    Some(RlsFencing {
+        tenant_guc,
+        tenant_value: t.tenant_value.clone(),
+        session_guc: None,
+        session_value: None,
+        kind_guc: None,
+        kind_value: None,
     })
 }
 
@@ -290,8 +315,20 @@ pub async fn mint_dynamic_role(
     // Run the mint DDL as the superuser on the maintenance database (CREATE ROLE / GRANT /
     // ALTER ROLE SET role / GRANT CONNECT are all cluster-global or shared-object, so none
     // needs a connection to the tenant database itself).
+    // Opt-in container RLS fencing: when the binding sets `rls_session` + `tenant_guc`, bake the
+    // resolved tenant into the dynamic role as a role-default GUC so every session (incl. the ORM
+    // auto-migrate path that never sets it per-request) carries the tenant — paired with the
+    // FORCE-on-ENABLE event trigger installed at provision time. `None` ⇒ no change (default off).
+    let fencing = rls_fencing_for(binding, &t);
     let admin = superuser_backend(deploy, &creds, &t, maintenance_database(t.kind)).await?;
-    for stmt in mint_dynamic_role_ddl(t.kind, &t.database, &t.owner_role, &t.dyn_role, &dyn_pw) {
+    for stmt in mint_dynamic_role_ddl(
+        t.kind,
+        &t.database,
+        &t.owner_role,
+        &t.dyn_role,
+        &dyn_pw,
+        fencing.as_ref(),
+    ) {
         admin
             .run_script(&stmt)
             .await

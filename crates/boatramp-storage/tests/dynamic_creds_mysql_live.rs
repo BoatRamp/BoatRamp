@@ -76,7 +76,7 @@ async fn dynamic_cred_lifecycle_is_clean_on_a_real_mysql() {
         .unwrap();
 
     // === 1. mint DYN1, do DDL + DML in the tenant db ===
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN1, DYN1_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN1, DYN1_PW, None) {
         root.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn1 `{stmt}`: {e}"));
@@ -125,7 +125,7 @@ async fn dynamic_cred_lifecycle_is_clean_on_a_real_mysql() {
     );
 
     // === 4. a FRESH dynamic user has identical access to the surviving data ===
-    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN2, DYN2_PW) {
+    for stmt in mint_dynamic_role_ddl(k, DB, OWNER, DYN2, DYN2_PW, None) {
         root.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("mint dyn2 `{stmt}`: {e}"));
