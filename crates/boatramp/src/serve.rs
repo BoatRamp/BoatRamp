@@ -130,8 +130,10 @@ pub enum Error {
          dns-publish credential writes (passed to the apex-NS guardrail)"
     )]
     DnsPublishNoZoneRoot,
-    /// No certificate is available yet — the cluster leader hasn't issued one.
-    #[cfg(all(feature = "cluster", feature = "acme-dns"))]
+    /// No certificate is available yet — the cluster leader hasn't issued one (and no on-demand
+    /// engine is serving, which would front SNI issuance without a static set). Reachable from the
+    /// unified AcmeDns serve arm on single-node + cluster alike.
+    #[cfg(feature = "acme-dns")]
     #[error("no certificates available yet — awaiting the cluster leader to issue (retry shortly)")]
     NoCertsYet,
 
@@ -1890,10 +1892,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let kv_handle = kv.clone();
     // Rate-limit windows are coordination state, not config: they must NOT be
     // cached (a stale window would count wrong), so the limiter uses the
-    // *uncached* backend directly.
-    if cluster_rate_limit {
-        options.cluster_rate_limit_kv = Some(kv_backend.clone());
-    }
+    // *uncached* backend directly. Resolved here into the SharedServe
+    // `cluster_rate_limit_kv` input; `serve_assembled` sets it on `options`.
+    let cluster_rate_limit_kv: Option<Arc<dyn KvStore>> =
+        cluster_rate_limit.then(|| kv_backend.clone());
     // The dynamic daemon-config runtime, built here so SIGHUP and the shared-store
     // changelog can **wake** an immediate reload (push-driven convergence) rather
     // than relying on the runtime's backstop tick.
@@ -1968,7 +1970,6 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         &node_id,
         cp_report.as_ref(),
     ));
-    spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
         // Both authz-keyspace fences (policy + GraphQL registry) are tripped by an unreachable poll.
         let fences: Vec<Arc<boatramp_core::cache_coherence::AuthzFence>> =
@@ -2002,6 +2003,268 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             backing: kv_backend.clone(),
             fence: fence.clone(),
         });
+    // On-demand per-SNI TLS (cap-req 03) — single-node GAINS it with the forward serve-path
+    // consolidation (PLAN forward gaps 1/2/3). The STATIC cert set stays the FILESYSTEM refresh
+    // (`CertRefresh::Local`); the optional per-SNI engine is built only for `--tls acme-dns` +
+    // `[serve.on_demand_tls] enabled`, over a `KvCertStore` on the single-node control-plane `kv`
+    // (envelope-wrapped when `[secrets]` is set — cert-at-rest encryption), an always-`|| true` leader
+    // (one node), and `kv` as the ACME-account store. The engine itself is built in the shared AcmeDns
+    // serve arm (where the DNS provider is in scope) and reaches `spawn_listeners` via the deferred-
+    // listener spawn there (anti-inert — the omission that motivated this consolidation).
+    #[cfg(feature = "acme-dns")]
+    let cert_refresh = CertRefresh::Local;
+    #[cfg(feature = "acme-dns")]
+    let on_demand: Option<OnDemandBuild> = match serve_cfg.on_demand_tls.clone() {
+        Some(od_cfg) if single_node_on_demand_enabled(args.tls, Some(&od_cfg)) => {
+            let cert_envelope = build_cert_envelope(config.secrets.as_ref(), &data_dir)?;
+            let cert_store: Arc<dyn boatramp_core::cert::CertStore> = match &cert_envelope {
+                Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
+                    kv.clone(),
+                    envelope.clone(),
+                )),
+                None => Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone())),
+            };
+            Some(OnDemandBuild {
+                cfg: od_cfg,
+                cert_store,
+                is_leader: Arc::new(|| true),
+                account_kv: kv.clone(),
+                account_envelope: cert_envelope,
+            })
+        }
+        _ => None,
+    };
+
+    // MF-3 (extended) GraphQL registry fence (+ uncached backing): wired into the handler runtime
+    // AFTER assembly, inside `serve_assembled`. Multi-writer only; single-writer leaves it unchanged.
+    let registry_fence: Option<(
+        Arc<dyn KvStore>,
+        Arc<boatramp_core::cache_coherence::AuthzFence>,
+    )> = graphql_fence.map(|fence| (kv_backend.clone(), fence));
+
+    // Cloud blob-upload minter (M4): single-node wires it (the cluster path fills this in a sequenced
+    // follow-up — Stage C). Carried as a SharedServe input so the wiring is ONE code path.
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = serve_cfg
+        .s3_ingress_cloud
+        .clone()
+        .map(|cloud| CloudBlobUpload {
+            blob_args: blob_args.clone(),
+            cloud,
+            // #505: the SAME sealed base credential the blob backend uses (if any).
+            sealed_credential: sealed_s3_credential.clone(),
+            mint_max_ttl_secs: serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            mint_max_bytes: serve_cfg.s3_ingress_mint_max_bytes,
+        });
+
+    // Graceful-shutdown epilogue (single-node): the close-in-progress breadcrumb (UX C8b) + the
+    // leader-lease resign (C1), run around the shared `quiesce_and_close` in `serve_assembled`.
+    let shutdown_kv = args.kv;
+    #[cfg(feature = "slatedb")]
+    let pre_data_dir = data_dir.clone();
+    #[cfg(feature = "slatedb")]
+    let pre_slate_s3 = slate_s3.clone();
+    #[cfg(feature = "slatedb")]
+    let post_data_dir = data_dir.clone();
+    #[cfg(feature = "slatedb")]
+    let post_slate_s3 = slate_s3.clone();
+    let on_pre_close: Option<ShutdownHook> = Some(Box::new(move || {
+        Box::pin(async move {
+            #[cfg(feature = "slatedb")]
+            if shutdown_kv == boatramp_node::backends::KvBackend::Slatedb {
+                write_kv_close_breadcrumb(&pre_data_dir, pre_slate_s3.as_ref()).await;
+            }
+            #[cfg(not(feature = "slatedb"))]
+            let _ = &shutdown_kv;
+            // Resign the leader lease so a successor takes over at once (best-effort).
+            if let Some(lease) = &leader_lease {
+                lease.resign().await;
+            }
+        })
+    }));
+    let on_post_close: Option<ShutdownHookClean> = Some(Box::new(move |close_clean: bool| {
+        Box::pin(async move {
+            #[cfg(feature = "slatedb")]
+            if close_clean && shutdown_kv == boatramp_node::backends::KvBackend::Slatedb {
+                clear_kv_close_breadcrumb(&post_data_dir, post_slate_s3.as_ref()).await;
+            }
+            #[cfg(not(feature = "slatedb"))]
+            let _ = close_clean;
+        })
+    }));
+
+    // ONE shared serve tail. The single-node SUBSTRATE (local KV, self-heal, CAS-lease election,
+    // checkpoint/GC) was built above + migration/default-scope already ran; every genuine single-vs-
+    // cluster difference below is a SharedServe field, so a capability can never be wired on one serve
+    // path and silently omitted from the other.
+    serve_assembled(SharedServe {
+        addr,
+        config,
+        data_dir,
+        args,
+        options,
+        built_blobs,
+        per_project_blob_backends,
+        kv,
+        kv_handle,
+        close_deadline: kv_close_deadline,
+        is_leader: is_leader_gate,
+        node_id: 0,
+        messaging: None,
+        shared_authz,
+        cluster_rate_limit_kv,
+        deployment: boatramp_server::s3_ingress::config::Deployment::SingleNode,
+        registry_fence,
+        mesh_control_builder: None,
+        startup_blob_backend: Some(blob_args.blobs),
+        #[cfg(feature = "acme-dns")]
+        cert_refresh,
+        #[cfg(feature = "acme-dns")]
+        on_demand,
+        #[cfg(any(
+            feature = "blob-upload-aws",
+            feature = "blob-upload-gcs",
+            feature = "blob-upload-azure"
+        ))]
+        cloud_blob_upload,
+        raft_shutdown: None,
+        on_pre_close,
+        on_post_close,
+    })
+    .await
+}
+
+/// The deferred cluster mesh-control builder: `options.mesh_control` is built from the
+/// post-`configure_auth` issuer, which only exists inside [`serve_assembled`], so the cluster path
+/// hands in a builder closure over its `node` instead of a finished value.
+type MeshControlBuilder = Box<
+    dyn FnOnce(&boatramp_server::ServerOptions) -> Arc<dyn boatramp_server::MeshControl> + Send,
+>;
+/// A graceful-shutdown hook run BEFORE the shared `quiesce_and_close` (single-node: close-in-progress
+/// breadcrumb + leader-lease resign).
+type ShutdownHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+/// A graceful-shutdown hook run AFTER `quiesce_and_close`, given the clean-close flag (single-node:
+/// clear the breadcrumb on a clean close).
+type ShutdownHookClean =
+    Box<dyn FnOnce(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// The forked serve SUBSTRATE threaded into the ONE shared serve tail [`serve_assembled`]. `run` builds
+/// the single-node values (local KV, always-`|| true` leader, no messaging, filesystem cert refresh,
+/// `SingleNode`); `run_cluster` builds the cluster values (replicated KV, Raft leader + messaging,
+/// replicated cert refresh, `MultiNode`). Every genuine single-vs-cluster divergence is one of these
+/// fields — so a capability can never again be wired on one serve path and silently omitted from the
+/// other, because there is exactly ONE tail. `per_project_blob_backends` + `deployment` are carried as
+/// INPUTS so the sequenced Stage-C cluster lift populates them without re-forking the tail.
+struct SharedServe<'a> {
+    addr: SocketAddr,
+    config: &'a ServerConfig,
+    data_dir: PathBuf,
+    args: ServeArgs,
+    options: boatramp_server::ServerOptions,
+    built_blobs: boatramp_node::blobs::BuiltBlobs,
+    per_project_blob_backends: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>>,
+    kv: Arc<dyn KvStore>,
+    /// The handle used to close the store cleanly on graceful shutdown (the single-node cached `kv`
+    /// clone, or the cluster node-local durable Raft store).
+    kv_handle: Arc<dyn KvStore>,
+    close_deadline: std::time::Duration,
+    is_leader: boatramp_server::CronLeaderGate,
+    node_id: u64,
+    messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
+    shared_authz: Option<boatramp_node::auth::SharedAuthz>,
+    /// Already resolved per path: `Some(store)` ⇒ set `options.cluster_rate_limit_kv` (the uncached
+    /// single-node backend, or the replicated RaftKv); `None` ⇒ leave it unset.
+    cluster_rate_limit_kv: Option<Arc<dyn KvStore>>,
+    deployment: boatramp_server::s3_ingress::config::Deployment,
+    /// Single-node multi-writer only: wire the GraphQL registry fence (+ uncached backing) into the
+    /// handler runtime after assembly. `None` on cluster / single-writer.
+    registry_fence: Option<(
+        Arc<dyn KvStore>,
+        Arc<boatramp_core::cache_coherence::AuthzFence>,
+    )>,
+    /// Cluster only: builds `options.mesh_control` from the post-`configure_auth` issuer.
+    mesh_control_builder: Option<MeshControlBuilder>,
+    /// `Some(backend)` ⇒ the single-node "starting boatramp" startup log (naming the effective blob
+    /// backend); `None` ⇒ the cluster "serving public traffic" log.
+    startup_blob_backend: Option<BlobBackend>,
+    #[cfg(feature = "acme-dns")]
+    cert_refresh: CertRefresh,
+    #[cfg(feature = "acme-dns")]
+    on_demand: Option<OnDemandBuild>,
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    cloud_blob_upload: Option<CloudBlobUpload>,
+    /// Cluster only: shut down Raft BEFORE the store close (coordination correctness).
+    raft_shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    /// Single-node only: run BEFORE `quiesce_and_close`.
+    on_pre_close: Option<ShutdownHook>,
+    /// Single-node only: run AFTER `quiesce_and_close` with the clean-close flag.
+    on_post_close: Option<ShutdownHookClean>,
+}
+
+/// The ONE forward serve tail shared by `run` (single-node) and `run_cluster`: rate-limit KV → SIGHUP
+/// → `configure_auth` → OIDC + `enforce_auth_bind` → (cluster) mesh-control → `assemble` → registry
+/// fence → startup banner → listeners / redirect / s3-ingress → (single-node) cloud blob-upload →
+/// `match --tls` (its AcmeDns arm is the unified `serve_acme_dns`, driven by `cert_refresh` +
+/// `on_demand`) → graceful shutdown (`quiesce_and_close`, bracketed by the per-path hooks). The forked
+/// substrate (local vs Raft KV/mesh) stays in each caller; MANDATORY: cluster behavior unchanged.
+#[allow(clippy::too_many_lines)]
+async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
+    let config = s.config;
+    let data_dir = s.data_dir;
+    let args = s.args;
+    let addr = s.addr;
+    let mut options = s.options;
+    let built_blobs = s.built_blobs;
+    let per_project_blob_backends = s.per_project_blob_backends;
+    let kv = s.kv;
+    let kv_handle = s.kv_handle;
+    let close_deadline = s.close_deadline;
+    let is_leader = s.is_leader;
+    let node_id = s.node_id;
+    let messaging = s.messaging;
+    let shared_authz = s.shared_authz;
+    let cluster_rate_limit_kv = s.cluster_rate_limit_kv;
+    let deployment = s.deployment;
+    let registry_fence = s.registry_fence;
+    let mesh_control_builder = s.mesh_control_builder;
+    let startup_blob_backend = s.startup_blob_backend;
+    #[cfg(feature = "acme-dns")]
+    let cert_refresh = s.cert_refresh;
+    #[cfg(feature = "acme-dns")]
+    let on_demand = s.on_demand;
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    let cloud_blob_upload = s.cloud_blob_upload;
+    let raft_shutdown = s.raft_shutdown;
+    let on_pre_close = s.on_pre_close;
+    let on_post_close = s.on_post_close;
+
+    let serve_cfg = config.serve.clone().unwrap_or_default();
+    let storage = built_blobs.storage.clone();
+
+    // Cluster-wide rate limiting (already resolved per path to the right store).
+    if let Some(rl_kv) = cluster_rate_limit_kv {
+        options.cluster_rate_limit_kv = Some(rl_kv);
+    }
+    // SIGHUP force-reloads the daemon config (the cluster ApplyObserver already handles replicated
+    // `daemon/*` writes; this is the manual override). Both paths set `options.daemon_runtime` above.
+    spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
+    // Control-plane auth. The only per-path difference is `shared_authz` (multi-writer single-node vs
+    // `None` everywhere else), carried as a field.
     let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
         serve_cfg.auth_root_private_key.clone(),
@@ -2014,11 +2277,14 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
     boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
-    // Wire the built store + configured auth/options into a running node graph:
-    // handler runtime, deploy store, compute + domain-verify reconcile loops. This
-    // is the same assembly `boatramp serve` exercises, now a library call so an
-    // embedder / in-process test builds the identical graph (PLAN-node-library N2b.3).
-    // `_reconcile` holds the detached reconcile loops for the server's serving life.
+    // Cluster mesh control hook (`POST /api/cluster/join` + `/rotate-key`): built from the
+    // post-`configure_auth` root signer (`options.issuer`), so the cluster hands in a builder closure.
+    if let Some(build_mesh_control) = mesh_control_builder {
+        options.mesh_control = Some(build_mesh_control(&options));
+    }
+    // Node-graph assembly — the SAME `boatramp_node::assemble` both paths converge on. The cluster
+    // differences are the `NodeInput` fields (Raft messaging, Raft `is_leader`, node id, per-project
+    // blob backends).
     let boatramp_node::RunningNode {
         deploy,
         handlers,
@@ -2036,51 +2302,58 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         serve_addr: Some(addr),
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
-        // Single-node: default messaging, id 0. The leader gate is always-true for a single-writer
-        // backend (one node), or the shared CAS-lease election (C1) for a multi-writer backend — so
-        // exactly ONE of N stateless nodes runs the five leader-gated singletons.
-        messaging: None,
-        is_leader: is_leader_gate,
-        node_id: 0,
+        messaging,
+        is_leader,
+        node_id,
         // `boatramp serve` re-execs itself for compute workers (the child is boatramp).
         worker_exe: None,
     })
     .await?;
 
     // MF-3 (extended) — wire the GraphQL registry fence + uncached backing into the handler runtime
-    // so the edge/resolve registry-version read reads THROUGH the backing when it cannot confirm
-    // currency, and denies if the store is unreachable (closing the stale-`@edgeHidden` hole).
-    // Multi-writer only; single-writer leaves the registry path unchanged.
+    // (single-node multi-writer only; `None` on cluster / single-writer).
     #[cfg(feature = "handlers")]
-    if let Some(fence) = graphql_fence.clone() {
-        handlers.set_registry_fence(kv_backend.clone(), fence);
+    if let Some((backing, fence)) = registry_fence {
+        handlers.set_registry_fence(backing, fence);
+    }
+    #[cfg(not(feature = "handlers"))]
+    let _ = registry_fence;
+
+    // Startup banner (per path: the single-node line names the effective blob backend).
+    match startup_blob_backend {
+        Some(blobs) => tracing::info!(
+            blobs = ?blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
+            auth = !auth.is_disabled(), "starting boatramp"
+        ),
+        None => tracing::info!(tls = ?args.tls, "cluster: serving public traffic"),
     }
 
-    tracing::info!(
-        // Log the EFFECTIVE blob backend (`blob_args.blobs` = `[serve].blobs` overriding the flag),
-        // not the clap default `args.blobs` — the old `args.blobs` here hid a config-vs-flag mismatch
-        // (e.g. logging `Fs` while actually serving S3), which obscured a prod diagnosis.
-        blobs = ?blob_args.blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
-        auth = !auth.is_disabled(), "starting boatramp"
-    );
-    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
-    // `[serve.listeners.<name>]`, gated on the posture. Single-node. Borrows `posture` before the TLS
-    // redirect below consumes it.
+    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound). DEFERRED into the AcmeDns arm (so a
+    // listener that opts in shares the ONE on-demand engine — cap-req 03 #4); spawned here with no
+    // on-demand resolver for every other mode (and every non-acme-dns build).
+    #[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
+    let defer_listeners = matches!(args.tls, TlsMode::AcmeDns);
+    #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
+    let defer_listeners = false;
     #[cfg(feature = "tcp-listener")]
-    // Single-node serve has no on-demand engine (it is cluster-gated — see `on_demand_tls`), so
-    // listeners here serve only their own static cert.
-    spawn_listeners(&serve_cfg.listeners, &posture, &handlers, &deploy, None);
-    // In a TLS mode, optionally bind a second plain-HTTP listener that redirects
-    // to HTTPS. Ignored for `--tls off`.
+    if !defer_listeners {
+        spawn_listeners(
+            &serve_cfg.listeners,
+            &options.posture,
+            &handlers,
+            &deploy,
+            None,
+        );
+    }
+    // In a TLS mode, optionally bind a second plain-HTTP listener that redirects to HTTPS.
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off)
         && let Some(redirect_addr) = serve_cfg.http_redirect_addr
     {
-        spawn_http_redirect(redirect_addr, deploy.clone(), posture);
+        spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
     }
-    // Optionally bind the dedicated local S3-ingress listener (PLAN-blob-s3-ingress, opt-in via
-    // `[serve].s3_ingress_addr`). Single-node here, so the fail-closed multi-node guard always admits;
-    // an explicit `s3_ingress_secret_file` is honored, else an ephemeral per-process root is used.
+    // Optionally bind the dedicated local S3-ingress listener. `deployment` is the per-path field:
+    // single-node always admits (ephemeral root ok); cluster REQUIRES the cluster-uniform secret file.
     if let Some(s3_addr) = serve_cfg.s3_ingress_addr {
         spawn_s3_ingress(
             s3_addr,
@@ -2088,7 +2361,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             &auth,
             &options,
             serve_cfg.s3_ingress_secret_file.clone(),
-            boatramp_server::s3_ingress::config::Deployment::SingleNode,
+            deployment,
             #[cfg(feature = "blob-upload")]
             &handlers,
             #[cfg(feature = "blob-upload")]
@@ -2101,66 +2374,66 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
-    // Cloud brokering (M4): when the node's blob backend is a cloud object store and
-    // `[serve.s3_ingress_cloud]` is set, install a cloud `BlobUploadMinter` (used instead of the local
-    // face) so a minted credential is a native scoped STS/CAB/SAS credential the client redeems
-    // directly against the real store. Independent of the local `s3_ingress_addr` listener — a
-    // cloud-only deployment never needs it. Gated on at least one cloud minter feature being compiled.
+    // Cloud blob-upload minter (M4): single-node populates this; the cluster side is a sequenced
+    // follow-up (Stage C) that fills the SAME input — never a re-fork of this tail.
     #[cfg(any(
         feature = "blob-upload-aws",
         feature = "blob-upload-gcs",
         feature = "blob-upload-azure"
     ))]
-    if let Some(cloud) = serve_cfg.s3_ingress_cloud.clone() {
+    if let Some(cbu) = cloud_blob_upload {
         wire_cloud_blob_upload(
             &handlers,
-            &blob_args,
-            cloud,
-            // #505: the SAME sealed base credential the blob backend uses (if any) so the minter's
-            // STS/presign SDK config signs with the sealed key, not the ambient env chain.
-            sealed_s3_credential.as_ref(),
-            serve_cfg
-                .s3_ingress_mint_max_ttl_secs
-                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
-            serve_cfg.s3_ingress_mint_max_bytes,
+            &cbu.blob_args,
+            cbu.cloud,
+            cbu.sealed_credential.as_ref(),
+            cbu.mint_max_ttl_secs,
+            cbu.mint_max_bytes,
         )
         .await?;
     }
+
+    // TLS dispatch. Off/Custom/Acme/Rpk are identical on both paths; the AcmeDns arm is the ONE
+    // unified `serve_acme_dns` driven by `cert_refresh` (filesystem vs replicated static set) +
+    // `on_demand` (the per-SNI engine ingredients) — the Pair-1 consolidation, single by construction.
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
             .map_err(Error::Serve),
         TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
-        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
+        #[cfg(feature = "acme-dns")]
+        TlsMode::AcmeDns => {
+            serve_acme_dns(
+                &args,
+                addr,
+                deploy,
+                auth,
+                handlers,
+                options,
+                cert_refresh,
+                on_demand,
+                #[cfg(feature = "tcp-listener")]
+                &serve_cfg.listeners,
+            )
+            .await
+        }
+        #[cfg(not(feature = "acme-dns"))]
+        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
-    // Graceful shutdown (Part A): the serve future has returned (and has already quiesced the
-    // scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
-    // variant on its own tail). Now abort+await the reconcile loops and
-    // cleanly CLOSE the control-plane store — not a bare `flush()` (which only pushed the WAL
-    // buffer out, leaving a live store whose next crash could freeze a torn tail), but a real
-    // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
-    // open has an empty WAL replay range. Bounded by the configurable `[serve.kv] close_deadline`
-    // (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
-    // UX C8b: drop a close-in-progress breadcrumb before the close; a clean close clears it, a
-    // cut-short one (fly SIGKILL) leaves it for the next boot's WARN.
-    #[cfg(feature = "slatedb")]
-    if args.kv == boatramp_node::backends::KvBackend::Slatedb {
-        write_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
+
+    // Graceful shutdown (Part A). The single-node breadcrumb/lease epilogue and the cluster Raft
+    // shutdown are the only per-path differences; both run around the ONE `quiesce_and_close`.
+    if let Some(pre) = on_pre_close {
+        pre().await;
     }
-    // Shared-mode (C1): resign the leader lease on graceful shutdown so a successor takes over at
-    // once instead of waiting a full TTL. Best-effort; a lost race / DB blip just lets it expire.
-    if let Some(lease) = &leader_lease {
-        lease.resign().await;
+    let close_clean = quiesce_and_close(kv_handle, reconcile, raft_shutdown, close_deadline).await;
+    if let Some(post) = on_post_close {
+        post(close_clean).await;
+    } else {
+        let _ = close_clean;
     }
-    let close_clean = quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
-    #[cfg(feature = "slatedb")]
-    if close_clean && args.kv == boatramp_node::backends::KvBackend::Slatedb {
-        clear_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
-    }
-    #[cfg(not(feature = "slatedb"))]
-    let _ = close_clean;
     serve_result
 }
 
@@ -3860,7 +4133,9 @@ async fn build_mesh_write_gate(
 
 /// Build the configured secrets-at-rest envelope from `[secrets]`,
 /// resolving a Vault token from the environment. `None` ⇒ store cleartext.
-#[cfg(all(feature = "cluster", feature = "acme-dns"))]
+/// Reachable from BOTH serve paths' AcmeDns arm (single-node gained cert-at-rest encryption with the
+/// forward consolidation — PLAN forward gap #3), so it is gated on `acme-dns` alone (not `cluster`).
+#[cfg(feature = "acme-dns")]
 fn build_cert_envelope(
     secrets: Option<&crate::config::SecretsConfig>,
     data_dir: &Path,
@@ -4368,144 +4643,46 @@ async fn run_cluster(
     // no-op here and stays a documented operator step.)
     default_scope_libsql_notice(config, &data_dir, kv.as_ref()).await;
 
-    // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
-    if config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
-        options.cluster_rate_limit_kv = Some(kv.clone());
-    }
-    // SIGHUP also force-reloads the daemon config (the ApplyObserver already
-    // handles replicated `daemon/*` writes; this is the manual override).
-    spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
-    let cluster_serve_cfg = config.serve.clone().unwrap_or_default();
-    let auth = boatramp_node::auth::configure_auth(
-        cluster_serve_cfg.signer.as_ref(),
-        cluster_serve_cfg.auth_root_private_key.clone(),
-        cluster_serve_cfg.auth_root_public_key.clone(),
-        &mut options,
-        kv.clone(),
-        // Raft cluster = single-writer over a node-local store (replication keeps every node
-        // current); no shared-mode authz guard — the authz path is unchanged.
-        None,
-    )
-    .await?;
-    configure_oidc(&args, &mut options).await?;
-    // Fail-closed: don't expose an unauthenticated control plane on a public bind.
-    boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
+    // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes. Resolved here into the
+    // SharedServe `cluster_rate_limit_kv` input; `serve_assembled` sets it on `options`.
+    let cluster_rate_limit_kv: Option<Arc<dyn KvStore>> = config
+        .serve
+        .as_ref()
+        .is_some_and(|s| s.cluster_rate_limit)
+        .then(|| kv.clone());
 
-    // The mesh control hook: `POST /api/cluster/join` + `/rotate-key` reach the
-    // cluster runtime through it. Constructed after `configure_auth` so it carries
-    // the control-plane root signer (`options.issuer`) — the join flow mints
-    // root-signed member assertions with it.
-    options.mesh_control = Some(Arc::new(ClusterMeshControl {
-        node: node.clone(),
-        issuer: options.issuer.clone(),
-    }));
-    // Node-graph assembly, shared with the single-node path (`boatramp_node::assemble`):
-    // handler runtime, deploy store (+ reserved `default` project), compute + domain-
-    // verify reconcile loops. The cluster differences are threaded as `NodeInput`
-    // fields: the Raft messaging substrate, a Raft `is_leader` gate (cron firing +
-    // both reconcile loops run only on the leader), and this node's compute id.
+    // The Raft `is_leader` gate (cron firing + both reconcile loops run only on the leader).
     let leader_raft = node.raft.clone();
     let leader_node_id = node.node_id;
     let is_leader: boatramp_server::CronLeaderGate =
         Arc::new(move || boatramp_cluster::raft::is_leader(&leader_raft, leader_node_id));
-    let boatramp_node::RunningNode {
-        deploy,
-        handlers,
-        auth,
-        options,
-        reconcile,
-    } = boatramp_node::assemble(boatramp_node::NodeInput {
-        config,
-        data_dir: data_dir.as_path(),
-        storage,
-        // PLAN-per-project-blob-backend: the cluster path refused a non-empty `[serve.blob_backends]`
-        // up front (their sealed credentials need the replicated KV, unavailable at blob-build time),
-        // so there are never per-project backends here.
-        per_project_blob_backends: std::collections::HashMap::new(),
-        kv,
-        auth,
-        options,
-        serve_addr: Some(addr),
-        watch_provider: built_blobs.watch_provider.clone(),
-        provision_tier: built_blobs.provision_tier,
-        messaging: Some(node.messaging.clone()),
-        is_leader,
-        node_id: node.node_id,
-        worker_exe: None,
-    })
-    .await?;
 
-    tracing::info!(tls = ?args.tls, "cluster: serving public traffic");
-    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
-    // `[serve.listeners.<name>]`, gated on the posture. Cluster path. Borrows `options.posture` before
-    // the TLS redirect below consumes it.
-    //
-    // DEFERRAL (cap-req 03 #4): when this node serves cluster-managed ACME certs (`TlsMode::AcmeDns`)
-    // in an `acme-dns` build, the spawn is deferred into `serve_cluster_acme_dns`, which builds the one
-    // on-demand engine (DNS provider + cert store in hand) and spawns the listeners with its shared
-    // resolver — so a listener that opts into on-demand issues through the *same* engine as the edge.
-    // Every other mode (and every `not(acme-dns)` build, where the `AcmeDns` arm calls `serve_acme_dns`
-    // which does NOT spawn listeners) spawns here with no on-demand resolver.
-    #[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
-    let defer_listeners = matches!(args.tls, TlsMode::AcmeDns);
-    #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
-    let defer_listeners = false;
-    #[cfg(feature = "tcp-listener")]
-    if !defer_listeners {
-        spawn_listeners(
-            &cluster_serve_cfg.listeners,
-            &options.posture,
-            &handlers,
-            &deploy,
-            None,
-        );
-    }
-    #[cfg(feature = "tls")]
-    if !matches!(args.tls, TlsMode::Off) {
-        let redirect = config.serve.as_ref().and_then(|s| s.http_redirect_addr);
-        if let Some(redirect_addr) = redirect {
-            spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
-        }
-    }
-    // Optionally bind the dedicated local S3-ingress listener. In cluster mode the deployment is
-    // treated as MULTI-NODE — so the fail-closed guard REQUIRES an explicitly configured, cluster-
-    // uniform `s3_ingress_secret_file` (never a per-node auto-generated key, which would make
-    // credentials un-verifiable across nodes).
-    if let Some(s3_addr) = cluster_serve_cfg.s3_ingress_addr {
-        spawn_s3_ingress(
-            s3_addr,
-            deploy.clone(),
-            &auth,
-            &options,
-            cluster_serve_cfg.s3_ingress_secret_file.clone(),
-            boatramp_server::s3_ingress::config::Deployment::MultiNode,
-            #[cfg(feature = "blob-upload")]
-            &handlers,
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg.s3_ingress_public_url.clone(),
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg
-                .s3_ingress_mint_max_ttl_secs
-                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
-            #[cfg(feature = "blob-upload")]
-            cluster_serve_cfg.s3_ingress_mint_max_bytes,
-        )?;
-    }
-    let serve_result = match args.tls {
-        TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
-            .await
-            .map_err(Error::Serve),
-        TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
-        TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
-        // Raw-public-key control channel: a self-signed RPK identity the client
-        // pins — no cluster cert management needed, so it serves like single-node.
-        TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
-        // Cluster-managed certs: the leader issues + stores in the
-        // replicated control plane; every node serves the replicated cert.
-        #[cfg(feature = "acme-dns")]
-        TlsMode::AcmeDns => {
-            // Wrap replicated cert private keys at rest when `[secrets]` is set. The envelope is also
-            // reused to wrap the on-demand ACME account credentials (cap-req 03 #2).
+    // The mesh control hook (`POST /api/cluster/join` + `/rotate-key`): built from the post-
+    // `configure_auth` root signer (`options.issuer`), which only exists inside `serve_assembled`, so
+    // hand in a builder closure over this node. The join flow mints root-signed member assertions.
+    let mesh_node = node.clone();
+    let mesh_control_builder: Option<MeshControlBuilder> = Some(Box::new(
+        move |opts: &boatramp_server::ServerOptions| -> Arc<dyn boatramp_server::MeshControl> {
+            Arc::new(ClusterMeshControl {
+                node: mesh_node.clone(),
+                issuer: opts.issuer.clone(),
+            })
+        },
+    ));
+
+    // Cluster cert refresh (replicated, leader-gated) + the on-demand engine ingredients (cap-req 03).
+    // The cert store/envelope are built ONLY for `--tls acme-dns` (so a non-AcmeDns cluster with a
+    // misconfigured `[secrets.vault]` does not fail at startup); for every other mode a throwaway
+    // `KvCertStore` (no envelope read) fills the field, which the non-AcmeDns serve arm never touches.
+    #[cfg(feature = "acme-dns")]
+    let (cert_refresh, on_demand) = {
+        let cert_raft = node.raft.clone();
+        let cert_node_id = node.node_id;
+        let is_leader_certs: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id));
+        if matches!(args.tls, TlsMode::AcmeDns) {
+            // Wrap replicated cert private keys at rest when `[secrets]` is set; the envelope is reused
+            // to wrap the on-demand ACME account credentials (cap-req 03 #2).
             let cert_envelope = build_cert_envelope(config.secrets.as_ref(), &data_dir)?;
             let cert_store: Arc<dyn boatramp_core::cert::CertStore> = match &cert_envelope {
                 Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
@@ -4514,44 +4691,40 @@ async fn run_cluster(
                 )),
                 None => Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
             };
-            let cert_raft = node.raft.clone();
-            let cert_node_id = node.node_id;
-            // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. The
-            // engine is built INSIDE `serve_cluster_acme_dns` (where the ACME DNS provider is in scope,
-            // so `dns-01` on-demand works too) and held alive across the serve. The replicated KV +
-            // envelope persist the ACME account across restarts/replicas (#2).
-            let on_demand_cfg = config.serve.as_ref().and_then(|s| s.on_demand_tls.clone());
-            serve_cluster_acme_dns(
-                &args,
-                addr,
-                deploy,
-                auth,
-                handlers,
-                options,
-                cert_store,
-                move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id),
-                on_demand_cfg,
-                node.kv.clone(),
-                cert_envelope,
-                // Deferred listener spawn (cap-req 03 #4): these bind inside, with the on-demand engine.
-                #[cfg(feature = "tcp-listener")]
-                &cluster_serve_cfg.listeners,
+            let on_demand = config
+                .serve
+                .as_ref()
+                .and_then(|s| s.on_demand_tls.clone())
+                .map(|cfg| OnDemandBuild {
+                    cfg,
+                    cert_store: cert_store.clone(),
+                    is_leader: is_leader_certs.clone(),
+                    account_kv: node.kv.clone(),
+                    account_envelope: cert_envelope,
+                });
+            (
+                CertRefresh::Replicated {
+                    cert_store,
+                    is_leader: is_leader_certs,
+                },
+                on_demand,
             )
-            .await
+        } else {
+            (
+                CertRefresh::Replicated {
+                    cert_store: Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
+                    is_leader: is_leader_certs,
+                },
+                None,
+            )
         }
-        #[cfg(not(feature = "acme-dns"))]
-        TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
 
-    // Graceful shutdown (Part A, cluster): the serve future has returned (and has already quiesced
-    // the scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
-    // variant on its own tail). Abort+await the reconcile loops,
-    // THEN shut down Raft, THEN cleanly CLOSE the node-local durable Raft store. The Raft shutdown
-    // MUST precede the store close: a write/apply after the store is marked closed would lose a
-    // committed log/state entry or desync the log vs the state machine (the cluster's correctness
-    // boundary). `close()` (not the old bare `flush()`) then advances the durable frontier so the
-    // next cold open replays an empty WAL range. Bounded by the configurable `[serve.kv]
-    // close_deadline` (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
+    // Graceful shutdown (Part A, cluster): shut down Raft BEFORE the node-local durable store close —
+    // a write/apply after the store is marked closed would lose a committed log/state entry or desync
+    // the log vs the state machine (the cluster's correctness boundary). `quiesce_and_close` (inside
+    // `serve_assembled`) runs this before the close; `close()` then advances the durable frontier so
+    // the next cold open replays an empty WAL range.
     let raft = node.raft.clone();
     let raft_shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(async move {
@@ -4561,237 +4734,154 @@ async fn run_cluster(
                 tracing::info!("cluster: raft shut down on graceful stop");
             }
         });
-    quiesce_and_close(
-        durable_kv_handle,
-        reconcile,
-        Some(raft_shutdown),
-        kv_close_deadline,
-    )
-    .await;
-    serve_result
+
+    // ONE shared serve tail. The forked cluster SUBSTRATE (Raft KV/log, mesh identity + trust, join/
+    // bootstrap, key rotation) was built above + migration/default-scope already ran; every genuine
+    // cluster-vs-single-node difference below is a SharedServe field. `per_project_blob_backends`
+    // (empty today) + the cloud minter are carried as inputs the sequenced Stage-C lift fills.
+    serve_assembled(SharedServe {
+        addr,
+        config,
+        data_dir,
+        args,
+        options,
+        built_blobs,
+        // PLAN-per-project-blob-backend: the cluster path refused a non-empty `[serve.blob_backends]`
+        // up front (sealed creds need the replicated KV, unavailable at blob-build time), so there are
+        // none here yet. Carried as an INPUT the Stage-C lift populates after the replicated KV is up.
+        per_project_blob_backends: std::collections::HashMap::new(),
+        kv,
+        kv_handle: durable_kv_handle,
+        close_deadline: kv_close_deadline,
+        is_leader,
+        node_id: node.node_id,
+        messaging: Some(node.messaging.clone()),
+        // Raft cluster = single-writer over a node-local store; no shared-mode authz guard.
+        shared_authz: None,
+        cluster_rate_limit_kv,
+        deployment: boatramp_server::s3_ingress::config::Deployment::MultiNode,
+        registry_fence: None,
+        mesh_control_builder,
+        // `None` ⇒ the cluster "serving public traffic" startup log.
+        startup_blob_backend: None,
+        #[cfg(feature = "acme-dns")]
+        cert_refresh,
+        #[cfg(feature = "acme-dns")]
+        on_demand,
+        // Cloud blob-upload minter: a sequenced follow-up on the cluster path (Stage C).
+        #[cfg(any(
+            feature = "blob-upload-aws",
+            feature = "blob-upload-gcs",
+            feature = "blob-upload-azure"
+        ))]
+        cloud_blob_upload: None,
+        raft_shutdown: Some(raft_shutdown),
+        on_pre_close: None,
+        on_post_close: None,
+    })
+    .await
 }
 
-/// Serve HTTPS with **cluster-managed** ACME DNS-01 certs:
-/// the leader issues each cert (sole writer of the DNS-01 TXT — no races) and
-/// stores it in the replicated control plane; every node loads the stored cert
-/// and serves it, hot-swapping on renewal. The live CA round-trip needs
-/// live-platform validation; the store↔serve bridge + leader-gating are unit-tested
-/// (`crate::cluster_tls`).
-#[cfg(all(feature = "cluster", feature = "acme-dns"))]
-#[allow(clippy::too_many_arguments)]
-async fn serve_cluster_acme_dns(
-    args: &ServeArgs,
-    addr: SocketAddr,
-    deploy: DeployStore,
-    auth: boatramp_server::Auth,
-    handlers: boatramp_server::HandlerRuntime,
-    options: boatramp_server::ServerOptions,
+/// How the STATIC (wildcard/domain) cert set is refreshed by the unified AcmeDns serve arm — the
+/// Pair-1 consolidation seam. Used by BOTH the init pass and the 6h renewal loop.
+#[cfg(feature = "acme-dns")]
+#[derive(Clone)]
+enum CertRefresh {
+    /// Single-node: obtain + cache each cert on the local FILESYSTEM (`obtain_all`). One node, so
+    /// every pass issues directly (always the leader); the DNS-reconcile gate is `|| true`.
+    Local,
+    /// Cluster: the leader issues + stores each cert in the REPLICATED cert store; every node loads
+    /// whatever is stored (`cluster_refresh_certs`, leader-gated). A follower awaiting the leader sees
+    /// an empty set and serves nothing yet (unless on-demand fronts it); the reconcile gate is the
+    /// Raft `is_leader`.
+    #[cfg(feature = "cluster")]
+    Replicated {
+        cert_store: Arc<dyn boatramp_core::cert::CertStore>,
+        is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+    },
+}
+
+#[cfg(feature = "acme-dns")]
+impl CertRefresh {
+    /// One refresh pass over `domains`: issue (or load) the static certs, returning the `(SNI, cert)`
+    /// entries to serve. Shared by the init pass and the renewal loop.
+    async fn run(
+        &self,
+        domains: &[String],
+        base: &boatramp_acme::acme::CertRequest,
+        provider: &Arc<dyn boatramp_acme::dns::DnsProvider>,
+        cache: &Path,
+    ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
+        match self {
+            CertRefresh::Local => obtain_all(domains, base, provider.as_ref(), cache).await,
+            #[cfg(feature = "cluster")]
+            CertRefresh::Replicated {
+                cert_store,
+                is_leader,
+            } => {
+                cluster_refresh_certs(cert_store, domains, is_leader(), provider, base, cache).await
+            }
+        }
+    }
+
+    /// The leader gate for the custom-domain DNS reconcile loop: single-node is always the sole writer
+    /// (`|| true`); a cluster gates on the Raft leader so only one node ever writes a zone.
+    fn reconcile_gate(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        match self {
+            CertRefresh::Local => Arc::new(|| true),
+            #[cfg(feature = "cluster")]
+            CertRefresh::Replicated { is_leader, .. } => is_leader.clone(),
+        }
+    }
+}
+
+/// The single-node on-demand-TLS build decision (anti-inert guard). The per-SNI engine is built only
+/// for `--tls acme-dns` AND an enabled `[serve.on_demand_tls]`. Extracted so the decision that was once
+/// silently hardcoded to "never" — a `None` handed to `spawn_listeners` on the single-node path — is
+/// unit-tested and can never regress back to inert.
+#[cfg(feature = "acme-dns")]
+fn single_node_on_demand_enabled(
+    tls: TlsMode,
+    cfg: Option<&boatramp_node::config::OnDemandTlsConfig>,
+) -> bool {
+    matches!(tls, TlsMode::AcmeDns) && cfg.is_some_and(|c| c.enabled)
+}
+
+/// Whether an empty STATIC cert set is fatal for the AcmeDns serve arm: it is, UNLESS an on-demand
+/// engine is serving per-SNI issuance (then the empty static set is served purely on-demand). This
+/// preserves the cluster follower-awaiting-leader semantics (no on-demand ⇒ bail with `NoCertsYet`)
+/// while allowing a serve-purely-on-demand node.
+#[cfg(feature = "acme-dns")]
+fn no_static_certs_is_fatal(entries_empty: bool, has_on_demand: bool) -> bool {
+    entries_empty && !has_on_demand
+}
+
+/// The ingredients the unified AcmeDns serve arm needs to build the on-demand per-SNI engine (cap-req
+/// 03) where the DNS provider is in scope. Single-node: a `KvCertStore` over the control-plane `kv` +
+/// an always-`|| true` leader; cluster: the replicated cert store + the Raft leader (the SAME
+/// `cert_store`/`is_leader` the `Replicated` refresh uses). `None` ⇒ no on-demand issuance.
+#[cfg(feature = "acme-dns")]
+struct OnDemandBuild {
+    cfg: boatramp_node::config::OnDemandTlsConfig,
     cert_store: Arc<dyn boatramp_core::cert::CertStore>,
-    is_leader: impl Fn() -> bool + Send + Sync + Clone + 'static,
-    on_demand_cfg: Option<boatramp_node::config::OnDemandTlsConfig>,
+    is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
     account_kv: Arc<dyn boatramp_core::kv::KvStore>,
     account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
-    // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
-    // the on-demand engine built below. Spawned once the resolver exists.
-    #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
-        String,
-        boatramp_node::config::ListenerConfig,
-    >,
-) -> Result<()> {
-    use boatramp_acme::acme::CertRequest;
-    use std::time::Duration;
+}
 
-    if args.acme_domain.is_empty() {
-        return Err(Error::NoAcmeDomainDns);
-    }
-    install_crypto_provider();
-
-    let kind = parse_dns_provider(&args.acme_dns_provider)?;
-    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
-        crate::acme_dns::build_provider(kind).await?.into();
-    // On-demand per-SNI issuance (cap-req 03): build the engine here, where the ACME DNS provider is
-    // in hand (so a `dns-01` challenge works), with the #02 allowlist (`deploy`), the replicated cert
-    // store, and the leader gate. `on_demand_engine` is held for the whole serve; `on_demand` is its
-    // resolver, composed with the static wildcard resolver at every config (re)build below.
-    let on_demand_engine: Option<Arc<crate::on_demand_tls::OnDemandTls>> = on_demand_cfg
-        .and_then(|cfg| {
-            crate::on_demand_tls::from_serve_config(
-                &cfg,
-                deploy.clone(),
-                cert_store.clone(),
-                Arc::new(is_leader.clone()),
-                Some(provider.clone()),
-                account_kv.clone(),
-                account_envelope.clone(),
-                args.acme_ca_cert.clone(),
-            )
-        })
-        .map(Arc::new);
-    // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
-    // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
-    let on_demand = on_demand_engine.as_ref().map(|e| e.resolver());
-    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists, bind the
-    // host-owned inbound-TCP listeners sharing it — a listener that opts in issues per-SNI through
-    // this same engine (one budget, one certreq single-flight). `on_demand.clone()` is `None` when
-    // on-demand TLS is disabled, so listeners then serve only their own static cert, exactly as the
-    // non-AcmeDns path would. (Spawned below, after the edge-cert readiness guard, so a node that bails
-    // with `NoCertsYet` never briefly binds listeners.)
-    let base = CertRequest {
-        directory_url: args.acme_directory.clone(),
-        contact_email: args.acme_contact.clone(),
-        domains: Vec::new(),
-        dns_ttl: 60,
-        propagation_wait: Duration::from_secs(args.acme_propagation_wait_secs),
-        propagation_poll_interval: Duration::from_secs(args.acme_propagation_poll_interval_secs),
-        timeout: Duration::from_secs(120),
-        extra_root_ca: args.acme_ca_cert.clone(),
-    };
-    let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
-    let cache = args.acme_cache.clone();
-
-    // Initial pass: the leader issues any missing cert + stores it; all nodes
-    // load whatever is in the replicated store.
-    let entries =
-        cluster_refresh_certs(&cert_store, &domains, is_leader(), &provider, &base, &cache).await?;
-    if entries.is_empty() {
-        return Err(Error::NoCertsYet);
-    }
-    // Deferred listener spawn (cap-req 03 #4): the on-demand resolver exists and the edge cert is
-    // ready, so bind the host-owned inbound-TCP listeners sharing that resolver — a listener that opts
-    // in issues per-SNI through this same engine (one budget, one certreq single-flight). `on_demand`
-    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
-    // exactly as the non-AcmeDns path would. Done before `options`/`handlers`/`deploy` are consumed by
-    // the serve below.
-    #[cfg(feature = "tcp-listener")]
-    spawn_listeners(
-        listeners,
-        &options.posture,
-        &handlers,
-        &deploy,
-        on_demand_engine.clone(),
-    );
-    // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same
-    // ACME certs (build_server_configs gives a `h3`-ALPN config off one resolver);
-    // its cert is hot-swapped on renewal below, exactly as the TCP path reloads.
-    // When on-demand TLS is enabled, the config composes the static wildcard certs with the
-    // per-SNI on-demand resolver (cap-req 03); otherwise it is the static resolver alone (unchanged).
-    #[cfg(feature = "http3")]
-    let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) = crate::acme_dns::build_server_configs_maybe(entries, on_demand.clone())?;
-        let endpoint =
-            boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
-        (tcp, Some(endpoint))
-    } else {
-        (
-            crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?,
-            None,
-        )
-    };
-    #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?;
-    let tls = boatramp_server::ReloadableTls::new(config);
-
-    // Background renewal: re-run the leader-gated pass and hot-swap (TCP + h3).
-    {
-        let (tls, cert_store, provider, base, cache, domains, is_leader, on_demand) = (
-            tls.clone(),
-            cert_store.clone(),
-            provider.clone(),
-            base.clone(),
-            cache.clone(),
-            domains.clone(),
-            is_leader.clone(),
-            on_demand.clone(),
-        );
-        #[cfg(feature = "http3")]
-        let h3_renew = h3_endpoint.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                match cluster_refresh_certs(
-                    &cert_store,
-                    &domains,
-                    is_leader(),
-                    &provider,
-                    &base,
-                    &cache,
-                )
-                .await
-                {
-                    Ok(entries) if !entries.is_empty() => {
-                        #[cfg(feature = "http3")]
-                        if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs_maybe(
-                                entries,
-                                on_demand.clone(),
-                            ) {
-                                Ok((tcp, h3)) => {
-                                    tls.reload(tcp);
-                                    match boatramp_server::quinn_server_config(h3) {
-                                        Ok(qc) => endpoint.set_server_config(Some(qc)),
-                                        Err(err) => {
-                                            tracing::error!(%err, "cluster acme-dns: rebuilding h3 config failed");
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                                }
-                            }
-                        } else {
-                            match crate::acme_dns::build_server_config_maybe(
-                                entries,
-                                on_demand.clone(),
-                            ) {
-                                Ok(config) => tls.reload(config),
-                                Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                                }
-                            }
-                        }
-                        #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())
-                        {
-                            Ok(config) => tls.reload(config),
-                            Err(err) => {
-                                tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
-                            }
-                        }
-                    }
-                    Ok(_) => {} // nothing stored yet (follower awaiting the leader)
-                    Err(err) => tracing::error!(%err, "cluster acme-dns: renewal failed"),
-                }
-            }
-        });
-    }
-
-    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
-    // "unwired core": `plan_reconcile` existed with zero live callers). Leader-gated
-    // with the SAME `is_leader` + provider as the cert renewal above, so only the
-    // Raft leader ever writes a zone — no split-brain double-writes. Opt-in via
-    // `--dns-target`; unset leaves this inert and `dns configure-domain` remains the
-    // manual, one-shot path.
-    if let Some(target) = args.dns_target.as_deref() {
-        crate::acme_dns::spawn_dns_reconcile(
-            deploy.clone(),
-            provider.clone(),
-            args.acme_dns_provider.clone(),
-            crate::dns::parse_target(target),
-            args.dns_reconcile_ttl,
-            is_leader.clone(),
-            Duration::from_secs(args.dns_reconcile_tick_secs),
-        );
-    }
-
-    tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
-    serve_router_over_tls(
-        addr,
-        tls,
-        (deploy, auth, handlers, options),
-        #[cfg(feature = "http3")]
-        h3_endpoint,
-    )
-    .await
+/// The cloud blob-upload minter wiring (M4), carried as a SharedServe input so the single-node path
+/// (today) and the sequenced cluster lift (Stage C) share ONE wiring site in `serve_assembled`.
+#[cfg(any(
+    feature = "blob-upload-aws",
+    feature = "blob-upload-gcs",
+    feature = "blob-upload-azure"
+))]
+struct CloudBlobUpload {
+    blob_args: BlobArgs,
+    cloud: boatramp_node::config::S3IngressCloud,
+    sealed_credential: Option<boatramp_node::s3_credential::SealedS3Credential>,
+    mint_max_ttl_secs: u64,
+    mint_max_bytes: Option<u64>,
 }
 
 /// One leader-gated refresh pass: per domain, the leader issues (live CA, via
@@ -4845,12 +4935,16 @@ pub(crate) fn parse_dns_provider(value: &str) -> Result<crate::acme_dns::DnsProv
         .map_err(|_| Error::UnknownDnsProvider(value.to_string()))
 }
 
-/// Serve HTTPS with ACME **DNS-01** certificates (wildcards included). Obtains
-/// each `--acme-domain` (and, with `--acme-wildcard-preview`, its
-/// `*.deploy.<domain>`) via the configured DNS provider, serves them by SNI,
-/// and renews in the background. The live CA + DNS round-trip is the
+/// Serve HTTPS with ACME **DNS-01** certificates (wildcards included) — the ONE handler for single-
+/// node AND cluster (the Pair-1 consolidation of the old `serve_acme_dns` + `serve_cluster_acme_dns`).
+/// Obtains each `--acme-domain` (and, with `--acme-wildcard-preview`, its `*.deploy.<domain>`) via the
+/// configured DNS provider, serves them by SNI, renews in the background, and — when `on_demand` is set
+/// — fronts per-SNI on-demand issuance (cap-req 03) through ONE shared engine (edge resolver + opted-in
+/// listeners). `cert_refresh` drives the static set: `Local` on single-node (filesystem `obtain_all`),
+/// `Replicated` on a cluster (the leader-gated replicated store). The live CA + DNS round-trip is the
 /// integration seam (validated against a Pebble/staging directory + real zone).
 #[cfg(feature = "acme-dns")]
+#[allow(clippy::too_many_arguments)]
 async fn serve_acme_dns(
     args: &ServeArgs,
     addr: SocketAddr,
@@ -4858,10 +4952,17 @@ async fn serve_acme_dns(
     auth: boatramp_server::Auth,
     handlers: boatramp_server::HandlerRuntime,
     options: boatramp_server::ServerOptions,
+    cert_refresh: CertRefresh,
+    on_demand: Option<OnDemandBuild>,
+    // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
+    // the on-demand engine built below. Spawned once the resolver exists.
+    #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
+        String,
+        boatramp_node::config::ListenerConfig,
+    >,
 ) -> Result<()> {
-    use std::time::Duration;
-
     use boatramp_acme::acme::CertRequest;
+    use std::time::Duration;
 
     if args.acme_domain.is_empty() {
         return Err(Error::NoAcmeDomainDns);
@@ -4869,7 +4970,30 @@ async fn serve_acme_dns(
     install_crypto_provider();
 
     let kind = parse_dns_provider(&args.acme_dns_provider)?;
-    let provider = crate::acme_dns::build_provider(kind).await?;
+    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
+        crate::acme_dns::build_provider(kind).await?.into();
+    // On-demand per-SNI issuance (cap-req 03): build the engine HERE, where the ACME DNS provider is in
+    // hand (so a `dns-01` challenge works), from the ingredients the serve path chose (single-node: a
+    // KvCertStore over the local kv + an always-`|| true` leader; cluster: the replicated store + the
+    // Raft leader). `on_demand_engine` is held for the whole serve; `on_demand_resolver` is its edge
+    // resolver, composed with the static resolver at every config (re)build below.
+    let on_demand_engine: Option<Arc<crate::on_demand_tls::OnDemandTls>> = on_demand
+        .and_then(|od| {
+            crate::on_demand_tls::from_serve_config(
+                &od.cfg,
+                deploy.clone(),
+                od.cert_store,
+                od.is_leader,
+                Some(provider.clone()),
+                od.account_kv,
+                od.account_envelope,
+                args.acme_ca_cert.clone(),
+            )
+        })
+        .map(Arc::new);
+    // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
+    // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
+    let on_demand_resolver = on_demand_engine.as_ref().map(|e| e.resolver());
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),
@@ -4881,40 +5005,73 @@ async fn serve_acme_dns(
         extra_root_ca: args.acme_ca_cert.clone(),
     };
     let domains = crate::acme_dns::server_domains(&args.acme_domain, args.acme_wildcard_preview);
+    let cache = args.acme_cache.clone();
 
-    // Obtain (or load cached) certs for every domain up front.
-    let entries = obtain_all(&domains, &base, provider.as_ref(), &args.acme_cache).await?;
-    // HTTP/3: a QUIC endpoint sharing the same ACME certs, hot-swapped on
-    // renewal below.
+    // Initial pass: obtain/load the static set (cluster: the leader issues + stores; every node loads).
+    let entries = cert_refresh.run(&domains, &base, &provider, &cache).await?;
+    // An empty static set with NO on-demand engine means there is nothing to serve yet — the cluster
+    // follower "awaiting the leader to issue" semantics (preserved). With an on-demand engine, serve
+    // purely on-demand (per-SNI issuance fronts the empty static set).
+    if no_static_certs_is_fatal(entries.is_empty(), on_demand_engine.is_some()) {
+        return Err(Error::NoCertsYet);
+    }
+    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists and the edge cert
+    // is ready, bind the host-owned inbound-TCP listeners sharing that engine — a listener that opts in
+    // issues per-SNI through this SAME engine (one budget, one certreq single-flight). `on_demand_engine`
+    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
+    // exactly as the non-AcmeDns path would.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(
+        listeners,
+        &options.posture,
+        &handlers,
+        &deploy,
+        on_demand_engine.clone(),
+    );
+    // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same certs (hot-swapped on renewal
+    // below). When on-demand TLS is enabled, the config composes the static certs with the per-SNI
+    // on-demand resolver (cap-req 03); otherwise it is the static resolver alone (`_maybe(_, None)`).
     #[cfg(feature = "http3")]
     let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) = crate::acme_dns::build_server_configs(entries)?;
+        let (tcp, h3) =
+            crate::acme_dns::build_server_configs_maybe(entries, on_demand_resolver.clone())?;
         let endpoint =
             boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
         (tcp, Some(endpoint))
     } else {
-        (crate::acme_dns::build_server_config(entries)?, None)
+        (
+            crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?,
+            None,
+        )
     };
     #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config(entries)?;
+    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?;
     let tls = boatramp_server::ReloadableTls::new(config);
 
-    // Background renewal: re-load (reissuing any near-expiry cert) and hot-swap
-    // the served config (TCP + h3), so the process never needs a restart to renew.
+    // Background renewal: re-run the refresh pass and hot-swap the served config (TCP + h3).
     {
-        let (tls, base, cache) = (tls.clone(), base.clone(), args.acme_cache.clone());
-        let domains = domains.clone();
-        let provider = crate::acme_dns::build_provider(kind).await?;
+        let (tls, provider, base, cache, domains, on_demand_resolver, renew_refresh) = (
+            tls.clone(),
+            provider.clone(),
+            base.clone(),
+            cache.clone(),
+            domains.clone(),
+            on_demand_resolver.clone(),
+            cert_refresh.clone(),
+        );
         #[cfg(feature = "http3")]
         let h3_renew = h3_endpoint.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                match obtain_all(&domains, &base, provider.as_ref(), &cache).await {
-                    Ok(entries) => {
+                match renew_refresh.run(&domains, &base, &provider, &cache).await {
+                    Ok(entries) if !entries.is_empty() => {
                         #[cfg(feature = "http3")]
                         if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs(entries) {
+                            match crate::acme_dns::build_server_configs_maybe(
+                                entries,
+                                on_demand_resolver.clone(),
+                            ) {
                                 Ok((tcp, h3)) => {
                                     tls.reload(tcp);
                                     match boatramp_server::quinn_server_config(h3) {
@@ -4929,7 +5086,10 @@ async fn serve_acme_dns(
                                 }
                             }
                         } else {
-                            match crate::acme_dns::build_server_config(entries) {
+                            match crate::acme_dns::build_server_config_maybe(
+                                entries,
+                                on_demand_resolver.clone(),
+                            ) {
                                 Ok(config) => tls.reload(config),
                                 Err(err) => {
                                     tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
@@ -4937,35 +5097,36 @@ async fn serve_acme_dns(
                             }
                         }
                         #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config(entries) {
+                        match crate::acme_dns::build_server_config_maybe(
+                            entries,
+                            on_demand_resolver.clone(),
+                        ) {
                             Ok(config) => tls.reload(config),
                             Err(err) => {
                                 tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                             }
                         }
                     }
+                    Ok(_) => {} // nothing stored yet (cluster follower awaiting the leader)
                     Err(err) => tracing::error!(%err, "acme-dns: renewal failed"),
                 }
             }
         });
     }
 
-    // Custom-domain DNS reconcile (capability #24 Stage 6 — the roadmap triage's
-    // "unwired core": `plan_reconcile` existed with zero live callers). Single-node
-    // is always the sole writer (no cluster, no leader lease to race), so the gate
-    // here is simply `|| true` — the same shape `serve_cluster_acme_dns` gates on its
-    // real `is_leader`. Opt-in via `--dns-target`; unset leaves this inert and `dns
-    // configure-domain` remains the manual, one-shot path.
+    // Custom-domain DNS reconcile (capability #24 Stage 6): leader-gated with the SAME gate the cert
+    // refresh uses (single-node `|| true`; cluster the Raft leader) so only one node ever writes a
+    // zone — no split-brain double-writes. Opt-in via `--dns-target`; unset leaves this inert and
+    // `dns configure-domain` remains the manual, one-shot path.
     if let Some(target) = args.dns_target.as_deref() {
-        let dns_provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
-            crate::acme_dns::build_provider(kind).await?.into();
+        let gate = cert_refresh.reconcile_gate();
         crate::acme_dns::spawn_dns_reconcile(
             deploy.clone(),
-            dns_provider,
+            provider.clone(),
             args.acme_dns_provider.clone(),
             crate::dns::parse_target(target),
             args.dns_reconcile_ttl,
-            || true,
+            move || gate(),
             Duration::from_secs(args.dns_reconcile_tick_secs),
         );
     }
@@ -5109,7 +5270,8 @@ async fn serve_router_over_tls(
         (app, fast)
     };
     let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await;
+        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
+            .await;
     // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
     // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
     // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
@@ -5422,6 +5584,90 @@ mod tests {
         SqlKvConfig {
             kind: kind.to_string(),
             ..Default::default()
+        }
+    }
+
+    /// Forward serve-path consolidation (PLAN Stage AB2): the decision guards + `CertRefresh`.
+    #[cfg(feature = "acme-dns")]
+    mod consolidation {
+        use super::super::{
+            CertRefresh, TlsMode, no_static_certs_is_fatal, single_node_on_demand_enabled,
+        };
+        use boatramp_node::config::OnDemandTlsConfig;
+
+        fn od(enabled: bool) -> OnDemandTlsConfig {
+            OnDemandTlsConfig {
+                enabled,
+                ..Default::default()
+            }
+        }
+
+        /// ANTI-INERT guard: single-node MUST build the on-demand engine for `--tls acme-dns` + an
+        /// enabled `[serve.on_demand_tls]` (the omission that produced the inert `None` to
+        /// `spawn_listeners`), and MUST NOT otherwise.
+        #[test]
+        fn single_node_on_demand_decision() {
+            assert!(
+                single_node_on_demand_enabled(TlsMode::AcmeDns, Some(&od(true))),
+                "acme-dns + enabled ⇒ engine is built (not inert None)"
+            );
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::AcmeDns,
+                Some(&od(false))
+            ));
+            assert!(!single_node_on_demand_enabled(TlsMode::AcmeDns, None));
+            // A non-acme-dns TLS mode never builds the on-demand engine.
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::Off,
+                Some(&od(true))
+            ));
+            assert!(!single_node_on_demand_enabled(
+                TlsMode::Custom,
+                Some(&od(true))
+            ));
+        }
+
+        /// An empty static cert set is fatal ONLY without an on-demand engine (preserving the cluster
+        /// follower-awaiting-leader `NoCertsYet`); with on-demand, serve purely on-demand.
+        #[test]
+        fn empty_static_set_fatal_only_without_on_demand() {
+            assert!(
+                no_static_certs_is_fatal(true, false),
+                "empty + no on-demand ⇒ NoCertsYet (follower awaiting leader)"
+            );
+            assert!(
+                !no_static_certs_is_fatal(true, true),
+                "empty + on-demand ⇒ serve purely on-demand (not fatal)"
+            );
+            assert!(!no_static_certs_is_fatal(false, false));
+            assert!(!no_static_certs_is_fatal(false, true));
+        }
+
+        /// `CertRefresh::Local` (single-node) is always the sole writer, so its DNS-reconcile gate is
+        /// unconditionally `true`.
+        #[test]
+        fn local_reconcile_gate_is_always_leader() {
+            assert!(CertRefresh::Local.reconcile_gate()());
+        }
+
+        /// `CertRefresh::Replicated` (cluster) reflects the Raft `is_leader` through its reconcile gate.
+        #[cfg(feature = "cluster")]
+        #[test]
+        fn replicated_reconcile_gate_tracks_is_leader() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let leader = Arc::new(AtomicBool::new(false));
+            let seen = leader.clone();
+            let refresh = CertRefresh::Replicated {
+                cert_store: Arc::new(boatramp_core::cert::KvCertStore::new(Arc::new(
+                    boatramp_core::kv::MemoryKv::new(),
+                ))),
+                is_leader: Arc::new(move || seen.load(Ordering::SeqCst)),
+            };
+            let gate = refresh.reconcile_gate();
+            assert!(!gate(), "follower: not the writer");
+            leader.store(true, Ordering::SeqCst);
+            assert!(gate(), "leader: the reconcile gate tracks is_leader");
         }
     }
 

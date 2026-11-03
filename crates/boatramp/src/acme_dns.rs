@@ -872,6 +872,27 @@ mod tests {
         );
     }
 
+    /// Forward serve-path consolidation (PLAN §4): `build_server_config_maybe` must build a VALID
+    /// resolver-only config from an EMPTY static entry set + `Some(on_demand_resolver)` — the
+    /// serve-purely-on-demand case a single-node node (or a cluster follower awaiting the leader) uses
+    /// when the static set is empty but on-demand issuance fronts it. (`None` is the unchanged static
+    /// path, already covered by `build_server_configs_sets_h3_alpn`.)
+    #[cfg(feature = "acme-dns")]
+    #[test]
+    fn maybe_empty_entries_with_on_demand_builds_resolver_only_config() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let resolver = std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(
+            std::sync::Arc::new(crate::on_demand_tls::CertCache::default()),
+        ));
+        // EMPTY static entries + an on-demand resolver ⇒ a valid composite config (serves on-demand).
+        let cfg = build_server_config_maybe(Vec::new(), Some(resolver)).expect("valid config");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "the resolver-only config still advertises the serving ALPN"
+        );
+    }
+
     #[test]
     fn wildcard_matches_one_label_only() {
         assert!(sni_matches(
