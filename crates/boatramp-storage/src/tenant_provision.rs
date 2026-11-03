@@ -265,10 +265,18 @@ pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
 /// or the database name even when the cosmetic marker is truncated for a long tenant.
 ///
 /// This is the non-superuser role that **owns the tenant's schema objects** and runs
-/// schema migrations (owner-authority DDL), kept separate from the runtime login role
-/// so the runtime role stays a non-owner and row-level security is still enforced
-/// against it, and separate from the cluster superuser so a migration can never reach
-/// beyond this tenant's own database (the superuser only ever provisions the shells).
+/// schema migrations (owner-authority DDL), kept separate from the cluster superuser so a
+/// migration can never reach beyond this tenant's own database (the superuser only ever
+/// provisions the shells).
+///
+/// Phase-2 posture note: the per-replica DYNAMIC runtime role is a member of THIS owner and
+/// connects with `SET role = <owner>` (see [`mint_dynamic_role_ddl`]), so at RUNTIME the
+/// session operates AS this owner. That is deliberate — it is how an ORM can auto-migrate on
+/// its single DSN without orphaning object ownership across replica rotation. The consequence
+/// is that the runtime session has the owner's DDL authority, and that PostgreSQL does NOT
+/// enforce a table's `ENABLE ROW LEVEL SECURITY` policies against that table's owner — a
+/// managed tenant table needs `FORCE ROW LEVEL SECURITY` for RLS to bind the runtime. (This
+/// corrects an earlier claim here that the runtime stayed a non-owner with RLS enforced.)
 pub fn tenant_owner_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident_capped(&format!("{base}_{tenant_ident}_owner"), MAX_ROLE_IDENT_LEN)
 }
@@ -311,12 +319,38 @@ pub fn quote_ident(kind: ExternalSqlKind, id: &str) -> String {
     }
 }
 
-/// Quote a SQL **string literal** (single-quoted, doubling any embedded `'`).
+/// Quote a SQL **string literal**, doubling any embedded `'` AND making it
+/// **backslash-safe** per engine.
 ///
-/// Used for the password and for the role-name literal in Postgres's
-/// `pg_roles` existence check. Same single-quote convention on both engines.
-fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+/// Used for passwords (minted hex, but also a BYO operator secret via
+/// [`ensure_login_role_ddl`]) and for the role-name literal in Postgres's `pg_roles`
+/// existence check. A doubled `'` alone is NOT enough on every engine: MySQL (default
+/// `sql_mode`) treats `\` as an escape *inside* a `'…'` literal, so a value ending in a
+/// lone backslash (`p\`) would turn our closing quote into an escaped one and break out —
+/// an injection vector for any non-hex literal. We therefore quote defensively for both:
+///
+/// * **MySQL** — double both `\` → `\\` and `'` → `''` inside a plain `'…'` literal.
+/// * **Postgres** — with `standard_conforming_strings` (the default) a backslash is an
+///   ordinary character, so a backslash-FREE literal (every minted/hex/sanitized value)
+///   keeps the exact plain `'…'` form it always had (no behavior change, no corruption).
+///   A literal that *does* carry a backslash (only a BYO secret can) is emitted as an
+///   `E'…'` escape string doubling both `\` and `'`, so it is interpreted deterministically
+///   even on a server with `standard_conforming_strings` off.
+///
+/// Replace `\` before `'` so neither pass can reintroduce the other's metacharacter.
+fn quote_literal(kind: ExternalSqlKind, s: &str) -> String {
+    match kind {
+        ExternalSqlKind::Mysql => {
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+        }
+        ExternalSqlKind::Postgres => {
+            if s.contains('\\') {
+                format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+            } else {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+        }
+    }
 }
 
 /// For MySQL, a user is `'name'@'host'`. We always scope to `@'%'` (any host);
@@ -324,7 +358,140 @@ fn quote_literal(s: &str) -> String {
 /// reachable). The name goes through [`quote_literal`] (single-quoted) because
 /// MySQL account names are string-literal-quoted, not identifier-quoted.
 fn mysql_user(role: &str) -> String {
-    format!("{}@'%'", quote_literal(role))
+    format!("{}@'%'", quote_literal(ExternalSqlKind::Mysql, role))
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in **container RLS fencing** (v0.53.0) — Postgres only.
+// ---------------------------------------------------------------------------
+
+/// Opt-in **container RLS fencing** configuration, threaded into the Postgres credential DDL
+/// builders when a managed-DB binding sets `rls_session` + a `tenant_guc`.
+///
+/// # Why
+///
+/// A managed-DB container's runtime DSN connects as a per-replica **dynamic role** that
+/// `SET role = <owner>`s (operate-as-owner, so one DSN can auto-migrate). PostgreSQL does **not**
+/// enforce a table's plain `ENABLE ROW LEVEL SECURITY` against the table's OWNER — only `FORCE ROW
+/// LEVEL SECURITY` binds the owner. So a tenant app's plain-RLS tables would be silently
+/// un-enforced under managed creds. RLS fencing closes that gap in two coordinated pieces, both
+/// opt-in and both Postgres-only:
+///
+/// 1. **This struct → [`mint_dynamic_role_ddl`]** bakes the host-resolved tenant (and, if the
+///    operator configured them, the session / principal-class axes) into the dynamic role as a
+///    **role-default GUC** (`ALTER ROLE <dyn> SET "<guc>" = '<value>'`), so every session of the
+///    operate-as-owner role carries the tenant even on a connection that does not set it
+///    per-request (the ORM auto-migrate path, any raw connection).
+/// 2. **[`force_rls_event_trigger_ddl`] → [`provision_ddl`]** installs a surgical event trigger
+///    that upgrades a table whose owner opted into plain `ENABLE ROW LEVEL SECURITY` to `FORCE ROW
+///    LEVEL SECURITY`, so RLS binds the owner the operate-as-owner role acts as.
+///
+/// Default **off**: a binding WITHOUT `rls_session` (+ `tenant_guc`) gets NEITHER, and the emitted
+/// DDL is byte-identical to the pre-feature output.
+///
+/// Every value here is operator/host-derived (never guest input — the guest can never set these
+/// GUCs, [`RlsGuc`](boatramp_core::sql::RlsGuc)), but each is still quoted defensively regardless:
+/// the GUC name as an identifier ([`quote_ident`]), the value as a string literal
+/// ([`quote_literal`]).
+#[derive(Debug, Clone)]
+pub struct RlsFencing {
+    /// The operator-configured **tenant** GUC name (e.g. `app.tenant_id`) baked as a role-default.
+    pub tenant_guc: String,
+    /// The host-resolved **tenant** value baked into [`Self::tenant_guc`]'s role-default.
+    pub tenant_value: String,
+    /// An optional anonymous-**session** GUC name to bake. Usually unset for a dynamic role (the
+    /// session axis is per-request, set by the handler, not a stable role-default); baked only when
+    /// BOTH this and [`Self::session_value`] are `Some`.
+    pub session_guc: Option<String>,
+    /// The value for [`Self::session_guc`] (see its note).
+    pub session_value: Option<String>,
+    /// An optional principal-**class** GUC name to bake. Usually unset (the class is per-request);
+    /// baked only when BOTH this and [`Self::kind_value`] are `Some`.
+    pub kind_guc: Option<String>,
+    /// The value for [`Self::kind_guc`] (see its note).
+    pub kind_value: Option<String>,
+}
+
+/// `ALTER ROLE <role_id> SET "<guc>" = '<value>'` — a **role-default GUC**, the opt-in RLS tenant
+/// fencing backstop baked into a per-replica dynamic role so it carries the resolved tenant into
+/// every session. `role_id` is ALREADY quoted; the GUC NAME is quoted as an identifier
+/// ([`quote_ident`] — a custom GUC like `app.tenant_id` becomes `"app.tenant_id"`, which Postgres
+/// resolves to the same parameter, with any embedded `"` doubled defensively) and the VALUE as a
+/// string literal ([`quote_literal`]). Both operator/host-derived; quoted regardless.
+fn alter_role_set_guc(kind: ExternalSqlKind, role_id: &str, guc: &str, value: &str) -> String {
+    let guc_id = quote_ident(kind, guc);
+    let val_lit = quote_literal(kind, value);
+    format!("ALTER ROLE {role_id} SET {guc_id} = {val_lit};")
+}
+
+/// The FIXED body of the `boatramp_force_rls()` event-trigger function. A verbatim constant — NO
+/// value is ever interpolated into it (only `<owner>` into the companion `ALTER FUNCTION … OWNER
+/// TO` line) — so the plpgsql is auditable as a single, unchanging unit. `SECURITY DEFINER` with a
+/// pinned `search_path` (`pg_catalog, pg_temp`) so the definer's privileges cannot be redirected
+/// through a mutable search path; it runs as the function's owner (set to the per-tenant owner),
+/// which owns the tenant's tables and may therefore `FORCE` RLS on them. The `relrowsecurity AND
+/// NOT relforcerowsecurity` guard makes it surgical (only tables that already enabled RLS) AND
+/// idempotent under its own recursive fire (the inner `ALTER TABLE … FORCE` re-fires the trigger,
+/// but the row now has `relforcerowsecurity` set, so the guard stops it).
+const FORCE_RLS_FN_BODY: &str = r#"CREATE OR REPLACE FUNCTION boatramp_force_rls() RETURNS event_trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT objid FROM pg_event_trigger_ddl_commands() WHERE object_type = 'table' LOOP
+    IF EXISTS (SELECT 1 FROM pg_class
+               WHERE oid = r.objid AND relrowsecurity AND NOT relforcerowsecurity) THEN
+      EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', r.objid::regclass);
+    END IF;
+  END LOOP;
+END $$;"#;
+
+/// Ordered, **idempotent**, **Postgres-only** DDL that installs the opt-in **FORCE-on-ENABLE**
+/// event trigger in a tenant database (part 2 of [`RlsFencing`]).
+///
+/// On every `CREATE TABLE` / `ALTER TABLE`, [`FORCE_RLS_FN_BODY`]'s `boatramp_force_rls()` upgrades
+/// a table whose owner opted into plain `ENABLE ROW LEVEL SECURITY` to `FORCE ROW LEVEL SECURITY`,
+/// so RLS binds the table's OWNER — which the per-replica dynamic role operates as — not merely
+/// non-owners. It is **surgical**: only a table that already enabled RLS is touched, so a no-RLS
+/// app (e.g. WordPress) is NOT broken by a blanket FORCE.
+///
+/// Statements, in order:
+/// 1. `CREATE OR REPLACE FUNCTION boatramp_force_rls()` — the fixed `SECURITY DEFINER` function.
+/// 2. `ALTER FUNCTION boatramp_force_rls() OWNER TO <owner>` — so the definer runs as the per-tenant
+///    owner (the only `<owner>`-derived interpolation here, via [`quote_ident`]).
+/// 3. `DROP EVENT TRIGGER IF EXISTS boatramp_force_rls_trg` — idempotent re-create.
+/// 4. `CREATE EVENT TRIGGER boatramp_force_rls_trg ON ddl_command_end WHEN TAG IN ('ALTER TABLE',
+///    'CREATE TABLE') EXECUTE FUNCTION boatramp_force_rls()`.
+///
+/// # Placement (database-local — read before wiring)
+///
+/// Event triggers are **per-database** objects and `CREATE EVENT TRIGGER` requires the bootstrap
+/// **superuser**, so these statements MUST run connected to the **tenant database** (NOT the
+/// maintenance database). The managed-provision path ([`provision_shared`](crate) in
+/// `boatramp-node`) runs them on the same tenant-DB superuser connection it uses for
+/// [`grant_app_role_ddl`]; a test / gate that runs the whole [`provision_ddl`] vec against a single
+/// connection installs the trigger in THAT database, so it must connect to the tenant DB (or run
+/// these four statements there separately).
+///
+/// # MySQL
+///
+/// Empty — RLS fencing is **Postgres-only** (MySQL has neither row-level security nor event
+/// triggers; its per-schema `GRANT` is the whole isolation boundary).
+pub fn force_rls_event_trigger_ddl(kind: ExternalSqlKind, owner_role: &str) -> Vec<String> {
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let owner_id = quote_ident(kind, owner_role);
+            vec![
+                FORCE_RLS_FN_BODY.to_string(),
+                format!("ALTER FUNCTION boatramp_force_rls() OWNER TO {owner_id};"),
+                "DROP EVENT TRIGGER IF EXISTS boatramp_force_rls_trg;".to_string(),
+                "CREATE EVENT TRIGGER boatramp_force_rls_trg ON ddl_command_end \
+                 WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE') \
+                 EXECUTE FUNCTION boatramp_force_rls();"
+                    .to_string(),
+            ]
+        }
+        ExternalSqlKind::Mysql => Vec::new(),
+    }
 }
 
 /// Ordered, **idempotent** DDL to create a tenant's isolated database + login
@@ -359,6 +526,16 @@ fn mysql_user(role: &str) -> String {
 /// 4. `GRANT ALL PRIVILEGES ON <db>.* TO '<role>'@'%'` — scoped to *this*
 ///    database only (that `<db>.*` scope is the isolation boundary).
 /// 5. `FLUSH PRIVILEGES`.
+///
+/// # Opt-in RLS fencing (`rls_session`, Postgres only)
+///
+/// When `rls_session` is set, the Postgres arm **APPENDS** the FORCE-on-ENABLE event-trigger
+/// statements ([`force_rls_event_trigger_ddl`]) to the vec — unchanged lockdown DDL, then the
+/// trigger tail. Those trailing statements are **database-local** (event triggers are per-database)
+/// and MUST run connected to the **tenant** database, not the maintenance database; see
+/// [`force_rls_event_trigger_ddl`] for the placement contract. When `rls_session` is `false` the
+/// output is byte-identical to the pre-feature DDL, and MySQL is unaffected on both settings (RLS
+/// fencing is Postgres-only).
 pub fn provision_ddl(
     kind: ExternalSqlKind,
     db: &str,
@@ -366,18 +543,19 @@ pub fn provision_ddl(
     password: &str,
     owner_role: &str,
     owner_password: &str,
+    rls_session: bool,
 ) -> Vec<String> {
     let db_id = quote_ident(kind, db);
     let role_id = quote_ident(kind, role);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
 
     match kind {
         ExternalSqlKind::Postgres => {
-            let role_lit = quote_literal(role);
+            let role_lit = quote_literal(kind, role);
             let owner_id = quote_ident(kind, owner_role);
-            let owner_lit = quote_literal(owner_role);
-            let owner_pw_lit = quote_literal(owner_password);
-            vec![
+            let owner_lit = quote_literal(kind, owner_role);
+            let owner_pw_lit = quote_literal(kind, owner_password);
+            let mut stmts = vec![
                 // 1. Idempotent runtime-role create (CREATE ROLE has no IF NOT EXISTS).
                 format!(
                     "DO $$ BEGIN \
@@ -416,7 +594,15 @@ pub fn provision_ddl(
                 // 7. The runtime role gets database-level privileges (CONNECT/TEMP; CREATE is unused —
                 //    DDL is the owner role's job). Table privileges come from `grant_app_role_ddl`.
                 format!("GRANT ALL PRIVILEGES ON DATABASE {db_id} TO {role_id};"),
-            ]
+            ];
+            // 8. OPT-IN container RLS fencing: install the FORCE-on-ENABLE event trigger so a
+            //    plain `ENABLE ROW LEVEL SECURITY` table actually binds the owner the dynamic
+            //    role operates as. DATABASE-LOCAL — the caller MUST run these connected to the
+            //    tenant database (see `force_rls_event_trigger_ddl`). Default off ⇒ byte-identical.
+            if rls_session {
+                stmts.extend(force_rls_event_trigger_ddl(kind, owner_role));
+            }
+            stmts
         }
         ExternalSqlKind::Mysql => {
             let user = mysql_user(role);
@@ -459,10 +645,10 @@ pub fn ensure_login_role_ddl(
 ) -> Vec<String> {
     let role_id = quote_ident(kind, role);
     let db_id = quote_ident(kind, database);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
     match kind {
         ExternalSqlKind::Postgres => {
-            let role_lit = quote_literal(role);
+            let role_lit = quote_literal(kind, role);
             vec![
                 format!(
                     "DO $$ BEGIN \
@@ -649,7 +835,7 @@ pub fn soft_deprovision_ddl(db: &str, renamed: &str, role: &str) -> Vec<String> 
     let db_id = quote_ident(kind, db);
     let renamed_id = quote_ident(kind, renamed);
     let role_id = quote_ident(kind, role);
-    let db_lit = quote_literal(db);
+    let db_lit = quote_literal(kind, db);
     vec![
         // 1. Evict live sessions so the RENAME can take the lock.
         format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {db_lit};"),
@@ -688,7 +874,7 @@ pub fn recover_soft_deprovision_ddl(renamed: &str, original: &str, role: &str) -
 ///   `FLUSH PRIVILEGES;`.
 pub fn rotate_ddl(kind: ExternalSqlKind, role: &str, password: &str) -> Vec<String> {
     let role_id = quote_ident(kind, role);
-    let pw_lit = quote_literal(password);
+    let pw_lit = quote_literal(kind, password);
     match kind {
         ExternalSqlKind::Postgres => {
             vec![format!(
@@ -699,6 +885,274 @@ pub fn rotate_ddl(kind: ExternalSqlKind, role: &str, password: &str) -> Vec<Stri
             let user = mysql_user(role);
             vec![
                 format!("ALTER USER {user} IDENTIFIED BY {pw_lit};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ownership-safe DYNAMIC (per-replica) credentials — the PLAN-compute-managed-db
+// phase-2 lifecycle. A compute workload that consumes a Shared managed database gets
+// a short-lived login role minted at REPLICA launch and dropped at REPLICA stop,
+// instead of sharing one long-lived tenant login role across every replica forever.
+//
+// # The ownership-orphaning hazard this is built to design out
+//
+// The naive "one distinct dynamic role per workload, let the app run DDL on its own
+// connection" makes the EPHEMERAL role the OWNER of every object its app/ORM/migration
+// tool creates (`CREATE TABLE` ⇒ owner = the creating role). Postgres then refuses to
+// `DROP ROLE` a role that still owns objects (`role "…" cannot be dropped because some
+// objects depend on it`), AND the next dynamic role can neither `ALTER` nor `DROP` the
+// tables it does not own — so schema management breaks across rotations and the role
+// leaks. (Verified live on pg16: see the `dynamic_creds_ownership_sqlx_live` gate.)
+//
+// # The design (verified live on pg16 — see the gate + the DESIGN note)
+//
+// The STABLE, persistent, boatramp-managed [`tenant_owner_role_name`] role — created at
+// DB-provision time by [`provision_ddl`], owning the database + its schema, NEVER dropped
+// — stays the one true owner. The per-replica dynamic role is minted as a **member of the
+// owner role** and configured to **operate AS the owner** on every session via the `role`
+// GUC (`ALTER ROLE <dyn> SET role = '<owner>'`). It is also minted **NOINHERIT** (Security
+// MEDIUM-1): membership alone grants it NOTHING automatically — all owner-level authority
+// flows through the explicit `SET role` GUC, which is unaffected by INHERIT. So an app that
+// does `SET ROLE NONE` / `RESET ROLE` drops back to a raw role with no direct grants on the
+// owner's schema and cannot create an owner-orphan object — the escape is closed
+// structurally, not merely cleaned up after by the drop-time `REASSIGN OWNED` safety net.
+// The verified consequences:
+//
+// - Anything the dynamic role creates (`CREATE TABLE`, the backing `serial` sequence, an
+//   index, …) is owned by the STABLE OWNER, so the dynamic role **owns nothing**.
+// - A fresh dynamic role on relaunch is another member operating as the same owner, so it
+//   has **identical** access to every object the owner holds (reads prior data, ALTERs/
+//   DROPs owner-owned tables).
+// - Because the dynamic role owns nothing, [`drop_dynamic_role_ddl`] drops it **cleanly**:
+//   `REASSIGN OWNED BY <dyn> TO <owner>` (a belt-and-suspenders no-op unless an app
+//   escaped the GUC with `SET ROLE NONE` and created objects as the raw role — then it
+//   moves them to the stable owner, no orphan, no data loss), then `DROP OWNED BY <dyn>`
+//   (clears the role's privileges + default-privilege entries, INCLUDING the shared
+//   database-level `CONNECT` grant when run connected to the tenant DB — verified), then
+//   `DROP ROLE <dyn>` (succeeds, and auto-removes the owner→dyn membership — verified).
+//
+// `role` is a Postgres GUC name, not a reserved word here; its value is emitted as a
+// **single-quoted string literal** of the owner role name (the safest, most portable
+// form — verified that string-literal, bare-identifier, and double-quoted-identifier
+// values all resolve, and the literal matches how this module already quotes a role-name
+// literal in the `pg_roles` existence check).
+//
+// # MySQL
+//
+// MySQL has **no object ownership**, so the hazard does not exist: a dynamic user is
+// granted `ALL PRIVILEGES ON <db>.*` (every current + future table, DDL included) and
+// `DROP USER` drops it cleanly with nothing to orphan (the data outlives the user). No
+// owner role is involved — the `owner` argument is inert, exactly as in [`provision_ddl`].
+
+/// Derive the per-REPLICA **dynamic login role** name.
+///
+/// Scheme: `<base>_<tenant_ident>_d_<instance_id>`, re-sanitized + length-capped to the
+/// tighter [`MAX_ROLE_IDENT_LEN`] (MySQL's 32-char user limit) via [`sanitize_ident_capped`].
+/// `base` is the binding's compute/server workload (the SAME base [`tenant_role_name`] /
+/// [`tenant_owner_role_name`] use, so a dynamic role sits in the tenant's own role family);
+/// `tenant_ident` is the already-`sanitize_ident`-ed tenant; `instance_id` is the
+/// replica identity ([`compute_instance_id`](boatramp_core::compute::compute_instance_id),
+/// e.g. `acme-web-0`) so two replicas of one workload get two DISTINCT roles.
+///
+/// Distinct from [`tenant_role_name`] (`_role`), [`tenant_owner_role_name`] (`_owner`), and
+/// [`ensure_user_role_name`] (`_u_`) by the `_d_` marker being part of the whole-input
+/// digest — so even when the cosmetic body truncates away under the 32-char cap, the
+/// 128-bit digest keeps every dynamic role distinct from the static roles, the owner role,
+/// the database name, and every OTHER replica's dynamic role. Never digit- or `pg_`-leading
+/// (the [`sanitize_ident_capped`] guards apply).
+pub fn dynamic_role_name(base: &str, tenant_ident: &str, instance_id: &str) -> String {
+    sanitize_ident_capped(
+        &format!("{base}_{tenant_ident}_d_{instance_id}"),
+        MAX_ROLE_IDENT_LEN,
+    )
+}
+
+/// Ordered, **idempotent** DDL to MINT a per-replica dynamic login role that operates AS
+/// the stable tenant owner (so anything it creates is owner-owned and it owns nothing).
+///
+/// `db` is the tenant database ([`tenant_db_name`]); `owner_role` is the stable owner
+/// ([`tenant_owner_role_name`]) that already owns `db`; `dyn_role` is the per-replica role
+/// ([`dynamic_role_name`]); `password` is its fresh login password (hex in practice, quoted
+/// defensively). All names are pre-derived + sanitized; every statement quotes identifiers
+/// and literals regardless.
+///
+/// # Postgres (run as the superuser on the MAINTENANCE database)
+///
+/// Every statement here is cluster-global or touches a shared object (the database-level
+/// `CONNECT`), so none needs a connection to `db` itself:
+/// 1. Idempotent `CREATE ROLE <dyn> LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS
+///    NOREPLICATION NOINHERIT PASSWORD …` (via `DO $$ … pg_roles … $$`), tolerating a
+///    crash-relaunch where the prior stop's drop did not run. `NOINHERIT` means the role
+///    does not automatically wield the owner's privileges by membership — its owner-level
+///    access comes solely from the `SET role` GUC (step 4), so `SET ROLE NONE`/`RESET ROLE`
+///    back to the raw role leaves it unable to create an owner-orphan object.
+/// 2. `ALTER ROLE <dyn> WITH LOGIN … NOINHERIT PASSWORD …` — re-assert the locked-down
+///    attributes + resync the fresh password.
+/// 3. `GRANT <owner> TO <dyn>` — membership, so `<dyn>` may operate as `<owner>` (PG16's
+///    default grant carries `SET TRUE`, permitting the session-start `SET ROLE`).
+/// 4. `ALTER ROLE <dyn> SET role = '<owner>'` — every `<dyn>` session starts AS `<owner>`,
+///    so objects it creates are owned by `<owner>` and `<dyn>` owns nothing.
+/// 5. `GRANT CONNECT ON DATABASE <db> TO <dyn>` — `CONNECT` is checked against the
+///    authenticated role (`<dyn>`) BEFORE the `role` GUC applies, so the dynamic role needs
+///    its own grant (the database was `REVOKE CONNECT … FROM PUBLIC`-locked at provision).
+///
+/// # MySQL (run as the superuser)
+/// `CREATE USER IF NOT EXISTS` + `ALTER USER` (resync password) + `GRANT ALL PRIVILEGES ON
+/// <db>.*` (the tenant-scoped isolation boundary; DDL included) + `FLUSH PRIVILEGES`. No
+/// owner role (no object ownership to transfer).
+///
+/// # Opt-in container RLS fencing (`fencing: Some`, Postgres only)
+///
+/// When `fencing` is `Some`, the Postgres arm inserts a **role-default GUC**
+/// (`ALTER ROLE <dyn> SET "<guc>" = '<value>'`) **immediately after** the operate-as-owner
+/// `SET role` (step 4) and before the `CONNECT` grant (step 5) — one for the tenant GUC always,
+/// plus the session / principal-class GUCs iff the operator configured a name AND a value for
+/// them (see [`RlsFencing`]). So every session of this operate-as-owner role carries the resolved
+/// tenant even when a connection does not set it per-request (the ORM auto-migrate path), which
+/// — paired with [`force_rls_event_trigger_ddl`]'s FORCE — makes RLS actually bind the owner.
+/// `None` ⇒ nothing is emitted and the DDL is byte-identical to the pre-feature output. MySQL is
+/// unaffected on both settings (RLS fencing is Postgres-only).
+pub fn mint_dynamic_role_ddl(
+    kind: ExternalSqlKind,
+    db: &str,
+    owner_role: &str,
+    dyn_role: &str,
+    password: &str,
+    fencing: Option<&RlsFencing>,
+) -> Vec<String> {
+    let db_id = quote_ident(kind, db);
+    let dyn_id = quote_ident(kind, dyn_role);
+    let pw_lit = quote_literal(kind, password);
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let dyn_lit = quote_literal(kind, dyn_role);
+            let owner_id = quote_ident(kind, owner_role);
+            // The `role` GUC value is emitted as a single-quoted string literal of the owner
+            // role name (verified: literal / bare / double-quoted all resolve; the literal is
+            // the safest + matches this module's `pg_roles` role-name-literal convention).
+            let owner_lit = quote_literal(kind, owner_role);
+            let mut stmts = vec![
+                // 1. Idempotent, locked-down create (tolerates a crash-relaunch leftover).
+                // NOINHERIT (Security MEDIUM-1): the dynamic role must NOT automatically wield
+                // the stable owner's privileges by mere membership. Its owner-level authority
+                // comes ONLY from the explicit `SET role = '<owner>'` GUC applied at connect
+                // (step 4) — which works regardless of INHERIT — so the happy path is
+                // unaffected, while `SET ROLE NONE` / `RESET ROLE` back to the raw dynamic role
+                // now leaves it with NO inherited CREATE on the owner's schema, structurally
+                // closing the escape that could otherwise create an owner-orphan object.
+                format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {dyn_lit}) THEN \
+                     CREATE ROLE {dyn_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD {pw_lit}; \
+                     END IF; END $$;"
+                ),
+                // 2. Re-assert the safe attributes (incl. NOINHERIT) + resync the fresh password.
+                format!(
+                    "ALTER ROLE {dyn_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD {pw_lit};"
+                ),
+                // 3. Membership so the dynamic role may SET ROLE to the stable owner.
+                format!("GRANT {owner_id} TO {dyn_id};"),
+                // 4. Operate AS the owner on every session (the ownership-transfer core).
+                format!("ALTER ROLE {dyn_id} SET role = {owner_lit};"),
+            ];
+            // 4b. OPT-IN container RLS fencing: bake the resolved tenant (+ optional session /
+            //     principal-class axes) as a role-default GUC, so every session of this
+            //     operate-as-owner role carries the tenant even on a connection that never sets
+            //     it per-request (the ORM auto-migrate path). AFTER `SET role`, before CONNECT.
+            //     Default off ⇒ nothing emitted (byte-identical to the pre-feature DDL).
+            if let Some(f) = fencing {
+                stmts.push(alter_role_set_guc(
+                    kind,
+                    &dyn_id,
+                    &f.tenant_guc,
+                    &f.tenant_value,
+                ));
+                if let (Some(name), Some(val)) = (&f.session_guc, &f.session_value) {
+                    stmts.push(alter_role_set_guc(kind, &dyn_id, name, val));
+                }
+                if let (Some(name), Some(val)) = (&f.kind_guc, &f.kind_value) {
+                    stmts.push(alter_role_set_guc(kind, &dyn_id, name, val));
+                }
+            }
+            // 5. Admit the dynamic role to the (PUBLIC-locked) tenant database.
+            stmts.push(format!("GRANT CONNECT ON DATABASE {db_id} TO {dyn_id};"));
+            stmts
+        }
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(dyn_role);
+            vec![
+                format!("CREATE USER IF NOT EXISTS {user} IDENTIFIED BY {pw_lit};"),
+                format!("ALTER USER {user} IDENTIFIED BY {pw_lit};"),
+                format!("GRANT ALL PRIVILEGES ON {db_id}.* TO {user};"),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        }
+    }
+}
+
+/// Ordered DDL to DROP a per-replica dynamic role **cleanly** (the inverse of
+/// [`mint_dynamic_role_ddl`]). `dyn_role` is the pre-derived [`dynamic_role_name`];
+/// `owner_role` is the stable [`tenant_owner_role_name`] the safety-net reassign targets.
+///
+/// # Postgres — run connected to the role's own TENANT database, as the superuser
+///
+/// `REASSIGN OWNED` / `DROP OWNED` act only on the CURRENT database (+ shared objects), so
+/// they MUST run connected to the tenant DB, where all of the dynamic role's privileges and
+/// any (escaped) objects live; `DROP ROLE` is cluster-global and runs fine from that same
+/// connection:
+/// 0. `SELECT pg_terminate_backend(pid) … WHERE usename = '<dyn>'` — **evict live sessions
+///    first**: `DROP ROLE` does NOT close an existing connection, and a session that already
+///    ran `SET role = <owner>` would otherwise retain owner authority after the drop. Targets
+///    the dynamic role's own backends by its authenticating `usename`. Defense-in-depth
+///    independent of the caller having stopped the container first.
+/// 1. `REASSIGN OWNED BY <dyn> TO <owner>` — **safety net**: the dynamic role normally owns
+///    nothing (it operates as `<owner>`), but if an app did `SET ROLE NONE` and created
+///    objects as the raw role, this moves them to the STABLE OWNER — no orphan, no data
+///    loss — so the drop is clean regardless. (Verified live on pg16.)
+/// 2. `DROP OWNED BY <dyn>` — clear the role's privileges + default-privilege entries,
+///    including the shared database-level `CONNECT` grant (verified cleared when run in the
+///    tenant DB). Now the role is depended on by nothing.
+/// 3. `DROP ROLE IF EXISTS <dyn>` — drop the cluster role; auto-removes the owner→dyn
+///    membership (verified — no explicit `REVOKE` needed).
+///
+/// Steps 1–2 error if the role does not exist; the caller treats a "role does not exist"
+/// error as success (idempotent — already gone), the same contract [`drop_login_role_ddl`]
+/// uses. Step 3 is `IF EXISTS` and never errors on absence.
+///
+/// # MySQL
+/// `DROP USER IF EXISTS '<dyn>'@'%'` + `FLUSH PRIVILEGES` — privileges drop with the user;
+/// nothing to orphan (`owner_role` is inert).
+pub fn drop_dynamic_role_ddl(
+    kind: ExternalSqlKind,
+    dyn_role: &str,
+    owner_role: &str,
+) -> Vec<String> {
+    let dyn_id = quote_ident(kind, dyn_role);
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let owner_id = quote_ident(kind, owner_role);
+            let dyn_lit = quote_literal(kind, dyn_role);
+            vec![
+                // Evict any live sessions this role still holds FIRST: `DROP ROLE` does NOT
+                // close an existing connection, and a session that already ran `SET role =
+                // <owner>` keeps owner authority after the drop. `usename` is the authenticating
+                // (session) role — the dynamic role — so this terminates exactly its backends.
+                // Defense-in-depth independent of the caller stopping the container first.
+                format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {dyn_lit};"
+                ),
+                format!("REASSIGN OWNED BY {dyn_id} TO {owner_id};"),
+                format!("DROP OWNED BY {dyn_id};"),
+                format!("DROP ROLE IF EXISTS {dyn_id};"),
+            ]
+        }
+        ExternalSqlKind::Mysql => {
+            let user = mysql_user(dyn_role);
+            vec![
+                format!("DROP USER IF EXISTS {user};"),
                 "FLUSH PRIVILEGES;".to_string(),
             ]
         }
@@ -1253,17 +1707,43 @@ mod tests {
         assert_eq!(quote_ident(ExternalSqlKind::Mysql, "plain"), "`plain`");
     }
 
-    /// Literal quoting doubles the embedded single quote and wraps.
+    /// Literal quoting doubles the embedded single quote and wraps. Backslash-free
+    /// literals (every minted/hex value) keep the identical plain `'…'` form on both
+    /// engines (no behavior change).
     #[test]
     fn quote_literal_doubles_embedded_quote() {
-        assert_eq!(quote_literal("O'Brien"), "'O''Brien'");
-        assert_eq!(quote_literal("hex_pw"), "'hex_pw'");
-        // The classic injection payload is neutralized (the closing quote is
-        // doubled, so it stays inside the literal).
+        for k in [ExternalSqlKind::Postgres, ExternalSqlKind::Mysql] {
+            assert_eq!(quote_literal(k, "O'Brien"), "'O''Brien'");
+            assert_eq!(quote_literal(k, "hex_pw"), "'hex_pw'");
+            // The classic injection payload is neutralized (the closing quote is
+            // doubled, so it stays inside the literal).
+            assert_eq!(
+                quote_literal(k, "'; DROP TABLE users; --"),
+                "'''; DROP TABLE users; --'"
+            );
+        }
+    }
+
+    /// LOW-2: a backslash in a literal is made engine-safe so it can't escape the closing
+    /// quote on MySQL (where `\` is a string escape by default). MySQL doubles the backslash
+    /// inside a plain literal; Postgres switches to an `E'…'` escape string (doubling both),
+    /// so the value is interpreted deterministically regardless of `standard_conforming_strings`.
+    #[test]
+    fn quote_literal_is_backslash_safe_per_engine() {
+        // A value ending in a lone backslash — the MySQL break-out shape.
+        assert_eq!(quote_literal(ExternalSqlKind::Mysql, "p\\"), "'p\\\\'");
+        assert_eq!(quote_literal(ExternalSqlKind::Postgres, "p\\"), "E'p\\\\'");
+        // Backslash + quote together: both are doubled, nothing escapes.
+        assert_eq!(quote_literal(ExternalSqlKind::Mysql, "a\\'b"), "'a\\\\''b'");
         assert_eq!(
-            quote_literal("'; DROP TABLE users; --"),
-            "'''; DROP TABLE users; --'"
+            quote_literal(ExternalSqlKind::Postgres, "a\\'b"),
+            "E'a\\\\''b'"
         );
+        // The adversarial MySQL break-out `\'; DROP ...` stays inside its literal (the
+        // leading backslash is doubled, so the following quote is still a doubled data quote).
+        let evil = "\\'; DROP TABLE users; --";
+        let my = quote_literal(ExternalSqlKind::Mysql, evil);
+        assert!(my.starts_with("'\\\\''") && my.ends_with('\''));
     }
 
     // ---- provision_ddl ---------------------------------------------------
@@ -1279,6 +1759,7 @@ mod tests {
             "deadbeef",
             "appdb_acme_owner",
             "0wnerpw",
+            false,
         );
         let joined = stmts.join("\n");
         // The isolation core: PUBLIC stripped, both this tenant's roles admitted.
@@ -1346,6 +1827,7 @@ mod tests {
             "deadbeef",
             "appdb_acme_owner",
             "0wnerpw",
+            false,
         );
         let joined = stmts.join("\n");
         assert!(joined.contains("CREATE DATABASE IF NOT EXISTS `appdb_acme`"));
@@ -1470,6 +1952,7 @@ mod tests {
                 evil,
                 "appdb_x_owner",
                 evil,
+                false,
             ),
             provision_ddl(
                 ExternalSqlKind::Mysql,
@@ -1478,6 +1961,7 @@ mod tests {
                 evil,
                 "appdb_x_owner",
                 evil,
+                false,
             ),
             rotate_ddl(ExternalSqlKind::Postgres, "appdb_x_role", evil),
             rotate_ddl(ExternalSqlKind::Mysql, "appdb_x_role", evil),
@@ -1507,5 +1991,485 @@ mod tests {
         assert_eq!(hash_suffix("appdb"), "6ldpyd2wfh6vhvqhj6s5o6hg0");
         // Therefore the whole identifier for a clean name is fully determined.
         assert_eq!(sanitize_ident("appdb"), "appdb_6ldpyd2wfh6vhvqhj6s5o6hg0");
+    }
+
+    // ---- dynamic (per-replica) role name + mint/drop DDL -----------------
+
+    /// A dynamic role name is derived from `(base, tenant_ident, instance_id)`, stays
+    /// within the MySQL 32-char user cap, is safe-charset, never digit-/`pg_`-leads, and
+    /// is DISTINCT from the static runtime role, the owner role, the ensure-user role, and
+    /// the database name of the same tenant — the distinctness that keeps a dropped dynamic
+    /// role from ever colliding with (and clobbering) a persistent identity.
+    #[test]
+    fn dynamic_role_name_is_bounded_distinct_and_safe() {
+        let ident = sanitize_ident("acme");
+        let d0 = dynamic_role_name("pg", &ident, "acme-web-0");
+        // Fits the tightest engine (MySQL user) cap, safe charset, not reserved/digit-leading.
+        assert!(d0.len() <= MAX_ROLE_IDENT_LEN, "dyn role over cap: {d0}");
+        assert!(!d0.starts_with("pg_"), "reserved pg_ prefix: {d0}");
+        assert!(!d0.as_bytes()[0].is_ascii_digit(), "digit-leading: {d0}");
+        assert!(
+            d0.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        );
+        // Distinct from every persistent identity of the SAME tenant (carried by the digest).
+        assert_ne!(d0, tenant_role_name("pg", &ident));
+        assert_ne!(d0, tenant_owner_role_name("pg", &ident));
+        assert_ne!(d0, ensure_user_role_name("pg", &ident, "web"));
+        assert_ne!(d0, tenant_db_name("appdb", &ident));
+        // Distinct PER REPLICA: a second replica of the same workload gets a different role.
+        assert_ne!(d0, dynamic_role_name("pg", &ident, "acme-web-1"));
+        // Deterministic for a given replica (idempotent mint/drop key).
+        assert_eq!(d0, dynamic_role_name("pg", &ident, "acme-web-0"));
+        // Even a long instance id (truncates the body) stays distinct via the digest.
+        let long_a = dynamic_role_name("pg", &ident, &format!("{}-0", "z".repeat(60)));
+        let long_b = dynamic_role_name("pg", &ident, &format!("{}-1", "z".repeat(60)));
+        assert_ne!(long_a, long_b, "long instance ids collided");
+        assert!(long_a.len() <= MAX_ROLE_IDENT_LEN);
+    }
+
+    /// Postgres mint DDL: the load-bearing ownership-transfer mechanism is present and in
+    /// order — membership, then `SET role = '<owner>'`, then the CONNECT grant — the role
+    /// is locked down (non-superuser, no cluster reach, RLS-subject), and names/passwords
+    /// are quoted. MUTATION: dropping the `SET role` statement (so the dynamic role creates
+    /// objects as ITSELF — the orphaning hazard) MUST fail this test.
+    #[test]
+    fn mint_dynamic_role_postgres_operates_as_owner_and_is_locked_down() {
+        let stmts = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d_acme_web_0",
+            "deadbeef",
+            None,
+        );
+        let joined = stmts.join("\n");
+        // The ownership-transfer core: membership + operate-AS-owner via the `role` GUC, the
+        // owner quoted as a STRING LITERAL (not an identifier) in the SET value.
+        assert!(
+            joined.contains("GRANT \"appdb_acme_owner\" TO \"appdb_acme_d_acme_web_0\""),
+            "missing owner membership:\n{joined}"
+        );
+        assert!(
+            joined.contains("ALTER ROLE \"appdb_acme_d_acme_web_0\" SET role = 'appdb_acme_owner'"),
+            "missing the operate-AS-owner SET role GUC (string-literal owner):\n{joined}"
+        );
+        // Admitted to the PUBLIC-locked tenant database.
+        assert!(
+            joined.contains(
+                "GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_d_acme_web_0\""
+            )
+        );
+        // Locked down exactly like the owner/runtime roles: no cluster-level reach, RLS-subject.
+        assert!(joined.contains("CREATE ROLE \"appdb_acme_d_acme_web_0\" LOGIN NOSUPERUSER"));
+        assert!(joined.contains("NOCREATEDB") && joined.contains("NOCREATEROLE"));
+        assert!(
+            joined.contains("NOBYPASSRLS"),
+            "dynamic role must not bypass RLS"
+        );
+        // MEDIUM-1: NOINHERIT on BOTH the create and the re-assert, so membership alone grants
+        // the dynamic role nothing — owner authority flows only through the SET role GUC, and
+        // `SET ROLE NONE` cannot create an owner-orphan. Present on the create AND the ALTER.
+        assert!(
+            joined.contains(
+                "CREATE ROLE \"appdb_acme_d_acme_web_0\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD"
+            ),
+            "the dynamic role must be minted NOINHERIT:\n{joined}"
+        );
+        assert!(
+            joined.contains(
+                "ALTER ROLE \"appdb_acme_d_acme_web_0\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT PASSWORD"
+            ),
+            "the re-assert must also carry NOINHERIT:\n{joined}"
+        );
+        assert!(
+            !joined.to_ascii_uppercase().contains(" SUPERUSER"),
+            "dynamic role must never be SUPERUSER:\n{joined}"
+        );
+        // Password only ever a quoted literal, never a bare token.
+        assert!(!joined.contains(" deadbeef"), "unquoted password leaked");
+        assert!(joined.contains("PASSWORD 'deadbeef'"));
+        // Ordering: create/alter, THEN membership, THEN SET role, THEN CONNECT.
+        let idx = |needle: &str| stmts.iter().position(|s| s.contains(needle)).unwrap();
+        assert!(idx("CREATE ROLE") < idx("GRANT \"appdb_acme_owner\" TO"));
+        assert!(idx("GRANT \"appdb_acme_owner\" TO") < idx("SET role ="));
+        assert!(idx("SET role =") < idx("GRANT CONNECT ON DATABASE"));
+    }
+
+    /// Postgres clean-drop DDL: evict the role's live sessions first
+    /// (`pg_terminate_backend … WHERE usename = <dyn>`, so a session that already ran
+    /// `SET role = <owner>` cannot retain owner access past the drop), then
+    /// `REASSIGN OWNED … TO <owner>` (safety net, to the STABLE OWNER — NOT the superuser),
+    /// then `DROP OWNED`, then `DROP ROLE IF EXISTS`, in that order, quoted. MUTATION: dropping
+    /// the terminate or the REASSIGN step, or reassigning to the superuser instead of the
+    /// owner, changes this structure and fails the ordering/owner asserts.
+    #[test]
+    fn drop_dynamic_role_postgres_reassigns_to_owner_then_drops_cleanly() {
+        let stmts = drop_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme_d_acme_web_0",
+            "appdb_acme_owner",
+        );
+        assert_eq!(
+            stmts,
+            vec![
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE usename = 'appdb_acme_d_acme_web_0';"
+                    .to_string(),
+                "REASSIGN OWNED BY \"appdb_acme_d_acme_web_0\" TO \"appdb_acme_owner\";"
+                    .to_string(),
+                "DROP OWNED BY \"appdb_acme_d_acme_web_0\";".to_string(),
+                "DROP ROLE IF EXISTS \"appdb_acme_d_acme_web_0\";".to_string(),
+            ]
+        );
+        // Live sessions are evicted FIRST (the role may already have `SET role = <owner>`).
+        assert!(
+            stmts[0].contains("pg_terminate_backend") && stmts[0].contains("usename ="),
+            "must terminate the dynamic role's backends before dropping it"
+        );
+        // The safety net reassigns to the OWNER, never the superuser (CURRENT_USER) — so an
+        // escaped object lands with the stable owner, not the cluster superuser.
+        assert!(
+            !stmts[1].contains("CURRENT_USER") && stmts[1].contains("REASSIGN OWNED"),
+            "must reassign to the owner, not the superuser"
+        );
+    }
+
+    /// MySQL mint/drop: grant-based, scoped to `<db>.*` (the isolation boundary, DDL
+    /// included), NO owner role (no object ownership), dropped cleanly with `DROP USER`.
+    #[test]
+    fn mint_and_drop_dynamic_role_mysql_is_grant_based_and_scoped() {
+        let mint = mint_dynamic_role_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "ignored_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+            None,
+        )
+        .join("\n");
+        assert!(
+            mint.contains("CREATE USER IF NOT EXISTS 'appdb_acme_d0'@'%' IDENTIFIED BY 'deadbeef'")
+        );
+        assert!(
+            mint.contains("GRANT ALL PRIVILEGES ON `appdb_acme`.* TO 'appdb_acme_d0'@'%'"),
+            "mysql dynamic grant must be scoped to the tenant db only:\n{mint}"
+        );
+        assert!(mint.contains("FLUSH PRIVILEGES"));
+        // MySQL has no object ownership, so the owner role never appears + there is no SET ROLE.
+        assert!(
+            !mint.contains("ignored_owner"),
+            "mysql mint must not reference an owner role"
+        );
+        assert!(!mint.to_ascii_uppercase().contains("SET ROLE"));
+        assert!(!mint.contains(" deadbeef"), "unquoted password leaked");
+
+        let drop = drop_dynamic_role_ddl(ExternalSqlKind::Mysql, "appdb_acme_d0", "ignored_owner");
+        assert_eq!(
+            drop,
+            vec![
+                "DROP USER IF EXISTS 'appdb_acme_d0'@'%';".to_string(),
+                "FLUSH PRIVILEGES;".to_string(),
+            ]
+        );
+    }
+
+    /// A malicious password/owner can't escape its literal in any emitted dynamic-cred
+    /// statement (defense-in-depth, mirroring the provision/rotate payload test).
+    #[test]
+    fn dynamic_role_ddl_neutralizes_injection() {
+        let evil = "'; DROP DATABASE postgres; --";
+        for stmts in [
+            mint_dynamic_role_ddl(ExternalSqlKind::Postgres, "db", "own", "dyn", evil, None),
+            mint_dynamic_role_ddl(ExternalSqlKind::Mysql, "db", "own", "dyn", evil, None),
+        ] {
+            for s in stmts {
+                if s.contains("DROP DATABASE postgres") {
+                    assert!(
+                        s.contains("''; DROP DATABASE postgres; --"),
+                        "password broke out of its literal: {s}"
+                    );
+                }
+            }
+        }
+
+        // LOW-2 backslash case: a payload LEADING with a backslash is the MySQL break-out
+        // shape (`\` escapes the quote that would otherwise double-close the literal). The
+        // backslash must be doubled so the following quote stays a data quote — on BOTH
+        // engines — and the injection text can never reach statement level.
+        let evil_bs = "\\'; DROP DATABASE postgres; --";
+        for (kind, pre) in [
+            (ExternalSqlKind::Postgres, "E'\\\\''"),
+            (ExternalSqlKind::Mysql, "'\\\\''"),
+        ] {
+            for s in mint_dynamic_role_ddl(kind, "db", "own", "dyn", evil_bs, None) {
+                if s.contains("DROP DATABASE postgres") {
+                    assert!(
+                        s.contains(&format!("{pre}; DROP DATABASE postgres; --")),
+                        "backslash payload broke out of its literal on {kind:?}: {s}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- container RLS fencing (v0.53.0) ---------------------------------
+
+    fn pg_provision(rls_session: bool) -> Vec<String> {
+        provision_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_role",
+            "deadbeef",
+            "appdb_acme_owner",
+            "0wnerpw",
+            rls_session,
+        )
+    }
+
+    /// `provision_ddl` with `rls_session` APPENDS the FORCE-on-ENABLE event trigger (the
+    /// `SECURITY DEFINER` function pinned + owned by the per-tenant owner, the idempotent
+    /// re-create, the trigger on CREATE/ALTER TABLE) and ONLY appends — the lockdown DDL is
+    /// unchanged. MUTATION: dropping the `stmts.extend(...)` leaves the trigger absent and fails
+    /// the `CREATE EVENT TRIGGER` / `FORCE ROW LEVEL SECURITY` asserts.
+    #[test]
+    fn provision_postgres_rls_fencing_appends_force_event_trigger() {
+        let off = pg_provision(false);
+        let on = pg_provision(true);
+        // OFF: no event-trigger DDL at all (default off ⇒ byte-identical to pre-feature output).
+        let off_join = off.join("\n");
+        assert!(
+            !off_join.contains("boatramp_force_rls")
+                && !off_join.to_ascii_uppercase().contains("EVENT TRIGGER"),
+            "fencing OFF must emit NO event-trigger DDL:\n{off_join}"
+        );
+        // ON only APPENDS: the OFF statements are an unchanged prefix of ON.
+        assert_eq!(
+            &on[..off.len()],
+            &off[..],
+            "fencing must ONLY append — the lockdown DDL is unchanged"
+        );
+        let tail = on[off.len()..].join("\n");
+        assert!(
+            tail.contains("CREATE OR REPLACE FUNCTION boatramp_force_rls()"),
+            "missing the SECURITY DEFINER function:\n{tail}"
+        );
+        assert!(
+            tail.contains("SECURITY DEFINER SET search_path = pg_catalog, pg_temp"),
+            "the definer's search_path must be pinned:\n{tail}"
+        );
+        assert!(
+            tail.contains("FORCE ROW LEVEL SECURITY"),
+            "the trigger must FORCE RLS:\n{tail}"
+        );
+        // The SECURITY DEFINER function runs as the PER-TENANT OWNER (the only interpolation).
+        assert!(
+            tail.contains("ALTER FUNCTION boatramp_force_rls() OWNER TO \"appdb_acme_owner\""),
+            "the definer function must be owned by the per-tenant owner:\n{tail}"
+        );
+        assert!(tail.contains("DROP EVENT TRIGGER IF EXISTS boatramp_force_rls_trg"));
+        assert!(
+            tail.contains("CREATE EVENT TRIGGER boatramp_force_rls_trg ON ddl_command_end")
+                && tail.contains("WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE')"),
+            "missing the event trigger:\n{tail}"
+        );
+        // Surgical, not blanket: the guard only touches a table that already enabled RLS.
+        assert!(tail.contains("relrowsecurity AND NOT relforcerowsecurity"));
+    }
+
+    /// RLS fencing is Postgres-only: MySQL provisioning is identical on and off, and the
+    /// event-trigger builder is empty for MySQL.
+    #[test]
+    fn provision_mysql_rls_fencing_is_noop() {
+        let off = provision_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "appdb_acme_role",
+            "deadbeef",
+            "appdb_acme_owner",
+            "0wnerpw",
+            false,
+        );
+        let on = provision_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "appdb_acme_role",
+            "deadbeef",
+            "appdb_acme_owner",
+            "0wnerpw",
+            true,
+        );
+        assert_eq!(off, on, "RLS fencing must be a no-op on MySQL provision");
+        assert!(force_rls_event_trigger_ddl(ExternalSqlKind::Mysql, "appdb_acme_owner").is_empty());
+    }
+
+    fn tenant_fencing() -> RlsFencing {
+        RlsFencing {
+            tenant_guc: "app.tenant_id".to_string(),
+            tenant_value: "acme".to_string(),
+            session_guc: None,
+            session_value: None,
+            kind_guc: None,
+            kind_value: None,
+        }
+    }
+
+    /// `mint_dynamic_role_ddl` with the fencing config bakes the tenant as a role-default GUC
+    /// (`ALTER ROLE … SET "app.tenant_id" = 'acme'`) AFTER the operate-as-owner `SET role` and
+    /// before the CONNECT grant; the optional session / class axes are baked only when a name
+    /// AND value are both present. WITHOUT fencing the DDL is byte-identical to pre-feature.
+    /// MUTATION: dropping the baked tenant GUC (so an unset `app.tenant_id` ⇒ FORCE RLS hides
+    /// every row for the ORM/migrate connection) fails the `SET "app.tenant_id"` assert.
+    #[test]
+    fn mint_postgres_rls_fencing_bakes_role_default_gucs() {
+        let off = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+            None,
+        );
+        let fencing = tenant_fencing();
+        let on = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+            Some(&fencing),
+        );
+        // WITHOUT fencing: no baked GUC anywhere.
+        assert!(
+            !off.join("\n").contains("app.tenant_id"),
+            "no fencing ⇒ no baked tenant GUC"
+        );
+        let on_join = on.join("\n");
+        // WITH fencing: the tenant GUC is baked, name as a quoted identifier + value as a literal.
+        assert!(
+            on_join.contains("ALTER ROLE \"appdb_acme_d0\" SET \"app.tenant_id\" = 'acme'"),
+            "missing the baked tenant role-default GUC:\n{on_join}"
+        );
+        // Ordering: SET role BEFORE the baked tenant GUC BEFORE the CONNECT grant.
+        let idx = |needle: &str| on.iter().position(|s| s.contains(needle)).unwrap();
+        assert!(idx("SET role =") < idx("SET \"app.tenant_id\" ="));
+        assert!(idx("SET \"app.tenant_id\" =") < idx("GRANT CONNECT ON DATABASE"));
+        // Removing ONLY the baked GUC line recovers the exact fencing-off output (pure insert).
+        let on_wo_guc: Vec<String> = on
+            .iter()
+            .filter(|s| !s.contains("SET \"app.tenant_id\""))
+            .cloned()
+            .collect();
+        assert_eq!(
+            on_wo_guc, off,
+            "fencing must ONLY insert the role-default GUC; every other statement is unchanged"
+        );
+
+        // The optional session / principal-class axes bake only when name AND value are present.
+        let full = RlsFencing {
+            session_guc: Some("app.session_id".to_string()),
+            session_value: Some("sess-1".to_string()),
+            kind_guc: Some("app.principal_kind".to_string()),
+            kind_value: Some("tenant".to_string()),
+            ..tenant_fencing()
+        };
+        let full_join = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+            Some(&full),
+        )
+        .join("\n");
+        assert!(full_join.contains("SET \"app.session_id\" = 'sess-1'"));
+        assert!(full_join.contains("SET \"app.principal_kind\" = 'tenant'"));
+        // A name without a value (or vice-versa) is NOT baked.
+        let name_only = RlsFencing {
+            session_guc: Some("app.session_id".to_string()),
+            session_value: None,
+            ..tenant_fencing()
+        };
+        let name_only_join = mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "appdb_acme",
+            "appdb_acme_owner",
+            "appdb_acme_d0",
+            "deadbeef",
+            Some(&name_only),
+        )
+        .join("\n");
+        assert!(
+            !name_only_join.contains("app.session_id"),
+            "a session GUC name with no value must not be baked:\n{name_only_join}"
+        );
+    }
+
+    /// RLS fencing is Postgres-only: a MySQL mint with fencing is identical to one without.
+    #[test]
+    fn mint_mysql_rls_fencing_is_noop() {
+        let fencing = tenant_fencing();
+        let off = mint_dynamic_role_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "ignored",
+            "appdb_acme_d0",
+            "deadbeef",
+            None,
+        );
+        let on = mint_dynamic_role_ddl(
+            ExternalSqlKind::Mysql,
+            "appdb_acme",
+            "ignored",
+            "appdb_acme_d0",
+            "deadbeef",
+            Some(&fencing),
+        );
+        assert_eq!(off, on, "RLS fencing must be a no-op on MySQL mint");
+    }
+
+    /// A malicious tenant VALUE stays inside its string literal, and a malicious GUC NAME stays a
+    /// single quoted identifier (embedded `"` doubled) — the fencing values are operator/host-
+    /// derived, but quoted defensively regardless.
+    #[test]
+    fn mint_rls_fencing_neutralizes_injection() {
+        let evil_val = RlsFencing {
+            tenant_value: "'; DROP DATABASE postgres; --".to_string(),
+            ..tenant_fencing()
+        };
+        for s in mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "db",
+            "own",
+            "dyn",
+            "pw",
+            Some(&evil_val),
+        ) {
+            if s.contains("DROP DATABASE postgres") {
+                assert!(
+                    s.contains("''; DROP DATABASE postgres; --"),
+                    "tenant value broke out of its literal: {s}"
+                );
+            }
+        }
+        let evil_name = RlsFencing {
+            tenant_guc: "app\".tenant".to_string(),
+            ..tenant_fencing()
+        };
+        for s in mint_dynamic_role_ddl(
+            ExternalSqlKind::Postgres,
+            "db",
+            "own",
+            "dyn",
+            "pw",
+            Some(&evil_name),
+        ) {
+            if s.contains("SET \"app") {
+                assert!(
+                    s.contains("SET \"app\"\".tenant\" ="),
+                    "GUC name must stay a single quoted identifier (embedded quote doubled): {s}"
+                );
+            }
+        }
     }
 }

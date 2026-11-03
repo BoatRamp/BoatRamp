@@ -494,12 +494,70 @@ logged, so a typo is diagnosable rather than silently half-filled.
   the reserved default project, which that project's container cannot resolve by
   internal name — use the default `tenant: single` for a compute-bound managed DB.
 
-### Phase-1 trade-off (static credential)
+### Dynamic per-replica credential
 
-The managed credential rides in the workload's env as a **static DSN**. A follow-up
-replaces it with a dynamic, per-replica role minted at launch and revoked on stop
-(anchored to a stable owner role); the workload contract — a DSN in its env — does
-not change.
+For a **`shared`**, non-default, project-scoped managed DB the runtime DSN carries a
+**dynamic, per-replica role** minted at launch and dropped at stop, anchored to a
+stable per-tenant owner role (so schema ownership never orphans across rotations).
+The workload contract is unchanged — it still just reads a DSN from its env — but the
+password is now short-lived and scoped to that one replica. Every other cell (the
+default tenant, a `single`-isolation DB, a bring-your-own `url_env` binding) keeps the
+static per-tenant credential. The **migration/DDL** identity always stays the stable
+owner role.
+
+## Templatable env for `kv`, `blob`, and `messaging`
+
+The same `{{…}}` mechanism the managed DSN uses works for the other surfaces: each
+`--bind` resolver contributes a `{surface}.*` namespace that the **one** render stage
+expands server-side at launch (an operator value may interleave surfaces and sealed
+secrets in a single string — `"{{kv.url}}?token={{kv.token}}"`). Every surface still
+injects its back-compat default env (`BOATRAMP_<KIND>_URL` + `_AUTH_TOKEN`), so a
+workload that templates nothing keeps working. The `{surface}.<name>.*` form also
+answers for a named binding (e.g. `{{kv.cache.token}}`).
+
+| Variable | Value |
+| --- | --- |
+| `{{kv.url}}` `{{kv.token}}` | the kv-shim base URL + the per-replica bearer token |
+| `{{messaging.url}}` `{{messaging.token}}` | the messaging-shim base URL + the per-replica bearer token |
+| `{{blob.url}}` `{{blob.token}}` | the blob-shim base URL + the per-replica bearer token (full R/W, via the HMAC shim) |
+| `{{blob.endpoint}}` `{{blob.region}}` `{{blob.bucket}}` | direct-S3: the R2/Tigris endpoint, region, and bucket (= the container) |
+| `{{blob.access_key}}` `{{blob.secret}}` `{{blob.session_token}}` `{{blob.prefix}}` | direct-S3: the short-lived STS key pair, session token, and key prefix (whole-container ⇒ empty) |
+
+The kv/messaging/blob-HMAC tokens are per-replica bearers the shim mints at launch and
+**revokes on stop** (they are registry-backed, never stateless — a token never outlives
+its replica), so an off-the-shelf HTTP client in the container reaches exactly the
+per-site `hkv/`/`hblob/` namespace or project bus a `wasi:*` handler sees.
+
+### Direct-to-R2/Tigris for `blob` (the `AWS_*` convention)
+
+When the node wires guest blob-upload minting and the workload binds a **named**
+container (`--bind blob:<container>`), that binding ALSO gets short-lived S3
+`TempCredentials` so an off-the-shelf S3 client (or the AWS SDK) talks **directly** to
+R2/Tigris — no shim hop. The default env follows the AWS SDK convention:
+
+| Default env var | From |
+| --- | --- |
+| `AWS_ENDPOINT_URL` | `{{blob.endpoint}}` |
+| `AWS_ACCESS_KEY_ID` | `{{blob.access_key}}` |
+| `AWS_SECRET_ACCESS_KEY` | `{{blob.secret}}` |
+| `AWS_SESSION_TOKEN` | `{{blob.session_token}}` |
+| `AWS_REGION` | `{{blob.region}}` |
+| `BOATRAMP_BLOB_BUCKET` | `{{blob.bucket}}` (= the container) |
+
+Notes:
+
+- The HMAC shim (`BOATRAMP_BLOB_URL` + `_AUTH_TOKEN`, `{{blob.url}}`/`{{blob.token}}`)
+  is **kept** alongside — it covers the full R/W namespace (the direct-S3 credential is
+  write-scoped: `PutObject` + multipart).
+- A **bare** `--bind blob` (no container) and any backend with **no real STS** (local
+  `fs`/dev) fall back to the HMAC shim only — never a blank or partial credential.
+- The `AWS_*` defaults are injected only when the workload has a **single** `blob`
+  binding (multiple would make the unqualified `AWS_*` ambiguous — then template the
+  named `{{blob.<container>.*}}` vars into whatever env each client reads).
+- STS credentials are leased by a **wall-clock TTL** (the operator ceiling) rather than
+  actively revoked on stop — AWS-style session credentials are stateless-verifiable, so
+  they **let-expire**; a relaunch mints fresh ones. The HMAC token is the revoke-on-stop
+  fallback.
 
 ## Reach a sibling workload by name (internal DNS)
 

@@ -48,9 +48,21 @@ pub mod config;
 /// default project's BLOB + LIBSQL data is still un-re-homed, so the serve guard + `boatramp migrate
 /// --finalize` reach the same bar as the KV version-guard.
 pub mod default_scope;
+/// Ownership-safe per-replica DYNAMIC managed-database credentials (PLAN-compute-managed-db
+/// phase 2): mint-on-launch / revoke-on-stop lifecycle for a compute workload's dynamic DB
+/// role, scoped to the workload's own tenant database. The pure SQL + its live ownership
+/// proof live in `boatramp_storage::tenant_provision`.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod dynamic_creds;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
+/// The shared managed-env template engine + unified render stage (PLAN-compute-managed-resources
+/// Phase 3): the `{{key}}` expander every surface resolver's vars are rendered against, and the
+/// [`RenderStageResolver`](managed_env_template::RenderStageResolver) the node wraps the binding
+/// chain with. Surface-independent, so it is available on a node with no sqlx engine (kv/blob/
+/// messaging shims still get the unified render).
+pub mod managed_env_template;
 // The managed-SQL module carries the Postgres/MySQL operator-SQL + credential machinery (sqlx) AND
 // the migration substrate. It compiles whenever a sqlx engine OR `migrate` (⇒ the embedded libsql
 // migration runner) is on, so the libsql migrate parity is reachable on a node with no external sqlx

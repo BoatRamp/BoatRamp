@@ -93,8 +93,8 @@ use boatramp_storage::sql_compute::{
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
-    soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    force_rls_event_trigger_ddl, grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl,
+    sanitize_ident, soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
 
 use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
@@ -588,7 +588,18 @@ pub async fn provision_tenant(
                 return Ok(());
             }
             let ident = sanitize_ident(&tenant_ident_raw);
-            provision_shared(deploy, &creds, kind, compute, user, project, &names, &ident).await
+            provision_shared(
+                deploy,
+                &creds,
+                kind,
+                compute,
+                user,
+                project,
+                &names,
+                &ident,
+                binding.rls_session,
+            )
+            .await
         }
     }
 }
@@ -675,6 +686,7 @@ async fn provision_shared(
     project: &str,
     names: &TenantNames,
     tenant_ident: &str,
+    rls_session: bool,
 ) -> Result<(), String> {
     // Superuser credential = the server's own managed credential, keyed under the
     // reserved default project + the bare workload (exactly as the server was
@@ -728,6 +740,10 @@ async fn provision_shared(
     // caller (`resolve`) propagates this error and hands back no connection, a
     // partially-created (created-but-not-yet-revoked) database is never served; the
     // next resolve re-runs the idempotent DDL and completes the lockdown. (L2 + M2)
+    // RLS fencing's event trigger is DATABASE-LOCAL (per-database object) and must run connected
+    // to the tenant database, so it is NOT emitted here (this loop runs against the MAINTENANCE
+    // database) — pass `false` to keep the maintenance DDL byte-identical. The FORCE-on-ENABLE
+    // trigger is installed on the tenant-DB connection below (alongside the app-role grants).
     for stmt in provision_ddl(
         kind,
         &names.database,
@@ -735,6 +751,7 @@ async fn provision_shared(
         &tenant_pw,
         &names.owner_role,
         &owner_pw,
+        false,
     ) {
         if let Err(e) = admin.run_script(&stmt).await {
             let is_create_database = stmt.to_ascii_uppercase().contains("CREATE DATABASE");
@@ -755,8 +772,16 @@ async fn provision_shared(
     // schema grants + `ALTER DEFAULT PRIVILEGES` are database-local — as the superuser (which
     // bypasses the CONNECT gate and can set default privileges on behalf of any role). Idempotent;
     // the migrate path re-runs it after each apply so newly-created tables are covered too.
-    let grants = grant_app_role_ddl(kind, &names.role, &names.owner_role);
-    if !grants.is_empty() {
+    let mut tenant_db_ddl = grant_app_role_ddl(kind, &names.role, &names.owner_role);
+    // OPT-IN container RLS fencing (Postgres only): install the FORCE-on-ENABLE event trigger in
+    // the TENANT database (event triggers are per-database objects, so they belong here, not on
+    // the maintenance connection above). The `SECURITY DEFINER` function is owned by the per-tenant
+    // owner so it may FORCE RLS on the owner-owned tenant tables. Idempotent; a re-provision
+    // re-runs it harmlessly. Empty for MySQL (no row-level security).
+    if rls_session {
+        tenant_db_ddl.extend(force_rls_event_trigger_ddl(kind, &names.owner_role));
+    }
+    if !tenant_db_ddl.is_empty() {
         let tenant_resolver = Arc::new(DeployEndpointResolver::new_ungated(
             deploy.clone(),
             DEFAULT_PROJECT,
@@ -772,11 +797,11 @@ async fn provision_shared(
             false,
             Some(Duration::from_secs(10)),
         );
-        for stmt in grants {
+        for stmt in tenant_db_ddl {
             tenant_admin
                 .run_script(&stmt)
                 .await
-                .map_err(|e| format!("grant app role on {}: {e}", names.database))?;
+                .map_err(|e| format!("provision tenant-db DDL on {}: {e}", names.database))?;
         }
     }
     Ok(())

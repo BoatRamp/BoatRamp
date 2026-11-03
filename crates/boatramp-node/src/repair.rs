@@ -1181,6 +1181,9 @@ fn owner_role_ddl(d: &Derived, owner_pw: &str) -> Vec<String> {
         "unused-runtime-password",
         &d.owner_role,
         owner_pw,
+        // Repair only slices out the owner-ROLE statements (below); RLS fencing's event-trigger
+        // tail is never wanted here, so it is off.
+        false,
     )
     .into_iter()
     // Keep ONLY the two owner-ROLE statements (the idempotent `DO … CREATE ROLE` + the

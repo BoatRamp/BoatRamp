@@ -2911,6 +2911,43 @@ jobs:
             || { echo "::error::migrate owner-role confinement gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE OWNER-ROLE CONFINEMENT OK \[postgres\]' migrate-owner.log \
             || { echo "::error::migrate owner-role confinement never reached its marker (a cluster-escape succeeded as the non-superuser owner, or the runtime role gained ownership/escalation)" >&2; exit 1; }
+      - name: Ownership-safe per-replica DYNAMIC credentials on a real Postgres (PLAN-compute-managed-db phase 2)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # Phase 2: a compute workload's managed-DB credential is minted PER REPLICA at launch
+          # and dropped at stop WITHOUT Postgres object-ownership orphaning. On a real PG, the
+          # REAL builders (provision_ddl stable-owner + mint/drop_dynamic_role_ddl) are stood up
+          # and proven: a per-replica dynamic role minted as a member of the stable owner +
+          # `SET role='<owner>'` creates tables OWNED BY THE STABLE OWNER (owns nothing itself);
+          # drops CLEANLY (REASSIGN OWNED->owner, DROP OWNED, DROP ROLE), clearing its CONNECT
+          # grant; a FRESH role then has identical owner-level access; a SET-ROLE-NONE escape is
+          # still clean via the reassign safety net; and the un-mitigated hazard (a naive role
+          # that owns an object CANNOT be dropped) is proven as a negative control. The test is
+          # `#[ignore]` + self-skips on unset env, so we require `--ignored` to run it AND the
+          # success marker so a silent skip or an orphaning regression fails the job.
+          cargo test -p boatramp-storage --features sql-postgres \
+            --test dynamic_creds_ownership_sqlx_live -- --ignored --nocapture 2>&1 | tee dyn-cred-pg.log
+          grep -qE 'test result: ok\. 1 passed' dyn-cred-pg.log \
+            || { echo "::error::dynamic-cred ownership gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DYNAMIC CRED OWNERSHIP OK \[postgres\]' dyn-cred-pg.log \
+            || { echo "::error::dynamic-cred ownership never reached its marker (an object was NOT owner-owned, a drop was NOT clean/orphaned, a fresh role lacked access, the escape safety net failed, or the negative control did not orphan)" >&2; exit 1; }
+      - name: Ownership-safe per-replica DYNAMIC credentials on a real MySQL (PLAN-compute-managed-db phase 2)
+        env:
+          BOATRAMP_TEST_MYSQL_URL: mysql://root:boatramp@localhost:3306/mysql
+        run: |
+          set -eo pipefail
+          # The MySQL analogue: grant-based (no object ownership, so no orphaning), scoped to
+          # <db>.*. A minted dynamic user does DDL+DML, is CONFINED to its tenant db (a second db
+          # it was not granted is unreachable), drops cleanly with the data surviving, and a fresh
+          # user has identical access. `#[ignore]` + self-skip, so require `--ignored` + the marker.
+          cargo test -p boatramp-storage --features sql-mysql \
+            --test dynamic_creds_mysql_live -- --ignored --nocapture 2>&1 | tee dyn-cred-mysql.log
+          grep -qE 'test result: ok\. 1 passed' dyn-cred-mysql.log \
+            || { echo "::error::dynamic-cred mysql gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DYNAMIC CRED OWNERSHIP OK \[mysql\]' dyn-cred-mysql.log \
+            || { echo "::error::dynamic-cred mysql lifecycle never reached its marker (a DDL/DML failure, a confinement breach, a non-surviving data drop, or a fresh-user access regression)" >&2; exit 1; }
       - name: Owner-gated schema-migration SUBSTRATE ledger on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

@@ -1463,6 +1463,38 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
+/// One binding resolver's contribution to the **unified managed-env render stage**
+/// (PLAN-compute-managed-resources Phase 3): the `{surface}.*` template variables it
+/// exposes (e.g. `kv.url`, `kv.token`, `blob.endpoint`, `sql.dsn`) and the default
+/// `(env_key, value)` pairs it injects when the operator set no template for that key.
+///
+/// The render stage unions every resolver's [`vars`](Self::vars) into ONE variable map,
+/// unseals any `{{secret.NAME}}` the operator referenced, renders each templated `env`
+/// value ONCE against that union (so an operator may interleave surfaces in a single
+/// value — `"{{sql.host}} {{kv.token}}"`), then folds each resolver's
+/// [`defaults`](Self::defaults) for the keys the operator did not set. Keeping vars and
+/// defaults distinct (rather than a resolver pre-rendering its own slice) is what lets
+/// the render happen in exactly one place and fail CLOSED on an unknown key.
+#[derive(Debug, Default, Clone)]
+pub struct SurfaceContribution {
+    /// The `{surface}.{key}` template variables this resolver exposes (no `{{}}`
+    /// delimiters — bare keys like `kv.url`). Unioned across resolvers by the render
+    /// stage; a later resolver's key wins on a collision (surfaces never share a key).
+    pub vars: std::collections::BTreeMap<String, String>,
+    /// The default `(env_key, value)` pairs to inject when the operator set no value for
+    /// `env_key` (a hand-set literal or an operator template for that key always wins).
+    pub defaults: Vec<(String, String)>,
+}
+
+impl SurfaceContribution {
+    /// Fold another contribution into this one (the chain merge): extend the var map
+    /// (later keys win) and concatenate the defaults.
+    pub fn merge(&mut self, other: Self) {
+        self.vars.extend(other.vars);
+        self.defaults.extend(other.defaults);
+    }
+}
+
 /// Resolves a workload's declared [`ComputeBinding`]s (PLAN-compute-bindings) to
 /// env vars injected into the guest at launch, registering any backing shim state.
 /// The concrete impl (the sql-shim resolver) lives server-side, where the
@@ -1500,6 +1532,29 @@ pub trait ComputeBindingResolver: Send + Sync {
         _env: &std::collections::BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
         self.resolve(project, workload, replica, bindings).await
+    }
+
+    /// Contribute this resolver's [`SurfaceContribution`] — the `{surface}.*` template
+    /// variables + per-surface default env for `bindings` — to the unified render stage
+    /// (PLAN-compute-managed-resources Phase 3), registering the SAME per-replica shim
+    /// state (token / minted credential) `resolve` would. `env` is the operator-declared
+    /// env (so a surface that must mint only at launch can gate on it being non-empty),
+    /// though most resolvers ignore it (their vars are env-independent). The default impl
+    /// contributes NO vars and takes [`resolve`](Self::resolve)'s output as the defaults —
+    /// so a resolver that does no templating (the libsql sql-shim) needs no change and the
+    /// render stage still injects its endpoint/token as a default.
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        SurfaceContribution {
+            vars: std::collections::BTreeMap::new(),
+            defaults: self.resolve(project, workload, replica, bindings).await,
+        }
     }
 
     /// Release the shim state for a torn-down replica.
@@ -1574,6 +1629,28 @@ impl ComputeBindingResolver for ChainedBindingResolver {
         env
     }
 
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        workload_env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        // Union every inner resolver's `{surface}.*` vars + per-surface defaults into ONE
+        // contribution, so the render stage above renders the operator `env` once against
+        // the whole set (each shim already filters to its own `BindingKind`).
+        let mut out = SurfaceContribution::default();
+        for resolver in &self.resolvers {
+            out.merge(
+                resolver
+                    .contribute(project, workload, replica, bindings, workload_env)
+                    .await,
+            );
+        }
+        out
+    }
+
     async fn release(
         &self,
         project: &str,
@@ -1596,6 +1673,24 @@ impl ComputeBindingResolver for ChainedBindingResolver {
 /// — empty when `workload` is not a managed database. **Idempotent**: the credential
 /// is generated once + sealed, then stable, so it is safe to call on every launch
 /// (the DB, initialized with it, keeps accepting the same password across restarts).
+/// One orphaned per-replica dynamic DB credential the sweep dropped (or, in dry-run, would
+/// drop) — the audit line for [`ManagedDbEnvResolver::sweep_orphan_dynamic_db_creds`]. Carries
+/// no secret (the role NAME is not sensitive; the sealed password never appears).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptDynamicCred {
+    /// The consumer/tenant project the credential was minted for.
+    pub project: String,
+    /// The managed server workload (the `compute` binding) the role lived on.
+    pub compute: String,
+    /// The replica identity ([`compute_instance_id`]) whose stop/absence orphaned the cred.
+    pub instance_id: String,
+    /// The dropped dynamic role / user name (non-secret).
+    pub role: String,
+    /// `true` when the role + sealed password were actually dropped; `false` in a dry-run
+    /// (identified as reapable but left untouched).
+    pub dropped: bool,
+}
+
 /// The concrete impl lives in `boatramp-node`, where the handler sql config + the
 /// sealed-credential store are; the reconcile only calls this trait.
 #[async_trait]
@@ -1652,6 +1747,74 @@ pub trait ManagedDbEnvResolver: Send + Sync {
         _endpoint: &Endpoint,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// **Mint** this replica's per-replica DYNAMIC database credential at launch, for a
+    /// workload that CONSUMES a managed database (PLAN-compute-managed-db phase 2). Called
+    /// once per launch, BEFORE binding resolution, so a DSN injector reads the freshly-
+    /// minted (sealed) per-replica credential. `bindings` are the launching workload's
+    /// declared bindings — the node impl resolves each `sql` binding to the managed DB it
+    /// names and mints that tenant's per-replica role. A workload that consumes no managed database
+    /// — and every cell where phase 2 does not apply (a bring-your-own `url_env` binding,
+    /// the reserved default tenant, `Single` isolation) — is a no-op `Ok(())`. An `Err`
+    /// FAILS the launch CLOSED (a consumer must not serve without its credential). The node
+    /// impl delegates to
+    /// [`boatramp_node::dynamic_creds::mint_dynamic_role`](../../boatramp_node/dynamic_creds/fn.mint_dynamic_role.html).
+    /// Defaulted to a no-op so a resolver that does not implement phase 2 is unaffected.
+    async fn mint_dynamic_db_cred(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _bindings: &[ComputeBinding],
+        _replica: u32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// **Revoke + drop** this replica's dynamic database credential at stop (PLAN-compute-
+    /// managed-db phase 2) — the `DROP OWNED` / `DROP ROLE` (or `DROP USER`) that keeps a
+    /// stopped replica's role from lingering. Idempotent: a non-consumer workload, an
+    /// already-dropped role, and an already-deleted credential are all no-ops, so it is safe
+    /// to call again (and from the orphan reaper). A revoke error is non-fatal to the
+    /// reconcile (the replica is already stopped; the next sweep retries). The node impl
+    /// delegates to
+    /// [`boatramp_node::dynamic_creds::revoke_dynamic_role`](../../boatramp_node/dynamic_creds/fn.revoke_dynamic_role.html).
+    /// Defaulted no-op.
+    async fn revoke_dynamic_db_cred(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _bindings: &[ComputeBinding],
+        _replica: u32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// **Sweep** orphaned per-replica dynamic DB credentials (PLAN-compute-managed-db phase 2,
+    /// Security HIGH-1) — the reconciliation backstop that keeps a MISSED stop (a node crash,
+    /// a node loss, a permanent scale-down, a workload deletion, or a stop whose revoke errored
+    /// on a transient DB outage) from leaking an operates-as-owner login role + its sealed
+    /// password INDEFINITELY. Enumerates the sealed dynamic-cred keys and DROPS (revoke DDL +
+    /// delete the sealed password) every one whose owning replica is **gone**:
+    /// `live` is the set of `(consumer_project, compute_instance_id)` PAIRS for every PERSISTED
+    /// replica record (the reaper gathers it in the same pass), and a cred whose
+    /// `(consumer_project, instance_id)` pair is in that set is KEPT — so the sweep is
+    /// tenant-correct (it drops only a cred whose owning replica no longer exists, never one
+    /// belonging to a live or parked replica, even on another node). The pair — not the bare
+    /// `instance_id` — is the key because [`compute_instance_id`]'s hyphen-join aliases across
+    /// project/workload splits (`("acme-web","api")` and `("acme","web-api")` both yield
+    /// `acme-web-api`), so a bare-id live set could let one tenant's live replica mask another
+    /// tenant's orphan; pairing with the (raw, un-joined) consumer project disambiguates.
+    /// Idempotent (the underlying revoke is: an already-gone role + an
+    /// already-deleted password are no-ops). `dry_run` identifies the orphans and returns them
+    /// with `dropped = false` WITHOUT touching anything. Hooked into the orphan reaper's `All`
+    /// pass. Defaulted no-op so a resolver that does not implement phase 2 is unaffected.
+    async fn sweep_orphan_dynamic_db_creds(
+        &self,
+        _live: &std::collections::HashSet<(String, String)>,
+        _dry_run: bool,
+    ) -> Result<Vec<SweptDynamicCred>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -2153,6 +2316,20 @@ pub async fn reconcile_once(
                             .push(format!("{wl}/{replica}: no backend {backend:?}"));
                         continue;
                     };
+                    // Phase 2 (PLAN-compute-managed-db): mint this replica's DYNAMIC database
+                    // credential BEFORE binding resolution, so a DSN injector reads the
+                    // freshly-sealed per-replica credential. Fail CLOSED — a consumer must not
+                    // launch without its credential. A non-consumer workload is a no-op.
+                    if let Some(m) = managed_db
+                        && let Err(e) = m
+                            .mint_dynamic_db_cred(&project_name, &wl, &spec.bindings, replica)
+                            .await
+                    {
+                        report
+                            .errors
+                            .push(format!("{wl}/{replica}: mint dynamic db cred: {e}"));
+                        continue;
+                    }
                     let node_region = region_of_node(nodes, node);
                     // Resolve declared bindings → env injected into the guest (registers
                     // the shim token for this replica).
@@ -2254,17 +2431,7 @@ pub async fn reconcile_once(
                             .errors
                             .push(format!("{}/{}: stop: {e}", handle.workload, handle.replica));
                     }
-                    match deploy
-                        .delete_replica_state(project, &handle.workload, handle.replica)
-                        .await
-                    {
-                        Ok(()) => report.stopped += 1,
-                        Err(e) => report.errors.push(format!(
-                            "{}/{}: forget: {e}",
-                            handle.workload, handle.replica
-                        )),
-                    }
-                    // Revoke this replica's shim tokens.
+                    // Revoke this replica's shim tokens (idempotent; independent of the DB cred).
                     if let Some(resolver) = resolver
                         && !spec.bindings.is_empty()
                     {
@@ -2276,6 +2443,45 @@ pub async fn reconcile_once(
                                 &spec.bindings,
                             )
                             .await;
+                    }
+                    // Phase 2 (PLAN-compute-managed-db, Security HIGH-1): revoke + drop this
+                    // replica's DYNAMIC database credential BEFORE forgetting the replica, so a
+                    // revoke failure (e.g. a transient DB outage) is RETRIABLE: the replica
+                    // record is kept, the next reconcile re-plans this Stop and retries the
+                    // revoke, and the credential never lingers un-dropped past a forgotten
+                    // record. The revoke is idempotent (a non-consumer / already-gone role /
+                    // already-deleted password are all no-ops), so re-running is harmless. A
+                    // stop that is MISSED entirely (crash, node loss, permanent scale-down) is
+                    // caught by the orphan reaper's dynamic-cred sweep, which drops any cred
+                    // whose replica record is gone.
+                    if let Some(m) = managed_db
+                        && let Err(e) = m
+                            .revoke_dynamic_db_cred(
+                                &project_name,
+                                &handle.workload,
+                                &spec.bindings,
+                                handle.replica,
+                            )
+                            .await
+                    {
+                        report.errors.push(format!(
+                            "{}/{}: revoke dynamic db cred (replica kept for retry): {e}",
+                            handle.workload, handle.replica
+                        ));
+                        // Keep the replica record so the next pass retries; do NOT forget it.
+                        continue;
+                    }
+                    // Credential is gone (or there was none) — now it is safe to forget the
+                    // replica. A delete failure is surfaced but still terminal for this pass.
+                    match deploy
+                        .delete_replica_state(project, &handle.workload, handle.replica)
+                        .await
+                    {
+                        Ok(()) => report.stopped += 1,
+                        Err(e) => report.errors.push(format!(
+                            "{}/{}: forget: {e}",
+                            handle.workload, handle.replica
+                        )),
                     }
                 }
                 Action::Snapshot { handle } => {
@@ -4289,6 +4495,166 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A managed-DB resolver that records every dynamic-cred revoke and fails or succeeds on
+    /// command — to prove the Stop path's revoke is RETRIABLE (Security HIGH-1): a failing
+    /// revoke must NOT forget the replica.
+    struct RevokeSpyDb {
+        fail: bool,
+        revokes: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ManagedDbEnvResolver for RevokeSpyDb {
+        async fn managed_db_env(&self, _p: &str, _w: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        async fn revoke_dynamic_db_cred(
+            &self,
+            _p: &str,
+            _w: &str,
+            _bindings: &[ComputeBinding],
+            _r: u32,
+        ) -> Result<(), String> {
+            self.revokes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err("db outage".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Security HIGH-1: on Stop the dynamic-cred revoke runs BEFORE the replica record is
+    /// forgotten, so a FAILED revoke keeps the record for a retry on the next reconcile —
+    /// the credential can never linger past a forgotten replica. A later pass whose revoke
+    /// succeeds then forgets it.
+    #[tokio::test]
+    async fn reconcile_keeps_replica_when_dynamic_cred_revoke_fails_then_forgets_on_success() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let s = spec(1, 128);
+        let hash = deploy.put_compute_spec(&s).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash.clone(),
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+
+        // Launch the single replica (no managed DB involved in the launch).
+        reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Scale to zero → a Stop is planned. The revoke FAILS, so the replica is kept.
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 0,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let failing = RevokeSpyDb {
+            fail: true,
+            revokes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            Some(&failing),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.stopped, 0, "a failed revoke must NOT count as stopped");
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("revoke dynamic db cred")),
+            "the retriable revoke failure must surface: {:?}",
+            r.errors
+        );
+        assert_eq!(failing.revokes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the replica record must be KEPT so the next pass retries the revoke"
+        );
+
+        // Next pass: the revoke SUCCEEDS → the replica is finally forgotten.
+        let ok = RevokeSpyDb {
+            fail: false,
+            revokes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let r2 = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            Some(&ok),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r2.stopped, 1,
+            "a succeeding revoke forgets the replica: {:?}",
+            r2.errors
+        );
+        assert_eq!(ok.revokes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the replica must be forgotten once its credential is revoked"
         );
     }
 
