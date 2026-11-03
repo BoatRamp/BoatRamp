@@ -1,0 +1,12 @@
+# The buf module for the boatramp Connect/gRPC-web example protos (PLAN-connect-grpc §9 / IU-5).
+# `just codegen` compiles these into the vendored Rust client (via prost) and the vendored
+# Web/TypeScript connect-es client (via buf + protoc-gen-es) — see `proto/buf.gen.yaml`.
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

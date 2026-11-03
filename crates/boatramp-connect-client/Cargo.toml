@@ -1,0 +1,43 @@
+# The boatramp Connect / gRPC-web **client shim** (PLAN-connect-grpc §9 / IU-5): the
+# client-direction analog of the `boatramp-connect` serving shim (which lives in the
+# boatramp-uchron-shim repo). Where the serving shim maps an inbound Connect RPC onto a managed
+# handler, this crate lets a Rust caller — the `boatramp` CLI, a host service, or (once vendored
+# into the shim repo) a guest making an outbound call — INVOKE a Connect unary / server-streaming
+# method on a live boatramp Connect service.
+#
+# It is built on the SAME shared `boatramp-connect-frame` codec the host serving path and the guest
+# serving shim use, so there is exactly one wire vocabulary; the Connect protocol version it speaks
+# is `boatramp_connect_frame::CONNECT_PROTOCOL_VERSION` ("1"), matching the serving shim.
+#
+# The protocol logic is transport-agnostic (a `Transport` trait); the crate ships a dependency-free
+# std `PlaintextHttpTransport` (HTTP/1.1, used by the live gates and for plaintext/overlay dials).
+# A production HTTPS caller implements the same trait over its own HTTP client — see the crate docs.
+[package]
+name = "boatramp-connect-client"
+version.workspace = true
+# Pinned to edition 2021, matching the sibling `boatramp-connect-frame` (which must stay 2021 for
+# its byte-identical shim vendoring); keeping both connect crates on one edition avoids divergence
+# and the edition-2024 clippy/fmt source churn.
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "boatramp Connect / gRPC-web client shim: invoke a Connect unary / server-streaming RPC on a live boatramp Connect service. The client-direction analog of the boatramp-connect serving shim, built on the shared boatramp-connect-frame codec."
+repository = "https://github.com/BoatRamp/BoatRamp"
+
+[lib]
+
+[dependencies]
+# The shared Connect / gRPC-web wire-framing codec (envelope + status vocabulary + the client-side
+# decoders). The one codec the host serving path and both shims share.
+boatramp-connect-frame = { workspace = true }
+# Protobuf runtime (message encode/decode). PINNED EXACT, matching the serving shim + codegen.
+prost = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests derive `prost::Message` directly (no protoc) to exercise the request build + response parse.
+prost = { workspace = true }
+
+# NB: no `[lints] workspace = true`, matching the sibling `boatramp-connect-frame`: this crate is the
+# client-direction analog that is also vendored into the shim repo, so it stays on clippy's default
+# lint set rather than the host workspace's idiomaticity lints (which would force source rewrites).

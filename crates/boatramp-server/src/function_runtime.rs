@@ -1266,6 +1266,10 @@ pub(super) async fn build_function_bindings(
                         // is a possible future extension (see PLAN-sealed-state-source); None here ⇒
                         // the source fails closed on the function lane.
                         sealed_state: None,
+                        // The construens #2 `pre_auth_request` source is likewise a SITE-HANDLER
+                        // serving-path capability (the pre-auth `/sso/start` route); None here ⇒ it
+                        // fails closed on the function lane.
+                        preauth: None,
                     },
                 )
                 .await

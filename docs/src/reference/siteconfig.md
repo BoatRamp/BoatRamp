@@ -194,8 +194,13 @@ Each `TenantSource` is `{"kind":"token","claim":"tid"}` (a verified JWT claim, `
 `{"kind":"sealed_state","param":{"kind":"query","name":"state"}}` (unseal an AEAD-sealed **state
 token** off a request `query` param — or a `header` — the pre-auth OIDC-callback tenant, resolved
 from the crypto seal and never parsed from request text; a tampered/forged/expired/missing token
-resolves nothing, fail-closed), or `{"kind":"none"}`
-(anonymous — an "own" grant then fails closed).
+resolves nothing, fail-closed),
+`{"kind":"pre_auth_request","selector":{"location":"query","name":"tenant"}}` (resolve the firm
+**host-side** from a configured request `location` — `host`/`query`/`path`/`body` — on an **unscoped
+login-start**, so the `sealed_state` *mint* can seal it; a **seal-only** subject that reaches only the
+mint — never a data tenant, no row/secret access at `/sso/start` — resolving only to a provisioned
+firm with a uniform fail-closed outcome; must be the route's **only** source, off by default), or
+`{"kind":"none"}` (anonymous — an "own" grant then fails closed).
 
 `AccessMode` is one of `none` (deny), `null` (the `tenant_id IS NULL` shared baseline only), `own`
 (the resolved tenant), `own_or_null` (both), or `all` (cross-tenant — default-deny, gated by the

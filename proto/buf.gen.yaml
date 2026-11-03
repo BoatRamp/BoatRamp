@@ -1,0 +1,20 @@
+# buf codegen template for the Web/TypeScript connect-es client (PLAN-connect-grpc §9 / IU-5).
+#
+# Run via `just codegen` from the repo root with `clients/ts/node_modules/.bin` on PATH (the
+# exact-pinned `@bufbuild/protoc-gen-es` from `clients/ts/package-lock.json`, installed with
+# `npm ci`). Connect-ES v2: `protoc-gen-es` emits BOTH the message types AND the service
+# descriptors; the runtime client is `createClient(Service, transport)` from `@connectrpc/connect`
+# over a `createConnectTransport({ useBinaryFormat: true })` from `@connectrpc/connect-web` (binary
+# proto over connect-web — the JSON codec is a deferred ergonomics add). The separate
+# `protoc-gen-connect-es` plugin of Connect-ES v1 is deprecated and intentionally not used.
+#
+# `out` is resolved relative to the repo root (the cwd `just codegen` runs buf from). The generated
+# TypeScript under `clients/ts/generated/` is VENDORED/committed and byte-reproducible.
+version: v2
+clean: true
+plugins:
+  - local: protoc-gen-es
+    out: clients/ts/generated
+    opt:
+      - target=ts
+      - import_extension=js

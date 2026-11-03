@@ -44,6 +44,7 @@
 - [Isolate tenants within a project](./how-to/tenant-isolation.md)
 - [Run owner-gated schema migrations](./how-to/in-app-migrations.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
+- [Generate a Connect / gRPC client](./how-to/connect-clients.md)
 - [Mint a delegated capability](./how-to/delegated-capabilities.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
 - [Build a duplex agent session (SSE + resume)](./how-to/sessions.md)

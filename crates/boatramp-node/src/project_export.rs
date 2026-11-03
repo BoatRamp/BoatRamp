@@ -43,13 +43,17 @@
 //! our own trusted DDL (`CREATE ROLE`/`CREATE/ALTER/DROP DATABASE`/`REASSIGN OWNED`), and pre-creates
 //! the operator trusted-extension allowlist in the shadow so a legit `CREATE EXTENSION IF NOT EXISTS
 //! <ext>` (pgvector) no-ops under the non-superuser apply. Residuals / boundaries: a `--data-only`
-//! member and a Shared/external member are NOT chunked, and a MANAGED sidecar apply is REFUSED
-//! fail-closed (it would apply as superuser — a least-privilege sidecar apply is the follow-up); an
-//! EXTERNAL bring-your-own-URL binding applies with the OPERATOR'S OWN credential against the
-//! operator's own database (their trust boundary); a Shared multi-tenant server is refused for
-//! chunked shadow-restore (the per-import physical shadow db is a cross-tenant surface deferred to
-//! the temp-schema follow-up, default #3 = temp-DB for dedicated/Single). The bundle is NOT
-//! whole-bundle atomic (cross-member window); overwriting a populated DB peaks at ~2× its size.
+//! member and a Shared/external member are NOT chunked. A MANAGED **FULL** sidecar member (a Shared
+//! tenant's pg export is framed sidecar; also any FULL dedicated dump staged sidecar) is applied via
+//! the SAME non-superuser ephemeral-role + shadow + atomic-swap mechanism (`pg_sidecar_shadow_restore`
+//! → `pg_shadow_plan`/`pg_create_shadow`/`pg_restore_shadow_invocation`/`pg_swap_shadow`): for a
+//! Shared tenant the per-tenant physical shadow is grant-isolated at creation (REVOKE PUBLIC) and the
+//! swapped-in db is re-provisioned to the per-tenant grants, so a cloned Shared tenant db is never a
+//! cross-tenant surface and is servable exactly like a provisioned one. A MANAGED **data-only**
+//! sidecar member is STILL refused fail-closed (an overlay into a live schema has no atomic shadow —
+//! a least-privilege overlay apply is the follow-up); an EXTERNAL bring-your-own-URL binding applies
+//! with the OPERATOR'S OWN credential against the operator's own database (their trust boundary). The
+//! bundle is NOT whole-bundle atomic (cross-member window); overwriting a populated DB peaks at ~2×.
 #![cfg(feature = "project-export")]
 
 use std::collections::{BTreeMap, HashMap};
@@ -78,12 +82,13 @@ use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
 
 use crate::config::ExternalDatabaseConfig;
-use crate::managed_sql::{ManagedSqlCredentials, operator_target};
+use crate::managed_sql::{ManagedSqlCredentials, operator_target, owner_target};
 use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
     mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
     mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
     pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major, psql_invocation,
+    psql_script_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -212,6 +217,105 @@ fn kind_is_mysql(kind: &str) -> bool {
 /// a managed binding (HIGH-1).
 fn is_managed_binding(cfg: &ExternalDatabaseConfig) -> bool {
     cfg.compute.as_deref().is_some_and(|c| !c.is_empty())
+}
+
+/// The sealed-credential KV keys that THIS node's own managed-DB self-provisioning
+/// (`ensure_target_db_provisioned` → [`crate::tenant_sql::provision_tenant`], run during a clone's
+/// member restore) mints for the tenant `(project, "")` across `databases`.
+///
+/// Re-derived the SAME way `provision_tenant` seals them (via [`crate::tenant_sql::tenant_key`] +
+/// [`crate::tenant_sql::tenant_names`] + the credential-key helpers) — the established "re-derive the
+/// tenant's names rather than guess" pattern in this crate — so the set can never drift from what a
+/// fresh provision actually writes. It is the `--fresh` identity drop's keep-set: those creds are
+/// locally minted + sealed under THIS node's KEK and the live roles/containers already authenticate
+/// with them, so the drop must NOT delete them (dropping one desyncs the sealed credential from the
+/// live role → the cloned tenant's own role can no longer connect). Every other `managed-sql-cred`
+/// key under the project is source-carried (a `--include-identity` KV member) and IS dropped.
+///
+/// Mirrors `provision_tenant`'s scope rules: a site-scoped binding is skipped (the clone
+/// self-provision refuses it, so it mints nothing); a Shared DEFAULT tenant mints nothing (the
+/// superuser is the app user); a Shared non-default tenant mints the login + owner creds; a Single
+/// tenant mints its workload cred (under its own `(cred_project, workload)`).
+fn self_provisioned_managed_cred_keys(
+    databases: &std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+    project: &str,
+) -> std::collections::BTreeSet<String> {
+    use crate::config::{TenantIsolation, TenantScope};
+    use crate::tenant_sql::{
+        credential_workload_key, owner_credential_workload_key, single_credential_project,
+        tenant_key, tenant_names,
+    };
+    // The KV key layout `ManagedSqlCredentials` seals under (kept in lockstep with
+    // `ManagedSqlCredentials::key`, which is private, and with the `managed-sql-cred/{project}/`
+    // prefix in `sealed_secret_prefixes`).
+    let cred_key = |project: &str, workload: &str| format!("managed-sql-cred/{project}/{workload}");
+
+    let mut keys = std::collections::BTreeSet::new();
+    for cfg in databases.values() {
+        let Some(compute) = cfg.compute.as_deref().filter(|c| !c.is_empty()) else {
+            continue; // bring-your-own url_env binding — not ours to provision.
+        };
+        if ExternalSqlKind::parse(&cfg.kind).is_none() {
+            continue; // config validation rejects this before serve.
+        }
+        // The clone self-provision only provisions a project-scoped binding (a site-scoped one is
+        // skipped by `ensure_target_db_provisioned`), so only that mints a credential.
+        if matches!(cfg.tenant_scope, TenantScope::Site) {
+            continue;
+        }
+        let database = cfg.database.as_deref().unwrap_or_default();
+        let (tenant_ident_raw, is_default) = tenant_key(cfg.tenant_scope, project, "");
+        let names = tenant_names(cfg.tenant, compute, database, &tenant_ident_raw, is_default);
+        match cfg.tenant {
+            TenantIsolation::Single => {
+                let cred_project = single_credential_project(project, is_default);
+                keys.insert(cred_key(&cred_project, &names.workload));
+            }
+            TenantIsolation::Shared => {
+                if is_default {
+                    continue; // the default shared tenant is the plain install — mints nothing.
+                }
+                let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+                keys.insert(cred_key(project, &credential_workload_key(compute, &ident)));
+                keys.insert(cred_key(
+                    project,
+                    &owner_credential_workload_key(compute, &ident),
+                ));
+            }
+        }
+    }
+    keys
+}
+
+/// How a SIDECAR (non-chunked) pg dump member must be applied on import — the narrowed post-HIGH-1
+/// policy (the untrusted dump must never reach the bootstrap superuser). A pure (managed × data_only)
+/// decision, factored out so the narrowing is unit-testable without a live backend.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarPgApply {
+    /// EXTERNAL bring-your-own-URL binding: the operator's OWN database + credential (their trust
+    /// boundary, not our managed cluster) — the dump is applied directly.
+    External,
+    /// MANAGED + FULL dump: apply via the atomic NON-superuser ephemeral-role shadow+swap. The
+    /// untrusted dump never reaches the bootstrap superuser, and the self-provisioned target is
+    /// replaced atomically (fresh or overwrite) — never a partial live overlay. This serves a Shared
+    /// tenant's sidecar-framed FULL export and any FULL dedicated dump staged sidecar.
+    ManagedShadowSwap,
+    /// MANAGED + data_only: an OVERLAY into the target's existing live schema. There is NO atomic
+    /// shadow for an overlay, and a direct apply would run as the bootstrap superuser (RCE) —
+    /// REFUSED fail-closed (a least-privilege overlay apply is a pending follow-up).
+    RefuseManagedDataOnly,
+}
+
+/// Decide how a SIDECAR pg dump member is applied. The narrowing (vs. the prior blanket "refuse all
+/// managed sidecar apply") is EXACTLY: a managed FULL dump is now applied via the atomic
+/// non-superuser shadow+swap; a managed `data_only` dump is STILL refused (overlay into a live
+/// schema, no atomic shadow); an external binding is applied directly as before.
+fn sidecar_pg_apply(is_managed: bool, data_only: bool) -> SidecarPgApply {
+    match (is_managed, data_only) {
+        (false, _) => SidecarPgApply::External,
+        (true, false) => SidecarPgApply::ManagedShadowSwap,
+        (true, true) => SidecarPgApply::RefuseManagedDataOnly,
+    }
 }
 
 /// Parse a `postgres://` / `mysql://` DSN into `(user, password, host, port, database)`
@@ -598,6 +702,14 @@ pub struct NodeProjectExport {
     /// relative name under this base; the host confines it (no escape) — the caller never
     /// supplies an absolute node path.
     resumable_base: Option<PathBuf>,
+    /// TEST-ONLY restore-window widener (milliseconds). `0` in every production build — only a
+    /// debug/test build can set it via [`with_shadow_restore_test_delay_ms`](Self::with_shadow_restore_test_delay_ms)
+    /// (that builder does not even compile under `--release`). When non-zero, `pg_create_shadow`
+    /// holds the SHARED shadow in existence (locked down: PUBLIC CONNECT already revoked + swept)
+    /// for this long before the restore proceeds, so the cross-tenant live gate can observe the
+    /// shadow while it exists and prove a sibling can never CONNECT to it. The hold is a plain
+    /// `tokio::time::sleep` that owns no DB connection; it changes no DDL and no statement order.
+    shadow_restore_test_delay_ms: u64,
 }
 
 impl NodeProjectExport {
@@ -632,7 +744,23 @@ impl NodeProjectExport {
             import_total_cap: DEFAULT_IMPORT_TOTAL_CAP,
             trusted_extensions: Vec::new(),
             resumable_base: None,
+            shadow_restore_test_delay_ms: 0,
         }
+    }
+
+    /// TEST-ONLY: hold the SHARED pg shadow in existence for `ms` milliseconds inside
+    /// `pg_create_shadow` — AFTER the shadow is created AND locked down (PUBLIC CONNECT revoked +
+    /// a terminate-sweep) — before the restore proceeds. Lets the cross-tenant live gate
+    /// (`project_export_clone_self_provisions_a_fresh_shared_tenant_live`) observe the shadow while
+    /// it exists and prove a sibling tenant can never CONNECT to it. Inert by default — the field
+    /// stays `0` unless a test sets it, so a release binary (which never calls this setter) runs
+    /// with no added delay. It widens only the window — it changes no DDL, no statement order, and
+    /// holds no DB connection. NOT `cfg(debug_assertions)`-gated: the integration test links the
+    /// library as built in CI (a non-debug profile), where that gate would hide the setter → E0599.
+    #[must_use]
+    pub fn with_shadow_restore_test_delay_ms(mut self, ms: u64) -> Self {
+        self.shadow_restore_test_delay_ms = ms;
+        self
     }
 
     /// Set the operator trusted-extension allowlist (from
@@ -1042,6 +1170,54 @@ impl NodeProjectExport {
         Ok((ep.into_mysql(self.connect_timeout_secs), image, version))
     }
 
+    /// Clone/import self-provision (PLAN-clone-self-provision-managed-db): before an import's
+    /// pg/mysql member restore connects to the TARGET's managed database, make sure it actually
+    /// EXISTS. Reuses the EXISTING lazy provisioner, [`tenant_sql::provision_tenant`] — the SAME
+    /// code the platform already runs on a normal managed-sql access (`provision_single`'s
+    /// workload registration) and on the `boatramp apply` / `db ensure database` declare path
+    /// (`NodeManagedDbDeclare::provision`). Without this, a clone onto a FRESH target (project
+    /// shell created, managed db never touched) fails the readiness probe with a confusing
+    /// "database … does not exist" instead of actually provisioning it (construens's clone
+    /// failure shape).
+    ///
+    /// - **Idempotent**: "already exists" is success (re-running on an already-provisioned
+    ///   target is a no-op — [`tenant_sql::provision_tenant`]'s own contract).
+    /// - **Target-scoped ONLY**: provisions exactly `(project, "")`'s OWN binding — the tenant
+    ///   name/database/role are derived from `project` (the clone's TARGET), never from anything
+    ///   source-carried, and never another project's. This is the tenancy-sensitive seam a
+    ///   Security review gates.
+    /// - A no-op for a bring-your-own (`url_env`) binding (nothing of ours to provision) and for
+    ///   a **site-scoped** managed database: operator SQL (the seam `resolve_pg`/`resolve_mysql`
+    ///   use) is project-level only and refuses a site-scoped binding regardless
+    ///   ([`crate::managed_sql::operator_target`]), so there is nothing reachable here to
+    ///   provision — the existing refusal stands unchanged.
+    async fn ensure_target_db_provisioned(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<(), Perr> {
+        if !is_managed_binding(cfg) {
+            return Ok(()); // bring-your-own URL — the operator's own database, not ours to create.
+        }
+        if matches!(cfg.tenant_scope, crate::config::TenantScope::Site) {
+            return Ok(()); // operator SQL can't target a site's db anyway; resolve_* refuses it.
+        }
+        let envelope = self.envelope.as_ref().ok_or_else(|| {
+            Perr::Unavailable(format!(
+                "managed database {db:?} needs a [secrets] envelope to unseal its credential — \
+                 none on this node"
+            ))
+        })?;
+        crate::tenant_sql::provision_tenant(&self.deploy, &self.kv, envelope, cfg, project, "")
+            .await
+            .map_err(|e| {
+                Perr::Other(format!(
+                    "clone self-provision of database {db:?} failed: {e}"
+                ))
+            })
+    }
+
     /// Best-effort schema-ledger fingerprint of a Postgres database (the applied
     /// migration set + content hashes). `None` if the ledger can't be read (e.g. no
     /// migrations table, or no operator-SQL seam) — the skew check then has nothing to
@@ -1163,11 +1339,72 @@ fn shadow_suffix() -> String {
     format!("{nanos}_{}", std::process::id())
 }
 
+/// Postgres `NAMEDATALEN - 1`: the maximum BYTE length of a stored identifier before the server
+/// silently TRUNCATES it to this prefix (emitting a `NOTICE: identifier … will be truncated`).
+/// MySQL's identifier cap is 64 bytes, so bounding a derived name to this value is safe for BOTH
+/// engines.
+const MAX_DERIVED_DB_NAME_LEN: usize = 63;
+
+/// Compose a transient database name `<live_db><marker><suffix>` (the `__shadow_` / `__old_` aside
+/// names) that NEVER exceeds Postgres's 63-byte identifier limit.
+///
+/// A Shared-tenant live db name is tenant-qualified and already close to the 63-byte cap, so the
+/// naive `format!("{live_db}{marker}{suffix}")` can push the identifier past `NAMEDATALEN`.
+/// Postgres then TRUNCATES the name back to its first 63 bytes — which, for a long live db,
+/// collapses right back to the LIVE name — so the shadow `CREATE DATABASE` fails with
+/// `database … already exists` and the clone/import fails. (Latent for ANY live db long enough
+/// that `<live><marker><suffix>` crosses 63 bytes, not only Shared tenants.)
+///
+/// Contract:
+/// - **Short names unchanged.** When `<live_db><marker><suffix>` already fits in 63 bytes the
+///   result is byte-identical to `format!("{live_db}{marker}{suffix}")`, so the dedicated/chunked
+///   path and every existing shadow-name test keep their exact names.
+/// - **Long names bounded.** Otherwise the `live_db` PREFIX is truncated (on a UTF-8 char
+///   boundary, never splitting a multi-byte sequence) to whatever room is left, so the whole name
+///   is ≤ 63 bytes while the FULL `{marker}{suffix}` distinguisher is preserved intact and within
+///   the first 63 bytes. This guarantees the result is (a) ≤ 63 bytes; (b) distinct from `live_db`
+///   truncated to 63 bytes (it ends in the `{marker}{suffix}` tail that a plain truncation of
+///   `live_db` drops — the exact collapse that caused the bug); (c) collision-free across imports,
+///   because the per-import-unique `suffix` is retained verbatim; and (d) still carrying the intact
+///   `marker` substring, so the `%__shadow_%` / `%__old_%` startup-sweep LIKE-patterns keep
+///   matching it. The marker (and suffix) are NEVER truncated — only the `live_db` prefix is.
+fn bounded_derived_db_name(live_db: &str, marker: &str, suffix: &str) -> String {
+    let tail_len = marker.len() + suffix.len();
+    if live_db.len() + tail_len <= MAX_DERIVED_DB_NAME_LEN {
+        return format!("{live_db}{marker}{suffix}");
+    }
+    // Keep the whole `{marker}{suffix}` distinguisher; give the live_db prefix whatever bytes are
+    // left (possibly zero). Floor the cut at a UTF-8 char boundary so a multi-byte char is intact.
+    let keep = MAX_DERIVED_DB_NAME_LEN.saturating_sub(tail_len);
+    let mut end = keep.min(live_db.len());
+    while end > 0 && !live_db.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}{suffix}", &live_db[..end])
+}
+
 /// Quote a Postgres **string literal** (single-quoted, doubling any embedded `'`) — for the
 /// `datname = '<db>'` predicate of our own generated `pg_terminate_backend` / `pg_database`
 /// utility SQL (the db name is driver-derived, never a credential or bundle data).
 fn pg_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Compose the superuser terminate-sweep that evicts EVERY backend attached to database `db`
+/// except our own. On the SHARED shadow path this clears any session a sibling tenant slipped
+/// onto the shadow during the (now batched, gap-minimized) `CREATE DATABASE` → `REVOKE CONNECT …
+/// FROM PUBLIC` window — `REVOKE` blocks only NEW connects, so the sweep is what evicts a session
+/// that connected before the revoke took effect. Run immediately before the untrusted restore so
+/// the restore begins on a shadow with ZERO foreign sessions.
+///
+/// `db` is a driver-derived name (never attacker-controlled); it is quoted as a SQL string literal
+/// via [`pg_lit`] for the `datname =` predicate — the SAME quoting the swap/teardown sweeps use.
+fn pg_terminate_backends_sql(db: &str) -> String {
+    format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = {} AND pid <> pg_backend_pid()",
+        pg_lit(db)
+    )
 }
 
 /// POSIX-single-quote each token of a driver-composed argv and join with spaces, so the
@@ -1741,6 +1978,40 @@ struct PgShadowPlan {
     /// The operator trusted-extension allowlist the superuser pre-creates in the shadow (so a legit
     /// `CREATE EXTENSION IF NOT EXISTS <ext>` in the dump no-ops under the non-superuser apply).
     trusted_extensions: Vec<String>,
+    /// SHARED multi-tenant re-provisioning context (`Some` only for a Shared NON-default tenant;
+    /// `None` for Single/dedicated + Shared-DEFAULT, which keep the original swap behavior). When
+    /// set, the shadow is grant-isolated at creation (`pg_create_shadow` REVOKEs PUBLIC CONNECT) and
+    /// the swapped-in db is re-provisioned to the per-tenant isolation + serving grants
+    /// (`pg_swap_shadow` re-runs the idempotent tenant provisioning). See [`SharedReprovision`].
+    shared_reprovision: Option<SharedReprovision>,
+}
+
+/// Post-swap re-provisioning context for a SHARED multi-tenant managed binding (a NON-default
+/// tenant). A Shared tenant's physical database is a sibling of OTHER tenants' databases on ONE
+/// shared cluster (grant-isolated, not process-isolated), so making a cloned tenant db
+/// indistinguishable from a freshly-provisioned one — and never a cross-tenant surface — takes two
+/// extra, idempotent steps beyond the dedicated swap:
+///
+/// 1. **At shadow creation** (`pg_create_shadow`): `REVOKE CONNECT ON DATABASE <shadow> FROM PUBLIC`
+///    the moment the shadow exists — the ephemeral role OWNS the shadow so it still connects, but no
+///    SIBLING tenant role can reach the restoring dump during the restore window (the same REVOKE
+///    the normal per-tenant provisioning applies).
+/// 2. **After the atomic rename** (`pg_swap_shadow`): re-run the idempotent [`provision_tenant`],
+///    re-asserting the per-tenant isolation + serving grants on the swapped-in db (owner/login
+///    roles, REVOKE PUBLIC, GRANT CONNECT/ALL, and the app-role table grants on the restored,
+///    now-owner-owned objects). The REASSIGN/ALTER-OWNER in the swap already points the db + its
+///    objects at the tenant OWNER role (not the superuser), so this re-provision completes the model.
+///
+/// This never widens the untrusted-apply surface: the dump is still applied ONLY by the ephemeral
+/// non-superuser role; all of the above is our own trusted DDL run by the superuser/maintenance
+/// connection.
+#[derive(Clone)]
+struct SharedReprovision {
+    /// The TARGET project whose per-tenant db was cloned (the project the re-provision runs for).
+    project: String,
+    /// The managed Shared binding (carries compute/database/tenant/scope — the exact input
+    /// `provision_tenant` re-derives the tenant's db + role names from).
+    binding: ExternalDatabaseConfig,
 }
 
 impl PgShadowPlan {
@@ -2712,16 +2983,36 @@ impl ProjectExport for NodeProjectExport {
         if matches!(opts.identity, IdentityChoice::Fresh) && !data_only && opts.apply {
             let prefixes =
                 boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
+            // The managed-SQL credential prefix needs special handling. This import's OWN managed-DB
+            // self-provisioning (`ensure_target_db_provisioned` → `provision_tenant`, run during
+            // member restore) MINTS the target tenant's login/owner (Shared) or workload (Single)
+            // credential under `managed-sql-cred/{project}/…`, sealed under THIS node's KEK, and
+            // sets the live role's password (or inits the container) to exactly it. Dropping one of
+            // THOSE would desync the sealed credential from the live role: the next
+            // `creds.password(...)` would mint a fresh random value that no longer authenticates the
+            // role (psql exit 2 — "password authentication failed", not "permission denied"), so the
+            // cloned tenant's own runtime/owner role could never connect. So keep exactly the keys
+            // this target's own self-provisioning owns (re-derived the same way `provision_tenant`
+            // seals them) and drop every OTHER managed cred under the prefix — a source-carried one
+            // (restored via a `--include-identity` KV member) is un-unsealable here and must go.
+            let managed_cred_prefix = format!("managed-sql-cred/{project}/");
+            let keep_managed = self_provisioned_managed_cred_keys(&self.databases, project);
             let mut dropped = 0usize;
+            let mut kept_minted = 0usize;
             for prefix in &prefixes {
                 for key in self.kv.list_prefix(prefix).await.map_err(other)? {
+                    if prefix == &managed_cred_prefix && keep_managed.contains(&key) {
+                        kept_minted += 1;
+                        continue;
+                    }
                     self.kv.delete_checkpointed(&key).await.map_err(other)?;
                     dropped += 1;
                 }
             }
             report.notes.push(format!(
-                "identity: --fresh dropped {dropped} source-sealed secret key(s); re-provision \
-                 secrets + the managed-DB credential on the target"
+                "identity: --fresh dropped {dropped} source-sealed secret key(s); kept \
+                 {kept_minted} self-provisioned managed-DB credential(s) (they match the cloned \
+                 tenant's live roles); re-provision application secrets on the target"
             ));
         }
 
@@ -3490,6 +3781,15 @@ impl NodeProjectExport {
                 let cfg = self.databases.get(db).ok_or_else(|| {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?;
+                // Clone self-provision (PLAN-clone-self-provision-managed-db): a Shared-tenant
+                // managed pg database restores via THIS sidecar arm (plan_export frames it
+                // non-chunked), so this is the seam that must provision a Shared tenant's own
+                // db before connecting. Gated on `opts.apply`: a verify/dry-run must mutate
+                // nothing — `resolve_pg` below still runs un-provisioned on a dry-run, exactly
+                // as before (an honest "not ready yet" is fine for a verify pass).
+                if opts.apply {
+                    self.ensure_target_db_provisioned(project, db, cfg).await?;
+                }
                 let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
                 if data_only {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
@@ -3502,58 +3802,74 @@ impl NodeProjectExport {
                     }
                 }
                 if opts.apply {
-                    // HIGH-1: a SIDECAR pg member (data-only, or a Shared/dedicated FULL that was not
-                    // chunked) is still ATTACKER-CRAFTED. Applying it via `resolve_pg` would connect
-                    // as the configured user, which on a MANAGED co-located server is the BOOTSTRAP
-                    // SUPERUSER — a crafted archive's `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE
-                    // c` / `CREATE EXTENSION` would then execute = RCE. The chunked FULL path confines
-                    // this with an ephemeral non-superuser role + shadow; a least-privilege sidecar
-                    // apply (data-only into a live schema) is the follow-up, so until it lands we
-                    // REFUSE a managed sidecar apply fail-closed rather than apply as superuser. An
-                    // EXTERNAL bring-your-own-URL binding applies with the OPERATOR'S OWN credential
-                    // against the OPERATOR'S OWN database (their trust boundary, not our managed
-                    // cluster), so it is still applied.
-                    //
-                    // DO NOT relax this on the reasoning "data-only carries no DDL, so it's safe": the
-                    // confinement is NON-SUPERUSER-APPLY, not DDL-inspection. `data_only` here is an
-                    // UNTRUSTED MANIFEST FLAG (the bundle is attacker-crafted) — it does NOT constrain
-                    // the member's bytes, which the `pg_restore` run executes verbatim. An attacker
-                    // sets `data_only: true` and ships a member full of superuser escapes; trusting the
-                    // flag to skip the shadow/non-superuser path reintroduces the exact RCE. The only
-                    // safe enablement is a real least-privilege sidecar apply (an ephemeral
-                    // non-superuser role, as the chunked path mints) — which raises OPEN owner
-                    // decisions (its grant surface on LIVE tenant tables, FK/trigger ordering without
-                    // superuser, non-atomic partial-apply semantics). Until those are settled, refuse.
-                    if is_managed_binding(cfg) {
-                        return Err(Perr::Unavailable(format!(
-                            "import refused: a MANAGED pg database ({db:?}) can only be restored via \
-                             the atomic chunked shadow path (a FULL, dedicated/Single bundle). A \
-                             data-only or Shared sidecar restore would apply the untrusted dump as \
-                             the bootstrap superuser (RCE risk); a least-privilege sidecar apply is a \
-                             pending follow-up. Re-export as a FULL dedicated bundle, or import into \
-                             an external (bring-your-own-URL) binding."
-                        )));
+                    // HIGH-1 (narrowed): a SIDECAR pg member is ATTACKER-CRAFTED (the trailing SHA is
+                    // integrity, not authenticity). It must NEVER be applied as the binding's
+                    // configured user, which on a MANAGED co-located server is the BOOTSTRAP SUPERUSER
+                    // — a crafted `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE c` / untrusted
+                    // `CREATE EXTENSION` would then execute = RCE. `sidecar_pg_apply` encodes the
+                    // (managed × data_only) policy, and the confinement is NON-SUPERUSER-APPLY, not
+                    // DDL/flag inspection (`data_only` is itself an untrusted manifest flag that does
+                    // not constrain the member's bytes).
+                    match sidecar_pg_apply(is_managed_binding(cfg), data_only) {
+                        SidecarPgApply::RefuseManagedDataOnly => {
+                            // Still REFUSED: a data-only sidecar is an OVERLAY into the target's
+                            // EXISTING live schema (rows into tables that must already exist) — there
+                            // is no atomic shadow+swap for an overlay (the shadow is a FRESH db, not
+                            // the live schema), and a direct apply would run the untrusted dump as the
+                            // bootstrap superuser. A least-privilege overlay apply is a pending
+                            // follow-up (OPEN questions: grant surface on LIVE tenant tables,
+                            // FK/trigger ordering without superuser, non-atomic partial-apply
+                            // semantics). Fail-closed.
+                            return Err(Perr::Unavailable(format!(
+                                "import refused: a data-only restore of MANAGED pg database \
+                                 ({db:?}) is not supported — it would overlay the untrusted dump \
+                                 onto the live schema as the bootstrap superuser (RCE risk), with no \
+                                 atomic shadow+swap; a least-privilege data-only/overlay apply is a \
+                                 pending follow-up. Re-export as a FULL bundle, or import into an \
+                                 external (bring-your-own-URL) binding."
+                            )));
+                        }
+                        SidecarPgApply::ManagedShadowSwap => {
+                            // NOW SAFE: a FULL managed sidecar dump (a Shared tenant's pg export is
+                            // framed sidecar/non-chunked; also any FULL dedicated dump staged
+                            // sidecar). Apply it through the SAME non-superuser ephemeral-role +
+                            // shadow + atomic-swap mechanism the chunked path uses — the untrusted
+                            // `-Fc` dump is applied ONLY as the ephemeral NOSUPERUSER role into a
+                            // shadow db, then the verified shadow is atomically swapped into the
+                            // self-provisioned target (so the bootstrap superuser never applies a
+                            // byte of it, and the target is replaced atomically — never a partial
+                            // live overlay).
+                            let stage_dir = temp.parent().ok_or_else(|| {
+                                Perr::Other("sidecar pg member temp has no parent dir".into())
+                            })?;
+                            self.pg_sidecar_shadow_restore(project, db, cfg, temp, stage_dir)
+                                .await?;
+                        }
+                        SidecarPgApply::External => {
+                            // EXTERNAL bring-your-own-URL binding: the OPERATOR'S OWN database +
+                            // credential (their trust boundary, not our managed cluster) — apply the
+                            // dump directly. Capture stderr via `sh -c '… 2>&1'` so a failed restore
+                            // is diagnosable instead of a causeless "exited N" (run_ephemeral drops
+                            // stderr on nonzero).
+                            let inv = pg_restore_invocation(&conn, data_only);
+                            let merged = merge_stderr_argv(&inv.argv);
+                            let outfile = temp.with_extension("restore.out");
+                            let code = self
+                                .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
+                                .await?;
+                            if code != 0 {
+                                let diag = tokio::fs::read_to_string(&outfile)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ = tokio::fs::remove_file(&outfile).await;
+                                return Err(Perr::Other(format!(
+                                    "pg_restore for {db:?} exited {code}: {}",
+                                    diag.trim()
+                                )));
+                            }
+                            let _ = tokio::fs::remove_file(&outfile).await;
+                        }
                     }
-                    let inv = pg_restore_invocation(&conn, data_only);
-                    // Capture stderr (where pg_restore reports a failed object) into the stdout
-                    // sink via `sh -c '… 2>&1'`, so a failed EXTERNAL restore is diagnosable
-                    // instead of a causeless "exited N" (run_ephemeral drops stderr on nonzero).
-                    let merged = merge_stderr_argv(&inv.argv);
-                    let outfile = temp.with_extension("restore.out");
-                    let code = self
-                        .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
-                        .await?;
-                    if code != 0 {
-                        let diag = tokio::fs::read_to_string(&outfile)
-                            .await
-                            .unwrap_or_default();
-                        let _ = tokio::fs::remove_file(&outfile).await;
-                        return Err(Perr::Other(format!(
-                            "pg_restore for {db:?} exited {code}: {}",
-                            diag.trim()
-                        )));
-                    }
-                    let _ = tokio::fs::remove_file(&outfile).await;
                 }
                 report.pg_databases += 1;
             }
@@ -3563,6 +3879,11 @@ impl NodeProjectExport {
                 let cfg = self.databases.get(db).ok_or_else(|| {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?;
+                // Clone self-provision — mirror of the PgDump arm above (same seam, same
+                // apply-gating rationale).
+                if opts.apply {
+                    self.ensure_target_db_provisioned(project, db, cfg).await?;
+                }
                 let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
                 if data_only {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
@@ -4903,16 +5224,30 @@ impl NodeProjectExport {
     // (`plan.maint`, on `postgres`) runs ONLY our own trusted DDL — never a byte of the dump — and,
     // before the apply, pre-creates the operator trusted-extension allowlist in the shadow so a legit
     // `CREATE EXTENSION IF NOT EXISTS <ext>` (e.g. pgvector) no-ops under the non-superuser apply.
-    // Chunked shadow-restore is for DEDICATED/Single managed servers only; a Shared multi-tenant
-    // server is refused here (the per-import physical shadow db is a cross-tenant surface deferred to
-    // the temp-schema follow-up).
+    // The shadow-restore serves BOTH DEDICATED/Single and SHARED multi-tenant managed servers. On a
+    // Shared server each tenant has its OWN physical DATABASE, so the DATABASE-level shadow+swap
+    // applies exactly as for a dedicated server; the per-tenant physical shadow is tenancy-hardened
+    // (`shared_reprovision`): REVOKE PUBLIC at creation closes the restore-window cross-tenant
+    // surface, a per-tenant OWNER role owns the swapped-in db + its objects, and a post-swap
+    // re-provision re-asserts the per-tenant isolation + serving grants — so a cloned Shared tenant
+    // db is never a cross-tenant surface and is servable exactly like a freshly-provisioned one. The
+    // chunked streaming path still runs only for FULL dedicated/Single members (a Shared pg export is
+    // framed sidecar and reaches the shadow via `pg_sidecar_shadow_restore`).
     // -----------------------------------------------------------------------
 
-    /// Resolve the [`PgShadowPlan`] for a MANAGED, non-Shared pg binding: the superuser/maintenance
-    /// connection (on `postgres`), a freshly-minted EPHEMERAL non-superuser apply role + password,
-    /// the client image, the shadow name, and the trusted-extension allowlist. External
-    /// (bring-your-own-URL) bindings are refused — we must not `CREATE/RENAME/DROP` databases on an
-    /// operator's own server — and a Shared multi-tenant server is refused (dedicated/Single only).
+    /// Resolve the [`PgShadowPlan`] for a MANAGED pg binding: the superuser/maintenance connection
+    /// (on `postgres`), a freshly-minted EPHEMERAL non-superuser apply role + password, the client
+    /// image, the shadow name, the trusted-extension allowlist, and (for a Shared NON-default tenant)
+    /// the [`SharedReprovision`] context. External (bring-your-own-URL) bindings are refused — we
+    /// must not `CREATE/RENAME/DROP` databases on an operator's own server.
+    ///
+    /// Both DEDICATED/Single and SHARED multi-tenant managed servers are handled. On a Shared server
+    /// each tenant has its OWN physical DATABASE (grant-isolated), so the DATABASE-level atomic
+    /// shadow+swap applies exactly as it does for a dedicated server; the untrusted dump is still
+    /// confined to the ephemeral non-superuser role. The only Shared-specific additions (driven by
+    /// `shared_reprovision`) are tenancy hygiene on the physical shadow: a per-tenant OWNER role for
+    /// the swapped-in db + its objects, a REVOKE-PUBLIC lockdown of the shadow at creation, and a
+    /// post-swap re-provision — see [`SharedReprovision`].
     async fn pg_shadow_plan(
         &self,
         project: &str,
@@ -4921,28 +5256,48 @@ impl NodeProjectExport {
     ) -> Result<PgShadowPlan, Perr> {
         if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
             return Err(Perr::Unavailable(format!(
-                "database {db:?}: the atomic chunked pg shadow-restore is for MANAGED \
-                 (compute-backed) databases only; an external bring-your-own-URL binding uses the \
-                 sidecar path"
+                "database {db:?}: the atomic pg shadow-restore is for MANAGED (compute-backed) \
+                 databases only; an external bring-your-own-URL binding uses the sidecar path"
             )));
         }
-        if matches!(cfg.tenant, crate::config::TenantIsolation::Shared) {
-            return Err(Perr::Unavailable(format!(
-                "database {db:?}: the atomic chunked pg shadow-restore is for DEDICATED/Single \
-                 managed servers only; a Shared multi-tenant server's per-import physical shadow db \
-                 is a cross-tenant surface deferred to the temp-schema follow-up"
-            )));
-        }
+        // Clone self-provision (PLAN-clone-self-provision-managed-db): every caller reaches here
+        // only under `opts.apply` (their dry-run arms return first), so this is unconditional. A
+        // target whose tenant db / dedicated workload was never provisioned gets provisioned now
+        // (idempotent — `provision_tenant`'s own contract); for Shared this also mints the per-tenant
+        // OWNER + login roles that the swap re-assigns ownership to + re-grants on.
+        self.ensure_target_db_provisioned(project, db, cfg).await?;
         // Operator identity (configured/superuser) + version-detect → client image. Its endpoint
-        // (host/port) + the live tenant db name + the configured owner seed the maintenance conn.
+        // (host/port) + the live tenant db name seed the maintenance conn (always the SUPERUSER —
+        // it runs ONLY trusted DDL, never the dump).
         let (operator_conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
-        let owner_user = operator_conn.user.clone();
+        // The role the swapped-in db + its restored objects are re-owned to. For a SHARED NON-default
+        // tenant this is the per-tenant non-superuser OWNER role (so the clone's db + schema are
+        // owned exactly as a provisioned tenant's — its future migrations run as that role); for
+        // Single/dedicated + Shared-DEFAULT it is the configured operator identity (the role that
+        // normally owns the whole-server db). The untrusted dump is NEVER applied as this role — it
+        // is applied as the ephemeral non-superuser role; this only names the post-restore owner.
+        let (_tenant_ident, is_default) =
+            crate::tenant_sql::tenant_key(cfg.tenant_scope, project, "");
+        let shared_nondefault =
+            matches!(cfg.tenant, crate::config::TenantIsolation::Shared) && !is_default;
+        let owner_user = if shared_nondefault {
+            owner_target(cfg, project, db).map_err(other)?.user
+        } else {
+            operator_conn.user.clone()
+        };
+        let shared_reprovision = shared_nondefault.then(|| SharedReprovision {
+            project: project.to_string(),
+            binding: cfg.clone(),
+        });
         let mut maint = operator_conn;
         // CREATE/ALTER/DROP DATABASE cannot run connected to the tenant db — point at `postgres`.
         maint.database = "postgres".to_string();
         let suffix = shadow_suffix();
-        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        // Bounded to Postgres's 63-byte NAMEDATALEN (truncating the live-db prefix, never the
+        // `__shadow_<suffix>` distinguisher) so a tenant-qualified Shared live db name does not push
+        // the shadow name past the limit and collapse it back to the live name on truncation.
+        let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_role = format!("brexp_apply_{suffix}");
         Ok(PgShadowPlan {
             live_db,
@@ -4954,7 +5309,105 @@ impl NodeProjectExport {
             owner_user,
             image,
             trusted_extensions: self.trusted_extensions.clone(),
+            shared_reprovision,
         })
+    }
+
+    /// Apply a FULL MANAGED **sidecar** pg dump (already staged + SHA-verified at `temp`) through the
+    /// SAME non-superuser ephemeral-role + shadow + atomic-swap mechanism the chunked/dedicated path
+    /// uses — now also serving a SHARED tenant's sidecar-framed FULL export (and any FULL dedicated
+    /// dump staged sidecar rather than chunked). Mirrors the chunked servicer's create → fail-closed
+    /// non-superuser probe → restore → swap sequence, but reads the staged member FILE as stdin
+    /// (sidecar) rather than a streamed body channel.
+    ///
+    /// THE INVARIANT (absolute): the untrusted `-Fc --no-owner --no-privileges` dump is restored
+    /// CONNECTED AS the ephemeral `NOSUPERUSER NOCREATEDB NOCREATEROLE` role into the shadow — so a
+    /// crafted `COPY … TO/FROM PROGRAM/FILE` / `CREATE FUNCTION … LANGUAGE c` / untrusted `CREATE
+    /// EXTENSION` FAILS at apply (Postgres denies it to a non-superuser), exactly as the chunked path
+    /// and the `project_export_pg_crafted_superuser_escape_refused_live` gate prove. The superuser /
+    /// maintenance connection runs ONLY our own trusted scaffolding DDL (create shadow + eph role,
+    /// pre-create allow-listed extensions, the atomic swap, Shared re-provision) — never a byte of
+    /// the dump. Any create/restore/swap failure tears the shadow down and leaves live untouched.
+    async fn pg_sidecar_shadow_restore(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        temp: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let plan = self.pg_shadow_plan(project, db, cfg).await?;
+        // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER role + the shadow it owns +
+        // (Shared) the REVOKE-PUBLIC lockdown + pre-create the allow-listed extensions.
+        if let Err(e) = self.pg_create_shadow(&plan, stage_dir).await {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // FAIL-CLOSED: refuse the untrusted apply unless the apply role is PROVABLY a non-superuser.
+        if let Err(e) = self
+            .pg_assert_not_superuser(&plan.apply_conn(), &plan.image, stage_dir)
+            .await
+        {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // SHARED tenancy, immediately before the UNTRUSTED restore runs: one last terminate-sweep on
+        // the shadow (belt-and-suspenders to the create-time REVOKE + sweep in `pg_create_shadow`).
+        // At this point no LEGITIMATE session is on the shadow — the restore has not started, and each
+        // prior step (create/lockdown, the non-superuser probe) ran in its own now-closed container —
+        // so this evicts ONLY a sibling tenant that slipped a CONNECT into the (now minimized) create
+        // window. REVOKE blocks new connects; this sweep drops the slipped-in one, so the restore
+        // begins on a shadow with zero foreign sessions. No-op off the Shared path (no sibling).
+        if plan.shared_reprovision.is_some()
+            && let Err(e) = self
+                .pg_run_ddl(
+                    &plan,
+                    &pg_terminate_backends_sql(&plan.shadow_db),
+                    stage_dir,
+                )
+                .await
+        {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // Apply the untrusted dump into the shadow AS the ephemeral role, reading the staged member
+        // FILE on stdin. `--single-transaction` (in `pg_restore_shadow_invocation`) makes the shadow
+        // restore all-or-nothing; stderr is merged so a refused/failed object is diagnosable
+        // (`run_ephemeral` drops a container's stderr on a non-zero exit).
+        let inv = pg_restore_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let outfile = stage_dir.join(format!("pgrestore-sidecar-{}.out", shadow_suffix()));
+        let code = match self
+            .run_sql_client(&plan.image, &merged, &inv.env, Some(temp), &outfile)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&outfile).await;
+                self.pg_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+        };
+        if code != 0 {
+            let diag = tokio::fs::read_to_string(&outfile)
+                .await
+                .unwrap_or_default();
+            let _ = tokio::fs::remove_file(&outfile).await;
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(Perr::Other(format!(
+                "pg_restore into shadow {:?} for {db:?} exited {code}; live untouched: {}",
+                plan.shadow_db,
+                diag.trim()
+            )));
+        }
+        let _ = tokio::fs::remove_file(&outfile).await;
+        // Restore clean (and the sidecar member was SHA-verified at staging) → atomic swap. A swap
+        // failure tears the shadow down (its own rollback keeps live intact); live is untouched.
+        if let Err(e) = self.pg_swap_shadow(&plan, stage_dir).await {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Fail-closed defense-in-depth probe: confirm the resolved apply identity (`conn`) is NOT a
@@ -5009,6 +5462,30 @@ impl NodeProjectExport {
         Ok(())
     }
 
+    /// Run SEVERAL trusted DDL/utility statements through the SUPERUSER / maintenance connection in
+    /// ONE psql process (a REPEATED `-c` per statement — see [`psql_script_invocation`]), each in
+    /// its own implicit transaction. Used to keep a sequence that must be GAP-FREE inside a single
+    /// connection/container launch — the SHARED shadow's `CREATE DATABASE` + `REVOKE CONNECT … FROM
+    /// PUBLIC` + terminate-sweep — so no sibling tenant can slip a PUBLIC CONNECT into a
+    /// cross-container gap. `ON_ERROR_STOP=1` aborts the whole run on the first failed statement.
+    async fn pg_run_ddl_script(
+        &self,
+        plan: &PgShadowPlan,
+        statements: &[String],
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = psql_script_invocation(&plan.maint, statements);
+        let (code, out) = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg shadow DDL script exited {code} ({statements:?}): {out}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether a database `name` exists (via the maintenance connection) — so the swap can skip the
     /// rename-aside when cloning into a target that has no live db yet.
     async fn pg_db_exists(
@@ -5053,12 +5530,79 @@ impl NodeProjectExport {
             stage_dir,
         )
         .await?;
-        self.pg_run_ddl(
-            plan,
-            &format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
-            stage_dir,
-        )
-        .await?;
+        // SHARED tenancy lockdown: the shadow is a sibling of OTHER tenants' databases on ONE shared
+        // cluster. A fresh `CREATE DATABASE` grants PUBLIC CONNECT by default, so until it is stripped
+        // a sibling tenant's role can reach the restoring dump — the restore-window cross-tenant
+        // surface. Close it with THREE moves run GAP-FREE in ONE psql process (a repeated `-c` per
+        // statement — each its own txn, so `CREATE DATABASE` is legal):
+        //   1. CREATE DATABASE (OWNED by the ephemeral role, so the apply still connects).
+        //   2. REVOKE CONNECT … FROM PUBLIC — blocks any NEW sibling connect.
+        //   3. a terminate-sweep — evicts a sibling session that connected in the sub-statement
+        //      window before the REVOKE took effect (REVOKE alone does not drop an existing session).
+        // Running these as ONE invocation (not three separate `pg_run_ddl` container spawns) shrinks
+        // the PUBLIC-connectable window from a whole container launch to a few back-to-back statements
+        // on one connection; a second terminate-sweep runs immediately before the untrusted restore
+        // (`pg_sidecar_shadow_restore`) as belt-and-suspenders. This is the same REVOKE the normal
+        // per-tenant provisioning applies, re-granted to the tenant's roles on the swapped-in db by
+        // the post-swap re-provision. No-op for Single/dedicated + Shared-DEFAULT (`shared_reprovision`
+        // is `None`), whose server hosts no sibling tenant.
+        if plan.shared_reprovision.is_some() {
+            self.pg_run_ddl_script(
+                plan,
+                &[
+                    format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
+                    format!("REVOKE CONNECT ON DATABASE {shadow_q} FROM PUBLIC"),
+                    pg_terminate_backends_sql(&plan.shadow_db),
+                ],
+                stage_dir,
+            )
+            .await?;
+            // PG≤14 defense-in-depth (cheap extra layer; PG15+ already revokes CREATE on `public`
+            // from PUBLIC by default): make it unconditional so even a hypothetical in-window connect
+            // cannot leave a SURVIVING object in schema `public` (the swap's `REASSIGN OWNED` only
+            // moves eph-role-owned objects — an intruder-owned one would survive the swap). Must run
+            // CONNECTED to the shadow (schema-local). Two statements:
+            //   1. REVOKE CREATE ON SCHEMA public FROM PUBLIC — a gap-intruder cannot create in public.
+            //   2. ALTER SCHEMA public OWNER TO <eph_role> — WHY this is REQUIRED, not optional: on
+            //      PG≤14 the DB-owner does NOT implicitly get CREATE on `public` (that comes only from
+            //      PUBLIC's default grant, which step 1 just removed), so without this the NON-superuser
+            //      restore (and later the tenant owner's migrations) could not create objects in public.
+            //      Making the ephemeral role OWN public restores its CREATE right, and the swap's
+            //      existing `REASSIGN OWNED BY <eph_role> TO <owner>` then transfers `public` (like
+            //      every other eph-owned object) to the tenant owner — so the cloned tenant's owner
+            //      keeps CREATE on public (no PG≤14 regression) while PUBLIC stays locked out.
+            let maint_shadow = PgShadowPlan {
+                maint: plan.maint_on_shadow(),
+                ..plan.clone()
+            };
+            self.pg_run_ddl_script(
+                &maint_shadow,
+                &[
+                    "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string(),
+                    format!("ALTER SCHEMA public OWNER TO {role_q}"),
+                ],
+                stage_dir,
+            )
+            .await?;
+            // TEST-ONLY widener (inert in production — field is 0, its setter does not compile under
+            // `--release`): hold here, with the shadow created but LOCKED DOWN (PUBLIC CONNECT revoked
+            // + swept above), so the cross-tenant live gate can observe the shadow while it exists and
+            // prove a sibling can never CONNECT to it. A plain sleep owning no DB connection; it moves
+            // no statement and changes no DDL.
+            if self.shadow_restore_test_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    self.shadow_restore_test_delay_ms,
+                ))
+                .await;
+            }
+        } else {
+            self.pg_run_ddl(
+                plan,
+                &format!("CREATE DATABASE {shadow_q} OWNER {role_q}"),
+                stage_dir,
+            )
+            .await?;
+        }
         // Pre-create the allowlisted extensions in the shadow AS THE SUPERUSER, connected to the
         // shadow (extensions are database-local). `IF NOT EXISTS` so a re-run is a no-op. A
         // non-trusted extension (e.g. pgvector — its control file sets no `trusted = true`) can
@@ -5136,7 +5680,10 @@ impl NodeProjectExport {
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
         let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
         let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_user);
-        let old_db = format!("{}__old_{}", plan.live_db, plan.suffix);
+        // Derive the rename-aside name through the SAME bounded helper as the shadow (above), so a
+        // long live db name keeps both the shadow and the `__old_<suffix>` aside within the 63-byte
+        // NAMEDATALEN limit and the `ALTER DATABASE … RENAME TO <old>` cannot overflow + collapse.
+        let old_db = bounded_derived_db_name(&plan.live_db, "__old_", &plan.suffix);
         let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
         // SWAP-SAFETY INVARIANT (defense in depth; mirror of the mysql guard): never rename live
         // aside + drop the aside without the shadow REPLACEMENT present. pg renames the whole shadow
@@ -5242,6 +5789,39 @@ impl NodeProjectExport {
         let _ = self
             .pg_run_ddl(plan, &format!("DROP ROLE IF EXISTS {role_q}"), stage_dir)
             .await;
+        // SHARED tenancy: the swapped-in db now carries ONLY the shadow's grants (owner-owned via the
+        // REASSIGN/ALTER-OWNER above, PUBLIC CONNECT revoked at creation) — NOT the per-tenant login
+        // grants a served tenant db needs. Re-run the idempotent tenant provisioning so the cloned db
+        // is grant-isolated + servable EXACTLY like a freshly-provisioned tenant db: it re-asserts
+        // REVOKE CONNECT FROM PUBLIC, GRANTs CONNECT/ALL to the owner + login roles, and GRANTs the
+        // app-role table privileges on the restored (now owner-owned) objects. The dump already
+        // landed atomically; this is our own trusted DDL (the superuser via `provision_tenant`'s own
+        // admin connection), never a byte of the untrusted dump. A failure here is loud — the clone
+        // is safely live but un-granted, and a later normal resolve re-runs the same idempotent path.
+        if let Some(rp) = &plan.shared_reprovision {
+            let envelope = self.envelope.as_ref().ok_or_else(|| {
+                Perr::Unavailable(format!(
+                    "shared clone re-provision of {:?} needs a [secrets] envelope to unseal its \
+                     credential — none on this node",
+                    plan.live_db
+                ))
+            })?;
+            crate::tenant_sql::provision_tenant(
+                &self.deploy,
+                &self.kv,
+                envelope,
+                &rp.binding,
+                &rp.project,
+                "",
+            )
+            .await
+            .map_err(|e| {
+                Perr::Other(format!(
+                    "shared clone re-provision of {:?} failed after the atomic swap: {e}",
+                    plan.live_db
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -5308,12 +5888,17 @@ impl NodeProjectExport {
                  managed servers only; a Shared multi-tenant server is deferred"
             )));
         }
+        // Clone self-provision — mirror of `pg_shadow_plan`'s call above (both callers only
+        // reach here under `opts.apply`; see that function's comment for the rationale).
+        self.ensure_target_db_provisioned(project, db, cfg).await?;
         let (operator_conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
         let live_db = operator_conn.database.clone();
         let maint = operator_conn; // mysql names no default db for the admin SQL
         // A SHORT suffix: `brexp_apply_<suffix>` must fit MySQL's 32-char USER-name cap.
         let suffix = mysql_eph_suffix();
-        let shadow_db = format!("{live_db}__shadow_{suffix}");
+        // Bounded to 63 bytes (≤ MySQL's 64-char identifier cap) by truncating the live-db prefix,
+        // keeping the `__shadow_<suffix>` distinguisher intact — latent overflow for a long db name.
+        let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_user = format!("brexp_apply_{suffix}");
         Ok(MysqlShadowPlan {
             live_db,
@@ -6930,7 +7515,10 @@ fn mysql_binlog_image(client_image: &str) -> String {
 /// would collide on `CREATE DATABASE` (a clean refusal, never corruption — the restore never drops a
 /// pre-existing shadow). Concurrent-import support is a tracked follow-up.
 fn mysql_delta_shadow_db(live_db: &str) -> String {
-    format!("{live_db}__shadow_brdelta")
+    // Bounded to the 63-byte limit (truncating the live-db prefix, never the `__shadow_brdelta`
+    // marker). Both the CAPTURE rewrite target and the RESTORE shadow call THIS function, so they
+    // stay the SAME derived name even after truncation.
+    bounded_derived_db_name(live_db, "__shadow_", "brdelta")
 }
 
 /// SWAP-SAFETY INVARIANT (data-loss guard): `true` when swapping the shadow in for live would move
@@ -8202,6 +8790,93 @@ mod tests {
         assert!(capture_entry_shielded(now + 5, 0, now, ttl));
     }
 
+    /// The `--fresh` drop's keep-set: `self_provisioned_managed_cred_keys` must name EXACTLY the
+    /// managed-SQL credential keys this node's own self-provisioning mints for `(project, "")` — so
+    /// the drop keeps the freshly cloned tenant's live-matching creds and drops only source-carried
+    /// ones. Regression for the clone live gate's 4th issue (fresh tenant's own role could not
+    /// connect because the drop wiped its just-minted credential).
+    #[test]
+    fn self_provisioned_managed_cred_keys_names_only_this_tenants_own_creds() {
+        use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+        use boatramp_core::project::DEFAULT_PROJECT;
+        use std::collections::BTreeMap;
+
+        let binding = |tenant, scope| ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("appdb".into()),
+            user: Some("postgres".into()),
+            tenant,
+            tenant_scope: scope,
+            ..Default::default()
+        };
+
+        // Shared, project-scoped, NON-default tenant → the login + owner creds (both under the
+        // project, the owner one carrying the `/owner` suffix) — and NOTHING else.
+        let shared = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Shared, TenantScope::Project),
+        )]);
+        let keys = self_provisioned_managed_cred_keys(&shared, "acme");
+        assert_eq!(
+            keys.len(),
+            2,
+            "shared non-default mints login + owner: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with("managed-sql-cred/acme/pg/")),
+            "keys are scoped to the project + compute: {keys:?}"
+        );
+        assert_eq!(
+            keys.iter().filter(|k| k.ends_with("/owner")).count(),
+            1,
+            "exactly one owner-role credential: {keys:?}"
+        );
+
+        // No managed bindings → NOTHING is self-provisioned, so a source-carried managed cred
+        // restored under this project IS dropped (the `adopt_..._fresh_drops_source_secrets` path).
+        assert!(
+            self_provisioned_managed_cred_keys(&BTreeMap::new(), "acme").is_empty(),
+            "no bindings → empty keep-set"
+        );
+
+        // A SITE-scoped binding is skipped by the clone self-provision, so it mints nothing.
+        let site = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Shared, TenantScope::Site),
+        )]);
+        assert!(
+            self_provisioned_managed_cred_keys(&site, "acme").is_empty(),
+            "site-scoped binding mints nothing"
+        );
+
+        // The reserved DEFAULT project (shared) is the plain install — the superuser is the app
+        // user, so no per-tenant cred is minted.
+        assert!(
+            self_provisioned_managed_cred_keys(&shared, DEFAULT_PROJECT).is_empty(),
+            "the default shared tenant mints nothing"
+        );
+
+        // Single, project-scoped → ONE workload credential (no `/owner` role — the container is the
+        // isolation), keyed under the tenant's project.
+        let single = BTreeMap::from([(
+            "app".to_string(),
+            binding(TenantIsolation::Single, TenantScope::Project),
+        )]);
+        let keys = self_provisioned_managed_cred_keys(&single, "acme");
+        assert_eq!(
+            keys.len(),
+            1,
+            "single mints exactly one workload cred: {keys:?}"
+        );
+        let k = keys.iter().next().unwrap();
+        assert!(
+            k.starts_with("managed-sql-cred/acme/pg-") && !k.ends_with("/owner"),
+            "single's cred is the per-tenant workload, not an owner role: {k}"
+        );
+    }
+
     /// Drive the streaming export into an in-memory buffer (the v2 bundle bytes) — the
     /// in-process stand-in for the HTTP response the handler wires the sink to.
     async fn export_to_buf(
@@ -8296,6 +8971,195 @@ mod tests {
         assert_eq!(
             pinned.mysql_image("not-a-version").unwrap(),
             "mysql:8.4@sha256:beef"
+        );
+    }
+
+    /// A reversible, in-memory [`KeyEnvelope`] fake for a unit test — no real KMS/KEK, so a
+    /// test never touches the network or disk for credential sealing.
+    struct TestEnvelope;
+    #[async_trait]
+    impl KeyEnvelope for TestEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(
+            &self,
+            w: &[u8],
+        ) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+
+    /// A minimal driver + control-plane fixture for [`NodeProjectExport::ensure_target_db_provisioned`]
+    /// unit tests: `MemoryKv` + a throwaway `FsStorage`-backed `DeployStore` + the reversible
+    /// `TestEnvelope` — no live backend/operator-SQL needed (this helper never connects to one).
+    fn provision_fixture() -> (NodeProjectExport, DeployStore, Arc<dyn KvStore>) {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let mut drv = NodeProjectExport::new(
+            BTreeMap::new(),
+            deploy.clone(),
+            kv.clone(),
+            blobs,
+            tmp.path().join("work"),
+        );
+        // Set the envelope directly (same module ⇒ private field access) — equivalent to
+        // `with_managed_pg` without needing a fake compute backend / operator-SQL seam, which
+        // `ensure_target_db_provisioned` never touches.
+        drv.envelope = Some(Arc::new(TestEnvelope) as Arc<dyn KeyEnvelope>);
+        (drv, deploy, kv)
+    }
+
+    /// PLAN-clone-self-provision-managed-db: a bring-your-own (`url_env`) binding is the
+    /// OPERATOR's own database — self-provision must be a clean no-op (never attempt to
+    /// `CREATE DATABASE` on someone else's server).
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_noop_for_external_binding() {
+        let (drv, _deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            url_env: "SOME_DSN".into(),
+            ..Default::default()
+        };
+        drv.ensure_target_db_provisioned("acme", "app", &cfg)
+            .await
+            .expect("external binding self-provision is a no-op");
+    }
+
+    /// A **site-scoped** managed binding: operator SQL (the seam the restore path's
+    /// `resolve_pg`/`resolve_mysql` use) refuses it regardless (project-level only), so
+    /// self-provision must no-op rather than provision a bogus `site=""` tenant.
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_noop_for_site_scoped_binding() {
+        let (drv, deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Single,
+            tenant_scope: crate::config::TenantScope::Site,
+            ..Default::default()
+        };
+        drv.ensure_target_db_provisioned("acme", "app", &cfg)
+            .await
+            .expect("site-scoped binding self-provision is a no-op");
+        // No workload was registered as a side effect (nothing was actually provisioned).
+        let workloads = deploy
+            .list_compute_workloads(ProjectRef::new("acme"))
+            .await
+            .unwrap();
+        assert!(
+            workloads.is_empty(),
+            "a site-scoped binding must register nothing"
+        );
+    }
+
+    /// PLAN-clone-self-provision-managed-db, the **dedicated/Single** half of the fix: before
+    /// this commit, nothing in the restore path registered a fresh target's dedicated managed-db
+    /// workload — `pg_shadow_plan` went straight to `resolve_pg` against a workload that might
+    /// never have been registered. `ensure_target_db_provisioned` now reuses the SAME lazy
+    /// provisioner (`tenant_sql::provision_tenant` → `provision_single`) the platform runs on a
+    /// normal first `sql` access, which durably REGISTERS the dedicated `<compute>-<ident>`
+    /// workload (idempotent — a re-run is a no-op). Registration is pure `DeployStore`/`KvStore`
+    /// I/O (no network connection), so this is provable without a live Postgres.
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_registers_a_fresh_single_tenant_workload() {
+        let (drv, deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Single,
+            tenant_scope: crate::config::TenantScope::Project,
+            ..Default::default()
+        };
+        let target = "acme-fresh";
+        // Nothing registered yet — the exact "fresh target" shape a clone onto a brand-new
+        // project shell has.
+        assert!(
+            deploy
+                .list_compute_workloads(ProjectRef::new(target))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drv.ensure_target_db_provisioned(target, "app", &cfg)
+            .await
+            .expect("Single self-provision registers the dedicated workload");
+        let workloads = deploy
+            .list_compute_workloads(ProjectRef::new(target))
+            .await
+            .unwrap();
+        assert_eq!(
+            workloads.len(),
+            1,
+            "exactly the target's own dedicated workload is registered"
+        );
+        // Idempotent: a second call (the retry-safe / already-provisioned-target shape) changes
+        // nothing — still exactly one workload, no clobber.
+        drv.ensure_target_db_provisioned(target, "app", &cfg)
+            .await
+            .expect("re-provisioning an already-provisioned target is a no-op");
+        let workloads_again = deploy
+            .list_compute_workloads(ProjectRef::new(target))
+            .await
+            .unwrap();
+        assert_eq!(
+            workloads_again.len(),
+            1,
+            "idempotent — no duplicate/clobber"
+        );
+
+        // TARGET-SCOPED ONLY: an unrelated project is never touched by provisioning `target`.
+        let other = deploy
+            .list_compute_workloads(ProjectRef::new("some-other-tenant"))
+            .await
+            .unwrap();
+        assert!(
+            other.is_empty(),
+            "self-provisioning one project must not register/touch another project's workload"
+        );
+    }
+
+    /// A **Shared**-tenant managed binding with no replica registered anywhere: self-provision
+    /// genuinely ATTEMPTS the real `provision_shared` DDL (reaching for the resolver / a
+    /// connection) rather than silently no-op'ing — it fails with a clear "no replica" / "not
+    /// ready" shape, never a panic and never a silent `Ok(())` that would mask the gap this fix
+    /// closes. (The success path — the server IS up and the tenant db gets created on it,
+    /// construens's exact failure shape going from broken to fixed — is proven live in
+    /// `project_export_roundtrip.rs`'s `project_export_clone_self_provisions_shared_tenant_live`,
+    /// which needs a real Postgres.)
+    #[tokio::test]
+    async fn ensure_target_db_provisioned_shared_without_a_replica_fails_informatively() {
+        let (drv, _deploy, _kv) = provision_fixture();
+        let cfg = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("app".into()),
+            user: Some("postgres".into()),
+            tenant: crate::config::TenantIsolation::Shared,
+            tenant_scope: crate::config::TenantScope::Project,
+            connect_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let err = drv
+            .ensure_target_db_provisioned("acme-fresh", "app", &cfg)
+            .await
+            .expect_err("Shared self-provision with no registered replica cannot succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("clone self-provision"),
+            "error is attributed to the self-provision call: {msg}"
         );
     }
 
@@ -8440,6 +9304,67 @@ mod tests {
     }
 
     #[test]
+    fn bounded_derived_db_name_fits_63_bytes_and_stays_distinct() {
+        // SHORT live db: byte-identical to the old `format!("{live}{marker}{suffix}")` — the
+        // dedicated/chunked path and the existing shadow-name tests keep their exact names.
+        assert_eq!(
+            bounded_derived_db_name("appdb", "__shadow_", "1700000000_42"),
+            "appdb__shadow_1700000000_42"
+        );
+        assert_eq!(
+            bounded_derived_db_name("appdb", "__old_", "1700000000_42"),
+            "appdb__old_1700000000_42"
+        );
+        assert_eq!(
+            bounded_derived_db_name("app", "__shadow_", "brdelta"),
+            "app__shadow_brdelta"
+        );
+
+        // LONG live db (the Shared-tenant shape): ~62 bytes, so the naive name would be ~98 bytes
+        // and Postgres would truncate it back to the live name. The real `shadow_suffix()` shape.
+        let live = "clonesp_clonesp_fresh_1793655865_7rmx_4ahtlf3v6btes2g18bq7820bx";
+        assert!(live.len() >= 60, "fixture must exercise the bounded path");
+        let suffix = "1793655865123456789_4242";
+        let name = bounded_derived_db_name(live, "__shadow_", suffix);
+
+        // (result) ≤ 63 bytes — never overflows NAMEDATALEN.
+        assert!(
+            name.len() <= MAX_DERIVED_DB_NAME_LEN,
+            "derived name {name:?} is {} bytes (> {MAX_DERIVED_DB_NAME_LEN})",
+            name.len()
+        );
+        // (b) the FULL `__shadow_<suffix>` marker+distinguisher survives intact, within the first
+        // 63 bytes — so the `%__shadow_%` sweep still matches and the suffix still disambiguates.
+        let marker_tail = format!("__shadow_{suffix}");
+        assert!(
+            name.ends_with(&marker_tail) && name.contains("__shadow_"),
+            "derived name {name:?} dropped part of its {marker_tail:?} distinguisher"
+        );
+        // (a) distinct from the live db name truncated to 63 bytes — the exact collapse that caused
+        // `CREATE DATABASE … already exists`. The derived name keeps the `__shadow_…` tail a plain
+        // truncation of `live` would have thrown away.
+        let live_trunc = &live[..live.len().min(MAX_DERIVED_DB_NAME_LEN)];
+        assert_ne!(
+            name, live_trunc,
+            "derived name collapsed back to the live name"
+        );
+
+        // (c) collision-free: two different per-import suffixes yield two different names.
+        let other = bounded_derived_db_name(live, "__shadow_", "1793655865999999999_4242");
+        assert_ne!(
+            name, other,
+            "distinct suffixes must yield distinct shadow names (collision-free across imports)"
+        );
+
+        // The `__old_` aside for the same long live db is also bounded and distinct from the shadow.
+        let old = bounded_derived_db_name(live, "__old_", suffix);
+        assert!(old.len() <= MAX_DERIVED_DB_NAME_LEN);
+        assert!(old.ends_with(&format!("__old_{suffix}")));
+        assert_ne!(old, name);
+        assert_ne!(old, live_trunc);
+    }
+
+    #[test]
     fn swap_safety_refuses_empty_shadow_over_nonempty_live() {
         let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // THE data-loss state: live has tables, shadow is EMPTY → swapping would move live aside +
@@ -8503,6 +9428,61 @@ mod tests {
         assert!(data_only_skew_blocks(None, Some("abc")));
         assert!(data_only_skew_blocks(Some("abc"), None));
         assert!(data_only_skew_blocks(None, None));
+    }
+
+    /// The SIDECAR pg apply narrowing (the pure decision behind the restore_member PgDump arm).
+    /// Pins the precise boundary: a MANAGED FULL dump is now applied via the atomic non-superuser
+    /// shadow+swap (so a Shared tenant's sidecar-framed FULL clone succeeds), while a MANAGED
+    /// `data_only` dump is STILL refused (overlay into a live schema, no atomic shadow) — the
+    /// narrowing must not over-open the guard. An external binding is applied directly as before.
+    /// (The live shadow apply itself needs Docker + pg; this unit test fixes the dispatch that the
+    /// `*_live` gates then exercise end-to-end.)
+    #[test]
+    fn sidecar_pg_apply_narrows_only_full_managed_dumps() {
+        // MANAGED + FULL (data_only = false): the NOW-SAFE case — atomic non-superuser shadow+swap.
+        assert_eq!(
+            sidecar_pg_apply(true, false),
+            SidecarPgApply::ManagedShadowSwap,
+            "a FULL managed sidecar dump applies via the non-superuser shadow+swap"
+        );
+        // MANAGED + data_only: STILL refused (the narrowing must not over-open the guard).
+        assert_eq!(
+            sidecar_pg_apply(true, true),
+            SidecarPgApply::RefuseManagedDataOnly,
+            "a data-only managed sidecar dump must STAY refused — no atomic shadow for an overlay"
+        );
+        // EXTERNAL (not managed): applied directly with the operator's own credential, FULL or not.
+        assert_eq!(sidecar_pg_apply(false, false), SidecarPgApply::External);
+        assert_eq!(sidecar_pg_apply(false, true), SidecarPgApply::External);
+    }
+
+    /// The SHARED-shadow restore-window closer's terminate-sweep SQL composes correctly: it targets
+    /// the shadow by its `datname` (a safely-quoted SQL string LITERAL, not an identifier) and
+    /// EXCLUDES our own backend. A mutation that dropped the `pid <> pg_backend_pid()` self-exclusion
+    /// (self-terminating the maintenance session) or misquoted the db name fails here. This is the
+    /// exact sweep run both in `pg_create_shadow` (batched after the REVOKE) and immediately before
+    /// the untrusted restore in `pg_sidecar_shadow_restore`.
+    #[test]
+    fn terminate_backends_sweep_targets_the_db_literal_and_spares_self() {
+        let sql = pg_terminate_backends_sql("clonesp_fresh__shadow_1700_42");
+        assert!(sql.starts_with("SELECT pg_terminate_backend(pid) FROM pg_stat_activity"));
+        // The db name is a single-quoted STRING LITERAL (datname is text), never an identifier.
+        assert!(
+            sql.contains("datname = 'clonesp_fresh__shadow_1700_42'"),
+            "the shadow db must be matched as a quoted datname literal: {sql}"
+        );
+        // Never evict our own maintenance backend (which runs the sweep).
+        assert!(
+            sql.contains("pid <> pg_backend_pid()"),
+            "the sweep must spare the running backend: {sql}"
+        );
+        // A db name bearing a quote is doubled (defensive — the name is driver-derived, not attacker
+        // input, but the literal quoting must be correct regardless).
+        let tricky = pg_terminate_backends_sql("od'd");
+        assert!(
+            tricky.contains("datname = 'od''d'"),
+            "embedded quote doubled: {tricky}"
+        );
     }
 
     /// Driver-level (in-process, no Docker): a `--data-only` export must NOT stage the

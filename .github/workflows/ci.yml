@@ -27,6 +27,20 @@ name: CI
 #                       assertions of runner CPU), live-gate-dns-publish (a real wasm guest
 #                       publishing DNS through the host `dns-publish` gate into a credential-free
 #                       ManualDnsProvider — the #24 fail-closed proof at the serve seam),
+#                       live-gate-dns-publish-serve-wiring (the #25 fix: the SAME guest through the
+#                       REAL router() pipeline — access-denied with no provider source installed, then
+#                       applied + captured once serve's boot wiring installs it — so the serve seam
+#                       can't regress to inert again),
+#                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
+#                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
+#                       that must never compression-mangle a framed body),
+#                       live-gate-connect-server-stream (real Connect/gRPC-web SERVER-STREAMs over
+#                       the host topic fan-out AND a guest serve_server_stream — PLAN-connect-grpc
+#                       §7 / IU-4, both framed via the shared boatramp-connect-frame codec),
+#                       live-gate-connect-client (a GENERATED Rust client — the vendored `just
+#                       codegen` output — driving a real Connect unary + server-stream round trip
+#                       over the boatramp-connect-client shim, both wires — PLAN-connect-grpc §9 /
+#                       IU-5),
 #                       test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
@@ -449,6 +463,28 @@ jobs:
             || { echo "::error::a no_secrets handler no longer resolves ZERO site secrets (Ask B-3 B regressed)" >&2; exit 1; }
           grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
             || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
+
+      # construens #2 — PRE-AUTH TENANT SOURCE e2e GATE (marker `PRE-AUTH TENANT SOURCE OK`). The
+      # `pre_auth_request` tenancy source resolves an UNSCOPED SSO login-start's firm from the request
+      # (host/query/path/body) as a SEAL-ONLY subject so the existing sealed-state mint can seal it —
+      # with NO data access at `/start` (no RLS / tenant-secrets). This real-path gate drives the full
+      # construens RP flow through the REAL Stage-0 resolver: it MUST reproduce today's failing shape
+      # in the INERT arm (an unscoped start resolves no tenant → the mint fails closed → no sealed firm)
+      # AND pass in the WIRED arm (the firm is host-resolved seal-only → the mint seals it → /callback
+      # recovers it). The marker prints ONLY after BOTH arms pass, so a silent skip / `#[cfg]`-out /
+      # rename — or a regression that let the unscoped start resolve a tenant, or let the pre-auth firm
+      # become a data tenant — fails the merge. The `preauth_source` unit tests (each location +
+      # fail-closed + seal-only confinement) run in the same lane.
+      - name: Pre-auth tenant source e2e gate (construens #2 — seal-only firm, fail-closed start)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,mcp,compression,domain-verify-dns --lib \
+            tenant_resolve::preauth -- --nocapture 2>&1 | tee preauth-source.log
+          grep -qE 'test result: ok\. 9 passed' preauth-source.log \
+            || { echo "::error::pre-auth tenant source gate did not run all 9 tests (silent skip, a failure, or a dropped case)" >&2; exit 1; }
+          grep -q 'PRE-AUTH TENANT SOURCE OK' preauth-source.log \
+            || { echo "::error::pre-auth tenant source e2e gate never reached its marker — the unscoped-start-fails-closed / seal-only-start-resolves / callback-recovers flow regressed" >&2; exit 1; }
 
       # v0.29.0 NEGATIVE-CACHE SECRET-SCOPING GATE. `CachedKv` caches an ABSENCE (negative lookup) to
       # kill the ~400 ms-per-serve unset-secret re-read, but ONLY for the secret keyspace — an authz
@@ -1610,6 +1646,214 @@ jobs:
             || { echo "::error::dns-publish live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
             || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
+
+  # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
+  # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
+  # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
+  # the serve binding seam, so every guest `dns-publish` call fail-closed to `access-denied` in dev AND
+  # prod). THIS gate drives the REAL serving pipeline — `router()` → `serve_sites` → `handler_dispatch`
+  # → `build_handler_bindings` → `maybe_attach` → `provider_source()` — with the real `dns-publish-
+  # writer.wasm` guest, in two arms in ONE process: (1) with NO provider source installed, a granted
+  # in-zone posture-ON write is `access-denied` and NOTHING is captured (the v0.51.0 inert shape,
+  # reproduced live at the serve seam); (2) after `install_provider_source` (the EXACT call
+  # `boatramp serve`'s boot wiring now makes — `boatramp::dns_publish_serve`), the SAME writes are
+  # APPLIED + CAPTURED by a credential-free `ManualDnsProvider` (no secrets — the capture is the
+  # publish-through-serve proof), out-of-zone is `not-authorized`, apex-NS is `apex-refused`. So the
+  # dispatch seam can't silently regress to inert again. `#[ignore]`d (run with `--ignored`); this
+  # dedicated job greps the success marker + pass count so a silent skip / compile-out fails the merge.
+  live-gate-dns-publish-serve-wiring:
+    name: live gate (dns-publish serve wiring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-dns-publish-serve-wiring-musl
+
+      - name: "dns-publish serve-wiring gate (inert access-denied with no source → applied + captured once installed, through router())"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features dns-publish --test dns_publish_serve_wiring_live \
+            -- --ignored --nocapture 2>&1 | tee dns-publish-serve-wiring.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-serve-wiring.log \
+            || { echo "::error::dns-publish serve-wiring gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH SERVE-WIRING OK' dns-publish-serve-wiring.log \
+            || { echo "::error::dns-publish serve-wiring gate never reached its marker (the serve-path provider-source install → maybe_attach → capture seam regressed to inert — cap-req #25)" >&2; exit 1; }
+
+      # SERVE-INSTALL CALL-SITE boot smoke. The gate above proves the install→dispatch→capture seam, but
+      # it installs the provider source itself — it cannot prove `boatramp serve` actually CALLS
+      # install_dns_publish_source at boot, and that one-line call-site is EXACTLY how #24 shipped inert
+      # (the call was missing). This smoke boots the REAL binary with `--dns-publish-provider manual` and
+      # asserts serve emits the install marker `DNS-PUBLISH SERVE-INSTALL CALLED` early in run() (before
+      # the mode fork / store seeding — so it is robust: capture the early stderr line, then kill; never
+      # waits for the full node boot). A lean feature set (fs,slatedb for a bootable store + the wiring)
+      # keeps the binary compile light. Deleting the call line drops the marker ⇒ this step fails.
+      - name: "dns-publish serve-INSTALL boot smoke (serve run() actually CALLS install_dns_publish_source)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --no-default-features --features fs,slatedb,dns-publish,acme-dns \
+            --test dns_publish_serve_install_boot \
+            -- --ignored --nocapture 2>&1 | tee dns-publish-install-boot.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-install-boot.log \
+            || { echo "::error::dns-publish serve-install boot smoke did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH SERVE-INSTALL-BOOT OK' dns-publish-install-boot.log \
+            || { echo "::error::serve did NOT call install_dns_publish_source at boot — the #24 inert-ship call-site regressed (cap-req #25)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §9 IU-1 CONNECT-UNARY LIVE GATE (marker `CONNECT UNARY LIVE OK`). The
+  # Connect / gRPC-web transport's milestone-1 end-to-end proof: a REAL compiled guest component
+  # (`connect-greeter.wasm`, built from the shim repo's `examples/connect-greeter` on the
+  # `boatramp-connect` serving shim) serves one unary RPC `POST /connect.greeter.v1.Greeter/SayHello`
+  # via `serve_unary`, deployed through a real DeployStore + `router`, and is driven with a
+  # hand-written HTTP/1.1 Connect-unary request over a loopback `TcpStream` — the ACTUAL hand-rolled
+  # HTTP stack (`boatramp_http::serve_connection` via `serve_plaintext_listener`), not an in-process
+  # oneshot. It asserts: (1) a bare `application/proto` unary round-trips and the bare reply message
+  # decodes; (2) an `application/grpc-web+proto` unary WITH on-the-fly compression ON + `Accept-Encoding:
+  # gzip` comes back UNCOMPRESSED (no `content-encoding`) and still decodes as [data frame][grpc-status:0
+  # trailers frame] — exercising the host residual (commit `2f5aa2d0`) that must NEVER HTTP-compress a
+  # framed Connect/gRPC-web body (it would mangle the length-prefixed envelope framing). The fixture is
+  # `include_bytes!`-embedded (prebuilt + committed), so this compiles + runs on musl with NO wasm
+  # toolchain. `#[ignore]`d (real loopback sockets, timing-sensitive like the other socket live gates)
+  # and run here with `--include-ignored` as its OWN job (NOT folded into the general `--all-features`
+  # suite, per the v0.49.0 timing-flake lesson); the gate greps the success marker + the pass count, so
+  # a silent skip / compile-out fails the merge (the `ignore-gated-tests-not-evidence` discipline).
+  live-gate-connect-unary:
+    name: live gate (connect-unary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-unary-musl
+
+      - name: "connect-unary live gate (bare application/proto + gRPC-web framed-body never-compressed)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_unary_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-unary-live.log
+          grep -qE 'test result: ok\. 1 passed' connect-unary-live.log \
+            || { echo "::error::connect-unary live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT UNARY LIVE OK' connect-unary-live.log \
+            || { echo "::error::connect-unary live gate never reached its marker (a Connect/gRPC-web serve-path regression — likely the host residual that must not compression-mangle a framed body, PLAN-connect-grpc §5 / IU-1)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §7 IU-4 CONNECT-SERVER-STREAM LIVE GATES. Two seams, each a real Connect /
+  # gRPC-web server-stream over the ACTUAL hand-rolled HTTP stack on a loopback socket, each wired as
+  # a hard CI success-marker per the ignore-gated-tests-not-evidence discipline:
+  #   • FANOUT (marker `CONNECT SERVER-STREAM FANOUT LIVE OK`): the host's live-topic fan-out frames
+  #     each delivered messaging payload as a length-prefixed Connect/gRPC-web envelope (instead of an
+  #     SSE `event:` line) when the client opens the stream with a Connect/gRPC-web content-type
+  #     (`stream.rs::serve_connect_stream`). A live `LogMessaging` backend + a background publisher
+  #     (the PLAN §7 producer) feed it; the client reads framed data frames decoding to the published
+  #     protobuf, the gRPC-web body comes back UNCOMPRESSED (the host residual on the fan-out path),
+  #     and a Scoped route with no bearer is 401 (per-subscriber authz gates the Connect path). No
+  #     wasm toolchain — the fan-out has no guest in the serving loop.
+  #   • GUEST (marker `CONNECT SERVER-STREAM GUEST LIVE OK`): a REAL compiled guest
+  #     (`connect-ticker.wasm`, built from the shim's `examples/connect-ticker` on `serve_server_stream`
+  #     with GENERATED prost messages) yields N Ticks onto the shim's incremental ResponseStream (the
+  #     §8 `#[handler(stream)]` arm), which the host drains chunk-by-chunk; the client asserts N data
+  #     frames + the terminal end frame (Connect EndStream / gRPC-web trailers) for both wires, and the
+  #     gRPC-web framed body is never HTTP-compressed. The `include_bytes!`-embedded fixture runs on
+  #     musl with no wasm toolchain. Both `#[ignore]`d (timing-sensitive loopback sockets) and run here
+  #     with `--include-ignored` as their OWN job, NOT folded into the general `--all-features` suite
+  #     (v0.49.0 timing-flake lesson); each step greps its marker + the pass count, so a silent skip /
+  #     compile-out fails the merge.
+  live-gate-connect-server-stream:
+    name: live gate (connect-server-stream)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-server-stream-musl
+
+      - name: "connect-server-stream FANOUT live gate (host topic fan-out framed as Connect/gRPC-web)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_server_stream_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-ss-fanout.log
+          grep -qE 'test result: ok\. 1 passed' connect-ss-fanout.log \
+            || { echo "::error::connect server-stream FANOUT live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT SERVER-STREAM FANOUT LIVE OK' connect-ss-fanout.log \
+            || { echo "::error::connect server-stream FANOUT live gate never reached its marker (a stream.rs Connect-framing-mode regression, PLAN-connect-grpc §7 / IU-4)" >&2; exit 1; }
+
+      - name: "connect-server-stream GUEST live gate (guest serve_server_stream over the §8 streaming arm)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_server_stream_guest_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-ss-guest.log
+          grep -qE 'test result: ok\. 1 passed' connect-ss-guest.log \
+            || { echo "::error::connect server-stream GUEST live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT SERVER-STREAM GUEST LIVE OK' connect-ss-guest.log \
+            || { echo "::error::connect server-stream GUEST live gate never reached its marker (a serve_server_stream / §8 streaming-arm / shared frame-codec regression, PLAN-connect-grpc §6-§8 / IU-3+IU-4)" >&2; exit 1; }
+
+  # PLAN-connect-grpc §9 IU-5 CONNECT-CLIENT LIVE GATES — the CLIENT-codegen "end-to-end proof". The
+  # client-side mirror of the connect-unary / connect-server-stream serving gates above: a GENERATED
+  # Rust client (`connect-clients` crate, the vendored `just codegen` output — prost messages + a
+  # typed client per service) drives a REAL Connect round trip over the `boatramp-connect-client`
+  # shim + its std `PlaintextHttpTransport`, against the SAME compiled guests (`connect-greeter.wasm`
+  # unary, `connect-ticker.wasm` server-stream) served over the ACTUAL hand-rolled HTTP/1.1 stack on
+  # a loopback socket. Each test exercises BOTH wires (Connect + gRPC-web):
+  #   • UNARY (marker `CONNECT CLIENT UNARY LIVE OK`): the generated GreeterClient.say_hello
+  #     round-trips a bare `application/proto` message and a framed `application/grpc-web+proto`
+  #     [data][grpc-status:0 trailers] response — proving the generated client, the client shim, and
+  #     the shared `boatramp-connect-frame` codec (its NEW client-side decoders) all agree with the
+  #     serving path. Confirms the client speaks `Connect-Protocol-Version: 1` (the shim's version).
+  #   • SERVER-STREAM (marker `CONNECT CLIENT SERVER-STREAM LIVE OK`): the generated
+  #     TickerClient.subscribe reads N framed Ticks + the terminal end-of-stream status (Connect
+  #     EndStream / gRPC-web trailers) via the shim's `ServerStream<Tick>` iterator.
+  # `include_bytes!`-embedded fixtures (runs on musl, no wasm toolchain). Both `#[ignore]`d (timing-
+  # sensitive loopback sockets) and run here with `--include-ignored` as their OWN job, NOT folded
+  # into the general suite (v0.49.0 timing-flake lesson); each step greps its marker + the pass
+  # count, so a silent skip / compile-out fails the merge (the ignore-gated-tests-not-evidence
+  # discipline).
+  live-gate-connect-client:
+    name: live gate (connect-client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-connect-client-musl
+
+      - name: "connect-client UNARY live gate (generated client, Connect + gRPC-web wires)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_client_unary_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-client-unary.log
+          grep -qE 'test result: ok\. 1 passed' connect-client-unary.log \
+            || { echo "::error::connect-client UNARY live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT CLIENT UNARY LIVE OK' connect-client-unary.log \
+            || { echo "::error::connect-client UNARY live gate never reached its marker (a generated-client / client-shim / shared frame-codec regression, PLAN-connect-grpc §9 / IU-5)" >&2; exit 1; }
+
+      - name: "connect-client SERVER-STREAM live gate (generated client ServerStream, Connect + gRPC-web wires)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,compression --test connect_client_server_stream_live \
+            -- --include-ignored --nocapture 2>&1 | tee connect-client-ss.log
+          grep -qE 'test result: ok\. 1 passed' connect-client-ss.log \
+            || { echo "::error::connect-client SERVER-STREAM live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONNECT CLIENT SERVER-STREAM LIVE OK' connect-client-ss.log \
+            || { echo "::error::connect-client SERVER-STREAM live gate never reached its marker (a generated-client ServerStream / client-shim / shared frame-codec regression, PLAN-connect-grpc §9 / IU-5)" >&2; exit 1; }
 
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql

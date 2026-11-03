@@ -1,0 +1,14 @@
+{
+  "//": "Typecheck config for the generated Web/TS connect-es client + the verify script (PLAN-connect-grpc IU-5). `npm run typecheck` (tsc --noEmit) proves the vendored client, the pinned connect runtime types, and verify.ts all agree — the honest 'it's real' signal that does not need a live endpoint. The live round trip is the manual `npm run verify` step (see README).",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"]
+  },
+  "include": ["generated/**/*.ts", "verify.ts"]
+}

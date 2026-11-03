@@ -530,10 +530,22 @@ fn substitute_template(t: &str, params: &std::collections::BTreeMap<String, Stri
     out
 }
 
-/// Serve a configured SSE stream: subscribe to each of its (scope-namespaced)
-/// topics on the messaging backend and fan them out to the client as
-/// `text/event-stream`, with `Last-Event-ID` resume, a heartbeat, an idle
-/// timeout, and per-scope + per-IP connection caps.
+/// Serve a configured stream: subscribe to each of its (scope-namespaced) topics on the messaging
+/// backend and fan them out to the client, with `Last-Event-ID` resume, an idle timeout, and
+/// per-scope + per-IP connection caps.
+///
+/// Two framings over the one fan-out, selected by `connect_wire`:
+/// * `None` — **SSE** (`text/event-stream`): each payload is an `event: <topic>` line, with a
+///   heartbeat (today's behavior, unchanged).
+/// * `Some(wire)` — **Connect / gRPC-web server-stream** (PLAN-connect-grpc §7 / IU-4): each
+///   payload is a length-prefixed envelope data frame, terminated by an in-body end-of-stream
+///   frame (a Connect EndStream `{}` or a gRPC-web `grpc-status: 0` trailers frame) when the
+///   fan-out ends or goes idle. The authz, topic resolution, permits, and fan-out are IDENTICAL —
+///   only the on-wire framing of each delivered payload differs — so per-subscriber
+///   `br-stream-authz` holds on the Connect path exactly as it does on SSE (same
+///   [`authorize_stream_topics`] call, run before any byte is produced). The host does not decode
+///   the request protobuf (it stays protobuf-agnostic); the subscribed scope rides the route
+///   params + bearer like every scoped stream.
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_stream(
@@ -547,6 +559,7 @@ pub(super) async fn serve_stream(
     bearer: Option<&str>,
     client_ip: IpAddr,
     preview: Option<&str>,
+    connect_wire: Option<boatramp_connect_frame::Wire>,
 ) -> Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::StreamExt;
@@ -599,6 +612,21 @@ pub(super) async fn serve_stream(
 
     // `after` is the client's Last-Event-ID (best-effort resume).
 
+    // Connect / gRPC-web server-stream framing (PLAN §7 / IU-4): the SAME fan-out, but each
+    // delivered payload is a length-prefixed envelope frame + a terminal end frame on close,
+    // instead of an SSE `event:` line. Authz + permits above already ran identically.
+    if let Some(wire) = connect_wire {
+        return serve_connect_stream(
+            messaging,
+            &scope,
+            &topics,
+            after,
+            wire,
+            site_permit,
+            ip_guard,
+        );
+    }
+
     // One live subscription per configured topic, each namespaced under the
     // scope (so the client sees only its own site's/preview's traffic). The
     // event's `event:` field is the *config* topic (scope-relative), matching
@@ -636,6 +664,100 @@ pub(super) async fn serve_stream(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+/// Build the **Connect / gRPC-web server-stream** response body (PLAN-connect-grpc §7 / IU-4):
+/// the SAME scope-namespaced topic fan-out as [`serve_stream`]'s SSE path, but each delivered
+/// payload is a length-prefixed envelope **data** frame, and the body ends with one terminal
+/// end-of-stream frame (a Connect **EndStream** `{}` for `application/connect+*`, or a gRPC-web
+/// `grpc-status: 0` **trailers** frame for `application/grpc-web*`) once the fan-out ends or goes
+/// idle past [`STREAM_IDLE_TIMEOUT`]. HTTP status is always `200`; the RPC status rides the end
+/// frame (that is the Connect-first lever — no HTTP/2 trailers, PLAN §4). The permits are held for
+/// the body's lifetime (moved into the stream state) and released when the client disconnects or
+/// the stream completes, exactly like the SSE path.
+///
+/// The payloads published to the topic are the already-protobuf-encoded reply messages (a producer
+/// — a mutation handler, a function, a consumer — publishes each one), so the host only has to
+/// frame them: it never decodes the protobuf, keeping the fan-out protobuf-agnostic.
+#[cfg(feature = "handlers")]
+fn serve_connect_stream(
+    messaging: Arc<dyn boatramp_core::messaging::Messaging>,
+    scope: &str,
+    topics: &[String],
+    after: Option<String>,
+    wire: boatramp_connect_frame::Wire,
+    site_permit: tokio::sync::OwnedSemaphorePermit,
+    ip_guard: IpStreamGuard,
+) -> Response {
+    use boatramp_connect_frame::{
+        Protocol, Status, encode_connect_end_stream, encode_envelope, encode_grpc_web_trailers,
+    };
+    use futures::StreamExt;
+
+    // One live subscription per configured (scope-namespaced) topic, merged — identical to the SSE
+    // path, but keeping only the raw payload bytes (the envelope carries no topic label; a Connect
+    // server-stream is one method's reply stream).
+    let merged = futures::stream::select_all(topics.iter().map(|topic| {
+        let namespaced = format!("{scope}/{topic}");
+        messaging
+            .subscribe(&namespaced, after.as_deref())
+            .map(|event| event.payload)
+            .boxed()
+    }));
+
+    // Stream state: the merged payloads, the permits (held for the connection's lifetime), the
+    // wire (for the terminal frame), and whether the terminal frame has been emitted.
+    struct ConnectConn {
+        events: futures::stream::BoxStream<'static, Vec<u8>>,
+        _site_permit: tokio::sync::OwnedSemaphorePermit,
+        _ip_guard: IpStreamGuard,
+        wire: boatramp_connect_frame::Wire,
+        ended: bool,
+    }
+    let conn = ConnectConn {
+        events: merged.boxed(),
+        _site_permit: site_permit,
+        _ip_guard: ip_guard,
+        wire,
+        ended: false,
+    };
+
+    let body = futures::stream::unfold(conn, |mut conn| async move {
+        // After the terminal frame, the body is complete.
+        if conn.ended {
+            return None;
+        }
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, conn.events.next()).await {
+            // A delivered payload → one envelope data frame.
+            Ok(Some(payload)) => {
+                let frame = encode_envelope(0, &payload);
+                Some((
+                    Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(frame)),
+                    conn,
+                ))
+            }
+            // All topics ended, or the topic went idle past the timeout: emit the terminal
+            // end-of-stream frame as the LAST body chunk, then stop.
+            Ok(None) | Err(_) => {
+                let end = match conn.wire.protocol {
+                    Protocol::GrpcWeb => encode_grpc_web_trailers(&Status::ok(), &[]),
+                    _ => encode_connect_end_stream(&Status::ok(), &[]),
+                };
+                conn.ended = true;
+                Some((Ok(bytes::Bytes::from(end)), conn))
+            }
+        }
+    });
+
+    // Always `200` (Connect/gRPC-web carry status in-body); the content.rs residual keeps these
+    // framed content-types off the compression allowlist, so the envelope framing is never mangled.
+    let mut resp = Body::from_stream(body).into_response();
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(wire.response_content_type()),
+    );
+    resp
 }
 
 /// Serve a GraphQL **subscription** as a [graphql-sse] event stream ("distinct

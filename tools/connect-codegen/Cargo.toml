@@ -1,0 +1,30 @@
+# The boatramp Connect / gRPC-web **client** codegen tool (PLAN-connect-grpc §9 / IU-5).
+#
+# A host dev tool, run ONLY via `just codegen` inside `nix develop` (which supplies the
+# nixpkgs-pinned `protoc`); it compiles the `.proto` files under `proto/` into the VENDORED/committed
+# Rust under `examples/connect-clients/src/generated/` — the `prost` message structs plus a typed
+# CLIENT per service (one method = one call over `boatramp_connect_client::call_unary` /
+# `call_server_stream`, the kind derived from the proto `stream` keyword). This is the
+# client-direction analog of the shim repo's server codegen (which emits a `ConnectService` serving
+# impl instead).
+#
+# Its OWN workspace (the empty `[workspace]` table below) with its OWN committed lockfile, so it is
+# NOT part of the host workspace build — only run when codegen runs — and so `prost-build`'s exact
+# version is pinned for byte-reproducible output (regenerate twice ⇒ identical bytes).
+[workspace]
+
+[package]
+name = "connect-codegen"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "connect-codegen"
+path = "src/main.rs"
+
+[dependencies]
+# PINNED EXACT — the SAME `prost`/`prost-build` family the `boatramp-connect-client` runtime and the
+# shim's server codegen pin, so the generated message bytes are reproducible across both repos
+# (PLAN §11.3). `prost-build` shells out to `protoc`; the Nix devshell pins that.
+prost-build = "=0.14.1"

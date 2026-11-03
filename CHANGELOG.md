@@ -9,6 +9,58 @@ versions.
 
 Nothing yet.
 
+## [0.52.0] - 2026-11-02
+
+This release delivers **Connect / gRPC-web** as a first-class transport — typed-protobuf unary and
+server-streaming over the hand-rolled HTTP stack, with **client code generation from `.proto`** so a
+client in any language can call a boatramp service; the first slice of **managed-service credentials
+for compute workloads** — a managed-DB-bound container now receives a real, operator-templatable
+`postgres://`/`mysql://` DSN in its environment, so an off-the-shelf driver works with no
+boatramp-specific client; a new **pre-auth tenant source** that lets a multi-tenant IdP resolve the
+firm for an unscoped SSO login-start; and the **serve-side wiring** that finally lets an operator
+enable guest DNS-publish. Plus an ACME DNS-01 propagation fix and a project-clone self-provisioning fix.
+
+### Added
+
+- **Connect / gRPC-web transport + client codegen.** Two new published crates —
+  `boatramp-connect-frame` (the shared Connect/gRPC-web wire-framing codec) and
+  `boatramp-connect-client` (a typed client shim) — plus `.proto` → client code generation
+  (`just codegen`), so clients generate code from `.proto` and call boatramp unary and
+  server-streaming endpoints. Served over the existing HTTP stack via the `application/proto`,
+  `application/connect+proto`, and `application/grpc-web+proto` content-types.
+- **Managed-DB DSN for compute workloads (phase 1).** A compute workload bound to a managed,
+  co-located Postgres/MySQL (`boatramp compute … --bind sql`) now receives a real
+  `postgres://`/`mysql://` DSN in its environment, so an off-the-shelf driver, ORM, or migration
+  tool Just Works with no shim or boatramp-specific token. The injected env var(s) are
+  **operator-templatable** — `{{sql.host|port|user|password|database|dsn}}`,
+  `{{sql.migration_*}}`, and `{{secret.NAME}}` rendered server-side into whatever variable names
+  the workload expects (`url_env` / `migration_url_env`), with a sensible full-DSN default. The
+  credential is the stable managed role; a dynamic per-replica credential is a follow-up.
+- **Pre-auth request tenant source (`pre_auth_request`).** A new tenancy source that resolves the
+  firm for a **pre-auth, unscoped SSO login-start** from a configurable request location — host,
+  query, path, or body. It is **seal-only** (no data access at `/sso/start`; it only scopes the
+  sealed OIDC `state`), resolves only to a configured firm (fail-closed, uniform outcome), and is
+  opt-in and sole-source per route. The sealed firm is a pre-auth *claim*, authoritative only once
+  the IdP authorization-code exchange + PKCE/nonce complete at the callback.
+
+### Fixed
+
+- **Guest DNS-publish is now operator-enablable.** `[serve.dns_publish]` /
+  `--dns-publish-provider` / `BOATRAMP_DNS_PUBLISH_PROVIDER` install the guest DNS-publish provider
+  source at serve boot — the v0.51.0 DNS-publish capability shipped without this serve wiring, so it
+  was inert. Same provider grammar and creds-from-env as `--acme-dns-provider` (a distinct
+  authority), with a `manual` provider for an offline proof; still gated by `allow_guest_dns_publish`
+  and `dns_publish_zones`.
+- **ACME DNS-01 propagation pre-check now queries the zone's authoritative nameservers** directly,
+  so a recursive resolver's negative cache can no longer stall issuance.
+- **Project clone (`import --clone-from`) now provisions and safely restores a fresh managed-DB
+  target, including a Shared-tenant managed Postgres.** The target database is self-provisioned
+  before member restore (a clone into a fresh project/tenant no longer fails with "database does not
+  exist"), and a Shared-tenant managed-pg dump is applied through a **non-superuser shadow + atomic
+  swap** — the untrusted dump runs only as an ephemeral `NOSUPERUSER` role in an isolated shadow DB
+  (`REVOKE CONNECT FROM PUBLIC` + a terminate sweep close the cross-tenant window), closing the
+  bootstrap-superuser RCE path that previously forced the Shared-tenant managed-pg clone to refuse.
+
 ## [0.51.0] - 2026-11-02
 
 This release ships five programs in one cut: guest **DNS-publish** (mailroom #24) — the write
