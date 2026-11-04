@@ -11,16 +11,24 @@
 //! Built standalone for `x86_64-unknown-linux-musl` (statically linked): depends on nothing but
 //! `libc` + `std`, via the two `#[path]`-included files shared with the host-side bench binary.
 
+// This bin is the Linux-only firecracker-guest init (it binds `AF_VSOCK` and uses Linux libc).
+// Everything but a stub `main` is gated to `target_os = "linux"`, so non-Linux targets (the
+// Windows Tunnel CI lane; macOS) build a stub that compiles + exits rather than failing on the
+// Linux-only socket/libc APIs. It is only ever actually BOOTED on the linux-musl guest.
+#[cfg(target_os = "linux")]
 #[path = "vsock_raw.rs"]
 mod vsock_raw;
+#[cfg(target_os = "linux")]
 #[path = "wire.rs"]
 mod wire;
 
 /// Fixed vsock port the guest listens on — the host-side `vsock-firecracker` substrate driver
 /// dials this same port.
+#[cfg(target_os = "linux")]
 const GUEST_PORT: u32 = 5201;
 /// The byte the guest fills every served response with (content is irrelevant to the benchmark —
 /// only the volume crossing is measured).
+#[cfg(target_os = "linux")]
 const FILL: u8 = 0xAB;
 /// The one-shot marker frame the guest sends the instant it has accepted a connection, BEFORE
 /// serving — the host's `exchange_runner::measure` reads exactly one frame after connect and
@@ -28,8 +36,16 @@ const FILL: u8 = 0xAB;
 /// (`worker::run_*`) sends this; the firecracker guest must match the SAME contract or the host
 /// blocks forever waiting for a frame that never comes. Content is irrelevant (the host discards
 /// it); it just has to be one framed message.
+#[cfg(target_os = "linux")]
 const READY: &[u8] = b"READY";
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("privsep-vsock-guest is a Linux-only firecracker-guest init (AF_VSOCK); not supported on this target");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     println!("privsep-vsock-guest: booting (pid 1)");
     loop {
@@ -39,6 +55,7 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run() -> std::io::Result<()> {
     let listener = vsock_raw::socket_vsock()?;
     vsock_raw::bind_vsock(listener, vsock_raw::VMADDR_CID_ANY, GUEST_PORT)?;
