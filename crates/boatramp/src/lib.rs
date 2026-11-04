@@ -62,13 +62,13 @@ mod db;
 // resolved `[privsep]` section is present. Lives in the lib (not the bin shim) so the `__root`/
 // `__instance` dispatch + the whole-process-sandbox-before-runtime install run in `main_entry`'s
 // pre-runtime single-threaded window.
-mod privsep;
 /// On-demand per-SNI TLS issuance at scale (cap-req 03): the allowlist-gated, single-flight issuer +
 /// the resolve-None-retry SNI resolver. Un-gated from `cluster` in v0.53.0 (serve-parity): the engine
 /// is injected with a cert store + an `is_leader` predicate + a KV, so single-node (`|| true` leader,
 /// local KV) runs it too — the cross-node certreq queue is simply inert on one node.
 #[cfg(feature = "acme-dns")]
 mod on_demand_tls;
+mod privsep;
 // `boatramp kv repair`: offline WAL-tail repair for the SlateDB control-plane store.
 // Gated on `slatedb` (it operates on the SlateDB store).
 #[cfg(feature = "slatedb")]
@@ -446,7 +446,8 @@ fn run() -> Result<(), CliError> {
             .config
             .clone()
             .unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
-        match config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches)) {
+        match config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))
+        {
             Ok(config) if config.privsep.is_some() => {
                 return privsep::run_root_with_config(config, &path);
             }

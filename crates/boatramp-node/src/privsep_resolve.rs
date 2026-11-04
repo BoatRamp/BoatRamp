@@ -1509,7 +1509,7 @@ mod tests {
         assert!(
             inputs
                 .base_read_write
-                .contains(&PathBuf::from("/srv/node/kv"))
+                .contains(&PathBuf::from("/srv/node/kv-slate"))
         );
         assert!(!inputs.base_read_write.contains(&PathBuf::from("/srv/node")));
         // Contract #1: data_dir is absolute + normalized; the config FILE (not its parent dir) is
@@ -1569,7 +1569,7 @@ mod tests {
         assert!(
             inputs
                 .base_read_write
-                .contains(&PathBuf::from("/srv/app/data/kv"))
+                .contains(&PathBuf::from("/srv/app/data/kv-slate"))
         );
     }
 

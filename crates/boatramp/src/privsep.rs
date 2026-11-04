@@ -1037,8 +1037,8 @@ mod per_tenant {
         Ok(())
     }
 
-    /// The root supervisor's OWN fork+exec spawn primitive (design §2 / §4.1) — EXTRACTED (WS-C step
-    /// 1) from the boot supervisor's spawn loop so the boot supervisor AND the per-tenant router
+    /// The root supervisor's OWN fork+exec spawn primitive (design §2 / §4.1) — EXTRACTED (WS-C
+    /// step 1) from the boot supervisor's spawn loop so the boot supervisor AND the per-tenant router
     /// instantiate an `__instance` the EXACT same way: re-exec the current binary with the spec's
     /// minimal secret-scrubbed env (F11-B `env_clear`), add `extra_env` (the fd map, the tenant
     /// scope), and in the child's `pre_exec` `dup2` each `(src → tgt)` onto its fixed target + clear
@@ -1514,9 +1514,7 @@ mod per_tenant {
     impl PerTenantInstanceRegistry for ComputePlaneRegistry {
         fn resolve(&self, scope: &TenantScope) -> Option<TenantInstanceLink> {
             let mut live = self.live.lock().unwrap();
-            let Some(inst) = live.get_mut(scope.project()) else {
-                return None;
-            };
+            let inst = live.get_mut(scope.project())?;
             // A child that has exited has a dead link — reap it and report NOT live, so the router
             // fails over to a fresh NotReady → instantiate rather than relaying onto a dead socket.
             if matches!(inst.child.try_wait(), Ok(Some(_))) {

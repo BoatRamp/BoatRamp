@@ -1738,14 +1738,16 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 3 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all three tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 4 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all four tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
             || { echo "::error::privsep signer-key-unlock live gate never reached its marker (a sealer→signer unseal / allowlist / resolver regression)" >&2; exit 1; }
           grep -q 'PRIVSEP FRONTEND INVERSION LIVE OK' privsep-live.log \
             || { echo "::error::privsep frontend-inversion live gate never reached its marker (a least-authority frontend / substrate / serving-splice regression)" >&2; exit 1; }
+          grep -q 'PRIVSEP PER-TENANT OK' privsep-live.log \
+            || { echo "::error::privsep per-tenant live gate never reached its marker (a WS-C per-tenant compute-plane spawn / execute-pin / resolver regression)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
