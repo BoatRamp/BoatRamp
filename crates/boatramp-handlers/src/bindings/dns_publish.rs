@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicU32;
 
 use boatramp_acme::dns::{
     DnsError, DnsProvider, DnsRecord as AcmeRecord, RecordKind, RecordKindTag, SvcParam,
-    canonicalize_owner_name, validate_writable,
+    ZoneResolution, canonicalize_owner_name, validate_writable,
 };
 
 use crate::engine::GuestDnsPublishNs;
@@ -453,7 +453,22 @@ impl<'a> DnsPublishHost<'a> {
             name,
             ttl: wit.ttl,
         };
-        validate_writable(b.provider.as_ref(), &record, &b.zone_root).map_err(map_guardrail_err)?;
+        // cap-req #27: the apex-NS guardrail needs the apex of the zone THIS record lands in. A single
+        // provider has one configured `zone_root` (`UseConfigured`); a multi-zone routing provider
+        // selects the per-record apex (`Zone`), or reports no authoritative zone (`NoZone` ⇒ fail
+        // closed — the record is in no zone this grant can write). The write dispatched below routes to
+        // the SAME selected zone, so the apex checked here matches the adapter actually used.
+        let zone_root: std::borrow::Cow<'_, str> = match b.provider.resolve_zone_root(&record.name)
+        {
+            ZoneResolution::UseConfigured => std::borrow::Cow::Borrowed(b.zone_root.as_str()),
+            ZoneResolution::Zone(z) => std::borrow::Cow::Owned(z),
+            ZoneResolution::NoZone => {
+                return Err(dns_publish::PublishError::NotAuthorized(
+                    record.name.clone(),
+                ));
+            }
+        };
+        validate_writable(b.provider.as_ref(), &record, &zone_root).map_err(map_guardrail_err)?;
         // MEDIUM-3: a surviving (non-apex) NS is gated by the operator's sub-zone-delegation posture.
         // The apex NS was already refused by `validate_writable`, so this only ever sees a sub-zone NS.
         if let RecordKind::Ns(ref target) = record.kind {
