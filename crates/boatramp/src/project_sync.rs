@@ -57,6 +57,28 @@ pub enum Error {
          --clone-source-token-file <path> or set BOATRAMP_CLONE_SOURCE_TOKEN"
     )]
     MissingSourceToken,
+    /// The selection names a control-plane KV stratum the CLI cannot carry over the wire yet — a
+    /// PRE-write refusal (fail-fast), so a half-sync can never be left behind (HIGH-1).
+    #[error(
+        "`project sync` cannot carry the {0} control-plane KV stratum over the CLI yet: there is \
+         no per-key admin KV API and the whole-slice clone is not piece-selective. Exclude it (the \
+         destination's own `apply` brings it), or carry it with a full `project import \
+         --clone-from`. A node-side selective-sync endpoint is the follow-up."
+    )]
+    StratumUnsupported(String),
+    /// A cross-node `--include-domains` carry without the explicit cutover intent (LOW-5).
+    #[error(
+        "refusing a cross-node `--include-domains` carry: the destination's host-uniqueness guard \
+         is same-node only and cannot see whether the remote source `{source_label}` still \
+         LIVE-owns the host(s), so this could create a SECOND simultaneously-live owner \
+         (double-live-ownership). Re-run with --allow-domain-cutover only after the source has \
+         yielded the host (DR / blue-green cutover), or drop --include-domains (the dest keeps its \
+         own domains)."
+    )]
+    DomainCutoverUnconfirmed {
+        /// The cross-node source label.
+        source_label: String,
+    },
     /// `--strict` and the preflight found ≥1 incoherent item that would be skipped.
     #[error(
         "strict sync refused: {count} incoherent item(s) would be skipped (--strict is \
@@ -186,6 +208,14 @@ pub struct SyncArgs {
     /// `BOATRAMP_CLONE_SOURCE_TOKEN`. Never passed as a bare CLI argument.
     #[arg(long, value_name = "PATH")]
     clone_source_token_file: Option<PathBuf>,
+
+    /// Intend a cross-node DOMAIN CUTOVER. Carrying `--include-domains` from a URL (cross-node)
+    /// source is refused without this flag: the dest node's host-uniqueness guard is same-node only
+    /// and cannot see whether the remote source still LIVE-owns the host, so a carry could create a
+    /// second simultaneously-live owner. Pass this only when the operator has taken the source down
+    /// (DR) or is deliberately yielding the host (blue-green cutover).
+    #[arg(long)]
+    allow_domain_cutover: bool,
 }
 
 impl SyncArgs {
@@ -232,8 +262,19 @@ impl SyncArgs {
     }
 }
 
-/// The typed result of `project sync` (increment 1): the dry-run preflight plan plus operator
-/// notes. Rendered by [`crate::output`].
+/// The included KV-stratum pieces the CLI cannot carry over the wire yet (no per-key admin KV API;
+/// the whole-slice clone is not piece-selective). The pure engine supports them; this is the CLI
+/// WIRING gap. A `--apply` naming any of these is refused up front (HIGH-1); the dry-run shows them
+/// honestly as "not carried", never `carry`.
+fn cli_unsupported_strata(selection: &Selection) -> Vec<Piece> {
+    [Piece::Settings, Piece::Graphql, Piece::History]
+        .into_iter()
+        .filter(|p| selection.includes(*p))
+        .collect()
+}
+
+/// The typed result of `project sync`: the preflight plan + operator notes, and (on `--apply`) the
+/// apply outcome. Rendered by [`crate::output`].
 #[derive(Debug, serde::Serialize)]
 pub struct SyncReport {
     /// The preflight plan (destination precondition + per-piece + per-item classification).
@@ -243,6 +284,10 @@ pub struct SyncReport {
     /// The APPLY outcome when `--apply` executed; `None` for a dry-run preflight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<SyncApplyReport>,
+    /// Included KV strata the CLI cannot carry over the wire yet — shown honestly in the dry-run as
+    /// "not carried" rather than `carry` (the pure engine supports them; this is the wiring gap).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cli_unsupported: Vec<Piece>,
 }
 
 impl crate::output::Rendered for SyncReport {
@@ -254,7 +299,7 @@ impl crate::output::Rendered for SyncReport {
         writeln!(w, "sync preflight: `{}` ← `{}`", p.target, p.source)?;
         let dest = match p.dest {
             project_sync::DestPrecondition::CreateAndProvision => {
-                "ABSENT — would be created + provisioned (increment 2)"
+                "ABSENT — would be created + provisioned"
             }
             project_sync::DestPrecondition::Exists => {
                 "exists — excluded pieces are preserved verbatim"
@@ -270,6 +315,18 @@ impl crate::output::Rendered for SyncReport {
 
         writeln!(w, "pieces:")?;
         for pp in &p.pieces {
+            // HIGH-1: the CLI cannot carry some included KV strata yet — tell the truth here
+            // instead of echoing the engine's `carry` disposition (the dry-run must not lie).
+            if pp.included && self.cli_unsupported.contains(&pp.piece) {
+                writeln!(
+                    w,
+                    "  [{:<9}] {:<10} NOT carried over the CLI — needs a node-side selective-sync \
+                     endpoint; exclude it or use `project import --clone-from` (`--apply` is refused)",
+                    "unsupported",
+                    pp.piece.as_str(),
+                )?;
+                continue;
+            }
             writeln!(
                 w,
                 "  [{:<9}] {:<10} {}",
@@ -450,6 +507,38 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
 
     let mut notes: Vec<String> = Vec::new();
 
+    // 3a) HIGH-1 (fail-fast): a selection naming a KV stratum the CLI cannot carry is refused BEFORE
+    //     any network I/O or mutation — never a half-sync after pg+blobs have already moved. The
+    //     dry-run does NOT refuse; it shows those strata honestly as "not carried" (see render).
+    let cli_unsupported = cli_unsupported_strata(&selection);
+    if args.apply && !cli_unsupported.is_empty() {
+        let list = cli_unsupported
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::StratumUnsupported(list));
+    }
+
+    // 3b) LOW-5: a cross-node `--include-domains` carry can create a second live owner of a host the
+    //     remote source still serves (the dest's hijack guard is same-node only). Refuse an apply
+    //     without the explicit cutover intent, and always note the hazard loudly.
+    let cross_node_domains = source_is_url && selection.includes(Piece::Domains);
+    if cross_node_domains {
+        if args.apply && !args.allow_domain_cutover {
+            return Err(Error::DomainCutoverUnconfirmed {
+                source_label: args.from.clone(),
+            });
+        }
+        notes.push(format!(
+            "DANGER: carrying domains from the cross-node source `{}` — the destination's \
+             host-uniqueness guard is same-node only and cannot see whether the source still \
+             LIVE-owns the host(s); a carry risks a SECOND simultaneously-live owner. Ensure the \
+             source has yielded the host (DR / blue-green) before applying.",
+            args.from
+        ));
+    }
+
     // 4) Resolve the SOURCE token (cross-node reads + the data stream need the source node's
     //    Project-Admin bearer; same-node reuses the operator's own dest token).
     let dest_token = client::token(config);
@@ -513,6 +602,16 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         ));
         project_sync::DestState::Absent
     };
+
+    // 6a) LOW-4: an EXISTING dest + an included data plane means `--apply` OVERWRITES the dest's
+    //     own pg/blobs (sync is a source-authoritative mirror). Warn loudly in the preflight.
+    if dest_present && (selection.includes(Piece::Pg) || selection.includes(Piece::Blobs)) {
+        notes.push(format!(
+            "WARNING: destination `{target}` already holds data — `--apply` OVERWRITES its \
+             managed-DB contents / blobs with the source's (source-authoritative mirror). Its \
+             EXCLUDED pieces are preserved, but the carried data plane is replaced."
+        ));
+    }
 
     // 7) Source inventory. Enumerate the source's declared databases and sites (with each site's
     //    domain presence) for the per-item classification. Cross-node without a source token can't
@@ -592,6 +691,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
             plan,
             notes,
             applied: None,
+            cli_unsupported,
         });
     }
 
@@ -622,6 +722,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         plan,
         notes,
         applied: Some(applied),
+        cli_unsupported, // empty on the apply path (a non-empty set was refused up front)
     })
 }
 
@@ -665,6 +766,19 @@ struct CliSyncExecutor {
     pg_included: bool,
     blobs_included: bool,
     data_transferred: bool,
+}
+
+/// MEDIUM-2 (cross-tenant path-traversal guard): validate a SOURCE-derived resource `name` BEFORE
+/// it is interpolated into a destination URL. The source is a trust boundary — a crafted site/db
+/// name like `../../victim/sites/web` would, via rust-url dot-segment resolution, reshape the
+/// request path to ANOTHER tenant's route (dangerous with a broad org/system dest token). A non-slug
+/// name is refused fail-closed, so only canonical `[a-z0-9-]`-style names ever reach the wire.
+fn validate_source_name(kind: &'static str, name: &str) -> std::result::Result<(), SyncApplyError> {
+    boatramp_core::project::validate_resource_name(kind, name).map_err(|e| {
+        SyncApplyError::Other(format!(
+            "refusing a source-derived {kind} name that is not a safe slug (cross-tenant guard): {e}"
+        ))
+    })
 }
 
 impl CliSyncExecutor {
@@ -717,6 +831,8 @@ impl SyncExecutor for CliSyncExecutor {
             SyncApplyError::Provision(format!("create project `{}`: {e}", self.target))
         })?;
         for db in &self.source_dbs {
+            // MEDIUM-2: the DB name is SOURCE-derived — validate before it hits the dest URL.
+            validate_source_name("database", &db.name)?;
             self.dest_cp
                 .declare_database(&db.name, db)
                 .await
@@ -751,6 +867,7 @@ impl SyncExecutor for CliSyncExecutor {
     }
 
     async fn carry_database(&mut self, name: &str) -> std::result::Result<(), SyncApplyError> {
+        validate_source_name("database", name)?; // MEDIUM-2
         let spec = self
             .source_cp
             .get_database(name)
@@ -767,6 +884,7 @@ impl SyncExecutor for CliSyncExecutor {
         &mut self,
         site: &str,
     ) -> std::result::Result<Option<boatramp_core::config::SiteConfig>, SyncApplyError> {
+        validate_source_name("site", site)?; // MEDIUM-2 (also guards the SOURCE read URL)
         self.source_cp
             .fetch_site_config(site)
             .await
@@ -778,6 +896,7 @@ impl SyncExecutor for CliSyncExecutor {
         &mut self,
         site: &str,
     ) -> std::result::Result<Option<boatramp_core::config::DomainConfig>, SyncApplyError> {
+        validate_source_name("site", site)?; // MEDIUM-2 (guards the DEST read URL)
         // `fetch_site_config` returns defaults for an unset site, so a fresh dest yields empty
         // domains (nothing to preserve).
         match self.dest_cp.fetch_site_config(site).await {
@@ -793,6 +912,7 @@ impl SyncExecutor for CliSyncExecutor {
         site: &str,
         cfg: &boatramp_core::config::SiteConfig,
     ) -> std::result::Result<bool, SyncApplyError> {
+        validate_source_name("site", site)?; // MEDIUM-2 — before ANY fetch/PUT interpolation
         // Idempotency (best-effort detection; the node's set_site_config is itself idempotent):
         // skip the PUT when the dest already serves a byte-identical body.
         let new_hash = project_sync::site_config_hash(cfg)?;
@@ -990,5 +1110,216 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    // ===== Security review fixes =============================================================
+
+    /// MEDIUM-2: a crafted SOURCE-derived site/db name (path traversal) is refused by the
+    /// client-side validation BEFORE any URL interpolation — the error is the cross-tenant guard,
+    /// not a transport error (so no wire call was even attempted). A valid slug passes the guard.
+    #[tokio::test]
+    async fn medium2_source_derived_traversal_names_refused_before_wire() {
+        let mut exec = dummy_exec(true, true);
+        let cfg = boatramp_core::config::SiteConfig::default();
+
+        let e1 = exec
+            .write_dest_site_config("../../victim/sites/web", &cfg)
+            .await
+            .expect_err("traversal site refused");
+        match e1 {
+            SyncApplyError::Other(m) => {
+                assert!(
+                    m.contains("cross-tenant guard") && m.contains("site"),
+                    "{m}"
+                )
+            }
+            o => panic!("expected guard refusal, got {o:?}"),
+        }
+
+        let e2 = exec
+            .carry_database("../../victim/databases/x")
+            .await
+            .expect_err("traversal db refused");
+        match e2 {
+            SyncApplyError::Other(m) => {
+                assert!(
+                    m.contains("cross-tenant guard") && m.contains("database"),
+                    "{m}"
+                )
+            }
+            o => panic!("expected guard refusal, got {o:?}"),
+        }
+
+        // A VALID slug passes the guard, then fails on the (unroutable) transport — proving the
+        // guard rejects only unsafe names, not every name.
+        let e3 = exec
+            .carry_database("validdb")
+            .await
+            .expect_err("transport fails at 127.0.0.1:0");
+        match e3 {
+            SyncApplyError::Other(m) => assert!(
+                !m.contains("cross-tenant guard"),
+                "a valid name must pass the guard (reach transport): {m}"
+            ),
+            o => panic!("expected a transport error, got {o:?}"),
+        }
+    }
+
+    /// MEDIUM-3 (the ≥2-tenant tenancy gate): with the dest = tenant A and a crafted source name
+    /// pointing at tenant B, assert the write/carry are refused and the dest node receives ZERO
+    /// requests — tenant B is UNTOUCHED (zero foreign bytes), because the guard fires before the
+    /// wire. A recording mock control-plane stands in for the dest; any request would have been
+    /// logged.
+    #[tokio::test]
+    async fn medium3_two_tenant_traversal_leaves_tenant_b_untouched() {
+        use std::sync::{Arc, Mutex};
+
+        async fn record_req(
+            axum::extract::State(log): axum::extract::State<Arc<Mutex<Vec<String>>>>,
+            req: axum::extract::Request,
+        ) -> axum::Json<boatramp_core::config::SiteConfig> {
+            log.lock()
+                .unwrap()
+                .push(format!("{} {}", req.method(), req.uri().path()));
+            axum::Json(boatramp_core::config::SiteConfig::default())
+        }
+
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(record_req)
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // The dest client is scoped to tenant A; tenant B is the would-be victim named in the
+        // traversal. (B's incumbent config is whatever the mock holds — the point is it is NEVER
+        // written, i.e. never even requested.)
+        let mut exec = CliSyncExecutor {
+            dest_cp: ControlPlane::new(base.clone(), client::http_client(None), "A".into()),
+            source_cp: ControlPlane::new(base.clone(), client::http_client(None), "A".into()),
+            target: "A".into(),
+            source_url: base.clone(),
+            source_project: "A".into(),
+            source_token: Vec::new(),
+            source_dbs: Vec::new(),
+            pg_included: true,
+            blobs_included: true,
+            data_transferred: false,
+        };
+
+        let cfg = boatramp_core::config::SiteConfig::default();
+        assert!(
+            exec.write_dest_site_config("../../B/sites/web", &cfg)
+                .await
+                .is_err(),
+            "traversal write refused"
+        );
+        assert!(
+            exec.carry_database("../../B/databases/secret")
+                .await
+                .is_err(),
+            "traversal carry refused"
+        );
+        // Give any (erroneously-sent) request a moment to land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            seen.is_empty(),
+            "ZERO foreign bytes: no request reached the dest node for a traversal name; got {seen:?}"
+        );
+    }
+
+    /// HIGH-1: `--apply` naming a KV stratum the CLI cannot carry is refused UP FRONT (before any
+    /// network I/O or mutation) — restoring fail-fast, never a half-sync after pg+blobs moved.
+    #[tokio::test]
+    async fn high1_apply_with_unsupported_stratum_refuses_pre_write() {
+        let args = parse(&[
+            "sync",
+            "--from",
+            "prod",
+            "--include-settings",
+            "--apply",
+            "-y",
+            "dst",
+        ])
+        .expect("parses");
+        // An unroutable server: if the refusal were NOT pre-write, run() would hit the network.
+        let err = run(args, &ProjectConfig::default(), "http://127.0.0.1:0".into())
+            .await
+            .expect_err("refused up front");
+        assert!(
+            matches!(err, Error::StratumUnsupported(ref s) if s.contains("settings")),
+            "got {err:?}"
+        );
+    }
+
+    /// LOW-5: a cross-node `--include-domains --apply` without `--allow-domain-cutover` is refused
+    /// (double-live-owner risk — the dest guard can't see the remote source's live ownership).
+    #[tokio::test]
+    async fn low5_cross_node_domains_apply_refused_without_cutover_flag() {
+        let args = parse(&[
+            "sync",
+            "--from",
+            "https://prod.example.com",
+            "--include-sites",
+            "--include-domains",
+            "--apply",
+            "-y",
+            "dst",
+        ])
+        .expect("parses");
+        let err = run(args, &ProjectConfig::default(), "http://127.0.0.1:0".into())
+            .await
+            .expect_err("refused without cutover intent");
+        assert!(
+            matches!(err, Error::DomainCutoverUnconfirmed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// HIGH-1 (dry-run truthfulness): a dry-run that includes an un-wireable stratum shows it as
+    /// "NOT carried", never `carry`.
+    #[test]
+    fn dry_run_shows_unsupported_stratum_as_not_carried_not_carry() {
+        use crate::output::Rendered;
+        let selection = parse(&["sync", "--from", "prod", "--include-settings", "dst"])
+            .expect("parses")
+            .selection_input()
+            .resolve()
+            .expect("resolves");
+        let plan = project_sync::plan_sync(
+            &selection,
+            &SyncInventory::default(),
+            &project_sync::DestState::Absent,
+            "src",
+            "dst",
+        );
+        let report = SyncReport {
+            plan,
+            notes: Vec::new(),
+            applied: None,
+            cli_unsupported: vec![Piece::Settings],
+        };
+        let mut buf = Vec::new();
+        report.render_human(&mut buf).expect("render");
+        let out = String::from_utf8(buf).unwrap();
+        // The settings row is honest…
+        assert!(
+            out.contains("NOT carried over the CLI"),
+            "dry-run must flag the unsupported stratum:\n{out}"
+        );
+        // …and the settings line is NOT shown as `carry`.
+        let settings_line = out
+            .lines()
+            .find(|l| l.contains("settings"))
+            .expect("settings row present");
+        assert!(
+            !settings_line.contains("[carry"),
+            "settings must not render as carry: {settings_line}"
+        );
     }
 }

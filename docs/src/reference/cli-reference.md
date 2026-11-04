@@ -2956,6 +2956,7 @@ Idempotent, selective, coherence-preserving project SYNC (the successor to `impo
 | `--apply` | — | — | — | Execute the sync (mutating). The default (no `--apply`) is the dry-run preflight; `--apply` requires `-y` |
 | `-y, --yes` | — | — | — | Confirm a mutating `--apply`. Required for `--apply` (there is no interactive prompt) |
 | `--clone-source-token-file <PATH>` | — | — | — | Path to a file holding the SOURCE node's Project-Admin token — required for a cross-node (URL `--from`) `--apply` (reads + streams the source). Falls back to `BOATRAMP_CLONE_SOURCE_TOKEN`. Never passed as a bare CLI argument |
+| `--allow-domain-cutover` | — | — | — | Intend a cross-node DOMAIN CUTOVER. Carrying `--include-domains` from a URL (cross-node) source is refused without this flag: the dest node's host-uniqueness guard is same-node only and cannot see whether the remote source still LIVE-owns the host, so a carry could create a second simultaneously-live owner. Pass this only when the operator has taken the source down (DR) or is deliberately yielding the host (blue-green cutover) |
 
 ## `boatramp dns`
 
