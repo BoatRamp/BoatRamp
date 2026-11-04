@@ -2103,19 +2103,31 @@ mod instance_serve {
         }
 
         if let Some(listener_fd) = fds.listener {
-            // PER-TENANT ROUTER FRONTEND (WS-C step 5): when the composition defines a per-tenant
-            // template, the public-listener holder is the per-tenant ROUTER — it resolves each
-            // connection's Host → project (Stage-0), routes to that tenant's instance, instantiating
-            // on a NotReady cold-start, and relays the client fd. Opt-in: fires ONLY with a template.
-            if has_template {
-                return run_per_tenant_frontend(label, gate, listener_fd, config, config_path);
-            }
             let link_fd = *fds.links.values().next().ok_or_else(|| {
                 "a listener instance has no feature-link to forward client connections over \
                  (the composition must link it to a backend)"
                     .to_string()
             })?;
+            // PER-TENANT PARSER (WS-D Finding-2): when the composition defines a per-tenant template,
+            // the public-listener holder is the pure-forward PARSER. It holds NEITHER `backend.kv`
+            // NOR `exec.compute` (the composition-closure lint refuses co-locating them on a
+            // `listen.http-parse` instance), so it cannot resolve Host→project or fork a tenant
+            // itself — it peeks the Host (its job as the http-parse holder) and forwards each accepted
+            // client fd + the peeked Host inward to the non-public SUPERVISOR over the link. The
+            // resolve + spawn live OFF the public parser (design `DESIGN-wsd.md`). Opt-in: fires ONLY
+            // with a template.
+            if has_template {
+                return run_per_tenant_parser(label, listener_fd, link_fd);
+            }
             run_frontend(label, listener_fd, link_fd)
+        } else if has_template && gate.may_materialize(HostAuthority::ExecCompute) {
+            // PER-TENANT SUPERVISOR (WS-D Finding-2): the non-public backend holding `backend.kv` +
+            // `exec.compute`. It binds no listener and parses no raw client bytes; it RECEIVES client
+            // fds + the peeked Host over the parser link, re-resolves Host→project against the
+            // control-plane KV (authoritative), instantiates / wakes the per-tenant `exec.wasmtime`
+            // child (fork), and relays the client fd onward. This is the half the parser's spawn + KV
+            // authority was split onto.
+            run_per_tenant_supervisor(label, gate, fds, config, config_path)
         } else if let Some((lname, link_fd)) = fds.links.iter().next() {
             run_backend(label, lname, *link_fd)
         } else {
@@ -2809,44 +2821,159 @@ mod instance_serve {
         }
     }
 
-    /// The PER-TENANT ROUTER frontend (WS-C step 5): accept on the inherited listener, resolve each
-    /// connection's `Host` → project (Stage-0, before any guest byte — via a `MSG_PEEK` that consumes
-    /// NOTHING, so the backend re-reads the full request), route to that tenant's instance, and relay
-    /// the accepted CLIENT fd. On a [`RouteOutcome::NotReady`] cold-start, INSTANTIATE the tenant's
-    /// instance (lazy socketpair + fork via the root's own primitive) then relay. On a `RouteRefusal`,
-    /// REFUSE the connection fail-closed — never a wildcard, a default site, or a fallback tenant. The
-    /// accepted fd confers no authority (F5); the tenant is taken ONLY from the host resolution, never
-    /// a guest field (the router has no parameter by which a guest could name a tenant).
-    fn run_per_tenant_frontend(
+    /// The PER-TENANT PARSER (WS-D Finding-2): the public-listener holder in a per-tenant composition
+    /// — `{listen.public-tls, listen.http-parse}`, holding NEITHER `backend.kv` NOR `exec.compute`
+    /// (the composition-closure lint refuses co-locating them). It accepts on the inherited listener,
+    /// peeks each connection's `Host` (Stage-0 `MSG_PEEK`, consuming NOTHING — its job as the
+    /// http-parse holder), and FORWARDS the accepted client fd + the peeked Host inward to the
+    /// non-public SUPERVISOR over the link. It resolves no tenant and forks nothing — the supervisor
+    /// (which holds KV + spawn, off the public parse surface) does. The accept + peek are
+    /// de-serialized (one task per connection) so a slow/silent peer never pins ingress (the slowloris
+    /// fix); sends over the single supervisor link are SERIALIZED (the `SCM_RIGHTS` fd-pass + head
+    /// frame of two connections must not interleave on one stream).
+    fn run_per_tenant_parser(label: &str, listener_fd: i32, link_fd: i32) -> Result<(), String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("building the Tokio runtime: {e}"))?;
+        rt.block_on(async move {
+            // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map. The
+            // Mutex serializes the fd-pass across concurrent per-connection tasks.
+            let link = Arc::new(std::sync::Mutex::new(unsafe {
+                LinkEndpoint::from_inherited_fd(link_fd)
+            }));
+            // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map.
+            // The parser NEVER forks (it holds no `exec.compute`), so the listener needs no CLOEXEC
+            // guard against an inherited child (unlike the pre-WS-D co-located router).
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking on the listener: {e}"))?;
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| format!("adopting the listener into Tokio: {e}"))?;
+            let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_TENANT_ROUTING));
+            tracing::info!(
+                instance = %label,
+                max_inflight = MAX_INFLIGHT_PER_TENANT_ROUTING,
+                "[privsep] per-tenant parser: accepting (async, de-serialized) + peeking Host \
+                 (Stage-0, MSG_PEEK); forwarding client fds + Host inward to the supervisor (holds \
+                 NO backend.kv / exec.compute — WS-D Finding-2)"
+            );
+            loop {
+                let (conn, _peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(e) => return Err::<(), String>(format!("accepting on the listener: {e}")),
+                };
+                let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        cap = MAX_INFLIGHT_PER_TENANT_ROUTING,
+                        "[privsep] per-tenant parser: at the in-flight cap — dropping a connection \
+                         (fail-closed, no unbounded queue)"
+                    );
+                    drop(conn);
+                    continue;
+                };
+                let link = link.clone();
+                // One task per connection: the host-peek runs OFF the accept loop, so a slow/silent
+                // peer pins only its own task until the peek deadline.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    forward_peeked_connection(conn, &link).await;
+                });
+            }
+        })
+    }
+
+    /// Peek the `Host` (deadline-bounded) off ONE accepted connection and forward the raw client fd +
+    /// the peeked Host (as the link head) inward to the supervisor. Consumes NOTHING from the client
+    /// (`MSG_PEEK`), so the supervisor relays the fd onward and the per-tenant child re-reads the full
+    /// request. An unpeekable Host forwards an EMPTY head — the supervisor then refuses it fail-closed
+    /// (the resolve policy lives on the KV holder, never the parser). Fail-closed on a transport error
+    /// (drop). The send is serialized under `link`'s Mutex so two connections' fd-passes never
+    /// interleave on the single supervisor stream.
+    async fn forward_peeked_connection(
+        conn: tokio::net::TcpStream,
+        link: &std::sync::Mutex<LinkEndpoint>,
+    ) {
+        let host = peek_host_async(&conn, PER_TENANT_PEEK_DEADLINE)
+            .await
+            .unwrap_or_default();
+        let conn = match conn.into_std() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[privsep] per-tenant parser: reclaiming the client fd from Tokio failed \
+                     (dropping the connection, fail-closed)"
+                );
+                return;
+            }
+        };
+        {
+            let guard = link.lock().unwrap();
+            if let Err(e) = guard.send_client_conn(conn.as_fd(), host.as_bytes()) {
+                tracing::warn!(
+                    error = %e,
+                    "[privsep] per-tenant parser: forwarding a client fd to the supervisor failed \
+                     (dropping the connection, fail-closed)"
+                );
+            }
+        }
+        // Our copy: a successful send SCM_RIGHTS-duplicated it to the supervisor; drop closes ours.
+        drop(conn);
+    }
+
+    /// The PER-TENANT SUPERVISOR (WS-D Finding-2): the non-public backend holding `backend.kv` +
+    /// `exec.compute`. It binds NO listener and parses NO raw client bytes. It RECEIVES client fds +
+    /// the parser-peeked Host over the parser link, RE-RESOLVES Host→project against the control-plane
+    /// KV (authoritative — the parser's Host is only an input, never selects the tenant on its own),
+    /// instantiates / wakes the per-tenant `exec.wasmtime` child (lazy socketpair + fork via the
+    /// root's own primitive, scale-to-zero pool), and relays the client fd onward to that child. This
+    /// is the half the public parser's spawn + KV authority was split onto — the resolve + fork that
+    /// the pre-WS-D co-located router performed in the same address space as the parse surface.
+    /// Fail-closed throughout (no wildcard / default / fallback tenant).
+    fn run_per_tenant_supervisor(
         label: &str,
         gate: &MaterializationGate,
-        listener_fd: i32,
+        fds: &PrivsepChildFds,
         config: &ServerConfig,
         config_path: &Path,
     ) -> Result<(), String> {
-        // The router resolves Host→project via the control-plane KV (the SAME source of truth the
-        // monolith uses). WS-C requires the router to be the SOLE `backend.kv` holder so opening the
-        // KV here does not DOUBLE-OPEN the single-writer control-plane store. A router that holds no
-        // backend.kv cannot resolve hosts → fail-closed (resolving host over a link to a separate
-        // backend.kv holder is the WS-D/WS-E per-tenant backend-call extension — flagged, not built).
+        // It is the SOLE `backend.kv` holder (so opening the control-plane KV here does not
+        // DOUBLE-OPEN the single-writer store) AND holds `exec.compute` (to fork the children). The
+        // closure lint guarantees a `listen.http-parse` instance holds neither, so these live here.
         if !gate.may_materialize(HostAuthority::BackendKv) {
             return Err(
-                "per-tenant router holds no `backend.kv` — it cannot resolve Host→project to a \
-                 tenant. Co-locate `backend.kv` on the router (the sole KV opener), or await the \
-                 WS-D host-resolution-over-a-link extension"
+                "per-tenant supervisor holds no `backend.kv` — it cannot resolve Host→project to a \
+                 tenant (the composition must place `backend.kv` + `exec.compute` on the supervisor)"
                     .to_string(),
             );
         }
-        // Re-derive the authorized plan IN THE ROUTER so the template's spawn spec is built by the
-        // SAME secret-scrubbed contract (F11-B) the root used (the router's own env is already
-        // scrubbed, and `build_instance_env` filters further) — a per-tenant child inherits NO secret.
+        // The supervisor's single boot-wired link is the inbound parser link (the per-tenant relay
+        // links to the templates are created LAZILY per tenant, not boot-wired). Fail-closed if absent.
+        let (link_name, inbound_fd) = fds
+            .links
+            .iter()
+            .next()
+            .map(|(n, fd)| (n.clone(), *fd))
+            .ok_or_else(|| {
+                "a per-tenant supervisor has no feature-link to receive client fds from the parser \
+                 over (the composition must link the parser to it)"
+                    .to_string()
+            })?;
+        // The supervisor FORKS per-tenant children, so the inbound parser link fd (NOT CLOEXEC — it
+        // survived the supervisor's own exec) must be CLOEXEC'd so no per-tenant child inherits it
+        // (F5: the only fd that ever reaches a per-tenant child is its own socketpair + client fds).
+        set_cloexec(inbound_fd).map_err(|e| format!("CLOEXEC on the parser link fd: {e}"))?;
+        // Re-derive the authorized plan IN THE SUPERVISOR so the template's spawn spec is built by the
+        // SAME secret-scrubbed contract (F11-B) the root used — a per-tenant child inherits NO secret.
         let parent_env: Vec<(String, String)> = std::env::vars().collect();
         let plan = super::plan_root(config, config_path, parent_env).map_err(|e| e.to_string())?;
         let template_spec = plan.templates.into_iter().next().ok_or_else(|| {
-            "the composition defines no per-tenant template spec (a WS-C router needs one)"
+            "the composition defines no per-tenant template spec (a supervisor needs one)"
                 .to_string()
         })?;
-        let link_name = per_tenant_relay_link_name(config, label, &template_spec.label)?;
+        let relay_link_name = per_tenant_relay_link_name(config, label, &template_spec.label)?;
         let current_exe =
             std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?;
         let policy = config
@@ -2861,10 +2988,9 @@ mod instance_serve {
             .map_err(|e| format!("building the Tokio runtime: {e}"))?;
         rt.block_on(async move {
             // Bound the control-plane KV open with a fail-loud timeout: if the store open stalls
-            // (e.g. a `backend.kv` Landlock-grant/store-path mismatch makes SlateDB's retrying
-            // object store spin on EACCES forever), the router EXITS with a clear error → the root's
-            // FailNodeClosed tears the node down, rather than the router hanging up inert while the
-            // node's public listener accepts connections it can never route. 30s is far beyond a
+            // (e.g. a `backend.kv` Landlock-grant/store-path mismatch makes SlateDB's retrying object
+            // store spin on EACCES forever), the supervisor EXITS with a clear error → the root's
+            // FailNodeClosed tears the node down, rather than hanging up inert. 30s is far beyond a
             // healthy control-plane open (sub-second); it only ever fires on a real stall.
             let deploy = match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -2875,75 +3001,74 @@ mod instance_serve {
                 Ok(res) => res?,
                 Err(_) => {
                     return Err::<(), String>(
-                        "per-tenant router: opening the control-plane KV for Host→project routing \
-                         timed out after 30s — the store open is stuck. The most likely cause is \
-                         that the `backend.kv` Landlock grant does not cover the store's real path \
-                         (see `sandbox::backend_state_subdir(BackendKv)` vs \
+                        "per-tenant supervisor: opening the control-plane KV for Host→project \
+                         routing timed out after 30s — the store open is stuck. The most likely \
+                         cause is that the `backend.kv` Landlock grant does not cover the store's \
+                         real path (see `sandbox::backend_state_subdir(BackendKv)` vs \
                          `build_slatedb_kv`'s `data_dir.join(\"kv-slate\")`). Failing closed."
                             .to_string(),
                     );
                 }
             };
-            // Shared across the spawned per-connection tasks: the registry (one, interior-mutable)
-            // and the Host→project resolver (cloneable, `Arc`-backed).
             let registry = Arc::new(ComputePlaneRegistry::new(
                 current_exe,
                 template_spec,
-                link_name,
+                relay_link_name,
                 policy,
             ));
-            // Mark the root-passed listener CLOEXEC so per-tenant children the router forks never
-            // INHERIT it (F5 — it is NOT CLOEXEC, having survived the router's own exec).
-            set_cloexec(listener_fd).map_err(|e| format!("CLOEXEC on the listener fd: {e}"))?;
-            // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map.
-            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
-            // Adopt the listener into Tokio so the accept loop is async: it NEVER blocks on client
-            // bytes or on a fork. Each accepted connection is handled in its OWN task (host-peek +
-            // route + cold-start + relay), so a slow/silent peer or a tenant's cold-start fork can
-            // no longer pin ingress (the HIGH slowloris / cold-start head-of-line fix).
-            std_listener
-                .set_nonblocking(true)
-                .map_err(|e| format!("set_nonblocking on the listener: {e}"))?;
-            let listener = tokio::net::TcpListener::from_std(std_listener)
-                .map_err(|e| format!("adopting the listener into Tokio: {e}"))?;
-            // Bound concurrent in-flight routing tasks. Over the cap ⇒ DROP the connection fail-closed
-            // (never queue unboundedly, never let spawn-per-connection become its own task DoS).
+            // SAFETY: `inbound_fd` is the fd the root dup'd into this child + named in the fd map; we
+            // CLOEXEC'd it above so forked children never inherit it.
+            let link = unsafe { LinkEndpoint::from_inherited_fd(inbound_fd) };
             let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_TENANT_ROUTING));
             tracing::info!(
                 instance = %label,
+                link = %link_name,
                 idle_evict_secs = policy.idle_eviction_secs,
                 max_instances = policy.max_instances,
                 max_inflight = MAX_INFLIGHT_PER_TENANT_ROUTING,
-                "[privsep] per-tenant router: accepting (async, de-serialized); resolving Host→project \
-                 (Stage-0) + routing to per-tenant instances (fail-closed — no wildcard / default / \
-                 fallback tenant)"
+                "[privsep] per-tenant supervisor: receiving client fds over the parser link; \
+                 resolving Host→project (KV) + instantiating per-tenant instances (fail-closed — no \
+                 wildcard / default / fallback tenant); parses NO raw client bytes"
             );
-            loop {
-                let (conn, _peer) = match listener.accept().await {
-                    Ok(accepted) => accepted,
-                    Err(e) => return Err::<(), String>(format!("accepting on the listener: {e}")),
-                };
-                // Admission for the HANDLER tasks themselves (distinct from the cold-start budget):
-                // over the in-flight cap we drop fail-closed rather than spawn without bound.
+            // Blocking link-drain on a dedicated thread (recv is blocking); it hands each received
+            // (client fd, peeked-Host head) to the async consumer. EOF/err ends the loop (parser gone).
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(OwnedFd, Vec<u8>)>(64);
+            let drain = std::thread::spawn(move || {
+                loop {
+                    match link.recv_client_conn() {
+                        Ok((fd, head)) => {
+                            if tx.blocking_send((fd, head)).is_err() {
+                                break; // the consumer is gone
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "[privsep] per-tenant supervisor: parser link recv ended");
+                            break;
+                        }
+                    }
+                }
+            });
+            while let Some((fd, head)) = rx.recv().await {
                 let Ok(permit) = inflight.clone().try_acquire_owned() else {
                     tracing::warn!(
                         cap = MAX_INFLIGHT_PER_TENANT_ROUTING,
-                        "[privsep] per-tenant router: at the in-flight cap — dropping a connection \
-                         (fail-closed, no unbounded queue)"
+                        "[privsep] per-tenant supervisor: at the in-flight cap — dropping a \
+                         connection (fail-closed, no unbounded queue)"
                     );
-                    drop(conn);
+                    drop(fd);
                     continue;
                 };
                 let deploy = deploy.clone();
                 let registry = registry.clone();
-                // One task per connection: the peek/route/cold-start/relay all run OFF the accept
-                // loop. The permit is held for the task's lifetime (so the semaphore bounds concurrent
-                // tasks) and released on completion.
+                // One task per connection: resolve + cold-start + relay run OFF the drain loop, so one
+                // tenant's fork never stalls routing for others.
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_routed_connection(conn, &deploy, registry.as_ref()).await;
+                    handle_supervised_connection(fd, head, &deploy, registry.as_ref()).await;
                 });
             }
+            let _ = drain.join();
+            Ok::<(), String>(())
         })
     }
 
@@ -2960,38 +3085,27 @@ mod instance_serve {
     /// longer pins ingress, and a tight deadline frees the task + its in-flight permit promptly.
     const PER_TENANT_PEEK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// Handle ONE accepted connection end-to-end, OFF the accept loop (its own task): async host-peek
-    /// (deadline-bounded) → route → on `Routed` relay, on `NotReady` cold-start-then-relay, on refusal
-    /// drop. Fail-closed throughout — an unresolved/ambiguous/absent Host, a backed-off/rate-limited
-    /// or failed cold start, or a relay error all DROP the connection; none falls back to another
-    /// tenant. The cold-start `instantiate` runs HERE (never on the accept loop), so one tenant's
-    /// fork never stalls routing for others.
-    async fn handle_routed_connection(
-        conn: tokio::net::TcpStream,
+    /// Handle ONE client fd received over the parser link, OFF the drain loop (its own task): the
+    /// parser already peeked the `Host` and sent it as the head → the supervisor RE-RESOLVES it
+    /// against the KV (authoritative; the parser's Host is only an input) → on `Routed` relay, on
+    /// `NotReady` cold-start-then-relay, on refusal drop. Fail-closed throughout — an
+    /// unresolved/ambiguous/absent Host, a backed-off/rate-limited or failed cold start, or a relay
+    /// error all DROP the connection; none falls back to another tenant. The cold-start `instantiate`
+    /// runs HERE (never on the drain loop), so one tenant's fork never stalls routing for others. The
+    /// supervisor parses NO raw client bytes: the Host rode in the head, and the client fd is passed
+    /// onward opaquely (F5).
+    async fn handle_supervised_connection(
+        client_fd: OwnedFd,
+        host_head: Vec<u8>,
         deploy: &boatramp_core::deploy::DeployStore,
         registry: &ComputePlaneRegistry,
     ) {
-        // Stage-0: async PEEK (consume NOTHING) just enough to parse the Host, BEFORE any guest byte;
-        // the full request still reaches the backend intact over the spliced fd. Deadline-bounded so
-        // a slow/silent peer cannot hold even this one task indefinitely.
-        let host = peek_host_async(&conn, PER_TENANT_PEEK_DEADLINE)
-            .await
-            .unwrap_or_default();
-        // Hand the raw client fd to the UNCHANGED SCM_RIGHTS relay path. Reclaim a blocking std stream
-        // from Tokio (the backend re-sets non-blocking on its OWN received copy, so the relayed fd's
-        // shape matches the pre-change accept-from-a-blocking-listener behavior); the peeked bytes
-        // stay queued in the kernel for the backend.
-        let conn = match conn.into_std() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "[privsep] per-tenant router: reclaiming the client fd from Tokio failed \
-                     (dropping the connection, fail-closed)"
-                );
-                return;
-            }
-        };
+        // The Host the parser peeked (an INPUT, never the authority): an empty/invalid head resolves
+        // to no tenant and is refused — the resolve policy lives HERE on the KV holder, not the parser.
+        let host = String::from_utf8_lossy(&host_head).into_owned();
+        // Adopt the received fd into a blocking std stream so the UNCHANGED SCM_RIGHTS relay path can
+        // splice it onward; the per-tenant child re-reads the full request (nothing was consumed).
+        let conn = std::net::TcpStream::from(client_fd);
         let _ = conn.set_nonblocking(false);
         match route_by_host(deploy, &host, registry).await {
             Ok(RouteOutcome::Routed(link)) => relay_client_to_tenant(&link, &conn),
@@ -3002,20 +3116,21 @@ mod instance_serve {
                 Err(e) if e.is_admission_decline() => tracing::warn!(
                     project = %scope.project(),
                     error = %e,
-                    "[privsep] per-tenant router: cold-start declined by admission control \
+                    "[privsep] per-tenant supervisor: cold-start declined by admission control \
                      (backoff / rate-limit) — refusing the connection (fail-closed)"
                 ),
                 Err(e) => tracing::error!(
                     project = %scope.project(),
                     error = %e,
-                    "[privsep] per-tenant router: cold-start instantiate FAILED — refusing the \
+                    "[privsep] per-tenant supervisor: cold-start instantiate FAILED — refusing the \
                      connection (fail-closed)"
                 ),
             },
             Err(refusal) => tracing::warn!(
                 host = %host,
                 %refusal,
-                "[privsep] per-tenant router: refusing a connection (fail-closed, no fallback tenant)"
+                "[privsep] per-tenant supervisor: refusing a connection (fail-closed, no fallback \
+                 tenant)"
             ),
         }
         // Our copy: a relay SCM_RIGHTS-duplicated it to the tenant; a refusal closes it here.
@@ -3305,12 +3420,21 @@ mod tests {
     /// A clean least-authority composition whose union == ALL (edge=C∪D∪E, data=B, signer=A).
     fn clean_privsep() -> PrivsepConfig {
         let mut instances = BTreeMap::new();
+        // The public HTTP parse surface on its OWN instance, holding NO spawn/KV (WS-D Finding-2).
         instances.insert(
-            "edge".to_string(),
+            "parser".to_string(),
             inst(
                 &[
                     HostAuthority::ListenPublicTls,
                     HostAuthority::ListenHttpParse,
+                ],
+                &[],
+            ),
+        );
+        instances.insert(
+            "edge".to_string(),
+            inst(
+                &[
                     HostAuthority::ListenMail,
                     HostAuthority::ListenOverlay,
                     HostAuthority::ListenS3Ingress,
@@ -3401,8 +3525,8 @@ mod tests {
         let cfg = cfg_with(Some(clean_privsep()));
         let plan = plan_root(&cfg, Path::new("/etc/boatramp.cfg"), fake_env())
             .expect("clean composition authorized");
-        // clean_privsep has NO per-tenant template, so all three instances are STATIC (boot-forked).
-        assert_eq!(plan.static_instances.len(), 3);
+        // clean_privsep has NO per-tenant template, so all four instances are STATIC (boot-forked).
+        assert_eq!(plan.static_instances.len(), 4);
         assert!(plan.templates.is_empty());
         for spec in &plan.static_instances {
             // The re-exec argv is the __instance tail with the config path.
@@ -3931,27 +4055,37 @@ mod tests {
         }
     }
 
-    /// A valid Phase-4 WS-C composition (union == ALL): `router` = listeners + `backend.kv` (the
-    /// per-tenant router + sole KV opener), `tenant-wasm` = `{exec.wasmtime}` PER-TENANT TEMPLATE,
-    /// `core` = crown jewels + the other backends, `aux` = the other listeners + exec.compute +
-    /// control. A `to-tenant` relay link connects the router and the template.
+    /// A valid Phase-4 WS-C + WS-D composition (union == ALL), with the public parser DE-COUPLED from
+    /// spawn + KV (Finding-2): `parser` = `{listen.public-tls, listen.http-parse}` (the most-exposed
+    /// instance, NO spawn/KV) forwards client fds inward; `supervisor` = `{backend.kv, exec.compute}`
+    /// (non-public, binds no listener) resolves Host→project + forks the per-tenant children;
+    /// `tenant-wasm` = `{exec.wasmtime}` PER-TENANT TEMPLATE; `core` = crown jewels + the other
+    /// backends; `aux` = the other listeners + control. `parser-sup` relays client fds parser→
+    /// supervisor; `to-tenant` relays them supervisor→template.
     fn phase4_privsep() -> PrivsepConfig {
         let mut instances = BTreeMap::new();
         instances.insert(
-            "router".to_string(),
+            "parser".to_string(),
             inst(
                 &[
                     HostAuthority::ListenPublicTls,
                     HostAuthority::ListenHttpParse,
+                ],
+                &["parser-sup"],
+            ),
+        );
+        instances.insert(
+            "supervisor".to_string(),
+            inst(
+                &[
+                    // The non-public per-tenant SUPERVISOR: `backend.kv` to resolve Host→project and
+                    // `exec.compute` to fork the per-tenant `exec.wasmtime` children. It binds no
+                    // listener and parses no raw client bytes — it is reached over `parser-sup`
+                    // (Finding-2: spawn + KV live OFF the public parser).
                     HostAuthority::BackendKv,
-                    // `exec.compute` = the compute-plane spawn authority: it is what legitimately
-                    // grants the router `execve` (the per-capability profile kills `execve` for
-                    // every instance EXCEPT the root + `exec.compute` holders) so it can fork the
-                    // per-tenant `exec.wasmtime` instances. NOT co-resident with `exec.wasmtime`
-                    // (that lives only on the template), so the Phase-4 lint is satisfied.
                     HostAuthority::ExecCompute,
                 ],
-                &["to-tenant"],
+                &["parser-sup", "to-tenant"],
             ),
         );
         instances.insert(
@@ -3992,9 +4126,18 @@ mod tests {
         );
         let mut links = BTreeMap::new();
         links.insert(
+            "parser-sup".to_string(),
+            PrivsepLink {
+                from: "parser".to_string(),
+                to: "supervisor".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Relay,
+            },
+        );
+        links.insert(
             "to-tenant".to_string(),
             PrivsepLink {
-                from: "router".to_string(),
+                from: "supervisor".to_string(),
                 to: "tenant-wasm".to_string(),
                 transport: LinkTransport::Local,
                 purpose: LinkPurpose::Relay,
@@ -4029,7 +4172,7 @@ mod tests {
         );
         assert_eq!(
             static_labels,
-            ["aux", "core", "router"]
+            ["aux", "core", "parser", "supervisor"]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<&str>>(),
             "every non-template instance is boot-forked"
@@ -4072,7 +4215,7 @@ mod tests {
         let plan = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env())
             .expect("a no-template composition ignores the per_tenant policy");
         assert!(plan.templates.is_empty());
-        assert_eq!(plan.static_instances.len(), 3);
+        assert_eq!(plan.static_instances.len(), 4);
     }
 
     /// An empty [`per_tenant::ComputePlaneRegistry`] resolves EVERY scope to `None` — the WS-C

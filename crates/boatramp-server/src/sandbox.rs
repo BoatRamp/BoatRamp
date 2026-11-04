@@ -2341,6 +2341,49 @@ mod privsep_derivation_tests {
     }
 
     #[test]
+    fn wsd_finding2_public_parser_cannot_spawn_or_touch_kv_slate() {
+        use std::path::Path;
+        // The most-exposed public parser, DE-COUPLED (WS-D Finding-2): `listen.http-parse` alone,
+        // holding NO `exec.compute` and NO `backend.kv` (the composition-closure lint guarantees
+        // this). The per-capability profile must make the containment physical.
+        let parser = caps(&[HostAuthority::ListenHttpParse]);
+        // (1) It CANNOT spawn: execve/execveat/fork/vfork are NOT in the allow-list, and ARE killed.
+        let allow = derive_seccomp_allowlist(&parser);
+        let kill = derive_seccomp_killlist(&parser);
+        for s in ["execve", "execveat", "fork", "vfork"] {
+            assert!(
+                !has(&allow, s),
+                "the public parser must not be allowed to {s} (it holds no exec.compute)"
+            );
+            assert!(
+                has(&kill, s),
+                "the public parser hard-kills {s} (the Finding-2 spawn wall)"
+            );
+        }
+        // (2) It gets NO backend-state grant: holding no backend.kv, the kv-slate subtree is not in
+        // its FS view at all (so a parser RCE cannot even open the control-plane KV).
+        let data_dir = Path::new("/data");
+        assert!(
+            instance_backend_state_grants(&parser, data_dir).is_empty(),
+            "the public parser must get no backend-state grant (no backend.kv ⇒ no kv-slate subtree)"
+        );
+        // (3) Complement: the non-public SUPERVISOR — where the split PUT spawn + KV — DOES get both.
+        let supervisor = caps(&[HostAuthority::BackendKv, HostAuthority::ExecCompute]);
+        let sup_allow = derive_seccomp_allowlist(&supervisor);
+        assert!(
+            has(&sup_allow, "execve") && has(&sup_allow, "fork"),
+            "the supervisor (exec.compute) MAY fork/execve — the spawn authority lives on it, off \
+             the public parser"
+        );
+        let grants = instance_backend_state_grants(&supervisor, data_dir);
+        assert!(
+            grants.iter().any(|p| p.ends_with("kv-slate")),
+            "the supervisor (backend.kv) gets the kv-slate rw subtree — the KV authority lives on \
+             it, off the public parser; got {grants:?}"
+        );
+    }
+
+    #[test]
     fn no_listener_instance_denies_bind_and_listen() {
         for set in [signer(), storage()] {
             let allow = derive_seccomp_allowlist(&set);

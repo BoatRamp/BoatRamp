@@ -53,10 +53,12 @@ fn privsep_two_instance_composition_serves_end_to_end() {
     let port = free_port();
     let cfg_path = tmp.join("boatramp.cfg");
 
-    // A minimal, VALID 2-instance composition (passes the closure lint: union == ALL; no crown
-    // jewel co-resident with a listener/exec/control surface; grants disjoint):
-    //   - `edge`  = every listener + both exec + both control (group C ∪ D ∪ E; no keys, no
-    //               backends) — the FRONTEND (binds serve.addr, splices client fds inward);
+    // A minimal, VALID 3-instance composition (passes the closure lint: union == ALL; no crown
+    // jewel co-resident with a listener/exec/control surface; grants disjoint; WS-D Finding-2: the
+    // public parser holds NO exec.compute / backend.kv):
+    //   - `edge`  = the public parse surface (`listen.public-tls` + `listen.http-parse`) — the
+    //               FRONTEND (binds serve.addr, splices client fds inward); NO spawn, NO KV;
+    //   - `aux`   = the other listeners + both exec + both control (no keys, no backends) — parks;
     //   - `core`  = every crown jewel + every backend (group A ∪ B; a crown jewel may co-reside
     //               only with A ∪ B) — the serving BACKEND.
     let cfg = format!(
@@ -65,14 +67,19 @@ fn privsep_two_instance_composition_serves_end_to_end() {
     privsep: (
         instances: {{
             "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
                 capabilities: [
-                    "listen.public-tls", "listen.http-parse", "listen.mail", "listen.overlay",
+                    "listen.mail", "listen.overlay",
                     "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
                     "exec.wasmtime", "exec.compute",
                     "control.admin-api", "acme.dns-control",
                 ],
                 sandbox: Derived,
-                links: ["to-core"],
+                links: [],
             ),
             "core": (
                 capabilities: [
@@ -215,14 +222,19 @@ fn privsep_sealer_signer_unseal_serves_end_to_end() {
     privsep: (
         instances: {{
             "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
                 capabilities: [
-                    "listen.public-tls", "listen.http-parse", "listen.mail", "listen.overlay",
+                    "listen.mail", "listen.overlay",
                     "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
                     "exec.wasmtime", "exec.compute",
                     "control.admin-api", "acme.dns-control",
                 ],
                 sandbox: Derived,
-                links: ["to-core"],
+                links: [],
             ),
             "core": (
                 capabilities: ["backend.kv", "backend.sql", "backend.blob", "backend.messaging"],
@@ -436,21 +448,24 @@ fn privsep_frontend_inversion_serves_end_to_end() {
     println!("PRIVSEP FRONTEND INVERSION LIVE OK");
 }
 
-/// Live end-to-end gate for the privsep **per-tenant wasm instantiation** (Phase-4 WS-C): a
+/// Live end-to-end gate for the privsep **per-tenant wasm instantiation** (Phase-4 WS-C + WS-D): a
 /// `[privsep]` composition with a `lifecycle: PerTenantTemplate` instance actually SERVES — one
 /// isolated `{exec.wasmtime}` OS process per project (tenant), instantiated on demand by the
-/// per-tenant ROUTER and wired to it over a lazily-created `socketpair`.
+/// non-public per-tenant SUPERVISOR and wired to it over a lazily-created `socketpair`.
 ///
-/// Composition: `router` (listen.public-tls + listen.http-parse + backend.kv — the sole KV opener,
-/// so it resolves Host→project without a double-open) + `tenant-wasm` (the per-tenant template, NOT
-/// boot-forked) + `core` (crown jewels + the other backends) + `aux` (the other listeners +
-/// exec.compute + control). The test PRE-SEEDS the control-plane KV with TWO `domain/<host>` →
-/// `(project, site)` mappings, then CLOSES it before the node opens it as the sole writer.
+/// Composition (WS-D Finding-2 split): `parser` (listen.public-tls + listen.http-parse ONLY — the
+/// public parse surface, NO spawn/KV) forwards client fds + the peeked Host inward; `supervisor`
+/// (backend.kv + exec.compute — non-public, binds no listener, the sole KV opener) re-resolves
+/// Host→project + instantiates + relays per tenant; `tenant-wasm` (the per-tenant template, NOT
+/// boot-forked); `core` (crown jewels + the other backends); `aux` (the other listeners + control).
+/// The test PRE-SEEDS the control-plane KV with TWO `domain/<host>` → `(project, site)` mappings,
+/// then CLOSES it before the node opens it as the sole writer.
 ///
 /// Drives TWO hosts (`tenant-a.test` → project `acme`, `tenant-b.test` → project `globex`): the
-/// router resolves each Host (Stage-0, MSG_PEEK — consuming nothing), instantiates that tenant's
-/// `exec.wasmtime` instance (lazy socketpair + fork via the root's OWN primitive, scope wired via
-/// `BOATRAMP_PRIVSEP_TENANT_SCOPE`, NO secret inherited), and relays the client fd. Each per-tenant
+/// parser peeks each Host (Stage-0, MSG_PEEK — consuming nothing) and forwards the client fd inward;
+/// the supervisor re-resolves the Host, instantiates that tenant's `exec.wasmtime` instance (lazy
+/// socketpair + fork via the root's OWN primitive, scope wired via `BOATRAMP_PRIVSEP_TENANT_SCOPE`,
+/// NO secret inherited), and relays the client fd. Each per-tenant
 /// backend establishes its UNFORGEABLE wired identity (fail-closed) and serves a body keyed by its
 /// scope — so the TWO hosts return TWO DISTINCT bodies (`project=acme` vs `project=globex`), proving
 /// two distinct per-tenant instances. Greps the `PRIVSEP PER-TENANT OK` marker.
@@ -460,17 +475,18 @@ fn privsep_frontend_inversion_serves_end_to_end() {
 /// the `sandbox` feature. The CI `live gate (privsep)` job runs it via `--include-ignored` and greps
 /// the marker + the pass count.
 ///
-/// NOTE (WS-D dependency, flagged): the per-tenant ROUTER forks per-tenant children, so its derived
-/// seccomp/Landlock profile must permit `clone`/`execve` of its own binary (today only the ROOT
-/// retains `execve`). Extending the per-capability profile derivation to grant a per-tenant router
-/// that is a WS-D profile change; until it lands this gate stands up fail-closed (the router cannot
-/// spawn) rather than serving — which is the correct fail-closed behavior, not a WS-C regression.
+/// NOTE (WS-D): the non-public SUPERVISOR (`exec.compute`) forks the per-tenant children, so its
+/// derived seccomp/Landlock profile permits `fork`/`execve` of its OWN binary (execute-pinned,
+/// never the writable `kv-slate` — `sandbox::derive_seccomp_allowlist` + the Landlock execute-pin
+/// grant `exec.compute` holders this; the public `parser` holds no `exec.compute`, so its `execve`
+/// stays seccomp-killed — the Finding-2 wall). The SUPERVISOR holds `backend.kv` (its `kv-slate`
+/// grant), NOT the parser.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 #[test]
-#[ignore = "live: forks boatramp __root for a per-tenant template composition; the router resolves \
-            two Hosts, instantiates two per-tenant exec.wasmtime instances (lazy socketpair + \
-            root fork+exec, scope-wired) + serves two distinct scoped bodies (Linux + `sandbox`); \
-            run via --include-ignored in the `live gate (privsep)` job"]
+#[ignore = "live: forks boatramp __root for a per-tenant template composition; the parser peeks two \
+            Hosts + forwards inward, the supervisor instantiates two per-tenant exec.wasmtime \
+            instances (lazy socketpair + root fork+exec, scope-wired) + serves two distinct scoped \
+            bodies (Linux + `sandbox`); run via --include-ignored in the `live gate (privsep)` job"]
 fn privsep_per_tenant_serves_end_to_end() {
     use boatramp_core::kv::KvOpenPolicy;
     use boatramp_core::project::DomainOwner;
@@ -487,10 +503,10 @@ fn privsep_per_tenant_serves_end_to_end() {
     let cfg_path = tmp.join("boatramp.cfg");
 
     // PRE-SEED the control-plane KV with two host→(project, site) domain mappings, exactly as the
-    // running router will read them (`domain/<canon-host>` → DomainOwner JSON), then CLOSE it so the
-    // node opens the SAME SlateDB store as its sole writer (no concurrent open — the router is the
-    // only `backend.kv` holder). Done in a dedicated current-thread runtime, mirroring the unseal
-    // gate's pre-seal.
+    // running supervisor will read them (`domain/<canon-host>` → DomainOwner JSON), then CLOSE it so
+    // the node opens the SAME SlateDB store as its sole writer (no concurrent open — the supervisor
+    // is the only `backend.kv` holder). Done in a dedicated current-thread runtime, mirroring the
+    // unseal gate's pre-seal.
     {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -524,22 +540,31 @@ fn privsep_per_tenant_serves_end_to_end() {
     }
 
     // The per-tenant composition (union == ALL; no crown co-resident with a listener/exec/control;
-    // exec.wasmtime lives ONLY on the per-tenant template):
-    //   - `router`      = listen.public-tls + listen.http-parse + backend.kv — the per-tenant ROUTER
-    //                     (sole KV opener: resolves Host→project, instantiates + relays per tenant);
+    // exec.wasmtime lives ONLY on the per-tenant template), with the public parser DE-COUPLED from
+    // spawn + KV (WS-D Finding-2):
+    //   - `parser`     = listen.public-tls + listen.http-parse ONLY — the public parse surface, holds
+    //                    NO backend.kv / exec.compute; it peeks Host + forwards client fds inward;
+    //   - `supervisor` = backend.kv + exec.compute (non-public, binds no listener) — RE-resolves
+    //                    Host→project (sole KV opener), instantiates + relays per tenant;
     //   - `tenant-wasm` = ONLY exec.wasmtime, `lifecycle: PerTenantTemplate` — NOT boot-forked;
     //   - `core`        = every crown jewel + the other backends (A ∪ B∖{kv});
-    //   - `aux`         = the other listeners + exec.compute + control (closes the union).
-    //   - `to-tenant`   = the router↔template Relay link (socketpaired per tenant at instantiation).
+    //   - `aux`         = the other listeners + control (closes the union).
+    //   - `parser-sup`  = the parser→supervisor Relay link (client fds + peeked Host ride inward);
+    //   - `to-tenant`   = the supervisor↔template Relay link (socketpaired per tenant at instantiation).
     let cfg = format!(
         r#"(
     serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
     privsep: (
         instances: {{
-            "router": (
-                capabilities: ["listen.public-tls", "listen.http-parse", "backend.kv", "exec.compute"],
+            "parser": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
                 sandbox: Derived,
-                links: ["to-tenant"],
+                links: ["parser-sup"],
+            ),
+            "supervisor": (
+                capabilities: ["backend.kv", "exec.compute"],
+                sandbox: Derived,
+                links: ["parser-sup", "to-tenant"],
             ),
             "tenant-wasm": (
                 capabilities: ["exec.wasmtime"],
@@ -566,7 +591,10 @@ fn privsep_per_tenant_serves_end_to_end() {
                 links: [],
             ),
         }},
-        links: {{ "to-tenant": (from: "router", to: "tenant-wasm", transport: Local, purpose: Relay) }},
+        links: {{
+            "parser-sup": (from: "parser", to: "supervisor", transport: Local, purpose: Relay),
+            "to-tenant": (from: "supervisor", to: "tenant-wasm", transport: Local, purpose: Relay),
+        }},
         per_tenant: ( idle_eviction_secs: 300, max_instances: 64 ),
     ),
 )"#,
@@ -604,8 +632,8 @@ fn privsep_per_tenant_serves_end_to_end() {
             let _ = std::fs::remove_dir_all(&tmp);
             panic!(
                 "`boatramp __root` exited early ({status}) — the per-tenant composition failed to \
-                 stand up (sandbox not Enforced? the router could not fork a per-tenant instance — \
-                 the flagged WS-D execve-grant dependency? link/listener wiring?)"
+                 stand up (sandbox not Enforced? the supervisor could not open the KV or fork a \
+                 per-tenant instance? the parser↔supervisor / supervisor↔template link wiring?)"
             );
         }
         for (host, marker) in want {
