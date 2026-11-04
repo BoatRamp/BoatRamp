@@ -1160,6 +1160,16 @@ impl NodeProjectExport {
         // the ephemeral client already shares, so it needs no join. `endpoint_project` is the
         // project the DB workload is registered under (the reserved default for a Shared default
         // tenant), which is exactly the network the DB container joined at launch.
+        //
+        // TENANCY INVARIANT (keeps the backend's dual-attach safe): every field of this endpoint —
+        // `host`/port (from the healthy replica's deploy-registry endpoint or the backend's own
+        // bridge IP), `user`/`database` (from the operator target derived from `project`+`db`), and
+        // the password (unsealed by the caller's own `cred_project`/`cred_workload`) — is derived
+        // STRUCTURALLY from the authenticated caller's own project and operator config, never from
+        // guest/tenant-writable input or dump content. The one-shot therefore dials only this
+        // caller-owned DB with the caller's own credential; it cannot be redirected at a foreign
+        // tenant. Any future "custom DB host override" / content-derived DSN MUST re-examine the
+        // docker backend's dual-attach, since it would turn the one-shot into a cross-tenant pivot.
         let ephemeral_network = (backend.id() == "docker")
             .then(|| boatramp_docker::project_network_name(&target.endpoint_project));
         Ok(SqlEndpoint {

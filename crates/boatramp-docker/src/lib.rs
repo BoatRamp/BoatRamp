@@ -393,8 +393,13 @@ pub fn project_network_name(project: &str) -> String {
     } else {
         project
     };
-    format!("boatramp-net-{p}")
+    format!("{PROJECT_NETWORK_PREFIX}{p}")
 }
+
+/// The fixed prefix every per-project network name carries (see [`project_network_name`]). Factored
+/// out so a holder of the name alone can recover the project (strip the prefix) — used by the
+/// export/import one-shot to label a create-if-absent network identically to the launch path.
+pub const PROJECT_NETWORK_PREFIX: &str = "boatramp-net-";
 
 /// Build the [`NetworkingConfig`] attaching a container to `network` with the given DNS `aliases`
 /// (the workload name for a server a sibling resolves by name; empty for a one-shot client that
@@ -900,10 +905,17 @@ impl ComputeBackend for DockerBackend {
         // client) and remember the network to attach to; absent ⇒ the one-shot stays on the daemon
         // default network (an external DSN, reachable via NAT egress), exactly as before.
         let mut env_pairs: Vec<(String, String)> = env.to_vec();
-        let ephemeral_network = env_pairs
-            .iter()
-            .position(|(k, _)| k == EPHEMERAL_NETWORK_ENV)
-            .map(|pos| env_pairs.remove(pos).1);
+        // Strip EVERY occurrence of the reserved hint (not just the first) so no duplicate pair can
+        // ever survive into the client env; the last value wins as the network to join.
+        let mut ephemeral_network: Option<String> = None;
+        env_pairs.retain(|(k, v)| {
+            if k == EPHEMERAL_NETWORK_ENV {
+                ephemeral_network = Some(v.clone());
+                false
+            } else {
+                true
+            }
+        });
 
         let env_strings: Vec<String> = env_pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
         // No `networking_config` at create: the one-shot comes up on the daemon's DEFAULT network
@@ -951,12 +963,14 @@ impl ComputeBackend for DockerBackend {
         // path) is unchanged. Connect before start so the interface is present when the client
         // runs; a failure here means the DB is unreachable, so force-remove + surface it.
         if let Some(net) = &ephemeral_network {
-            let _ = self
-                .create_bridge_network(
-                    net,
-                    HashMap::from([("boatramp.managed".to_string(), "true".to_string())]),
-                )
-                .await;
+            // Create-if-absent with the SAME labels as the launch path (managed + project), so an
+            // operator's project-scoped GC/identification finds this network whether a one-shot or
+            // a workload launch won the create race. `net` is always `project_network_name(..)`-
+            // shaped, so recover the project by stripping the fixed prefix.
+            let project = net
+                .strip_prefix(PROJECT_NETWORK_PREFIX)
+                .unwrap_or(net.as_str());
+            let _ = self.ensure_project_network(project).await;
             if let Err(e) = self
                 .docker
                 .connect_network(
@@ -969,6 +983,11 @@ impl ComputeBackend for DockerBackend {
                 .await
             {
                 self.force_remove_container(&name).await;
+                // Best-effort reap of the network if THIS call just created it (a fresh per-project
+                // network with no other endpoints). `remove_network` is a no-op error, ignored, when
+                // the network pre-existed and still has workloads attached — so we never tear down a
+                // live project network, only our own orphan.
+                let _ = self.docker.remove_network(net).await;
                 return Err(BackendError::Other(format!(
                     "ephemeral join project network {net}: {e}"
                 )));
