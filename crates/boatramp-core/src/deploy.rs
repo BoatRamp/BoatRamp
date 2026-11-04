@@ -3930,6 +3930,192 @@ impl DeployStore {
         Ok(purged)
     }
 
+    /// GC a project's **provably-orphaned** control-plane state (`boatramp project prune`).
+    ///
+    /// The scalpel to [`purge_project`](Self::purge_project)'s guillotine: it reclaims the orphans a
+    /// `clone --force` COMMINGLE (or a routine `deploy apply` that rewrote a site's domains) leaves
+    /// behind, while touching NOTHING live. The whole design is **fail-closed** — a key is pruned
+    /// ONLY when this store can PROVE nothing live references it; on any uncertainty the key is KEPT.
+    /// See [`crate::project_prune`] for the full contract.
+    ///
+    /// Scope + exclusions (the security gate):
+    /// - The scan is confined to `project/<project>/…` — the C1 cross-tenant-isolation boundary.
+    ///   Another project's keys, the global routing/TLS keyspace (`domain/`, `wildcard/`, `cert/`),
+    ///   the node `daemonconfig/`, and the project's OWN `graphql/<p>/` + `hapq/<p>/` (which live
+    ///   outside `project/<p>/`) are all physically out of scope and retained.
+    /// - The KEK-**sealed** / credential families
+    ///   ([`sealed_secret_prefixes`](crate::project_export::sealed_secret_prefixes):
+    ///   `secret/`, `tenant-secret/`, `tenant-secret-index/`, `email/`, and `managed-sql-cred/`) are
+    ///   excluded STRUCTURALLY before any key is classified — never pruned.
+    /// - Live project resources (`config/`, `database/`, `functions/`, `compute/`) are kept.
+    ///
+    /// Prunes exactly two provable-orphan classes (see [`crate::project_prune::PruneReason`]):
+    /// 1. **Dead-site leftovers** — the per-site routing/config keys (`site/`, `current-principal/`,
+    ///    `history/`, `sitecontexts/`, `alias/`, `domainverify/`, `dnsmanaged/`) of a site with NO
+    ///    resolvable config body AND NO `current/` deployment pointer. The `current/` pointer is the
+    ///    liveness anchor and is itself never pruned.
+    /// 2. **Foreign-domain entries** of a LIVE site — a `domainverify/<site>/<host>` or
+    ///    `dnsmanaged/<site>/<host>` whose `<host>` is not one the site's CURRENT config answers to
+    ///    ([`host_is_answered_by`](crate::project_prune::host_is_answered_by)).
+    ///
+    /// With `apply == false` (the default) NOTHING is written — the returned plan lists exactly what
+    /// an `--apply` would remove. With `apply == true` the plan's keys are deleted in one
+    /// frontier-advancing batch (so a pruned routing/verification record cannot resurrect after a
+    /// crash) and `removed` is set. Idempotent: a second run on a clean project prunes nothing.
+    pub async fn prune_project(
+        &self,
+        project: &str,
+        apply: bool,
+    ) -> Result<crate::project_prune::ProjectPrunePlan, DeployError> {
+        use crate::project_prune::{
+            ProjectPrunePlan, PrunableKey, PruneReason, host_is_answered_by,
+        };
+        let pref = ProjectRef::new(project);
+
+        // Structural exclusion: the sealed/credential families are NEVER classified. Concrete,
+        // project-qualified prefixes built from the single source of truth.
+        let sealed = crate::project_export::sealed_secret_prefixes(pref);
+        let is_sealed = |key: &str| sealed.iter().any(|p| key.starts_with(p.as_str()));
+
+        // Everything this verb may consider lives under the project's resource prefix. (graphql/<p>/,
+        // hapq/<p>/ and managed-sql-cred/<p>/ are OUTSIDE it, so they are never scanned — retained.)
+        let resource_prefix = crate::project::resource_prefix(project); // project/<p>/
+        let all_keys = self.kv.list_prefix(&resource_prefix).await?;
+
+        // Pass 1 — discover the LIVE sites that anchor the referenced set:
+        //  - a `current/<site>` deployment pointer ⇒ live (and never pruned); and
+        //  - a `site/<site>` config pointer that resolves to an existing body ⇒ live (its resolved
+        //    config, contexts overlaid, is what the foreign-domain test compares against).
+        let current_prefix = keys::current_prefix(pref); // project/<p>/current/
+        let mut current_sites: BTreeSet<String> = BTreeSet::new();
+        let site_prefix = keys::site_prefix(pref); // project/<p>/site/
+        let mut config_sites: std::collections::BTreeMap<String, SiteConfig> = Default::default();
+        for key in &all_keys {
+            if let Some(site) = key
+                .strip_prefix(&current_prefix)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            {
+                current_sites.insert(site.to_string());
+            } else if let Some(site) = key
+                .strip_prefix(&site_prefix)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            {
+                // A resolvable config (body present) makes the site live; a dangling pointer
+                // (`get_site_config` → `None`) leaves it dead and the pointer itself prunable.
+                if let Some(cfg) = self.get_site_config(pref, site).await? {
+                    config_sites.insert(site.to_string(), cfg);
+                }
+            }
+        }
+        let is_live = |site: &str| current_sites.contains(site) || config_sites.contains_key(site);
+
+        // Pass 2 — classify each per-site key. Non-per-site families (config/database/functions/
+        // compute), the `current/` liveness anchor, and the sealed families are kept.
+        let mut prunable: Vec<PrunableKey> = Vec::new();
+        for key in &all_keys {
+            if is_sealed(key) {
+                continue;
+            }
+            let Some(rest) = key.strip_prefix(&resource_prefix) else {
+                continue;
+            };
+            let mut segs = rest.split('/');
+            let Some(family) = segs.next().filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            // Only the per-site routing/config families are classifiable. `current` is the liveness
+            // anchor — always kept. Everything else is a live resource — kept.
+            let per_site = matches!(
+                family,
+                "site"
+                    | "current-principal"
+                    | "history"
+                    | "sitecontexts"
+                    | "alias"
+                    | "domainverify"
+                    | "dnsmanaged"
+            );
+            if !per_site {
+                continue;
+            }
+            let Some(site) = segs.next().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+
+            if !is_live(site) {
+                // A key of a site that serves nothing (no config body, no deployment pointer).
+                prunable.push(PrunableKey {
+                    key: key.clone(),
+                    reason: PruneReason::DeadSite,
+                    detail: format!(
+                        "site `{site}` has no live config and no active deployment — a dead-site leftover"
+                    ),
+                });
+                continue;
+            }
+
+            // A LIVE site: only a foreign-domain verification / managed-DNS ledger entry is an
+            // orphan, and only when the site has a RESOLVABLE config to compare the host against
+            // (a site live solely by a `current/` pointer with a dangling config is kept — nothing
+            // to prove the host foreign against). Everything else for a live site is kept.
+            if matches!(family, "domainverify" | "dnsmanaged") {
+                let Some(host) = segs.next().filter(|h| !h.is_empty()) else {
+                    continue;
+                };
+                let Some(cfg) = config_sites.get(site) else {
+                    continue; // live via current pointer, no resolvable config — keep (fail-closed)
+                };
+                if !host_is_answered_by(host, cfg) {
+                    let (reason, label) = if family == "domainverify" {
+                        (PruneReason::ForeignDomainVerify, "domain-verification")
+                    } else {
+                        (PruneReason::ForeignManagedDns, "managed-DNS")
+                    };
+                    prunable.push(PrunableKey {
+                        key: key.clone(),
+                        reason,
+                        detail: format!(
+                            "host `{host}` is not answered by site `{site}`'s current config — a stale/foreign {label} record"
+                        ),
+                    });
+                }
+            }
+        }
+
+        prunable.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut live_sites: Vec<String> = current_sites
+            .iter()
+            .cloned()
+            .chain(config_sites.keys().cloned())
+            .collect();
+        live_sites.sort();
+        live_sites.dedup();
+
+        let mut plan = ProjectPrunePlan {
+            project: project.to_string(),
+            prunable,
+            live_sites,
+            applied: false,
+            removed: 0,
+        };
+
+        if apply && !plan.prunable.is_empty() {
+            let ops: Vec<WriteOp> = plan
+                .prunable
+                .iter()
+                .map(|p| WriteOp::Delete(p.key.clone()))
+                .collect();
+            let removed = ops.len();
+            // A pruned routing/verification/auto-DNS record must stay gone past a crash (it would
+            // otherwise resurrect and re-assert a claim the operator just reclaimed), so advance the
+            // durable frontier — matching `delete_site`'s crown-jewel discipline.
+            self.kv.write_batch_checkpointed(ops).await?;
+            plan.applied = true;
+            plan.removed = removed;
+        }
+        Ok(plan)
+    }
+
     /// Atomically point `site` at deployment `id`. Captures NO system class (the activator is
     /// unknown), so the site's [`current_principal`](keys::current_principal) is CLEARED — a
     /// `run_as: deployer` cron on this site then fails closed. The control-plane handler uses
@@ -8490,5 +8676,297 @@ mod tests {
             Some(&b""[..]),
             "an empty policy stores empty bytes (gate off)"
         );
+    }
+
+    // ---- project prune (GC of provably-orphaned control-plane state) --------------------------
+
+    fn live_cfg(primary: &str, aliases: &[&str]) -> crate::config::SiteConfig {
+        crate::config::SiteConfig {
+            domains: crate::config::DomainConfig {
+                primary: Some(primary.to_string()),
+                aliases: aliases.iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The motivating case: a `--force` clone commingle (or a `deploy apply` that rewrote a site's
+    /// domains) leaves verification + auto-DNS ledger entries for a FOREIGN host the current config
+    /// no longer answers to. Prune reports exactly those, keeps the active-domain records + config,
+    /// and `--apply` removes exactly the dry-run set (idempotent on a second run).
+    #[tokio::test]
+    async fn prune_project_prunes_foreign_domain_leftovers_and_keeps_active() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        // A LIVE site answering to its primary + alias.
+        store
+            .set_site_config(
+                acme,
+                "shop",
+                &live_cfg("active.example.com", &["www.active.example.com"]),
+            )
+            .await
+            .unwrap();
+
+        // Active-host verification + managed-DNS ledger entries (the config answers to these).
+        let active_verify = keys::domain_verification(acme, "shop", "active.example.com");
+        kv.put(&active_verify, b"token".to_vec()).await.unwrap();
+        let active_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "active.example.com");
+        kv.put(&active_dns, b"{}".to_vec()).await.unwrap();
+
+        // Foreign-domain leftovers a commingle left behind (NOT in the current config).
+        let foreign_verify = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign_verify, b"token".to_vec()).await.unwrap();
+        let foreign_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "foreign.example.net");
+        kv.put(&foreign_dns, b"{}".to_vec()).await.unwrap();
+
+        // Dry-run: reports exactly the two foreign keys, mutates nothing.
+        let plan = store.prune_project("acme", false).await.unwrap();
+        assert!(
+            !plan.applied && plan.removed == 0,
+            "dry-run changes nothing"
+        );
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(
+            pruned.len(),
+            2,
+            "exactly two foreign leftovers: {:?}",
+            plan.prunable
+        );
+        assert!(pruned.contains(foreign_verify.as_str()));
+        assert!(pruned.contains(foreign_dns.as_str()));
+        assert!(
+            !pruned.contains(active_verify.as_str()),
+            "active record is referenced — kept"
+        );
+        assert!(
+            !pruned.contains(active_dns.as_str()),
+            "active record is referenced — kept"
+        );
+        assert_eq!(plan.live_sites, vec!["shop".to_string()]);
+        // Nothing was deleted by the dry-run.
+        assert!(kv.get(&foreign_verify).await.unwrap().is_some());
+
+        // Apply: removes EXACTLY the dry-run set.
+        let applied = store.prune_project("acme", true).await.unwrap();
+        assert!(applied.applied && applied.removed == 2);
+        assert!(kv.get(&foreign_verify).await.unwrap().is_none());
+        assert!(kv.get(&foreign_dns).await.unwrap().is_none());
+        // Active records + the site config are untouched.
+        assert!(kv.get(&active_verify).await.unwrap().is_some());
+        assert!(kv.get(&active_dns).await.unwrap().is_some());
+        assert!(store.get_site_config(acme, "shop").await.unwrap().is_some());
+
+        // Idempotent: a clean project prunes nothing.
+        let again = store.prune_project("acme", true).await.unwrap();
+        assert!(again.is_clean() && again.removed == 0);
+    }
+
+    /// A site with no resolvable config and no `current/` deployment pointer is dead: every per-site
+    /// routing/config leftover it still owns (a dangling `site/` pointer, history, contexts, aliases,
+    /// the activator-class record, verification + managed-DNS ledgers) is a provable orphan. A LIVE
+    /// site alongside is untouched.
+    #[tokio::test]
+    async fn prune_project_prunes_dead_site_residuals_keeps_live_site() {
+        use crate::kv::MemoryKv;
+        use crate::project_prune::PruneReason;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+
+        // GHOST site — leftover per-site keys only (no config body, no current pointer).
+        let dangling_pointer = keys::site_pointer(acme, "ghost"); // → a hash whose body is absent
+        let ghost_keys = [
+            dangling_pointer.clone(),
+            keys::current_principal(acme, "ghost"),
+            keys::history(acme, "ghost"),
+            keys::site_contexts(acme, "ghost"),
+            keys::alias(acme, "ghost", "staging"),
+            keys::domain_verification(acme, "ghost", "ghost.example.com"),
+            crate::dns_managed::dnsmanaged_key("acme", "ghost", "ghost.example.com"),
+        ];
+        kv.put(&dangling_pointer, b"deadbeefdeadbeef".to_vec())
+            .await
+            .unwrap();
+        for k in ghost_keys.iter().skip(1) {
+            kv.put(k, b"x".to_vec()).await.unwrap();
+        }
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        assert_eq!(plan.removed, ghost_keys.len(), "every ghost key is pruned");
+        assert!(
+            plan.prunable
+                .iter()
+                .all(|p| p.reason == PruneReason::DeadSite),
+            "ghost keys are dead-site orphans: {:?}",
+            plan.prunable
+        );
+        for k in &ghost_keys {
+            assert!(
+                kv.get(k).await.unwrap().is_none(),
+                "ghost key must be gone: {k}"
+            );
+        }
+        // The live site's config pointer survives (referenced).
+        assert!(store.get_site_config(acme, "shop").await.unwrap().is_some());
+        assert!(
+            kv.get(&keys::site_pointer(acme, "shop"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Sealed secrets, per-tenant secrets + their index, email profiles, and managed-SQL credentials
+    /// are NEVER prunable — even when a real orphan (a foreign-domain leftover) is present so the
+    /// sweep genuinely runs. The exclusion is structural (applied before classification).
+    #[tokio::test]
+    async fn prune_project_never_prunes_sealed_or_managed_cred() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+
+        let sealed = [
+            keys::secret(acme, "api-key"),
+            keys::email_profile(acme, "smtp"),
+            keys::tenant_secret(acme, "firm-a", "oauth-secret"),
+            keys::tenant_secret_index(acme, "firm-a"),
+            "managed-sql-cred/acme/shop".to_string(),
+        ];
+        for k in &sealed {
+            kv.put(k, b"SEALED-UNDER-KEK".to_vec()).await.unwrap();
+        }
+        // A genuine orphan so the sweep has work to do.
+        let foreign = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign, b"token".to_vec()).await.unwrap();
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        assert!(
+            pruned.contains(foreign.as_str()),
+            "the real orphan is pruned"
+        );
+        for k in &sealed {
+            assert!(
+                !pruned.contains(k.as_str()),
+                "a sealed/cred key must never be prunable: {k}"
+            );
+            assert!(
+                kv.get(k).await.unwrap().is_some(),
+                "a sealed/cred key must survive an apply: {k}"
+            );
+        }
+    }
+
+    /// Live project resources and out-of-`project/<p>/` owned state (graphql subgraph SDLs, hapq
+    /// APQ) are RETAINED — they are in PRESENT but not provably orphaned. The scan never reaches them.
+    #[tokio::test]
+    async fn prune_project_keeps_graphql_hapq_and_live_resources() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+        // Keys that must survive: a subgraph SDL, a persisted APQ op, a project config + a function.
+        let subgraph = format!("{}users", keys::graphql_subgraph_prefix(acme));
+        let apq = format!("{}abc123", keys::graphql_safelist_prefix(acme));
+        let cfg_key = keys::project_config(acme, "tenancy");
+        let fn_key = "project/acme/functions/hello".to_string();
+        for k in [&subgraph, &apq, &cfg_key, &fn_key] {
+            kv.put(k, b"keep-me".to_vec()).await.unwrap();
+        }
+        // A real orphan so the sweep runs.
+        let foreign = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign, b"token".to_vec()).await.unwrap();
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(
+            pruned.len(),
+            1,
+            "only the foreign orphan is pruned: {:?}",
+            plan.prunable
+        );
+        for k in [&subgraph, &apq, &cfg_key, &fn_key] {
+            assert!(kv.get(k).await.unwrap().is_some(), "must be retained: {k}");
+        }
+    }
+
+    /// Cross-tenant isolation: pruning project `alpha` touches ZERO of project `bravo`'s keys. A
+    /// single-project fixture is blind to a leak, so the fixture seeds BOTH tenants with the shared
+    /// keyspace shape (a live site + a foreign-domain leftover + a dead-site ghost each).
+    #[tokio::test]
+    async fn prune_project_is_tenant_scoped_two_project_fixture() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let alpha = ProjectRef::new("alpha");
+        let bravo = ProjectRef::new("bravo");
+
+        // Distinct domains per project (a host is globally unique in the routing index).
+        store
+            .set_site_config(alpha, "s", &live_cfg("alpha.example.com", &[]))
+            .await
+            .unwrap();
+        store
+            .set_site_config(bravo, "s", &live_cfg("bravo.example.com", &[]))
+            .await
+            .unwrap();
+        let alpha_foreign = keys::domain_verification(alpha, "s", "foreign-a.example.net");
+        let bravo_foreign = keys::domain_verification(bravo, "s", "foreign-b.example.net");
+        let bravo_ghost = keys::history(bravo, "ghost");
+        kv.put(&alpha_foreign, b"t".to_vec()).await.unwrap();
+        kv.put(&bravo_foreign, b"t".to_vec()).await.unwrap();
+        kv.put(&bravo_ghost, b"t".to_vec()).await.unwrap();
+
+        // Snapshot ALL of bravo's keyspace before pruning alpha.
+        let bravo_before: BTreeSet<String> = kv
+            .list_prefix("project/bravo/")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        let plan = store.prune_project("alpha", true).await.unwrap();
+        assert_eq!(plan.removed, 1, "only alpha's foreign leftover is pruned");
+        assert!(kv.get(&alpha_foreign).await.unwrap().is_none());
+
+        // ZERO of bravo's keys changed — no foreign byte removed from the other tenant.
+        let bravo_after: BTreeSet<String> = kv
+            .list_prefix("project/bravo/")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            bravo_before, bravo_after,
+            "pruning alpha must not touch bravo"
+        );
+        assert!(kv.get(&bravo_foreign).await.unwrap().is_some());
+        assert!(kv.get(&bravo_ghost).await.unwrap().is_some());
     }
 }

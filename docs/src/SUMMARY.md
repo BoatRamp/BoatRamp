@@ -85,6 +85,7 @@
   - [Back up & restore](./how-to/backup.md)
   - [Export, import & clone a project](./how-to/clone-project.md)
   - [Incremental & true-delta export](./how-to/delta-export.md)
+  - [Prune a project's orphaned control-plane state](./how-to/prune-project.md)
   - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)
   - [Switch the blob backend with zero downtime](./how-to/blob-backend-migration.md)
   - [Upgrade boatramp to a new version](./how-to/upgrade-boatramp.md)

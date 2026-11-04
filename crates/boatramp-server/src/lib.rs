@@ -63,10 +63,11 @@ pub(crate) use admin_api::{
     get_daemon_config, get_database, get_deployment, get_project_tenancy, get_site_config,
     invalidate_cache, list_aliases, list_compute, list_compute_volumes, list_databases,
     list_deployments, list_operator_registry_auth, list_sites, migrate_apply, migrate_baseline,
-    migrate_dry_run, migrate_status, project_export, project_import, prune_delete, prune_report,
-    put_blob, put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
-    repair_apply, repair_dry_run, restart_database, rollback_daemon_config, scrub_blobs, set_alias,
-    set_operator_registry_auth, sql_exec, sql_move, sql_ping, sql_query, sql_status,
+    migrate_dry_run, migrate_status, project_export, project_import, project_prune_apply,
+    project_prune_report, prune_delete, prune_report, put_blob, put_compute, put_daemon_config,
+    put_project_tenancy, put_site_config, remove_alias, repair_apply, repair_dry_run,
+    restart_database, rollback_daemon_config, scrub_blobs, set_alias, set_operator_registry_auth,
+    sql_exec, sql_move, sql_ping, sql_query, sql_status,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{

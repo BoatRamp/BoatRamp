@@ -99,6 +99,25 @@ enum ProjectCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// GC this project's PROVABLY-orphaned control-plane state (`Project·Admin`).
+    ///
+    /// Reclaims the leftovers a `clone --force` COMMINGLE — or a routine `deploy apply` that
+    /// rewrote a site's domains — leaves behind: stale per-site routing/config keys of a site that
+    /// serves nothing, and foreign-domain verification + auto-DNS ledger records a site's CURRENT
+    /// config no longer answers to. Fail-closed: ONLY provably-orphaned keys are touched — sealed
+    /// secrets, managed-DB credentials, another tenant's keys, the global routing/TLS keyspace,
+    /// live site config, GraphQL subgraphs and persisted APQ are ALL kept.
+    ///
+    /// DRY-RUN by default: reports every orphan + WHY, changing nothing. `--apply` deletes exactly
+    /// the reported set. Shared content-addressed deploy blobs/manifests are NOT reclaimed here —
+    /// that node-global GC is `boatramp prune` (`System·Admin`).
+    Prune {
+        /// The project to prune.
+        name: String,
+        /// Execute the prune — delete the reported orphans. Without it, a safe dry-run only.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Drive this project's owner-gated schema migrations for a managed database
     /// (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's
     /// non-superuser owner role and need a `Project·Admin` token; `status` needs `Project·Read`.
@@ -668,6 +687,10 @@ pub enum ProjectOutput {
         plan: boatramp_core::project_export::ClonePlan,
         report: boatramp_core::project_export::ImportReport,
     },
+    /// `project prune` — the provable-orphan plan (dry-run) or executed outcome (`--apply`).
+    Pruned {
+        plan: boatramp_core::project_prune::ProjectPrunePlan,
+    },
     /// The output was already written directly by this arm (a delegated subcommand's own
     /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
     Passthrough,
@@ -832,6 +855,42 @@ impl crate::output::Rendered for ProjectOutput {
                 }
                 Ok(())
             }
+            Self::Pruned { plan } => {
+                if plan.is_clean() {
+                    return writeln!(
+                        w,
+                        "project `{}` is clean — no provably-orphaned control-plane state found",
+                        plan.project
+                    );
+                }
+                let verb = if plan.applied { "pruned" } else { "prunable" };
+                writeln!(
+                    w,
+                    "project `{}`: {} orphaned control-plane key(s) [{}]",
+                    plan.project,
+                    plan.prunable.len(),
+                    verb,
+                )?;
+                for p in &plan.prunable {
+                    writeln!(w, "  - {} [{}]: {}", p.key, p.reason.as_str(), p.detail)?;
+                }
+                if plan.applied {
+                    writeln!(w, "removed {} key(s)", plan.removed)?;
+                } else {
+                    writeln!(
+                        w,
+                        "(dry-run — nothing deleted; re-run with --apply to remove the above)"
+                    )?;
+                }
+                if !plan.live_sites.is_empty() {
+                    writeln!(w, "kept live site(s): {}", plan.live_sites.join(", "))?;
+                }
+                writeln!(
+                    w,
+                    "note: shared content-addressed deploy blobs/manifests are reclaimed by the \
+                     node-global `boatramp prune` (System·Admin), not this per-project verb"
+                )
+            }
             Self::Passthrough => Ok(()),
         }
     }
@@ -936,6 +995,10 @@ pub async fn run(
                     Err(e) => Err(e.into()),
                 }
             }
+        }
+        ProjectCommand::Prune { name, apply } => {
+            let plan = cp.project_prune(&name, apply).await?;
+            Ok(ProjectOutput::Pruned { plan })
         }
         ProjectCommand::Migrate(margs) => {
             crate::project_migrate::run(margs, &cp).await?;

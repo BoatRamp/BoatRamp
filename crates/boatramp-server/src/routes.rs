@@ -499,6 +499,15 @@ pub fn router_with_fast(
         // + re-checked defense-in-depth at the handler.
         .route("/api/project-export", post(project_export))
         .route("/api/project-import", post(project_import))
+        // `boatramp project prune` (owner-requested): GC a project's PROVABLY-orphaned control-plane
+        // state — the stale per-site routing/config leftovers + foreign-domain verification/auto-DNS
+        // records a `--force` clone commingle leaves. `Project·Admin` on the `?project=` target
+        // (uniform with export/import/clone — NOT node-global System·Admin), re-checked
+        // defense-in-depth at the handler. GET = dry-run report (mutates nothing); POST = apply.
+        .route(
+            "/api/project-prune",
+            get(project_prune_report).post(project_prune_apply),
+        )
         // Streaming project CLONE (PLAN-project-clone, increment 1): the SOURCE manifest + filtered
         // member stream, and the TARGET orchestrator. Reached as `/api/projects/<proj>/clone/…`
         // (project-scoped, rewritten here by `project_scope`), so authz gates the family at
