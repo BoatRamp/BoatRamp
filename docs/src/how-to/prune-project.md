@@ -24,11 +24,24 @@ It removes two provable-orphan classes:
 
 | Class | What it is |
 | --- | --- |
-| **Dead-site leftovers** | The per-site routing/config keys (`site/`, `history/`, `sitecontexts/`, `alias/`, `domainverify/`, `dnsmanaged/`, the activator-class record) of a site that has **no** resolvable config **and no** active deployment — a site that serves nothing. |
-| **Foreign-domain records** | A domain-verification (`domainverify/<site>/<host>`) or auto-DNS (`dnsmanaged/<site>/<host>`) ledger entry for a host the site's **current** config no longer answers to — the motivating commingle leftover. |
+| **Dead-site leftovers** | The per-site routing/config keys (`site/`, `history/`, `sitecontexts/`, `alias/`, `domainverify/`, the activator-class record) of a site that has **no** resolvable config **and no** active deployment — a site that serves nothing. |
+| **Foreign, dead domain-verification records** | A domain-verification (`domainverify/<site>/<host>`) entry for a host the site's **current** config no longer answers to **and** whose challenge is **unverified and expired** — a stale, never-completed commingle leftover. A **verified** ownership proof and an **unexpired pending** challenge for such a host are *kept* (see below). |
 
 It **never** touches:
 
+- **The auto-DNS ledger (`dnsmanaged/<site>/<host>`)** — each entry fronts an
+  external DNS record boatramp published at a provider, and its lifecycle (retract
+  the provider record, *then* drop the ledger) is owned by the auto-DNS reconcile
+  sweep. Deleting the ledger directly would strand the external record — a leaked
+  dangling hostname the reconcile GC could never reclaim. So prune leaves every
+  `dnsmanaged/` key alone, for a dead site **and** a live site's foreign host; the
+  reconcile sweep retracts a stale/foreign one correctly.
+- **A verified domain-ownership proof, or an unexpired pending challenge**, even
+  for a host no longer in the config — a verified record proves ownership (a
+  DNS-verified parent still authorizes on-demand TLS for its subtree); removing it
+  is a `domain rm`, not GC. A pending challenge is a verify-before-attach in
+  flight. Only an *unverified, expired* record for a not-in-config host is a
+  provable dead orphan.
 - **Sealed secrets, per-tenant secrets, email profiles, and managed-SQL
   credentials** — excluded structurally, before anything is classified. Losing
   one is unrecoverable.
@@ -53,9 +66,8 @@ boatramp project prune acme
 ```
 
 ```text
-project `acme`: 2 orphaned control-plane key(s) [prunable]
-  - project/acme/domainverify/shop/old.example.net [foreign-domain-verify]: host `old.example.net` is not answered by site `shop`'s current config — a stale/foreign domain-verification record
-  - project/acme/dnsmanaged/shop/old.example.net [foreign-managed-dns]: host `old.example.net` is not answered by site `shop`'s current config — a stale/foreign managed-DNS record
+project `acme`: 1 orphaned control-plane key(s) [prunable]
+  - project/acme/domainverify/shop/old.example.net [foreign-domain-verify]: host `old.example.net` is not answered by site `shop`'s current config and its verification challenge is unverified + expired — a stale/foreign domain-verification record
 (dry-run — nothing deleted; re-run with --apply to remove the above)
 kept live site(s): shop
 note: shared content-addressed deploy blobs/manifests are reclaimed by the node-global `boatramp prune` (System·Admin), not this per-project verb
@@ -69,22 +81,31 @@ project `acme` is clean — no provably-orphaned control-plane state found
 
 ## 2. Apply the prune
 
-Re-run with `--apply` to delete exactly the reported set:
+Re-run with `--apply` to delete exactly the reported set. Because deletes are
+irreversible, `--apply` first re-prints the plan and asks you to **type the
+project name to confirm** (parity with `project rm --force`); pass `-y` / `--yes`
+to skip the prompt for automation (required when stdin is not a TTY):
 
 ```sh
-boatramp project prune acme --apply
+boatramp project prune acme --apply        # previews, then prompts
+boatramp project prune acme --apply --yes  # unattended
 ```
 
 ```text
-project `acme`: 2 orphaned control-plane key(s) [pruned]
+project `acme`: 1 orphaned control-plane key(s) [pruned]
   - project/acme/domainverify/shop/old.example.net [foreign-domain-verify]: …
-  - project/acme/dnsmanaged/shop/old.example.net [foreign-managed-dns]: …
-removed 2 key(s)
+removed 1 key(s)
 kept live site(s): shop
 ```
 
 The apply is idempotent — a second run on a now-clean project removes nothing.
 Scripts can take the machine-readable form with `--output-format json`.
+
+> **Degraded KV:** if the control-plane KV booted into a self-healed /
+> quarantined state (a torn WAL tail was dropped — see `boatramp kv status`),
+> `--apply` is **refused** fail-closed: a transiently-absent site pointer in the
+> recovered view could misclassify a live site as dead. Review and `boatramp kv
+> status --ack` first, then re-run. The dry-run report still works while degraded.
 
 ## Authorization
 

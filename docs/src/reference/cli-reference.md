@@ -2746,6 +2746,7 @@ GC this project's PROVABLY-orphaned control-plane state (`Project·Admin`)
 | --- | --- | --- | --- | --- |
 | `<NAME>` | — | — | — | The project to prune |
 | `--apply` | — | — | — | Execute the prune — delete the reported orphans. Without it, a safe dry-run only |
+| `-y, --yes` | — | — | — | Skip the interactive confirmation prompt on `--apply` (required to `--apply` when stdin is not a TTY). Deletes are irreversible, so `--apply` otherwise previews the plan and asks you to type the project name — parity with `project rm --force` |
 
 ### `boatramp project migrate`
 
