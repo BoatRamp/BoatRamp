@@ -48,6 +48,9 @@ pub mod config;
 /// default project's BLOB + LIBSQL data is still un-re-homed, so the serve guard + `boatramp migrate
 /// --finalize` reach the same bar as the KV version-guard.
 pub mod default_scope;
+/// `type:value` config-pointer resolution for the per-zone DNS providers (`[serve.dns_providers]`,
+/// cap-req #27). Ungated — the core DNS-provider config + resolver must compile in the lean lane.
+pub mod dns_provider_ref;
 /// Ownership-safe per-replica DYNAMIC managed-database credentials (PLAN-compute-managed-db
 /// phase 2): mint-on-launch / revoke-on-stop lifecycle for a compute workload's dynamic DB
 /// role, scoped to the workload's own tenant database. The pure SQL + its live ownership
