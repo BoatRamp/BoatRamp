@@ -290,17 +290,22 @@ jobs:
         run: |
           set -o pipefail
           kubectl cluster-info
-          # Run ONLY the #[ignore]d live tests (--ignored), single-threaded so the two
+          # Run ONLY the #[ignore]d live tests (--ignored), single-threaded so the
           # cluster-mutating tests don't race on shared objects, capturing every marker.
           cargo test -p boatramp-k8s --test k8s_live -- --ignored --nocapture --test-threads=1 \
             2>&1 | tee k8s-compute-live.log
-          # Hard gate: all three live tests ran (not silently skipped) AND each marker printed.
-          grep -qE 'test result: ok\. 3 passed' k8s-compute-live.log \
-            || { echo "FAIL: expected 3 live tests to run (silent self-skip?)"; exit 1; }
+          # Hard gate: all four live tests ran (not silently skipped) AND each marker printed.
+          grep -qE 'test result: ok\. 4 passed' k8s-compute-live.log \
+            || { echo "FAIL: expected 4 live tests to run (silent self-skip?)"; exit 1; }
           grep -q 'K8S COMPUTE BACKEND OK' k8s-compute-live.log \
             || { echo "FAIL: missing managed-Postgres (Phase 1) marker"; exit 1; }
           grep -q 'K8S COMPUTE PHASE2 OK' k8s-compute-live.log \
             || { echo "FAIL: missing generic-workload (Phase 2) marker"; exit 1; }
+          # The multi-tenant (strict) posture proof: a managed Postgres boots under a read-only
+          # root with the F1 scratch volumes AND the applied StatefulSet has cap_add dropped +
+          # read-only root. A silent skip here would ship the strict-posture fix unverified-live.
+          grep -q 'K8S STRICT MANAGED-DB OK' k8s-compute-live.log \
+            || { echo "FAIL: missing strict-posture read-only-root managed-DB (F1) marker"; exit 1; }
           echo "k8s compute backend live gate GREEN"
 
   # LIVE project export/import round-trip (inc2: atomic shadow-restore, the ephemeral
