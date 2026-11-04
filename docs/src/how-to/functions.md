@@ -1,5 +1,7 @@
 # Deploy & invoke a function
 
+**For: app developers**
+
 A **top-level function** is a WASI component you deploy and call by name, with its
 own version line — independent of any site deployment. Use it when you want a unit
 of compute that is invoked directly (sync or async), versioned and rolled back on

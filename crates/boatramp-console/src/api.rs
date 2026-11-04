@@ -52,6 +52,15 @@ impl ApiError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, ApiError::Status { code: 404, .. })
     }
+
+    /// Whether this is a `403` — the token is valid but lacks the scope the
+    /// resource needs. Mutating views (e.g. the GraphQL safelist register/remove,
+    /// which need `Project·Deploy`) use this to degrade to read-only inline
+    /// ("your token lacks the required scope") rather than treating a scope
+    /// mismatch as a fatal error.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, ApiError::Forbidden)
+    }
 }
 
 /// A `Result` over [`ApiError`].
@@ -64,7 +73,17 @@ pub type ApiResult<T> = Result<T, ApiError>;
 /// (`/api/metrics`, `/api/instance-stats`, `/api/tokens`, `/api/projects` itself,
 /// the node-ops endpoints, …) are NOT listed, so they are never rewritten. This
 /// list grows as each console stage adds a project-scoped family.
-const PROJECT_FAMILIES: &[&str] = &["/api/sites", "/api/functions", "/api/tenancy"];
+const PROJECT_FAMILIES: &[&str] = &[
+    "/api/sites",
+    "/api/functions",
+    "/api/tenancy",
+    // The GraphQL registry — subgraph schemas, the operation safelist, and the
+    // composed supergraph — is a project-owned family (see `project_scope` and
+    // `authz::Right::required`): the console's GraphQL section drives
+    // `/api/graphql/…` and it must scope to the active project exactly like the
+    // server's `/api/projects/<proj>/graphql/…` form expects.
+    "/api/graphql",
+];
 
 /// The control-plane API client. Holds the base URL, an optional bearer token,
 /// and the active project (whose non-`default` value scopes the family paths);

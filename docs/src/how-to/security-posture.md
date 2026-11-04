@@ -1,5 +1,7 @@
 # Choose & inspect a security posture
 
+**For: operators**
+
 The **security posture** is the operator's trust model, resolved at startup from
 `boatramp.cfg`. It decides defaults for hazards a site writer must not control:
 whether a public bind may run without auth, upload and component size caps,

@@ -1,5 +1,7 @@
 # Deploy a handler
 
+**For: app developers**
+
 Serve a route from an already-built WebAssembly component. A handler is a
 [function](../explanation/functions.md) reached by an HTTP route — you declare it
 in `project.cfg`, validate the manifest, then sync, and the sync step validates the

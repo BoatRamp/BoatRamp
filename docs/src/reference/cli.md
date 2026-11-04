@@ -5,6 +5,12 @@ page documents each command. Any command also prints its own flags with
 `boatramp <command> --help`, and group commands list their sub-actions with
 `boatramp <command> help`.
 
+> **Looking for the exhaustive flag list?** This page is the hand-written *guide* —
+> curated grouping, worked examples and cross-links. For the complete, always-current
+> reference of **every** command, subcommand, flag, environment variable and default,
+> see the [generated CLI reference](./cli-reference.md), which is produced from the code
+> (`cargo xtask gen-docs`) and verified against drift in CI.
+
 Precedence for any overridable value: **explicit CLI flag > environment variable > config
 file > built-in default** (one layered resolver — see [the configuration
 model](../explanation/config-model.md)). Project commands read `project.cfg`; `serve` and the
@@ -160,8 +166,13 @@ Nickel-generated config on a non-`.json` path). See
 | `--acme-cache <path>` | `./data/acme` | Certificate cache directory. |
 | `--acme-dns-provider <name>` | `manual` | DNS-01 provider (`--tls acme-dns`); see [DNS providers](./dns-providers.md). |
 | `--acme-wildcard-preview` | `false` | Also issue `*.deploy.<domain>` for by-id previews. |
-| `--acme-propagation-wait-secs <n>` | `15` | DNS-01: max seconds to wait for the `_acme-challenge` TXT to propagate before validating (a readiness poll, not a blind sleep). |
+| `--acme-propagation-wait-secs <n>` | `45` | DNS-01: max seconds to wait for the `_acme-challenge` TXT to propagate before validating (a readiness poll against the zone's authoritative nameservers, not a blind sleep). |
 | `--acme-propagation-poll-interval-secs <n>` | `2` | DNS-01: how often to re-check DNS while waiting for the TXT to propagate. |
+| `--dns-target <addr\|host>` | — | `--tls acme-dns` only: point every site's verified **custom** domains at this address via a leader-gated background reconcile loop (never the `*.deploy.<host>` preview wildcard). An IPv4/IPv6 literal becomes an A/AAAA record, anything else a CNAME — the same convention as `dns configure-domain --target`. Unset (default) disables the loop; `dns configure-domain` remains the manual, one-shot path. See [Automate DNS with a provider](../how-to/auto-dns.md). |
+| `--dns-reconcile-tick-secs <n>` | `300` | How often the `--dns-target` reconcile loop re-sweeps every site's verified custom domains. Ignored when `--dns-target` is unset. |
+| `--dns-reconcile-ttl <n>` | `300` | TTL (seconds) for the A/AAAA/CNAME records the `--dns-target` reconcile loop writes. Ignored when `--dns-target` is unset. |
+| `--dns-publish-provider <name>` | — (off) | Install a host-held DNS provider for the guest **`dns-publish` WRITE** capability (same provider grammar as `--acme-dns-provider`; `manual` for an offline proof). Unset ⇒ nothing wired ⇒ every guest `dns-publish` is `access-denied` (fail-closed). A distinct authority from `--acme-dns-provider`. Also needs the posture `allow_guest_dns_publish` + a per-handler `dns_publish_zones` allowlist. See [`serve.dns_publish`](./boatramp-cfg.md#servedns_publish). |
+| `--dns-publish-zone-root <apex>` | — | The authoritative zone apex the `--dns-publish-provider` credential writes (e.g. `example.com`). Required once `--dns-publish-provider` is set. |
 | `--http-redirect-addr <host:port>` | `BOATRAMP_HTTP_REDIRECT_ADDR` | Second listener that `308`s plain HTTP to HTTPS. |
 
 ### Uploads, serving, cluster
@@ -238,7 +249,7 @@ Migrate a pre-0.2.0 control-plane store to the project-scoped layout (mutable
 per-name records re-key under `project/<proj>/…`; no content-addressed body moves).
 The migration is online, idempotent, and resumable. `serve` refuses an unmigrated
 store unless started with [`--auto-migrate`](#boatramp-serve). See
-[Upgrade a store to project scoping](../how-to/migrate-to-projects.md).
+[Upgrade a store to project scoping](../how-to/upgrade-store-to-projects.md).
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -897,7 +908,7 @@ Generate/inspect the control-plane root key and edit the RBAC policy. See
 | `init` | Generate a fresh ES256 root keypair. |
 | `pubkey --private-key <alg:hex>` | Derive the public key from a root private key. |
 | `pin --root-pubkey <k>` | Resolve a `--tls rpk` server's TLS pin from the root anchor (prints `BOATRAMP_SERVER_PUBKEY`). |
-| `rotate-root [--add <pubkey>] [--retire <pubkey>]` | Make-before-break root rotation: trust a new anchor, or retire an old one; no flag lists the extra anchors. See [Migrate the root key](../how-to/migrate-root-key.md). |
+| `rotate-root [--add <pubkey>] [--retire <pubkey>]` | Make-before-break root rotation: trust a new anchor, or retire an old one; no flag lists the extra anchors. See [Rotate the root key](../how-to/rotate-root-key.md). |
 | `policy get` | Print the active RBAC policy as JSON (the built-in default if none is stored). |
 | `policy set <file.json>` | Replace the policy from a JSON file (validated server-side). |
 
@@ -927,7 +938,7 @@ Manage Firecracker microVM compute workloads. See
 | `get <name>` | Print one workload's desired state as JSON. |
 | `set <name> …` | Create/update a workload from already-pushed rootfs/kernel blobs. |
 | `build <name> …` | Build an ext4 rootfs from an OCI image, upload it, and set the workload (needs `mke2fs`). |
-| `rm <name>` | Remove a workload (its replicas are stopped). Its persistent volume is left on disk — reclaim it with `compute volume rm`. |
+| `rm <name>` | Remove a workload (its replicas are stopped). When `<name>` backs a managed-SQL dependency another workload still declares (a project-declared or node-static `sql` binding), the dependency is **drained** first — its replicas are marked unhealthy so the serve-time gate shields new requests with a retryable `503`, and a short grace window lets in-flight work finish — before it is actually removed (PLAN-managed-dependency-readiness WS5). Prints the drained binding name(s), if any. Its persistent volume is left on disk — reclaim it with `compute volume rm`. |
 | `reap [<workload> --replica <n>] [--execute] [--reclaim-volumes] [--grace-secs <n>]` | Reap **orphaned** replicas — a replica with NO desired workload AND no live container that the reconcile plane ignores. Destructive + node-global; System·Admin. **Dry-run by default** (reports what it *would* reap); `--execute` actually reaps. Fail-closed — never reaps a replica that is live or part of a desired spec, even one named explicitly (reported `skipped` with the reason). Name a `<workload>` + `--replica` to target one; omit both to scan every project. `--reclaim-volumes` also frees the orphan's stranded volume staging (PGDATA). See [Reap stranded replicas](../how-to/node-health-alerting.md#reap-stranded-replicas). |
 | `exec <name> -- <cmd…>` | Run a command inside a running workload replica (docker-exec style) — e.g. pipe a SQL file into `psql`, or run `pg_dump`. `--stdin` feeds this process's stdin to the command. Requires the `allow_compute_exec` posture; container + docker backends only. |
 | `registry-auth set <name> --username <u> (--password-stdin \| --password <p>) [--operator]` | Seal (or rotate) a registry pull credential for private `image(…)` workloads. Project-scoped (referenced from `compute set --pull-secret <name>`) unless `--operator`, which sets the node-wide `[compute].registry_auth` host-map credential (System·Admin). The password is sealed server-side and never echoed; prefer `--password-stdin` so it never hits argv/history. |
@@ -968,6 +979,10 @@ Manage Firecracker microVM compute workloads. See
 | `--startup-grace-secs <n>` | `30` | Seconds a freshly launched replica has to become healthy before a still-unhealthy one is treated as a broken launch (stop + relaunch). Raise it for a slow-initializing image (a stock database's first `initdb`). Managed databases use a larger per-engine default (Postgres 60, MySQL 120). |
 | `--isolation <trusted\|untrusted>` | `trusted` | `untrusted` forces a microVM (never a shared kernel). |
 | `--region <name>` | — | Allowed placement region (repeatable; empty = any). |
+| `--bind <kind>[:<name>]` | — | Managed binding the workload depends on (repeatable): `sql`/`sql:<name>` the site database (or a named external DB); `kv`/`kv:<name>` the site key/value store (or one named bucket); `blob`/`blob:<name>` the site blob store (or one named container); `messaging`/`messaging:<topic>` the project bus — BOTH halves, publish AND consume. The endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` / `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). A bare `kv`/`blob` (no `:<name>`) is **site-wide**; a bare `messaging` is **project-bus-wide** — name a target to confine it. `invoke` (compute→function) is declared only — it parses and round-trips but injects no env yet (Phase 3). `set`/`build`. |
+| `--writable-root` | `false` | Allow a writable root filesystem (single-tenant posture only; the hardened read-only root is the default). Prefer a persistent volume for app writes. `set`/`build`. |
+| `--cap-add <CAP>` | — | Add back a Linux capability on the shared-kernel backends (docker / native container), without the `CAP_` prefix, e.g. `CHOWN` (repeatable; single-tenant posture only). `set`/`build`. |
+| `--user <uid[:gid]>` | — | Run the entrypoint as this user instead of the backend default, so a stock image can run rootless against a pre-owned volume. Honored under any posture. `set`/`build`. |
 
 ### The kernel blob
 

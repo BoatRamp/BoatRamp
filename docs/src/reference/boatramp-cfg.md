@@ -63,6 +63,8 @@ Top-level sections, all optional:
 | `kv` | table | — | Control-plane SlateDB KV durability cadence + shutdown budget. See [`serve.kv`](#servekv). |
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
 | `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
+| `dns_publish` | table | — (off) | Host-held DNS provider backing the guest **`dns-publish` WRITE** capability (cap-req #24/#25). **Absent ⇒ no provider is wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed). See [`serve.dns_publish`](#servedns_publish). |
+| `dns_providers` | list | `[]` | A per-zone DNS provider **list** (cap-req #27): N providers, each a `type:value`-pointer-sourced identity + credential, routed by longest-suffix `zone_root` for BOTH ACME DNS-01 and guest `dns-publish`. Empty ⇒ the single env-seeded provider path, unchanged. `acme-dns` feature. See [`serve.dns_providers`](#servedns_providers). |
 | `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
 | `sandbox` | table | — | The whole-process OS sandbox (seccomp-bpf + Landlock; privsep Phase 0). See [`serve.sandbox`](#servesandbox). |
 
@@ -412,7 +414,7 @@ replicated cert).
 | `max_inflight` | int | `4` | Max concurrent in-flight issuances (global). |
 | `negative_ttl_secs` | int | `300` | How long a refused/failed SNI is negatively cached. |
 | `rate_limit_per_hour` | int | `50` | Max CA orders per rolling hour (the account rate-limit floor). `0` ⇒ unlimited. |
-| `propagation_wait_secs` | int | `15` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll (resolve the record, confirm the value), not a blind sleep. Issuance proceeds as soon as the record resolves; if this elapses first it proceeds anyway (the CA retries). Ignored for `tls-alpn-01`. |
+| `propagation_wait_secs` | int | `45` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll against the zone's **authoritative** nameservers (resolve the record, confirm the value), not a blind sleep. Issuance proceeds as soon as the record resolves; if this elapses first it proceeds anyway (the CA retries). Ignored for `tls-alpn-01`. |
 | `propagation_poll_interval_secs` | int | `2` | DNS-01 only: how often to re-check DNS while waiting for the TXT to propagate. |
 
 ### `serve.alerts`
@@ -533,6 +535,10 @@ Override knobs (byte caps: `0` = unlimited):
 | `allow_site_private_upstreams` | Let a site's gateway target private IPs. |
 | `allow_guest_private_egress` | Let a handler guest's outbound `wasi:http` reach private/loopback IPs. Off under `multi-tenant` (the SSRF default — guests reach only public hosts); on under `single-tenant`/`dev`. A guest calling its own site or a sibling function uses the capability-gated `invoke` binding instead, which is unaffected by this knob. |
 | `allow_guest_self_egress` | Let a handler guest's outbound `wasi:http` reach **this instance's own serve socket** (loopback on the serve port) even when `allow_guest_private_egress` is off — a much tighter grant, exposing only boatramp's own front door (which re-applies host routing + auth + rate-limit). Self-recursion is depth-capped. On by default in every posture. |
+| `allow_guest_tcp_egress` | Permit a guest's gated `wasi:sockets` capability to open a host-mediated outbound TCP `connect` (`tcp-egress`), and a guest's `dns-resolve` capability to resolve MX/addresses. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. Also needs a non-empty per-handler `egress_allowlist` (connect) — `dns-resolve` needs only this posture. |
+| `allow_guest_tcp_listener` | Permit a host-owned inbound-TCP **listener** (`[serve.listeners.<name>]`) to dispatch an accepted connection to a guest. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. Independent of `allow_guest_tcp_egress` (inbound ≠ outbound). |
+| `allow_guest_dns_publish` | Permit a guest's `dns-publish` capability to WRITE DNS records through a host-held provider credential (cap-req #24). **Off in every built-in profile** — a new, security-sensitive zone-write surface; an operator opts in explicitly. Also needs a non-empty per-handler `dns_publish_zones` writable-zone allowlist. Independent of the egress knobs (DNS write is a distinct authority). |
+| `guest_dns_publish_ns` | Posture for a guest's **sub-zone `NS` delegation** via `dns-publish` (Security review MEDIUM-3): `none` (refuse all sub-zone NS, the `multi-tenant` default), `allowlist` (only an NS target on the per-handler `dns_publish_ns_targets` allowlist, the `single-tenant` default), or `any` (today's behavior, the `dev` default). |
 | `max_handler_blob_bytes` | Per-handler blobstore write cap. |
 | `max_component_bytes` | Wasm component size cap. |
 | `oidc_require_audience` | Require an `aud` claim on OIDC exchange. |
@@ -700,6 +706,95 @@ a test MX at a local sink) is still dropped by the SSRF floor unless the operato
 turns on `allow_guest_private_egress` (dev/single-tenant) — so the override can be
 neither a cross-tenant escalation nor a private-IP oracle. Takes effect only on a build
 with the `tcp-egress` resolver compiled in.
+
+### `serve.dns_publish`
+
+The WRITE counterpart to `dns-resolve`: the host-held DNS provider that performs a
+granted guest's `dns-publish` mutations (cap-req #24/#25). The guest never holds a
+zone-write token — it only NAMES records; the host writes them through this
+operator-configured, host-held credential. **Absent (the default) ⇒ no provider is
+wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed; compiling the
+capability in grants no one by itself). This is the config-file form of the
+`--dns-publish-provider` / `--dns-publish-zone-root` flags (and `BOATRAMP_DNS_PUBLISH_PROVIDER`
+/ `BOATRAMP_DNS_PUBLISH_ZONE_ROOT`); **flag/env win** over the block.
+
+- **`provider`** — which provider adapter writes guest DNS: the same grammar as
+  `--acme-dns-provider` (`manual` | `cloudflare` | `route53` | `oci` | `digitalocean` |
+  `hetzner` | `ns1` | `dnsimple` | `gcp-dns` | `azure-dns` | `akamai`). `manual` installs
+  the credential-free Manual provider (records/echoes the intended writes — an offline
+  proof). Absent ⇒ fail-closed.
+- **`zone_root`** — the authoritative zone apex the credential writes (e.g.
+  `example.com`), passed to the central `validate_writable` guardrail so an apex `NS` is
+  refused. Required once `provider` is set.
+
+**Credentials are never in config** — they come from the environment, via the SAME
+per-provider env vars `--acme-dns-provider` reads (see `boatramp dns --help`), the
+established "no secrets in config" posture. Two further gates still bound every write:
+the node posture `allow_guest_dns_publish` (off in every built-in profile) and the
+per-handler `dns_publish_zones` writable-zone allowlist (empty ⇒ deny-all). This block
+is a DISTINCT authority from `--acme-dns-provider`, which configures the DNS credential
+for ACME **certificate issuance** only. Takes effect on a build with both the
+`dns-publish` and `acme-dns` features compiled in.
+
+```ron
+// Operator opt-in. Credentials come from the environment, never here.
+serve: (
+    dns_publish: (
+        provider: "cloudflare",        // or "manual" for an offline proof
+        zone_root: "example.com",      // the apex the credential is authoritative over
+    ),
+)
+```
+
+### `serve.dns_providers`
+
+A **list** of per-zone managed-DNS providers (cap-req #27). Generalizes the single
+env-seeded provider (one `CLOUDFLARE_ZONE_ID`/`CLOUDFLARE_API_TOKEN` per process ⇒ one
+zone) into N per-zone providers, each with its OWN `type:value` pointer-sourced identity +
+credential. **Both** the ACME DNS-01 cert issuer (`--tls acme-dns`) **and** the guest
+`dns-publish` capability route to the provider whose `zone_root` is the **longest
+label-boundary suffix** of the record's / certificate's owner name — so a single-tenant
+serve authoritative for several domains in **different** zones can manage DNS / issue
+per-SNI TLS for all of them. **Empty (the default) ⇒ the single env-seeded provider path is
+used unchanged** (`--acme-dns-provider` / `--dns-publish-provider` + the single
+`zone_root`) — full backward-compat; a single provider is a list of one.
+
+Each entry:
+
+- **`name`** — an operator label (diagnostics / boot log; not a credential).
+- **`kind`** — a quoted string, the SAME grammar + aliases as `--acme-dns-provider`
+  (`"manual"` | `"cloudflare"` | `"route53"` | `"oci"` | `"digitalocean"`/`"do"` |
+  `"hetzner"` | `"ns1"` | `"dnsimple"` | `"gcp-dns"`/`"gcp"` | `"azure-dns"`/`"azure"` |
+  `"akamai"`). It is a string (not a bare enum) so a hyphenated kind is expressible.
+- **`zone_root`** — the authoritative zone apex (e.g. `mailroom.pro`): the routing key AND
+  the apex passed to the `validate_writable` guardrail (so an apex `NS` is refused).
+- **per-kind fields** — each a `type:value` pointer (literal, `env:VAR`, `boatramp:NAME`),
+  resolved independently at startup against the control-plane KV + `[secrets]` envelope. A
+  **secret** field (`token`/`api_key`/`access_token`/`client_token`/`client_secret`) MUST
+  be a `env:`/`boatramp:` ref — a plaintext literal is refused (no secrets in config). A
+  `boatramp:` ref with no `[secrets]` envelope is a fail-closed startup error. The full
+  per-kind field table is in [DNS providers & credentials](dns-providers.md#per-kind-config-fields).
+
+Routing is per-record: no configured zone authoritative for a name ⇒ fail-closed (ACME
+skips that name; `dns-publish` returns access-denied). A duplicate `zone_root` is refused at
+startup. Only usable on a build with the `acme-dns` feature (a non-empty list without it is
+a logged no-op). For guest `dns-publish` over the registry, set `--dns-publish-provider
+list` (or `[serve.dns_publish].provider = "list"`); the posture `allow_guest_dns_publish` +
+the per-handler `dns_publish_zones` allowlist still gate every write.
+
+```ron
+// Two Cloudflare zones from one serve. Tokens sealed in [secrets]; zone ids are literals.
+serve: (
+    dns_providers: [
+        ( name: "mailroom-pro", kind: "cloudflare", zone_root: "mailroom.pro",
+          zone_id: "741f56…", token: "boatramp:CF_TOKEN_MAILROOM_PRO" ),
+        ( name: "cariello", kind: "cloudflare", zone_root: "cariello.name",
+          zone_id: "a1b2c3…", token: "boatramp:CF_TOKEN_CARIELLO" ),
+    ],
+    // Opt guest dns-publish into the same registry (still posture + allowlist gated):
+    dns_publish: ( provider: "list" ),
+)
+```
 
 ### Memory ceilings per lane
 
@@ -897,6 +992,9 @@ differs by backend — the environment difference lives behind the backend.
 | `sql_shim_url` | url | — | Guest-reachable base URL of the compute **sql-shim** — set ⇒ a workload's `--bind sql` reaches the managed database through a listener bound on `0.0.0.0:<port>`. Use the address the *guest* reaches the host at: the compute bridge gateway for the native container backend (`http://10.0.0.1:8081`), the docker bridge gateway for rootful docker (`http://172.17.0.1:8081`), or `http://host.containers.internal:8081` for rootless podman. `None` ⇒ compute sql bindings off. |
 | `blob_shim_url` | url | — | Guest-reachable base URL of the compute **blob-shim** — set ⇒ a workload's `--bind blob` reaches the SAME per-site `hblob/{site}/…` blob namespace a `wasi:blobstore` handler sees, through a listener bound on the host:port this URL names (the bridge gateway / loopback, not all interfaces). Same address convention as `sql_shim_url` (e.g. `http://10.0.0.1:8082`). `None` ⇒ compute blob bindings off. |
 | `messaging_shim_url` | url | — | Guest-reachable base URL of the compute **messaging-shim** — set ⇒ a workload's `--bind messaging` reaches BOTH halves of the SAME `{project}/bus/<topic>` project bus a `wasi:messaging` handler sees: `POST /publish/{topic}` to publish, and `POST /claim/{topic}` + `POST /ack` + `POST /nack` to consume (lease a batch, delete on success, redeliver — immediately or after a `delay_ms` backoff — on failure), through a listener bound on the host:port this URL names (the bridge gateway / loopback, not all interfaces). Same address convention as `sql_shim_url` (e.g. `http://10.0.0.1:8083`). `None` ⇒ compute messaging bindings off. |
+| `kv_shim_url` | url | — | Guest-reachable base URL of the compute **kv-shim** — set ⇒ a workload's `--bind kv` reaches the SAME per-site `hkv/{site}/…` key/value namespace a `wasi:keyvalue` handler sees: `GET`/`PUT`/`DELETE` on `/{key}` (the default bucket) or `/b/{bucket}/{key}` (a named one), through a listener bound on the host:port this URL names (the bridge gateway / loopback, not all interfaces). Same address convention as `sql_shim_url` (e.g. `http://10.0.0.1:8084`). `None` ⇒ compute kv bindings off. |
+| `blob_shim_max_object_bytes` | integer | — | Per-object `PUT` ceiling (bytes) for the compute blob-shim — a compromised/buggy workload gets `413` on an oversize `PUT` instead of exhausting node/bucket storage. `None` (default) ⇒ the shim's built-in default (5 GiB, S3's single-PUT limit); `0` ⇒ unlimited. |
+| `kv_shim_max_value_bytes` | integer | — | Per-value `PUT` ceiling (bytes) for the compute kv-shim — the direct analogue of `blob_shim_max_object_bytes`, sized for small KV values. `None` (default) ⇒ the shim's built-in default (1 MiB); `0` ⇒ unlimited. |
 | `docker_endpoint` | `published` \| `bridge` | `published` | How the remote-Docker backend reports a workload's reachable endpoint. `published` publishes the container port on `127.0.0.1:<ephemeral>` and routes there, so a host-native `serve` reaches it on any daemon — including Docker Desktop / macOS, where the container bridge IP is not host-routable. `bridge` routes to the container bridge IP directly; only reachable when `serve` shares the daemon's network (e.g. `serve` itself runs in a container on the same Docker bridge). |
 | `docker_volume_mode` | `named` \| `bind` | `named` | How the remote-Docker backend backs a workload's persistent volumes. `named` attaches a daemon-managed `docker volume` by name (portable — works with a remote daemon and Docker Desktop / macOS). `bind` bind-mounts a host directory under `<data_dir>/compute/volumes/<name>` (matches the native-container layout, local daemon only). Docker volumes are node-local and outside the blob-snapshot durability story (consistent with the docker backend's no scale-to-zero); named volumes survive restarts but not cross-node migration. |
 | `region` | string | — | This node's region tag (FA-8). Advertised on the node so a gateway routing to a `compute:`-backed workload with `--lb nearest` sends each request to the nearest replica by its node's region — no manual `--region` map. See [Route to the nearest region](../how-to/gateway.md#route-to-the-nearest-region). |

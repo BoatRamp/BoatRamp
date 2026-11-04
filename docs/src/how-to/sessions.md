@@ -1,5 +1,7 @@
 # Build a duplex agent session (SSE + resume)
 
+**For: app developers**
+
 A **session** is a long-lived, resumable, bidirectional channel between a client and a
 WebAssembly guest — the primitive for streaming agent UIs (AG-UI, chat, tool-call
 streams). The client opens an [SSE] stream to receive frames and `POST`s frames back

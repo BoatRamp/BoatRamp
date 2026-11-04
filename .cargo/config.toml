@@ -98,3 +98,12 @@ rustflags = [
   "-C",
   "link-args=/DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA",
 ]
+# Workspace cargo aliases.
+#
+# `cargo xtask …` runs the dev-tool runner crate (crates/xtask). Its one task today is
+# `gen-docs` — regenerate the generated reference pages (docs/src/reference/cli-reference.md
+# from boatramp's clap tree) and, with `--check`, fail on drift (the CI docs-drift gate).
+#   cargo xtask gen-docs            # regenerate in place
+#   cargo xtask gen-docs --check    # verify committed pages match the code (nonzero on drift)
+[alias]
+xtask = "run -p xtask --"

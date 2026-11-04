@@ -659,6 +659,7 @@ mod tests {
             kind: BindingKind::Sql,
             name: String::new(),
             url_env: None,
+            migration_url_env: None,
         }];
 
         let env = resolver.resolve("acme", "api", 0, &bindings).await;

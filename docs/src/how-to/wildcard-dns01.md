@@ -1,5 +1,7 @@
 # Wildcard certs with DNS-01
 
+**For: operators**
+
 Issue a `*.example.com` certificate by proving control of the domain through a
 DNS TXT record instead of an HTTP path.
 
@@ -43,6 +45,13 @@ see [DNS providers & credentials](../reference/dns-providers.md); for pointing
 custom domains at your server see
 [Automate DNS with a provider](./auto-dns.md).
 
+> **Several zones from one serve?** `--acme-dns-provider` + the env vars drive a
+> **single** zone. To issue wildcards across domains in **different** zones from one
+> `serve`, declare a `[serve.dns_providers]` **list** instead — one entry per zone, each
+> with its own sealed `token`/`boatramp:…` credential; issuance routes by the
+> certificate's longest-suffix `zone_root`. See
+> [`serve.dns_providers`](../reference/boatramp-cfg.md#servedns_providers).
+
 ## Add preview subdomains
 
 To serve by-id preview deployments over HTTPS, add `--acme-wildcard-preview`. It
@@ -74,23 +83,33 @@ acme: _acme-challenge.example.com observed; validating
 acme: certificate issued (expires 2026-10-07)
 ```
 
-The wait is a real readiness poll, not a fixed sleep:
+The wait is a real readiness poll, not a fixed sleep. The check queries the
+zone's **authoritative** nameservers directly (finding the zone apex and its NS
+set, following a CNAME-delegated `_acme-challenge` to the zone that serves it),
+so a recursive resolver's negative cache can't make a freshly-written record keep
+reading as "not live" — issuance confirms readiness promptly instead of leaning
+on the CA's retry. If authoritative discovery can't run (NS unreachable, no SOA),
+it falls back to the recursive resolver, then to a blind wait, so it is never
+worse than a recursive-only check.
 
 - `--acme-propagation-wait-secs` (env `BOATRAMP_ACME_PROPAGATION_WAIT`, default
-  `15`) is the **maximum** time to wait. Issuance proceeds the instant the record
-  resolves; if the wait elapses first, boatramp logs a warning and tells the CA to
-  validate anyway (the CA retries on its own), so a slow-propagating zone still
-  gets a cert rather than crashing.
+  `45`) is the **maximum** time to wait. Issuance proceeds the instant the record
+  is observed at the authoritative nameservers; if the wait elapses first, boatramp
+  logs a warning and tells the CA to validate anyway (the CA retries on its own),
+  so a slow-propagating zone still gets a cert rather than crashing.
 - `--acme-propagation-poll-interval-secs` (env
   `BOATRAMP_ACME_PROPAGATION_POLL_INTERVAL`, default `2`) is how often it
   re-checks DNS.
-- `BOATRAMP_ACME_PROPAGATION_RESOLVER` overrides the resolver used for the check
-  with a comma-separated `ip[:port]` list (UDP) — useful when the container's own
-  resolver caches negative answers aggressively; e.g.
-  `BOATRAMP_ACME_PROPAGATION_RESOLVER=1.1.1.1,8.8.8.8`.
+- `BOATRAMP_ACME_PROPAGATION_RESOLVER` overrides the recursive resolver used for
+  zone/NS discovery and the fallback check with a comma-separated `ip[:port]` list
+  (UDP) — useful when the container's own resolver caches negative answers
+  aggressively; e.g. `BOATRAMP_ACME_PROPAGATION_RESOLVER=1.1.1.1,8.8.8.8`.
 
-For the on-demand per-SNI issuer, the same knobs live under
-`[serve.on_demand_tls]` as `propagation_wait_secs` / `propagation_poll_interval_secs`.
+These same propagation knobs apply to the on-demand per-SNI issuer when it uses
+the DNS-01 challenge, as `propagation_wait_secs` / `propagation_poll_interval_secs`
+under `[serve.on_demand_tls]` — see [Issue certificates on-demand](./on-demand-tls.md)
+for issuing a certificate per verified domain at the first handshake, instead of
+enumerating every name here.
 
 ## Publish the TXT record by hand
 

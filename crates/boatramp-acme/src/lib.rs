@@ -14,8 +14,15 @@
 
 pub mod dns;
 
+/// Multi-zone DNS provider routing (cap-req #27). Always compiled — it only uses the base `dns`
+/// module, so a lean build that pulls no provider adapters still has the registry type available.
+pub mod routing;
+
 #[cfg(feature = "acme")]
 pub mod acme;
+
+#[cfg(feature = "acme")]
+pub mod authoritative;
 
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
@@ -49,9 +56,11 @@ pub mod akamai;
 
 pub use dns::{
     CaaTag, DnsError, DnsOp, DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,
-    RecordKindTag, SvcParam, TxtResolver, acme_challenge_name, canonicalize_owner_name,
-    dns01_txt_value, domain_record, preview_record, preview_wildcard, validate_writable,
+    RecordKindTag, SvcParam, TxtResolver, ZoneResolution, acme_challenge_name,
+    canonicalize_owner_name, dns01_txt_value, domain_record, preview_record, preview_wildcard,
+    validate_writable,
 };
+pub use routing::{RoutingBuildError, RoutingDnsProvider};
 
 /// Seconds since the Unix epoch, for the request-signing timestamps the OCI and
 /// Akamai DNS providers stamp into their auth headers. (This crate is standalone,

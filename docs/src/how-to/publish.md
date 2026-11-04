@@ -1,5 +1,7 @@
 # Publish, roll back, and alias a site
 
+**For: operators & app developers**
+
 Every publish is an immutable **deployment**: `boatramp sync` uploads a folder's
 blobs, records a manifest, and activates the **site** to point at it. Activation
 is a pointer flip, so switching between deployments is instant. This page covers

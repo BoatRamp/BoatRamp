@@ -60,7 +60,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use base64::Engine as _;
 use boatramp_core::blob_backends::BlobBackends;
-use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
+use boatramp_core::compute::{
+    BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution,
+};
 use boatramp_core::project::{ProjectRef, validate_key_segment, validate_object_key};
 use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
 use futures::StreamExt as _;
@@ -195,7 +197,34 @@ pub struct BlobShimResolver {
     shim: BlobShim,
     base_url: String,
     secret: [u8; 32],
+    /// The optional **direct-S3 STS minter** (PLAN-compute-managed-resources Phase 3) + its
+    /// lease TTL (seconds). `Some` ⇒ a `--bind blob:<container>` ALSO gets short-lived
+    /// `TempCredentials` so an off-the-shelf S3 client talks DIRECTLY to R2/Tigris (`AWS_*` env
+    /// plus `{{blob.*}}` STS vars), KEEPING the HMAC shim as the full-R/W fallback. `None` (always,
+    /// in a build without `blob-upload`, or on a backend with no real STS) ⇒ the HMAC shim only.
+    /// Feature-gated because `boatramp_handlers` (the `BlobUploadMinter` seam) is an optional dep.
+    #[cfg(feature = "blob-upload")]
+    blob_minter: Option<(
+        Arc<dyn boatramp_handlers::BlobUploadMinter>,
+        u64,
+        Option<u64>,
+    )>,
 }
+
+/// The direct-S3 STS minter slot [`spawn_blob_shim`] takes:
+/// `Some((minter, max_ttl_secs, max_bytes_ceiling))` wires direct-to-R2/Tigris
+/// `TempCredentials`; `None` (and the always-`()` variant without the `blob-upload` feature) ⇒
+/// the HMAC shim only. `max_bytes_ceiling` is the operator per-object size ceiling (the SAME
+/// one the guest mint path clamps to). Keeps the node's call site feature-independent.
+#[cfg(feature = "blob-upload")]
+pub type BlobMintSlot = Option<(
+    Arc<dyn boatramp_handlers::BlobUploadMinter>,
+    u64,
+    Option<u64>,
+)>;
+/// See the feature-on variant: without `blob-upload` there is no minter type, so the slot is unit.
+#[cfg(not(feature = "blob-upload"))]
+pub type BlobMintSlot = ();
 
 impl BlobShimResolver {
     /// `base_url` is the shim URL reachable from the guest; `secret` is a per-node random
@@ -211,7 +240,22 @@ impl BlobShimResolver {
             shim,
             base_url,
             secret,
+            #[cfg(feature = "blob-upload")]
+            blob_minter: None,
         }
+    }
+
+    /// Attach the direct-S3 STS minter + its lease TTL + the operator per-object size ceiling.
+    /// Builder used by [`spawn_blob_shim`].
+    #[cfg(feature = "blob-upload")]
+    pub fn with_blob_minter(
+        mut self,
+        minter: Option<Arc<dyn boatramp_handlers::BlobUploadMinter>>,
+        max_ttl_secs: u64,
+        max_bytes_ceiling: Option<u64>,
+    ) -> Self {
+        self.blob_minter = minter.map(|m| (m, max_ttl_secs, max_bytes_ceiling));
+        self
     }
 
     /// A deterministic, unguessable bearer token for one `(project, workload, replica,
@@ -307,6 +351,57 @@ impl ComputeBindingResolver for BlobShimResolver {
         env
     }
 
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        // PLAN-compute-managed-resources Phase 3: contribute the `{{blob.*}}` namespace. TWO layers:
+        //   (1) the HMAC shim (always) — `{{blob.url}}`/`{{blob.token}}` + the back-compat
+        //       `BOATRAMP_BLOB_URL`(+`_AUTH_TOKEN`) defaults — the registry-backed bearer `resolve`
+        //       mints, revoked-on-stop via `release`; the full R/W namespace.
+        //   (2) direct-S3 STS (a `--bind blob:<container>` + a wired minter) — real
+        //       `TempCredentials` an off-the-shelf S3 client uses to talk DIRECTLY to R2/Tigris,
+        //       surfaced as `{{blob.endpoint/region/bucket/access_key/secret/session_token/prefix}}`
+        //       + `AWS_*` defaults. STS creds are stateless-verifiable (cannot be actively revoked),
+        //       so they LET-EXPIRE at the lease TTL; the HMAC token is the revoke-on-stop fallback.
+        let mut out = SurfaceContribution::default();
+        let blob_bindings: Vec<&ComputeBinding> = bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Blob)
+            .collect();
+        let single = blob_bindings.len() == 1;
+        for binding in blob_bindings {
+            let Some(scope) = self.scope(project, workload, binding) else {
+                continue;
+            };
+            let token = self.token(project, workload, replica, binding);
+            self.shim.register(&token, scope).await;
+            let url_env = binding.url_env();
+            out.defaults.push((url_env.clone(), self.base_url.clone()));
+            out.defaults
+                .push((format!("{url_env}_AUTH_TOKEN"), token.clone()));
+            if binding.name.is_empty() || single {
+                out.vars
+                    .insert("blob.url".to_string(), self.base_url.clone());
+                out.vars.insert("blob.token".to_string(), token.clone());
+            }
+            if !binding.name.is_empty() {
+                out.vars
+                    .insert(format!("blob.{}.url", binding.name), self.base_url.clone());
+                out.vars
+                    .insert(format!("blob.{}.token", binding.name), token.clone());
+            }
+            #[cfg(feature = "blob-upload")]
+            self.contribute_blob_sts(project, workload, binding, single, &mut out)
+                .await;
+        }
+        out
+    }
+
     async fn release(
         &self,
         project: &str,
@@ -324,6 +419,133 @@ impl ComputeBindingResolver for BlobShimResolver {
     }
 }
 
+#[cfg(feature = "blob-upload")]
+impl BlobShimResolver {
+    /// Mint direct-S3 `TempCredentials` for a `--bind blob:<container>` and contribute the
+    /// `{{blob.*}}` STS vars + `AWS_*` default env, so an off-the-shelf S3 client talks DIRECTLY
+    /// to R2/Tigris. A bare `--bind blob` (no container) stays HMAC-only; so does any backend with
+    /// no real STS minter wired, a mint failure, or a presigned-only return — all FALL BACK to the
+    /// HMAC shim (never panic). NEVER logs the minted secret / session token (a `TempCredentials`
+    /// is read field-by-field into the var/default maps, never `{:?}`-printed).
+    async fn contribute_blob_sts(
+        &self,
+        project: &str,
+        workload: &str,
+        binding: &ComputeBinding,
+        single: bool,
+        out: &mut SurfaceContribution,
+    ) {
+        use boatramp_handlers::{
+            MintScope, MintedCredentials, TempCredentials, UploadConstraints, UploadPerm,
+            UploadTarget, screen_upload_target,
+        };
+        let Some((minter, max_ttl_secs, max_bytes_ceiling)) = &self.blob_minter else {
+            return;
+        };
+        // Posture-off kill switch: a `0` TTL ceiling disables direct-S3 minting entirely — mirror
+        // the guest mint path's guard (bindings/blob_upload.rs) so this path fails closed to the
+        // HMAC shim regardless of the upstream `set_blob_upload_minting` 0-ceiling drop, rather than
+        // relying on that invariant (LOW-1, security review).
+        if *max_ttl_secs == 0 {
+            return;
+        }
+        // Direct-S3 needs a concrete container to scope the credential to; a bare `--bind blob`
+        // (no container) stays HMAC-only.
+        if binding.name.is_empty() {
+            return;
+        }
+        let target = UploadTarget::Prefix(String::new()); // the whole container (no sub-prefix)
+        // Defense-in-depth: screen the container/target the SAME way the guest/operator mint path
+        // does, even though `scope` already validated the container name. A refusal ⇒ HMAC-only.
+        if let Err(e) = screen_upload_target(&binding.name, &target) {
+            tracing::warn!(
+                %project, %workload, container = %binding.name, error = ?e,
+                "blob binding: direct-S3 scope screen refused; falling back to the HMAC shim"
+            );
+            return;
+        }
+        let scope = MintScope {
+            project: project.to_string(),
+            // The SITE is host-forced to the workload name — the SAME per-site identity the shim's
+            // `hblob/{qualified-site}/` prefix + a `wasi:blobstore` handler use (never guest-named).
+            site: workload.to_string(),
+            container: binding.name.clone(),
+            target,
+            // Direct-S3 is WRITE-scoped (PUT + multipart); the HMAC shim covers reads (GET).
+            perms: vec![UploadPerm::Put, UploadPerm::Multipart],
+            // Clamp per-object size to the operator ceiling (the SAME ceiling the guest mint
+            // path applies) so a compromised/greedy replica cannot write unbounded objects on
+            // the direct-S3 path. `None` ⇒ no operator ceiling configured (unbounded, as before).
+            constraints: UploadConstraints {
+                max_bytes: *max_bytes_ceiling,
+                ..UploadConstraints::default()
+            },
+            // Leased to the replica by a generous wall-clock TTL (the operator ceiling): off-the-
+            // shelf apps read creds once at startup, so a short TTL would break them. A relaunch
+            // mints fresh creds; the creds LET-EXPIRE on stop — an STS lease CANNOT be actively
+            // revoked, so the operator `max_ttl_secs` ceiling IS the containment window: keep it
+            // short. (revoke-on-stop cuts the HMAC token + the dynamic DB role, not this lease.)
+            ttl_secs: *max_ttl_secs,
+        };
+        let creds: TempCredentials = match minter.mint(&scope).await {
+            Ok(MintedCredentials::TempCredentials(t)) => t,
+            Ok(MintedCredentials::PresignedPut(_)) => {
+                tracing::warn!(
+                    %project, %workload, container = %binding.name,
+                    "blob binding: minter returned a presigned PUT (not temp credentials); \
+                     direct-S3 env not injected (the HMAC shim still works)"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %project, %workload, container = %binding.name, error = %e,
+                    "blob binding: direct-S3 credential mint failed; falling back to the HMAC shim"
+                );
+                return;
+            }
+        };
+        // STS template vars (bare + named mirror the HMAC convention). The `prefix` is empty — the
+        // credential is scoped to the whole container (the `bucket`).
+        let mut put_vars = |ns: &str| {
+            out.vars
+                .insert(format!("{ns}.endpoint"), creds.endpoint.clone());
+            out.vars
+                .insert(format!("{ns}.region"), creds.region.clone());
+            out.vars
+                .insert(format!("{ns}.bucket"), creds.bucket.clone());
+            out.vars
+                .insert(format!("{ns}.access_key"), creds.access_key_id.clone());
+            out.vars
+                .insert(format!("{ns}.secret"), creds.secret.clone());
+            out.vars
+                .insert(format!("{ns}.session_token"), creds.session_token.clone());
+            out.vars.insert(format!("{ns}.prefix"), String::new());
+        };
+        if single {
+            put_vars("blob");
+        }
+        put_vars(&format!("blob.{}", binding.name));
+        // The `AWS_*` convention defaults so a stock S3 client Just Works — only for the SINGLE
+        // blob binding (multiple would make the unqualified `AWS_*` ambiguous; the operator then
+        // templates the named `{{blob.<container>.*}}` vars into whatever env each client reads).
+        if single {
+            out.defaults
+                .push(("AWS_ENDPOINT_URL".to_string(), creds.endpoint.clone()));
+            out.defaults
+                .push(("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id.clone()));
+            out.defaults
+                .push(("AWS_SECRET_ACCESS_KEY".to_string(), creds.secret.clone()));
+            out.defaults
+                .push(("AWS_SESSION_TOKEN".to_string(), creds.session_token.clone()));
+            out.defaults
+                .push(("AWS_REGION".to_string(), creds.region.clone()));
+            out.defaults
+                .push(("BOATRAMP_BLOB_BUCKET".to_string(), creds.bucket.clone()));
+        }
+    }
+}
+
 /// Activate the compute blob-shim: bind its listener and build the resolver to hand the
 /// compute reconcile. `shim_url` is the guest-reachable base URL (e.g.
 /// `http://10.0.0.1:8082`, or the docker bridge gateway); the shim binds the **host:port the
@@ -336,6 +558,7 @@ pub async fn spawn_blob_shim(
     blob: Option<Arc<dyn BlobBackends>>,
     shim_url: Option<String>,
     max_object_bytes: Option<u64>,
+    mint_slot: BlobMintSlot,
 ) -> Option<Arc<dyn ComputeBindingResolver>> {
     let blob = blob?;
     let base_url = shim_url?;
@@ -370,9 +593,20 @@ pub async fn spawn_blob_shim(
             return None;
         }
     }
-    Some(Arc::new(BlobShimResolver::new(
-        blob, shim, base_url, secret,
-    )))
+    let resolver = BlobShimResolver::new(blob, shim, base_url, secret);
+    // Attach the direct-S3 STS minter (PLAN-compute-managed-resources Phase 3), when wired. Without
+    // the `blob-upload` feature `mint_slot` is `()` and there is no minter to attach.
+    #[cfg(feature = "blob-upload")]
+    let resolver = {
+        let (minter, max_ttl_secs, max_bytes_ceiling) = match mint_slot {
+            Some((m, ttl, ceil)) => (Some(m), ttl, ceil),
+            None => (None, 0, None),
+        };
+        resolver.with_blob_minter(minter, max_ttl_secs, max_bytes_ceiling)
+    };
+    #[cfg(not(feature = "blob-upload"))]
+    let _ = mint_slot;
+    Some(Arc::new(resolver))
 }
 
 // ---- the enforced authorization + key-composition decision -------------------
@@ -884,6 +1118,7 @@ mod tests {
             kind: BindingKind::Blob,
             name: name.to_string(),
             url_env: None,
+            migration_url_env: None,
         }
     }
 
@@ -911,6 +1146,42 @@ mod tests {
         // … and release revokes it.
         resolver.release("default", "api", 0, &bindings).await;
         let (status, _) = request(&shim, "PUT", "/assets/cat.jpg", Some(&token), b"hi").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// PLAN-compute-managed-resources Phase 3: with NO minter wired, `contribute` is HMAC-only —
+    /// `{{blob.url}}`/`{{blob.token}}` + the back-compat defaults, NO `AWS_*`/STS vars — and the
+    /// token is revoked on stop (registry-backed).
+    #[tokio::test]
+    async fn contribute_without_minter_is_hmac_only_and_revoked_on_stop() {
+        let shim = BlobShim::new();
+        let storage = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage);
+        let bindings = vec![blob_binding("assets")];
+
+        let c = resolver
+            .contribute(
+                "acme",
+                "api",
+                0,
+                &bindings,
+                &std::collections::BTreeMap::new(),
+            )
+            .await;
+        assert_eq!(
+            c.vars.get("blob.url").map(String::as_str),
+            Some("http://10.0.0.1:8082")
+        );
+        let token = c.vars.get("blob.token").expect("blob.token var").clone();
+        assert_eq!(c.vars.get("blob.assets.token"), Some(&token));
+        // No direct-S3 creds without a minter.
+        assert!(!c.vars.contains_key("blob.endpoint"));
+        assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
+        // Revoke-on-stop: the HMAC token the var carries is invalidated by release.
+        let (status, _) = request(&shim, "PUT", "/assets/x", Some(&token), b"z").await;
+        assert_eq!(status, StatusCode::OK);
+        resolver.release("acme", "api", 0, &bindings).await;
+        let (status, _) = request(&shim, "PUT", "/assets/x", Some(&token), b"z").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -1144,5 +1415,157 @@ mod tests {
         );
 
         println!("COMPUTE BLOB-SHIM SCOPED OK");
+    }
+
+    /// A fake [`BlobUploadMinter`] returning fixed `TempCredentials` (bucket = the requested
+    /// container), so the direct-S3 wiring is unit-testable without a live S3/STS endpoint.
+    #[cfg(feature = "blob-upload")]
+    struct FakeBlobMinter;
+    #[cfg(feature = "blob-upload")]
+    #[async_trait::async_trait]
+    impl boatramp_handlers::BlobUploadMinter for FakeBlobMinter {
+        async fn mint(
+            &self,
+            scope: &boatramp_handlers::MintScope,
+        ) -> Result<boatramp_handlers::MintedCredentials, String> {
+            Ok(boatramp_handlers::MintedCredentials::TempCredentials(
+                boatramp_handlers::TempCredentials {
+                    access_key_id: "AKIAFAKE".to_string(),
+                    secret: "sekret".to_string(),
+                    session_token: "sess-tok".to_string(),
+                    endpoint: "https://r2.example.com".to_string(),
+                    region: "auto".to_string(),
+                    bucket: scope.container.clone(),
+                    force_path_style: true,
+                    expires_at: 9_999_999_999,
+                    expires_in_secs: scope.ttl_secs,
+                    enforced: Vec::new(),
+                    advisory: Vec::new(),
+                },
+            ))
+        }
+    }
+
+    #[cfg(feature = "blob-upload")]
+    fn resolver_with_minter(shim: &BlobShim, storage: Arc<dyn Storage>) -> BlobShimResolver {
+        BlobShimResolver::new(
+            Arc::new(GlobalBlobBackend::new(storage)),
+            shim.clone(),
+            "http://10.0.0.1:8082".to_string(),
+            [9u8; 32],
+        )
+        .with_blob_minter(Some(Arc::new(FakeBlobMinter)), 3600, Some(8 * 1024 * 1024))
+    }
+
+    /// Phase 3: a `--bind blob:<container>` with a wired minter ALSO gets direct-S3 `TempCredentials`
+    /// — `{{blob.*}}` STS vars + the `AWS_*` convention defaults — WHILE keeping the HMAC shim env.
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn contribute_mints_direct_s3_temp_credentials_for_a_named_container() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let resolver = resolver_with_minter(&shim, storage);
+        let c = resolver
+            .contribute(
+                "acme",
+                "api",
+                0,
+                &[blob_binding("assets")],
+                &BTreeMap::new(),
+            )
+            .await;
+        // STS template vars (bare + named).
+        assert_eq!(
+            c.vars.get("blob.endpoint").map(String::as_str),
+            Some("https://r2.example.com")
+        );
+        assert_eq!(c.vars.get("blob.region").map(String::as_str), Some("auto"));
+        assert_eq!(
+            c.vars.get("blob.bucket").map(String::as_str),
+            Some("assets")
+        );
+        assert_eq!(
+            c.vars.get("blob.access_key").map(String::as_str),
+            Some("AKIAFAKE")
+        );
+        assert_eq!(
+            c.vars.get("blob.secret").map(String::as_str),
+            Some("sekret")
+        );
+        assert_eq!(
+            c.vars.get("blob.session_token").map(String::as_str),
+            Some("sess-tok")
+        );
+        assert_eq!(c.vars.get("blob.prefix").map(String::as_str), Some(""));
+        assert_eq!(
+            c.vars.get("blob.assets.access_key").map(String::as_str),
+            Some("AKIAFAKE")
+        );
+        // AWS_* convention defaults (single binding) so a stock S3 client Just Works.
+        let def = |k: &str| {
+            c.defaults
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(def("AWS_ENDPOINT_URL"), Some("https://r2.example.com"));
+        assert_eq!(def("AWS_ACCESS_KEY_ID"), Some("AKIAFAKE"));
+        assert_eq!(def("AWS_SECRET_ACCESS_KEY"), Some("sekret"));
+        assert_eq!(def("AWS_SESSION_TOKEN"), Some("sess-tok"));
+        assert_eq!(def("AWS_REGION"), Some("auto"));
+        assert_eq!(def("BOATRAMP_BLOB_BUCKET"), Some("assets"));
+        // The HMAC shim env is STILL present (back-compat full R/W).
+        assert!(def("BOATRAMP_BLOB_URL").is_some());
+        assert!(c.vars.contains_key("blob.token"));
+    }
+
+    /// **Live gate** (PLAN-compute-managed-resources Phase 3, marker `PHASE3 BLOB STS DIRECT-R2 OK`).
+    /// Proves a boatramp-minted blob credential uploads DIRECTLY to R2/Tigris — no shim hop. Set
+    /// `BOATRAMP_PHASE3_S3_PUT_URL` to a presigned PUT URL derived from a real workload's injected
+    /// direct-S3 creds, e.g. deploy a workload with `--bind blob:<container>`, read its injected
+    /// `AWS_ENDPOINT_URL`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_REGION`,
+    /// then `aws --endpoint-url "$AWS_ENDPOINT_URL" s3 presign "s3://$BUCKET/phase3-probe"`. The gate
+    /// does a REAL `PUT` to that URL and asserts success. `#[ignore]` (needs live R2/Tigris); run on
+    /// the Linux box. Do NOT run in CI's default lane.
+    #[tokio::test]
+    #[ignore = "live: set BOATRAMP_PHASE3_S3_PUT_URL to a presigned PUT derived from a workload's injected AWS_* creds; proves direct-to-R2 upload"]
+    async fn blob_sts_direct_r2_live() {
+        let Ok(put_url) = std::env::var("BOATRAMP_PHASE3_S3_PUT_URL") else {
+            panic!(
+                "set BOATRAMP_PHASE3_S3_PUT_URL to a presigned PUT URL from a workload's injected \
+                 AWS_* creds to run this live gate"
+            );
+        };
+        let resp = reqwest::Client::new()
+            .put(&put_url)
+            .body(b"phase3-direct-r2".to_vec())
+            .send()
+            .await
+            .expect("PUT to R2/Tigris with the minted credential");
+        assert!(
+            resp.status().is_success(),
+            "direct-to-R2 upload with the boatramp-minted credential must succeed; got {}",
+            resp.status()
+        );
+        println!("PHASE3 BLOB STS DIRECT-R2 OK");
+    }
+
+    /// A BARE `--bind blob` (no container) can't scope an STS credential, so even WITH a minter it
+    /// falls back to the HMAC shim only — never a panic, never a blank credential.
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn contribute_bare_blob_binding_falls_back_to_hmac_even_with_a_minter() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let resolver = resolver_with_minter(&shim, storage);
+        let c = resolver
+            .contribute("acme", "api", 0, &[blob_binding("")], &BTreeMap::new())
+            .await;
+        assert!(
+            !c.vars.contains_key("blob.endpoint"),
+            "no STS for a bare binding"
+        );
+        assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
+        assert!(c.vars.contains_key("blob.url"), "HMAC var still present");
     }
 }

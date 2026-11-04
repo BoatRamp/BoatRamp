@@ -61,6 +61,46 @@ pub(crate) struct TenantSourceInputs<'a> {
     /// the `sealed-state` source resolves no value (fail-closed). Bundled so the whole capability is
     /// present-or-absent atomically.
     pub sealed_state: Option<SealedStateInputs<'a>>,
+    /// Inputs for the [`TenantSource::PreAuthRequest`] source (construens #2 — the pre-auth SSO
+    /// login-start firm selection): the request param/path lookup, the (optionally buffered) request
+    /// body for the `body` location, the routed-host context for the `host` location, the
+    /// host-resolved project, and the configured-firm registry. `None` on any lane with no request
+    /// surface (async/background) ⇒ the `pre_auth_request` source resolves no value (fail-closed).
+    pub preauth: Option<PreAuthInputs<'a>>,
+}
+
+/// A buffered request body for the [`TenantSource::PreAuthRequest`] `body` location (construens #2).
+/// The serving path buffers it (up to the selector's size cap) and snapshots the `Content-Type`
+/// ONLY for a route that declared a `body`-location pre-auth source, so the body parse never touches
+/// the per-tenant serving hot path. Borrowed by [`PreAuthInputs`].
+pub(crate) struct PreAuthBody {
+    /// The request `Content-Type` header value (for content-type dispatch), or `None`.
+    pub content_type: Option<String>,
+    /// The buffered body bytes (already capped at the serving buffer; re-checked at parse).
+    pub bytes: Vec<u8>,
+}
+
+/// Everything the [`TenantSource::PreAuthRequest`] source needs at the (pre-auth) login-start.
+/// `params`/`body`/`registry` are host-held references; `domain_context` is the routed-host context
+/// tag (for the `host` location); `project` is THIS request's host-resolved project (passed to the
+/// registry's configured-firm check). A trait-object registry so the resolver is unit-testable with
+/// an in-memory set.
+#[derive(Clone, Copy)]
+pub(crate) struct PreAuthInputs<'a> {
+    /// The request's query + path lookup (the `query`/`path` locations).
+    pub params: &'a dyn RequestParams,
+    /// The buffered request body (the `body` location); `None` when the route declared no body
+    /// source (so the body was never buffered — the hot-path guarantee).
+    pub body: Option<&'a PreAuthBody>,
+    /// The routed-host context tag (the `host` location — the strongest signal, host-stamped at
+    /// routing). `None` ⇒ the `host` location fails closed.
+    pub domain_context: Option<&'a str>,
+    /// This request's host-resolved project (passed to the configured-firm registry).
+    pub project: &'a str,
+    /// The configured-firm registry: a firm selector resolves ONLY to a provisioned/configured firm
+    /// in the project (reuses the same [`TenantExists`] provisioning signal the `sealed-state`
+    /// source's defense-in-depth check uses). An unknown/unconfigured selector fails closed.
+    pub registry: &'a dyn TenantExists,
 }
 
 /// A request's parameter lookup surface for the `sealed-state` source — query params + headers. The
@@ -72,6 +112,12 @@ pub(crate) trait RequestParams: Send + Sync {
     fn query(&self, name: &str) -> Option<String>;
     /// The value of request header `name` (case-insensitive), or `None`.
     fn header(&self, name: &str) -> Option<String>;
+    /// The request **path** (without the query string), e.g. `/sso/start/ten_X`. Used by the
+    /// `pre_auth_request` source's `path` extraction (construens #2). Defaults to `None` for a lane /
+    /// test double that carries no path (the path extraction then fails closed).
+    fn path(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A [`RequestParams`] over a live HTTP request's query string + headers — the serving-path impl the
@@ -84,6 +130,8 @@ pub(crate) struct HttpStateParams {
     pub query: Option<String>,
     /// A snapshot of the request headers.
     pub headers: axum::http::HeaderMap,
+    /// The request path (without the query string), for the `pre_auth_request` `path` extraction.
+    pub path: Option<String>,
 }
 
 impl RequestParams for HttpStateParams {
@@ -103,6 +151,9 @@ impl RequestParams for HttpStateParams {
             .get(name)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
+    }
+    fn path(&self) -> Option<String> {
+        self.path.clone()
     }
 }
 
@@ -269,6 +320,38 @@ pub(crate) async fn resolve_host_tenancy(
                     // guest `current-principal` system shape. Applied last (it also re-clamps modes).
                     .coerce_system(),
                 )),
+                // construens #2 — a SEAL-ONLY pre-auth firm (login-start). The firm is carried as the
+                // `HostTenancy` seal-only subject, NOT a `ScopeAxis::Tenant` data fact, so it reaches
+                // ONLY the `sealed-state:mint` binding. The data axes are FORCED to `None` (every
+                // scoped read/write denied) regardless of the route's declared `read`/`write`, so a
+                // login-start has NO data access at all (the firm's rows are unreachable, and
+                // `resolved_tenant_string(facts)` is `None` ⇒ `tenant-secrets`/blob are
+                // `no-resolved-tenant`) — the confinement is structural (no `Tenant` fact + `None`
+                // grants), not a bolt-on guard. A session cookie (if the login-start carried a valid
+                // one) still resolves its anonymous `Session` fact independently (never the firm). The
+                // firm becomes a DATA tenant only later, at `/callback`, once `sealed-state` unseals it
+                // (and the external auth has run).
+                Some(ResolvedPrincipal::PreAuthSeal(firm)) => {
+                    let mut facts = Vec::new();
+                    if let Some(value) = resolve_session_fact(&inputs) {
+                        facts.push(boatramp_handlers::ScopeFact {
+                            axis: boatramp_core::tenancy::ScopeAxis::Session,
+                            value,
+                        });
+                    }
+                    Ok(Some(
+                        HostTenancy::from_facts(
+                            column.clone(),
+                            facts,
+                            // No data access at /start: force both axes to `None` (deny every scoped
+                            // op), independent of the declared modes — airtight even if a pre-auth
+                            // route wrongly declares `read: all`.
+                            AccessMode::None,
+                            AccessMode::None,
+                        )
+                        .with_preauth_seal_subject(Some(firm)),
+                    ))
+                }
                 // A concrete tenant value (or none) + the anonymous session fact (R3, from a verified
                 // cookie) — each axis resolved independently, tagged, carried as the principal's fact
                 // set. Either may be absent (a purely anonymous request has only a session fact; a
@@ -493,6 +576,12 @@ pub(crate) enum ResolvedPrincipal {
     /// The node-wide **system** principal (no tenant), conferred ONLY by a verified system source
     /// (P1: a `system_when` operator opt-in on an exactly-named first-party issuer).
     System,
+    /// A **pre-auth seal-only firm** (construens #2 — [`TenantSource::PreAuthRequest`]): the firm
+    /// resolved host-side from an UNSCOPED login-start request, validated against the configured-firm
+    /// registry. It is NOT a data tenant — [`resolve_host_tenancy`] carries it as the
+    /// [`HostTenancy`]'s seal-only subject (no `ScopeAxis::Tenant` fact), so it reaches ONLY the
+    /// `sealed-state:mint` binding and grants no RLS/`tenant-secrets` access at `/start`.
+    PreAuthSeal(String),
 }
 
 async fn resolve_from_sources(
@@ -513,6 +602,21 @@ async fn resolve_from_sources(
             counter = "transform_denied",
             "tenant claim transform: a namespaced token source is mixed with an un-namespaced \
              tenant source on this route; refusing to resolve a principal (fail closed)"
+        );
+        return None;
+    }
+    // construens #2 sole-source backstop: a `pre_auth_request` source confers a SEAL-ONLY firm, not a
+    // data tenant key. It must be the SOLE source — mixing it with any other tenant-producing source
+    // would let a login-start route also resolve a real data tenant, blurring the seal-only boundary.
+    // Refuse to resolve ANY principal for such a mix (fail closed), covering a control-plane deploy
+    // that bypassed the apply-time `validate_sources` check.
+    if boatramp_core::claim_extract::preauth_source_misplaced(sources) {
+        tracing::warn!(
+            tenant_source = "pre_auth_request",
+            outcome = "preauth_source_mix",
+            counter = "preauth_denied",
+            "pre_auth_request is not the sole source on this route; refusing to resolve a principal \
+             (fail closed)"
         );
         return None;
     }
@@ -815,8 +919,170 @@ async fn resolve_value(
                 boatramp_core::sql::SqlValue::Text(claims.tenant),
             ))
         }
+        // construens #2 — the pre-auth SSO login-start firm selection. Extract the firm selector from
+        // the configured location (host/query/path/body), screen it for key-safety (malformed /
+        // wildcard ⇒ fail closed), and resolve ONLY to a CONFIGURED/provisioned firm in the project
+        // (the registry — the same provisioning signal the sealed-state source uses). The result is a
+        // SEAL-ONLY firm (`PreAuthSeal`), NOT a data tenant: `resolve_host_tenancy` carries it as the
+        // `HostTenancy` seal-only subject (no `ScopeAxis::Tenant` fact), so it reaches ONLY the
+        // `sealed-state:mint` binding — NO RLS / `tenant-secrets` access at `/start`. The guest-facing
+        // outcome is UNIFORM across every failure (no existence oracle); the host logs the precise
+        // reason. The request-carried firm is safe BECAUSE the auth (the external IdP / firm
+        // credentials + the callback's sealed-firm validation) is the real gate — this only selects
+        // WHICH configured firm to seal. No pre-auth substrate on this lane (async/background drain,
+        // or no request surface) ⇒ fail closed.
+        TenantSource::PreAuthRequest { selector } => {
+            let pre = inputs.preauth.as_ref()?;
+            // Extract the raw request-carried selector from the configured location. Missing ⇒ None.
+            let Some(selected) = extract_preauth_selector(selector, pre) else {
+                tracing::warn!(
+                    tenant_source = "pre_auth_request",
+                    outcome = "selector_absent",
+                    counter = "preauth_denied",
+                    location = ?selector.location,
+                    "pre_auth_request: no firm selector present in the configured location (fail closed)"
+                );
+                return None;
+            };
+            // Key-safety screen (defense in depth over the registry): empty / wildcard (`*`) /
+            // traversal / whitespace / control / over-long ⇒ fail closed BEFORE the registry call.
+            if let Err(e) =
+                boatramp_core::project::validate_key_segment("pre_auth_firm", selected.trim())
+            {
+                tracing::warn!(
+                    tenant_source = "pre_auth_request",
+                    outcome = "selector_malformed",
+                    counter = "preauth_denied",
+                    reason = %e,
+                    "pre_auth_request: firm selector failed the key-safety screen (fail closed)"
+                );
+                return None;
+            }
+            let firm = selected.trim();
+            // Configured-firm registry: resolve ONLY to a provisioned/configured firm in the project.
+            // Uniform fail-closed outcome — an unknown firm is indistinguishable from any other
+            // failure at the guest; the host logs the (non-value) reason. NO fallback / default.
+            if !pre.registry.exists(pre.project, firm).await {
+                tracing::warn!(
+                    tenant_source = "pre_auth_request",
+                    outcome = "unknown_or_unconfigured_firm",
+                    counter = "preauth_denied",
+                    "pre_auth_request: selected firm is not a configured/provisioned tenant (fail closed)"
+                );
+                return None;
+            }
+            Some(ResolvedPrincipal::PreAuthSeal(firm.to_string()))
+        }
         // Truly anonymous — no "own" tenant.
         TenantSource::None => None,
+    }
+}
+
+/// Extract the raw, request-carried firm **selector** string for a [`TenantSource::PreAuthRequest`]
+/// from its configured [`location`](boatramp_core::tenancy::PreAuthLocation) (construens #2) — BEFORE
+/// any key-safety screen or registry check (both applied by the caller). `None` when the selector is
+/// absent from the configured location (fail closed). This is the ONLY place a pre-auth firm is read
+/// from request text, and it never touches the per-tenant serving hot path (the `body` surface is
+/// buffered by the serving path ONLY for a route that declared a `body` source).
+fn extract_preauth_selector(
+    selector: &boatramp_core::tenancy::PreAuthSelector,
+    pre: &PreAuthInputs<'_>,
+) -> Option<String> {
+    use boatramp_core::tenancy::PreAuthLocation;
+    match selector.location {
+        // The routed-host context tag — the strongest signal (host-stamped at routing, never a client
+        // header). Reuses the `domain` source's resolved context; `name` is ignored.
+        PreAuthLocation::Host => pre
+            .domain_context
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned),
+        // The already-parsed query string (`?<name>=<firm>`).
+        PreAuthLocation::Query => pre.params.query(&selector.name).filter(|v| !v.is_empty()),
+        // The already-parsed path: the firm segment is the one IMMEDIATELY FOLLOWING a literal
+        // segment equal to `name` (e.g. `name: "start"` → `/sso/start/<firm>`), so the position is
+        // unambiguous and label-anchored (never "guess the Nth segment"). Absent label ⇒ None.
+        PreAuthLocation::Path => {
+            let path = pre.params.path()?;
+            let mut segs = path.split('/').filter(|s| !s.is_empty());
+            while let Some(seg) = segs.next() {
+                if seg == selector.name {
+                    return segs.next().filter(|v| !v.is_empty()).map(str::to_owned);
+                }
+            }
+            None
+        }
+        // The buffered request body (the AWS-IAM-style credentials-against-the-firm POST). Content-
+        // type dispatch (form-urlencoded + JSON), size cap, malformed ⇒ None. Buffered by the serving
+        // path ONLY for a route that declared a `body` source (the hot-path guarantee).
+        PreAuthLocation::Body => {
+            let body = pre.body?;
+            extract_preauth_body_field(selector, body)
+        }
+    }
+}
+
+/// Parse a buffered request body for the `body`-location firm field (construens #2): dispatch on the
+/// `Content-Type` (`application/x-www-form-urlencoded` or `application/json`), enforce the selector's
+/// body-size cap, and extract the string field named `selector.name`. Any mismatch — an over-cap
+/// body, an unaccepted/unknown content-type, malformed form/JSON, a missing or non-string field —
+/// yields `None` (fail closed). A nested/array/number JSON value for the field is rejected (a firm
+/// selector is always a top-level string).
+fn extract_preauth_body_field(
+    selector: &boatramp_core::tenancy::PreAuthSelector,
+    body: &PreAuthBody,
+) -> Option<String> {
+    // Size cap (re-checked here even though the serving buffer already capped it — defense in depth,
+    // and the unit tests exercise it directly).
+    if body.bytes.len() > selector.effective_body_cap() {
+        return None;
+    }
+    // The request's MEDIA TYPE: the `Content-Type` header with any parameters (`; charset=utf-8`)
+    // dropped, then trimmed and lowercased. Matching is a proper media-type EQUALITY test — never a
+    // substring test, which would let a crafted header like `application/json-evil` or
+    // `text/x-application/json` smuggle past the allowlist and pick a parser it was never granted.
+    let media_type = body
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // Is this request's media type accepted? The configured allowlist (each entry matched for EQUALITY
+    // against the request media type, case-insensitively), or — when the operator configured none —
+    // any media type (the two understood parsers then self-select on the actual media type below). A
+    // media type matching no configured entry fails closed (never parsed).
+    let accepted = selector.content_types.is_empty()
+        || selector
+            .content_types
+            .iter()
+            .any(|c| !c.is_empty() && c.trim().eq_ignore_ascii_case(&media_type));
+    // Dispatch the parser on the ACTUAL media type (only among the understood types); an accepted but
+    // unrecognized media type still fails closed (never guess a parser).
+    let accepts = |expected: &str| accepted && media_type == expected;
+    if accepts("application/x-www-form-urlencoded") {
+        // Reuse the form-urlencoded value decoder (first matching key wins).
+        let text = std::str::from_utf8(&body.bytes).ok()?;
+        for pair in text.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            if decode_query_value(k) == selector.name {
+                let decoded = decode_query_value(v);
+                return (!decoded.is_empty()).then_some(decoded);
+            }
+        }
+        None
+    } else if accepts("application/json") {
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes).ok()?;
+        match json.get(&selector.name) {
+            // A firm selector is always a top-level JSON string; a non-string (number/array/object/
+            // bool/null) is rejected (fail closed) rather than coerced.
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    } else {
+        // An unaccepted / unrecognized content-type: fail closed (never guess a parser).
+        None
     }
 }
 
@@ -3717,6 +3983,750 @@ mod sealed_state_gate {
             stale,
             Some("firm-x".to_string()),
             "neutering the expiry check must let an expired seal resolve — the gate is live"
+        );
+    }
+}
+
+/// Unit tests for the construens #2 **`pre_auth_request`** source (the pre-auth SSO login-start firm
+/// selection): each extraction location (host/query/path/body), the fail-closed cases (unknown /
+/// missing / malformed / wildcard / unconfigured firm, body size-cap / malformed / unaccepted
+/// content-type), the sole-source backstop, and the **seal-only confinement** (the resolved firm is
+/// NEVER a data `Tenant` fact — no RLS / `tenant-secrets` access at `/start`).
+#[cfg(test)]
+mod preauth_source {
+    use super::{
+        PreAuthBody, PreAuthInputs, RequestParams, TenantExists, TenantPosture, TenantSourceInputs,
+        resolve_host_tenancy,
+    };
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::{
+        AccessMode, OnUnresolved, PreAuthLocation, PreAuthSelector, ScopeAxis, Tenancy,
+        TenantSource,
+    };
+    use boatramp_handlers::TenantAxis as Axis;
+
+    /// A request param/path surface for the query/path locations.
+    #[derive(Default)]
+    struct Req {
+        query: Vec<(String, String)>,
+        path: Option<String>,
+    }
+    impl RequestParams for Req {
+        fn query(&self, name: &str) -> Option<String> {
+            self.query
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+        fn header(&self, _name: &str) -> Option<String> {
+            None
+        }
+        fn path(&self) -> Option<String> {
+            self.path.clone()
+        }
+    }
+
+    /// The configured-firm registry (a firm is configured iff listed).
+    struct Configured(Vec<String>);
+    #[async_trait::async_trait]
+    impl TenantExists for Configured {
+        async fn exists(&self, _project: &str, tenant: &str) -> bool {
+            self.0.iter().any(|t| t == tenant)
+        }
+    }
+
+    fn selector(location: PreAuthLocation, name: &str) -> PreAuthSelector {
+        PreAuthSelector {
+            location,
+            name: name.into(),
+            content_types: Vec::new(),
+            max_body_bytes: None,
+        }
+    }
+
+    fn decision(sources: Vec<TenantSource>) -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources,
+            // Even an `own` grant yields NO data access on a pre-auth resolution (forced to `None`).
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        }
+    }
+
+    fn posture() -> TenantPosture {
+        TenantPosture {
+            require_declaration: true,
+            allow_cross_tenant: false,
+        }
+    }
+
+    /// Resolve a `pre_auth_request` decision and return the resolved `HostTenancy`.
+    async fn resolve(
+        selector: PreAuthSelector,
+        req: &Req,
+        body: Option<&PreAuthBody>,
+        domain_context: Option<&str>,
+        configured: &[&str],
+    ) -> boatramp_handlers::HostTenancy {
+        let registry = Configured(configured.iter().copied().map(String::from).collect());
+        let inputs = TenantSourceInputs {
+            preauth: Some(PreAuthInputs {
+                params: req,
+                body,
+                domain_context,
+                project: "acme",
+                registry: &registry,
+            }),
+            ..Default::default()
+        };
+        resolve_host_tenancy(
+            Some(&decision(vec![TenantSource::PreAuthRequest { selector }])),
+            true,
+            posture(),
+            inputs,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// The load-bearing SEAL-ONLY assertion: the firm is the seal-only subject, NOT a data `Tenant`
+    /// fact — every scoped read/write is denied (no RLS access) and there is no own-tenant value for a
+    /// `tenant-secrets`/blob binding to key on.
+    fn assert_seal_only(ht: &boatramp_handlers::HostTenancy, firm: &str) {
+        assert_eq!(
+            ht.preauth_seal_subject(),
+            Some(firm),
+            "the firm is carried as the seal-only subject (the only consumer is sealed-state:mint)"
+        );
+        assert!(
+            !ht.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
+            "a pre-auth firm must NOT be a data Tenant fact (no RLS data access at /start)"
+        );
+        assert_eq!(
+            ht.value(),
+            None,
+            "no own-tenant value — a tenant-secrets/blob binding keys on None => no-resolved-tenant"
+        );
+        assert!(
+            ht.orm_scope(Axis::Read).is_err(),
+            "every scoped READ is denied at /start (no data access)"
+        );
+        assert!(
+            ht.orm_scope(Axis::Write).is_err(),
+            "every scoped WRITE is denied at /start (no data access)"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_location_resolves_a_configured_firm_seal_only() {
+        let req = Req {
+            query: vec![("tenant".into(), "ten_x".into())],
+            ..Default::default()
+        };
+        let ht = resolve(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req,
+            None,
+            None,
+            &["ten_x"],
+        )
+        .await;
+        assert_seal_only(&ht, "ten_x");
+    }
+
+    /// Multi-firm POSITIVE-DISCRIMINATION gate (the standing "tenancy gate needs a multi-tenant
+    /// fixture" rule). With TWO configured firms, `/sso/start?tenant=<firm>` must resolve the seal-only
+    /// subject to EXACTLY the requested firm and never the OTHER configured firm — a single-firm
+    /// fixture is blind to a lookup that returns the first/any configured firm instead of echoing the
+    /// request-selected one. Guards against a future "lookup-returns-value" refactor.
+    #[tokio::test]
+    async fn two_configured_firms_resolve_exactly_the_requested_one() {
+        // firm-x requested; BOTH firm-x and firm-y configured => the seal subject is EXACTLY firm-x.
+        let req_x = Req {
+            query: vec![("tenant".into(), "firm-x".into())],
+            ..Default::default()
+        };
+        let ht_x = resolve(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req_x,
+            None,
+            None,
+            &["firm-x", "firm-y"],
+        )
+        .await;
+        assert_eq!(
+            ht_x.preauth_seal_subject(),
+            Some("firm-x"),
+            "the requested firm-x is the resolved seal subject"
+        );
+        assert_ne!(
+            ht_x.preauth_seal_subject(),
+            Some("firm-y"),
+            "and NEVER the other configured firm (firm-y)"
+        );
+
+        // firm-y requested; the SAME two firms configured => the seal subject is EXACTLY firm-y.
+        let req_y = Req {
+            query: vec![("tenant".into(), "firm-y".into())],
+            ..Default::default()
+        };
+        let ht_y = resolve(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req_y,
+            None,
+            None,
+            &["firm-x", "firm-y"],
+        )
+        .await;
+        assert_eq!(
+            ht_y.preauth_seal_subject(),
+            Some("firm-y"),
+            "the requested firm-y is the resolved seal subject"
+        );
+        assert_ne!(
+            ht_y.preauth_seal_subject(),
+            Some("firm-x"),
+            "and NEVER the other configured firm (firm-x)"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_location_reuses_the_routed_host_context() {
+        let req = Req::default();
+        let ht = resolve(
+            selector(PreAuthLocation::Host, "ignored"),
+            &req,
+            None,
+            Some("ten_host"),
+            &["ten_host"],
+        )
+        .await;
+        assert_seal_only(&ht, "ten_host");
+    }
+
+    #[tokio::test]
+    async fn path_location_extracts_the_segment_after_the_label() {
+        let req = Req {
+            path: Some("/sso/start/ten_path/extra".into()),
+            ..Default::default()
+        };
+        let ht = resolve(
+            selector(PreAuthLocation::Path, "start"),
+            &req,
+            None,
+            None,
+            &["ten_path"],
+        )
+        .await;
+        assert_seal_only(&ht, "ten_path");
+    }
+
+    #[tokio::test]
+    async fn body_location_form_urlencoded_and_json() {
+        // form-urlencoded
+        let body = PreAuthBody {
+            content_type: Some("application/x-www-form-urlencoded".into()),
+            bytes: b"account=ten_body&password=secret".to_vec(),
+        };
+        let ht = resolve(
+            selector(PreAuthLocation::Body, "account"),
+            &Req::default(),
+            Some(&body),
+            None,
+            &["ten_body"],
+        )
+        .await;
+        assert_seal_only(&ht, "ten_body");
+
+        // JSON
+        let body = PreAuthBody {
+            content_type: Some("application/json".into()),
+            bytes: br#"{"account":"ten_json","password":"secret"}"#.to_vec(),
+        };
+        let ht = resolve(
+            selector(PreAuthLocation::Body, "account"),
+            &Req::default(),
+            Some(&body),
+            None,
+            &["ten_json"],
+        )
+        .await;
+        assert_seal_only(&ht, "ten_json");
+    }
+
+    /// Every fail-closed case resolves NO principal (uniform outcome) — the `HostTenancy` carries no
+    /// Tenant fact AND no seal-only subject, so the mint later fails `no-resolved-tenant`.
+    async fn resolves_nothing(
+        selector: PreAuthSelector,
+        req: &Req,
+        body: Option<&PreAuthBody>,
+        domain_context: Option<&str>,
+        configured: &[&str],
+    ) {
+        let ht = resolve(selector, req, body, domain_context, configured).await;
+        assert_eq!(
+            ht.preauth_seal_subject(),
+            None,
+            "a failed pre-auth resolution carries NO seal subject (the mint fails closed)"
+        );
+        assert!(
+            !ht.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
+            "and never a data Tenant fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_closed_unknown_missing_malformed_wildcard_unconfigured() {
+        // Unknown / unconfigured firm (registry says no).
+        let req = Req {
+            query: vec![("tenant".into(), "ten_x".into())],
+            ..Default::default()
+        };
+        resolves_nothing(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req,
+            None,
+            None,
+            &["ten_y"],
+        )
+        .await;
+
+        // Missing selector (param absent).
+        resolves_nothing(
+            selector(PreAuthLocation::Query, "tenant"),
+            &Req::default(),
+            None,
+            None,
+            &["ten_x"],
+        )
+        .await;
+
+        // Wildcard — even if a firm literally named "*" were provisioned, the key-safety screen
+        // rejects `*` BEFORE the registry call (no wildcard fan-out).
+        let req = Req {
+            query: vec![("tenant".into(), "*".into())],
+            ..Default::default()
+        };
+        resolves_nothing(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req,
+            None,
+            None,
+            &["*"],
+        )
+        .await;
+
+        // Malformed (path traversal) — rejected by the key-safety screen.
+        let req = Req {
+            query: vec![("tenant".into(), "../etc".into())],
+            ..Default::default()
+        };
+        resolves_nothing(
+            selector(PreAuthLocation::Query, "tenant"),
+            &req,
+            None,
+            None,
+            &["../etc"],
+        )
+        .await;
+
+        // host location with no routed host context => nothing.
+        resolves_nothing(
+            selector(PreAuthLocation::Host, "x"),
+            &Req::default(),
+            None,
+            None,
+            &["ten_x"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn body_fail_closed_cases() {
+        let sel = selector(PreAuthLocation::Body, "account");
+
+        // Over the size cap => fail closed.
+        let mut sel_capped = sel.clone();
+        sel_capped.max_body_bytes = Some(8);
+        let body = PreAuthBody {
+            content_type: Some("application/json".into()),
+            bytes: br#"{"account":"ten_body"}"#.to_vec(),
+        };
+        resolves_nothing(
+            sel_capped,
+            &Req::default(),
+            Some(&body),
+            None,
+            &["ten_body"],
+        )
+        .await;
+
+        // Malformed JSON => fail closed.
+        let body = PreAuthBody {
+            content_type: Some("application/json".into()),
+            bytes: b"{not json".to_vec(),
+        };
+        resolves_nothing(
+            sel.clone(),
+            &Req::default(),
+            Some(&body),
+            None,
+            &["ten_body"],
+        )
+        .await;
+
+        // Unaccepted content-type (never guess a parser) => fail closed.
+        let body = PreAuthBody {
+            content_type: Some("text/plain".into()),
+            bytes: b"account=ten_body".to_vec(),
+        };
+        resolves_nothing(
+            sel.clone(),
+            &Req::default(),
+            Some(&body),
+            None,
+            &["ten_body"],
+        )
+        .await;
+
+        // A non-string JSON field (a number) is rejected (a firm selector is always a string).
+        let body = PreAuthBody {
+            content_type: Some("application/json".into()),
+            bytes: br#"{"account":12345}"#.to_vec(),
+        };
+        resolves_nothing(sel.clone(), &Req::default(), Some(&body), None, &["12345"]).await;
+
+        // No body buffered at all (the route declared a body source but the serving path passed None,
+        // e.g. an over-cap read reconstructed an empty body) => fail closed.
+        resolves_nothing(sel, &Req::default(), None, None, &["ten_body"]).await;
+    }
+
+    /// The sole-source backstop: a `pre_auth_request` mixed with ANY other tenant-producing source
+    /// resolves NO principal (fail closed) — covering a control-plane deploy that bypassed the
+    /// apply-time `validate_sources` check.
+    #[tokio::test]
+    async fn preauth_mixed_with_another_source_fails_closed() {
+        let registry = Configured(vec!["ten_x".into()]);
+        let req = Req {
+            query: vec![("tenant".into(), "ten_x".into())],
+            ..Default::default()
+        };
+        let inputs = TenantSourceInputs {
+            preauth: Some(PreAuthInputs {
+                params: &req,
+                body: None,
+                domain_context: Some("ten_x"),
+                project: "acme",
+                registry: &registry,
+            }),
+            domain_context: Some("ten_x"),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(
+            Some(&decision(vec![
+                TenantSource::PreAuthRequest {
+                    selector: selector(PreAuthLocation::Query, "tenant"),
+                },
+                TenantSource::Domain,
+            ])),
+            true,
+            posture(),
+            inputs,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            ht.preauth_seal_subject(),
+            None,
+            "a mixed pre_auth_request route resolves no seal subject (sole-source backstop)"
+        );
+        assert_eq!(
+            ht.value(),
+            None,
+            "and never silently resolves the mixed Domain source as a data tenant"
+        );
+        // Belt: the domain source would otherwise have resolved `ten_x` as a Tenant fact.
+        assert!(
+            !ht.facts()
+                .iter()
+                .any(|f| f.value == SqlValue::Text("ten_x".into())),
+            "the mix resolves NO principal at all (fail closed)"
+        );
+    }
+}
+
+/// The construens #2 **`pre_auth_request` e2e tenancy gate** — the real-path, reproduces-the-failing-
+/// shape gate (non-negotiable per our lessons). Drives the FULL construens RP flow through the REAL
+/// Stage-0 [`resolve_host_tenancy`]:
+///
+/// 1. **WIRED arm**: `/sso/start?tenant=firm-x` with `sources: [pre_auth_request(query,"tenant")]` =>
+///    the firm becomes the HOST-RESOLVED *seal-only* subject (NO data `Tenant` fact) => the existing
+///    mint (`boatramp_core::sealed_state::seal_state`, driven with the SAME `resolved_tenant` the
+///    `build_bindings` mint call site derives) seals it => `/sso/callback?state=<token>` with
+///    `sources: [sealed_state(query,"state")]` UNSEALS and recovers `firm-x`.
+/// 2. **INERT arm** (reproduces today's failure): an UNSCOPED `/sso/start` (no `pre_auth_request`
+///    source) resolves NO tenant and NO seal subject => the mint's `resolved_tenant` is `None` => the
+///    mint FAILS CLOSED (`no-resolved-tenant`) => no sealed firm => the callback recovers nothing.
+///
+/// Neutering the START-side resolution (removing the seal subject) turns the WIRED arm into the INERT
+/// shape — proving the new source is what makes the firm host-resolved.
+#[cfg(test)]
+mod preauth_gate {
+    use super::{
+        PreAuthInputs, RequestParams, SealedStateInputs, TenantExists, TenantPosture,
+        TenantSourceInputs, resolve_host_tenancy,
+    };
+    use crate::envelope::LocalKek;
+    use boatramp_core::sealed_state::{mint_claims, seal_state};
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::{
+        AccessMode, OnUnresolved, ParamKind, PreAuthLocation, PreAuthSelector, ScopeAxis,
+        StateParam, Tenancy, TenantSource,
+    };
+    use boatramp_handlers::HostTenancy;
+
+    const PROJECT: &str = "acme";
+    const SITE: &str = "console";
+
+    struct Req {
+        query: Vec<(String, String)>,
+    }
+    impl RequestParams for Req {
+        fn query(&self, name: &str) -> Option<String> {
+            self.query
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+        fn header(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    struct Configured(Vec<String>);
+    #[async_trait::async_trait]
+    impl TenantExists for Configured {
+        async fn exists(&self, _project: &str, tenant: &str) -> bool {
+            self.0.iter().any(|t| t == tenant)
+        }
+    }
+
+    fn kek() -> LocalKek {
+        LocalKek::from_bytes([42u8; 32])
+    }
+
+    fn posture() -> TenantPosture {
+        TenantPosture {
+            require_declaration: true,
+            allow_cross_tenant: false,
+        }
+    }
+
+    fn start_decision(sources: Vec<TenantSource>) -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources,
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        }
+    }
+
+    /// The EXACT value the `build_bindings` mint call site derives for the sealed-state mint's
+    /// `resolved_tenant`: the own-`Tenant` fact (if any), else the seal-only pre-auth subject. `None`
+    /// => the mint fails closed (`no-resolved-tenant`), exactly as `SealedStateMintBinding::mint` does.
+    fn mint_tenant(ht: &HostTenancy) -> Option<String> {
+        ht.facts()
+            .iter()
+            .find(|f| f.axis == ScopeAxis::Tenant)
+            .and_then(|f| match &f.value {
+                SqlValue::Text(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+            .or_else(|| ht.preauth_seal_subject().map(str::to_owned))
+    }
+
+    /// The START leg: resolve `/sso/start` through the REAL Stage-0 resolver and return the resolved
+    /// `HostTenancy` (whose seal-only subject the mint consumes).
+    async fn resolve_start(start: &Tenancy, req: &Req, configured: &[&str]) -> HostTenancy {
+        let registry = Configured(configured.iter().copied().map(String::from).collect());
+        let inputs = TenantSourceInputs {
+            preauth: Some(PreAuthInputs {
+                params: req,
+                body: None,
+                domain_context: None,
+                project: PROJECT,
+                registry: &registry,
+            }),
+            ..Default::default()
+        };
+        resolve_host_tenancy(Some(start), true, posture(), inputs)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The CALLBACK leg: resolve `/sso/callback?state=<token>` through the REAL Stage-0 resolver over
+    /// a `sealed_state` source and return the recovered own-tenant (or `None`, fail-closed).
+    async fn resolve_callback(env: &LocalKek, token: Option<&str>) -> Option<String> {
+        struct State(Option<String>);
+        impl RequestParams for State {
+            fn query(&self, name: &str) -> Option<String> {
+                (name == "state").then(|| self.0.clone()).flatten()
+            }
+            fn header(&self, _n: &str) -> Option<String> {
+                None
+            }
+        }
+        let params = State(token.map(str::to_owned));
+        let registry = Configured(vec!["firm-x".into()]);
+        let inputs = TenantSourceInputs {
+            sealed_state: Some(SealedStateInputs {
+                params: &params,
+                env,
+                project: PROJECT,
+                site: SITE,
+                registry: &registry,
+            }),
+            ..Default::default()
+        };
+        let callback = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SealedState {
+                param: StateParam {
+                    kind: ParamKind::Query,
+                    name: "state".into(),
+                },
+            }],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        };
+        let ht = resolve_host_tenancy(Some(&callback), true, posture(), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        ht.facts()
+            .iter()
+            .find(|f| f.axis == ScopeAxis::Tenant)
+            .map(|f| match &f.value {
+                SqlValue::Text(s) => s.clone(),
+                other => panic!("tenant fact must be text, got {other:?}"),
+            })
+    }
+
+    async fn seal_firm(env: &LocalKek, firm: &str) -> String {
+        let now = boatramp_core::time::now_unix();
+        let claims = mint_claims(
+            PROJECT,
+            SITE,
+            firm,
+            Some("pkce".into()),
+            Some("n".into()),
+            300,
+            now,
+        );
+        seal_state(env, &claims).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn preauth_start_to_callback_roundtrips_and_an_unscoped_start_fails_closed() {
+        let env = kek();
+
+        // ---- INERT arm (today's failing shape): an UNSCOPED /sso/start resolves no tenant. ----
+        // A plain login-start declaring NO pre_auth_request source (a bare `[None]` source list):
+        // nothing resolves, so there is NO own tenant and NO seal subject => the mint's resolved_tenant
+        // is None => the mint FAILS CLOSED (no token is produced) => the callback recovers nothing.
+        let inert = resolve_start(
+            &start_decision(vec![TenantSource::None]),
+            &Req {
+                query: vec![("tenant".into(), "firm-x".into())],
+            },
+            &["firm-x"],
+        )
+        .await;
+        assert_eq!(
+            mint_tenant(&inert),
+            None,
+            "an unscoped start resolves NO tenant -> the mint fails closed (no sealed firm)"
+        );
+        // With no token minted, the callback has nothing to unseal.
+        assert_eq!(
+            resolve_callback(&env, None).await,
+            None,
+            "no sealed firm -> the callback recovers nothing (today's failing shape)"
+        );
+
+        // ---- WIRED arm: /sso/start?tenant=firm-x with the pre_auth_request source. ----
+        let start = resolve_start(
+            &start_decision(vec![TenantSource::PreAuthRequest {
+                selector: PreAuthSelector {
+                    location: PreAuthLocation::Query,
+                    name: "tenant".into(),
+                    content_types: Vec::new(),
+                    max_body_bytes: None,
+                },
+            }]),
+            &Req {
+                query: vec![("tenant".into(), "firm-x".into())],
+            },
+            &["firm-x"],
+        )
+        .await;
+        // SEAL-ONLY confinement: the firm is the seal subject, NOT a data Tenant fact => NO data access
+        // at /start (every scoped op denied, and no own-tenant value for tenant-secrets/blob to key on).
+        assert_eq!(start.preauth_seal_subject(), Some("firm-x"));
+        assert!(
+            !start.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
+            "SEAL-ONLY: the pre-auth firm is never a data tenant fact (no RLS at /start)"
+        );
+        assert!(
+            start
+                .orm_scope(boatramp_handlers::TenantAxis::Read)
+                .is_err()
+                && start
+                    .orm_scope(boatramp_handlers::TenantAxis::Write)
+                    .is_err(),
+            "SEAL-ONLY: every scoped read/write is denied at /start (no tenant-secrets / RLS access)"
+        );
+        // The firm is now HOST-RESOLVED, so the existing mint seals it.
+        let firm = mint_tenant(&start).expect("the pre-auth firm is the mint's resolved tenant");
+        assert_eq!(firm, "firm-x");
+        let token = seal_firm(&env, &firm).await;
+        // The callback UNSEALS and recovers the firm as a real (data) tenant.
+        assert_eq!(
+            resolve_callback(&env, Some(&token)).await,
+            Some("firm-x".to_string()),
+            "WIRED: the sealed firm is recovered at /sso/callback"
+        );
+
+        // A seal minted for firm-x can never be turned into a resolution of firm-y (the sealed-state
+        // isolation still holds end to end): a tampered token recovers nothing.
+        let mut b = token.into_bytes();
+        let mid = b.len() / 2;
+        b[mid] = if b[mid] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(b).unwrap();
+        assert_eq!(
+            resolve_callback(&env, Some(&tampered)).await,
+            None,
+            "a tampered sealed state recovers nothing (fail closed)"
+        );
+
+        // The anti-silent-skip marker — printed ONLY after BOTH the INERT (fails closed) and WIRED
+        // (seal-only start -> mint -> callback recovers firm) arms pass. The CI gate greps this.
+        println!(
+            "PRE-AUTH TENANT SOURCE OK: unscoped start fails closed; wired start resolves firm-x \
+             SEAL-ONLY (no data tenant), mint seals it, /callback recovers firm-x"
         );
     }
 }

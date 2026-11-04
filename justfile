@@ -38,6 +38,15 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# Regenerate the VENDORED/committed Connect / gRPC-web CLIENTS from `proto/` (PLAN-connect-grpc §9
+# / IU-5): the Rust client (prost + a typed client per service) and the Web/TypeScript connect-es
+# client. Runs inside `nix develop` so protoc + buf + the toolchain are the pinned ones — the output
+# is reproducible (generate twice ⇒ identical bytes) and committed, so the normal build never runs
+# codegen. Review + commit `examples/connect-clients/src/generated/*.rs` and
+# `clients/ts/generated/**/*_pb.ts` afterwards.
+codegen:
+    nix develop --command bash scripts/connect-codegen.sh
+
 # Run the test suite.
 test:
     cargo nextest run --workspace
@@ -278,7 +287,7 @@ bump-version version:
 
 # The workspace crates in dependency (publish) order — leaf crates first, so each
 # crate's internal deps are already on crates.io by the time it publishes.
-crate_order := "boatramp-http boatramp-types boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-overlay-proto boatramp-overlay boatramp-overlay-client boatramp-overlay-tunnel boatramp-cloudflare boatramp-firecracker boatramp-container boatramp-docker boatramp-vz boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp-node boatramp"
+crate_order := "boatramp-http boatramp-types boatramp-connect-frame boatramp-connect-client boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-overlay-proto boatramp-overlay boatramp-overlay-client boatramp-overlay-tunnel boatramp-cloudflare boatramp-firecracker boatramp-container boatramp-docker boatramp-vz boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp-node boatramp"
 
 # Dry-run the release packaging of every workspace crate (no upload). `cargo` can't
 # validate a dependent crate until its internal deps are actually on crates.io, so

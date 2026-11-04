@@ -1,5 +1,7 @@
 # Declare a project with `apply`
 
+**For: operators & app developers**
+
 `boatramp apply` reads one RON manifest that declares a whole **project** — its
 member sites, top-level functions, and compute workloads — and reconciles it to that
 desired state in a single pass. It is the declarative counterpart to `sync` (one

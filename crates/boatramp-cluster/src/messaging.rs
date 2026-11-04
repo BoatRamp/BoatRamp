@@ -33,7 +33,10 @@ use boatramp_core::messaging::{
     self, ClaimedMessage, DeadLetter, DeadLetterFilter, GroupInfo, Messaging, MessagingError,
     StreamHubs,
 };
-use boatramp_core::{PutMeta, Storage};
+use boatramp_core::{
+    ByteStream, ChangeStream, DrainPair, GetObject, ListPage, ObjectMeta, PutMeta, Storage,
+    StorageError,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
@@ -108,6 +111,168 @@ fn hrw_score(topic: &str, node: NodeId) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// The fail-closed message a pre-bind spill operation surfaces on an unbound [`LateStorage`]
+/// (wrapped by the messaging layer into `MessagingError::Backend`). A named constant so the
+/// invariant ("never an ambient/uncredentialed fallback") is greppable from tests and reviews.
+const UNBOUND_SPILL_STORE: &str = "messaging payload-spill store not yet initialized";
+
+/// A **late-bindable** [`Storage`] handle for the cluster's cross-node messaging payload-spill store
+/// (PLAN-serve-single-cluster-parity, seal-messaging residual).
+///
+/// On a cluster, [`build_node`](crate::node::build_node) wires [`RaftMessaging`]'s payload-spill
+/// store BEFORE the replicated control-plane vault (`node.kv`) exists — and a node-level sealed
+/// `boatramp:` base S3 credential can only be resolved AFTER that vault is up (the boot
+/// chicken-and-egg). So the spill store cannot be built with the sealed credential at `build_node`
+/// time. Rather than wire an uncredentialed / ambient-AWS backend early (the pre-fix behavior), the
+/// serve path hands `build_node` this handle **unbound**, then resolves the sealed credential
+/// post-KV and [`bind`](Self::bind)s it to the SAME sealed backend that serves guests — strictly
+/// before `serve_assembled` serves and before any messaging traffic can flow.
+///
+/// **Fail-closed:** every storage operation issued before [`bind`](Self::bind) returns a
+/// [`StorageError::Backend`] carrying [`UNBOUND_SPILL_STORE`] — the spill NEVER silently falls back
+/// to an ambient or uncredentialed backend. In practice no spill runs pre-bind (messaging does not
+/// serve until the post-KV pass has bound the handle), so the fail-closed path is defensive depth,
+/// not a hot path.
+///
+/// The indirection is a plain `RwLock<Option<Arc<dyn Storage>>>`: it is bound once at boot and read
+/// on each spill, so the read lock is uncontended. (`arc_swap::ArcSwapOption` cannot hold an
+/// `Arc<dyn Trait>` — its `RefCnt` impl requires a `Sized` pointee — so a lock-free swap would need
+/// a double `Arc`; a bind-once/read-many `RwLock` is simpler and adds no dependency.)
+pub struct LateStorage {
+    inner: std::sync::RwLock<Option<Arc<dyn Storage>>>,
+}
+
+impl LateStorage {
+    /// A fresh, **unbound** handle: every storage operation fails closed until [`bind`](Self::bind).
+    #[must_use]
+    pub fn unbound() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Bind (or rebind) the handle to a concrete backend. Idempotent and safe to call more than once
+    /// (the latest binding wins); the serve path calls it exactly once, post-KV, with the sealed
+    /// serving backend.
+    pub fn bind(&self, storage: Arc<dyn Storage>) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(storage);
+    }
+
+    /// Whether a backend has been bound yet (diagnostics / tests).
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The bound backend as an owned `Arc` (so no lock is held across the delegated `await`), or a
+    /// fail-closed [`StorageError::Backend`] naming the unbound state.
+    fn bound(&self) -> Result<Arc<dyn Storage>, StorageError> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| StorageError::Backend(UNBOUND_SPILL_STORE.to_string()))
+    }
+}
+
+#[async_trait]
+impl Storage for LateStorage {
+    async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+        self.bound()?.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<GetObject, StorageError> {
+        self.bound()?.get_range(key, offset, len).await
+    }
+
+    async fn put(
+        &self,
+        key: &str,
+        body: ByteStream,
+        meta: PutMeta,
+    ) -> Result<ObjectMeta, StorageError> {
+        self.bound()?.put(key, body, meta).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+        self.bound()?.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.bound()?.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+        self.bound()?.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage, StorageError> {
+        self.bound()?.list_page(prefix, after, limit).await
+    }
+
+    async fn watch(&self, prefix: &str) -> Result<Option<ChangeStream>, StorageError> {
+        self.bound()?.watch(prefix).await
+    }
+
+    // Sync capability probes delegate to the bound backend, or return a SAFE default when unbound
+    // (no mapping/sendfile/watch, pruning permitted) — the async ops above still fail closed.
+    fn mapped(&self, key: &str) -> Option<bytes::Bytes> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|s| s.mapped(key))
+    }
+
+    fn local_file(&self, key: &str) -> Option<std::fs::File> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|s| s.local_file(key))
+    }
+
+    fn supports_watch(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|s| s.supports_watch())
+    }
+
+    fn allows_prune(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|s| s.allows_prune())
+    }
+
+    fn drain_pair(&self) -> Option<DrainPair> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|s| s.drain_pair())
+    }
 }
 
 /// The cluster [`Messaging`]: a durable log whose **index** is the Raft state
@@ -1897,6 +2062,155 @@ mod tests {
         }
     }
 
+    /// Drain a `GetObject` body into a `Vec<u8>`.
+    async fn drain(obj: GetObject) -> Vec<u8> {
+        let mut body = obj.body;
+        let mut buf = Vec::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        buf
+    }
+
+    /// PLAN-serve-single-cluster-parity (seal-messaging residual): the late-bound payload-spill
+    /// handle [`LateStorage`] `build_node` wires into [`RaftMessaging`]. UNBOUND ⇒ every spill op
+    /// FAILS CLOSED (never an ambient/uncredentialed fallback); BOUND ⇒ it delegates to the bound
+    /// backend; REBIND ⇒ the latest binding wins. This is the exact indirection the serve path binds
+    /// to the sealed serving backend post-KV.
+    #[tokio::test]
+    async fn late_storage_fails_closed_until_bound_then_delegates() {
+        let late = LateStorage::unbound();
+        assert!(!late.is_bound(), "a fresh handle is unbound");
+
+        // UNBOUND: every async storage op fails closed with the named backend error — NEVER a silent
+        // fallback to an ambient/uncredentialed backend.
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"x")) }).boxed();
+        let err = late
+            .put("mqp/t/1", body, PutMeta::default())
+            .await
+            .expect_err("unbound put must fail closed");
+        assert!(
+            matches!(&err, StorageError::Backend(m) if m == UNBOUND_SPILL_STORE),
+            "unbound put surfaces the named fail-closed error; got: {err}"
+        );
+        assert!(
+            late.get("mqp/t/1").await.is_err(),
+            "unbound get fails closed"
+        );
+        assert!(
+            late.get_range("mqp/t/1", 0, None).await.is_err(),
+            "unbound get_range fails closed"
+        );
+        assert!(
+            late.head("mqp/t/1").await.is_err(),
+            "unbound head fails closed"
+        );
+        assert!(
+            late.delete("mqp/t/1").await.is_err(),
+            "unbound delete fails closed"
+        );
+        assert!(
+            late.list("mqp/").await.is_err(),
+            "unbound list fails closed"
+        );
+        // Sync capability probes fall back to safe defaults when unbound (no mapping/sendfile/watch).
+        assert!(!late.supports_watch(), "unbound supports_watch is false");
+        assert!(late.mapped("mqp/t/1").is_none(), "unbound mapped is None");
+
+        // BIND to a concrete backend (stands in for the SEALED serving backend the post-KV pass binds).
+        let backend = Arc::new(MemStorage::default());
+        late.bind(backend.clone());
+        assert!(late.is_bound(), "bound after bind()");
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"payload")) }).boxed();
+        late.put("mqp/t/1", body, PutMeta::default())
+            .await
+            .expect("bound put delegates");
+        assert!(
+            backend.objects.lock().unwrap().contains_key("mqp/t/1"),
+            "the spill landed in the BOUND backend"
+        );
+        assert_eq!(
+            drain(late.get("mqp/t/1").await.expect("bound get delegates")).await,
+            b"payload",
+            "a bound get reads back through the handle"
+        );
+
+        // REBIND to a DIFFERENT backend: the latest binding wins (idempotent/safe).
+        let backend2 = Arc::new(MemStorage::default());
+        late.bind(backend2.clone());
+        assert!(
+            late.get("mqp/t/1").await.is_err(),
+            "after rebind the new (empty) backend has no prior key"
+        );
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"second")) }).boxed();
+        late.put("mqp/t/2", body, PutMeta::default())
+            .await
+            .expect("rebind put delegates to the NEW backend");
+        assert!(
+            backend2.objects.lock().unwrap().contains_key("mqp/t/2"),
+            "writes now land in the rebound backend"
+        );
+        assert!(
+            !backend.objects.lock().unwrap().contains_key("mqp/t/2"),
+            "the old backend no longer receives writes after rebind"
+        );
+    }
+
+    /// Seal-messaging residual, end-to-end through [`RaftMessaging`]: with the spill store wired as an
+    /// UNBOUND [`LateStorage`] (as `build_node` does on a cluster before `node.kv` exists), a publish
+    /// that must spill (> `INLINE_MAX`, so it hits object storage) FAILS CLOSED — proving the spill
+    /// never silently uses an ambient/uncredentialed backend. After [`LateStorage::bind`] to the
+    /// (sealed) backend — what the post-KV pass does — the SAME publish spills into that backend.
+    #[tokio::test]
+    async fn raft_messaging_spill_fails_closed_until_late_storage_bound() {
+        let sealed = Arc::new(MemStorage::default());
+        let spill = Arc::new(LateStorage::unbound());
+        let (rafts, mqs) = cluster_mq_with_storage(1, spill.clone()).await;
+        let mq = mqs[&1].clone();
+
+        // A payload larger than INLINE_MAX forces the object-store spill path (`!inline`).
+        let big = vec![b'z'; messaging::INLINE_MAX + 1];
+
+        // UNBOUND: the spill `put` inside publish fails closed, so publish returns an error and nothing
+        // is proposed / stored.
+        let err = mq
+            .publish("orders/created", &big)
+            .await
+            .expect_err("a spilling publish must fail closed while the spill store is unbound");
+        assert!(
+            matches!(&err, MessagingError::Backend(m) if m.contains(UNBOUND_SPILL_STORE)),
+            "the unbound spill surfaces the fail-closed backend error; got: {err}"
+        );
+        assert!(
+            sealed.objects.lock().unwrap().is_empty(),
+            "no payload reached the (sealed) backend while unbound"
+        );
+
+        // BIND the spill handle to the sealed backend (the post-KV pass) — now the SAME publish spills.
+        spill.bind(sealed.clone());
+        mq.publish("orders/created", &big).await.expect(
+            "a spilling publish succeeds once the spill store is bound to the sealed backend",
+        );
+        let spilled: Vec<String> = sealed
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("mqp/orders/created/"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            spilled.len(),
+            1,
+            "exactly one payload spilled into the BOUND sealed backend; got {spilled:?}"
+        );
+
+        shutdown(rafts).await;
+    }
+
     /// An initialized `n`-node in-process cluster, each node fronted by a
     /// [`RaftMessaging`] over **one shared** payload store. Returns the rafts
     /// (for shutdown) and the per-node coordinators.
@@ -1906,8 +2220,20 @@ mod tests {
         BTreeMap<NodeId, Raft<TypeConfig>>,
         BTreeMap<NodeId, Arc<RaftMessaging>>,
     ) {
+        cluster_mq_with_storage(n, Arc::new(MemStorage::default())).await
+    }
+
+    /// As [`cluster_mq`], but over a caller-supplied shared payload store — so a test can inject a
+    /// [`LateStorage`] and exercise the seal-messaging late-bind path (the spill store `build_node`
+    /// wires unbound, bound to the sealed backend post-KV).
+    async fn cluster_mq_with_storage(
+        n: u64,
+        storage: Arc<dyn Storage>,
+    ) -> (
+        BTreeMap<NodeId, Raft<TypeConfig>>,
+        BTreeMap<NodeId, Arc<RaftMessaging>>,
+    ) {
         let registry = Registry::default();
-        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
         let bus = InProcessStreamBus::new();
         let config = Arc::new(
             Config {

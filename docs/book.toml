@@ -25,3 +25,10 @@ enable = true
 [output.html.fold]
 enable = true
 level = 1
+
+# Keep old URLs working after the how-to findability restructure (renames).
+# Key = the old published path (from the site root); value = the new page.
+[output.html.redirect]
+"/how-to/migrate.html" = "migrate-from-netlify.html"
+"/how-to/migrate-to-projects.html" = "upgrade-store-to-projects.html"
+"/how-to/migrate-root-key.html" = "rotate-root-key.html"

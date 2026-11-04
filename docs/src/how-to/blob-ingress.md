@@ -1,5 +1,7 @@
 # Ingest large uploads over S3 (blob-ingress)
 
+**For: app developers**
+
 A wasm guest reads blob objects by key through the `wasi:blobstore` binding, but
 it can't accept a multi-gigabyte upload streamed through the sandbox — and a
 browser or a bulk agent shouldn't have to POST bytes through your handler at all.

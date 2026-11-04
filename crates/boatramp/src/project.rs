@@ -241,6 +241,23 @@ enum ProjectCommand {
         /// `--skip-member-mismatch`.
         #[arg(long, requires = "skip_member_mismatch")]
         skip_member_mismatch_any_blob: bool,
+        /// Clone robustness — GET THE TRANSFER THROUGH past a per-blob FAILURE (not just an
+        /// integrity mismatch): forgive the listed error kinds (warn, record, skip that one blob,
+        /// then continue) instead of aborting the whole op. Bare `--continue-on-error` forgives
+        /// EVERY kind; `--continue-on-error=backend,member-mismatch` forgives only those. The kinds
+        /// are `backend` (a blob target-write that survived the backend's retries and the complete
+        /// HEAD-recovery) and `member-mismatch` (the integrity mismatch — the generalised home of
+        /// `--skip-member-mismatch`). Each skipped blob lands in a skip MANIFEST the op reports, for
+        /// `--only-blobs` repair. Default off (hard-fail the first failure).
+        #[arg(long, value_name = "KINDS", num_args = 0..=1, require_equals = true,
+              default_missing_value = "all")]
+        continue_on_error: Option<String>,
+        /// Clone robustness — REPAIR: re-stream ONLY the blob keys named in this skip MANIFEST (the
+        /// file a prior `--continue-on-error` run wrote), restoring nothing else. The blobs are
+        /// pulled again from the source over the SAME streaming path (no local copy, no spool). The
+        /// manifest is the JSON the op reported; read locally and its keys forwarded to the node.
+        #[arg(long, value_name = "MANIFEST")]
+        only_blobs: Option<std::path::PathBuf>,
     },
 }
 
@@ -718,6 +735,29 @@ impl crate::output::Rendered for ProjectOutput {
                         "project import DRY-RUN (no mutation; re-run with --apply):"
                     )?;
                 }
+                // Clone-robustness (PLAN-clone-robustness #3): if the server's report JSON carries
+                // skips, surface a DISTINCT "completed with N skipped" status + the manifest path
+                // BEFORE echoing the raw report (never a silent success). Best-effort parse — a
+                // non-JSON / older report simply skips this line and prints as before.
+                if let Ok(parsed) =
+                    serde_json::from_str::<boatramp_core::project_export::ImportReport>(report)
+                    && parsed.completed_with_skips()
+                {
+                    writeln!(
+                        w,
+                        "COMPLETED WITH {} BLOB(S) SKIPPED (not a clean success):",
+                        parsed.skipped.len()
+                    )?;
+                    for s in &parsed.skipped {
+                        writeln!(w, "  - {} [{}]: {}", s.key, s.kind, s.reason)?;
+                    }
+                    if let Some(path) = &parsed.skip_manifest {
+                        writeln!(
+                            w,
+                            "skip manifest: {path} (repair with `project import --only-blobs {path}`)"
+                        )?;
+                    }
+                }
                 write!(w, "{report}")?;
                 if !report.ends_with('\n') {
                     writeln!(w)?;
@@ -769,6 +809,24 @@ impl crate::output::Rendered for ProjectOutput {
                     "  restored: {} blobs, pg {}, libsql {}, kv {} records",
                     report.blobs, report.pg_databases, report.libsql_databases, report.kv_records,
                 )?;
+                // Clone-robustness (PLAN-clone-robustness #3): a DISTINCT "completed with N skipped"
+                // status, never a silent success — with the manifest path for an `--only-blobs` repair.
+                if report.completed_with_skips() {
+                    writeln!(
+                        w,
+                        "  COMPLETED WITH {} BLOB(S) SKIPPED (not a clean success):",
+                        report.skipped.len()
+                    )?;
+                    for s in &report.skipped {
+                        writeln!(w, "    - {} [{}]: {}", s.key, s.kind, s.reason)?;
+                    }
+                    if let Some(path) = &report.skip_manifest {
+                        writeln!(
+                            w,
+                            "  skip manifest: {path} (repair with `project import --only-blobs {path}`)"
+                        )?;
+                    }
+                }
                 for note in &report.notes {
                     writeln!(w, "  note: {note}")?;
                 }
@@ -972,11 +1030,34 @@ pub async fn run(
             enumerate_mismatches,
             skip_member_mismatch,
             skip_member_mismatch_any_blob,
+            continue_on_error,
+            only_blobs,
         } => {
+            // `--only-blobs <MANIFEST>` repair: read the skip manifest LOCALLY and extract its
+            // TARGET blob keys (the node re-streams exactly these). The manifest format round-trips
+            // with the node's writer via `SkipManifest::from_json` — the same core type.
+            let only_blob_keys = match &only_blobs {
+                Some(path) => {
+                    let bytes = std::fs::read(path).map_err(Error::Io)?;
+                    let manifest = boatramp_core::project_export::SkipManifest::from_json(&bytes)
+                        .map_err(Error::Aborted)?;
+                    manifest.blob_keys().into_iter().collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
+            // `--skip-member-mismatch` is a back-compat ALIAS for `--continue-on-error=member-mismatch`:
+            // fold it into the tolerance value so the one policy drives member-mismatch skipping.
+            let continue_on_error = match (continue_on_error, skip_member_mismatch) {
+                (Some(c), _) => Some(c),
+                (None, true) => Some("member-mismatch".to_string()),
+                (None, false) => None,
+            };
             let mismatch = crate::client::MismatchFlags {
                 enumerate: enumerate_mismatches,
                 skip: skip_member_mismatch,
                 skip_any_blob: skip_member_mismatch_any_blob,
+                continue_on_error,
+                only_blobs: only_blob_keys,
             };
             // STREAMING CLONE from a live source node — a distinct mode (no bundle file).
             if let Some(source_url) = clone_from {

@@ -40,6 +40,17 @@ pub(super) fn negotiate_encoding<'a>(
 #[cfg(feature = "compression")]
 fn is_compressible(content_type: &str) -> bool {
     let ct = content_type.split(';').next().unwrap_or("").trim();
+    // Framed Connect / gRPC-web transports (PLAN-connect-grpc §5.1) carry a sequence of
+    // length-prefixed envelope frames, not a single document, and negotiate any compression
+    // per-message via the envelope's own flag — never HTTP `Content-Encoding`. Applying
+    // transfer compression here would mangle the framing a client does not expect it on, so the
+    // host leaves these bodies untouched (the Connect-first lever: the host streams them as-is).
+    // This is explicit (not merely an allowlist omission) so a later allowlist edit can't corrupt
+    // framing. The bare Connect-unary `application/proto` / `application/json` are a single
+    // message and stay governed by the allowlist below (HTTP-level compression is valid there).
+    if ct.starts_with("application/grpc-web") || ct.starts_with("application/connect+") {
+        return false;
+    }
     matches!(
         ct,
         "application/javascript"
@@ -401,5 +412,37 @@ mod tests {
         assert_eq!(parse_ranges("bytes=500-100", 1000), None); // end < start
         assert_eq!(parse_ranges("bytes=-0", 1000), None); // zero suffix
         assert_eq!(parse_ranges("bytes=0-499", 0), None); // empty resource
+    }
+}
+
+#[cfg(all(test, feature = "compression"))]
+mod compression_tests {
+    use super::is_compressible;
+
+    /// PLAN-connect-grpc §5.1: the framed Connect / gRPC-web transports must never be
+    /// HTTP-layer compressed (that would mangle the length-prefixed envelope framing). Lock the
+    /// invariant so a future edit to the compressible allowlist can't silently reintroduce it.
+    #[test]
+    fn framed_connect_grpc_web_types_are_never_compressible() {
+        for ct in [
+            "application/connect+proto",
+            "application/connect+json",
+            "application/grpc-web+proto",
+            "application/grpc-web",
+            "application/grpc-web+json",
+            "application/grpc-web+proto; charset=utf-8",
+        ] {
+            assert!(!is_compressible(ct), "{ct} must not be compressible");
+        }
+    }
+
+    /// The bare Connect-unary codecs are a single message, so HTTP-level compression stays valid
+    /// (a Connect client handles `Content-Encoding`); and ordinary text still compresses.
+    #[test]
+    fn unary_and_text_remain_compressible() {
+        assert!(is_compressible("application/json"));
+        assert!(is_compressible("text/html; charset=utf-8"));
+        // The bare proto unary type was never in the allowlist (binary proto gains nothing).
+        assert!(!is_compressible("application/proto"));
     }
 }

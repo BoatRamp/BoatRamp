@@ -2,6 +2,15 @@
 /target
 # Nested target dirs for out-of-workspace wasm guest examples/fixtures.
 examples/**/target
+# The Connect client codegen tool is its own workspace (so its prost-build pin is isolated); it
+# builds into its own nested target dir. Its output (examples/connect-clients/src/generated/) IS
+# committed — only the build dir is ignored.
+tools/**/target
+
+# Node (the Connect Web/TS client codegen toolchain, clients/ts). node_modules is restored with
+# `npm ci` from the committed package-lock.json; the generated client (clients/ts/generated/) and
+# the lockfile ARE committed.
+clients/ts/node_modules
 # The web console (crates/boatramp-console) is workspace-excluded, so it builds
 # into its own nested target dir.
 crates/boatramp-console/target

@@ -497,8 +497,9 @@ pub fn from_serve_config(
     // enabling on-demand TLS in production configures `[secrets]`.
     let envelope_wrapped = account_envelope.is_some();
     // DNS-01 propagation knobs (`[serve.on_demand_tls]`): a real readiness poll, max `propagation_wait`,
-    // re-checked every `propagation_poll_interval`. Default to the behaviour-equivalent 15s cap / 2s poll.
-    let propagation_wait = Duration::from_secs(cfg.propagation_wait_secs.unwrap_or(15));
+    // re-checked every `propagation_poll_interval`. Default to a 45s cap / 2s poll — the authoritative-NS
+    // pre-check returns the moment the record is live, so the cap only bounds the slow/fallback case.
+    let propagation_wait = Duration::from_secs(cfg.propagation_wait_secs.unwrap_or(45));
     let propagation_poll_interval =
         Duration::from_secs(cfg.propagation_poll_interval_secs.unwrap_or(2));
     let issuer = Arc::new(AcmeIssuer::new(
@@ -832,10 +833,12 @@ impl CertIssuer for AcmeIssuer {
         };
         let issued = match &self.challenge {
             AcmeChallenge::Dns01(provider) => {
-                // Wire the propagation pre-check so we tell the CA to validate only once the
-                // `_acme-challenge` TXT is live (the fix). If the resolver can't be built, fall back to
-                // the no-pre-check solver (blind `propagation_wait`), no worse than before.
-                match boatramp_acme::acme::HickoryTxtResolver::system() {
+                // Wire the authoritative-NS propagation pre-check so we tell the CA to validate only
+                // once the `_acme-challenge` TXT is live at the zone's own nameservers (the fix for the
+                // recursive-resolver negative-cache race); it falls forward to the recursive resolver
+                // internally. Only if NO recursive resolver can be built do we fall back to the
+                // no-pre-check solver (blind `propagation_wait`), no worse than before.
+                match boatramp_acme::acme::AuthoritativeTxtResolver::system() {
                     Ok(resolver) => {
                         let solver = boatramp_acme::acme::Dns01Solver::with_resolver(
                             provider.as_ref(),
@@ -1666,5 +1669,265 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         println!("ON-DEMAND PEBBLE E2E OK: authorized SNI issued via DNS-01, unauthorized refused");
+    }
+
+    /// SINGLE-NODE serve-level on-demand issuance against Pebble (forward serve-path consolidation
+    /// live gate): build the engine through the SINGLE-NODE production seam [`from_serve_config`] — a
+    /// `KvCertStore` over an in-memory control-plane kv, an always-`|| true` leader, DNS-01 via
+    /// challtestsrv — behind the REAL [`DeployGate`] #02 allowlist, then drive the EDGE resolver. A
+    /// seeded attached+VERIFIED domain issues on the first handshake (served on the retry); a merely-
+    /// attached UNVERIFIED SNI is refused fail-closed. Reuses the `on_demand_issuance_against_pebble`
+    /// harness (pebble + challtestsrv bring-up). `#[ignore]`d — needs `pebble` + `pebble-challtestsrv`
+    /// on PATH (nix dev shell) + binds local ports. Run on lighthouse:
+    /// `cargo test -p boatramp --features acme-dns single_node_on_demand_against_pebble -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
+    async fn single_node_on_demand_against_pebble() {
+        use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+        use std::time::Duration;
+
+        const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
+        const DIRECTORY_URL: &str = "https://localhost:14000/dir";
+
+        struct ChallTestSrv {
+            client: reqwest::Client,
+        }
+        #[async_trait]
+        impl DnsProvider for ChallTestSrv {
+            async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.kind.flat_value() }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+            async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/clear-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+        }
+        struct Child(tokio::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.start_kill();
+            }
+        }
+        fn on_path(bin: &str) -> bool {
+            std::process::Command::new(bin)
+                .arg("-help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+        fn mint_certs(dir: &std::path::Path) -> std::path::PathBuf {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+            let ca_path = dir.join("ca.pem");
+            std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+            std::fs::write(dir.join("cert.pem"), leaf_cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem()).unwrap();
+            ca_path
+        }
+
+        if !on_path("pebble") || !on_path("pebble-challtestsrv") {
+            eprintln!(
+                "skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)"
+            );
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir =
+            std::env::temp_dir().join(format!("br-sn-ondemand-pebble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = mint_certs(&dir);
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": "[::]:14000", "managementListenAddress": "[::]:15000",
+            "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
+            "httpPort": 5002, "tlsPort": 5001, "ocspResponderURL": "" } });
+        let config_path = dir.join("pebble.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let _challtestsrv = Child(
+            tokio::process::Command::new("pebble-challtestsrv")
+                .args([
+                    "-dnsserver",
+                    "127.0.0.1:8053",
+                    "-management",
+                    "127.0.0.1:8055",
+                ])
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble-challtestsrv"),
+        );
+        let _pebble = Child(
+            tokio::process::Command::new("pebble")
+                .args(["-config", config_path.to_str().unwrap()])
+                .args(["-dnsserver", "127.0.0.1:8053"])
+                .env("PEBBLE_VA_NOSLEEP", "1")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble"),
+        );
+        let probe = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .user_agent("boatramp-sn-ondemand-pebble-test")
+            .build()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if probe
+                .get(DIRECTORY_URL)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(ready, "Pebble directory did not become ready");
+        for _ in 0..50 {
+            if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Seed the #02 allowlist on ONE single-node DeployStore: an attached + ownership-VERIFIED
+        // domain (authorized) and a merely-attached, UNVERIFIED domain (must be refused fail-closed).
+        let deploy = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        let proj = ProjectRef::new("shop");
+        let site = SiteName::new("storefront");
+        // Seed order mirrors the PASSING offline gate test `deploy_gate_requires_verification_not_mere_attachment`:
+        // (1) write the merely-ATTACHED, UNVERIFIED name FIRST via a plain whole-config PUT (so it
+        // resolves but is never verified), THEN (2) verify+attach the VERIFIED domain additively.
+        // Order matters: a plain `set_site_config` prunes stale `domain/<host>` index keys, so it must
+        // NOT run AFTER the verified domain is attached (that self-clobbered `www.deploy.test` — the
+        // bug this gate first caught). `attach_verified_domain` is additive and leaves the earlier
+        // `evil.deploy.test` resolvable-but-unverified. (A cooperative PUT does NOT rescue a displaced
+        // verified PRIMARY — it preserves verified ALIASES only — so reordering, not cooperation, is
+        // the fix.)
+        let cfg = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some("evil.deploy.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(proj, "storefront", &cfg)
+            .await
+            .unwrap();
+        deploy
+            .start_domain_verification(
+                proj,
+                &site,
+                "www.deploy.test",
+                boatramp_core::domain_verify::VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        deploy
+            .mark_domain_verified(proj, &site, "www.deploy.test")
+            .await
+            .unwrap();
+        deploy
+            .attach_verified_domain(proj, &site, "www.deploy.test")
+            .await
+            .unwrap();
+
+        // Build the on-demand engine through the SINGLE-NODE production seam — the SAME call `run`
+        // makes for `--tls acme-dns` + an enabled `[serve.on_demand_tls]`.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let cert_store: Arc<dyn CertStore> =
+            Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone()));
+        let provider: Arc<dyn DnsProvider> = Arc::new(ChallTestSrv {
+            client: reqwest::Client::new(),
+        });
+        let od_cfg = boatramp_node::config::OnDemandTlsConfig {
+            enabled: true,
+            challenge: boatramp_node::config::OnDemandChallenge::Dns01,
+            directory_url: Some(DIRECTORY_URL.to_string()),
+            contact_email: Some("ops@example.test".to_string()),
+            // Short propagation wait (the system resolver can't see challtestsrv; Pebble's own VA does).
+            propagation_wait_secs: Some(2),
+            propagation_poll_interval_secs: Some(1),
+            // Unlimited (the gate, not the limiter, is under test).
+            rate_limit_per_hour: Some(0),
+            ..Default::default()
+        };
+        let engine = from_serve_config(
+            &od_cfg,
+            deploy.clone(),
+            cert_store.clone(),
+            Arc::new(|| true),
+            Some(provider),
+            kv.clone(),
+            None,
+            Some(ca_path),
+        )
+        .expect("single-node on-demand engine MUST build when enabled (anti-inert)");
+        let resolver = engine.resolver();
+
+        // First handshake for the VERIFIED SNI: the resolver returns None (triggers issuance in the
+        // worker); poll until the cert is issued + cached, which is what the client's retry serves.
+        let _ = resolver.resolve_sni("www.deploy.test", false);
+        let mut issued = false;
+        for _ in 0..80 {
+            if resolver.resolve_sni("www.deploy.test", false).is_some() {
+                issued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            issued,
+            "a seeded attached+VERIFIED domain must issue on the first handshake (single-node)"
+        );
+        assert!(
+            matches!(cert_store.get("www.deploy.test").await, Ok(Some(_))),
+            "the issued cert is persisted in the single-node cert store"
+        );
+
+        // The UNVERIFIED SNI must be refused fail-closed: trigger it, give the worker time, then
+        // assert nothing was issued (no cert cached, none stored) — the #02 gate, end to end.
+        let _ = resolver.resolve_sni("evil.deploy.test", false);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            resolver.resolve_sni("evil.deploy.test", false).is_none(),
+            "an UNVERIFIED SNI is never served (fail-closed)"
+        );
+        assert!(
+            matches!(cert_store.get("evil.deploy.test").await, Ok(None)),
+            "an UNVERIFIED SNI issues nothing, even against a live CA"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("SINGLE-NODE ON-DEMAND TLS OK");
     }
 }

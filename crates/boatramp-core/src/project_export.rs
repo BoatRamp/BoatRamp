@@ -289,6 +289,158 @@ impl std::fmt::Debug for IdentityChoice {
     }
 }
 
+/// One kind of error a [`ContinueOnError`] policy can be told to forgive during an import/clone.
+/// Kept small + exhaustive so the CLI/API surface is a CLOSED vocabulary — an unknown kind is
+/// rejected fail-closed, never silently treated as "forgive everything".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContinueErrorKind {
+    /// A blob transfer/BACKEND failure that survived the backend's own bounded retries AND the
+    /// `complete_multipart_upload` HEAD-recovery (so the object genuinely did not land) — the NEW
+    /// clone-robustness class. Forgiving it WARNs + RECORDS + SKIPS that one blob (its body is never
+    /// buffered or staged — the stream simply moves on) and the op completes "with N skipped".
+    Backend,
+    /// A member whose streamed bytes disagree with its declared size/SHA-256 — the EXISTING
+    /// integrity-mismatch class (the member-mismatch tolerance framework). Forgiving it routes
+    /// through the SAME `der/`-scoped skip as the legacy `--skip-member-mismatch` (a
+    /// baseline/primary/non-blob mismatch still hard-fails unless separately broadened).
+    MemberMismatch,
+}
+
+impl ContinueErrorKind {
+    /// The stable wire/CLI token (`backend`, `member-mismatch`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backend => "backend",
+            Self::MemberMismatch => "member-mismatch",
+        }
+    }
+
+    /// Parse ONE token (`backend` / `member-mismatch`); the `member_mismatch` underscore spelling is
+    /// also accepted so the query-param surface is forgiving of either separator.
+    pub fn parse_token(token: &str) -> Option<Self> {
+        match token.trim() {
+            "backend" => Some(Self::Backend),
+            "member-mismatch" | "member_mismatch" => Some(Self::MemberMismatch),
+            _ => None,
+        }
+    }
+}
+
+/// The import/clone error-TOLERANCE policy (PLAN-clone-robustness #2) — how far an op pushes past a
+/// per-blob failure instead of aborting the whole transfer:
+/// - [`Off`](Self::Off) (default) — the first still-failing blob HARD-FAILS the op (historical).
+/// - [`AllKinds`](Self::AllKinds) — the bare `--continue-on-error`: forgive EVERY kind.
+/// - [`Kinds`](Self::Kinds) — `--continue-on-error=backend,member-mismatch`: forgive ONLY the listed
+///   kinds; an unlisted kind hard-fails.
+///
+/// A forgiven failure WARNs + RECORDS `(key, kind, reason)` + SKIPS that one blob and continues —
+/// nothing is buffered or spooled. Generalises the legacy `skip_member_mismatch` flag (forgiving
+/// [`ContinueErrorKind::MemberMismatch`] is equivalent to it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ContinueOnError {
+    /// Hard-fail on the first still-failing blob (current behaviour).
+    #[default]
+    Off,
+    /// Forgive EVERY error kind.
+    AllKinds,
+    /// Forgive ONLY the listed kinds; an unlisted kind hard-fails.
+    Kinds(std::collections::BTreeSet<ContinueErrorKind>),
+}
+
+impl ContinueOnError {
+    /// Whether this policy forgives `kind` (⇒ warn + record + skip instead of abort the whole op).
+    pub fn forgives(&self, kind: ContinueErrorKind) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AllKinds => true,
+            Self::Kinds(set) => set.contains(&kind),
+        }
+    }
+
+    /// Whether the policy is the hard-fail default (forgives nothing).
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Parse the CLI/API value, fail-closed. `None`/empty ⇒ [`Off`](Self::Off). A bare sentinel
+    /// (`all`/`any`/`true`) ⇒ [`AllKinds`](Self::AllKinds); `off`/`none`/`false` ⇒ `Off`. Otherwise
+    /// a comma-separated list of kinds (`backend,member-mismatch`); an UNKNOWN token is an error (so
+    /// a typo can never silently degrade to "forgive everything"), returning the offending token.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(Self::Off);
+        };
+        if matches!(value, "all" | "any" | "true") {
+            return Ok(Self::AllKinds);
+        }
+        if matches!(value, "off" | "none" | "false") {
+            return Ok(Self::Off);
+        }
+        let mut set = std::collections::BTreeSet::new();
+        for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            match ContinueErrorKind::parse_token(token) {
+                Some(k) => {
+                    set.insert(k);
+                }
+                None => return Err(token.to_string()),
+            }
+        }
+        if set.is_empty() {
+            Ok(Self::Off)
+        } else {
+            Ok(Self::Kinds(set))
+        }
+    }
+}
+
+/// One blob an import/clone SKIPPED (did not write) because its error kind was forgiven by the
+/// [`ContinueOnError`] policy — recorded so the operator sees exactly what was left behind and can
+/// re-stream it with `--only-blobs`. `key` is the TARGET storage key (as it appears in the target's
+/// own `hblob/{project}/…` scope), so a repair re-streams into the SAME place. Carries no object
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedBlob {
+    /// The TARGET storage key that was not written.
+    pub key: String,
+    /// The forgiven error kind (`backend` / `member-mismatch`).
+    pub kind: String,
+    /// A short operator-level reason (backend error text / integrity-mismatch summary).
+    pub reason: String,
+}
+
+/// The skip-report MANIFEST an import/clone writes when it completed WITH skips — one entry per
+/// skipped blob. It ROUND-TRIPS: [`to_json`](Self::to_json) serialises it (what the node writes
+/// under its base + surfaces the path of), [`from_json`](Self::from_json) parses it back (what
+/// `--only-blobs` reads), and [`blob_keys`](Self::blob_keys) yields the TARGET keys to re-stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipManifest {
+    /// The TARGET project the skipped blobs belong to.
+    pub project: String,
+    /// Every blob that was skipped (one entry each).
+    pub skipped: Vec<SkippedBlob>,
+}
+
+impl SkipManifest {
+    /// Serialise to the on-disk JSON (pretty, newline-terminated).
+    pub fn to_json(&self) -> String {
+        let mut s = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
+        s.push('\n');
+        s
+    }
+
+    /// Parse a manifest written by [`to_json`](Self::to_json). A malformed manifest is an error
+    /// (fail-closed — a repair must never silently transfer nothing because the manifest was junk).
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid skip manifest: {e}"))
+    }
+
+    /// The set of TARGET blob keys to re-stream for an `--only-blobs` repair.
+    pub fn blob_keys(&self) -> std::collections::BTreeSet<String> {
+        self.skipped.iter().map(|s| s.key.clone()).collect()
+    }
+}
+
 /// Flags for an import. `Debug` is hand-written so the adopt transport key cannot leak.
 #[derive(Clone, Default)]
 pub struct ImportOptions {
@@ -326,6 +478,17 @@ pub struct ImportOptions {
     /// explicit opt-in. NEVER tolerates a non-blob (DB/KV/identity) member even so. Ignored unless
     /// `skip_member_mismatch` is set. Default `false`.
     pub skip_any_blob_mismatch: bool,
+    /// Clone-robustness (PLAN-clone-robustness #2): the error-TOLERANCE policy — forgive (warn +
+    /// record + skip) a per-blob failure instead of aborting the whole op. [`ContinueOnError::Off`]
+    /// (default) keeps the hard-fail. GENERALISES [`skip_member_mismatch`](Self::skip_member_mismatch):
+    /// forgiving [`ContinueErrorKind::MemberMismatch`] here is equivalent to that flag, and the two
+    /// are OR-ed when deciding member-mismatch tolerance.
+    pub continue_on_error: ContinueOnError,
+    /// Clone-robustness (PLAN-clone-robustness #3) REPAIR: when `Some`, restore ONLY the blob
+    /// members whose TARGET key is in this set (re-streamed from the source — NO local copy, NO
+    /// spool) and SKIP every other member (blobs not listed + all non-blob members). Built from a
+    /// skip MANIFEST (`--only-blobs`). `None` ⇒ restore everything (the normal path).
+    pub only_blobs: Option<std::collections::BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for ImportOptions {
@@ -339,6 +502,14 @@ impl std::fmt::Debug for ImportOptions {
             .field("enumerate_mismatches", &self.enumerate_mismatches)
             .field("skip_member_mismatch", &self.skip_member_mismatch)
             .field("skip_any_blob_mismatch", &self.skip_any_blob_mismatch)
+            .field("continue_on_error", &self.continue_on_error)
+            .field(
+                "only_blobs",
+                &self
+                    .only_blobs
+                    .as_ref()
+                    .map(std::collections::BTreeSet::len),
+            )
             .finish()
     }
 }
@@ -363,6 +534,25 @@ pub struct ImportReport {
     pub schema_skew: Vec<String>,
     /// Free-form notes (deferred/skipped members, warnings).
     pub notes: Vec<String>,
+    /// Clone-robustness (PLAN-clone-robustness #3): every blob SKIPPED because its error kind was
+    /// forgiven by [`ImportOptions::continue_on_error`]. A NON-EMPTY list makes an APPLIED op a
+    /// DISTINCT "completed with N skipped" outcome (see [`completed_with_skips`](Self::completed_with_skips)) —
+    /// never a silent success. Empty on a clean pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedBlob>,
+    /// The path of the skip-report MANIFEST written under the node base when anything was skipped
+    /// (one entry per skipped blob; feeds the `--only-blobs` repair). `None` on a clean pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_manifest: Option<String>,
+}
+
+impl ImportReport {
+    /// Whether the op left ≥1 blob behind (a forgiven skip) — the DISTINCT "completed with N
+    /// skipped" outcome, as opposed to a clean success. The caller surfaces this as its own status
+    /// rather than a plain OK.
+    pub fn completed_with_skips(&self) -> bool {
+        !self.skipped.is_empty()
+    }
 }
 
 /// Why a project export/import failed.

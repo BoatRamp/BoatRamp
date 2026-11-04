@@ -26,12 +26,21 @@ use crate::blob_fault;
 /// wrapper, [`crate::HedgedStorage`], races the *typical* tail). Applied uniformly so every S3-compatible
 /// backend gets the same ceiling.
 fn with_http_tuning(builder: aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder {
-    builder.timeout_config(
-        aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .operation_attempt_timeout(Duration::from_secs(10))
-            .build(),
-    )
+    builder
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .operation_attempt_timeout(Duration::from_secs(10))
+                .build(),
+        )
+        // Clone-robustness (PLAN-clone-robustness #1): make the SDK's BOUNDED retry EXPLICIT on
+        // every S3 client so a transient `upload_part`/`complete_multipart_upload` fault (5xx /
+        // timeout / throttle) is retried a few times from the SDK's OWN in-flight buffers before it
+        // ever surfaces to the import. `RetryConfig::standard()` is the SDK default under
+        // `behavior-version-latest`, but we pin it here so a future config change can't silently
+        // disable retries. The SDK replays from its own request state — it adds NO disk spill and
+        // NEVER buffers a whole blob (the body is still streamed one `PART_SIZE` part at a time).
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard())
 }
 
 /// Size of each multipart-upload part. S3 requires every part except the last
@@ -433,7 +442,8 @@ impl Storage for S3Storage {
                 let completed = CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
                     .build();
-                self.client
+                match self
+                    .client
                     .complete_multipart_upload()
                     .bucket(&self.bucket)
                     .key(key)
@@ -441,14 +451,57 @@ impl Storage for S3Storage {
                     .multipart_upload(completed)
                     .send()
                     .await
-                    .map_err(sdk_err)?;
-
-                Ok(ObjectMeta {
-                    key: key.to_string(),
-                    size: Some(total),
-                    content_type: meta.content_type,
-                    etag: None,
-                })
+                {
+                    Ok(_) => Ok(ObjectMeta {
+                        key: key.to_string(),
+                        size: Some(total),
+                        content_type: meta.content_type,
+                        etag: None,
+                    }),
+                    Err(err) => {
+                        // HEAD-DISAMBIGUATE a `NoSuchUpload` on `complete` (clone-robustness #1).
+                        // The AWS SDK can RETRY `complete` after a LOST SUCCESS (a network blip
+                        // after the first `complete` actually landed): the object is already
+                        // completed and the upload-id is gone, so the retry sees `NoSuchUpload`
+                        // (404, "retryable") yet replaying the upload-id can never work. Tell that
+                        // recovered success apart from a genuine loss with ONE metadata call — a
+                        // `HEAD`. No body, no storage, no buffering. A present object at the
+                        // EXPECTED size ⇒ the write succeeded; anything else ⇒ propagate the error.
+                        let is_no_such_upload =
+                            err.as_service_error().and_then(ProvideErrorMetadata::code)
+                                == Some("NoSuchUpload");
+                        if is_no_such_upload {
+                            let head = self.head(key).await;
+                            if let Some(recovered) = recover_completed_from_head(
+                                &head,
+                                total,
+                                meta.content_type.clone(),
+                                key,
+                            ) {
+                                tracing::info!(
+                                    key = %key,
+                                    size = total,
+                                    "S3 complete_multipart_upload returned NoSuchUpload but HEAD \
+                                     shows the object present at the expected size — treating as a \
+                                     recovered lost-success (the earlier complete landed; the retry \
+                                     saw the now-consumed upload-id)"
+                                );
+                                return Ok(recovered);
+                            }
+                        }
+                        // Not recoverable — best-effort abort (a NoSuchUpload abort is a harmless
+                        // no-op on an already-gone upload) then propagate the concrete error.
+                        let _ = self
+                            .client
+                            .abort_multipart_upload()
+                            .bucket(&self.bucket)
+                            .key(key)
+                            .upload_id(&upload_id)
+                            .send()
+                            .await;
+                        Err(sdk_err(err))
+                    }
+                }
             }
             Err(err) => {
                 // Best-effort cleanup so a failed stream does not leave an
@@ -621,6 +674,35 @@ fn aws_body_to_stream(body: AwsByteStream) -> ByteStream {
     .boxed()
 }
 
+/// Decide, on a `complete_multipart_upload` failure that looked like a lost-success `NoSuchUpload`,
+/// whether the object actually LANDED. Given the `HEAD` outcome, the byte `total` the parts
+/// streamed, and the object's `content_type`, return `Some(meta)` to treat the write as a SUCCESS
+/// (the object is present at the EXPECTED size — the earlier `complete` landed, the retry just saw
+/// the now-consumed upload-id), or `None` to PROPAGATE the original error (the object is ABSENT, or
+/// present at a DIFFERENT size — a genuine loss / partial). Pure + synchronous so the lost-success
+/// disambiguation is unit-testable without an S3 HTTP mock: it does NO I/O and buffers nothing (the
+/// caller already made the single HEAD call).
+fn recover_completed_from_head(
+    head: &Result<ObjectMeta, StorageError>,
+    total: u64,
+    content_type: Option<String>,
+    key: &str,
+) -> Option<ObjectMeta> {
+    match head {
+        // Present at the expected size ⇒ the write succeeded; carry the real etag from HEAD.
+        Ok(meta) if meta.size == Some(total) => Some(ObjectMeta {
+            key: key.to_string(),
+            size: Some(total),
+            content_type,
+            etag: meta.etag.clone(),
+        }),
+        // Present at a DIFFERENT size (partial/clobbered), size unknown, or ABSENT (NotFound / any
+        // read fault) ⇒ not a recovered success; the caller propagates the concrete `complete`
+        // error.
+        _ => None,
+    }
+}
+
 /// Map any AWS SDK error into a [`StorageError`] with a readable message.
 fn sdk_err<E, R>(err: SdkError<E, R>) -> StorageError
 where
@@ -660,7 +742,82 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::range_header;
+    use super::{range_header, recover_completed_from_head};
+    use boatramp_core::{ObjectMeta, StorageError};
+
+    /// GATE (clone-robustness #1, lost-success HEAD-recovery) — the DECISION `put()` makes when
+    /// `complete_multipart_upload` returns `NoSuchUpload`: a HEAD showing the object PRESENT at the
+    /// expected size is a recovered success (the earlier complete landed); anything else propagates.
+    /// This is the load-bearing, mutation-verifiable seam (no S3 HTTP mock harness exists in the
+    /// tree, and adding one would churn the lockfile with hyper-0.14 test-util deps). `put()` wires
+    /// the real `complete` error + the real HEAD into exactly this function and returns its verdict.
+    #[test]
+    fn complete_recovery_returns_success_only_on_a_present_object_at_the_expected_size() {
+        let total = 42u64;
+        let present_right = Ok(ObjectMeta {
+            key: "hblob/acme/x".into(),
+            size: Some(total),
+            content_type: Some("image/png".into()),
+            etag: Some("\"deadbeef\"".into()),
+        });
+        // (1) NoSuchUpload + HEAD present at the EXPECTED size ⇒ RECOVERED success: the returned
+        // meta carries the streamed total, the caller's content-type, and HEAD's real etag.
+        let recovered = recover_completed_from_head(
+            &present_right,
+            total,
+            Some("image/png".into()),
+            "hblob/acme/x",
+        );
+        let meta = recovered.expect("present at the expected size must recover as success");
+        assert_eq!(meta.size, Some(total));
+        assert_eq!(meta.content_type.as_deref(), Some("image/png"));
+        assert_eq!(meta.etag.as_deref(), Some("\"deadbeef\""));
+
+        // (2) NoSuchUpload + HEAD ABSENT (a genuine loss) ⇒ PROPAGATE (None).
+        let absent: Result<ObjectMeta, StorageError> =
+            Err(StorageError::NotFound("hblob/acme/x".into()));
+        assert!(
+            recover_completed_from_head(&absent, total, Some("image/png".into()), "hblob/acme/x")
+                .is_none(),
+            "an absent object must NOT be treated as a recovered success"
+        );
+
+        // (3) NoSuchUpload + HEAD present but WRONG size (partial/clobbered) ⇒ PROPAGATE (None).
+        let present_wrong = Ok(ObjectMeta {
+            key: "hblob/acme/x".into(),
+            size: Some(total - 1),
+            content_type: None,
+            etag: None,
+        });
+        assert!(
+            recover_completed_from_head(&present_wrong, total, None, "hblob/acme/x").is_none(),
+            "a size disagreement is a genuine loss, never a recovery"
+        );
+
+        // (4) HEAD present but size UNKNOWN ⇒ PROPAGATE (can't prove the bytes landed).
+        let present_unknown = Ok(ObjectMeta {
+            key: "hblob/acme/x".into(),
+            size: None,
+            content_type: None,
+            etag: None,
+        });
+        assert!(
+            recover_completed_from_head(&present_unknown, total, None, "hblob/acme/x").is_none(),
+            "an unknown HEAD size cannot confirm a landed write"
+        );
+
+        // (5) A read fault on HEAD ⇒ PROPAGATE.
+        let fault: Result<ObjectMeta, StorageError> = Err(StorageError::BackendRead {
+            reason: "503 SlowDown".into(),
+            status: Some(503),
+            code: Some("SlowDown".into()),
+            request_id: None,
+        });
+        assert!(
+            recover_completed_from_head(&fault, total, None, "hblob/acme/x").is_none(),
+            "a HEAD read fault is not evidence of a landed write"
+        );
+    }
 
     /// GATE (v0.7.5, blob-read-404 = 416 InvalidRange on Tigris) — a whole-object read MUST NOT forge
     /// an out-of-range explicit end. Mutation-verified: revert `range_header` to the old

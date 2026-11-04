@@ -141,6 +141,16 @@ pub struct HostTenancy {
     /// branches its injected tenant predicate on it. CRITICAL: an empty-fact `Tenant` principal
     /// (anonymous/null) and a `System` principal differ ONLY in this marker (see [`PrincipalKind`]).
     principal_kind: PrincipalKind,
+    /// **Pre-auth seal-only firm** (construens #2 — `TenantSource::PreAuthRequest`). The firm
+    /// resolved host-side from an UNSCOPED login-start request, carried as a seal-only subject whose
+    /// SOLE consumer is the `sealed-state:mint` binding (so the mint can seal it into the OIDC login
+    /// `state`). It is DELIBERATELY **not** a [`ScopeAxis::Tenant`] fact: it never drives RLS/ORM row
+    /// scoping, is never returned by [`value`](Self::value)/[`rls_tenant_value`](Self::rls_tenant_value),
+    /// and is never the `resolved_tenant` a `tenant-secrets`/`wasi:blobstore` binding keys on — so
+    /// `/start` grants NO data access (scoped reads deny, `tenant-secrets` is `no-resolved-tenant`)
+    /// until `/callback` unseals the firm. `None` on every ordinary invocation. The confinement is
+    /// structural (the absence of a `Tenant` fact), not a bolt-on guard.
+    preauth_seal_subject: Option<String>,
 }
 
 impl HostTenancy {
@@ -185,6 +195,7 @@ impl HostTenancy {
             unscoped_writes: std::collections::BTreeSet::new(),
             pass_unresolved: false,
             principal_kind: PrincipalKind::Tenant,
+            preauth_seal_subject: None,
         }
     }
 
@@ -210,7 +221,29 @@ impl HostTenancy {
         self.facts.clear();
         self.read = AccessMode::Null;
         self.write = AccessMode::Null;
+        // A system principal is never a pre-auth login-start; drop any seal-only subject defensively.
+        self.preauth_seal_subject = None;
         self
+    }
+
+    /// Attach a **pre-auth seal-only firm** (construens #2 — [`TenantSource::PreAuthRequest`](boatramp_core::tenancy::TenantSource)):
+    /// the firm resolved host-side from an UNSCOPED login-start request, confined to feed ONLY the
+    /// `sealed-state:mint` binding. It is NOT a tenant fact — it never scopes data — so the common
+    /// (`None`) path and every test caller need not name it. Set ONLY at the resolve choke, from the
+    /// host-validated configured firm; a `Target`/`System`/ordinary principal always leaves it `None`.
+    #[must_use]
+    pub fn with_preauth_seal_subject(mut self, firm: Option<String>) -> Self {
+        self.preauth_seal_subject = firm;
+        self
+    }
+
+    /// The pre-auth seal-only firm (construens #2), if this invocation resolved one — the host-
+    /// validated configured firm the `sealed-state:mint` binding seals into the OIDC login `state`.
+    /// `None` for every ordinary/target/system invocation. DELIBERATELY distinct from
+    /// [`value`](Self::value)/[`facts`](Self::facts): it is never a data `Tenant` fact, so it drives
+    /// no RLS/ORM scoping and is never the `resolved_tenant` a `tenant-secrets`/blob binding keys on.
+    pub fn preauth_seal_subject(&self) -> Option<&str> {
+        self.preauth_seal_subject.as_deref()
     }
 
     /// Attach this route's #503 per-route write-global allowlist (its
@@ -325,6 +358,8 @@ impl HostTenancy {
             // A target principal is a `TargetTenant` read of ANOTHER tenant's public subset — a tenant
             // class, never the system class.
             principal_kind: PrincipalKind::Tenant,
+            // A target principal is never a pre-auth login-start (own/target never co-occur).
+            preauth_seal_subject: None,
         }
     }
 

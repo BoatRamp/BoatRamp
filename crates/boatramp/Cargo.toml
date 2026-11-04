@@ -14,6 +14,15 @@ repository.workspace = true
 description = "boatramp — self-hosted, streaming-first static site publishing (server + CLI in one binary)"
 default-run = "boatramp"
 
+# The crate is a library + a thin binary shim. The library (`src/lib.rs`) holds the
+# whole CLI surface — the clap command tree, every subcommand, and the server — so
+# in-workspace tooling (`cargo xtask gen-docs`) can introspect the EXACT command tree
+# this binary parses, via `boatramp::cli_command()`, without re-exec'ing the binary.
+# The binary (`src/main.rs`) is a one-line shim over `boatramp::main_entry()`.
+[lib]
+name = "boatramp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "boatramp"
 path = "src/main.rs"
@@ -224,6 +233,10 @@ http3 = ["tls", "boatramp-server/http3"]
 acme-dns = [
   "tls",
   "boatramp-node/acme-dns",
+  # The on-demand per-SNI TLS issuer (`on_demand_tls`) is now `acme-dns`-gated (not `cluster`), and its
+  # `IssuanceGate`/`CertIssuer`/`ChallengeSolver` traits are `#[async_trait]` — so `acme-dns` must pull
+  # `async-trait` itself (previously it rode in via `cluster`/`overlay`).
+  "dep:async-trait",
   "dep:boatramp-acme",
   "boatramp-acme/acme",
   "boatramp-acme/cloudflare",

@@ -1,5 +1,7 @@
 # Back up & restore
 
+**For: operators**
+
 boatramp keeps its state in a few well-defined places. Back up each one, and a
 restore is putting them back and re-verifying. There is no single dump command —
 you snapshot the backends you configured.

@@ -5988,3 +5988,627 @@ async fn project_export_libsql_true_delta_chain_and_crafted_escape_gate() {
 
     println!("PROJECT EXPORT LIBSQL TRUE-DELTA CHAIN OK");
 }
+
+/// **Live clone self-provision on a Shared tenant** (PLAN-clone-self-provision-managed-db;
+/// Tier-2 / nightly — needs a Docker daemon AND a Postgres server whose DSN user can `CREATE
+/// ROLE`/`CREATE DATABASE`). Self-skips.
+///
+/// Reproduces construens's exact clone failure shape and proves the fix end-to-end through the
+/// REAL `NodeProjectExport` driver (not a hand-rolled SQL reproduction, like the other
+/// `_chunked_shadow_live` tests): ONE Shared Postgres server is ALREADY up and serving an
+/// EXISTING tenant (`src`, provisioned + seeded through the shipped `provision_tenant` path,
+/// exactly as a real project would be) when a clone targets a BRAND-NEW tenant project
+/// (`fresh`) whose own database was NEVER provisioned on that already-healthy server —
+/// construens's "database … does not exist" readiness-probe failure, reached via the SAME
+/// sidecar `restore_member` arm a Shared binding's FULL dump always takes (`plan_export` frames
+/// a Shared managed pg dump non-chunked). Before the fix, `driver.import(.., apply: true, ..)`
+/// fails exactly that way; with the fix it self-provisions `fresh`'s own database first, so the
+/// clone succeeds and the restored row matches the source.
+///
+/// Also proves, in the SAME run (the tenancy-gate + idempotency discipline) — and now every
+/// cross-tenant assertion acts AS THE SIBLING tenant's LOGIN role (or fresh's own non-superuser
+/// roles), NEVER the superuser, so a grant leak the superuser would be blind to is caught:
+/// - **Restore-window negative control (the HIGH cross-tenant repro)**: while the clone runs and
+///   the driver holds the shadow in existence, a concurrent loop as the sibling's login role
+///   discovers the `<fresh_db>__shadow_%` names from `pg_database` and HAMMERS CONNECT attempts —
+///   ZERO must succeed, the shadow's `datacl` never shows PUBLIC CONNECT, and no sibling session is
+///   ever attached (the terminate-sweep ran). Non-vacuous: the prober must actually see the shadow.
+/// - **Post-clone confidentiality**: the sibling cannot connect to `fresh`'s live db or read its
+///   rows; `fresh`'s OWN owner + runtime roles can; `fresh`'s db has PUBLIC CONNECT revoked.
+/// - **No surviving injected object**: `fresh`'s db holds no object owned by a role other than its
+///   own owner/runtime roles.
+/// - **Teardown**: no `<fresh_db>__shadow_%` db and no `brexp_apply_%` role remain after success.
+/// - **Target-scoped only**: a THIRD, pre-existing tenant (`other`) is seeded and verified
+///   UNCHANGED after the clone into `fresh` — self-provisioning `fresh` must never create,
+///   touch, or affect `other`'s database.
+/// - **Idempotent**: importing the SAME bundle into the now-provisioned `fresh` AGAIN
+///   (`overwrite: true`) succeeds with no clobber/error — a retry-safe re-provision.
+#[tokio::test]
+async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
+    use async_trait::async_trait;
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        sanitize_ident, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live clone self-provision not run)");
+        return;
+    };
+    let Some((superuser, su_password, host, port, maint_db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live clone self-provision not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "clonesp";
+    let s = now_suffix();
+    let src_project = format!("clonesp-src-{s}");
+    let fresh_project = format!("clonesp-fresh-{s}");
+    let other_project = format!("clonesp-other-{s}");
+
+    let maint = conn(&superuser, &su_password, &host, port, &maint_db);
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "SHOW server_version_num; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("version maps to a client image");
+
+    // --- control plane: MemoryKv + a throwaway FsStorage-backed DeployStore + a reversible
+    // test envelope (mirrors `repair_reconcile_pg_live.rs`'s established live-gate fixture). ---
+    struct RevEnvelope;
+    #[async_trait]
+    impl KeyEnvelope for RevEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(&self, w: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-clone-selfprov-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+    // Pre-seal the SUPERUSER credential under the SAME key `provision_shared` + the server-init
+    // env injector read — `(DEFAULT_PROJECT, COMPUTE)` — to the test URL's ACTUAL password (a
+    // plain `.password()` would mint a random one the real server would reject).
+    let sealed_su = envelope
+        .wrap(su_password.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+
+    // Seed ONE healthy, ALREADY-Provisioned replica of the `pg` workload pointing at the test
+    // Postgres — "the shared server is already up," exactly construens's shape. No container is
+    // launched; the resolver just needs a healthy endpoint in the deploy store.
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+
+    let db_name = |project: &str| tenant_db_name(DATABASE, &sanitize_ident(project));
+    let direct = |db: &str| conn(&superuser, &su_password, &host, port, db);
+
+    // Teardown any prior run (re-runnable).
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name(p)),
+        )
+        .await;
+    }
+
+    // === Provision + seed the SOURCE and the OTHER (pre-existing sibling) tenant through the
+    // SHIPPED path — exactly as a normal first managed-sql access would. ===
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+    provision_tenant(&deploy, &kv, &envelope, &binding, &other_project, "")
+        .await
+        .expect("provision the pre-existing sibling tenant");
+
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&src_project)),
+        "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (1,'alpha'),(2,'beta');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed source tenant table");
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (99,'untouched');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed the pre-existing sibling tenant");
+    let other_before = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+
+    // --- the driver, wired exactly like the normal serve path (managed pg context). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-clone-selfprov-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-clone-selfprov-blobs-{s}")),
+    ));
+    // Hold the SHARED shadow in existence (CREATED + LOCKED DOWN) for a few seconds so the
+    // concurrent sibling prober below can observe it and prove a sibling can never CONNECT to it —
+    // the direct repro of the HIGH restore-window finding. Test-only (inert in production).
+    const SHADOW_WINDOW_DELAY_MS: u64 = 6_000;
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_shadow_restore_test_delay_ms(SHADOW_WINDOW_DELAY_MS);
+
+    // === The SIBLING tenant's real LOGIN role + password (never the superuser) — the identity the
+    // cross-tenant assertions act as. `other` is a legitimate, already-provisioned sibling on the
+    // SAME shared cluster; its login role can connect to its OWN database and read the world-readable
+    // `pg_database`, but must be unable to reach `fresh`'s shadow or live db. ===
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let other_ident = sanitize_ident(&other_project);
+    let other_role = tenant_role_name(COMPUTE, &other_ident);
+    let other_pw = creds
+        .password(&other_project, &format!("{COMPUTE}/{other_ident}"))
+        .await
+        .expect("sibling login credential");
+    let other_login = conn(
+        &other_role,
+        &other_pw,
+        &host,
+        port,
+        &db_name(&other_project),
+    );
+    let fresh_db = db_name(&fresh_project);
+    // The driver bounds the shadow name to Postgres's 63-byte NAMEDATALEN by TRUNCATING the live-db
+    // prefix while keeping the full `__shadow_<suffix>` distinguisher (see `bounded_derived_db_name`),
+    // so a tenant-qualified `fresh_db` (already ~62 bytes) no longer appears verbatim in the shadow
+    // name — a `'{fresh_db}__shadow_%'` LIKE would never match. Discover the shadow by a
+    // guaranteed-retained prefix of `fresh_db` + the intact `__shadow_` marker. The helper always
+    // keeps `>= 63 - len("__shadow_") - len(suffix)` (~27) bytes of the live prefix, so the first 20
+    // bytes of `fresh_db` are always present; the `%` then spans the truncation point + the suffix.
+    // This import is the only one on the cluster, so no sibling shadow can match this pattern.
+    let fresh_prefix: String = fresh_db.chars().take(20).collect();
+    let shadow_like = format!("{fresh_prefix}%__shadow_%");
+
+    // === EXPORT the source tenant (FULL) through the driver — a Shared binding frames its pg
+    // dump SIDECAR (non-chunked), the exact member shape `restore_member`'s PgDump arm handles. ===
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(
+                &src_project,
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: false,
+                    transport_key: None,
+                    delta: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("driver export of the source tenant");
+        sink.into_inner()
+    };
+
+    // === IMPORT into the BRAND-NEW `fresh` tenant — construens's exact shape: its own db was
+    // NEVER provisioned on the already-healthy shared server. Before the fix this fails with the
+    // readiness-probe "database … does not exist"; with the fix it self-provisions first.
+    //
+    // RESTORE-WINDOW NEGATIVE CONTROL (the direct repro of the HIGH cross-tenant finding): while the
+    // clone runs — the driver HOLDS the shadow in existence for `SHADOW_WINDOW_DELAY_MS` after it is
+    // created + locked down — a concurrent loop acts AS THE SIBLING tenant's login role, discovers
+    // the `<fresh_db>__shadow_%` names from the world-readable `pg_database`, and HAMMERS CONNECT
+    // attempts at them. The gate: ZERO successful sibling connects for the clone's whole duration
+    // (every attempt must be `permission denied for database`), the shadow's `datacl` never shows
+    // PUBLIC CONNECT, and the shadow never carries a sibling session (the terminate-sweep ran). On
+    // the pre-fix shape (PUBLIC-CONNECT left on the shadow across a separate-container CREATE→REVOKE
+    // gap, no terminate-sweep) a sibling connects during this window and the gate FAILS; with the fix
+    // (gap-free CREATE+REVOKE+sweep, plus a pre-restore sweep) it holds. `shadow_sightings > 0` makes
+    // the control non-vacuous: the prober MUST have actually seen the shadow while it existed. ===
+    let done = Arc::new(AtomicBool::new(false));
+    let import_fut = {
+        let done = done.clone();
+        let driver = &driver;
+        let bundle = bundle.clone();
+        let fresh_project = fresh_project.clone();
+        async move {
+            let mut source = futures::io::Cursor::new(bundle);
+            let r = driver
+                .import(
+                    &fresh_project,
+                    &mut source,
+                    ImportOptions {
+                        apply: true,
+                        force: true,
+                        overwrite: false, // a genuinely fresh target — no prior data to overlay.
+                        identity: IdentityChoice::Fresh,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            done.store(true, Ordering::SeqCst);
+            r
+        }
+    };
+    let probe_fut = {
+        let backend = backend.clone();
+        let image = image.clone();
+        let done = done.clone();
+        let other_login = other_login.clone();
+        let other_role = other_role.clone();
+        let other_pw = other_pw.clone();
+        let shadow_like = shadow_like.clone();
+        let host = host.clone();
+        async move {
+            let mut sightings = 0u32;
+            let mut connect_successes: Vec<String> = Vec::new();
+            let mut public_connectable: Vec<String> = Vec::new();
+            let mut sibling_sessions: Vec<String> = Vec::new();
+            while !done.load(Ordering::SeqCst) {
+                // Enumerate the live shadow(s) AS THE SIBLING (pg_database is world-readable).
+                let (_c, listing) = psql(
+                    backend.as_ref(),
+                    &image,
+                    &other_login,
+                    &format!("SELECT datname FROM pg_database WHERE datname LIKE '{shadow_like}'"),
+                )
+                .await;
+                for shadow in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    sightings += 1;
+                    // (a) a DIRECT connect attempt to the shadow as the sibling role — must be
+                    // refused. `psql` exits non-zero on a refused connect (merged stderr carries
+                    // "permission denied for database"); code == 0 means it got IN (a leak).
+                    let sconn = conn(&other_role, &other_pw, &host, port, shadow);
+                    let (code, out) = psql(backend.as_ref(), &image, &sconn, "SELECT 1").await;
+                    if code == 0 {
+                        connect_successes.push(format!("{shadow} => {out}"));
+                    }
+                    // (b) datacl + session witnesses, both read AS THE SIBLING from the global
+                    // catalogs: PUBLIC must NOT hold CONNECT on the shadow, and no sibling session
+                    // may be attached to it (proves REVOKE + the terminate-sweep held).
+                    let (_c2, witness) = psql(
+                        backend.as_ref(),
+                        &image,
+                        &other_login,
+                        &format!(
+                            "SELECT has_database_privilege('public', '{shadow}', 'CONNECT') || '|' \
+                             || (SELECT count(*) FROM pg_stat_activity WHERE datname = '{shadow}' \
+                             AND usename = '{other_role}')"
+                        ),
+                    )
+                    .await;
+                    if let Some((pub_conn, sib_sessions)) = witness.trim().split_once('|') {
+                        if pub_conn.trim() == "t" {
+                            public_connectable.push(shadow.to_string());
+                        }
+                        if sib_sessions.trim() != "0" {
+                            sibling_sessions.push(format!(
+                                "{shadow} has {} sibling session(s)",
+                                sib_sessions.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+            (
+                sightings,
+                connect_successes,
+                public_connectable,
+                sibling_sessions,
+            )
+        }
+    };
+    let (import_res, (sightings, connect_successes, public_connectable, sibling_sessions)) =
+        tokio::join!(import_fut, probe_fut);
+    let report = import_res.expect(
+        "clone into a fresh, never-provisioned Shared tenant must now self-provision \
+         and succeed (construens's failure shape, fixed)",
+    );
+    assert!(
+        report.pg_databases >= 1,
+        "the clone restored at least one pg database"
+    );
+    // The negative control is non-vacuous: the prober genuinely observed the shadow while it existed.
+    assert!(
+        sightings > 0,
+        "the restore-window prober never saw a {shadow_like} database — the window was not \
+         exercised (vacuous); raise SHADOW_WINDOW_DELAY_MS"
+    );
+    assert!(
+        connect_successes.is_empty(),
+        "CROSS-TENANT LEAK: the sibling tenant CONNECTED to the restoring shadow during the clone \
+         window ({sightings} sighting(s)): {connect_successes:?}"
+    );
+    assert!(
+        public_connectable.is_empty(),
+        "the shadow had PUBLIC CONNECT during the window (datacl not locked down): {public_connectable:?}"
+    );
+    assert!(
+        sibling_sessions.is_empty(),
+        "a sibling session was attached to the shadow (terminate-sweep did not evict it): {sibling_sessions:?}"
+    );
+
+    // ROW equality on the newly self-provisioned target.
+    let got = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&fresh_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        got, "1:alpha\n2:beta",
+        "fresh tenant restored the source's rows"
+    );
+
+    // === POST-CLONE CONFIDENTIALITY (as the SIBLING + as FRESH's OWN roles, never the superuser).
+    // The cloned live db must be grant-isolated EXACTLY like a freshly-provisioned tenant db: the
+    // sibling cannot connect to it or read its rows; fresh's own roles can; PUBLIC CONNECT is off. ===
+    let fresh_ident = sanitize_ident(&fresh_project);
+    let fresh_login_role = tenant_role_name(COMPUTE, &fresh_ident);
+    let fresh_login_pw = creds
+        .password(&fresh_project, &format!("{COMPUTE}/{fresh_ident}"))
+        .await
+        .expect("fresh login credential (minted at self-provision)");
+    let fresh_owner_role = tenant_owner_role_name(COMPUTE, &fresh_ident);
+    let fresh_owner_pw = creds
+        .password(&fresh_project, &format!("{COMPUTE}/{fresh_ident}/owner"))
+        .await
+        .expect("fresh owner credential (minted at self-provision)");
+
+    // The sibling tenant CANNOT connect to fresh's live db and so cannot read its rows.
+    let (code, out) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&other_role, &other_pw, &host, port, &fresh_db),
+        "SELECT count(*) FROM t",
+    )
+    .await;
+    assert_ne!(
+        code, 0,
+        "CROSS-TENANT LEAK: the sibling connected to fresh's live db + read its rows: {out}"
+    );
+    assert!(
+        out.contains("permission denied for database"),
+        "the sibling must be refused at CONNECT to fresh's live db (got: {out})"
+    );
+    // fresh's OWN runtime + owner roles CAN connect (the re-provision re-granted them).
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&fresh_login_role, &fresh_login_pw, &host, port, &fresh_db),
+        "SELECT 1",
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "fresh's own runtime role must be able to connect to its db"
+    );
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&fresh_owner_role, &fresh_owner_pw, &host, port, &fresh_db),
+        "SELECT 1",
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "fresh's own owner role must be able to connect to its db"
+    );
+    // PUBLIC CONNECT is revoked on the live cloned db (read AS THE SIBLING from the global catalog).
+    let (_c, pub_conn) = psql(
+        backend.as_ref(),
+        &image,
+        &other_login,
+        &format!("SELECT has_database_privilege('public', '{fresh_db}', 'CONNECT')"),
+    )
+    .await;
+    assert_eq!(
+        pub_conn.trim(),
+        "f",
+        "the cloned live db must have PUBLIC CONNECT revoked (datacl) like a provisioned tenant"
+    );
+
+    // === NO SURVIVING INJECTED OBJECT: every object in a non-system schema of the cloned db is
+    // owned by fresh's OWN owner/runtime roles — never a sibling/intruder role (connected as fresh's
+    // OWN owner role, the natural non-superuser identity that can read its own db's catalog). ===
+    let (code, foreign_objs) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&fresh_owner_role, &fresh_owner_pw, &host, port, &fresh_db),
+        &format!(
+            "SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+             AND c.relkind IN ('r','v','m','S','p') \
+             AND r.rolname NOT IN ('{fresh_owner_role}','{fresh_login_role}')"
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "enumerate fresh's objects as its own owner role");
+    assert_eq!(
+        foreign_objs.trim(),
+        "0",
+        "an object owned by a role other than fresh's owner/runtime roles survived the clone \
+         (a possible in-window injected object): {foreign_objs}"
+    );
+
+    // TENANCY GATE: the pre-existing sibling tenant is byte-for-byte UNCHANGED.
+    let other_after = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&other_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        other_after, other_before,
+        "self-provisioning the fresh target must not touch the pre-existing sibling tenant"
+    );
+
+    // IDEMPOTENCY: re-importing the SAME bundle into the now-provisioned `fresh` target is a
+    // clean, no-clobber success (retry-safe).
+    let report2 = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: true, // now has prior data from the first import.
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-importing into an already-provisioned target is idempotent")
+    };
+    assert!(
+        report2.pg_databases >= 1,
+        "the re-import still restored the pg database"
+    );
+    let got_again = psql(
+        backend.as_ref(),
+        &image,
+        &direct(&db_name(&fresh_project)),
+        "SELECT id || ':' || v FROM t ORDER BY id",
+    )
+    .await
+    .1;
+    assert_eq!(
+        got_again, "1:alpha\n2:beta",
+        "idempotent re-import — rows unchanged, no clobber"
+    );
+
+    // === TEARDOWN: after a successful clone, NEITHER a transient shadow database NOR the ephemeral
+    // apply role survives (the swap renamed the shadow in + dropped the eph role; a failure path
+    // would have dropped the shadow). Read AS THE SIBLING from the world-readable catalogs. ===
+    let (_c, leftover_shadows) = psql(
+        backend.as_ref(),
+        &image,
+        &other_login,
+        &format!("SELECT count(*) FROM pg_database WHERE datname LIKE '{shadow_like}'"),
+    )
+    .await;
+    assert_eq!(
+        leftover_shadows.trim(),
+        "0",
+        "a {shadow_like} shadow database leaked past a successful clone: {leftover_shadows}"
+    );
+    let (_c, leftover_roles) = psql(
+        backend.as_ref(),
+        &image,
+        &other_login,
+        "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'brexp_apply_%'",
+    )
+    .await;
+    assert_eq!(
+        leftover_roles.trim(),
+        "0",
+        "an ephemeral brexp_apply_% apply role leaked past a successful clone: {leftover_roles}"
+    );
+
+    // --- cleanup (best-effort) ---
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name(p)),
+        )
+        .await;
+    }
+
+    println!("PROJECT EXPORT CLONE SELF-PROVISION SHARED TENANT OK");
+}

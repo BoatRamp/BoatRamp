@@ -568,12 +568,42 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         crate::compute::spawn_internal_dns(config.compute.as_ref(), &compute_backends, &deploy);
     // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener +
     // build the resolver when a sql provider and `compute.sql_shim_url` are both present.
+    // Then, when a sqlx engine + a `[secrets]` envelope are present, WRAP it with the
+    // managed-DB DSN resolver (PLAN-compute-managed-db-dsn Phase 1): a workload bound to a
+    // managed co-located Postgres/MySQL gets a real `postgres://`/`mysql://` DSN injected
+    // (operator-templatable), while per-site libsql / external bindings keep falling through
+    // to the shim. No envelope ⇒ no managed-credential path ⇒ just the shim, as before.
     #[cfg(feature = "handlers")]
-    let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
-        handlers.sql_backends(),
-        config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
-    )
-    .await;
+    let sql_resolver = {
+        let shim = boatramp_server::sql_shim::spawn_sql_shim(
+            handlers.sql_backends(),
+            config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
+        )
+        .await;
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        let resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> =
+            match secrets_envelope.clone() {
+                Some(envelope) => {
+                    Some(Arc::new(crate::managed_db_dsn::ManagedDbDsnResolver::wrap(
+                        shim,
+                        config
+                            .handlers
+                            .as_ref()
+                            .and_then(|h| h.bindings.sql.as_ref())
+                            .map(|sql| sql.databases.clone())
+                            .unwrap_or_default(),
+                        deploy.clone(),
+                        kv.clone(),
+                        envelope,
+                        secret_store.clone(),
+                    )))
+                }
+                None => shim,
+            };
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        let resolver = shim;
+        resolver
+    };
     #[cfg(not(feature = "handlers"))]
     let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
@@ -582,18 +612,32 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // `compute.blob_shim_url` are both present, so a workload's `--bind blob` reaches the
     // SAME per-site `hblob/{qualified-site}/…` namespace a `wasi:blobstore` handler sees.
     #[cfg(feature = "handlers")]
-    let blob_resolver = boatramp_server::blob_shim::spawn_blob_shim(
-        handlers.blob_backends(),
-        config
-            .compute
-            .as_ref()
-            .and_then(|c| c.blob_shim_url.clone()),
-        config
-            .compute
-            .as_ref()
-            .and_then(|c| c.blob_shim_max_object_bytes),
-    )
-    .await;
+    let blob_resolver = {
+        // The direct-S3 STS minter (PLAN-compute-managed-resources Phase 3): when the node wires
+        // guest blob-upload minting (local S3 face or a cloud broker), a `--bind blob:<container>`
+        // ALSO gets short-lived `TempCredentials` + `AWS_*` env so an off-the-shelf S3 client talks
+        // DIRECTLY to R2/Tigris — the HMAC shim stays the full-R/W fallback. `()` (no minter) in a
+        // build without `blob-upload`; `None` when minting is not offered ⇒ the HMAC shim only.
+        // The slot is `(minter, max_ttl_secs, max_bytes_ceiling)` — exactly what the minter
+        // accessor returns (the operator ceilings ride through to the direct-S3 STS mint).
+        #[cfg(feature = "blob-upload")]
+        let mint_slot = handlers.blob_upload_minter();
+        #[cfg(not(feature = "blob-upload"))]
+        let mint_slot = ();
+        boatramp_server::blob_shim::spawn_blob_shim(
+            handlers.blob_backends(),
+            config
+                .compute
+                .as_ref()
+                .and_then(|c| c.blob_shim_url.clone()),
+            config
+                .compute
+                .as_ref()
+                .and_then(|c| c.blob_shim_max_object_bytes),
+            mint_slot,
+        )
+        .await
+    };
     #[cfg(not(feature = "handlers"))]
     let blob_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
@@ -614,6 +658,25 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(feature = "handlers"))]
     let messaging_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
+    // Activate the compute kv-shim (PLAN-compute-bindings): the symmetric sibling of the
+    // sql/blob/messaging shims — bind its listener + build the resolver when the node's
+    // control-plane kv store and `compute.kv_shim_url` are both present, so a workload's
+    // `--bind kv` reaches the SAME per-site `hkv/{qualified-site}/…` namespace a `wasi:keyvalue`
+    // handler sees. Unlike sql/blob, there is no per-project provider to look up — `handlers.kv()`
+    // is the one store every site shares, namespaced by key prefix.
+    #[cfg(feature = "handlers")]
+    let kv_resolver = boatramp_server::kv_shim::spawn_kv_shim(
+        handlers.kv(),
+        config.compute.as_ref().and_then(|c| c.kv_shim_url.clone()),
+        config
+            .compute
+            .as_ref()
+            .and_then(|c| c.kv_shim_max_value_bytes),
+    )
+    .await;
+    #[cfg(not(feature = "handlers"))]
+    let kv_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
+
     // Retain a clone of the blob resolver (before it is moved into the reconcile chain) so
     // the dev/CI affordance `POST /api/compute/dev-bind-blob` can mint + register a blob
     // credential for a non-managed local process through the EXACT managed `resolve` path.
@@ -624,13 +687,23 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let dev_messaging_bind_resolver = messaging_resolver.clone();
 
     // One resolver for the reconcile: each shim filters to its own binding kind, so chaining
-    // them lets a workload declaring `sql`, `blob`, and/or `messaging` bindings be served by all
-    // three from a single `resolve` call.
+    // them lets a workload declaring `sql`, `blob`, `messaging`, and/or `kv` bindings be served
+    // by all of them from a single `resolve` call.
     let binding_resolver = boatramp_core::compute::ChainedBindingResolver::chain([
         sql_resolver,
         blob_resolver,
         messaging_resolver,
+        kv_resolver,
     ]);
+    // PLAN-compute-managed-resources Phase 3: wrap the per-surface chain in the UNIFIED render
+    // stage, so an operator `env` value templating ANY surface — `{{sql.dsn}}`, `{{kv.token}}`,
+    // `{{blob.access_key}}`, `{{messaging.url}}` — plus `{{secret.NAME}}` is rendered ONCE,
+    // server-side, at launch (fail-closed on an unknown key). The per-surface resolvers now only
+    // CONTRIBUTE their `{surface}.*` vars + defaults; this stage holds the sealed-secret store and
+    // does the single render. `None` chain ⇒ no wrap (the feature stays off).
+    let binding_resolver = binding_resolver.map(|chain| {
+        crate::managed_env_template::RenderStageResolver::wrap(chain, secret_store.clone())
+    });
 
     // Managed compute-backed SQL (PLAN-managed-compute-sql P2-b): if the handler
     // `sql` config declares any managed database, inject its `POSTGRES_*`/`MYSQL_*`
@@ -949,8 +1022,19 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // `POST /api/compute/maintenance/reap` (System·Admin) AND the alerting loop's orphan
     // scan + opt-in auto-reap. Clone the registry before the reconcile loop consumes the
     // original below.
+    // The reaper also runs the orphan DYNAMIC-DB-credential sweep (PLAN-compute-managed-db
+    // phase 2, Security HIGH-1) on its full passes, so hand it a clone of the managed-DB
+    // resolver (the same one the reconcile uses) when one is wired — `None` on a node with no
+    // managed SQL binding / no secrets envelope, where the sweep is simply inert.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let reaper_dynamic_cred_sweeper = managed_db_resolver.clone();
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let reaper_dynamic_cred_sweeper: Option<
+        Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>,
+    > = None;
     let compute_reaper: Arc<dyn boatramp_core::compute::ComputeReaper> = Arc::new(
-        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone(), node_id),
+        crate::compute::NodeComputeReaper::new(compute_backends.clone(), deploy.clone(), node_id)
+            .with_dynamic_cred_sweeper(reaper_dynamic_cred_sweeper),
     );
 
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(

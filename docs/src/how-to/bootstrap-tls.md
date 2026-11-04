@@ -1,5 +1,7 @@
 # Reach the control plane on day zero (`--tls rpk`)
 
+**For: operators**
+
 Before a host has a certificate, the control-plane API is normally reached over
 plaintext loopback, an SSH tunnel, or a TLS-terminating proxy. On a bare-metal or
 VPS node you often want an **encrypted, authenticated** control channel from the

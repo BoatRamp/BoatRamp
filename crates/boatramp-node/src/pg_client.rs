@@ -218,6 +218,43 @@ pub fn psql_invocation(conn: &PgConnection, sql: &str) -> SqlInvocation {
     }
 }
 
+/// Build a `psql` invocation that runs SEVERAL trusted, we-generate-it statements back-to-back in
+/// ONE psql process — each as its OWN implicit transaction, via a REPEATED `-c` per statement.
+///
+/// This is deliberately NOT a single `-c "s1; s2; …"` string: psql wraps a multi-statement `-c`
+/// string in ONE implicit transaction, which `CREATE DATABASE` forbids ("CREATE DATABASE cannot
+/// run inside a transaction block"). Repeated `-c` runs each statement in its own autocommit
+/// transaction in the SAME connection, so `CREATE DATABASE` is legal AND the statements that must
+/// be GAP-FREE stay inside a single connection/container launch.
+///
+/// The security reason this exists (SHARED-tenant shadow restore): a fresh `CREATE DATABASE` grants
+/// PUBLIC CONNECT by default, so on a shared cluster the shadow is briefly connectable by a sibling
+/// tenant. Running `CREATE DATABASE` + `REVOKE CONNECT … FROM PUBLIC` (+ a terminate-sweep) as
+/// separate `psql -c` invocations put a whole container spawn between grant and revoke — a large
+/// cross-tenant restore-window. Batching them here collapses that window to a few back-to-back
+/// statements on one connection. `ON_ERROR_STOP=1` aborts the whole run (non-zero exit) on the
+/// first failed statement, so a failed `CREATE DATABASE`/`REVOKE` is never mistaken for success.
+///
+/// Each `sql` is a constant/identifier-composed statement WE build (never a credential, never
+/// bundle-derived data), so argv is correct; the only secret, the password, still rides in
+/// `PGPASSWORD` (the env), never argv.
+pub fn psql_script_invocation(conn: &PgConnection, statements: &[String]) -> SqlInvocation {
+    let mut argv = vec![
+        "psql".to_string(),
+        "-v".to_string(),
+        "ON_ERROR_STOP=1".to_string(),
+        "-tA".to_string(),
+    ];
+    for sql in statements {
+        argv.push("-c".to_string());
+        argv.push(sql.clone());
+    }
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
 /// Build the `pg_restore` invocation that applies the **attacker-crafted bundle dump** into a
 /// pre-created SHADOW database (inc2 Stage C) — the UNTRUSTED side of the atomic-shadow split.
 ///
@@ -566,6 +603,58 @@ mod tests {
                 inv.argv.get(pos + 1).map(String::as_str),
                 Some(conn().database.as_str()),
                 "the target database must follow -d"
+            );
+        }
+    }
+
+    #[test]
+    fn psql_script_runs_each_statement_in_its_own_transaction() {
+        // The SHARED-shadow gap-closer: CREATE DATABASE + REVOKE CONNECT + terminate-sweep must
+        // ride ONE psql process with a REPEATED `-c` per statement (each its own txn — so CREATE
+        // DATABASE is legal), NEVER a single `-c "s1; s2"` string (which psql wraps in ONE txn that
+        // CREATE DATABASE forbids). A mutation that joined the statements into one `-c` string, or
+        // dropped a statement, fails here.
+        let c = conn();
+        let stmts = vec![
+            "CREATE DATABASE \"app__shadow_1\" OWNER \"brexp_apply_1\"".to_string(),
+            "REVOKE CONNECT ON DATABASE \"app__shadow_1\" FROM PUBLIC".to_string(),
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'app__shadow_1' \
+             AND pid <> pg_backend_pid()"
+                .to_string(),
+        ];
+        let inv = psql_script_invocation(&c, &stmts);
+        assert_eq!(inv.argv[0], "psql");
+        assert!(inv.argv.iter().any(|a| a == "ON_ERROR_STOP=1"));
+        // Exactly ONE `-c` per statement (repeated `-c`), and each statement present verbatim and
+        // on its own — so each runs in its own implicit transaction.
+        assert_eq!(
+            inv.argv.iter().filter(|a| a.as_str() == "-c").count(),
+            stmts.len(),
+            "one repeated -c per statement, never a single joined -c string: {:?}",
+            inv.argv
+        );
+        for s in &stmts {
+            assert!(
+                inv.argv.iter().any(|a| a == s),
+                "statement must appear verbatim as its own -c arg: {s:?}"
+            );
+        }
+        // No statement was concatenated into another (`; ` joiner) — the whole point of repeated -c.
+        assert!(
+            !inv.argv.iter().any(|a| a.contains("; ")),
+            "statements must not be joined into one transaction-wrapping -c string: {:?}",
+            inv.argv
+        );
+        // The credential is in the env, never argv.
+        assert!(
+            inv.env
+                .iter()
+                .any(|(k, v)| k == "PGPASSWORD" && v == &c.password)
+        );
+        for a in &inv.argv {
+            assert!(
+                !a.contains(&c.password),
+                "credential leaked into argv: {a:?}"
             );
         }
     }

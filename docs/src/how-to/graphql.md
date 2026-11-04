@@ -1,5 +1,7 @@
 # Serve a GraphQL API
 
+**For: app developers**
+
 A GraphQL API on boatramp is a normal Wasm handler that speaks GraphQL (for
 example built with [async-graphql]). Point boatramp at it, turn on
 `[handlers.graphql]`, and the platform treats GraphQL as a protocol it

@@ -62,7 +62,7 @@ Two independent defenses reduce the blast radius without touching custody:
 
 - **A root-pubkey *set*.** `cluster.root_pubkeys` is a set, enabling
   make-before-break **root rotation** (add the new anchor, re-sign, retire the
-  old) with no rejection window — see [Migrate the root key](../how-to/migrate-root-key.md).
+  old) with no rejection window — see [Rotate the root key](../how-to/rotate-root-key.md).
 - **A distinct mesh-admission signer.** You can mint join tokens (and member
   assertions) with a **separate key** from the admin-token root and trust it via
   `auth rotate-root --add <admission-pubkey>`. The join path verifies against the
@@ -89,6 +89,6 @@ resolves to *removed*.
 ## See also
 
 - [Deploy a self-hosted cluster](../how-to/deploy-cluster.md)
-- [Migrate the root key](../how-to/migrate-root-key.md)
+- [Rotate the root key](../how-to/rotate-root-key.md)
 - [Bootstrap TLS & pinning](../how-to/bootstrap-tls.md)
 - [Auth model](./auth-model.md)

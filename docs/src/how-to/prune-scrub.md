@@ -1,5 +1,7 @@
 # Garbage-collect & verify integrity
 
+**For: operators**
+
 `boatramp prune` reclaims disk by deleting orphaned deployments and the blobs no
 deployment references. `boatramp scrub` re-hashes every stored blob to confirm
 its content still matches its key. Run prune to recover space; run scrub to catch

@@ -1,0 +1,34 @@
+// The Connect / gRPC-web SERVER-STREAM example service (PLAN-connect-grpc §9 / IU-5 client codegen).
+//
+// The client-side counterpart of the identically-defined service the boatramp-uchron-shim repo
+// serves (`examples/connect-ticker`): the SAME `connect.ticker.v1.Ticker/Subscribe` the host
+// Connect-server-stream GUEST live gate stands up. Vendored here so the host repo's Nix-pinned
+// client codegen (`just codegen`) compiles it into the VENDORED/committed Rust client
+// (`examples/connect-clients/src/generated/`) and the Web/TypeScript connect-es client — with no
+// cross-repo path dependency. The codegen derives the `Subscribe` method's server-streaming kind
+// from the proto `stream` keyword.
+//
+// Keep the message + service definitions byte-for-byte in step with the shim repo's copy.
+syntax = "proto3";
+
+package connect.ticker.v1;
+
+// A subscription request: how many ticks to emit before the stream ends cleanly.
+message SubscribeRequest {
+  // Number of ticks to emit (bounded by the guest). Zero emits the guest's default.
+  uint32 count = 1;
+}
+
+// One streamed tick.
+message Tick {
+  // Monotonic sequence number, starting at 1.
+  int64 seq = 1;
+  // A free-form note on the tick.
+  string note = 2;
+}
+
+// A minimal server-streaming ticker.
+service Ticker {
+  // Subscribe to a bounded stream of ticks (one request, a stream of responses).
+  rpc Subscribe(SubscribeRequest) returns (stream Tick);
+}

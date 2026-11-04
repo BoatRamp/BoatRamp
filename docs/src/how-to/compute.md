@@ -1,5 +1,7 @@
 # Run a container or microVM
 
+**For: operators & app developers**
+
 A **compute workload** runs a long-lived server — a container image or a
 microVM — behind a route, next to your static content and Wasm handlers. Use it
 when a Wasm handler is not enough: an existing container image, a language
@@ -296,7 +298,7 @@ boatramp compute set pg --image postgres:16 --port 5432 \
 ```
 
 **Managed databases do this for you.** When a handler `sql` binding is sourced from a
-database boatramp runs (see [Managed SQL](./handler-bindings.md)), boatramp applies a
+database boatramp runs (see [Managed SQL](./handler-binding-sql.md#managed-sql-on-a-database-boatramp-runs)), boatramp applies a
 privilege strategy automatically — no `--user`/`--cap-add` needed. The strategy is
 `[compute].managed_db_privilege`: `rootless` (the default — run as the image's DB user
 against its pre-owned volume, no capabilities, any posture) or `caps` (add the minimal
@@ -349,6 +351,216 @@ The command's stdout and stderr are printed and `boatramp` exits with the comman
 own exit code. It runs against a live, healthy replica; there is no guarantee of
 which replica for a multi-replica workload, so target a single-replica workload (a
 managed database is one) for state-changing commands.
+
+## Bind a workload to a managed data store (`--bind`)
+
+A native compute workload (container/microVM/docker — not a wasm handler) can reach
+the **same** per-site managed data stores a wasm handler sees through
+`wasi:keyvalue`/`wasi:blobstore`/`wasi:messaging`/`sql`, via `compute set --bind
+<kind>[:<name>]` (repeatable):
+
+```sh
+boatramp compute set app --image myapp:latest --port 8080 \
+  --bind sql --bind kv:cache --bind blob:assets --bind messaging:deliver
+```
+
+| Kind | Reaches | Injected env |
+| --- | --- | --- |
+| `sql` / `sql:<name>` | The site's default database, or a named external one. | `BOATRAMP_SQL_URL` |
+| `kv` / `kv:<bucket>` | The per-site `hkv/{site}/…` key/value store (default bucket, or one named bucket). | `BOATRAMP_KV_URL` |
+| `blob` / `blob:<container>` | The per-site `hblob/{site}/…` blob store (default, or one named container). | `BOATRAMP_BLOB_URL` |
+| `messaging` / `messaging:<topic>` | BOTH halves of the project bus — publish AND consume (claim/ack/nack). | `BOATRAMP_MESSAGING_URL` |
+| `invoke` | Compute → function calls. **Declared only** — it parses and round-trips, but no shim backs it yet, so no env is injected (Phase 3). | — |
+
+The `sql` endpoint above is the libsql / hrana shim. When the `sql` target is a
+**managed co-located Postgres/MySQL** database instead, boatramp injects a real
+`postgres://` / `mysql://` **DSN** (operator-templatable) — see [Use a managed
+Postgres/MySQL from a compute workload](#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn)
+below.
+
+A bare `kv`/`blob` (no `:<name>`) is **site-wide** — the workload can read/write
+every bucket/container in the site's namespace; a bare `messaging` is
+**project-bus-wide** (any topic). Name a target (`kv:cache`, `blob:assets`,
+`messaging:deliver`) to confine the credential. Each shim binds only the host its
+`[compute].<kind>_shim_url` names (the bridge gateway / loopback, never all
+interfaces) — unset (the default), the corresponding `--bind` kind parses but
+injects no env, so declaring it grants nothing until the operator configures the
+shim. See [`kv_shim_url`/`blob_shim_url`/`messaging_shim_url`/`sql_shim_url` and
+their `*_max_*_bytes` size caps](../reference/boatramp-cfg.md#compute) in the
+config reference.
+
+## Use a managed Postgres/MySQL from a compute workload (a real DSN)
+
+The `sql` binding above hands a **libsql / hrana** endpoint — the right shape for
+the site's default per-site database, but not something an off-the-shelf
+Postgres/MySQL driver can speak. When the `sql` binding instead targets a
+**boatramp-managed, co-located Postgres or MySQL** database (a `databases:` entry
+boatramp runs — see [Declare a managed database](./managed-databases.md)), boatramp
+injects a **real `postgres://` / `mysql://` DSN** instead, so a stock app, ORM, or
+migration tool with a standard driver Just Works — no boatramp shim or token to
+understand.
+
+The backend is **auto-detected** by the binding's target: a managed pg/mysql DB → a
+real DSN; the per-site libsql default (or an external `url_env` database) → the
+libsql shim endpoint + token, exactly as before.
+
+### The default (simple case)
+
+Declare the managed DB, then bind it by name. With no further configuration the
+workload receives two env vars:
+
+| Env var | What it holds |
+| --- | --- |
+| `BOATRAMP_SQL_URL` (or the binding's `url_env`) | the full **runtime** DSN — `postgres://<user>:<pass>@<host>:<port>/<db>` |
+| `BOATRAMP_SQL_URL_MIGRATION` (or the binding's `migration_url_env`) | the **migration/DDL** DSN (the owner-role identity) |
+
+```ron
+// project.cfg (apply manifest)
+(
+  project: "acme",
+  databases: [ ( name: "app", kind: postgres, size: medium, tenant: single ) ],
+  compute: [
+    ( name: "simertec",
+      spec: (
+        root: image("ghcr.io/acme/simertec:1"), vcpus: 1, mem_mib: 512, port: 8080,
+        bindings: [ ( kind: sql, name: "app" ) ],
+      ),
+      replicas: 1 ),
+  ],
+)
+```
+
+The workload's env then carries (password redacted):
+
+```text
+BOATRAMP_SQL_URL=postgres://app:***@pg-acme_3f9c…:5432/appdb
+BOATRAMP_SQL_URL_MIGRATION=postgres://app:***@pg-acme_3f9c…:5432/appdb
+```
+
+Override the var NAMES on the binding (defaults: `BOATRAMP_SQL_URL` and
+`<url_env>_MIGRATION`):
+
+```ron
+bindings: [ ( kind: sql, name: "app",
+              url_env: "SIMERTEC_DATABASE_URL",
+              migration_url_env: "SIMERTEC_MIGRATE_URL" ) ]
+```
+
+### Operator-templatable env (the general mechanism)
+
+The operator decides **exactly** what env the workload receives. The resolved
+connection is exposed as **template variables** you reference from the workload's
+own `env:` map (or `compute set --env K=V`); a value containing a `{{…}}`
+placeholder is rendered **server-side** at launch and replaces the template:
+
+| Variable | Value |
+| --- | --- |
+| `{{sql.host}}` | the managed DB's internal-DNS name |
+| `{{sql.port}}` | the engine port (`5432` / `3306`) |
+| `{{sql.user}}` `{{sql.password}}` `{{sql.database}}` | the runtime role, its password, the database |
+| `{{sql.dsn}}` | the ready-made runtime DSN |
+| `{{sql.migration_user}}` `{{sql.migration_password}}` `{{sql.migration_dsn}}` | the migration/DDL identity |
+| `{{sql.<name>.*}}` | the same for a *named* binding (e.g. `{{sql.analytics.host}}`) |
+| `{{secret.<NAME>}}` | a sealed project secret, unsealed server-side |
+
+```ron
+env: {
+  // one DSN with your own query params
+  "SIMERTEC_DATABASE_URL": "postgres://{{sql.user}}:{{sql.password}}@{{sql.host}}:{{sql.port}}/{{sql.database}}?sslmode=require",
+  // …or discrete libpq-style vars
+  "PGHOST": "{{sql.host}}", "PGPORT": "{{sql.port}}", "PGUSER": "{{sql.user}}",
+  "PGPASSWORD": "{{sql.password}}", "PGDATABASE": "{{sql.database}}",
+  // …or a mix of DB parts, a static param, and a referenced sealed secret
+  "APP_DSN": "postgres://{{sql.user}}:{{sql.password}}@{{sql.host}}/{{sql.database}}?application_name=simertec",
+  "STRIPE_KEY": "{{secret.stripe_key}}",
+}
+```
+
+The DB password and any referenced secret are unsealed **server-side** at launch and
+injected only into this workload's env; rendered secret values are never logged. A
+hand-set **literal** env value (no `{{…}}`) is left untouched; a template that can't
+be fully rendered (an unknown placeholder, an unset secret) is left in place and
+logged, so a typo is diagnosable rather than silently half-filled.
+
+### Reachability & tenancy
+
+- **Host** is the managed DB workload's **internal-DNS name** (`pg-<ident>` — see
+  [Reach a sibling workload by name](#reach-a-sibling-workload-by-name-internal-dns)),
+  not a numeric IP, so the DSN survives a DB relaunch and re-resolves to the live
+  healthy replica at connect time. It needs `compute.internal_dns` (on by default on
+  the Linux container backend). **Port** is the engine's standard bridge port
+  (`5432` / `3306`).
+- The DB is resolved for the workload's **own project** (from the workload key), so a
+  workload can never compose another tenant's DSN — it is the same per-tenant database
+  + credential a handler for that project's `sql.open("app")` would get.
+- Phase-1 limit: a `shared`-tenant managed DB in a **non-default project** runs under
+  the reserved default project, which that project's container cannot resolve by
+  internal name — use the default `tenant: single` for a compute-bound managed DB.
+
+### Dynamic per-replica credential
+
+For a **`shared`**, non-default, project-scoped managed DB the runtime DSN carries a
+**dynamic, per-replica role** minted at launch and dropped at stop, anchored to a
+stable per-tenant owner role (so schema ownership never orphans across rotations).
+The workload contract is unchanged — it still just reads a DSN from its env — but the
+password is now short-lived and scoped to that one replica. Every other cell (the
+default tenant, a `single`-isolation DB, a bring-your-own `url_env` binding) keeps the
+static per-tenant credential. The **migration/DDL** identity always stays the stable
+owner role.
+
+## Templatable env for `kv`, `blob`, and `messaging`
+
+The same `{{…}}` mechanism the managed DSN uses works for the other surfaces: each
+`--bind` resolver contributes a `{surface}.*` namespace that the **one** render stage
+expands server-side at launch (an operator value may interleave surfaces and sealed
+secrets in a single string — `"{{kv.url}}?token={{kv.token}}"`). Every surface still
+injects its back-compat default env (`BOATRAMP_<KIND>_URL` + `_AUTH_TOKEN`), so a
+workload that templates nothing keeps working. The `{surface}.<name>.*` form also
+answers for a named binding (e.g. `{{kv.cache.token}}`).
+
+| Variable | Value |
+| --- | --- |
+| `{{kv.url}}` `{{kv.token}}` | the kv-shim base URL + the per-replica bearer token |
+| `{{messaging.url}}` `{{messaging.token}}` | the messaging-shim base URL + the per-replica bearer token |
+| `{{blob.url}}` `{{blob.token}}` | the blob-shim base URL + the per-replica bearer token (full R/W, via the HMAC shim) |
+| `{{blob.endpoint}}` `{{blob.region}}` `{{blob.bucket}}` | direct-S3: the R2/Tigris endpoint, region, and bucket (= the container) |
+| `{{blob.access_key}}` `{{blob.secret}}` `{{blob.session_token}}` `{{blob.prefix}}` | direct-S3: the short-lived STS key pair, session token, and key prefix (whole-container ⇒ empty) |
+
+The kv/messaging/blob-HMAC tokens are per-replica bearers the shim mints at launch and
+**revokes on stop** (they are registry-backed, never stateless — a token never outlives
+its replica), so an off-the-shelf HTTP client in the container reaches exactly the
+per-site `hkv/`/`hblob/` namespace or project bus a `wasi:*` handler sees.
+
+### Direct-to-R2/Tigris for `blob` (the `AWS_*` convention)
+
+When the node wires guest blob-upload minting and the workload binds a **named**
+container (`--bind blob:<container>`), that binding ALSO gets short-lived S3
+`TempCredentials` so an off-the-shelf S3 client (or the AWS SDK) talks **directly** to
+R2/Tigris — no shim hop. The default env follows the AWS SDK convention:
+
+| Default env var | From |
+| --- | --- |
+| `AWS_ENDPOINT_URL` | `{{blob.endpoint}}` |
+| `AWS_ACCESS_KEY_ID` | `{{blob.access_key}}` |
+| `AWS_SECRET_ACCESS_KEY` | `{{blob.secret}}` |
+| `AWS_SESSION_TOKEN` | `{{blob.session_token}}` |
+| `AWS_REGION` | `{{blob.region}}` |
+| `BOATRAMP_BLOB_BUCKET` | `{{blob.bucket}}` (= the container) |
+
+Notes:
+
+- The HMAC shim (`BOATRAMP_BLOB_URL` + `_AUTH_TOKEN`, `{{blob.url}}`/`{{blob.token}}`)
+  is **kept** alongside — it covers the full R/W namespace (the direct-S3 credential is
+  write-scoped: `PutObject` + multipart).
+- A **bare** `--bind blob` (no container) and any backend with **no real STS** (local
+  `fs`/dev) fall back to the HMAC shim only — never a blank or partial credential.
+- The `AWS_*` defaults are injected only when the workload has a **single** `blob`
+  binding (multiple would make the unqualified `AWS_*` ambiguous — then template the
+  named `{{blob.<container>.*}}` vars into whatever env each client reads).
+- STS credentials are leased by a **wall-clock TTL** (the operator ceiling) rather than
+  actively revoked on stop — AWS-style session credentials are stateless-verifiable, so
+  they **let-expire**; a relaunch mints fresh ones. The HMAC token is the revoke-on-stop
+  fallback.
 
 ## Reach a sibling workload by name (internal DNS)
 

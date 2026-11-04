@@ -826,8 +826,18 @@
               # `.mcp.json`) launches it via `nix develop --command playwright-mcp`.
               pkgs.playwright-mcp
               # Node.js for the JS function template's `jco componentize` build
-              # (`boatramp function build` fetches a version-pinned `jco` via npx).
+              # (`boatramp function build` fetches a version-pinned `jco` via npx) AND the Connect
+              # Web/TypeScript client codegen (PLAN-connect-grpc IU-5): `just codegen` runs
+              # `npm ci` + `buf generate` with the exact-pinned `@bufbuild/protoc-gen-es` from
+              # `clients/ts/package-lock.json`.
               pkgs.nodejs
+              # Connect / gRPC-web client codegen (PLAN-connect-grpc §9 / IU-5): `buf` drives the
+              # multi-language client generation (the Web/TS connect-es client day-one; the
+              # Go/Swift/Kotlin/Python one-liners), and `protobuf` provides the `protoc` that the
+              # Rust `prost-build` codegen (`tools/connect-codegen`) shells out to. Pinned via
+              # flake.lock, so `just codegen` is reproducible (regenerate twice ⇒ identical bytes).
+              pkgs.buf
+              pkgs.protobuf
               # uv for the Python function template's `componentize-py` build
               # (`boatramp function build` runs it version-pinned via `uvx`).
               pkgs.uv
@@ -874,6 +884,9 @@
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
             # libclang for bindgen (aws-lc-rs) when building `--features s3`.
             LIBCLANG_PATH = lib.makeLibraryPath [ pkgs.llvmPackages.libclang.lib ];
+            # Point `prost-build` (the Connect client codegen, tools/connect-codegen) at the pinned
+            # protoc so `just codegen` never picks up a stray system protoc.
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
 
             shellHook = ''
               echo "boatramp dev shell ready — run 'just' to list tasks."
@@ -1270,7 +1283,7 @@
                 # docker usable for the ephemeral client containers) — a self-skip still prints
                 # `ok`, so require the exact passed count AND every success marker, exactly like
                 # the host-runner job's grep gate.
-                assert re.search(r"test result: ok\. 19 passed", out), "not all 19 tests ran (silent skip?)"
+                assert re.search(r"test result: ok\. 20 passed", out), "not all 20 tests ran (silent skip?)"
                 for marker in [
                     "PROJECT EXPORT ROUNDTRIP OK",
                     "PROJECT EXPORT PG CHUNKED SHADOW OK",

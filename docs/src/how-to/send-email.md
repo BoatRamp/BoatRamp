@@ -1,5 +1,7 @@
 # Send email from a function or handler
 
+**For: app developers**
+
 A function or handler often needs to send mail — a signup-verification link, a
 password reset, a receipt. boatramp offers this as a first-class, **per-project**
 capability: the guest imports `email` and calls `send`; boatramp holds the SMTP

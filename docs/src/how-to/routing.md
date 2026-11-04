@@ -1,5 +1,7 @@
 # Configure routing
 
+**For: operators & app developers**
+
 Routing rules — redirects, rewrites, response headers, an SPA fallback, clean
 URLs, the trailing-slash policy, and custom error documents — live in the
 `routing` section of `project.cfg`. This section folds into the immutable
@@ -97,7 +99,7 @@ project.cfg: routing OK (2 redirects, 1 rewrite, 1 header rule, clean_urls on)
 
 Migrating from Netlify or Cloudflare Pages? `sync` folds `_redirects` and
 `_headers` files into this config, so you keep those rules without rewriting them
-— see [Migrate from Netlify / Cloudflare Pages](./migrate.md).
+— see [Migrate from Netlify / Cloudflare Pages](./migrate-from-netlify.md).
 
 ## Publish and verify
 

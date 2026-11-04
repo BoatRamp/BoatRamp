@@ -479,6 +479,28 @@ pub fn validate_namespace(namespace: &str) -> Result<(), ConfigError> {
 /// refused (the conservative v1 stance — relax later if a safe mixed pattern is needed).
 pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), ConfigError> {
     use crate::tenancy::TenantSource;
+    // construens #2 — a `PreAuthRequest` (seal-only pre-auth firm) must be the SOLE source on its
+    // route (like `system_when`): a seal-only firm must never co-resolve with a real data tenant.
+    // Validate the selector + refuse any mix (a loud 422; the runtime `resolve_from_sources` backstop
+    // refuses the same mix fail-closed even if apply was bypassed).
+    if sources
+        .iter()
+        .any(|s| matches!(s, TenantSource::PreAuthRequest { .. }))
+    {
+        if sources.len() != 1 {
+            return Err(ConfigError::pattern(
+                "sources",
+                "a `pre_auth_request` source must be the ONLY source on its route — a seal-only \
+                 pre-auth firm must never share a route with a real tenant-producing source (token, \
+                 domain, signed_context, sealed_state); declare the login-start route with \
+                 `sources: [(kind: \"pre_auth_request\", selector: (...))]` alone"
+                    .to_string(),
+            ));
+        }
+        if let TenantSource::PreAuthRequest { selector } = &sources[0] {
+            validate_preauth_selector(selector)?;
+        }
+    }
     let mut seen_namespaces: Vec<&str> = Vec::new();
     for s in sources {
         if let TenantSource::Token {
@@ -512,6 +534,38 @@ pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), 
     Ok(())
 }
 
+/// Apply-time validation of a [`TenantSource::PreAuthRequest`] selector (construens #2): a
+/// non-empty `name` for the `query`/`path`/`body` locations (the `host` location ignores it), and a
+/// body-size cap within [`PREAUTH_BODY_MAX_BYTES_CEILING`]. A 422 at apply, never a silent runtime
+/// deny.
+pub fn validate_preauth_selector(
+    selector: &crate::tenancy::PreAuthSelector,
+) -> Result<(), ConfigError> {
+    use crate::tenancy::{PREAUTH_BODY_MAX_BYTES_CEILING, PreAuthLocation};
+    // The `host` location uses the whole routed-host context tag, so its `name` is ignored; every
+    // other location needs a non-empty extraction name.
+    if !matches!(selector.location, PreAuthLocation::Host) && selector.name.trim().is_empty() {
+        return Err(ConfigError::pattern(
+            "selector.name",
+            "a pre_auth_request selector needs a non-empty `name` (the query param / path label / \
+             body field the firm selector is read from) for every location except `host`"
+                .to_string(),
+        ));
+    }
+    if let Some(cap) = selector.max_body_bytes
+        && cap > PREAUTH_BODY_MAX_BYTES_CEILING
+    {
+        return Err(ConfigError::pattern(
+            "selector.max_body_bytes",
+            format!(
+                "pre_auth_request body-size cap {cap} exceeds the ceiling \
+                 {PREAUTH_BODY_MAX_BYTES_CEILING}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a `Scoped` route's `sources` list mixes a **namespaced** token source with an
 /// **un-namespaced** tenant-producing source (a plain token, a `domain`, or a `signed_context`).
 /// Such a mix shares one flat key space, so an un-namespaced value (which an attacker may influence
@@ -539,10 +593,28 @@ pub fn sources_mix_is_forbidden(sources: &[crate::tenancy::TenantSource]) -> boo
             // it shares the flat key space exactly like a domain / signed-context source — mixing it
             // with a namespaced token is the same cross-tenant-collision hazard, refused identically.
             | TenantSource::SealedState { .. } => any_unnamespaced = true,
+            // A `PreAuthRequest` produces a SEAL-ONLY subject, never a data tenant key, so it shares
+            // no flat key space — the namespaced-mix hazard does not apply. (It is refused on any
+            // mixed route anyway by the sole-source rule in `validate_sources` + the runtime
+            // backstop.) Treated as neither namespaced nor un-namespaced here.
+            TenantSource::PreAuthRequest { .. } => {}
             TenantSource::None => {}
         }
     }
     any_namespaced && any_unnamespaced
+}
+
+/// Whether a `Scoped` route's `sources` list places a [`TenantSource::PreAuthRequest`] on a route
+/// that is NOT exactly `[PreAuthRequest]` (construens #2). A seal-only pre-auth firm must be the
+/// sole source, so a mix is a misconfiguration — refused at apply ([`validate_sources`]) AND as a
+/// runtime backstop in the host's `resolve_from_sources` (which refuses to resolve ANY principal for
+/// such a route — fail closed — so the mix is unsafe even if apply-time admission was bypassed).
+pub fn preauth_source_misplaced(sources: &[crate::tenancy::TenantSource]) -> bool {
+    use crate::tenancy::TenantSource;
+    let any_preauth = sources
+        .iter()
+        .any(|s| matches!(s, TenantSource::PreAuthRequest { .. }));
+    any_preauth && !matches!(sources, [TenantSource::PreAuthRequest { .. }])
 }
 
 #[cfg(test)]
@@ -685,6 +757,55 @@ mod tests {
         assert!(validate_sources(&[tok(Some("sfdc")), TenantSource::SignedContext]).is_err());
         // No namespacing at all (today's behavior) — any mix is fine.
         assert!(validate_sources(&[tok(None), TenantSource::Domain]).is_ok());
+    }
+
+    #[test]
+    fn validate_sources_enforces_preauth_sole_source_and_selector() {
+        use crate::tenancy::{PreAuthLocation, PreAuthSelector, TenantSource};
+        let preauth = |location, name: &str, max: Option<usize>| TenantSource::PreAuthRequest {
+            selector: PreAuthSelector {
+                location,
+                name: name.into(),
+                content_types: Vec::new(),
+                max_body_bytes: max,
+            },
+        };
+        // Sole `pre_auth_request` with a valid selector: OK.
+        assert!(validate_sources(&[preauth(PreAuthLocation::Query, "tenant", None)]).is_ok());
+        // Host location ignores the name (empty name OK for host).
+        assert!(validate_sources(&[preauth(PreAuthLocation::Host, "", None)]).is_ok());
+        // Mixed with ANY other source: rejected (sole-source rule).
+        assert!(
+            validate_sources(&[
+                preauth(PreAuthLocation::Query, "tenant", None),
+                TenantSource::Domain,
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_sources(&[
+                TenantSource::Token {
+                    claim: "tid".into(),
+                    extract: None,
+                    namespace: None,
+                },
+                preauth(PreAuthLocation::Query, "tenant", None),
+            ])
+            .is_err()
+        );
+        // Empty name on a non-host location: rejected.
+        assert!(validate_sources(&[preauth(PreAuthLocation::Query, "", None)]).is_err());
+        // Over-ceiling body cap: rejected.
+        assert!(
+            validate_sources(&[preauth(
+                PreAuthLocation::Body,
+                "account",
+                Some(crate::tenancy::PREAUTH_BODY_MAX_BYTES_CEILING + 1),
+            )])
+            .is_err()
+        );
+        // A body cap within the ceiling: OK.
+        assert!(validate_sources(&[preauth(PreAuthLocation::Body, "account", Some(4096))]).is_ok());
     }
 
     #[test]

@@ -42,7 +42,81 @@ and `boatramp domain add --provider <name>`.
   API token (`dns.hetzner.com`, `Auth-API-Token`) is decommissioned and no longer
   works. Mint a Cloud API token in the Hetzner Cloud Console
   (project → Security → API tokens). Supported record types include A, AAAA,
-  CNAME, TXT, MX, SRV, CAA, NS, PTR, and HTTPS/SVCB.
+  CNAME, TXT, MX, SRV, CAA, NS, PTR, TLSA, and HTTPS/SVCB.
+
+## Multi-zone: a per-zone provider list (`[serve.dns_providers]`)
+
+The `--provider` / `--acme-dns-provider` / `--dns-publish-provider` flags seed **one**
+provider from process-global env vars (`CLOUDFLARE_ZONE_ID` + `CLOUDFLARE_API_TOKEN`,
+…) — so one `boatramp serve` manages exactly **one** zone. A single-tenant serve that is
+authoritative for several domains in **different** zones instead declares a **list** of
+per-zone providers in `[serve.dns_providers]`. **Both** consumers — the ACME DNS-01 cert
+issuer (`--tls acme-dns`) and the guest `dns-publish` capability — route to the provider
+whose `zone_root` is the **longest label-boundary suffix** of the record's / certificate's
+owner name (`uranion.link` matches `a.uranion.link` and `uranion.link`, but **not**
+`evil-uranion.link`; a nested `b.example.com` wins over `example.com`). No match ⇒
+fail-closed. **Empty/absent `dns_providers` ⇒ the single env-seeded path above, unchanged.**
+
+Every identity/credential field is a standard boatramp **`type:value` config pointer**:
+
+- a **bare literal** (`zone_id: "741f56…"`),
+- `env:VAR` — the operator's environment (only when the posture's `allow_env_secret_refs`
+  is set), or
+- `boatramp:NAME` — the sealed `[secrets]` store (resolved under the default project at
+  startup; a `boatramp:` ref with no `[secrets]` envelope is a fail-closed **startup error**).
+
+**No secrets in config:** a SECRET field (`token`, `api_key`, `access_token`,
+`client_token`, `client_secret`) **must** be a `env:`/`boatramp:` ref — a plaintext literal
+is refused at startup (exactly as `[serve.s3_credential].secret_access_key` is). Non-secret
+identifiers may be a literal but accept the pointer grammar uniformly. Duplicate `zone_root`s
+are refused at startup (longest-suffix can't disambiguate an exact duplicate).
+
+```ron
+// Cloudflare, two zones, one serve. Tokens sealed in [secrets]; zone ids are literals.
+serve: (
+    dns_providers: [
+        ( name: "mailroom-pro", kind: "cloudflare", zone_root: "mailroom.pro",
+          zone_id: "741f56…",                         // literal (or env:… / boatramp:…)
+          token:   "boatramp:CF_TOKEN_MAILROOM_PRO" ), // sealed-store ref (a zone-scoped token)
+        ( name: "cariello", kind: "cloudflare", zone_root: "cariello.name",
+          zone_id: "a1b2c3…", token: "boatramp:CF_TOKEN_CARIELLO" ),
+        // …one entry per served domain/zone
+    ],
+)
+```
+
+`kind` is a **quoted string** using the same grammar + aliases as `--provider` (so a
+hyphenated kind like `"gcp-dns"` is expressible — RON enum variants can't contain a hyphen).
+
+### Per-kind config fields
+
+Mirror each provider's env vars, lowercased/namespaced. **Bold** = secret (must be a ref).
+
+| `kind` | config fields (→ mirrors the env vars above) |
+|--------|-----------------------------------------------|
+| `manual` | *(none)* |
+| `cloudflare` | `zone_id`, **`token`**, `proxied` (bool, optional — orange-cloud) |
+| `route53` | `hosted_zone_id` (credentials via the AWS provider chain — no token field) |
+| `oci` | `region`, `zone`, `key_id`, `private_key_file` (a path; the PEM stays on disk) |
+| `digitalocean` | `domain`, **`token`** |
+| `hetzner` | `zone`, **`token`** |
+| `ns1` | `zone`, **`api_key`** |
+| `dnsimple` | `account_id`, `zone`, **`token`** |
+| `gcp-dns` | `project`, `zone`, **`access_token`** |
+| `azure-dns` | `subscription_id`, `resource_group`, `zone`, **`access_token`** |
+| `akamai` | `host`, **`client_token`**, **`client_secret`**, **`access_token`**, `zone` |
+
+For **guest `dns-publish`** over the multi-zone registry, set
+`--dns-publish-provider list` (or `[serve.dns_publish].provider = "list"`); the posture
+`allow_guest_dns_publish` + the per-handler `dns_publish_zones` allowlist still gate every
+write. See [`serve.dns_providers`](boatramp-cfg.md#servedns_providers).
+
+> **Operator caution (multi-zone blast radius).** The registry is **node-global**: a single
+> `dns-publish` provider source now serves *every* configured zone, routed by the record's own
+> name. So a **wide** per-handler `dns_publish_zones` allowlist (e.g. `**`) exposes **all**
+> configured zones to that guest, not just one — a broader reach than the pre-registry single-zone
+> model. Keep each grant's `dns_publish_zones` scoped to the exact owner names it needs (the default
+> is deny-all); the allowlist, not the registry, is the per-guest least-privilege bound.
 
 ## See also
 

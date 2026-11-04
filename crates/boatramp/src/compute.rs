@@ -157,15 +157,18 @@ enum ComputeCommand {
         #[arg(long = "region")]
         regions: Vec<String>,
         /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
-        /// `sql` binds the site database, `sql:analytics` a named external DB; `blob`
-        /// binds the site blob store, `blob:assets` one named container; `messaging` binds
-        /// the project bus — BOTH halves, publish AND consume (claim/ack/nack) — `messaging:
-        /// deliver` one topic. The endpoint URL + token are injected into the guest env
-        /// (`BOATRAMP_SQL_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
-        /// `blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY container in
-        /// its site's `hblob/{site}/` space; use `blob:<name>` to confine it. Likewise a bare
-        /// `messaging` is PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish
-        /// and claim); use `messaging:<topic>` to confine it to one topic.
+        /// `sql` binds the site database, `sql:analytics` a named external DB; `kv` binds
+        /// the site key/value store, `kv:cache` one named bucket; `blob` binds the site blob
+        /// store, `blob:assets` one named container; `messaging` binds the project bus — BOTH
+        /// halves, publish AND consume (claim/ack/nack) — `messaging:deliver` one topic. The
+        /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
+        /// `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
+        /// `kv`/`blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY
+        /// bucket/container in its site's `hkv{,blob}/{site}/` space; use `kv:<name>` /
+        /// `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any
+        /// topic under `{project}/bus/`, for both publish and claim); use `messaging:<topic>`
+        /// to confine it to one topic. `invoke` (compute→function) is declared only — no
+        /// shim resolver yet, so it parses but injects no env (Phase 3).
         #[arg(long = "bind")]
         bind: Vec<String>,
         /// Name of a **sealed registry pull credential** in THIS project's secret store
@@ -542,8 +545,15 @@ pub enum ComputeOutput {
     Set { name: String, spec: String },
     /// `compute build` — the rootfs was built, uploaded, and the workload set.
     Build { name: String, spec: String },
-    /// `compute rm` — the workload was removed.
-    Rm { name: String },
+    /// `compute rm` — the workload was removed. `drained_dependents` is non-empty only
+    /// when the removed workload backed a managed SQL dependency
+    /// (PLAN-managed-dependency-readiness WS5): the server drained those binding(s) first
+    /// (flipped unhealthy + a short grace wait) before actually removing the workload.
+    Rm {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        drained_dependents: Vec<String>,
+    },
     /// `compute bind-blob` — the injected blob-shim env (as `K=V` pairs).
     BindBlob {
         /// Whether `--export` was requested (prefixes each human line with `export `).
@@ -632,7 +642,20 @@ impl crate::output::Rendered for ComputeOutput {
             Self::Build { name, spec } => {
                 writeln!(w, "workload {name} built + set (spec {spec})")
             }
-            Self::Rm { name } => writeln!(w, "removed {name}"),
+            Self::Rm {
+                name,
+                drained_dependents,
+            } => {
+                writeln!(w, "removed {name}")?;
+                if !drained_dependents.is_empty() {
+                    writeln!(
+                        w,
+                        "  drained managed-SQL dependent(s) first: {}",
+                        drained_dependents.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
             Self::BindBlob { export, env } | Self::BindMessaging { export, env } => {
                 let prefix = if *export { "export " } else { "" };
                 for (k, v) in env {
@@ -1122,11 +1145,28 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             ComputeOutput::Build { name, spec: hash }
         }
         ComputeCommand::Rm { name } => {
-            http.delete(format!("{server}/api/{seg}/{name}"))
+            let resp = http
+                .delete(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?;
-            ComputeOutput::Rm { name }
+            // `200` (vs the plain `204`) carries the WS5 drain report — best-effort parse;
+            // an older server's bare `204` (or any body the shape doesn't match) just means
+            // no dependents to report.
+            let drained_dependents = if resp.status() == reqwest::StatusCode::OK {
+                resp.json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("drained_dependents").cloned())
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            ComputeOutput::Rm {
+                name,
+                drained_dependents,
+            }
         }
         ComputeCommand::Exec { name, stdin, argv } => {
             use base64::Engine;
@@ -1742,12 +1782,16 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
                 "kv" => BindingKind::Kv,
                 "blob" => BindingKind::Blob,
                 "messaging" => BindingKind::Messaging,
+                // Declared only (PLAN-compute-bindings Phase 3) — no shim resolver yet, so a
+                // workload naming it gets no env injected until that lands.
+                "invoke" => BindingKind::Invoke,
                 other => return Err(Error::Args(format!("unknown binding kind `{other}`"))),
             };
             Ok(ComputeBinding {
                 kind,
                 name: name.to_string(),
                 url_env: None,
+                migration_url_env: None,
             })
         })
         .collect()
@@ -2014,6 +2058,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);
+    }
+
+    #[test]
+    fn compute_set_bind_kv_and_invoke_parse() {
+        // `--bind kv` (site-wide) and `--bind kv:cache` (named bucket) both parse through the
+        // CLI into the raw `bind` flags, then into typed `ComputeBinding`s — mirroring the
+        // already-wired `sql`/`blob`/`messaging` kinds.
+        match parse(&[
+            "compute",
+            "set",
+            "worker",
+            "--image",
+            "ghcr.io/acme/app:1",
+            "--port",
+            "8080",
+            "--bind",
+            "kv",
+            "--bind",
+            "kv:cache",
+            "--bind",
+            "invoke",
+        ]) {
+            Ok(ComputeCommand::Set { bind, .. }) => {
+                assert_eq!(bind, vec!["kv", "kv:cache", "invoke"]);
+                let bindings = parse_bindings(&bind).expect("every flag parses");
+                assert_eq!(
+                    bindings,
+                    vec![
+                        ComputeBinding {
+                            kind: BindingKind::Kv,
+                            name: String::new(),
+                            url_env: None,
+                            migration_url_env: None,
+                        },
+                        ComputeBinding {
+                            kind: BindingKind::Kv,
+                            name: "cache".into(),
+                            url_env: None,
+                            migration_url_env: None,
+                        },
+                        // `invoke` parses like every other kind (Phase 3 — no resolver yet).
+                        ComputeBinding {
+                            kind: BindingKind::Invoke,
+                            name: String::new(),
+                            url_env: None,
+                            migration_url_env: None,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // An unknown kind fails closed.
+        assert!(parse_bindings(&["nope".to_string()]).is_err());
     }
 
     #[test]
