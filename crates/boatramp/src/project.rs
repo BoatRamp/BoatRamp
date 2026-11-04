@@ -117,6 +117,11 @@ enum ProjectCommand {
         /// Execute the prune — delete the reported orphans. Without it, a safe dry-run only.
         #[arg(long)]
         apply: bool,
+        /// Skip the interactive confirmation prompt on `--apply` (required to `--apply` when stdin
+        /// is not a TTY). Deletes are irreversible, so `--apply` otherwise previews the plan and
+        /// asks you to type the project name — parity with `project rm --force`.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Drive this project's owner-gated schema migrations for a managed database
     /// (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's
@@ -286,6 +291,25 @@ enum ProjectCommand {
 /// TTY.
 fn confirmation_matches(project: &str, typed: &str) -> bool {
     typed.trim() == project
+}
+
+/// A concise human summary of a prune plan's provable orphans, shown before the `--apply`
+/// confirmation prompt (parity with `project rm`'s plan preview). Lists each key + why it is an
+/// orphan, plus the live sites the sweep kept.
+fn summarize_prune_plan(plan: &boatramp_core::project_prune::ProjectPrunePlan) -> String {
+    use std::fmt::Write;
+    let mut out = format!(
+        "project `{}`: {} orphaned control-plane key(s) would be deleted:\n",
+        plan.project,
+        plan.prunable.len(),
+    );
+    for p in &plan.prunable {
+        let _ = writeln!(out, "  - {} [{}]: {}", p.key, p.reason.as_str(), p.detail);
+    }
+    if !plan.live_sites.is_empty() {
+        let _ = writeln!(out, "keeping live site(s): {}", plan.live_sites.join(", "));
+    }
+    out
 }
 
 /// Render a clone plan's to-transfer byte count. A fallback backend with no per-object size makes
@@ -996,7 +1020,38 @@ pub async fn run(
                 }
             }
         }
-        ProjectCommand::Prune { name, apply } => {
+        ProjectCommand::Prune { name, apply, yes } => {
+            if apply && !yes {
+                // Preview the provable-orphan plan first (a read-only dry-run), then require an
+                // interactive confirmation — deletes are irreversible. Parity with
+                // `project rm --force` (show the plan, type the project name to confirm).
+                let preview = cp.project_prune(&name, false).await?;
+                if preview.is_clean() {
+                    // Nothing to delete — report the clean plan, no prompt/apply needed.
+                    return Ok(ProjectOutput::Pruned { plan: preview });
+                }
+                println!("{}", summarize_prune_plan(&preview));
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    return Err(Error::Aborted(
+                        "refusing to --apply a prune non-interactively; pass --yes to confirm"
+                            .to_string(),
+                    ));
+                }
+                use std::io::Write;
+                print!(
+                    "this permanently deletes the above control-plane key(s) and cannot be undone; \
+                     type the project name to confirm: "
+                );
+                std::io::stdout().flush().map_err(Error::Io)?;
+                let mut typed = String::new();
+                std::io::stdin().read_line(&mut typed).map_err(Error::Io)?;
+                if !confirmation_matches(&name, &typed) {
+                    return Err(Error::Aborted(format!(
+                        "confirmation `{}` does not match project `{name}` — aborted",
+                        typed.trim()
+                    )));
+                }
+            }
             let plan = cp.project_prune(&name, apply).await?;
             Ok(ProjectOutput::Pruned { plan })
         }
@@ -1254,6 +1309,30 @@ mod tests {
         }
         // `rm` requires a name.
         assert!(parse(&["project", "rm"]).is_err());
+    }
+
+    #[test]
+    fn prune_flags_parse() {
+        // Bare `prune <name>` → dry-run (no apply), no yes.
+        match parse(&["project", "prune", "acme"]) {
+            Ok(ProjectCommand::Prune { name, apply, yes }) => {
+                assert_eq!(name, "acme");
+                assert!(!apply && !yes);
+            }
+            other => panic!("expected prune, got {other:?}"),
+        }
+        // `--apply -y` (short `-y` for `--yes`, for automation).
+        match parse(&["project", "prune", "acme", "--apply", "-y"]) {
+            Ok(ProjectCommand::Prune { apply, yes, .. }) => assert!(apply && yes),
+            other => panic!("expected prune --apply -y, got {other:?}"),
+        }
+        // `--apply --yes` long form.
+        match parse(&["project", "prune", "acme", "--apply", "--yes"]) {
+            Ok(ProjectCommand::Prune { apply, yes, .. }) => assert!(apply && yes),
+            other => panic!("expected prune --apply --yes, got {other:?}"),
+        }
+        // `prune` requires a name.
+        assert!(parse(&["project", "prune"]).is_err());
     }
 
     #[test]
