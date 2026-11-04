@@ -285,12 +285,16 @@ pub struct ComputeBinding {
     /// (`sql` → `BOATRAMP_SQL_URL`). The credential is injected as `<url_env>_AUTH_TOKEN`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url_env: Option<String>,
-    /// For a `sql` binding to a managed co-located Postgres/MySQL database only: the env
-    /// var the **migration/DDL** connection URL is injected as (the owner-role analog used
-    /// to run schema migrations). `None` ⇒ the derived default `<url_env>_MIGRATION`. On a
-    /// per-site libsql binding (the shim path) it is ignored. The general override is an
-    /// operator `env:` template referencing `{{sql.migration_dsn}}`; this discrete name is
-    /// the simple-case default.
+    /// For a `sql` binding to a managed co-located Postgres/MySQL database only: the env var
+    /// the **migration/DDL** connection URL (the owner-role analog for running schema
+    /// migrations) is injected as. **Setting this field is the OPT-IN to the separate
+    /// owner-login migration DSN (MEDIUM-2).** When it is `None` the migration DSN is NOT
+    /// injected by default: a self-migrating app (WordPress-style) leaves it unset and uses
+    /// the runtime DSN (`url_env`) — which under phase-2 operates AS the owner, so it can run
+    /// its own DDL, and which revoke-on-stop cuts off when the replica stops. Set it (to the
+    /// desired env var name) only for a workload that runs a DISTINCT migration step. On a
+    /// per-site libsql binding (the shim path) it is ignored. An operator `env:` template
+    /// referencing `{{sql.migration_dsn}}` injects the migration DSN regardless of this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_url_env: Option<String>,
 }

@@ -1,5 +1,7 @@
 # PoP-bind a control-plane token (DPoP)
 
+**For: operators & app developers**
+
 A control-plane token is a **bearer** token: whoever holds the bytes can use it
 until it expires or is revoked. If one leaks — a CI log, a `.env`, a laptop — it is
 replayable as-is within that window.

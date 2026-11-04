@@ -1,5 +1,7 @@
 # Switch the blob backend with zero downtime
 
+**For: operators**
+
 boatramp stores every deployment's content-addressed blobs, every `hblob/…`
 ingress object, and the message-queue payloads (`mqgp/…`) in **one** blob
 backend — the node's `[serve]` `blobs` selector (`fs`, `s3`, `gcs`, `azure`).

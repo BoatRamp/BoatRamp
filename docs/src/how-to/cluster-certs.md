@@ -1,5 +1,7 @@
 # Manage certificates in a cluster
 
+**For: operators**
+
 In a cluster the leader owns TLS. It issues each certificate once, stores it in
 the replicated control plane, and every node serves that replicated cert and
 hot-swaps it on renewal. You configure ACME on the cluster, not on each node.

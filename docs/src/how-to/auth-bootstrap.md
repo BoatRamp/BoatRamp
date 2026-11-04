@@ -1,5 +1,7 @@
 # Bootstrap authentication & mint tokens
 
+**For: operators**
+
 The control-plane API (publishing, config, tokens) authenticates; public serving
 never does. This guide takes a fresh server from no auth to a working admin
 token you can mint scoped tokens with. For the model behind it — COSE/CWT

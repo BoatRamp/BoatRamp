@@ -1,5 +1,7 @@
 # Deploy a single node in production
 
+**For: operators**
+
 One process, local disk, authenticated control plane, TLS. Blobs go to the
 filesystem; control-plane metadata goes to an embedded SlateDB that is durable on
 every write. This is the whole platform on one host.

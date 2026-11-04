@@ -1,5 +1,7 @@
 # Compose components into one handler
 
+**For: app developers**
+
 A handler is a single WebAssembly component. But you often want to author it in
 **pieces** — a resolver here, a middleware there, a shared library of business
 logic — each a separate, independently-built component with a typed WIT

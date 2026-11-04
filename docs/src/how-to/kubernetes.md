@@ -1,5 +1,7 @@
 # Run boatramp on Kubernetes
 
+**For: operators**
+
 boatramp ships a **Kubernetes operator in the same binary** — there is no separate
 controller image or Helm chart to track. The operator reconciles a
 `BoatRampCluster` custom resource into its workloads (a StatefulSet for cluster

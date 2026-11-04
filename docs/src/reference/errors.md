@@ -70,7 +70,7 @@ error: the control-plane store is not migrated to the project-scoped (0.2.0)
   layout; run `boatramp migrate` first, or start `serve --auto-migrate`
 ```
 
-See [Migrate to projects](../how-to/migrate-to-projects.md).
+See [Upgrade a store to project scoping](../how-to/upgrade-store-to-projects.md).
 
 ## Resource-name validation
 

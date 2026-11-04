@@ -1,5 +1,7 @@
 # Wildcard certs with DNS-01
 
+**For: operators**
+
 Issue a `*.example.com` certificate by proving control of the domain through a
 DNS TXT record instead of an HTTP path.
 
@@ -42,6 +44,13 @@ provider-specific environment variables. For the full provider-by-variable table
 see [DNS providers & credentials](../reference/dns-providers.md); for pointing
 custom domains at your server see
 [Automate DNS with a provider](./auto-dns.md).
+
+> **Several zones from one serve?** `--acme-dns-provider` + the env vars drive a
+> **single** zone. To issue wildcards across domains in **different** zones from one
+> `serve`, declare a `[serve.dns_providers]` **list** instead — one entry per zone, each
+> with its own sealed `token`/`boatramp:…` credential; issuance routes by the
+> certificate's longest-suffix `zone_root`. See
+> [`serve.dns_providers`](../reference/boatramp-cfg.md#servedns_providers).
 
 ## Add preview subdomains
 
@@ -96,8 +105,11 @@ worse than a recursive-only check.
   (UDP) — useful when the container's own resolver caches negative answers
   aggressively; e.g. `BOATRAMP_ACME_PROPAGATION_RESOLVER=1.1.1.1,8.8.8.8`.
 
-For the on-demand per-SNI issuer, the same knobs live under
-`[serve.on_demand_tls]` as `propagation_wait_secs` / `propagation_poll_interval_secs`.
+These same propagation knobs apply to the on-demand per-SNI issuer when it uses
+the DNS-01 challenge, as `propagation_wait_secs` / `propagation_poll_interval_secs`
+under `[serve.on_demand_tls]` — see [Issue certificates on-demand](./on-demand-tls.md)
+for issuing a certificate per verified domain at the first handshake, instead of
+enumerating every name here.
 
 ## Publish the TXT record by hand
 

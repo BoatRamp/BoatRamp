@@ -1,5 +1,7 @@
 # Reach services over the overlay (service tunneler)
 
+**For: operators**
+
 The service tunneler turns `boatramp tunnel` on your workstation into a client
 for overlay services: you reach a cluster's private services by name — for
 example `db.svc.<cluster>.<zone>` — without exposing them publicly and without

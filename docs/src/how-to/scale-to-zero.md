@@ -1,5 +1,7 @@
 # Scale compute to zero
 
+**For: operators & app developers**
+
 A scale-to-zero workload snapshots and stops when it goes idle, then restores on
 the next request. You pay no CPU or memory for an idle service, and a cold
 request pays a restore instead of a full boot. It applies to microVM workloads,

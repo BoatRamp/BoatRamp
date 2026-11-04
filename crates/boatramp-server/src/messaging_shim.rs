@@ -81,7 +81,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine as _;
-use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
+use boatramp_core::compute::{
+    BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution,
+};
 use boatramp_core::messaging::{ClaimedMessage, Messaging};
 use boatramp_core::project::{ProjectRef, validate_object_key};
 use hmac::{Hmac, Mac};
@@ -315,6 +317,56 @@ impl ComputeBindingResolver for MessagingShimResolver {
             env.push((format!("{url_env}_AUTH_TOKEN"), token));
         }
         env
+    }
+
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        // PLAN-compute-managed-resources Phase 3: contribute `{{messaging.url}}` /
+        // `{{messaging.token}}` alongside the back-compat `BOATRAMP_MESSAGING_URL`(+`_AUTH_TOKEN`)
+        // defaults. The token is the SAME registry-backed HMAC bearer `resolve` mints (scoped to
+        // the project bus, + the one topic when `--bind messaging:<topic>` names one), registered
+        // here — so it is already revoked-on-stop via `release` (deregister) and rotated on a node
+        // restart; it never outlives its replica.
+        let mut out = SurfaceContribution::default();
+        let msg_bindings: Vec<&ComputeBinding> = bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Messaging)
+            .collect();
+        let single = msg_bindings.len() == 1;
+        for binding in msg_bindings {
+            let Some(scope) = self.scope(project, binding) else {
+                continue;
+            };
+            let token = self.token(project, workload, replica, binding);
+            self.shim.register(&token, scope).await;
+            let url_env = binding.url_env();
+            out.defaults.push((url_env.clone(), self.base_url.clone()));
+            out.defaults
+                .push((format!("{url_env}_AUTH_TOKEN"), token.clone()));
+            // Bare `messaging.*` for the sole / bus-wide binding; `messaging.<topic>.*` for a
+            // topic-pinned one.
+            if binding.name.is_empty() || single {
+                out.vars
+                    .insert("messaging.url".to_string(), self.base_url.clone());
+                out.vars
+                    .insert("messaging.token".to_string(), token.clone());
+            }
+            if !binding.name.is_empty() {
+                out.vars.insert(
+                    format!("messaging.{}.url", binding.name),
+                    self.base_url.clone(),
+                );
+                out.vars
+                    .insert(format!("messaging.{}.token", binding.name), token.clone());
+            }
+        }
+        out
     }
 
     async fn release(
@@ -1084,6 +1136,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         // … and release revokes it.
         resolver.release("default", "mx", 0, &bindings).await;
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"job").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// PLAN-compute-managed-resources Phase 3: `contribute` exposes `{{messaging.url}}` /
+    /// `{{messaging.token}}` (bare + topic-named) alongside the back-compat defaults, and the token
+    /// is the SAME registry-backed bearer — REVOKED ON STOP by `release` (deregister).
+    #[tokio::test]
+    async fn contribute_exposes_messaging_vars_and_token_is_revoked_on_stop() {
+        let shim = MessagingShim::new();
+        let backend = Arc::new(RecordingMessaging::default());
+        let resolver = resolver(&shim, backend.clone());
+        let bindings = vec![messaging_binding("deliver")];
+
+        let c = resolver
+            .contribute(
+                "acme",
+                "mx",
+                0,
+                &bindings,
+                &std::collections::BTreeMap::new(),
+            )
+            .await;
+        assert_eq!(
+            c.vars.get("messaging.url").map(String::as_str),
+            Some("http://10.0.0.1:8083")
+        );
+        let token = c
+            .vars
+            .get("messaging.token")
+            .expect("messaging.token var")
+            .clone();
+        assert_eq!(c.vars.get("messaging.deliver.token"), Some(&token));
+        let def_token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_MESSAGING_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("default token");
+        assert_eq!(def_token, token);
+
+        // Authorizes a publish NOW …
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"job").await;
+        assert_eq!(status, StatusCode::OK);
+        // … and release (stop) revokes it.
+        resolver.release("acme", "mx", 0, &bindings).await;
         let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"job").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }

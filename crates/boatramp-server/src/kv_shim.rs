@@ -74,7 +74,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use base64::Engine as _;
-use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
+use boatramp_core::compute::{
+    BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution,
+};
 use boatramp_core::kv::{KvError, KvStore};
 use boatramp_core::project::{ProjectRef, validate_key_segment};
 use hmac::{Hmac, Mac};
@@ -307,6 +309,53 @@ impl ComputeBindingResolver for KvShimResolver {
             env.push((format!("{url_env}_AUTH_TOKEN"), token));
         }
         env
+    }
+
+    async fn contribute(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> SurfaceContribution {
+        // PLAN-compute-managed-resources Phase 3: contribute the `{{kv.url}}` / `{{kv.token}}`
+        // template namespace alongside the back-compat `BOATRAMP_KV_URL`(+`_AUTH_TOKEN`) defaults.
+        // The token is the SAME registry-backed HMAC bearer `resolve` mints, registered here — so
+        // it is already revoked-on-stop by `release` (deregister) + rotated on a node restart (the
+        // registry starts empty + the per-node secret is fresh): it is NOT a stateless, replica-
+        // outliving credential. Exposing it as a var simply lets the operator place it in whatever
+        // env var an off-the-shelf client reads.
+        let mut out = SurfaceContribution::default();
+        let kv_bindings: Vec<&ComputeBinding> = bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Kv)
+            .collect();
+        let single = kv_bindings.len() == 1;
+        for binding in kv_bindings {
+            let Some(scope) = self.scope(project, workload, binding) else {
+                continue;
+            };
+            let token = self.token(project, workload, replica, binding);
+            self.shim.register(&token, scope).await;
+            let url_env = binding.url_env();
+            out.defaults.push((url_env.clone(), self.base_url.clone()));
+            out.defaults
+                .push((format!("{url_env}_AUTH_TOKEN"), token.clone()));
+            // Bare `kv.*` for the sole / empty-name binding; `kv.<name>.*` for a named one (mirrors
+            // the sql surface so a `--bind kv:cache` answers both `{{kv.url}}` and `{{kv.cache.url}}`).
+            if binding.name.is_empty() || single {
+                out.vars.insert("kv.url".to_string(), self.base_url.clone());
+                out.vars.insert("kv.token".to_string(), token.clone());
+            }
+            if !binding.name.is_empty() {
+                out.vars
+                    .insert(format!("kv.{}.url", binding.name), self.base_url.clone());
+                out.vars
+                    .insert(format!("kv.{}.token", binding.name), token.clone());
+            }
+        }
+        out
     }
 
     async fn release(
@@ -714,6 +763,54 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// PLAN-compute-managed-resources Phase 3: `contribute` exposes the `{{kv.url}}` / `{{kv.token}}`
+    /// var namespace (bare + named) alongside the back-compat defaults, and the token it carries is
+    /// the SAME registry-backed bearer — so it is REVOKED ON STOP by `release` (deregister).
+    #[tokio::test]
+    async fn contribute_exposes_kv_vars_and_token_is_revoked_on_stop() {
+        let shim = KvShim::new();
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let resolver = resolver(&shim, store);
+        let bindings = vec![kv_binding("cache")];
+
+        let c = resolver
+            .contribute(
+                "acme",
+                "api",
+                0,
+                &bindings,
+                &std::collections::BTreeMap::new(),
+            )
+            .await;
+        // Bare + named vars for the single binding.
+        assert_eq!(
+            c.vars.get("kv.url").map(String::as_str),
+            Some("http://10.0.0.1:8084")
+        );
+        let token = c.vars.get("kv.token").expect("kv.token var").clone();
+        assert_eq!(c.vars.get("kv.cache.token"), Some(&token));
+        assert_eq!(
+            c.vars.get("kv.cache.url").map(String::as_str),
+            Some("http://10.0.0.1:8084")
+        );
+        // The back-compat default env carries the SAME token.
+        let def_token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_KV_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("default token");
+        assert_eq!(def_token, token);
+
+        // The token authorizes a request NOW …
+        let (status, _) = request(&shim, "PUT", "/x", Some(&token), b"z").await;
+        assert_eq!(status, StatusCode::OK);
+        // … and release (replica stop) REVOKES it — the token is registry-backed, not stateless.
+        resolver.release("acme", "api", 0, &bindings).await;
+        let (status, _) = request(&shim, "PUT", "/x", Some(&token), b"z").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn named_project_qualifies_the_site_prefix() {
         // A non-default project qualifies the site: `hkv/{project}/{workload}/…`.
@@ -841,6 +938,66 @@ mod tests {
                 .is_unspecified()
         );
         assert!(crate::shim_bind_addr("http://").is_none());
+    }
+
+    /// **Live serve-path gate** (PLAN-compute-managed-resources Phase 3, marker
+    /// `PHASE3 KV TOKEN REVOKED-ON-STOP OK`). Unlike the in-process router gate above, this binds a
+    /// REAL loopback socket via [`spawn_kv_shim`] and drives REAL HTTP with `reqwest`, proving the
+    /// token injected at LAUNCH (`resolve`) authenticates against the live shim AND is REVOKED on
+    /// STOP (`release` → deregister) — the registry-backed, replica-leased token never outlives its
+    /// replica. `#[ignore]` (binds a port); run explicitly on the Linux box. Do NOT run in CI's
+    /// default lane.
+    #[tokio::test]
+    #[ignore = "live serve-path gate: binds a real loopback socket + drives real HTTP; run on the Linux box"]
+    async fn kv_token_revoked_on_stop_live() {
+        use tokio::net::TcpListener;
+        // Reserve a free loopback port, then point the shim at it.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let base_url = format!("http://{addr}");
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let resolver = spawn_kv_shim(Some(store), Some(base_url.clone()), None)
+            .await
+            .expect("kv-shim binds the loopback socket");
+        let bindings = vec![kv_binding("cache")];
+
+        // LAUNCH: resolve mints + registers the per-replica token.
+        let env = resolver.resolve("acme", "api", 0, &bindings).await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_KV_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("token injected");
+        let client = reqwest::Client::new();
+        let ok = client
+            .put(format!("{base_url}/live-key"))
+            .bearer_auth(&token)
+            .body("v")
+            .send()
+            .await
+            .expect("PUT to the live shim");
+        assert_eq!(
+            ok.status().as_u16(),
+            200,
+            "the injected token must authenticate against the live shim"
+        );
+
+        // STOP: release REVOKES the token; the same token is now rejected over the real socket.
+        resolver.release("acme", "api", 0, &bindings).await;
+        let revoked = client
+            .put(format!("{base_url}/live-key"))
+            .bearer_auth(&token)
+            .body("v")
+            .send()
+            .await
+            .expect("PUT to the live shim");
+        assert_eq!(
+            revoked.status().as_u16(),
+            401,
+            "a replica-leased token MUST be revoked after release (stop)"
+        );
+        println!("PHASE3 KV TOKEN REVOKED-ON-STOP OK");
     }
 
     /// **CI mutation gate** (PLAN-compute-bindings anti-hollow, marker `COMPUTE KV-SHIM SCOPED OK`).

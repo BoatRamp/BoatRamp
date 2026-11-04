@@ -75,8 +75,8 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::project_export::{
-    CloneBlobRef, CloneManifest, CloneSkip, ExportOptions, IdentityChoice, ImportOptions,
-    ImportReport, ProjectExport, ProjectExportError,
+    CloneBlobRef, CloneManifest, CloneSkip, ContinueErrorKind, ExportOptions, IdentityChoice,
+    ImportOptions, ImportReport, ProjectExport, ProjectExportError, SkipManifest, SkippedBlob,
 };
 use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
@@ -643,6 +643,49 @@ async fn write_kek_file(path: &std::path::Path, kek: &[u8]) -> Result<(), Perr> 
     .await
     .map_err(other)?
     .map_err(other)
+}
+
+/// Build the member-mismatch [`VerifyPolicy`](project_bundle::VerifyPolicy) from the import options.
+/// Clone-robustness (PLAN-clone-robustness #2): member-mismatch tolerance is the OR of the legacy
+/// `skip_member_mismatch` flag and `continue_on_error` forgiving [`ContinueErrorKind::MemberMismatch`]
+/// — so `--continue-on-error=member-mismatch` is a true back-compat ALIAS for `--skip-member-mismatch`,
+/// routed through the ONE policy. The skip SCOPE stays `der/`-only unless `skip_any_blob_mismatch`
+/// broadens it (the louder opt-in, unchanged). Extracted as a free fn so the routing is unit-testable
+/// without driving a whole import.
+fn verify_policy_from_opts(opts: &ImportOptions) -> project_bundle::VerifyPolicy {
+    let skip_mismatch = opts.skip_member_mismatch
+        || opts
+            .continue_on_error
+            .forgives(ContinueErrorKind::MemberMismatch);
+    project_bundle::VerifyPolicy {
+        enumerate_all: opts.enumerate_mismatches,
+        skip_mismatch,
+        skip_scope: if opts.skip_any_blob_mismatch {
+            project_bundle::SkipScope::AnyBlob
+        } else {
+            project_bundle::SkipScope::DerivativesOnly
+        },
+    }
+}
+
+/// Whether the `--only-blobs` repair filter SKIPS this member (does not write/apply it): a blob
+/// whose TARGET key is NOT in the manifest set, or ANY non-blob member (a repair is blobs-only). No
+/// filter (`None`) keeps every member. `target_key` is `None` for a non-blob member. Pure so the
+/// filter is unit-testable.
+fn only_blobs_skips(
+    only_blobs: Option<&std::collections::BTreeSet<String>>,
+    is_blob: bool,
+    target_key: Option<&str>,
+) -> bool {
+    match only_blobs {
+        None => false,
+        Some(set) => match (is_blob, target_key) {
+            (true, Some(key)) => !set.contains(key),
+            // A non-blob member (or a blob whose key could not be derived) is never part of a
+            // blobs-only repair.
+            _ => true,
+        },
+    }
 }
 
 /// Always constructible from the node's always-present deps (deploy + KV + blobs); the
@@ -2338,15 +2381,7 @@ impl ProjectExport for NodeProjectExport {
         // mismatch); `enumerate_mismatches` scans all + fails at the end; `skip_member_mismatch`
         // warns + continues past a re-generable `der/` mismatch (broadened by `skip_any_blob_mismatch`
         // to any blob — never a non-blob member).
-        let verify_policy = project_bundle::VerifyPolicy {
-            enumerate_all: opts.enumerate_mismatches,
-            skip_mismatch: opts.skip_member_mismatch,
-            skip_scope: if opts.skip_any_blob_mismatch {
-                project_bundle::SkipScope::AnyBlob
-            } else {
-                project_bundle::SkipScope::DerivativesOnly
-            },
-        };
+        let verify_policy = verify_policy_from_opts(&opts);
         let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(STREAM_BYTE_CHANNEL);
         let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ImportMsg>(1);
         let reader = ChannelReader::new(byte_rx);
@@ -2491,7 +2526,10 @@ impl ProjectExport for NodeProjectExport {
                                     ));
                                 };
                                 let qsite = ProjectRef::new(project).qualified(site);
-                                if opts.apply {
+                                // `--only-blobs` repair (clone-robustness #3) is BLOBS-ONLY: skip a
+                                // DB member entirely (drain + count, open no shadow), exactly like a
+                                // dry-run, so a repair never re-applies the database.
+                                if opts.apply && opts.only_blobs.is_none() {
                                     match libsql.begin_dump_shadow(&qsite, "", opts.overwrite).await
                                     {
                                         Ok(mut shadow) => {
@@ -2582,8 +2620,9 @@ impl ProjectExport for NodeProjectExport {
                                         )));
                                     }
                                 };
-                                if !opts.apply {
-                                    // Dry-run: don't touch the server — drain + count.
+                                // Dry-run OR an `--only-blobs` (blobs-only) repair: don't touch the
+                                // server — drain + count, open no shadow.
+                                if !opts.apply || opts.only_blobs.is_some() {
                                     let _ = reply.send(Ok(()));
                                     while body_rx.recv().await.is_some() {}
                                     report.pg_databases += 1;
@@ -2661,7 +2700,9 @@ impl ProjectExport for NodeProjectExport {
                                         )));
                                     }
                                 };
-                                if !opts.apply {
+                                // Dry-run OR an `--only-blobs` (blobs-only) repair: don't touch the
+                                // server — drain + count, open no shadow.
+                                if !opts.apply || opts.only_blobs.is_some() {
                                     let _ = reply.send(Ok(()));
                                     while body_rx.recv().await.is_some() {}
                                     report.pg_databases += 1;
@@ -2900,7 +2941,7 @@ impl ProjectExport for NodeProjectExport {
                 }
                 _ => {}
             }
-            Ok((report, data_only, saw_identity))
+            Ok((report, data_only, saw_identity, source_project))
         };
 
         let (feed_res, serv_res, read_res) = tokio::join!(feeder, servicer, read_handle);
@@ -2908,7 +2949,7 @@ impl ProjectExport for NodeProjectExport {
         // Error precedence: a restore failure is the most specific cause; a bundle-integrity
         // error (SHA / size / order / truncation) next; a body-read error last. On ANY error
         // skip the post-stream steps (fresh-drop etc.) so a half-stream never half-finishes.
-        let (mut report, data_only, saw_identity) = match serv_res {
+        let (mut report, data_only, saw_identity, source_project) = match serv_res {
             Ok(v) => v,
             Err(e) => {
                 let _ = tokio::fs::remove_dir_all(&session).await;
@@ -2936,7 +2977,10 @@ impl ProjectExport for NodeProjectExport {
         // Clone-robustness (PLAN-clone-robustness #2): record every TOLERATED member-mismatch skip
         // in the report notes, so the operator sees exactly which re-generable derivatives were
         // skipped (and thus will be re-derived on the target on next access). A clean strict pass
-        // leaves this empty.
+        // leaves this empty. ALSO record each as a structured `SkippedBlob` (clone-robustness #3) so
+        // it lands in the skip MANIFEST alongside any backend skips — its `key` is the TARGET key
+        // (re-keyed to this project's own scope, so `--only-blobs` can re-stream it if the operator
+        // wants the exact bytes rather than a target-side re-derivation).
         for m in &member_mismatches {
             if m.skipped {
                 report.notes.push(format!(
@@ -2948,6 +2992,22 @@ impl ProjectExport for NodeProjectExport {
                     m.declared,
                     m.streamed
                 ));
+                // Re-key to the target scope when it is a blob member; fall back to the raw member
+                // path if the re-key fails closed (a non-blob / wrong-scope member — never skipped
+                // by the mismatch policy, but recorded faithfully rather than dropped).
+                let key = target_blob_key(&m.path, &source_project, project)
+                    .unwrap_or_else(|_| m.path.clone());
+                report.skipped.push(SkippedBlob {
+                    key,
+                    kind: ContinueErrorKind::MemberMismatch.as_str().to_string(),
+                    reason: format!(
+                        "{:?} mismatch [{}]: declared {}, streamed {}",
+                        m.kind,
+                        m.class.label(),
+                        m.declared,
+                        m.streamed
+                    ),
+                });
             }
         }
 
@@ -3027,6 +3087,46 @@ impl ProjectExport for NodeProjectExport {
                  certs (routing + certs are intentionally not carried in a portable bundle)"
                     .into(),
             );
+        }
+
+        // Clone-robustness (PLAN-clone-robustness #3): if ANYTHING was skipped (backend and/or
+        // member-mismatch), write a skip-report MANIFEST under the node base — one entry per skipped
+        // blob — and surface its path + count in the report. Written to `self.work_dir` (the base),
+        // NOT the per-import `session` dir, so it SURVIVES the session cleanup below. This makes an
+        // applied op that left blobs behind a DISTINCT "completed with N skipped" outcome (the
+        // caller renders it as such), and the manifest round-trips into a later `--only-blobs`
+        // repair. On a clean pass nothing is written. Only when APPLYING (a dry-run mutates
+        // nothing, so there is nothing to repair).
+        if opts.apply && report.completed_with_skips() {
+            let manifest = SkipManifest {
+                project: project.to_string(),
+                skipped: report.skipped.clone(),
+            };
+            let path = self
+                .work_dir
+                .join(format!("skip-manifest-{project}-{}.json", now_secs()));
+            match tokio::fs::write(&path, manifest.to_json()).await {
+                Ok(()) => {
+                    let n = report.skipped.len();
+                    let shown = path.display().to_string();
+                    report.skip_manifest = Some(shown.clone());
+                    report.notes.push(format!(
+                        "completed with {n} blob(s) skipped — skip manifest written to {shown}; \
+                         re-stream them with `import --only-blobs {shown}`"
+                    ));
+                }
+                Err(e) => {
+                    // The import itself succeeded; only the manifest write failed. Surface it as a
+                    // note (the structured `skipped` list is still in the report) rather than
+                    // failing the whole op after the data already landed.
+                    report.notes.push(format!(
+                        "WARNING: completed with {} blob(s) skipped but the skip manifest could not \
+                         be written to {}: {e}; the skipped list is in this report",
+                        report.skipped.len(),
+                        path.display(),
+                    ));
+                }
+            }
         }
 
         let _ = tokio::fs::remove_dir_all(&session).await;
@@ -3687,6 +3787,22 @@ impl NodeProjectExport {
         report: &mut ImportReport,
         saw_identity: &mut bool,
     ) -> Result<(), Perr> {
+        // --only-blobs REPAIR (clone-robustness #3): restore ONLY the blob members named in the
+        // manifest; SKIP every other member (non-blob members, and blobs not in the set). The body
+        // was already streamed to its bounded temp by the reader — skipping means simply NOT writing
+        // it; nothing is buffered or re-staged. A wrong-scope blob key still fails closed below in
+        // `target_blob_key`, so the repair never trusts a member path to reach a foreign key.
+        if opts.only_blobs.is_some() {
+            let is_blob = spec.kind == MemberKind::Blob;
+            let target_key = if is_blob {
+                Some(target_blob_key(&spec.path, source_project, project)?)
+            } else {
+                None
+            };
+            if only_blobs_skips(opts.only_blobs.as_ref(), is_blob, target_key.as_deref()) {
+                return Ok(());
+            }
+        }
         match spec.kind {
             MemberKind::Identity => {
                 *saw_identity = true;
@@ -3751,7 +3867,6 @@ impl NodeProjectExport {
                 // member is refused, so no source-scope (or other-tenant) key can survive a
                 // rename.
                 let target_key = target_blob_key(&spec.path, source_project, project)?;
-                report.blobs += 1;
                 if opts.apply {
                     // Stream the staged member into the target key via the `Storage::put`
                     // byte-stream path (reuses `FsStorage`'s streaming get) — the whole blob is
@@ -3765,14 +3880,41 @@ impl NodeProjectExport {
                         .ok_or_else(|| Perr::Other("blob staging temp has no file name".into()))?;
                     let staged = boatramp_storage::FsStorage::new(staged_dir);
                     let obj = staged.get(staged_name).await.map_err(other)?;
-                    self.blobs
+                    match self
+                        .blobs
                         .put(
                             &target_key,
                             obj.body,
                             boatramp_core::PutMeta { content_type: None },
                         )
                         .await
-                        .map_err(other)?;
+                    {
+                        Ok(_) => report.blobs += 1,
+                        // BACKEND continue-on-error (clone-robustness #2): the target-write failed
+                        // AFTER the backend's own bounded retries AND the `complete` HEAD-recovery
+                        // (s3 Part 1), so the object genuinely did not land. If the policy forgives
+                        // `backend`, WARN + RECORD (key, kind, reason) + SKIP this ONE blob and move
+                        // on — the body is NOT buffered or re-staged (the stream has already passed
+                        // it). Otherwise HARD-FAIL the whole import (the historical behaviour).
+                        Err(e) if opts.continue_on_error.forgives(ContinueErrorKind::Backend) => {
+                            let reason = e.to_string();
+                            tracing::warn!(
+                                key = %target_key,
+                                reason = %reason,
+                                "clone-robustness: SKIPPING a blob whose target-write failed \
+                                 (continue-on-error=backend); re-stream it later with --only-blobs"
+                            );
+                            report.skipped.push(SkippedBlob {
+                                key: target_key,
+                                kind: ContinueErrorKind::Backend.as_str().to_string(),
+                                reason,
+                            });
+                        }
+                        Err(e) => return Err(other(e)),
+                    }
+                } else {
+                    // Dry-run: count what WOULD be copied, writing nothing.
+                    report.blobs += 1;
                 }
             }
             MemberKind::PgDump => {
@@ -8918,6 +9060,380 @@ mod tests {
     ) -> Result<ImportReport, Perr> {
         let mut src = futures::io::Cursor::new(bytes.to_vec());
         drv.import(project, &mut src, opts).await
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Clone-robustness (PLAN-clone-robustness #2/#3) — fault-injecting target + its tests.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A fault-injecting [`Storage`] that wraps an inner backend and fails `put` for a configured set
+    /// of keys with a BACKEND error — the stand-in for a blob whose target-write survives the
+    /// backend's own bounded retries AND the `complete` HEAD-recovery (s3 Part 1) yet still fails.
+    /// Everything else delegates to the inner store. Introduces NO disk buffering: a failed `put`
+    /// consumes the body ONE chunk at a time (discarding each — never accumulating a whole blob) and
+    /// writes nothing; the inner store streams normally.
+    struct FaultStorage {
+        inner: std::sync::Arc<dyn boatramp_core::Storage>,
+        fail_put_keys: std::collections::BTreeSet<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl boatramp_core::Storage for FaultStorage {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            self.inner.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: Option<u64>,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            self.inner.get_range(key, offset, len).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            body: boatramp_core::ByteStream,
+            meta: boatramp_core::PutMeta,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            if self.fail_put_keys.contains(key) {
+                // Consume the body chunk-by-chunk (nothing accumulated, nothing spooled) so the
+                // source read completes exactly as a real backend would, THEN fail.
+                let mut body = body;
+                while let Some(chunk) = body.next().await {
+                    chunk?;
+                }
+                return Err(boatramp_core::StorageError::backend(format!(
+                    "injected backend fault writing {key} (survived retries + complete HEAD-recovery)"
+                )));
+            }
+            self.inner.put(key, body, meta).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), boatramp_core::StorageError> {
+            self.inner.delete(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    /// Seed a source driver with the given blobs, data-only export it to a bundle buffer. Returns
+    /// the bundle bytes. (A data-only bundle carries blobs but no KV/DB, keeping these tests focused
+    /// on the blob restore seam.)
+    async fn source_bundle_with_blobs(
+        tmp: &std::path::Path,
+        tag: &str,
+        blobs: &[(&'static str, Vec<u8>)],
+    ) -> Vec<u8> {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.join(format!("{tag}-blobs"))));
+        let deploy = DeployStore::new(store.clone(), kv.clone());
+        let work = tmp.join(format!("{tag}-work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv, store.clone(), work);
+        for (key, bytes) in blobs {
+            let bytes = bytes.clone();
+            let body: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            store
+                .put(key, body, boatramp_core::PutMeta { content_type: None })
+                .await
+                .unwrap();
+        }
+        export_to_buf(
+            &drv,
+            "acme",
+            &ExportOptions {
+                data_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source export")
+    }
+
+    /// GATE (clone-robustness #2): a blob whose target-write always fails (`backend`) HARD-FAILS the
+    /// whole import by default; with `continue_on_error=backend` it is WARNED + RECORDED + SKIPPED,
+    /// the op is a DISTINCT "completed with N skipped" (never a silent success), and a skip MANIFEST
+    /// under the node base lists it and round-trips. A `=member-mismatch` policy does NOT forgive a
+    /// backend fault (still hard-fails) — the reverse of `=backend` (test #2 + the backend half of #3).
+    #[tokio::test]
+    async fn backend_failure_hard_fails_by_default_and_is_skipped_under_continue_on_error() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::project_export::{ContinueErrorKind, ContinueOnError, SkipManifest};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = source_bundle_with_blobs(
+            tmp.path(),
+            "src",
+            &[
+                ("hblob/acme/web/assets/a.bin", b"aaaa".to_vec()),
+                ("hblob/acme/web/assets/b.bin", b"bbbb".to_vec()),
+            ],
+        )
+        .await;
+
+        // The target fails to write exactly b.bin (a same-name import keeps the key unchanged).
+        let fail_key = "hblob/acme/web/assets/b.bin".to_string();
+        let mk_target = |tag: &str| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let fs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("{tag}-blobs"))));
+            let blobs: Arc<dyn Storage> = Arc::new(FaultStorage {
+                inner: fs.clone(),
+                fail_put_keys: BTreeSet::from([fail_key.clone()]),
+            });
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            let work = tmp.path().join(format!("{tag}-work"));
+            std::fs::create_dir_all(&work).unwrap();
+            let drv =
+                NodeProjectExport::new(BTreeMap::new(), deploy, kv, blobs.clone(), work.clone());
+            (drv, fs, work)
+        };
+
+        // (1) DEFAULT (Off): the backend fault HARD-FAILS the whole import.
+        let (tgt_off, _, _) = mk_target("off");
+        assert!(
+            import_buf(
+                &tgt_off,
+                "acme",
+                &bundle,
+                ImportOptions {
+                    apply: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err(),
+            "a backend write fault must hard-fail by default"
+        );
+
+        // (2) `=member-mismatch` does NOT forgive a backend fault ⇒ still HARD-FAILS (the reverse).
+        let (tgt_mm, _, _) = mk_target("mm");
+        assert!(
+            import_buf(
+                &tgt_mm,
+                "acme",
+                &bundle,
+                ImportOptions {
+                    apply: true,
+                    continue_on_error: ContinueOnError::Kinds(BTreeSet::from([
+                        ContinueErrorKind::MemberMismatch
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err(),
+            "=member-mismatch must NOT forgive a backend fault"
+        );
+
+        // (3) `=backend`: WARN + RECORD + SKIP + continue → "completed with 1 skipped" + manifest.
+        let (tgt_be, tgt_fs, _work) = mk_target("be");
+        let report = import_buf(
+            &tgt_be,
+            "acme",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                continue_on_error: ContinueOnError::Kinds(BTreeSet::from([
+                    ContinueErrorKind::Backend,
+                ])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("=backend tolerates the backend fault");
+        assert_eq!(report.blobs, 1, "only the writable blob was copied");
+        assert!(
+            report.completed_with_skips(),
+            "a skipped blob is a DISTINCT outcome, not a silent success"
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].key, fail_key);
+        assert_eq!(report.skipped[0].kind, "backend");
+        // The MANIFEST exists under the node base + round-trips to the same skipped set.
+        let manifest_path = report
+            .skip_manifest
+            .clone()
+            .expect("a manifest was written");
+        let parsed =
+            SkipManifest::from_json(&std::fs::read(&manifest_path).unwrap()).expect("round-trip");
+        assert_eq!(parsed.blob_keys(), BTreeSet::from([fail_key.clone()]));
+        // The good blob LANDED in the inner store; the skipped one did NOT.
+        assert!(
+            tgt_fs.head("hblob/acme/web/assets/a.bin").await.is_ok(),
+            "the writable blob landed"
+        );
+        assert!(
+            tgt_fs.head("hblob/acme/web/assets/b.bin").await.is_err(),
+            "the skipped blob was NOT written"
+        );
+    }
+
+    /// GATE (clone-robustness #3): `only_blobs` restores ONLY the listed blob keys (re-streamed),
+    /// skipping every other member — and the key list ROUND-TRIPS through the Part-3 manifest
+    /// writer/reader ([`SkipManifest::to_json`] → [`SkipManifest::from_json`]). (Test #4.)
+    #[tokio::test]
+    async fn only_blobs_transfers_only_the_listed_keys() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::project_export::{SkipManifest, SkippedBlob};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = source_bundle_with_blobs(
+            tmp.path(),
+            "src",
+            &[
+                ("hblob/acme/web/assets/a.bin", b"aaaa".to_vec()),
+                ("hblob/acme/web/assets/b.bin", b"bbbb".to_vec()),
+                ("hblob/acme/web/assets/c.bin", b"cccc".to_vec()),
+            ],
+        )
+        .await;
+
+        // A repair manifest listing ONLY a.bin + c.bin — serialise then parse it back (round-trip),
+        // and drive the import from the PARSED keys (so the manifest format is proven round-trippable).
+        let manifest = SkipManifest {
+            project: "acme".into(),
+            skipped: vec![
+                SkippedBlob {
+                    key: "hblob/acme/web/assets/a.bin".into(),
+                    kind: "backend".into(),
+                    reason: "prior fault".into(),
+                },
+                SkippedBlob {
+                    key: "hblob/acme/web/assets/c.bin".into(),
+                    kind: "backend".into(),
+                    reason: "prior fault".into(),
+                },
+            ],
+        };
+        let round = SkipManifest::from_json(manifest.to_json().as_bytes()).expect("round-trip");
+        let only = round.blob_keys();
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let tgt_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("tgt-blobs")));
+        let deploy = DeployStore::new(tgt_blobs.clone(), kv.clone());
+        let work = tmp.path().join("tgt-work");
+        std::fs::create_dir_all(&work).unwrap();
+        let tgt = NodeProjectExport::new(BTreeMap::new(), deploy, kv, tgt_blobs.clone(), work);
+
+        let report = import_buf(
+            &tgt,
+            "acme",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                only_blobs: Some(only.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("only-blobs import");
+        assert_eq!(
+            report.blobs, 2,
+            "exactly the two LISTED blobs were transferred"
+        );
+        assert!(
+            tgt_blobs.head("hblob/acme/web/assets/a.bin").await.is_ok(),
+            "a.bin (listed) transferred"
+        );
+        assert!(
+            tgt_blobs.head("hblob/acme/web/assets/c.bin").await.is_ok(),
+            "c.bin (listed) transferred"
+        );
+        assert!(
+            tgt_blobs.head("hblob/acme/web/assets/b.bin").await.is_err(),
+            "b.bin (NOT listed) must NOT be transferred"
+        );
+    }
+
+    /// GATE (clone-robustness #2 routing): `continue_on_error` maps to the RIGHT seams —
+    /// `member-mismatch` drives the member-mismatch `VerifyPolicy.skip_mismatch` (the generalised
+    /// `--skip-member-mismatch`) but does NOT forgive `backend`; `backend` is the reverse; `all`
+    /// forgives both; `off` neither; and the legacy flag still drives mismatch tolerance (the ALIAS).
+    /// Composes with the existing `project_bundle` member-mismatch e2e tests (which prove
+    /// skip_mismatch=true tolerates a der/ mismatch and strict hard-fails). (The routing half of #3.)
+    #[test]
+    fn continue_on_error_routes_to_the_right_seams() {
+        use boatramp_core::project_export::{ContinueErrorKind, ContinueOnError};
+        use std::collections::BTreeSet;
+        let opts = |c: ContinueOnError, skip: bool| ImportOptions {
+            continue_on_error: c,
+            skip_member_mismatch: skip,
+            ..Default::default()
+        };
+
+        // =member-mismatch → VerifyPolicy skips mismatches, but backend is NOT forgiven.
+        let mm = opts(
+            ContinueOnError::Kinds(BTreeSet::from([ContinueErrorKind::MemberMismatch])),
+            false,
+        );
+        assert!(verify_policy_from_opts(&mm).skip_mismatch);
+        assert!(!mm.continue_on_error.forgives(ContinueErrorKind::Backend));
+
+        // =backend → backend forgiven, mismatch NOT tolerated by the policy.
+        let be = opts(
+            ContinueOnError::Kinds(BTreeSet::from([ContinueErrorKind::Backend])),
+            false,
+        );
+        assert!(!verify_policy_from_opts(&be).skip_mismatch);
+        assert!(be.continue_on_error.forgives(ContinueErrorKind::Backend));
+
+        // all → both; off → neither.
+        let all = opts(ContinueOnError::AllKinds, false);
+        assert!(verify_policy_from_opts(&all).skip_mismatch);
+        assert!(all.continue_on_error.forgives(ContinueErrorKind::Backend));
+        let off = opts(ContinueOnError::Off, false);
+        assert!(!verify_policy_from_opts(&off).skip_mismatch);
+        assert!(!off.continue_on_error.forgives(ContinueErrorKind::Backend));
+
+        // Back-compat ALIAS: the legacy `skip_member_mismatch` flag still drives mismatch tolerance.
+        assert!(verify_policy_from_opts(&opts(ContinueOnError::Off, true)).skip_mismatch);
+
+        // Parse: bare → AllKinds; None → Off; a list → Kinds; an unknown token → Err (fail-closed).
+        assert_eq!(
+            ContinueOnError::parse(Some("all")).unwrap(),
+            ContinueOnError::AllKinds
+        );
+        assert_eq!(ContinueOnError::parse(None).unwrap(), ContinueOnError::Off);
+        assert_eq!(
+            ContinueOnError::parse(Some("backend,member-mismatch")).unwrap(),
+            ContinueOnError::Kinds(BTreeSet::from([
+                ContinueErrorKind::Backend,
+                ContinueErrorKind::MemberMismatch
+            ]))
+        );
+        assert!(ContinueOnError::parse(Some("backend,bogus")).is_err());
     }
 
     #[test]

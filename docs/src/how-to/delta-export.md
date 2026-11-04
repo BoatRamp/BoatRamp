@@ -1,5 +1,7 @@
 # Incremental & true-delta export
 
+**For: operators**
+
 A full [project export](./clone-project.md) ships the whole project every time. A **delta
 export** ships only what **changed** since a chosen base — the control-plane KV upserts and
 tombstones, the new and changed blobs (and blob tombstones), and, for a managed SQL database

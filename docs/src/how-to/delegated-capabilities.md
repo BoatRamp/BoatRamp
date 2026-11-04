@@ -1,5 +1,7 @@
 # Mint a delegated capability
 
+**For: app developers**
+
 Sometimes a guest wants to hand a **scoped, time-bounded read** of its own project's public
 data to another party — an embed, a share link, an agent-to-agent handoff — or to narrow a
 single client's access within a tenant. The usual reach for this is a bearer token, but

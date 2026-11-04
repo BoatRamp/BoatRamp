@@ -1,5 +1,7 @@
 # Migrate from Netlify / Cloudflare Pages
 
+**For: operators & app developers**
+
 Move a static site to boatramp without rewriting your redirect and header rules.
 On `sync`, boatramp folds a Netlify-style `_redirects` file and a `_headers` file
 from the root of your published folder into the deployment's routing, so those

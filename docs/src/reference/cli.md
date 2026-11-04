@@ -5,6 +5,12 @@ page documents each command. Any command also prints its own flags with
 `boatramp <command> --help`, and group commands list their sub-actions with
 `boatramp <command> help`.
 
+> **Looking for the exhaustive flag list?** This page is the hand-written *guide* —
+> curated grouping, worked examples and cross-links. For the complete, always-current
+> reference of **every** command, subcommand, flag, environment variable and default,
+> see the [generated CLI reference](./cli-reference.md), which is produced from the code
+> (`cargo xtask gen-docs`) and verified against drift in CI.
+
 Precedence for any overridable value: **explicit CLI flag > environment variable > config
 file > built-in default** (one layered resolver — see [the configuration
 model](../explanation/config-model.md)). Project commands read `project.cfg`; `serve` and the
@@ -241,7 +247,7 @@ Migrate a pre-0.2.0 control-plane store to the project-scoped layout (mutable
 per-name records re-key under `project/<proj>/…`; no content-addressed body moves).
 The migration is online, idempotent, and resumable. `serve` refuses an unmigrated
 store unless started with [`--auto-migrate`](#boatramp-serve). See
-[Upgrade a store to project scoping](../how-to/migrate-to-projects.md).
+[Upgrade a store to project scoping](../how-to/upgrade-store-to-projects.md).
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -884,7 +890,7 @@ Generate/inspect the control-plane root key and edit the RBAC policy. See
 | `init` | Generate a fresh ES256 root keypair. |
 | `pubkey --private-key <alg:hex>` | Derive the public key from a root private key. |
 | `pin --root-pubkey <k>` | Resolve a `--tls rpk` server's TLS pin from the root anchor (prints `BOATRAMP_SERVER_PUBKEY`). |
-| `rotate-root [--add <pubkey>] [--retire <pubkey>]` | Make-before-break root rotation: trust a new anchor, or retire an old one; no flag lists the extra anchors. See [Migrate the root key](../how-to/migrate-root-key.md). |
+| `rotate-root [--add <pubkey>] [--retire <pubkey>]` | Make-before-break root rotation: trust a new anchor, or retire an old one; no flag lists the extra anchors. See [Rotate the root key](../how-to/rotate-root-key.md). |
 | `policy get` | Print the active RBAC policy as JSON (the built-in default if none is stored). |
 | `policy set <file.json>` | Replace the policy from a JSON file (validated server-side). |
 

@@ -1,5 +1,7 @@
 # Drive boatramp from an AI agent (MCP)
 
+**For: operators & app developers**
+
 boatramp ships a [Model Context Protocol](https://modelcontextprotocol.io) server,
 so an agent like Claude (Desktop, Code) or Codex can operate your control plane in
 natural language: list sites, inspect deployments, activate or roll back, manage

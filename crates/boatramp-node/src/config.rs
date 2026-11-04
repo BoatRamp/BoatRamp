@@ -2469,6 +2469,20 @@ pub struct ServeConfig {
     /// posture), via the SAME per-provider env vars `--acme-dns-provider` reads. See
     /// `boatramp::dns_publish_serve` and [`DnsPublishServeConfig`].
     pub dns_publish: Option<DnsPublishServeConfig>,
+    /// `[serve.dns_providers]` — a LIST of per-zone managed-DNS providers (cap-req #27). Generalizes the
+    /// single env-seeded provider (one `CLOUDFLARE_ZONE_ID`/`CLOUDFLARE_API_TOKEN` per process ⇒ one
+    /// zone) into N per-zone providers, each with its OWN `type:value` pointer-sourced identity +
+    /// credential. BOTH the ACME DNS-01 cert issuer (`--tls acme-dns`) AND the guest `dns-publish`
+    /// capability route to the provider whose `zone_root` is the longest label-boundary suffix of the
+    /// record's / certificate's owner name, so a single-tenant serve authoritative for several domains
+    /// in DIFFERENT zones can manage DNS / issue per-SNI TLS for all of them. **Empty (the default) ⇒
+    /// the existing single env-seeded provider path is used unchanged** (`--acme-dns-provider` /
+    /// `--dns-publish-provider` + the single zone) — full backward-compat. Resolved at serve startup
+    /// against the control-plane KV + `[secrets]` envelope; a `boatramp:` ref with no envelope is a
+    /// fail-closed startup error. Only usable on a build with the `acme-dns` feature (a non-empty list
+    /// on a build without it is a logged no-op). See [`DnsProviderConfig`].
+    #[serde(default)]
+    pub dns_providers: Vec<DnsProviderConfig>,
     /// The fleet's canonical public origin (e.g. `https://cp.example.com`) that a
     /// per-request proof-of-possession must bind to (`aud`). Required for
     /// holder-bound (`cnf`/PoP) tokens to be usable — a proof's origin is compared
@@ -2969,6 +2983,166 @@ pub struct DnsPublishServeConfig {
     /// The authoritative zone apex the provider writes (e.g. `example.com`), passed to the central
     /// `validate_writable` guardrail so an apex `NS` is refused. Required when `provider` is set.
     pub zone_root: Option<String>,
+}
+
+/// Which managed-DNS provider adapter a `[serve.dns_providers]` entry drives (cap-req #27). The SAME
+/// provider kinds (+ aliases) as the `--acme-dns-provider` / `--dns-publish-provider` flag grammar. In
+/// RON the kind is a **quoted string** (`kind: "cloudflare"`, `kind: "gcp-dns"`) — the string form lets
+/// a hyphenated name like `gcp-dns`/`azure-dns` be expressed (RON enum variants must be bare
+/// identifiers, which a hyphen cannot be). `manual` is the credential-free provider that records/echoes
+/// the intended records (an offline proof).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsProviderKind {
+    /// Print/record the records to apply by hand (no credentials).
+    Manual,
+    /// Cloudflare.
+    Cloudflare,
+    /// AWS Route 53 (credentials via the standard AWS provider chain).
+    Route53,
+    /// Oracle Cloud DNS.
+    Oci,
+    /// DigitalOcean (flag alias `do`).
+    DigitalOcean,
+    /// Hetzner Cloud DNS.
+    Hetzner,
+    /// NS1 / IBM.
+    Ns1,
+    /// DNSimple.
+    Dnsimple,
+    /// Google Cloud DNS (flag name `gcp-dns`, alias `gcp`).
+    GcpDns,
+    /// Azure DNS (flag name `azure-dns`, alias `azure`).
+    AzureDns,
+    /// Akamai Edge DNS.
+    Akamai,
+}
+
+impl DnsProviderKind {
+    /// The canonical token for this kind (the primary flag-grammar spelling).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Oci => "oci",
+            Self::DigitalOcean => "digitalocean",
+            Self::Hetzner => "hetzner",
+            Self::Ns1 => "ns1",
+            Self::Dnsimple => "dnsimple",
+            Self::GcpDns => "gcp-dns",
+            Self::AzureDns => "azure-dns",
+            Self::Akamai => "akamai",
+        }
+    }
+
+    /// Parse a kind token (case-insensitive), accepting the SAME names + aliases as the
+    /// `--acme-dns-provider` flag (`do`, `gcp`, `azure`, …). `None` ⇒ unrecognized.
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "manual" => Some(Self::Manual),
+            "cloudflare" => Some(Self::Cloudflare),
+            "route53" => Some(Self::Route53),
+            "oci" => Some(Self::Oci),
+            "digitalocean" | "do" => Some(Self::DigitalOcean),
+            "hetzner" => Some(Self::Hetzner),
+            "ns1" => Some(Self::Ns1),
+            "dnsimple" => Some(Self::Dnsimple),
+            "gcp-dns" | "gcp" | "gcpdns" => Some(Self::GcpDns),
+            "azure-dns" | "azure" | "azuredns" => Some(Self::AzureDns),
+            "akamai" => Some(Self::Akamai),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for DnsProviderKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DnsProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::from_token(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown DNS provider kind {s:?} (expected manual | cloudflare | route53 | oci | \
+                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai)"
+            ))
+        })
+    }
+}
+
+/// One `[serve.dns_providers]` entry (cap-req #27): a single per-zone DNS provider. The list
+/// generalizes the one env-seeded provider into N per-zone providers so a single-tenant serve
+/// authoritative for several domains in DIFFERENT zones can manage DNS / issue per-SNI TLS for all of
+/// them. Both consumers — the ACME DNS-01 cert issuer and the guest `dns-publish` write capability —
+/// route to the provider whose `zone_root` is the longest label-boundary suffix of the record's /
+/// certificate's owner name.
+///
+/// **Every credential/identity field is a `type:value` config pointer:** a bare literal, `env:VAR` (the
+/// operator's environment, honored only when the posture's `allow_env_secret_refs` is set), or
+/// `boatramp:NAME` (the project-scoped sealed `[secrets]` store). A **secret** field (`token`,
+/// `api_key`, `access_token`, `client_token`, `client_secret`) MUST be a `env:`/`boatramp:` ref — a raw
+/// literal secret in the config is refused at startup (mirrors `[serve.s3_credential].secret_access_key`
+/// — no secrets in config). Non-secret identifiers (`zone_id`, `hosted_zone_id`, `region`, `zone`, …)
+/// MAY be a literal, but accept the pointer grammar uniformly. A `boatramp:` ref with no `[secrets]`
+/// envelope is a fail-closed startup error (never a silent env fallback).
+///
+/// Which fields apply depends on `kind` (the per-kind field table is in the `dns-providers` reference).
+/// A field for another kind is ignored. A single provider is representable as a list of one; an
+/// empty/absent list keeps the existing single-env path unchanged (full backward-compat).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsProviderConfig {
+    /// Operator label for this provider (diagnostics / boot log). Not a credential.
+    pub name: String,
+    /// Which provider adapter this entry drives.
+    pub kind: Option<DnsProviderKind>,
+    /// The authoritative zone apex this provider manages (e.g. `example.com`). The routing key:
+    /// selection is the longest `zone_root` that is a label-boundary suffix of the owner name. Also the
+    /// apex passed to the central `validate_writable` guardrail (so an apex `NS` is refused).
+    pub zone_root: String,
+    // ---- per-kind pointer fields (all `type:value` pointers) --------------------------------------
+    /// Cloudflare zone id (non-secret identifier).
+    pub zone_id: Option<String>,
+    /// API token/key — **secret** (Cloudflare / Hetzner / DigitalOcean `token`).
+    pub token: Option<String>,
+    /// Cloudflare per-record proxy (orange-cloud) flag. Not a pointer (a plain bool); absent ⇒ off.
+    pub proxied: Option<bool>,
+    /// Route 53 hosted-zone id (non-secret). Route 53 credentials come from the AWS provider chain, not
+    /// a pointer field.
+    pub hosted_zone_id: Option<String>,
+    /// OCI region (non-secret).
+    pub region: Option<String>,
+    /// Zone/domain name for providers addressed by name (OCI / Hetzner / NS1 / DNSimple / GCP / Azure).
+    /// Non-secret.
+    pub zone: Option<String>,
+    /// OCI API key id / OCID (non-secret identifier).
+    pub key_id: Option<String>,
+    /// OCI private-key PEM **file path** (non-secret — a path; the file holds the key, as today). The
+    /// pointer resolves to a path, which is then read at startup.
+    pub private_key_file: Option<String>,
+    /// DigitalOcean domain (non-secret).
+    pub domain: Option<String>,
+    /// NS1 API key — **secret**.
+    pub api_key: Option<String>,
+    /// DNSimple numeric account id (non-secret).
+    pub account_id: Option<String>,
+    /// OAuth2 access token — **secret** (GCP / Azure / Akamai `access_token`).
+    pub access_token: Option<String>,
+    /// GCP project (non-secret).
+    pub project: Option<String>,
+    /// Azure subscription id (non-secret).
+    pub subscription_id: Option<String>,
+    /// Azure resource group (non-secret).
+    pub resource_group: Option<String>,
+    /// Akamai EdgeGrid host (non-secret).
+    pub host: Option<String>,
+    /// Akamai EdgeGrid client token — **secret**.
+    pub client_token: Option<String>,
+    /// Akamai EdgeGrid client secret — **secret**.
+    pub client_secret: Option<String>,
 }
 
 /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch
@@ -5309,6 +5483,61 @@ mod tests {
             err.is_err(),
             "unknown [serve.s3_credential] field must be rejected"
         );
+    }
+
+    #[test]
+    fn serve_dns_providers_config_parses() {
+        // cap-req #27: absent ⇒ empty list (⇒ the single env-seeded provider path, unchanged).
+        let cfg = server(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        assert!(cfg.serve.unwrap().dns_providers.is_empty());
+        // A multi-zone list: two Cloudflare zones, each with a literal `zone_id` + a sealed `boatramp:`
+        // token ref (the config text carries only the REFERENCE, never the secret).
+        let cfg = server(
+            r#"( serve: ( dns_providers: [
+                ( name: "mailroom-pro", kind: "cloudflare", zone_root: "mailroom.pro",
+                  zone_id: "741f56", token: "boatramp:CF_TOKEN_MAILROOM_PRO" ),
+                ( name: "cariello", kind: "cloudflare", zone_root: "cariello.name",
+                  zone_id: "a1b2c3", token: "boatramp:CF_TOKEN_CARIELLO", proxied: true ),
+            ] ) )"#,
+        );
+        let providers = cfg.serve.unwrap().dns_providers;
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name, "mailroom-pro");
+        assert_eq!(providers[0].kind, Some(DnsProviderKind::Cloudflare));
+        assert_eq!(providers[0].zone_root, "mailroom.pro");
+        assert_eq!(providers[0].zone_id.as_deref(), Some("741f56"));
+        assert_eq!(
+            providers[0].token.as_deref(),
+            Some("boatramp:CF_TOKEN_MAILROOM_PRO")
+        );
+        assert_eq!(providers[1].proxied, Some(true));
+        // The kind enum spells every flag-grammar name, incl. the renamed ones.
+        let cfg = server(
+            r#"( serve: ( dns_providers: [
+                ( name: "g", kind: "gcp-dns", zone_root: "g.example", zone: "z", project: "p",
+                  access_token: "env:GCP_TOKEN" ),
+                ( name: "a", kind: "azure-dns", zone_root: "a.example" ),
+                ( name: "d", kind: "do", zone_root: "d.example" ),
+            ] ) )"#,
+        );
+        let providers = cfg.serve.unwrap().dns_providers;
+        assert_eq!(providers[0].kind, Some(DnsProviderKind::GcpDns));
+        assert_eq!(providers[1].kind, Some(DnsProviderKind::AzureDns));
+        assert_eq!(
+            providers[2].kind,
+            Some(DnsProviderKind::DigitalOcean),
+            "`do` alias"
+        );
+        // An unknown field is rejected (`deny_unknown_fields`) — a fat-fingered key fails fast.
+        let err: Result<ServerConfig, _> = ron_options().from_str(
+            r#"( serve: ( dns_providers: [ ( name: "x", kind: "manual", zone_root: "x.example", bogus: 1 ) ] ) )"#,
+        );
+        assert!(err.is_err(), "unknown dns_providers field must be rejected");
+        // An unknown kind token is rejected at config-parse (fail fast).
+        let err: Result<ServerConfig, _> = ron_options().from_str(
+            r#"( serve: ( dns_providers: [ ( name: "x", kind: "bogus-provider", zone_root: "x.example" ) ] ) )"#,
+        );
+        assert!(err.is_err(), "unknown kind token must be rejected");
     }
 
     #[test]

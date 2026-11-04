@@ -1,5 +1,7 @@
 # Orchestrate functions with workflows
 
+**For: app developers**
+
 A **workflow** chains functions into a small DAG with durable state, retries,
 barrier joins, and on-failure compensation. Reach for one when a job is several
 steps that must run in order (or fan out and rejoin) and you want the run to

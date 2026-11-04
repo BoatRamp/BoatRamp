@@ -36,15 +36,34 @@ and typos.
 
 ## Design docs
 
-The `docs/*.md` files (outside `src/`) are the design record:
+The engineering/design record lives in `docs/design-notes/` (outside `src/`, so
+it never renders on the docs site):
 
-- `ARCHITECTURE-kv.md` — the KV stack and shared-mode coherence.
-- `KEYSPACE.md`, `OPERATING.md` — the keyspace and the operator guide.
-- `CLOUDFLARE.md` — the Cloudflare deployment design.
+- `design-notes/ARCHITECTURE-kv.md` — the KV stack and shared-mode coherence.
+- `design-notes/CLOUDFLARE.md` — the Cloudflare deployment design.
+- `design-notes/config-figment-migration.md`, `design-notes/default-scope-migration.md`
+  — config and default-scope migration records.
+- `design-notes/rust-idiomaticity-catalog.md` — the idiomatic-Rust catalog.
+
+The keyspace and the operator guide are no longer loose design docs — they are
+part of the book: see [KV keyspace](./reference/keyspace.md) and
+[Start here: operators](./how-to/operators.md).
 
 This documentation site (`docs/src/`) is built with
 [mdBook](https://rust-lang.github.io/mdBook/): `mdbook serve docs` to preview,
 `mdbook build docs` to render.
+
+### Adding a how-to guide
+
+A how-to guide is reached through **three** parallel views — update all of them in
+the same change, or they drift apart:
+
+- **`SUMMARY.md`** — the sidebar nav; add the guide under its section.
+- **[`how-to/index.md`](./how-to/index.md)** — the browsable index; add it to the right
+  topic group (and, if it is a task most readers hit early, the *Most common tasks*
+  shortlist).
+- **The audience reading-path** it belongs to — [`how-to/operators.md`](./how-to/operators.md)
+  or [`how-to/app-developers.md`](./how-to/app-developers.md).
 
 ## What's validated where
 

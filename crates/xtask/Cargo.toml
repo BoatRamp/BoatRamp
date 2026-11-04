@@ -1,0 +1,32 @@
+# The workspace dev-tool runner (`cargo xtask …`, via the `.cargo/config.toml` alias).
+# Houses `gen-docs`: regenerate the GENERATED reference pages from the code source of
+# truth (today: `docs/src/reference/cli-reference.md` from boatramp's clap tree) and, with
+# `--check`, fail on drift (the CI docs-drift gate). See `src/main.rs`.
+#
+# NEVER published: it is a build/CI tool, not a shipped crate. `publish = false` keeps it
+# out of `cargo publish` entirely, and it is deliberately NOT in the justfile `crate_order`.
+# It depends on `boatramp` (published) — never the reverse — so it can't affect a release.
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The CLI source of truth: `boatramp::cli_command()` returns the fully-constructed clap
+# command tree. Default (batteries-included) features are REQUIRED here — a `#[cfg(feature
+# = …)]`-gated subcommand (overlay, cluster, mcp, operator, email, acme-dns, …) only
+# appears in the tree when its feature is on, so the generated reference is complete and
+# reproducible only against the default feature set. Run the generator with a plain
+# `cargo xtask gen-docs` (no extra `--features`/`--no-default-features`) so dev and CI
+# produce byte-identical output.
+boatramp = { path = "../boatramp" }
+# The clap types the generator walks (`Command`, `Arg`, `ArgAction`, …).
+clap.workspace = true
+
+[lints]
+workspace = true

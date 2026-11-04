@@ -11,18 +11,20 @@ node, a self-hosted cluster, or Cloudflare Containers.
 
 - **New here?** Publish something in ten minutes —
   [Publish your first site](./tutorials/first-site.md).
-- **Running it in production?** Start with
-  [Deploy a single node](./how-to/deploy-single-node.md).
+- **Running it in production?** Follow the operator path —
+  [Start here: operators](./how-to/operators.md).
 - **Writing functions?** Build and deploy one behind a route in
-  [Write your first handler](./tutorials/first-handler.md), then
-  [invoke one by name](./how-to/functions.md).
+  [Write your first handler](./tutorials/first-handler.md), then follow the
+  app-developer path — [Start here: app developers](./how-to/app-developers.md).
+- **Looking for a specific task?** Browse the
+  [how-to guides](./how-to/index.md) by topic.
 - **Automating or integrating?** Read the
   [authentication & authorization model](./explanation/auth-model.md).
 - **Want to chat?** Join the community on [Discord](https://discord.gg/A78gHFF3F3).
 
 ## What boatramp does
 
-| | |
+| Capability | What it does |
 | --- | --- |
 | [Static hosting](./tutorials/first-site.md) | Content-addressed blobs, atomic deploys, instant rollback. |
 | [Domains & TLS](./how-to/custom-domain.md) | Virtualhosts, ownership verification, automatic certificates. |

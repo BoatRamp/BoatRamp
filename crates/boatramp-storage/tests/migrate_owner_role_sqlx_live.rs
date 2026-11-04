@@ -69,6 +69,7 @@ async fn migrate_owner_role_is_confined_to_project_owner_authority() {
         ROLE_PW,
         OWNER,
         OWNER_PW,
+        false,
     ) {
         su.run_script(&stmt)
             .await

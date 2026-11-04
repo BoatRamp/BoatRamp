@@ -1,5 +1,7 @@
 # Sign in with OIDC
 
+**For: operators**
+
 Enable OIDC on `serve` so users sign in with an identity provider you already run
 (Okta, Keycloak, Auth0, Entra ID), then exchange the provider's JWT for a
 boatramp token. The control plane only ever authorizes boatramp tokens — the IdP

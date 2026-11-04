@@ -182,6 +182,25 @@ jobs:
           fi
           echo "relaxed-durability sole-caller guard OK"
 
+  # The generated reference docs (PLAN-docs-structure Lever 2) must match the code source of
+  # truth. `cargo xtask gen-docs --check` regenerates each generated `reference/*.md` page (today
+  # just `cli-reference.md`, from boatramp's clap command tree) to a temp file and `diff`s it
+  # against the committed copy, failing on any drift — the automated replacement for the manual
+  # pre-release docs-drift audit. Cheap: it compiles the boatramp crate (default/batteries-included
+  # features) ONLY to introspect clap, not to run anything, and the dep closure is rust-cached. On a
+  # failure the step itself prints the diff + the fix (`cargo xtask gen-docs` and commit).
+  docs-drift:
+    name: docs drift (generated reference)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs-drift
+      - name: Generated reference docs match the code
+        run: cargo xtask gen-docs --check
+
   # TIER 1 compile guarantee. Clippy the SHIPPED config — `--all-features --all-targets`
   # on the musl target the release binary + OCI images ship — via the crane-cached nix
   # check. `--all-targets` COMPILES every feature-gated test target (sql live tests,
@@ -2084,7 +2103,7 @@ jobs:
             a2_quiesce_before_close_no_write_races_the_close 2>&1 | tee wal-a2.log
           grep -qE 'test result: ok\. 1 passed' wal-a2.log \
             || { echo "::error::A2 scheduler-quiesce-before-close gate did not pass" >&2; exit 1; }
-          cargo test -p boatramp --bin boatramp -- \
+          cargo test -p boatramp --lib -- \
             a2_cluster_raft_shuts_down_before_store_close \
             a3_stalled_close_is_abandoned_at_deadline 2>&1 | tee wal-a3.log
           grep -qE 'test result: ok\. 2 passed' wal-a3.log \
@@ -2123,7 +2142,7 @@ jobs:
           grep -qE 'test result: ok\. 1 passed' v-authz.log \
             || { echo "::error::version endpoint operator-gating gate did not pass" >&2; exit 1; }
           # The `version` subcommand coexists with clap's `--version` flag (tree is structurally valid).
-          cargo test -p boatramp --bin boatramp cli_tree_is_valid 2>&1 | tee v-cli.log
+          cargo test -p boatramp --lib cli_tree_is_valid 2>&1 | tee v-cli.log
           grep -qE 'test result: ok\. 1 passed' v-cli.log \
             || { echo "::error::CLI tree / version-subcommand gate did not pass" >&2; exit 1; }
           # blob-upload capability advertised iff compiled (a capabilities-omission gap).
@@ -2132,7 +2151,7 @@ jobs:
           grep -qE 'test result: ok\. 1 passed' bu-reg.log \
             || { echo "::error::blob-upload capability-registry gate did not pass" >&2; exit 1; }
           # A declared blob-upload:write/:multipart satisfies the capability token; undeclared refused.
-          cargo test -p boatramp --bin boatramp policy_gates_blob_upload_by_either_declared_right 2>&1 | tee bu-tok.log
+          cargo test -p boatramp --lib policy_gates_blob_upload_by_either_declared_right 2>&1 | tee bu-tok.log
           grep -qE 'test result: ok\. 1 passed' bu-tok.log \
             || { echo "::error::blob-upload capability-token gate did not pass" >&2; exit 1; }
           # Presigned-only no-STS mint: single-object presigned PUT works with NO STS; prefix/multipart
@@ -2438,7 +2457,7 @@ jobs:
         run: cargo test -p boatramp-container resolvconf::tests::newline_in_project_cannot_inject_a_second_nameserver_line
       # The offline mint feeder refusal (end-to-end, in the CLI binary).
       - name: Offline mint feeder refuses a non-conforming target
-        run: cargo test -p boatramp --bins token::tests::offline_mint_refuses_nonconforming_role_target
+        run: cargo test -p boatramp --lib token::tests::offline_mint_refuses_nonconforming_role_target
       # The charset/authz/scope unit invariants in their home crates.
       - name: Charset + authz-backstop + A6 unit invariants
         run: |
@@ -2892,6 +2911,43 @@ jobs:
             || { echo "::error::migrate owner-role confinement gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE OWNER-ROLE CONFINEMENT OK \[postgres\]' migrate-owner.log \
             || { echo "::error::migrate owner-role confinement never reached its marker (a cluster-escape succeeded as the non-superuser owner, or the runtime role gained ownership/escalation)" >&2; exit 1; }
+      - name: Ownership-safe per-replica DYNAMIC credentials on a real Postgres (PLAN-compute-managed-db phase 2)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # Phase 2: a compute workload's managed-DB credential is minted PER REPLICA at launch
+          # and dropped at stop WITHOUT Postgres object-ownership orphaning. On a real PG, the
+          # REAL builders (provision_ddl stable-owner + mint/drop_dynamic_role_ddl) are stood up
+          # and proven: a per-replica dynamic role minted as a member of the stable owner +
+          # `SET role='<owner>'` creates tables OWNED BY THE STABLE OWNER (owns nothing itself);
+          # drops CLEANLY (REASSIGN OWNED->owner, DROP OWNED, DROP ROLE), clearing its CONNECT
+          # grant; a FRESH role then has identical owner-level access; a SET-ROLE-NONE escape is
+          # still clean via the reassign safety net; and the un-mitigated hazard (a naive role
+          # that owns an object CANNOT be dropped) is proven as a negative control. The test is
+          # `#[ignore]` + self-skips on unset env, so we require `--ignored` to run it AND the
+          # success marker so a silent skip or an orphaning regression fails the job.
+          cargo test -p boatramp-storage --features sql-postgres \
+            --test dynamic_creds_ownership_sqlx_live -- --ignored --nocapture 2>&1 | tee dyn-cred-pg.log
+          grep -qE 'test result: ok\. 1 passed' dyn-cred-pg.log \
+            || { echo "::error::dynamic-cred ownership gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DYNAMIC CRED OWNERSHIP OK \[postgres\]' dyn-cred-pg.log \
+            || { echo "::error::dynamic-cred ownership never reached its marker (an object was NOT owner-owned, a drop was NOT clean/orphaned, a fresh role lacked access, the escape safety net failed, or the negative control did not orphan)" >&2; exit 1; }
+      - name: Ownership-safe per-replica DYNAMIC credentials on a real MySQL (PLAN-compute-managed-db phase 2)
+        env:
+          BOATRAMP_TEST_MYSQL_URL: mysql://root:boatramp@localhost:3306/mysql
+        run: |
+          set -eo pipefail
+          # The MySQL analogue: grant-based (no object ownership, so no orphaning), scoped to
+          # <db>.*. A minted dynamic user does DDL+DML, is CONFINED to its tenant db (a second db
+          # it was not granted is unreachable), drops cleanly with the data surviving, and a fresh
+          # user has identical access. `#[ignore]` + self-skip, so require `--ignored` + the marker.
+          cargo test -p boatramp-storage --features sql-mysql \
+            --test dynamic_creds_mysql_live -- --ignored --nocapture 2>&1 | tee dyn-cred-mysql.log
+          grep -qE 'test result: ok\. 1 passed' dyn-cred-mysql.log \
+            || { echo "::error::dynamic-cred mysql gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DYNAMIC CRED OWNERSHIP OK \[mysql\]' dyn-cred-mysql.log \
+            || { echo "::error::dynamic-cred mysql lifecycle never reached its marker (a DDL/DML failure, a confinement breach, a non-surviving data drop, or a fresh-user access regression)" >&2; exit 1; }
       - name: Owner-gated schema-migration SUBSTRATE ledger on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
@@ -3799,7 +3855,7 @@ jobs:
           set -eo pipefail
           # Both halves filtered by the shared `config_json` name prefix; exit code is the whole gate.
           cargo test -p boatramp-node --lib config_json -- --nocapture
-          cargo test -p boatramp --bin boatramp config_json -- --nocapture
+          cargo test -p boatramp --lib config_json -- --nocapture
 
   deny:
     name: cargo-deny

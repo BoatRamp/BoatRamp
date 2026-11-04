@@ -378,6 +378,39 @@ pub trait DnsProvider: Send + Sync {
     fn name(&self) -> &'static str {
         "dns"
     }
+
+    /// Multi-zone routing hook (cap-req #27). Resolve the authoritative zone apex
+    /// for the owner `name`, so a caller that must run [`validate_writable`] (whose
+    /// apex-`NS` guard needs the record's own zone apex) uses the RIGHT apex even
+    /// when one logical "provider" actually fronts several per-zone providers.
+    ///
+    /// The default — [`ZoneResolution::UseConfigured`] — means "this is a single,
+    /// non-routing adapter": the caller's own configured `zone_root` stands, so
+    /// every existing adapter is unchanged. The [`RoutingDnsProvider`] registry
+    /// (cap-req #27) overrides this to return the longest-suffix match's apex
+    /// ([`ZoneResolution::Zone`]), or [`ZoneResolution::NoZone`] when no configured
+    /// zone is authoritative for `name` (⇒ the caller fails closed).
+    ///
+    /// [`RoutingDnsProvider`]: crate::routing::RoutingDnsProvider
+    fn resolve_zone_root(&self, name: &str) -> ZoneResolution {
+        let _ = name;
+        ZoneResolution::UseConfigured
+    }
+}
+
+/// The outcome of resolving an owner name to its authoritative zone apex through
+/// [`DnsProvider::resolve_zone_root`] (cap-req #27 multi-zone routing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneResolution {
+    /// Not a routing provider — the caller's own configured `zone_root` stands
+    /// (the default; every single-zone adapter returns this, so behavior is
+    /// unchanged).
+    UseConfigured,
+    /// A routing registry selected this zone apex (the longest-suffix match).
+    Zone(String),
+    /// A routing registry found NO configured zone authoritative for the name —
+    /// the caller must fail closed (refuse the write / skip issuance).
+    NoZone,
 }
 
 /// Whether two DNS names refer to the same owner (trailing dot and ASCII case

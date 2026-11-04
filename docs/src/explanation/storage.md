@@ -67,4 +67,4 @@ once its notification pipeline is provisioned. The per-site SQL binding (libsql:
 file per site, or a sqld namespace per site) is configured under
 `[handlers.bindings.sql]`; a guest can also open an operator-configured external
 Postgres/MySQL by name (bring-your-own, isolation the operator's) — see
-[Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql).
+[Bring your own database](../how-to/handler-binding-sql.md#bring-your-own-database-external-postgres--mysql).

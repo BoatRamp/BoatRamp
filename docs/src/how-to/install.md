@@ -1,5 +1,7 @@
 # Install boatramp
 
+**For: operators & app developers**
+
 boatramp is a single binary — server and CLI in one. This page installs the
 `boatramp` binary. Pick one method, then verify.
 

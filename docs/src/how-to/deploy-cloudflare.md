@@ -1,5 +1,7 @@
 # Deploy on Cloudflare Containers
 
+**For: operators**
+
 boatramp runs on Cloudflare as its own cluster mode: the boatramp binary runs in
 Cloudflare Containers, and a thin edge Worker routes to it. The Worker reuses the
 same routing engine as the origin, so the edge and the Containers do not drift.
