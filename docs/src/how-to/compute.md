@@ -289,7 +289,10 @@ The database credential (and any workload env) is written to a per-workload
 pod by `secretKeyRef`, so **no credential is a plaintext value in the
 StatefulSet/Pod spec**. Launched pods are hardened (privilege escalation denied,
 all Linux capabilities dropped, the runtime default seccomp profile, and no
-auto-mounted ServiceAccount token).
+auto-mounted ServiceAccount token); a managed DB runs **rootless** as the image's
+DB user, so a one-shot minimal init container (root, only `CHOWN`) pre-owns the
+data volume to that user — the k8s equivalent of boatramp's volume pre-chown on
+the other backends.
 
 ## Set a workload from an existing source
 

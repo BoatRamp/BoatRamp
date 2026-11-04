@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use boatramp_core::compute::{ComputeSpec, RootSource, compute_instance_id};
+use boatramp_core::compute::{ComputeSpec, RootSource, VolumeRef, compute_instance_id};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, LocalObjectReference,
@@ -247,9 +247,18 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     };
 
     // A numeric `user` (`uid[:gid]`) becomes the pod security context, and `fsGroup`
-    // makes the kubelet group-own the mounted PVC to that gid — the k8s-native
-    // equivalent of the docker/native pre-chown so a rootless DB can write its data dir.
+    // makes the kubelet group-own the mounted PVC to that gid.
     let security_context = pod_security_context(spec);
+
+    // `fsGroup` only sets the volume's GROUP; a rootless managed DB must also OWN its data
+    // dir — Postgres `initdb` chmods `PGDATA` and so must be its owner, and a fresh PVC is
+    // uid-owned by root. So, for a rootless DB (a numeric `user`), pre-chown the mounted
+    // volume to that uid:gid in a minimal root init container BEFORE the rootless server
+    // container starts — the k8s-native equivalent of the docker backend's host-side
+    // pre-chown (`boatramp-docker` chowns the bind dir for the same reason). One-shot,
+    // drops every capability except the three `chown -R` needs, and exits. In `caps` mode
+    // (no `user`; the entrypoint runs as root and chowns itself) no init container is added.
+    let init_containers = chown_init_container(spec, &image, volume).map(|c| vec![c]);
 
     let pod_volume = Volume {
         name: volume.name.clone(),
@@ -260,6 +269,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         ..Default::default()
     };
     let pod = PodSpec {
+        init_containers,
         containers: vec![container],
         volumes: Some(vec![pod_volume]),
         security_context,
@@ -512,6 +522,50 @@ fn hardened_security_context(spec: &ComputeSpec) -> SecurityContext {
         }),
         ..Default::default()
     }
+}
+
+/// A one-shot **root** init container that `chown -R`'s the mounted data volume to the
+/// rootless DB user (`spec.user` = `uid[:gid]`), so the rootless server container then OWNS
+/// its data dir (`initdb`/the engine needs to chmod it). The k8s-native equivalent of the
+/// docker backend's host-side pre-chown. `None` unless the spec runs rootless with a numeric
+/// user (in `caps` mode the root entrypoint chowns itself — no init container needed). Runs
+/// as uid 0 with every capability dropped except the three `chown -R` across a populated
+/// reuse needs (`CHOWN` to change owner, `FOWNER`/`DAC_OVERRIDE` to traverse+chown files it
+/// doesn't own), no privilege escalation, RuntimeDefault seccomp — then exits.
+fn chown_init_container(spec: &ComputeSpec, image: &str, volume: &VolumeRef) -> Option<Container> {
+    let (uid, gid) = spec.user.as_deref().and_then(parse_uid_gid)?;
+    Some(Container {
+        name: "chown-data".to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("chown -R {uid}:{gid} {}", volume.mount),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: volume.name.clone(),
+            mount_path: volume.mount.clone(),
+            ..Default::default()
+        }]),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: Some(vec![
+                    "CHOWN".to_string(),
+                    "DAC_OVERRIDE".to_string(),
+                    "FOWNER".to_string(),
+                ]),
+            }),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 /// The pod security context derived from a numeric `spec.user` (`uid[:gid]`), or `None`
@@ -1189,6 +1243,66 @@ mod tests {
         assert_eq!(
             sc.capabilities.as_ref().unwrap().add.as_deref(),
             Some(["NET_BIND_SERVICE".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn rootless_managed_db_gets_a_chown_init_container() {
+        // A rootless managed DB (numeric user) pre-chowns its data volume to that uid:gid
+        // via a minimal root init container, so the rootless server owns its data dir.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.user = Some("999:999".to_string());
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        let init = pod
+            .init_containers
+            .as_ref()
+            .and_then(|v| v.first())
+            .expect("rootless managed DB gets a chown init container");
+        assert_eq!(init.name, "chown-data");
+        let cmd = init.command.as_ref().unwrap().join(" ");
+        assert!(
+            cmd.contains("chown -R 999:999 /var/lib/postgresql/data"),
+            "chown command: {cmd}"
+        );
+        // It mounts the data volume and runs as root with only the chown caps.
+        assert_eq!(
+            init.volume_mounts.as_ref().unwrap()[0].mount_path,
+            "/var/lib/postgresql/data"
+        );
+        let sc = init.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_user, Some(0));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        let caps = sc.capabilities.as_ref().unwrap();
+        assert_eq!(caps.drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        assert_eq!(
+            caps.add.as_deref(),
+            Some(
+                [
+                    "CHOWN".to_string(),
+                    "DAC_OVERRIDE".to_string(),
+                    "FOWNER".to_string()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn caps_mode_managed_db_has_no_chown_init_container() {
+        // In `caps` mode (no rootless user) the root entrypoint chowns itself — no init.
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        assert!(
+            plan.stateful_set
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .init_containers
+                .is_none(),
+            "no rootless user ⇒ no chown init container"
         );
     }
 
