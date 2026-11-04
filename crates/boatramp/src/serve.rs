@@ -136,6 +136,20 @@ pub enum Error {
     #[cfg(feature = "acme-dns")]
     #[error("no certificates available yet — awaiting the cluster leader to issue (retry shortly)")]
     NoCertsYet,
+    /// A `[serve.dns_providers]` entry could not be resolved/built (cap-req #27): a missing required
+    /// field, a refused plaintext secret, a `boatramp:` ref with no `[secrets]` envelope, a duplicate
+    /// `zone_root`, an unreadable OCI key file, etc. Fail-closed at startup.
+    #[cfg(feature = "acme-dns")]
+    #[error("[serve.dns_providers]: {0}")]
+    DnsProvidersConfig(String),
+    /// `--dns-publish-provider list` requested the `[serve.dns_providers]` registry for guest writes,
+    /// but no providers are configured (cap-req #27).
+    #[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
+    #[error(
+        "--dns-publish-provider list (or [serve.dns_publish].provider = \"list\") selects the \
+         [serve.dns_providers] registry for guest DNS writes, but [serve.dns_providers] is empty"
+    )]
+    DnsPublishNoProviders,
 
     // ---- propagated library errors (`#[from]`) ------------------------------
     /// Node-library assembly (handler runtime / SQL binding) failed.
@@ -1410,6 +1424,17 @@ async fn spawn_overlay_roles(
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
+    // cap-req #27: a `[serve.dns_providers]` list needs the ACME/provider adapters, pulled only by the
+    // `acme-dns` feature. On a build without it the list is parsed (the config struct is always present)
+    // but cannot be wired — log a prominent no-op warning rather than silently ignoring it.
+    #[cfg(not(feature = "acme-dns"))]
+    if !serve_cfg.dns_providers.is_empty() {
+        tracing::warn!(
+            count = serve_cfg.dns_providers.len(),
+            "[serve.dns_providers] is configured but this build lacks the `acme-dns` feature — \
+             the multi-zone DNS provider registry is NOT wired (no-op)",
+        );
+    }
     // Resolve the operator security posture once (profile preset + overrides);
     // absent `[security]` ⇒ the strict `multi-tenant` default. Threaded into
     // `ServerOptions` so it reaches the cluster path too.
@@ -1484,11 +1509,23 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 .as_ref()
                 .and_then(|d| d.zone_root.clone())
         });
-        crate::dns_publish_serve::install_dns_publish_source(
-            dp_provider.as_deref(),
-            dp_zone_root.as_deref(),
-        )
-        .await?;
+        // cap-req #27: the `list` sentinel selects the `[serve.dns_providers]` multi-zone registry for
+        // guest writes instead of a single env-seeded provider. The registry needs the control-plane KV
+        // (not built yet here), so its install is DEFERRED to `serve_assembled` (post-KV); skip the
+        // single-env install for it. Every other value keeps the unchanged single-env install.
+        if dp_provider.as_deref() == Some("list") {
+            tracing::debug!(
+                target: "boatramp::dns::publish",
+                "dns-publish: provider `list` selects the [serve.dns_providers] registry — \
+                 deferring install to the post-KV serve pass",
+            );
+        } else {
+            crate::dns_publish_serve::install_dns_publish_source(
+                dp_provider.as_deref(),
+                dp_zone_root.as_deref(),
+            )
+            .await?;
+        }
     }
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or
@@ -1816,6 +1853,19 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let _ = &sealed_s3_credential;
     let storage = built_blobs.storage.clone();
 
+    // Multi-zone DNS provider registry (cap-req #27): resolve `[serve.dns_providers]` now that the
+    // (single-node) control-plane KV + `[secrets]` envelope exist, so a `boatramp:` token ref unseals.
+    // `None` ⇒ the list is empty and the single env-seeded provider path is used unchanged.
+    #[cfg(feature = "acme-dns")]
+    let dns_registry = resolve_dns_registry(
+        &serve_cfg,
+        config.secrets.as_ref(),
+        &data_dir,
+        kv.clone(),
+        options.posture.allow_env_secret_refs,
+    )
+    .await?;
+
     // Blob-backend migration Part 2: a prominent startup WARNING while `[serve.blob_fallback]` is
     // active. Fallback is a bounded TRANSITION mode, not a steady state — the one live hazard is a
     // guest deleting its OWN object during the window (a primary-delete + a read fallback can
@@ -2133,6 +2183,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         cert_refresh,
         #[cfg(feature = "acme-dns")]
         on_demand,
+        #[cfg(feature = "acme-dns")]
+        dns_registry,
         #[cfg(any(
             feature = "blob-upload-aws",
             feature = "blob-upload-gcs",
@@ -2204,6 +2256,11 @@ struct SharedServe<'a> {
     cert_refresh: CertRefresh,
     #[cfg(feature = "acme-dns")]
     on_demand: Option<OnDemandBuild>,
+    /// The resolved multi-zone DNS provider registry (`[serve.dns_providers]`, cap-req #27), or `None`
+    /// when the list is empty (⇒ the single env-seeded provider path). Threaded to BOTH the ACME DNS-01
+    /// issuer (`serve_acme_dns`) and the guest `dns-publish` writer (install below).
+    #[cfg(feature = "acme-dns")]
+    dns_registry: Option<Arc<boatramp_acme::routing::RoutingDnsProvider>>,
     #[cfg(any(
         feature = "blob-upload-aws",
         feature = "blob-upload-gcs",
@@ -2249,6 +2306,8 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
     let cert_refresh = s.cert_refresh;
     #[cfg(feature = "acme-dns")]
     let on_demand = s.on_demand;
+    #[cfg(feature = "acme-dns")]
+    let dns_registry = s.dns_registry;
     #[cfg(any(
         feature = "blob-upload-aws",
         feature = "blob-upload-gcs",
@@ -2399,6 +2458,31 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
         .await?;
     }
 
+    // cap-req #27: install the registry-backed guest `dns-publish` provider source when the operator
+    // selected the `[serve.dns_providers]` multi-zone registry via `--dns-publish-provider list`
+    // (`[serve.dns_publish].provider = "list"`). Done HERE — post-KV, before serving — because the
+    // registry is resolved against the control-plane KV; the pre-fork install handled every single-env
+    // case and deliberately skipped `list`. The node posture `allow_guest_dns_publish` + the per-handler
+    // `dns_publish_zones` allowlist still gate every write; routing (incl. the apex-NS guardrail) is
+    // per-record via the registry's longest-suffix selection.
+    #[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
+    {
+        let dp_provider = args.dns_publish_provider.clone().or_else(|| {
+            serve_cfg
+                .dns_publish
+                .as_ref()
+                .and_then(|d| d.provider.clone())
+        });
+        if dp_provider.as_deref() == Some("list") {
+            match dns_registry.clone() {
+                Some(registry) => {
+                    crate::dns_publish_serve::install_dns_publish_registry_source(registry);
+                }
+                None => return Err(Error::DnsPublishNoProviders),
+            }
+        }
+    }
+
     // TLS dispatch. Off/Custom/Acme/Rpk are identical on both paths; the AcmeDns arm is the ONE
     // unified `serve_acme_dns` driven by `cert_refresh` (filesystem vs replicated static set) +
     // `on_demand` (the per-SNI engine ingredients) — the Pair-1 consolidation, single by construction.
@@ -2420,6 +2504,7 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
                 options,
                 cert_refresh,
                 on_demand,
+                dns_registry,
                 #[cfg(feature = "tcp-listener")]
                 &serve_cfg.listeners,
             )
@@ -2485,6 +2570,33 @@ fn serve_secrets_envelope(
         }
     };
     build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
+}
+
+/// Resolve the `[serve.dns_providers]` multi-zone DNS provider registry (cap-req #27) against the
+/// control-plane `kv` + the `[secrets]` envelope — the SAME post-KV seam + fail-closed posture as the
+/// sealed base S3 credential. `None` ⇒ the list is empty, so the caller uses the single env-seeded
+/// provider path unchanged (full backward-compat). Shared by the single-node (`run`) and cluster
+/// (`run_cluster`) paths; a `boatramp:` ref resolves against whichever control-plane KV each path has
+/// at this point (local KV single-node; the replicated `node.kv` post-KV on a cluster).
+#[cfg(feature = "acme-dns")]
+async fn resolve_dns_registry(
+    serve_cfg: &crate::config::ServeConfig,
+    secrets: Option<&crate::config::SecretsConfig>,
+    data_dir: &Path,
+    kv: Arc<dyn KvStore>,
+    allow_env_secret_refs: bool,
+) -> Result<Option<Arc<boatramp_acme::routing::RoutingDnsProvider>>> {
+    if serve_cfg.dns_providers.is_empty() {
+        return Ok(None);
+    }
+    let envelope = serve_secrets_envelope(secrets, data_dir)?;
+    crate::dns_providers::build_routing_registry(
+        &serve_cfg.dns_providers,
+        kv,
+        envelope,
+        allow_env_secret_refs,
+    )
+    .await
 }
 
 /// Resolve the node-level sealed base S3 credential (#505) — if `[serve.s3_credential]` is set —
@@ -4689,6 +4801,18 @@ async fn run_cluster(
         options.posture.allow_env_secret_refs,
     )
     .await?;
+    // Multi-zone DNS provider registry (cap-req #27): resolved HERE, the cluster's post-KV seam — the
+    // only point a `boatramp:` sealed token ref can unseal against the replicated `node.kv` (same
+    // reverse-lift timing as the sealed base S3 credential). `None` ⇒ the single env-seeded path.
+    #[cfg(feature = "acme-dns")]
+    let dns_registry = resolve_dns_registry(
+        &serve_cfg,
+        config.secrets.as_ref(),
+        &data_dir,
+        kv.clone(),
+        options.posture.allow_env_secret_refs,
+    )
+    .await?;
     // Reverse lift #5 — cloud blob-upload minter, wired post-KV from the SAME sealed base cred, at parity
     // with single-node. `serve_assembled` performs the one wiring; `None` ⇒ unchanged (no cloud minter).
     #[cfg(any(
@@ -4877,6 +5001,10 @@ async fn run_cluster(
         cert_refresh,
         #[cfg(feature = "acme-dns")]
         on_demand,
+        // Multi-zone DNS provider registry (cap-req #27): resolved in the post-KV pass above against the
+        // replicated control-plane KV; `None` ⇒ the single env-seeded provider path.
+        #[cfg(feature = "acme-dns")]
+        dns_registry,
         // Cloud blob-upload minter (reverse lift #5): built in the post-KV pass above from the sealed
         // base cred; `None` ⇒ unchanged (no cloud minter configured).
         #[cfg(any(
@@ -5064,6 +5192,10 @@ async fn serve_acme_dns(
     options: boatramp_server::ServerOptions,
     cert_refresh: CertRefresh,
     on_demand: Option<OnDemandBuild>,
+    // The multi-zone DNS provider registry (`[serve.dns_providers]`, cap-req #27). `Some` ⇒ it IS the
+    // DNS provider (routing every `_acme-challenge` write by the certificate's owner name to the
+    // longest-suffix zone); `None` ⇒ the single env-seeded provider (`--acme-dns-provider`), unchanged.
+    dns_registry: Option<Arc<boatramp_acme::routing::RoutingDnsProvider>>,
     // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
     // the on-demand engine built below. Spawned once the resolver exists.
     #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
@@ -5079,9 +5211,21 @@ async fn serve_acme_dns(
     }
     install_crypto_provider();
 
-    let kind = parse_dns_provider(&args.acme_dns_provider)?;
-    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
-        crate::acme_dns::build_provider(kind).await?.into();
+    // cap-req #27: when `[serve.dns_providers]` is configured the registry IS the provider (per-zone
+    // routing for every challenge write); otherwise the single env-seeded provider path is unchanged.
+    let provider: Arc<dyn boatramp_acme::dns::DnsProvider> = match dns_registry {
+        Some(registry) => {
+            tracing::info!(
+                zones = ?registry.zones(),
+                "acme-dns: using the multi-zone [serve.dns_providers] registry for DNS-01 (cap-req #27)",
+            );
+            registry
+        }
+        None => {
+            let kind = parse_dns_provider(&args.acme_dns_provider)?;
+            crate::acme_dns::build_provider(kind).await?.into()
+        }
+    };
     // On-demand per-SNI issuance (cap-req 03): build the engine HERE, where the ACME DNS provider is in
     // hand (so a `dns-01` challenge works), from the ingredients the serve path chose (single-node: a
     // KvCertStore over the local kv + an always-`|| true` leader; cluster: the replicated store + the
@@ -5233,7 +5377,10 @@ async fn serve_acme_dns(
         crate::acme_dns::spawn_dns_reconcile(
             deploy.clone(),
             provider.clone(),
-            args.acme_dns_provider.clone(),
+            // The ledger's provider label: the adapter's own stable name (`routing` for the cap-req #27
+            // multi-zone registry; the adapter name otherwise). Cosmetic — retract uses `provider`
+            // directly, not a name lookup.
+            provider.name().to_string(),
             crate::dns::parse_target(target),
             args.dns_reconcile_ttl,
             move || gate(),

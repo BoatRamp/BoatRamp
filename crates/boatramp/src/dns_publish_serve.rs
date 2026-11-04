@@ -115,6 +115,61 @@ pub async fn build_dns_publish_source(
     })))
 }
 
+/// A `dns-publish` provider source backed by the multi-zone `[serve.dns_providers]` registry (cap-req
+/// #27). The registry IS a [`DnsProvider`] that routes each write by the record's owner name to the
+/// longest-suffix zone, so one node-global grant serves every project/site: the per-record routing —
+/// including the apex-NS guardrail's per-zone apex (via [`DnsProvider::resolve_zone_root`]) — happens
+/// inside the provider, not here. The grant's `zone_root` is therefore left empty (the registry never
+/// consults it; it resolves the apex per record). The per-grant `dns_publish_zones` own-name allowlist +
+/// the posture gate still bound every guest write, a layer up.
+pub struct RegistryDnsPublishSource {
+    provider: Arc<dyn DnsProvider>,
+}
+
+impl std::fmt::Debug for RegistryDnsPublishSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryDnsPublishSource")
+            .field("provider", &self.provider.name())
+            .finish()
+    }
+}
+
+impl DnsPublishProviderSource for RegistryDnsPublishSource {
+    fn provider_for(&self, _project: &str, _site: &str) -> Option<DnsPublishGrant> {
+        Some(DnsPublishGrant {
+            provider: Arc::clone(&self.provider),
+            // Unused for a routing provider: it resolves the authoritative apex per record via
+            // `resolve_zone_root`, so the single `zone_root` fallback is never consulted. Empty is safe
+            // (it can never equal a real owner name, so it never triggers a false apex-NS refusal).
+            zone_root: String::new(),
+        })
+    }
+}
+
+/// Install the registry-backed `dns-publish` provider source (cap-req #27, the `list` opt-in). Called
+/// from the post-KV serve pass once the `[serve.dns_providers]` registry is resolved. Emits the SAME
+/// stable `DNS-PUBLISH SERVE-INSTALL CALLED` boot marker as the single-env install (it means "a guest
+/// dns-publish provider source was installed").
+pub fn install_dns_publish_registry_source(
+    registry: Arc<boatramp_acme::routing::RoutingDnsProvider>,
+) {
+    let zones = registry.zones();
+    let source = Arc::new(RegistryDnsPublishSource {
+        provider: registry as Arc<dyn DnsProvider>,
+    });
+    boatramp_server::dns_publish::install_provider_source(Some(
+        source as Arc<dyn DnsPublishProviderSource>,
+    ));
+    tracing::info!(
+        target: "boatramp::dns::publish",
+        zones = ?zones,
+        "dns-publish: guest DNS-write provider source INSTALLED from the [serve.dns_providers] \
+         multi-zone registry (operator opt-in, --dns-publish-provider list) — DNS-PUBLISH \
+         SERVE-INSTALL CALLED; the node posture `allow_guest_dns_publish` + a per-handler \
+         `dns_publish_zones` allowlist still gate every guest write",
+    );
+}
+
 /// Install the operator-configured `dns-publish` provider source ONCE at serve boot — the one-call fix
 /// for cap-req #25 (the dead seam v0.51.0 shipped). A no-op (fail-closed, nothing installed) when no
 /// provider is configured. Mirrors [`crate::dns_resolve_override`]'s `install_override`. Call once,

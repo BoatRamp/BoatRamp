@@ -75,6 +75,10 @@ mod config_cmd;
 mod dlq;
 #[cfg(feature = "acme-dns")]
 mod dns;
+/// Build the multi-zone `[serve.dns_providers]` registry (cap-req #27): resolve each per-zone
+/// provider's `type:value` pointer fields and construct the routing `DnsProvider`.
+#[cfg(feature = "acme-dns")]
+mod dns_providers;
 /// Serve-boot install of the guest `dns-publish` (write) provider source (cap-req #25).
 #[cfg(all(feature = "dns-publish", feature = "acme-dns"))]
 mod dns_publish_serve;
