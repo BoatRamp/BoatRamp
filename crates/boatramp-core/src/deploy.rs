@@ -2556,6 +2556,14 @@ impl DeployStore {
         }
     }
 
+    /// Persist a verification record (+ its HTTP self-serve index). The **unlocked internal** writer:
+    /// its only callers ([`start_domain_verification`](Self::start_domain_verification),
+    /// [`mark_domain_verified`](Self::mark_domain_verified)) hold [`domain_claim_lock`] across their
+    /// read-modify-write, so this must NOT take it (`futures::lock::Mutex` is non-reentrant). Mirrors
+    /// the [`set_site_config`](Self::set_site_config)/[`set_site_config_locked`](Self::set_site_config_locked)
+    /// locked/unlocked split (Security review N1).
+    ///
+    /// [`domain_claim_lock`]: DeployStoreInner::domain_claim_lock
     async fn put_domain_verification(
         &self,
         project: ProjectRef<'_>,
@@ -2700,6 +2708,12 @@ impl DeployStore {
     /// method (so re-running `domain add` shows the same token instead of
     /// invalidating an in-progress setup); otherwise mints a fresh one. A
     /// challenge that's already `verified` is returned untouched.
+    ///
+    /// Holds [`domain_claim_lock`](DeployStoreInner::domain_claim_lock) across the whole
+    /// read-check-mint-write (Security review N1): the domain-verification writers serialize against
+    /// the destructive sweeps ([`prune_project`](Self::prune_project) / [`delete_site`](Self::delete_site)),
+    /// so a challenge cannot be minted between a prune's locked scan and its batched delete and then
+    /// be deleted from under this writer. Mirrors [`attach_verified_domain`](Self::attach_verified_domain).
     pub async fn start_domain_verification(
         &self,
         project: ProjectRef<'_>,
@@ -2708,6 +2722,7 @@ impl DeployStore {
         method: VerificationMethod,
         now_unix: u64,
     ) -> Result<DomainVerification, DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
         if let Some(existing) = self.get_domain_verification(project, site, host).await?
             && (existing.verified || existing.method == method)
         {
@@ -2792,13 +2807,17 @@ impl DeployStore {
     }
 
     /// Mark `(site, host)`'s challenge verified and persist it. Errors if no
-    /// challenge has been started.
+    /// challenge has been started. Holds [`domain_claim_lock`](DeployStoreInner::domain_claim_lock)
+    /// across the read-modify-write so the proof cannot be minted/flipped between a destructive
+    /// sweep's locked scan and its batched delete (Security review N1; see
+    /// [`start_domain_verification`](Self::start_domain_verification)).
     pub async fn mark_domain_verified(
         &self,
         project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<DomainVerification, DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
         let mut verification = self
             .get_domain_verification(project, site, host)
             .await?
@@ -2812,13 +2831,16 @@ impl DeployStore {
     }
 
     /// Drop the verification record for `(site, host)` (when detaching a host).
-    /// Returns whether one existed.
+    /// Returns whether one existed. Holds [`domain_claim_lock`](DeployStoreInner::domain_claim_lock)
+    /// across the read-then-delete so it serializes against the destructive sweeps (Security review
+    /// N1; see [`start_domain_verification`](Self::start_domain_verification)).
     pub async fn remove_domain_verification(
         &self,
         project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<bool, DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
         let Some(v) = self.get_domain_verification(project, site, host).await? else {
             return Ok(false);
         };
@@ -4018,16 +4040,21 @@ impl DeployStore {
         // torn WAL tail this boot, a LIVE site's `current/`/`site/` pointer can be transiently
         // absent in the recovered view, so the site would be misclassified `DeadSite` and its
         // records deleted. So a destructive `--apply` is REFUSED whenever a boot-time degraded
-        // breadcrumb is present (the same state `GET /api/kv-status` surfaces) — the operator
-        // reviews + `boatramp kv status --ack`s first, then re-runs. The dry-run report is read-only
-        // + advisory, so it still runs (the operator WANTS to see the plan while degraded).
+        // breadcrumb is present (the same state `GET /api/kv-status` surfaces). `self.kv_degraded`
+        // is an IMMUTABLE boot snapshot read once after the store opened, so `kv status --ack` (which
+        // clears the on-disk `DEGRADED.json`) does NOT lift this refusal in the RUNNING process — a
+        // node RESTART is required for the node to re-read a cleared breadcrumb (Security review N2).
+        // The guidance below says exactly that. The dry-run report is read-only + advisory, so it
+        // still runs (the operator WANTS to see the plan while degraded).
         if apply && let Some(marker) = &self.kv_degraded {
             return Err(DeployError::Conflict(format!(
                 "control-plane KV is in a degraded/quarantined state (self-heal at {stamp}; \
                  loss window: {loss}); refusing to --apply a destructive project prune — a \
                  transiently-absent site pointer in the recovered view could misclassify a live \
                  site as dead and delete its records. Review `boatramp kv status`, acknowledge with \
-                 `boatramp kv status --ack`, then re-run. (A dry-run report still works.)",
+                 `boatramp kv status --ack`, THEN RESTART the node (this refusal is keyed on a \
+                 boot-time snapshot, so `--ack` alone does not clear it in the running process), \
+                 then re-run the prune. (A dry-run report still works meanwhile.)",
                 stamp = marker.stamp,
                 loss = marker.loss_window,
             )));
@@ -9561,5 +9588,68 @@ mod tests {
             applied.prunable
         );
         assert!(kv.get(&foreign).await.unwrap().is_none());
+    }
+
+    /// Security review N1 — the domain-verification writers (`start` / `mark` / `remove`) now take
+    /// the same `domain_claim_lock` the destructive sweeps hold, so a challenge cannot be
+    /// minted/verified between a prune's locked scan and its batched delete and then be deleted from
+    /// under the writer. This exercises all three writers end-to-end THROUGH the lock (which would
+    /// hang on a re-entrant deadlock if `put_domain_verification` also took it) and confirms the
+    /// outcomes prune then draws on them: a VERIFIED proof minted via the real writer survives a
+    /// prune apply even for a not-in-config host, while a `remove_domain_verification` then clears it.
+    #[tokio::test]
+    async fn domain_verification_writers_lock_and_survive_prune_without_deadlock() {
+        use crate::domain_verify::VerificationMethod;
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+        let site = SiteName::new("shop");
+
+        // A live site answering only `shop.example.com`.
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+
+        // Mint + verify an ownership proof for a host NOT in the config, via the REAL (now
+        // lock-taking) writers. `start` (locked) → `put` (unlocked internal) must not deadlock.
+        let now = crate::time::now_unix();
+        store
+            .start_domain_verification(
+                acme,
+                &site,
+                "proof.example.net",
+                VerificationMethod::Dns,
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(acme, &site, "proof.example.net")
+            .await
+            .unwrap();
+        let proof_key = keys::domain_verification(acme, "shop", "proof.example.net");
+
+        // Prune (apply) takes the SAME lock across its scan+delete. The verified proof for the
+        // not-in-config host is KEPT (Finding B), and no deadlock occurred (the call returned).
+        let plan = store.prune_project("acme", true).await.unwrap();
+        assert!(
+            plan.is_clean(),
+            "a verified proof minted via the real writer is kept by prune: {:?}",
+            plan.prunable
+        );
+        assert!(kv.get(&proof_key).await.unwrap().is_some());
+
+        // The locked `remove_domain_verification` clears the proof (its own `domain rm` path) — again
+        // through the lock, no deadlock.
+        assert!(
+            store
+                .remove_domain_verification(acme, &site, "proof.example.net")
+                .await
+                .unwrap()
+        );
+        assert!(kv.get(&proof_key).await.unwrap().is_none());
     }
 }

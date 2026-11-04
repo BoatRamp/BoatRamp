@@ -104,8 +104,11 @@ Scripts can take the machine-readable form with `--output-format json`.
 > **Degraded KV:** if the control-plane KV booted into a self-healed /
 > quarantined state (a torn WAL tail was dropped — see `boatramp kv status`),
 > `--apply` is **refused** fail-closed: a transiently-absent site pointer in the
-> recovered view could misclassify a live site as dead. Review and `boatramp kv
-> status --ack` first, then re-run. The dry-run report still works while degraded.
+> recovered view could misclassify a live site as dead. The refusal is keyed on a
+> **boot-time snapshot**, so review, `boatramp kv status --ack`, then **restart
+> the node** (so it re-reads the cleared breadcrumb) before re-running the prune —
+> `--ack` alone does not lift the refusal in the running process. The dry-run
+> report still works while degraded.
 
 ## Authorization
 
