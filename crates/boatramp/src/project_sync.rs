@@ -1106,7 +1106,7 @@ mod tests {
             .expect_err("no selective KV seam");
         match err {
             SyncApplyError::Unsupported(m) => {
-                assert!(m.contains("settings") && m.contains("selective-sync"))
+                assert!(m.contains("settings") && m.contains("selective-sync"));
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1131,7 +1131,7 @@ mod tests {
                 assert!(
                     m.contains("cross-tenant guard") && m.contains("site"),
                     "{m}"
-                )
+                );
             }
             o => panic!("expected guard refusal, got {o:?}"),
         }
@@ -1145,7 +1145,7 @@ mod tests {
                 assert!(
                     m.contains("cross-tenant guard") && m.contains("database"),
                     "{m}"
-                )
+                );
             }
             o => panic!("expected guard refusal, got {o:?}"),
         }
