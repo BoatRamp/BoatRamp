@@ -280,6 +280,160 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
     println!("K8S COMPUTE BACKEND OK");
 }
 
+/// STRICT (multi-tenant) managed-database live gate (mailroom #26 security F1). Same managed
+/// Postgres/pgvector bring-up as the Phase-1 lane, but with the backend built under the
+/// `strict` posture — so the F1 shared-kernel hardening is applied to the DB pod: a tenant
+/// `cap_add` is DROPPED and the container root filesystem is forced READ-ONLY, with only the
+/// `/tmp`+`/run` `emptyDir` scratch writable (mirroring the docker backend's `/tmp`+`/run`
+/// tmpfs). The real risk this gate closes: a stock `pgvector/postgres` image's `initdb` +
+/// startup write OUTSIDE the PVC (its unix socket under `/run`, temp files under `/tmp`), so
+/// a read-only root with the wrong scratch would never reach Ready. Reaching Ready PROVES
+/// the scratch volumes let the hardened pod boot.
+///
+/// It also `get`s the APPLIED `StatefulSet` and asserts the hardened shape live
+/// (`readOnlyRootFilesystem=true`, no `cap_add` even though the spec requested one, the two
+/// scratch `emptyDir`s), so the gate fails if the strict shape regresses in EITHER the plan
+/// or the apply. Marker `K8S STRICT MANAGED-DB OK`.
+#[tokio::test]
+#[ignore = "live: needs a real k8s/k3s cluster — set BOATRAMP_TEST_K8S=1 (marker: K8S STRICT MANAGED-DB OK)"]
+async fn k8s_strict_managed_postgres_boots_under_read_only_root() {
+    if std::env::var("BOATRAMP_TEST_K8S").is_err() {
+        eprintln!("skipping k8s live gate: set BOATRAMP_TEST_K8S=1 (needs a reachable cluster)");
+        return;
+    }
+    // STRICT posture (the 5th arg): the multi-tenant hardening is applied. retain_pvc=false
+    // (throwaway gate DB).
+    let backend = KubernetesBackend::connect(None, false, None, None, true)
+        .await
+        .expect("connect to the cluster");
+
+    // The managed Postgres spec, plus a stand-in password (delivered via the backend's env
+    // Secret + secretKeyRef) and rootless user 999:999 (as the reconcile's default privilege
+    // strategy sets). ALSO request a `cap_add` — under the strict posture it MUST be dropped;
+    // the applied-shape assertion below proves it is (and the DB still boots without it).
+    let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+    spec.env
+        .insert("POSTGRES_PASSWORD".to_string(), "livegate-pw".to_string());
+    spec.user = Some("999:999".to_string());
+    spec.cap_add = vec!["NET_BIND_SERVICE".to_string()];
+    let image = spec.root.as_str().to_string();
+    let workload = "pgtest-strict";
+    let req = LaunchRequest {
+        project: "default".to_string(),
+        workload: workload.to_string(),
+        replica: 0,
+        artifact: Artifact::Image {
+            reference: image.clone(),
+        },
+        spec,
+    };
+
+    // (1) launch → StatefulSet + Service + PVC under the strict (hardened) posture.
+    let instance = backend
+        .launch(&req)
+        .await
+        .expect("launch strict managed postgres");
+    let handle = instance.handle.clone();
+
+    // (2) assert the APPLIED StatefulSet carries the hardened shape (so a regression in the
+    // plan OR the apply fails the gate), using an independent client of the same config.
+    {
+        use k8s_openapi::api::apps::v1::StatefulSet;
+        use kube::{Api, Client};
+        let client = Client::try_default()
+            .await
+            .expect("kube client for the shape assertion");
+        let sts_api: Api<StatefulSet> = Api::default_namespaced(client);
+        let sts = sts_api
+            .get(workload)
+            .await
+            .expect("get the applied StatefulSet");
+        let pod = sts
+            .spec
+            .expect("statefulset spec")
+            .template
+            .spec
+            .expect("pod spec");
+        let db = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "db")
+            .expect("db container");
+        let sc = db
+            .security_context
+            .as_ref()
+            .expect("db container security context");
+        assert_eq!(
+            sc.read_only_root_filesystem,
+            Some(true),
+            "strict posture must force a read-only root filesystem on the applied pod"
+        );
+        let cap_add = sc.capabilities.as_ref().and_then(|c| c.add.as_ref());
+        assert!(
+            cap_add.is_none_or(Vec::is_empty),
+            "strict posture must drop the tenant cap_add; applied add = {cap_add:?}"
+        );
+        let scratch: Vec<&str> = pod
+            .volumes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|v| v.empty_dir.is_some())
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(
+            scratch.contains(&"scratch-tmp") && scratch.contains(&"scratch-run"),
+            "strict posture must mount writable /tmp + /run emptyDir scratch; got {scratch:?}"
+        );
+    }
+
+    // (3) the pod goes Ready — PROVES the read-only root + scratch let the stock pgvector
+    // image's initdb/startup boot (the real F1 bring-up risk).
+    let mut ready = false;
+    for _ in 0..90 {
+        if matches!(backend.health(&handle).await, Ok(Health::Healthy)) {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if !ready {
+        let diag = backend.diagnose(&handle).await;
+        eprintln!("{diag}");
+        panic!(
+            "strict managed postgres never went Ready under a read-only root — diagnostics above"
+        );
+    }
+
+    // (4) the database is live under the read-only root — exec `psql` SELECT 1 inside the pod
+    // (writes its socket to the /run scratch, temp to the /tmp scratch).
+    let sel = backend
+        .exec(
+            &handle,
+            &[
+                "psql".into(),
+                "-U".into(),
+                "postgres".into(),
+                "-tAc".into(),
+                "select 1".into(),
+            ],
+            None,
+        )
+        .await
+        .expect("exec psql select 1");
+    assert_eq!(sel.exit_code, 0, "psql select 1 exit: {sel:?}");
+    assert!(
+        String::from_utf8_lossy(&sel.stdout).trim() == "1",
+        "psql select 1 stdout: {:?}",
+        String::from_utf8_lossy(&sel.stdout)
+    );
+
+    // (5) teardown (retain_pvc_on_stop=false ⇒ the PVC goes too).
+    backend.stop(&handle).await.expect("stop");
+
+    println!("K8S STRICT MANAGED-DB OK");
+}
+
 #[tokio::test]
 #[ignore = "live: needs a real k8s cluster + a CSI VolumeSnapshotClass — set BOATRAMP_TEST_K8S=1 (marker: K8S COMPUTE PHASE2 OK)"]
 async fn k8s_phase2_volume_snapshot_round_trip() {
