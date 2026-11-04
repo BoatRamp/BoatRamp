@@ -77,6 +77,10 @@ pub mod project_export;
 /// `project prune` — GC a project's provably-orphaned control-plane state (fail-closed; the
 /// pure classification types + host-matching, applied over live KV by `DeployStore`).
 pub mod project_prune;
+/// `project sync` planning + preflight (increment 1) — the piece↔KV-strata taxonomy, the
+/// `--include-/--exclude-` selection model, and the pure dry-run classifier (carry / rewrite /
+/// re-derive / drop / preserve / skip) run before any byte moves. No mutation (apply = inc 2).
+pub mod project_sync;
 pub mod redact;
 pub mod registry_auth;
 pub mod sealed_state;
