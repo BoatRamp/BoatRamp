@@ -196,7 +196,7 @@ impl KubernetesBackend {
     /// field manager owns a field this apply sets) FAILS CLOSED instead of silently stealing
     /// the field / adopting a foreign object. boatramp's own idempotent re-apply uses the
     /// SAME field manager, so it never conflicts; a clash can only mean a non-boatramp
-    /// object squats the name (which the injective naming already makes a mis-config, not a
+    /// object squats the name (which the injective naming already makes a misconfiguration, not a
     /// cross-tenant collision) — and we refuse rather than overwrite it.
     async fn apply<K>(&self, obj: &K) -> Result<(), BackendError>
     where

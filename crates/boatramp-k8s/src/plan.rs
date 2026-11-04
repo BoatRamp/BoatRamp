@@ -2436,9 +2436,9 @@ mod tests {
             .iter()
             .find(|p| p.metadata.name.as_deref() == Some(&allow_policy_name("pg")))
             .expect("per-workload allow policy present");
-        let aspec = allow.spec.as_ref().unwrap();
+        let allow_spec = allow.spec.as_ref().unwrap();
         assert_eq!(
-            aspec
+            allow_spec
                 .pod_selector
                 .match_labels
                 .as_ref()
@@ -2447,15 +2447,15 @@ mod tests {
                 .map(String::as_str),
             Some("pg")
         );
-        let rule = &aspec.ingress.as_ref().unwrap()[0];
+        let rule = &allow_spec.ingress.as_ref().unwrap()[0];
         // Allowed port is the DB port.
         assert_eq!(
             rule.ports.as_ref().unwrap()[0].port,
             Some(IntOrString::Int(5432))
         );
         // Allowed sources: a managed-by=boatramp sibling and a compute-consumer=true pod.
-        let froms = rule.from.as_ref().unwrap();
-        let labels: Vec<_> = froms
+        let from_peers = rule.from.as_ref().unwrap();
+        let labels: Vec<_> = from_peers
             .iter()
             .filter_map(|p| p.pod_selector.as_ref())
             .filter_map(|s| s.match_labels.as_ref())
