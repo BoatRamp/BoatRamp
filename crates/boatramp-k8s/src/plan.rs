@@ -420,10 +420,11 @@ pub fn expandable_storage_class(name: &str, provisioner: &str) -> StorageClass {
 pub const DNS_LABEL_MAX: usize = 63;
 
 /// Hex-digit width of the collision-resistant hash suffix appended to a shortened /
-/// sanitized name (16 hex = 64 bits of a SHA-256 digest — negligible collision odds for
-/// the handful of objects in one namespace, and stable across runs + binary versions
-/// since SHA-256 is fixed).
-const HASH_SUFFIX_LEN: usize = 16;
+/// sanitized name (32 hex = **128 bits** of a SHA-256 digest — ~2⁻¹²⁸ collision odds, at
+/// parity with the managed-DB `bramp-db-<digest>` derivation's 128-bit base-36 digest; NEW-3.
+/// Stable across runs + binary versions since SHA-256 is fixed). Leaves a 30-char body
+/// budget (`63 - 32 - 1`), ample for a readable prefix before the hash.
+const HASH_SUFFIX_LEN: usize = 32;
 
 /// A stable, collision-resistant short digest of `s` (`HASH_SUFFIX_LEN` lowercase hex
 /// chars of its SHA-256), used to disambiguate a shortened / sanitized object name.
@@ -435,26 +436,41 @@ fn short_hash(s: &str) -> String {
     hex
 }
 
-/// Coerce `ident` into a valid RFC 1123 DNS label (a Kubernetes object/Service name),
-/// **deterministically and injectively**.
+/// Whether `s` is a valid RFC 1035 DNS label — a Kubernetes **Service** name. Stricter than
+/// [`is_dns1123_label`] in one way: the first character must be **alphabetic** (`[a-z]`), not
+/// merely alphanumeric. A `Service` is rejected by the apiserver (422, "a DNS-1035 label must
+/// start with an alphabetic character") if it starts with a digit, even though that same name
+/// is a valid DNS-1123 label for a StatefulSet/Deployment/Pod/Secret/NetworkPolicy.
+pub fn is_dns1035_label(s: &str) -> bool {
+    is_dns1123_label(s) && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+}
+
+/// Coerce `ident` into a valid RFC 1035 DNS label (a Kubernetes object **and Service**
+/// name), **deterministically and injectively**.
 ///
-/// - An `ident` that is ALREADY a valid label is returned **unchanged** (byte-identical
-///   on the wire): every derived managed-DB workload name (`bramp-db-<digest>`) and any
-///   plain lowercase `[a-z0-9-]` workload passes through untouched, so existing names +
+/// - An `ident` that is ALREADY a valid DNS-1035 label (a valid DNS-1123 label that is also
+///   **letter-leading**) is returned **unchanged** (byte-identical on the wire): every
+///   derived managed-DB workload name (`bramp-db-<digest>`) and any plain lowercase
+///   letter-leading `[a-z][a-z0-9-]*` workload passes through untouched, so existing names +
 ///   their in-cluster DNS do not move.
 /// - Otherwise the name is sanitized (lowercased; every out-of-charset byte — `_`, `.`,
 ///   uppercase, … — folded to `-`; runs of `-` collapsed; trimmed to an alphanumeric
 ///   edge) AND a [`short_hash`] of the **original** `ident` is appended, so two distinct
 ///   idents that sanitize to the same body can never collide on one k8s object. An
 ///   over-long name is truncated to fit the hash within the 63-char label budget.
+/// - The result is GUARANTEED to start with a letter (a fixed `x` prefix is spliced in when
+///   the sanitized body is empty or digit-leading), so it is a valid DNS-1035 label and can
+///   name a `Service` — closing the regression where a digit-leading
+///   [`workload_object_name`] produced a Service the apiserver rejected with a 422. The
+///   disambiguating hash is of the ORIGINAL `ident`, so the prefix never breaks injectivity.
 ///
-/// Total (never fails) and idempotent on an already-valid label.
+/// Total (never fails) and idempotent on an already-valid DNS-1035 label.
 pub fn dns_safe_name(ident: &str) -> String {
-    if is_dns1123_label(ident) {
+    if is_dns1035_label(ident) {
         return ident.to_string();
     }
     // Sanitize to the DNS-label charset.
-    let mut body = String::with_capacity(ident.len());
+    let mut body = String::with_capacity(ident.len() + 1);
     let mut pending_dash = false;
     for ch in ident.chars() {
         let c = ch.to_ascii_lowercase();
@@ -469,6 +485,17 @@ pub fn dns_safe_name(ident: &str) -> String {
             pending_dash = true;
         }
     }
+    // Guarantee an ALPHABETIC leading character (DNS-1035 — a Service name must start with a
+    // letter; a valid DNS-1123 label may start with a digit). Splice a fixed `x` in front
+    // when the body is empty or digit-leading; injectivity is unaffected (the hash below is
+    // of the original `ident`, not the body).
+    if body
+        .as_bytes()
+        .first()
+        .is_none_or(|b| !b.is_ascii_lowercase())
+    {
+        body.insert(0, 'x');
+    }
     let suffix = short_hash(ident);
     // Budget the readable body so `<body>-<suffix>` fits a 63-char label.
     let max_body = DNS_LABEL_MAX - suffix.len() - 1;
@@ -476,12 +503,9 @@ pub fn dns_safe_name(ident: &str) -> String {
     while body.ends_with('-') {
         body.pop();
     }
-    if body.is_empty() {
-        // The ident was entirely out-of-charset: a stable alphanumeric-led name.
-        format!("x-{suffix}")
-    } else {
-        format!("{body}-{suffix}")
-    }
+    // `body` is non-empty and letter-leading here (the `x` splice guaranteed a leading
+    // letter, and truncation keeps the first char).
+    format!("{body}-{suffix}")
 }
 
 /// The DNS-safe k8s object name for a **generic (stateless) workload** replica — the
@@ -1851,6 +1875,30 @@ mod tests {
     }
 
     #[test]
+    fn dns_safe_name_forces_a_leading_letter_for_dns1035() {
+        // A digit-leading name is a valid DNS-1123 label but NOT a valid DNS-1035 Service
+        // name — dns_safe_name must coerce it to start with a letter (the live 422 regression).
+        let n = dns_safe_name("7web");
+        assert!(is_dns1035_label(&n), "not DNS-1035: {n}");
+        assert!(
+            n.starts_with('x'),
+            "digit-leading name must get a letter prefix: {n}"
+        );
+        // A letter-leading valid label still passes through byte-identical.
+        assert_eq!(dns_safe_name("web-0"), "web-0");
+        assert_eq!(
+            dns_safe_name("bramp-db-abcdef0123456789abcdef012"),
+            "bramp-db-abcdef0123456789abcdef012"
+        );
+        // The 128-bit (32-hex) suffix keeps a sanitized name within the 63-char budget.
+        let long = dns_safe_name(&format!("Tenant_{}", "x".repeat(200)));
+        assert!(
+            long.len() <= DNS_LABEL_MAX && is_dns1035_label(&long),
+            "{long}"
+        );
+    }
+
+    #[test]
     fn workload_object_name_is_dns_safe_and_project_qualified() {
         // The injective (F2) naming always yields a valid DNS-1123 label, even from an
         // underscore workload or a non-default project.
@@ -2264,6 +2312,47 @@ mod tests {
         assert_ne!(c, d, "{c} vs {d}");
         // Deterministic across calls (stable object names across relaunch/upgrade).
         assert_eq!(workload_object_name("a", "b-c", 0), a);
+    }
+
+    #[test]
+    fn workload_object_name_is_a_valid_dns1035_service_name() {
+        // Regression (live kind gate): the length-prefixed encoding starts with a digit, so
+        // the derived Service name was digit-leading and the apiserver 422'd it ("a DNS-1035
+        // label must start with an alphabetic character"). Every generic object name must now
+        // be a valid DNS-1035 label (letter-leading) — it names a Service.
+        let digit_leading_regex = |s: &str| {
+            // ^[a-z]([-a-z0-9]*[a-z0-9])?$
+            let b = s.as_bytes();
+            !s.is_empty()
+                && b[0].is_ascii_lowercase()
+                && b[b.len() - 1].is_ascii_alphanumeric()
+                && b.iter()
+                    .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        };
+        // The exact live-failing input.
+        let n = workload_object_name("default", "phase2-web", 0);
+        assert!(
+            is_dns1035_label(&n) && digit_leading_regex(&n),
+            "not DNS-1035: {n}"
+        );
+        // A sweep, including digit-leading project/workload.
+        for (p, w, r) in [
+            ("default", "web", 0u32),
+            ("acme", "api_v2", 1),
+            ("9proj", "7load", 42),
+            ("x", "y", 0),
+        ] {
+            let name = workload_object_name(p, w, r);
+            assert!(
+                is_dns1035_label(&name) && digit_leading_regex(&name),
+                "not DNS-1035 for ({p},{w},{r}): {name}"
+            );
+        }
+        // Injectivity survives the leading-letter coercion.
+        assert_ne!(
+            workload_object_name("a", "b-c", 0),
+            workload_object_name("a-b", "c", 0)
+        );
     }
 
     #[test]
