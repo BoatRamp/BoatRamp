@@ -106,6 +106,23 @@ impl KubernetesBackend {
             strict,
             "kubernetes compute backend ready"
         );
+        // NEW-2: the per-workload network isolation (the default-deny + per-workload-allow
+        // NetworkPolicies this backend applies) is ONLY enforced if the cluster CNI enforces
+        // NetworkPolicy. On a non-enforcing CNI (stock flannel, say) the policies are applied
+        // but are SILENT NO-OPS — a managed-DB Service stays reachable namespace-wide, so the
+        // compute tenancy isolation is NOT actually in effect. State this loudly at startup
+        // (a WARN under the multi-tenant posture, where it is a tenancy control) so an
+        // operator cannot be unaware of the dependency.
+        if strict {
+            tracing::warn!(
+                "kubernetes compute tenancy isolation depends on a NetworkPolicy-ENFORCING \
+                 CNI: the default-deny + per-workload-allow NetworkPolicies this backend \
+                 applies are silent no-ops on a non-enforcing CNI (e.g. stock flannel), \
+                 leaving managed-workload Services reachable namespace-wide. Use a CNI that \
+                 enforces NetworkPolicy (Calico, Cilium, Antrea, Weave, …) for multi-tenant \
+                 compute. See docs/how-to/compute.md (Network isolation)."
+            );
+        }
         Ok(Self {
             client,
             namespace,
