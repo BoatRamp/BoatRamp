@@ -48,16 +48,42 @@ affinity: {}
 # the `kubernetes` compute backend (`[compute].backend: kubernetes` / in-cluster
 # auto-detect), it manages its own managed compute (managed DBs → StatefulSet + Service +
 # PVC) as native k8s objects in its OWN namespace. Enable this to ship the least-privilege,
-# namespace-scoped Role + RoleBinding (+ ServiceAccount) that lets the serve pod do so. No
-# ClusterRole is granted. Off by default — a plain operator install needs none of it.
+# namespace-scoped Role + RoleBinding (+ ServiceAccount + NetworkPolicy RBAC) that lets the
+# serve pod do so. No ClusterRole is granted. Off by default — a plain operator install
+# needs none of it.
+#
+# SECURITY (mailroom #26 F4) — the compute namespace MUST be DEDICATED, distinct from the
+# operator's release namespace: the serve pod's compute ServiceAccount holds namespace-wide
+# create/patch/delete on Secrets (it mints the per-workload env Secret), so if the serve pod
+# shared a namespace with the operator's Site / Function / TLS Secrets, that token's blast
+# radius would reach them. The compute SA/Role/RoleBinding are therefore created in
+# `namespace` below (default `boatramp-compute`), the serve pod MUST be deployed there (not
+# in the operator's release namespace), and the chart REFUSES to render when the two
+# coincide (unless `allowOperatorNamespace: true` is set to override — not recommended).
 computeBackend:
   kubernetes:
     enabled: false
+    # The DEDICATED namespace the compute SA/Role/RoleBinding live in and the serve pod runs
+    # in. MUST differ from the operator's release namespace (see the SECURITY note above).
+    # The serve pod's Site/Function/TLS secrets must NOT live in this namespace.
+    namespace: boatramp-compute
+    # Create the dedicated `namespace` above (set false to bind to a pre-existing one, e.g.
+    # one created by `helm --create-namespace` or out-of-band).
+    createNamespace: true
+    # Escape hatch: allow `namespace` to equal the operator's release namespace. Leave false
+    # — a true value re-opens the Secret blast-radius F4 describes; the chart otherwise
+    # refuses to render when they coincide.
+    allowOperatorNamespace: false
     # The ServiceAccount the serve pod runs as; the Role is bound to it. Point the serve
-    # pod's `serviceAccountName` at this value.
+    # pod's `serviceAccountName` at this value (in the dedicated `namespace`).
     serviceAccountName: boatramp-compute
     # Create the ServiceAccount here (set false to bind a pre-existing one).
     createServiceAccount: true
+    # The label the serve/gateway pod MUST carry so the per-workload NetworkPolicy (F3)
+    # admits it as an authorized consumer of a managed workload's Service (it holds the
+    # managed-DB DSN). Set this label on the serve pod: `boatramp.dev/compute-consumer: "true"`.
+    # Managed workload pods reach each other via their own `managed-by=boatramp` label; every
+    # other pod (any other namespace, any non-boatramp pod) is denied by the default-deny.
 
 # Extra labels/annotations applied to operator resources.
 commonLabels: {}
