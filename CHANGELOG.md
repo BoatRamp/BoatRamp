@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-11-04
+
 ### Added
 
 - **Kubernetes compute backend (`[compute].backend: kubernetes`).** A fifth `ComputeBackend`
@@ -40,8 +42,44 @@ versions.
     profile, and do **not** auto-mount a ServiceAccount token. A per-project sealed pull credential is
     **refused** (fail-closed) — the private-registry path is an operator-configured `imagePullSecret`
     (`[compute].k8s_image_pull_secret`).
+  - **Multi-tenant isolation (`strict` posture).** Under a multi-tenant posture the launched pod's
+    `cap_add` is dropped entirely and its root filesystem is read-only (with `/tmp` + `/run`
+    `emptyDir` scratch so a stock image still boots), at parity with the docker / native-container
+    backends. Every managed workload is fenced by a default-deny-ingress `NetworkPolicy` plus a
+    per-workload allow admitting only same-project siblings and the serve pod (labelled
+    `boatramp.dev/compute-consumer`) — so one project's workloads cannot reach another's `Service`.
+    **This requires a NetworkPolicy-enforcing CNI** (Calico / Cilium / Antrea / …); on a
+    non-enforcing CNI such as stock flannel the policies are silent no-ops (logged at startup). The
+    operator places a compute-hosting cluster's serve pod in a **dedicated namespace** with the
+    namespace-scoped compute `ServiceAccount` (never the operator's cluster-wide SA) and the consumer
+    label; generic-workload object names are collision-resistant per `(project, workload, replica)`.
+    Creating a `BoatRampCluster` is cluster-admin-only and must not be delegated — its
+    `serviceAccountName` selects the serve pod's identity.
   - **Default-inert:** without the `k8s-backend` cargo feature the crate is a shell that pulls none of
     the kube-rs / k8s-openapi tree; the backend is registered only when selected or auto-detected.
+
+- **`project prune` — reclaim a project's provably-orphaned control-plane state.** A new
+  `Project·Admin` maintenance operation (CLI `boatramp project prune`, `GET`/`POST
+  /api/project-prune`) that garbage-collects a project's dead-site routing/config leftovers and
+  foreign-domain verification records that nothing live references. **Dry-run by default** — a report
+  enumerating every key with its reason; `--apply` performs the deletion and requires `-y` (or an
+  interactive confirmation). Strictly scoped to the project's own key prefix (sealed secrets and
+  managed-DB credentials are never touched); refuses to run when the control-plane KV is in a
+  degraded/recovering state (fail-closed); never removes a record a live site still answers; keeps
+  verified or in-flight domain-ownership proofs; and leaves managed-DNS ledgers to the auto-DNS
+  reconcile sweep, which retracts the external records before removing them.
+
+### Fixed
+
+- **Remote-Docker managed-DB DSN resolution.** The remote-Docker `ComputeBackend` placed every
+  container on the daemon default bridge, which has no embedded DNS, so a name-based managed-DB DSN
+  (`postgres://…@<db-workload>:5432/db`) never resolved and a dependent workload crash-looped (broken
+  since the v0.52.0 managed-DB DSN phase-1, only now exercised). Each project's workloads now share a
+  **per-project user-defined network** with a DNS alias equal to the workload name — docker's embedded
+  DNS resolves siblings by name, and its inter-network isolation keeps one project from resolving or
+  reaching another's. The managed-DB export/import one-shot additionally joins that network (keeping
+  default-network reach) so `pg_dump` / `pg_restore` / `psql` reach the DB whether it lives on a
+  per-project network or (external DSN / pre-upgrade) on the default bridge.
 
 ## [0.54.0] - 2026-11-04
 

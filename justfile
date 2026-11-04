@@ -267,13 +267,13 @@ bump-version version:
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' Cargo.toml
     # The internal path-dep pins, anchored on the boatramp path so no external dep
     # is touched.
-    perl -i -pe 's/(boatramp-[a-z-]+ = \{ path = "crates\/boatramp-[a-z-]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
+    perl -i -pe 's/(boatramp-[a-z0-9-]+ = \{ path = "crates\/boatramp-[a-z0-9-]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
     # Member crates that pin an internal dep DIRECTLY (a relative `../boatramp-*` path with its
     # own version — e.g. boatramp-overlay-client's feature-selected boatramp-overlay) rather than
     # through [workspace.dependencies]. Anchored on the `../boatramp-*` relative path so no external
     # dep is touched, and tolerant of a trailing `, default-features = …, features = [ …` on the line.
     for m in crates/*/Cargo.toml; do
-      perl -i -pe 's/(boatramp-[a-z-]+ = \{ path = "\.\.\/boatramp-[a-z-]+", )version = "[^"]*"/${1}version = "'"$v"'"/g' "$m"
+      perl -i -pe 's/(boatramp-[a-z0-9-]+ = \{ path = "\.\.\/boatramp-[a-z0-9-]+", )version = "[^"]*"/${1}version = "'"$v"'"/g' "$m"
     done
     # The workspace-excluded console crate (its own manifest + lockfile).
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
@@ -300,12 +300,17 @@ publish-dry:
     for c in {{ crate_order }}; do
       if out="$(cargo publish -p "$c" --dry-run --no-verify 2>&1)"; then
         echo "OK       $c"
-      elif grep -qE "no matching package named .boatramp-|failed to select a version for the requirement .boatramp-" <<<"$out"; then
+      elif grep -qE "no matching package named .boatramp-|failed to select a version for the requirement .boatramp-|depends on .boatramp-[a-z0-9-]+. with feature .* does not have that feature" <<<"$out"; then
         # An internal dep's new version isn't on crates.io yet — cargo can't resolve it in a
-        # dry run (either "no matching package" if the crate is brand-new, or "failed to select
-        # a version" if only older versions are indexed). Both are the expected DEFERRED case,
-        # validated for real when the crates publish in dependency order.
-        echo "DEFERRED $c (internal deps not yet on crates.io)"
+        # dry run against the registry, in one of three shapes: "no matching package" (the dep
+        # crate is brand-new), "failed to select a version" (only older versions are indexed), or
+        # "depends on <internal> with feature X but <internal> does not have that feature" (a NEW
+        # feature this cycle — the workspace crate has it, but the older crates.io version resolved
+        # in the dry run does not). All are the expected DEFERRED case, validated for real when the
+        # crates publish in dependency order (the bumped version, with the feature, lands first).
+        # The workspace feature build (`cargo check -p <crate> --features …`) + the CI feature-combo
+        # jobs are the real gate for feature WIRING; this recipe only checks crates.io packaging.
+        echo "DEFERRED $c (internal deps / new features not yet on crates.io)"
       else
         echo "FAIL     $c"; tail -5 <<<"$out"; rc=1
       fi
