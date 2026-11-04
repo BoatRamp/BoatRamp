@@ -51,23 +51,37 @@ metadata:
   labels:
     {{- include "boatramp-operator.labels" . | nindent 4 }}
 rules:
+  # apps workloads: get (readiness/liveness reads) + server-side-apply (create+patch) +
+  # delete (teardown). No `watch` (the backend runs no informer) and no `update` (SSA is a
+  # PATCH, never a plain UPDATE); `list` kept as a cheap read for operator visibility.
   - apiGroups: ["apps"]
     resources: ["statefulsets", "deployments"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # The per-workload routing Service + the data PVC: apply (create+patch), delete, and
+  # list (list_volumes enumerates the managed PVCs). No watch/update.
   - apiGroups: [""]
     resources: ["services", "persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # Pods are READ-ONLY to the backend: resolve_pod LISTs them and they are
+  # StatefulSet/Deployment-controller-managed — the backend never creates, mutates or
+  # deletes a pod directly. Granting only get+list stops a compromised serve token from
+  # touching (deleting/patching) co-located pods in the namespace.
   - apiGroups: [""]
-    resources: ["pods", "pods/log"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Pod logs (get) + the exec subresource (create — exec is a POST/connect, not a writer).
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # CSI VolumeSnapshot backup / restore (Phase 2). Namespace-scoped; the cluster-scoped
-  # VolumeSnapshotClass is NOT granted (an operator step).
+    verbs: ["get", "create"]
+  # CSI VolumeSnapshot backup / restore (Phase 2): apply (create+patch) + get + delete
+  # (snapshot cleanup). Namespace-scoped; the cluster-scoped VolumeSnapshotClass is NOT
+  # granted (an operator step).
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

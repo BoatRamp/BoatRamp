@@ -250,6 +250,59 @@ jobs:
           KEEP: "1"
         run: scripts/e2e-k8s.sh
 
+  # LIVE Kubernetes COMPUTE-BACKEND gate (mailroom #26): stand up a throwaway kind cluster
+  # (a REAL apiserver — no private infra, no secrets) and run the `#[ignore]`d live-seam
+  # tests in `crates/boatramp-k8s/tests/k8s_live.rs` against it with BOATRAMP_TEST_K8S=1.
+  # They exercise the backend's actual k8s client path end to end — managed Postgres+pgvector
+  # StatefulSet+Service+PVC bring-up (pod Ready + `SELECT 1` + the `vector` extension, via the
+  # pod `exec` subresource so no in-cluster network route is needed), a generic Deployment +
+  # exec/logs/volumes/stop, and the CSI VolumeSnapshot *unsupported* path (no snapshotter
+  # installed, so snapshot/restore is a clean "unsupported"). Like `export-import-live`, this
+  # runs the WHOLE binary and greps for EVERY success marker AND the `N passed` line, so a
+  # silent self-skip (unset env ⇒ the tests return early) or a regression FAILS the job rather
+  # than reporting a clean `ok`. The plan's ARM-k3s run (pgvector on the Hetzner cluster) is the
+  # production-shaped gate; this kind leg proves the backend logic on every nightly/preflight.
+  k8s-compute-e2e:
+    name: k8s compute backend e2e (kind)
+    runs-on: ubuntu-latest
+    # Fail a hung kind cluster / slow image pull fast rather than the 6h default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: k8s-compute-e2e
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: boatramp-k8s-compute
+      - name: Kubernetes compute backend holds live (hard gate — pgvector StatefulSet + exec/logs/volumes)
+        env:
+          # The tests connect with the runner's kubeconfig (kind-action wrote ~/.kube/config);
+          # BOATRAMP_TEST_K8S=1 lifts their self-skip. No VolumeSnapshotClass is set, so the
+          # snapshot test takes its clean-"unsupported" branch (no CSI snapshotter needed).
+          BOATRAMP_TEST_K8S: "1"
+        run: |
+          set -o pipefail
+          kubectl cluster-info
+          # Run ONLY the #[ignore]d live tests (--ignored), single-threaded so the two
+          # cluster-mutating tests don't race on shared objects, capturing every marker.
+          cargo test -p boatramp-k8s --test k8s_live -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee k8s-compute-live.log
+          # Hard gate: all three live tests ran (not silently skipped) AND each marker printed.
+          grep -qE 'test result: ok\. 3 passed' k8s-compute-live.log \
+            || { echo "FAIL: expected 3 live tests to run (silent self-skip?)"; exit 1; }
+          grep -q 'K8S COMPUTE BACKEND OK' k8s-compute-live.log \
+            || { echo "FAIL: missing managed-Postgres (Phase 1) marker"; exit 1; }
+          grep -q 'K8S COMPUTE PHASE2 OK' k8s-compute-live.log \
+            || { echo "FAIL: missing generic-workload (Phase 2) marker"; exit 1; }
+          echo "k8s compute backend live gate GREEN"
+
   # LIVE project export/import round-trip (inc2: atomic shadow-restore, the ephemeral
   # non-superuser apply that closes RCE-on-import, and a pgvector FULL round-trip) against
   # REAL Postgres (pgvector) + MySQL — `crates/boatramp-node/tests/project_export_roundtrip.rs`.

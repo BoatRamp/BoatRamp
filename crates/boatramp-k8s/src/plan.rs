@@ -12,10 +12,10 @@ use std::collections::BTreeMap;
 use boatramp_core::compute::{ComputeSpec, RootSource, compute_instance_id};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
+    Capabilities, Container, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
     PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, TCPSocketAction,
-    TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
+    PodTemplateSpec, Probe, SeccompProfile, SecurityContext, Service, ServicePort, ServiceSpec,
+    TCPSocketAction, TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -229,6 +229,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
             period_seconds: Some(10),
             ..Default::default()
         }),
+        security_context: Some(hardened_security_context(spec)),
         ..Default::default()
     };
 
@@ -250,6 +251,10 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         volumes: Some(vec![pod_volume]),
         security_context,
         image_pull_secrets: image_pull_secrets(ctx),
+        // A managed-DB pod never calls the k8s API, so do not auto-mount the namespace
+        // default ServiceAccount token into it — removing unnecessary apiserver reach from
+        // a SQL-reachable operand image (a classic SQL→RCE surface).
+        automount_service_account_token: Some(false),
         ..Default::default()
     };
 
@@ -433,6 +438,33 @@ fn env_vars(spec: &ComputeSpec) -> Option<Vec<EnvVar>> {
     (!env.is_empty()).then_some(env)
 }
 
+/// A hardened **container** `SecurityContext` applied to every launched container — the
+/// k8s-native equivalent of the docker/container shared-kernel baseline (`boatramp-docker`
+/// sets `no-new-privileges:true` + `cap_drop: ALL` + the allowlisted `cap_add`): deny
+/// privilege escalation, drop every Linux capability (adding back only the spec's
+/// explicitly-allowlisted `cap_add` — honored only under the single-tenant posture, the
+/// only posture that ever reaches this shared-kernel backend), and pin the runtime's
+/// default seccomp profile. `readOnlyRootFilesystem` is intentionally NOT forced here: a
+/// stock DB/operand image writes to its root fs outside the data volume (`/var/run/...`,
+/// `/tmp`), so a blanket read-only root would break bring-up without per-image writable
+/// `emptyDir` mounts — a documented hardening follow-up, not forced in this cut.
+fn hardened_security_context(spec: &ComputeSpec) -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            // Add back only the explicitly-allowlisted caps (empty by default); mirrors
+            // the docker backend's `cap_add` escape hatch for the single-tenant posture.
+            add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
+        }),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// The pod security context derived from a numeric `spec.user` (`uid[:gid]`), or `None`
 /// for an image username / unset (the pod then runs as the image's own user).
 fn pod_security_context(spec: &ComputeSpec) -> Option<PodSecurityContext> {
@@ -507,6 +539,7 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
             period_seconds: Some(10),
             ..Default::default()
         }),
+        security_context: Some(hardened_security_context(spec)),
         ..Default::default()
     };
 
@@ -514,6 +547,9 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
         containers: vec![container],
         security_context: pod_security_context(spec),
         image_pull_secrets: image_pull_secrets(ctx),
+        // A generic workload pod never calls the k8s API — do not auto-mount the default
+        // ServiceAccount token (no unnecessary apiserver reach from a workload image).
+        automount_service_account_token: Some(false),
         ..Default::default()
     };
 
@@ -1024,6 +1060,76 @@ mod tests {
             sc.fs_group,
             Some(999),
             "fsGroup group-owns the PVC for the rootless DB"
+        );
+    }
+
+    #[test]
+    fn statefulset_pod_is_hardened_and_drops_the_sa_token() {
+        // Security-review F2/F3: every launched pod drops privilege escalation + all caps
+        // + pins RuntimeDefault seccomp (the docker/container shared-kernel baseline), and
+        // does NOT auto-mount the ServiceAccount token (a DB pod never calls the k8s API).
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        let sc = pod.containers[0]
+            .security_context
+            .as_ref()
+            .expect("container security context");
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop.as_deref(),
+            Some(["ALL".to_string()].as_slice())
+        );
+        assert!(
+            sc.capabilities.as_ref().unwrap().add.is_none(),
+            "no caps added back by default"
+        );
+        assert_eq!(
+            sc.seccomp_profile.as_ref().unwrap().type_.as_str(),
+            "RuntimeDefault"
+        );
+    }
+
+    #[test]
+    fn deployment_pod_is_hardened_and_drops_the_sa_token() {
+        let plan = deployment_plan(&ctx("web-0"), &generic_spec()).unwrap();
+        let pod = plan.deployment.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        let sc = pod.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop.as_deref(),
+            Some(["ALL".to_string()].as_slice())
+        );
+        assert_eq!(
+            sc.seccomp_profile.as_ref().unwrap().type_.as_str(),
+            "RuntimeDefault"
+        );
+    }
+
+    #[test]
+    fn allowlisted_cap_add_rides_back_onto_the_hardened_container() {
+        // The single-tenant posture `cap_add` escape hatch (the only posture that reaches
+        // this shared-kernel backend) is honored: dropped-ALL, then the allowlisted caps
+        // added back — mirroring the docker backend.
+        let mut spec = generic_spec();
+        spec.cap_add = vec!["NET_BIND_SERVICE".to_string()];
+        let plan = deployment_plan(&ctx("web-0"), &spec).unwrap();
+        let sc = plan
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0]
+            .security_context
+            .clone()
+            .unwrap();
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().add.as_deref(),
+            Some(["NET_BIND_SERVICE".to_string()].as_slice())
         );
     }
 

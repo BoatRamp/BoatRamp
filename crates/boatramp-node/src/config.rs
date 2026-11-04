@@ -725,6 +725,16 @@ impl ServerConfig {
 /// list so [`ServerConfig::apply_env_overrides`] can decide whether to materialise
 /// an absent section without repeating the names.
 const COMPUTE_ENV_VARS: &[&str] = &[
+    // Kubernetes compute backend (mailroom #26): backend selection + the k8s placement
+    // knobs. `BOATRAMP_COMPUTE_BACKEND` is also the env the `--compute-backend` serve flag
+    // maps through (the flag layer reuses this overlay), so wiring it here makes BOTH the
+    // documented env var AND the CLI flag select the backend. The k8s_* knobs are the
+    // idiomatic env/ConfigMap config path for a pod deployment.
+    "BOATRAMP_COMPUTE_BACKEND",
+    "BOATRAMP_COMPUTE_K8S_STORAGE_CLASS",
+    "BOATRAMP_COMPUTE_K8S_RETAIN_PVC",
+    "BOATRAMP_COMPUTE_K8S_IMAGE_PULL_SECRET",
+    "BOATRAMP_COMPUTE_K8S_VOLUME_SNAPSHOT_CLASS",
     "BOATRAMP_COMPUTE_BRIDGE",
     "BOATRAMP_COMPUTE_SUBNET",
     "BOATRAMP_COMPUTE_VCPUS",
@@ -1127,13 +1137,14 @@ pub struct ComputeConfig {
     /// PVC `StorageClass` for the Kubernetes backend's managed-database data volumes.
     /// `None` (default) ⇒ no `storageClassName` on the PVC, so the cluster's **default**
     /// StorageClass is used (it must allow volume expansion for grow-in-place). Only read
-    /// by the `kubernetes` backend.
+    /// by the `kubernetes` backend. Env: `BOATRAMP_COMPUTE_K8S_STORAGE_CLASS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_storage_class: Option<String>,
     /// Whether the Kubernetes backend RETAINS a managed database's PVC on `stop` (default
     /// `true` — a database's data must survive a routine teardown; an explicit destroy
-    /// deletes it). Only read by the `kubernetes` backend.
+    /// deletes it). Only read by the `kubernetes` backend. Env:
+    /// `BOATRAMP_COMPUTE_K8S_RETAIN_PVC`.
     #[serde(default = "default_k8s_retain_pvc")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_retain_pvc: bool,
@@ -1142,14 +1153,15 @@ pub struct ComputeConfig {
     /// kubelet can pull an operand/workload image from a PRIVATE registry (Phase 2).
     /// `None` (default) ⇒ anonymous/public pulls. The secret is managed outside boatramp
     /// (the backend's least-privilege Role grants no `secrets` verb). Only read by the
-    /// `kubernetes` backend.
+    /// `kubernetes` backend. Env: `BOATRAMP_COMPUTE_K8S_IMAGE_PULL_SECRET`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_image_pull_secret: Option<String>,
     /// The CSI `VolumeSnapshotClass` the Kubernetes backend uses for volume snapshot /
     /// restore (backup / clone-from-backup). `None` (default) ⇒ snapshot/restore is a
     /// clean "unsupported" (the cluster's StorageClass CSI driver has no snapshot support,
-    /// or the operator did not opt in). Only read by the `kubernetes` backend.
+    /// or the operator did not opt in). Only read by the `kubernetes` backend. Env:
+    /// `BOATRAMP_COMPUTE_K8S_VOLUME_SNAPSHOT_CLASS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_volume_snapshot_class: Option<String>,

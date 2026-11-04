@@ -190,5 +190,9 @@ write pause is a future optimization (openraft 0.9 has no simple transfer call).
 
 - [Deploy a self-hosted cluster](./deploy-cluster.md) — the dynamic-join model the
   operator automates.
+- [The Kubernetes compute backend](./compute.md#the-kubernetes-backend-boatramp-on-k8s)
+  — when boatramp runs as a pod, it can run its own managed compute (managed DBs,
+  workloads) as native k8s objects; enable its least-privilege RBAC with the chart's
+  `computeBackend.kubernetes.enabled`.
 - [Mesh identity & the single root anchor](../explanation/SECURITY-mesh-identity.md).
 - [Deployment topologies](../explanation/topologies.md).
