@@ -43,6 +43,15 @@ spec:
                 description: 'Name of a `Secret` (same namespace) that wires **auth into the pods**: key `root-private-key` (the cluster root **private** key — the founder signs join tokens / attestations / member assertions with it) and an optional `bootstrap-secret` (single-use, to mint the first admin token). Absent ⇒ the pods run without control-plane auth (dev only).'
                 nullable: true
                 type: string
+              computeBackend:
+                description: 'Opt-in: run this cluster''s serve pods as the in-pod `kubernetes` compute backend — under the dedicated compute `ServiceAccount` and labelled as the authorized compute consumer (see [`ComputeBackendSpec`]). Omit for a cluster that does not host its own managed compute (the serve pods then use the namespace `default` ServiceAccount, as before).'
+                nullable: true
+                properties:
+                  serviceAccountName:
+                    default: boatramp-compute
+                    description: The `ServiceAccount` the serve pods run as — the one the chart's `computeBackend.kubernetes` Role/RoleBinding is bound to (default `boatramp-compute`). It grants the namespace-scoped verbs the `kubernetes` compute backend needs (statefulsets/deployments/services/pvcs/secrets/networkpolicies in THIS namespace), and nothing cluster-wide.
+                    type: string
+                type: object
               image:
                 description: Container image; empty ⇒ the operator's own image (one artifact, one version).
                 nullable: true

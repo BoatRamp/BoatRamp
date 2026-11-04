@@ -223,11 +223,20 @@ API (using the serve pod's own ServiceAccount — the same in-cluster config the
 | Managed database / stateful | a `StatefulSet` (stable identity, the operand image) + a `Service` named for the workload (the `pg-<ident>` in-cluster DNS the sql-shim/bindings resolve) + a `PersistentVolumeClaim` on the default (or configured) `StorageClass` |
 | Generic stateless workload | a `Deployment` + a ClusterIP `Service` |
 
-All objects land in the serve pod's **own namespace**. PVCs on a CSI
-`StorageClass` are snapshottable, resizable, and cross-node — so a managed DB's
-data has k8s-native durability (no node-local volume caveat). A pod is
-shared-kernel, classified like the container / docker backends, so the strict
-`multi-tenant` posture excludes it exactly as it excludes those.
+All objects land in the serve pod's **own namespace**, which **must be a dedicated
+compute namespace, distinct from the operator's release namespace** (see
+*Dedicated namespace* below) — it holds the serve pod + its managed compute, never
+the operator's Site/Function/TLS Secrets. PVCs on a CSI `StorageClass` are
+snapshottable, resizable, and cross-node — so a managed DB's data has k8s-native
+durability (no node-local volume caveat). A pod is shared-kernel, classified like
+the container / docker backends, so the strict `multi-tenant` posture excludes it
+from *strong-isolation* placement exactly as it excludes those — but when it IS the
+node's backend (boatramp-on-k8s), the multi-tenant posture is still enforced on
+every pod it launches: a tenant `cap_add` is **dropped**, the container root
+filesystem is **read-only** (with writable `/tmp` + `/run` `emptyDir` scratch so a
+stock image still boots, mirroring the docker backend's `/tmp`+`/run` tmpfs), and
+per-workload **NetworkPolicies** isolate each workload's Service (see *Network
+isolation* below).
 
 **Selection.** The backend is used when it is explicitly pinned *or*
 auto-detected in-cluster:
@@ -256,13 +265,27 @@ binary; inert until selected).
 computeBackend:
   kubernetes:
     enabled: true
-    serviceAccountName: boatramp-compute   # point the serve pod's serviceAccountName here
+    namespace: boatramp-compute            # DEDICATED namespace (see below) — not the operator's
+    createNamespace: true
+    serviceAccountName: boatramp-compute   # the serve pod runs as this SA
     createServiceAccount: true
 ```
 
+**Dedicated namespace (F4).** The compute ServiceAccount holds namespace-wide
+`create/patch/delete` on Secrets (it mints the per-workload credential `Secret`), so
+it must **not** share a namespace with the operator's Site/Function/TLS Secrets. The
+chart therefore creates the SA/Role/RoleBinding in a **dedicated** namespace
+(`computeBackend.kubernetes.namespace`, default `boatramp-compute`) and **refuses to
+render** if that equals the operator's release namespace (override only with
+`allowOperatorNamespace: true`). When the operator deploys a compute-hosting cluster
+(a `BoatRampCluster` with `spec.computeBackend`, created in that namespace), it runs
+the serve pods under this SA and labels them `boatramp.dev/compute-consumer=true` —
+see [Hosting managed compute](./kubernetes.md#hosting-managed-compute-boatramp-on-k8s).
+
 The Role grants only the verbs the backend uses on `statefulsets`/`deployments`
 (apps), `services`/`persistentvolumeclaims`/`pods` (pods read-only), `pods/log`,
-`pods/exec`, and `volumesnapshots` — no wildcards and no cluster-scoped grants.
+`pods/exec`, `networkpolicies`, and `volumesnapshots` — no wildcards and no
+cluster-scoped grants.
 The one secret authority is a **write-only** `secrets: [create, patch, delete]`
 (no `get`/`list`/`watch`, so the token can neither enumerate nor read secret
 *values*) for the per-workload credential `Secret` (below). For a non-helm install,
@@ -293,6 +316,31 @@ auto-mounted ServiceAccount token); a managed DB runs **rootless** as the image'
 DB user, so a one-shot minimal init container (root, only `CHOWN`) pre-owns the
 data volume to that user — the k8s equivalent of boatramp's volume pre-chown on
 the other backends.
+
+### Network isolation (NetworkPolicy + CNI)
+
+For every managed workload the backend applies **NetworkPolicies**: a namespace
+**default-deny-ingress** (targeting every boatramp-managed workload pod) plus a
+**per-workload allow** that admits ingress to that workload's pods only from
+authorized consumers — a boatramp-managed sibling (`app.kubernetes.io/managed-by=boatramp`)
+or the serve pod (`boatramp.dev/compute-consumer=true`) — on the workload's service
+port. So a managed-DB `Service` is **not** reachable namespace- or cluster-wide; only
+the serve pod and sibling managed workloads can reach it. (The operator stamps the
+`boatramp.dev/compute-consumer` label on a compute-hosting cluster's serve pods
+automatically — see [Hosting managed compute](./kubernetes.md#hosting-managed-compute-boatramp-on-k8s).)
+
+> **HARD REQUIREMENT — a NetworkPolicy-enforcing CNI.** NetworkPolicy is only
+> *enforced* by CNI plugins that implement it (Calico, Cilium, Antrea, Weave,
+> Kube-router, …). On a **non-enforcing CNI** — notably **stock flannel** (the k3s
+> default is flannel) — the apiserver still *accepts* these policies but **nothing
+> enforces them**: they are silent no-ops and a managed-DB Service stays reachable
+> namespace-wide. **Compute tenant isolation therefore depends on running a
+> NetworkPolicy-enforcing CNI.** Under the multi-tenant posture boatramp logs a
+> startup **WARN** stating this dependency (it cannot detect enforcement from inside
+> a pod); verify your cluster's CNI enforces NetworkPolicy before hosting multiple
+> tenants' compute. True per-*project* micro-segmentation (keying the allow on a
+> project label) is a documented follow-up; today the allow is per-workload keyed on
+> the managed-by/consumer labels.
 
 ## Set a workload from an existing source
 

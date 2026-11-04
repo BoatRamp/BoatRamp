@@ -240,7 +240,11 @@ jobs:
           cluster_name: boatramp-e2e
       - uses: azure/setup-helm@v4
       # Install → found a 3-node cluster → scale 3→5→3 → rolling upgrade →
-      # kill-pod recovery, quorum-verified at each step. The kind cluster is
+      # kill-pod recovery, quorum-verified at each step; THEN deploy a
+      # compute-hosting cluster (spec.computeBackend) in a DEDICATED namespace and
+      # assert the operator places its serve pods there under the compute
+      # ServiceAccount + the boatramp.dev/compute-consumer label (mailroom #26
+      # NEW-1 — F4 blast-radius + F3 NetworkPolicy binding). The kind cluster is
       # created by kind-action above; the script reuses it (KEEP=1) and builds +
       # loads the operator image itself.
       - name: Operator e2e
@@ -248,7 +252,15 @@ jobs:
           PROVIDER: kind
           CLUSTER: boatramp-e2e
           KEEP: "1"
-        run: scripts/e2e-k8s.sh
+        run: |
+          set -o pipefail
+          scripts/e2e-k8s.sh 2>&1 | tee operator-e2e.log
+          # Hard gate: the operator e2e PASSED and the NEW-1 compute serve-pod
+          # placement (dedicated namespace + compute SA + consumer label) was asserted.
+          # (pipefail above makes the script's own non-zero exit fail the step.)
+          grep -q 'OPERATOR COMPUTE-PLACEMENT OK' operator-e2e.log \
+            || { echo "FAIL: missing operator compute serve-pod placement marker (NEW-1)"; exit 1; }
+          echo "operator e2e GREEN (incl. compute serve-pod placement)"
 
   # LIVE Kubernetes COMPUTE-BACKEND gate (mailroom #26): stand up a throwaway kind cluster
   # (a REAL apiserver — no private infra, no secrets) and run the `#[ignore]`d live-seam
