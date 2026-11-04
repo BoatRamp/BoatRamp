@@ -1735,6 +1735,7 @@ mod tests {
                     readiness: boatramp_core::compute::Readiness::Provisioned,
                     data_dir: None,
                     snapshot: None,
+                    active_spec: None,
                 },
             )
         };
@@ -1898,6 +1899,7 @@ mod tests {
             readiness: Readiness::Starting,
             data_dir: None,
             snapshot: None,
+            active_spec: None,
         }
     }
 
