@@ -735,6 +735,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_K8S_RETAIN_PVC",
     "BOATRAMP_COMPUTE_K8S_IMAGE_PULL_SECRET",
     "BOATRAMP_COMPUTE_K8S_VOLUME_SNAPSHOT_CLASS",
+    "BOATRAMP_COMPUTE_K8S_ALLOW_OUT_OF_CLUSTER",
     "BOATRAMP_COMPUTE_BRIDGE",
     "BOATRAMP_COMPUTE_SUBNET",
     "BOATRAMP_COMPUTE_VCPUS",
@@ -1165,6 +1166,17 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub k8s_volume_snapshot_class: Option<String>,
+    /// Allow an explicit `[compute].backend = "kubernetes"` pin to be accepted even when
+    /// this process is NOT running in-cluster (no `KUBERNETES_SERVICE_HOST` + mounted
+    /// ServiceAccount). `false` (default) ⇒ the pin is REFUSED out-of-cluster and boatramp
+    /// falls back to capability-detected backends, so a pin alone can't make it drive
+    /// whatever cluster a stray local kubeconfig points at (fail closed, mailroom #26
+    /// security F6). Set `true` to deliberately run boatramp out-of-cluster against a
+    /// kubeconfig-selected cluster. Only read by the `kubernetes` backend selection. Env:
+    /// `BOATRAMP_COMPUTE_K8S_ALLOW_OUT_OF_CLUSTER`.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_allow_out_of_cluster: bool,
     /// Bridge the container veths / VM taps attach to (default `br-boatramp`).
     pub bridge: String,
     /// Guest IP subnet (default `10.0.0.0/24`).
@@ -1444,6 +1456,7 @@ impl Default for ComputeConfig {
             k8s_retain_pvc: default_k8s_retain_pvc(),
             k8s_image_pull_secret: None,
             k8s_volume_snapshot_class: None,
+            k8s_allow_out_of_cluster: false,
             bridge: "br-boatramp".to_string(),
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,

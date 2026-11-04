@@ -75,8 +75,13 @@ async fn k8s_phase2_generic_exec_logs_volumes_round_trip() {
         return;
     }
 
-    // Connect with the in-cluster / kubeconfig config (no second auth path).
-    let backend = KubernetesBackend::connect(None, false, None, None)
+    // Connect with the in-cluster / kubeconfig config (no second auth path). `strict=false`
+    // (single-tenant) here: the strict-posture object shape (dropped cap_add, read-only root
+    // + /tmp,/run scratch) is covered by the plan.rs unit tests; this image
+    // (nginx-unprivileged) writes to /var/cache/nginx, which — like the docker backend's
+    // read-only root — needs a cache volume to run read-only, so the generic bring-up gate
+    // uses the writable-root posture.
+    let backend = KubernetesBackend::connect(None, false, None, None, false)
         .await
         .expect("connect to the cluster");
 
@@ -159,7 +164,7 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
         eprintln!("skipping k8s live gate: set BOATRAMP_TEST_K8S=1 (needs a reachable cluster)");
         return;
     }
-    let backend = KubernetesBackend::connect(None, false, None, None)
+    let backend = KubernetesBackend::connect(None, false, None, None, false)
         .await
         .expect("connect to the cluster");
 
@@ -283,7 +288,7 @@ async fn k8s_phase2_volume_snapshot_round_trip() {
         return;
     }
     let snap_class = std::env::var("BOATRAMP_TEST_K8S_SNAPCLASS").ok();
-    let backend = KubernetesBackend::connect(None, true, None, snap_class.clone())
+    let backend = KubernetesBackend::connect(None, true, None, snap_class.clone(), false)
         .await
         .expect("connect to the cluster");
 

@@ -9,18 +9,24 @@
 
 use std::collections::BTreeMap;
 
-use boatramp_core::compute::{ComputeSpec, RootSource, VolumeRef, compute_instance_id};
+use boatramp_core::compute::{ComputeSpec, RootSource, VolumeRef};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, LocalObjectReference,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, SeccompProfile, Secret, SecretKeySelector,
-    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, TypedLocalObjectReference,
-    Volume, VolumeMount, VolumeResourceRequirements,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    SeccompProfile, Secret, SecretKeySelector, SecurityContext, Service, ServicePort, ServiceSpec,
+    TCPSocketAction, TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
+};
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    LabelSelector, LabelSelectorRequirement, ObjectMeta,
+};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +43,15 @@ pub const WORKLOAD_LABEL: &str = "boatramp.dev/workload";
 /// Annotation recording the owning project (an annotation, not a label, so a project
 /// name outside the label charset is still carried without an invalid-value rejection).
 pub const PROJECT_ANNOTATION: &str = "boatramp.dev/project";
+/// The label a pod must carry to be an AUTHORIZED consumer of a managed workload's Service
+/// under the per-workload NetworkPolicy — the serve/gateway pod that holds the managed-DB
+/// DSN and connects to the `pg-<ident>` Service. The serve pod is NOT boatramp-managed
+/// compute (it carries no [`WORKLOAD_LABEL`]), so the per-workload allow names this label
+/// explicitly; the chart documents that the serve pod must carry
+/// `boatramp.dev/compute-consumer=true`. Value is the literal `"true"`.
+pub const CONSUMER_LABEL: &str = "boatramp.dev/compute-consumer";
+/// The value for [`CONSUMER_LABEL`].
+pub const CONSUMER_VALUE: &str = "true";
 
 /// Why building the resource plan failed (pure, no I/O).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +78,17 @@ pub enum PlanError {
     /// directory). Phase 1 covers the managed-DB stateful case only.
     #[error("managed-database spec must declare exactly one persistent volume, found {0}")]
     VolumeCount(usize),
+    /// A volume's in-guest `mount` path is not a safe absolute path (defense-in-depth
+    /// validation at the plan boundary — the mount is interpolated into the chown init
+    /// container). Must be an absolute path (`/…`) of conservative charset
+    /// (`[A-Za-z0-9/._-]`), bounded length, with no `..` traversal component — so a crafted
+    /// mount can never carry a shell metacharacter, whitespace, or path-escape even if a
+    /// future call site reintroduced a shell.
+    #[error(
+        "volume mount path {0:?} is not a safe absolute path (expected an absolute `/…` path of \
+         charset [A-Za-z0-9/._-], no `..`)"
+    )]
+    InvalidMountPath(String),
 }
 
 /// The inputs the planner needs beyond the immutable [`ComputeSpec`]: the replica
@@ -91,6 +117,16 @@ pub struct PlanContext {
     /// secret itself is managed outside boatramp (never created here — the backend's RBAC
     /// grants no `secrets` verb).
     pub image_pull_secret: Option<String>,
+    /// The **isolation posture** this backend runs under. `true` = the multi-tenant
+    /// (`strict`) posture: the shared-kernel hardening is NON-NEGOTIABLE — a spec's
+    /// `cap_add` is dropped (never added back), and the container root filesystem is forced
+    /// read-only (with writable `/tmp` + `/run` `emptyDir` scratch so a stock image still
+    /// boots, mirroring the docker backend's `/tmp`+`/run` tmpfs). `false` = the
+    /// single-tenant / dev posture: `cap_add` is honored and the root stays writable, the
+    /// escape hatches the docker/container backends expose under the same posture gate. The
+    /// backend sets this from its own `strict` flag (threaded from the node's
+    /// `allow_shared_kernel` posture), NEVER from a tenant-supplied spec.
+    pub strict: bool,
 }
 
 /// The typed Kubernetes objects for one managed database — what the backend applies
@@ -110,6 +146,12 @@ pub struct ResourcePlan {
     /// StatefulSet/Pod spec**. `None` when the spec declares no env (nothing to carry).
     /// The backend applies this BEFORE the workload and deletes it on teardown.
     pub secret: Option<Secret>,
+    /// The per-project/per-workload network isolation (F3): a namespace default-deny-ingress
+    /// policy targeting all boatramp-managed workload pods + a per-workload allow admitting
+    /// only authorized consumers (the serve pod + sibling managed pods) on the service port.
+    /// Applied alongside the workload so a managed-DB Service is NOT reachable
+    /// namespace/cluster-wide. See [`network_policies`].
+    pub network_policies: Vec<NetworkPolicy>,
 }
 
 /// Whether `s` is a valid RFC 1123 DNS label (a Kubernetes object/Service name).
@@ -183,6 +225,12 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         return Err(PlanError::VolumeCount(spec.volumes.len()));
     }
     let volume = &spec.volumes[0];
+    // Defense-in-depth (F5): the mount path is interpolated into the chown init container,
+    // so validate it is a safe absolute path at the plan boundary even though the chown now
+    // runs in exec form (no shell).
+    if !is_safe_mount_path(&volume.mount) {
+        return Err(PlanError::InvalidMountPath(volume.mount.clone()));
+    }
     let claim = pvc_name(&volume.name, &ctx.workload);
 
     // The PVC: RWO on the configured/default StorageClass, sized from the spec. Resizing
@@ -216,6 +264,16 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     let secret = env_secret(ctx, spec);
     let env = env_vars(spec, &env_secret_name(&ctx.workload));
 
+    // The data mount, plus the writable `/tmp`+`/run` scratch mounts the hardened read-only
+    // root needs under the strict posture (see [`writable_scratch`]).
+    let (scratch_volumes, scratch_mounts) = writable_scratch(ctx.strict);
+    let mut volume_mounts = vec![VolumeMount {
+        name: volume.name.clone(),
+        mount_path: volume.mount.clone(),
+        ..Default::default()
+    }];
+    volume_mounts.extend(scratch_mounts);
+
     let container = Container {
         name: "db".to_string(),
         image: Some(image.clone()),
@@ -227,11 +285,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
             protocol: Some("TCP".to_string()),
             ..Default::default()
         }]),
-        volume_mounts: Some(vec![VolumeMount {
-            name: volume.name.clone(),
-            mount_path: volume.mount.clone(),
-            ..Default::default()
-        }]),
+        volume_mounts: Some(volume_mounts),
         // A TCP readiness probe on the DB port makes the StatefulSet's `readyReplicas`
         // (what `health` reads) reflect the server actually accepting connections.
         readiness_probe: Some(Probe {
@@ -242,7 +296,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
             period_seconds: Some(10),
             ..Default::default()
         }),
-        security_context: Some(hardened_security_context(spec)),
+        security_context: Some(hardened_security_context(spec, ctx.strict)),
         ..Default::default()
     };
 
@@ -268,10 +322,12 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         }),
         ..Default::default()
     };
+    let mut volumes = vec![pod_volume];
+    volumes.extend(scratch_volumes);
     let pod = PodSpec {
         init_containers,
         containers: vec![container],
-        volumes: Some(vec![pod_volume]),
+        volumes: Some(volumes),
         security_context,
         image_pull_secrets: image_pull_secrets(ctx),
         // A managed-DB pod never calls the k8s API, so do not auto-mount the namespace
@@ -326,6 +382,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         service,
         pvc,
         secret,
+        network_policies: network_policies(ctx, spec.port),
     })
 }
 
@@ -428,12 +485,30 @@ pub fn dns_safe_name(ident: &str) -> String {
 }
 
 /// The DNS-safe k8s object name for a **generic (stateless) workload** replica — the
-/// Deployment + its routing Service share it, and it is the endpoint host the gateway
-/// routes to. Derived from the project-qualified [`compute_instance_id`] (so two
-/// projects' same-named workloads never collide) through [`dns_safe_name`] (so an
-/// underscore / over-long instance id still names a valid object).
+/// Deployment, its routing Service, its env `Secret` and its NetworkPolicy share it, and it
+/// is the endpoint host the gateway routes to.
+///
+/// Derived **injectively** from `(project, workload, replica)` so two DISTINCT tuples can
+/// NEVER map to one k8s object/Secret (a silent cross-tenant hijack). [`compute_instance_id`]
+/// is deliberately NOT used as the identity source here: its `-` join is NON-injective
+/// (`("a","b-c")` and `("a-b","c")` both yield `a-b-c-<replica>`), so two different tenants'
+/// workloads could collide on one Deployment/Secret and — with a `.force()` apply — one
+/// could adopt or overwrite the other's object. Instead the tuple is folded through a
+/// **length-prefixed, unambiguous encoding** (`"<len(project)>:<project>:<len(workload)>:<workload>:<replica>"`)
+/// — `project` and `workload` are each recoverable by their declared byte length regardless
+/// of how many `-`/`:` the segments contain, so the encoding is injective over the tuple —
+/// and that encoding is run through [`dns_safe_name`], which (because the `:`-bearing
+/// encoding is never already a valid label) always appends a [`short_hash`] of it: distinct
+/// encodings ⇒ distinct hashes ⇒ distinct, valid RFC-1123 object names. This mirrors the
+/// already-safe managed-DB `bramp-db-<digest>` naming, which this function does NOT drive
+/// (the StatefulSet is named by the bare `workload`).
 pub fn workload_object_name(project: &str, workload: &str, replica: u32) -> String {
-    dns_safe_name(&compute_instance_id(project, workload, replica))
+    let encoded = format!(
+        "{}:{project}:{}:{workload}:{replica}",
+        project.len(),
+        workload.len()
+    );
+    dns_safe_name(&encoded)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,28 +575,89 @@ fn env_vars(spec: &ComputeSpec, secret_name: &str) -> Option<Vec<EnvVar>> {
 /// A hardened **container** `SecurityContext` applied to every launched container — the
 /// k8s-native equivalent of the docker/container shared-kernel baseline (`boatramp-docker`
 /// sets `no-new-privileges:true` + `cap_drop: ALL` + the allowlisted `cap_add`): deny
-/// privilege escalation, drop every Linux capability (adding back only the spec's
-/// explicitly-allowlisted `cap_add` — honored only under the single-tenant posture, the
-/// only posture that ever reaches this shared-kernel backend), and pin the runtime's
-/// default seccomp profile. `readOnlyRootFilesystem` is intentionally NOT forced here: a
-/// stock DB/operand image writes to its root fs outside the data volume (`/var/run/...`,
-/// `/tmp`), so a blanket read-only root would break bring-up without per-image writable
-/// `emptyDir` mounts — a documented hardening follow-up, not forced in this cut.
-fn hardened_security_context(spec: &ComputeSpec) -> SecurityContext {
+/// privilege escalation, drop every Linux capability, and pin the runtime's default seccomp
+/// profile.
+///
+/// The two posture-gated knobs mirror the docker/container backends' `cap_add_allowed` /
+/// `writable_root_allowed` gates exactly (F1 — a tenant spec must never relax the
+/// shared-kernel baseline on its own):
+///
+/// - **`cap_add`**: under `strict` (multi-tenant) the spec's `cap_add` is DROPPED (`add:
+///   None`) — never added back on top of the dropped-`ALL` default; under non-strict
+///   (single-tenant/dev) the allowlisted caps ride back, the docker backend's escape hatch.
+/// - **`readOnlyRootFilesystem`**: under `strict` the root filesystem is forced read-only
+///   (`Some(true)`); the writable `/tmp`+`/run` `emptyDir` scratch ([`writable_scratch`])
+///   lets a stock DB/operand image still boot (its socket dir + temp files), mirroring the
+///   docker backend's `/tmp`+`/run` tmpfs. Under non-strict it is left unset (writable
+///   root) — today's single-tenant behavior, unchanged.
+fn hardened_security_context(spec: &ComputeSpec, strict: bool) -> SecurityContext {
     SecurityContext {
         allow_privilege_escalation: Some(false),
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
-            // Add back only the explicitly-allowlisted caps (empty by default); mirrors
-            // the docker backend's `cap_add` escape hatch for the single-tenant posture.
-            add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
+            // Add back the allowlisted caps ONLY under the single-tenant posture; the
+            // multi-tenant guard keeps every capability dropped (a tenant `cap_add` is
+            // ignored), mirroring the docker backend's posture gate.
+            add: (!strict && !spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
         }),
+        // Force a read-only root under the multi-tenant posture (writable scratch is mounted
+        // separately); preserve the writable-root default under single-tenant.
+        read_only_root_filesystem: strict.then_some(true),
         seccomp_profile: Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// The writable scratch an otherwise read-only-root workload still needs to boot — an
+/// `emptyDir` mounted at each of `/tmp` and `/run`, mirroring the docker backend's
+/// `/tmp`+`/run` tmpfs. A stock image writes its unix socket under `/run` (`/var/run` is a
+/// symlink to `/run`, so Postgres' `/var/run/postgresql`, MySQL's `/run/mysqld`, … land
+/// here) and temp files under `/tmp`; everything else stays on the read-only root or the
+/// persistent data volume. Returns `(volumes, mounts)` to splice into the pod + container,
+/// or `(empty, empty)` under the non-strict posture (the root is writable, no scratch
+/// needed).
+fn writable_scratch(strict: bool) -> (Vec<Volume>, Vec<VolumeMount>) {
+    if !strict {
+        return (Vec::new(), Vec::new());
+    }
+    const SCRATCH_PATHS: [(&str, &str); 2] = [("scratch-tmp", "/tmp"), ("scratch-run", "/run")];
+    let volumes = SCRATCH_PATHS
+        .iter()
+        .map(|(name, _)| Volume {
+            name: (*name).to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        })
+        .collect();
+    let mounts = SCRATCH_PATHS
+        .iter()
+        .map(|(name, path)| VolumeMount {
+            name: (*name).to_string(),
+            mount_path: (*path).to_string(),
+            ..Default::default()
+        })
+        .collect();
+    (volumes, mounts)
+}
+
+/// Whether `p` is a safe absolute in-guest mount path (F5 defense-in-depth): absolute,
+/// bounded length, no `..` traversal, and drawn only from a conservative path charset
+/// (`[A-Za-z0-9/._-]`) — so a crafted mount can carry no shell metacharacter, whitespace,
+/// quote, `$`, backtick, or NUL even if a call site reintroduced a shell. The chown init
+/// container already runs in exec form (no shell); this bounds the value regardless.
+fn is_safe_mount_path(p: &str) -> bool {
+    if p.len() < 2 || p.len() > 1024 || !p.starts_with('/') {
+        return false;
+    }
+    // Reject any `..` path component (traversal), checking segment boundaries.
+    if p.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    p.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
 }
 
 /// A one-shot **root** init container that `chown -R`'s the mounted data volume to the
@@ -537,10 +673,15 @@ fn chown_init_container(spec: &ComputeSpec, image: &str, volume: &VolumeRef) -> 
     Some(Container {
         name: "chown-data".to_string(),
         image: Some(image.to_string()),
+        // Exec form — NO shell (F5): the mount path is a plain argv element, so it can carry
+        // no shell metacharacter even if it were crafted. `chown` resolves on PATH; the init
+        // container reuses the operand image (a stock DB image ships coreutils). The mount is
+        // additionally charset-validated at the plan boundary ([`is_safe_mount_path`]).
         command: Some(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!("chown -R {uid}:{gid} {}", volume.mount),
+            "chown".to_string(),
+            "-R".to_string(),
+            format!("{uid}:{gid}"),
+            volume.mount.clone(),
         ]),
         volume_mounts: Some(vec![VolumeMount {
             name: volume.name.clone(),
@@ -602,6 +743,10 @@ pub struct DeploymentPlan {
     /// a generic workload's env may itself hold secrets — is a plaintext value in the
     /// Deployment/Pod spec). `None` when the spec declares no env.
     pub secret: Option<Secret>,
+    /// The network isolation (F3): the namespace default-deny + the per-workload allow (see
+    /// [`network_policies`]), applied alongside the Deployment so its Service is not
+    /// reachable namespace/cluster-wide.
+    pub network_policies: Vec<NetworkPolicy>,
 }
 
 /// Build the generic stateless [`DeploymentPlan`]. `ctx.workload` MUST already be the
@@ -629,6 +774,10 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
     let secret = env_secret(ctx, spec);
     let env = env_vars(spec, &env_secret_name(&ctx.workload));
 
+    // Writable `/tmp`+`/run` scratch under the strict posture's read-only root (empty
+    // otherwise) — same mechanism as the stateful path.
+    let (scratch_volumes, scratch_mounts) = writable_scratch(ctx.strict);
+
     let container = Container {
         name: "app".to_string(),
         image: Some(image),
@@ -640,6 +789,7 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
             protocol: Some("TCP".to_string()),
             ..Default::default()
         }]),
+        volume_mounts: (!scratch_mounts.is_empty()).then(|| scratch_mounts.clone()),
         // A TCP readiness probe on the app port drives the Deployment's
         // `availableReplicas` (what `health` reads) off the app actually accepting
         // connections, not merely the container starting.
@@ -651,12 +801,13 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
             period_seconds: Some(10),
             ..Default::default()
         }),
-        security_context: Some(hardened_security_context(spec)),
+        security_context: Some(hardened_security_context(spec, ctx.strict)),
         ..Default::default()
     };
 
     let pod = PodSpec {
         containers: vec![container],
+        volumes: (!scratch_volumes.is_empty()).then_some(scratch_volumes),
         security_context: pod_security_context(spec),
         image_pull_secrets: image_pull_secrets(ctx),
         // A generic workload pod never calls the k8s API — do not auto-mount the default
@@ -706,7 +857,129 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
         deployment,
         service,
         secret,
+        network_policies: network_policies(ctx, spec.port),
     })
+}
+
+// ---------------------------------------------------------------------------
+// F3: per-workload network isolation (NetworkPolicy)
+// ---------------------------------------------------------------------------
+
+/// The fixed name of the namespace **default-deny-ingress** NetworkPolicy (one per
+/// namespace; idempotent server-side apply).
+pub const DEFAULT_DENY_POLICY_NAME: &str = "boatramp-compute-default-deny";
+
+/// The per-workload allow NetworkPolicy name for an object (`<object>-allow`).
+pub fn allow_policy_name(object_name: &str) -> String {
+    format!("{object_name}-allow")
+}
+
+/// The network isolation for one workload (F3): a namespace **default-deny-ingress**
+/// targeting every boatramp-managed workload pod, plus a **per-workload allow** admitting
+/// only authorized consumers to this workload's pods on its service port.
+///
+/// Without this a managed-DB Service is reachable namespace/cluster-wide (every pod could
+/// open the DB port) — weaker than the docker backend's per-project network and not
+/// fail-closed. The model:
+///
+/// - **default-deny** selects pods carrying [`WORKLOAD_LABEL`] (Exists) — i.e. all
+///   boatramp-managed compute workloads, NOT the serve pod (which carries no workload
+///   label, so its own ingress is untouched) — with `policyTypes: [Ingress]` and no rules,
+///   so by default NOTHING may reach a managed workload pod.
+/// - **per-workload allow** re-admits ingress to THIS workload's pods
+///   (`managed-by=boatramp` + `workload=<name>`) only FROM, in the same namespace, a
+///   boatramp-managed pod (a sibling workload — `managed-by=boatramp`) or an authorized
+///   consumer (the serve/gateway pod — [`CONSUMER_LABEL`]`=true`), and only on the
+///   workload's service port.
+///
+/// Combined with the serve pod living in its OWN namespace (F4), this bounds a managed-DB's
+/// reachability to exactly {serve pod + sibling managed workloads in that namespace} — no
+/// other namespace, no arbitrary cluster pod. True per-PROJECT micro-segmentation (keying
+/// the allow's `from` on a project label) is a documented follow-up: the owning project is
+/// carried as an annotation, not a label, and NetworkPolicy selectors match only labels.
+pub fn network_policies(ctx: &PlanContext, port: u16) -> Vec<NetworkPolicy> {
+    vec![
+        default_deny_ingress_policy(ctx),
+        workload_allow_policy(ctx, port),
+    ]
+}
+
+/// The namespace default-deny-ingress policy — see [`network_policies`].
+fn default_deny_ingress_policy(ctx: &PlanContext) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(DEFAULT_DENY_POLICY_NAME.to_string()),
+            namespace: Some(ctx.namespace.clone()),
+            labels: Some(BTreeMap::from([(
+                MANAGED_BY_LABEL.to_string(),
+                MANAGED_BY_VALUE.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            // Every boatramp-managed workload pod (has the per-workload label), regardless
+            // of its value — but not the serve pod, which carries no workload label.
+            pod_selector: LabelSelector {
+                match_expressions: Some(vec![LabelSelectorRequirement {
+                    key: WORKLOAD_LABEL.to_string(),
+                    operator: "Exists".to_string(),
+                    values: None,
+                }]),
+                ..Default::default()
+            },
+            policy_types: Some(vec!["Ingress".to_string()]),
+            // No ingress rules ⇒ deny all ingress to the selected pods.
+            ingress: Some(Vec::new()),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The per-workload allow policy — see [`network_policies`].
+fn workload_allow_policy(ctx: &PlanContext, port: u16) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: object_meta(allow_policy_name(&ctx.workload), ctx),
+        spec: Some(NetworkPolicySpec {
+            // THIS workload's pods only.
+            pod_selector: LabelSelector {
+                match_labels: Some(selector_labels(&ctx.workload)),
+                ..Default::default()
+            },
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![
+                    // A sibling boatramp-managed workload pod (same namespace).
+                    NetworkPolicyPeer {
+                        pod_selector: Some(LabelSelector {
+                            match_labels: Some(BTreeMap::from([(
+                                MANAGED_BY_LABEL.to_string(),
+                                MANAGED_BY_VALUE.to_string(),
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    // The authorized consumer — the serve/gateway pod (holds the DSN).
+                    NetworkPolicyPeer {
+                        pod_selector: Some(LabelSelector {
+                            match_labels: Some(BTreeMap::from([(
+                                CONSUMER_LABEL.to_string(),
+                                CONSUMER_VALUE.to_string(),
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(i32::from(port))),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+            }]),
+            ..Default::default()
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1248,17 @@ mod tests {
             namespace: "boatramp".to_string(),
             storage_class: None,
             image_pull_secret: None,
+            // Default the unit fixtures to the single-tenant posture (today's behavior); the
+            // strict-posture tests build their own strict ctx.
+            strict: false,
         }
+    }
+
+    /// A multi-tenant (strict) plan context, for the F1 posture-gate tests.
+    fn strict_ctx(workload: &str) -> PlanContext {
+        let mut c = ctx(workload);
+        c.strict = true;
+        c
     }
 
     #[test]
@@ -1562,15 +1845,25 @@ mod tests {
 
     #[test]
     fn workload_object_name_is_dns_safe_and_project_qualified() {
-        // Default project keeps the bare instance id (valid label ⇒ unchanged).
-        assert_eq!(workload_object_name("default", "web", 0), "web-0");
-        // A non-default project qualifies it; an underscore workload still yields a label.
+        // The injective (F2) naming always yields a valid DNS-1123 label, even from an
+        // underscore workload or a non-default project.
         let n = workload_object_name("acme", "api_v2", 1);
         assert!(is_dns1123_label(&n), "got {n}");
+        assert!(is_dns1123_label(&workload_object_name("default", "web", 0)));
         // Distinct projects never collide on one object name.
         assert_ne!(
             workload_object_name("acme", "web", 0),
             workload_object_name("beta", "web", 0)
+        );
+        // Deterministic across calls (stable object names across relaunch/upgrade).
+        assert_eq!(
+            workload_object_name("acme", "api_v2", 1),
+            workload_object_name("acme", "api_v2", 1)
+        );
+        // Distinct replicas of one workload are distinct objects.
+        assert_ne!(
+            workload_object_name("acme", "web", 0),
+            workload_object_name("acme", "web", 1)
         );
     }
 
@@ -1808,5 +2101,317 @@ mod tests {
             pspec.resources.unwrap().requests.unwrap().get("storage"),
             Some(&Quantity("20480Mi".to_string()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F1: the multi-tenant (strict) posture gate
+    // -----------------------------------------------------------------------
+
+    /// The container security context of a stateful (managed-DB) plan.
+    fn sts_container_sc(plan: &ResourcePlan) -> SecurityContext {
+        plan.stateful_set
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .security_context
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn strict_posture_drops_cap_add_and_forces_read_only_root() {
+        // Under the multi-tenant posture a tenant `cap_add` is IGNORED and the root
+        // filesystem is forced read-only — the shared-kernel escape F1 closes.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.cap_add = vec!["SYS_ADMIN".to_string(), "NET_ADMIN".to_string()];
+        let plan = managed_db_plan(&strict_ctx("pg"), &spec).unwrap();
+        let sc = sts_container_sc(&plan);
+        assert!(
+            sc.capabilities.as_ref().unwrap().add.is_none(),
+            "strict posture must drop a tenant cap_add, got {:?}",
+            sc.capabilities.as_ref().unwrap().add
+        );
+        assert_eq!(
+            sc.read_only_root_filesystem,
+            Some(true),
+            "strict posture forces a read-only root"
+        );
+        // Dropped-ALL still holds.
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop.as_deref(),
+            Some(["ALL".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn non_strict_posture_honors_cap_add_and_keeps_writable_root() {
+        // Single-tenant / dev: today's behavior is preserved — cap_add rides back, the root
+        // stays writable (read_only_root_filesystem unset).
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.cap_add = vec!["CHOWN".to_string()];
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let sc = sts_container_sc(&plan);
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().add.as_deref(),
+            Some(["CHOWN".to_string()].as_slice()),
+            "single-tenant honors cap_add"
+        );
+        assert_eq!(
+            sc.read_only_root_filesystem, None,
+            "single-tenant preserves the writable-root default"
+        );
+    }
+
+    #[test]
+    fn strict_posture_adds_writable_tmp_run_scratch_mounts() {
+        // A read-only-root workload still needs writable /tmp + /run (mirrors docker's
+        // tmpfs) so a stock image boots. The strict plan mounts an emptyDir at each.
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&strict_ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        let mount_paths: Vec<&str> = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mount_path.as_str())
+            .collect();
+        assert!(mount_paths.contains(&"/tmp"), "mounts: {mount_paths:?}");
+        assert!(mount_paths.contains(&"/run"), "mounts: {mount_paths:?}");
+        assert!(
+            mount_paths.contains(&"/var/lib/postgresql/data"),
+            "the data mount is still present: {mount_paths:?}"
+        );
+        // Each scratch mount is backed by an emptyDir pod volume.
+        let vol_names: Vec<&str> = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|v| v.empty_dir.is_some())
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(vol_names.contains(&"scratch-tmp"), "volumes: {vol_names:?}");
+        assert!(vol_names.contains(&"scratch-run"), "volumes: {vol_names:?}");
+    }
+
+    #[test]
+    fn non_strict_posture_mounts_no_scratch() {
+        // Writable root ⇒ no scratch emptyDirs (only the data volume).
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        assert!(
+            pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|v| v.empty_dir.is_none()),
+            "no scratch emptyDir under the single-tenant posture"
+        );
+    }
+
+    #[test]
+    fn strict_generic_deployment_drops_cap_add_and_forces_read_only_root() {
+        let mut spec = generic_spec();
+        spec.cap_add = vec!["NET_BIND_SERVICE".to_string()];
+        let plan = deployment_plan(&strict_ctx("web-0"), &spec).unwrap();
+        let pod = plan.deployment.spec.unwrap().template.spec.unwrap();
+        let sc = pod.containers[0].security_context.clone().unwrap();
+        assert!(sc.capabilities.as_ref().unwrap().add.is_none());
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        // The scratch mounts/volumes are present for the read-only root.
+        let mounts: Vec<&str> = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mount_path.as_str())
+            .collect();
+        assert!(mounts.contains(&"/tmp") && mounts.contains(&"/run"));
+    }
+
+    // -----------------------------------------------------------------------
+    // F2: injective generic workload object / Secret naming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workload_object_name_is_injective_over_aliasing_inputs() {
+        // compute_instance_id's `-` join aliases `("a","b-c")` and `("a-b","c")` to one id;
+        // the injective length-prefixed encoding must keep them DISTINCT k8s object names.
+        let a = workload_object_name("a", "b-c", 0);
+        let b = workload_object_name("a-b", "c", 0);
+        assert_ne!(
+            a, b,
+            "aliasing (project, workload) must not collide: {a} vs {b}"
+        );
+        assert!(is_dns1123_label(&a) && is_dns1123_label(&b));
+        // Another aliasing pair: the replica boundary vs workload tail.
+        let c = workload_object_name("p", "w", 10);
+        let d = workload_object_name("p", "w1", 0);
+        assert_ne!(c, d, "{c} vs {d}");
+        // Deterministic across calls (stable object names across relaunch/upgrade).
+        assert_eq!(workload_object_name("a", "b-c", 0), a);
+    }
+
+    #[test]
+    fn generic_env_secret_name_follows_the_injective_object_name() {
+        // The Secret name is `<object>-env`; since the object name is injective, so is the
+        // Secret name — two aliasing tenants cannot share one env Secret.
+        let ca = {
+            let mut c = ctx(&workload_object_name("a", "b-c", 0));
+            c.project = "a".to_string();
+            c
+        };
+        let cb = {
+            let mut c = ctx(&workload_object_name("a-b", "c", 0));
+            c.project = "a-b".to_string();
+            c
+        };
+        let sa = deployment_plan(&ca, &generic_spec())
+            .unwrap()
+            .secret
+            .unwrap();
+        let sb = deployment_plan(&cb, &generic_spec())
+            .unwrap()
+            .secret
+            .unwrap();
+        assert_ne!(
+            sa.metadata.name, sb.metadata.name,
+            "aliasing tenants must not share one env Secret"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F3: per-workload network isolation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_emits_default_deny_and_per_workload_allow_policies() {
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        assert_eq!(plan.network_policies.len(), 2);
+
+        // Default-deny: selects all workload pods (workload label Exists), no ingress rules.
+        let deny = plan
+            .network_policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(DEFAULT_DENY_POLICY_NAME))
+            .expect("default-deny policy present");
+        let dspec = deny.spec.as_ref().unwrap();
+        assert_eq!(
+            dspec.policy_types.as_deref(),
+            Some(["Ingress".to_string()].as_slice())
+        );
+        assert!(
+            dspec.ingress.as_ref().unwrap().is_empty(),
+            "default-deny has no ingress rules"
+        );
+        let me = &dspec.pod_selector.match_expressions.as_ref().unwrap()[0];
+        assert_eq!(me.key, WORKLOAD_LABEL);
+        assert_eq!(me.operator, "Exists");
+
+        // Per-workload allow: targets this workload, admits managed-by + consumer on the port.
+        let allow = plan
+            .network_policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(&allow_policy_name("pg")))
+            .expect("per-workload allow policy present");
+        let aspec = allow.spec.as_ref().unwrap();
+        assert_eq!(
+            aspec
+                .pod_selector
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get(WORKLOAD_LABEL)
+                .map(String::as_str),
+            Some("pg")
+        );
+        let rule = &aspec.ingress.as_ref().unwrap()[0];
+        // Allowed port is the DB port.
+        assert_eq!(
+            rule.ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(5432))
+        );
+        // Allowed sources: a managed-by=boatramp sibling and a compute-consumer=true pod.
+        let froms = rule.from.as_ref().unwrap();
+        let labels: Vec<_> = froms
+            .iter()
+            .filter_map(|p| p.pod_selector.as_ref())
+            .filter_map(|s| s.match_labels.as_ref())
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|m| m.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)),
+            "allow from managed-by=boatramp siblings"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|m| m.get(CONSUMER_LABEL).map(String::as_str) == Some(CONSUMER_VALUE)),
+            "allow from the compute-consumer serve pod"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F5: exec-form chown + mount-path validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chown_init_container_uses_exec_form_not_a_shell() {
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.user = Some("999:999".to_string());
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let init = plan
+            .stateful_set
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .init_containers
+            .unwrap();
+        let cmd = init[0].command.as_ref().unwrap();
+        // Exec form: `chown -R 999:999 <mount>` — NO `sh -c`, no shell string.
+        assert_eq!(cmd[0], "chown");
+        assert_eq!(cmd[1], "-R");
+        assert_eq!(cmd[2], "999:999");
+        assert_eq!(cmd[3], "/var/lib/postgresql/data");
+        assert!(
+            !cmd.iter()
+                .any(|a| a == "sh" || a == "-c" || a.contains(' ')),
+            "no shell / no space-joined argv: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_mount_path_is_refused_at_the_plan_boundary() {
+        for bad in [
+            "relative/path",    // not absolute
+            "/data; rm -rf /",  // shell metacharacters
+            "/data/../../etc",  // traversal
+            "/data$(whoami)",   // command substitution
+            "/data with space", // whitespace
+        ] {
+            let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+            spec.volumes[0].mount = bad.to_string();
+            assert!(
+                matches!(
+                    managed_db_plan(&ctx("pg"), &spec).unwrap_err(),
+                    PlanError::InvalidMountPath(_)
+                ),
+                "mount {bad:?} should be refused"
+            );
+        }
+        // A normal absolute path is accepted.
+        let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        assert!(managed_db_plan(&ctx("pg"), &spec).is_ok());
     }
 }

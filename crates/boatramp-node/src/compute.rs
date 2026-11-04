@@ -207,7 +207,26 @@ pub async fn build_compute(
     let explicit_backend = cfg.backend.as_deref().filter(|s| !s.is_empty());
     #[cfg(feature = "k8s-backend")]
     let use_k8s = match explicit_backend {
-        Some("kubernetes") => true,
+        // An explicit `[compute].backend = "kubernetes"` pin is accepted ONLY when we are
+        // actually in-cluster (KUBERNETES_SERVICE_HOST + a mounted ServiceAccount token) OR
+        // the operator explicitly opts in to an out-of-cluster client
+        // (`[compute].k8s_allow_out_of_cluster`). Otherwise the pin is REFUSED (F6 — a pin
+        // alone must not make boatramp talk to whatever cluster a stray local kubeconfig
+        // happens to point at); we fall back to capability-detected backends and warn.
+        Some("kubernetes") => {
+            if boatramp_k8s::in_cluster() || cfg.k8s_allow_out_of_cluster {
+                true
+            } else {
+                tracing::warn!(
+                    "[compute].backend = \"kubernetes\" is pinned but this process is not \
+                     running in-cluster (no KUBERNETES_SERVICE_HOST + mounted ServiceAccount \
+                     token) and [compute].k8s_allow_out_of_cluster is false; REFUSING the pin \
+                     (fail closed) and falling back to capability-detected backends — set \
+                     k8s_allow_out_of_cluster to use an out-of-cluster kubeconfig deliberately"
+                );
+                false
+            }
+        }
         Some(_) => false, // another id ⇒ capability-detected, not pinned here
         None => boatramp_k8s::in_cluster(),
     };
@@ -230,6 +249,10 @@ pub async fn build_compute(
             cfg.k8s_retain_pvc,
             cfg.k8s_image_pull_secret.clone(),
             cfg.k8s_volume_snapshot_class.clone(),
+            // Isolation posture (F1): multi-tenant (`strict`) drops a tenant `cap_add` and
+            // forces a read-only root, mirroring the docker/container backends'
+            // `with_cap_add_allowed(!strict)` / `with_writable_root_allowed(!strict)`.
+            strict,
         )
         .await
         {

@@ -51,6 +51,15 @@ pub struct KubernetesBackend {
     /// clean "unsupported" (the cluster's StorageClass has no snapshottable CSI driver, or
     /// the operator did not opt in).
     volume_snapshot_class: Option<String>,
+    /// The isolation **posture** (F1). `true` = multi-tenant (`strict`): the shared-kernel
+    /// hardening is non-negotiable — a spec's `cap_add` is dropped and the container root
+    /// filesystem is forced read-only (with writable `/tmp`+`/run` scratch). `false` =
+    /// single-tenant/dev: `cap_add` honored, writable root. Threaded from the node's
+    /// `allow_shared_kernel` posture (`strict = !allow_shared_kernel`), mirroring how the
+    /// docker/container backends receive `with_cap_add_allowed(!strict)` /
+    /// `with_writable_root_allowed(!strict)`. Fed into every [`PlanContext`]; NEVER derived
+    /// from a tenant spec.
+    strict: bool,
 }
 
 impl std::fmt::Debug for KubernetesBackend {
@@ -61,6 +70,7 @@ impl std::fmt::Debug for KubernetesBackend {
             .field("retain_pvc_on_stop", &self.retain_pvc_on_stop)
             .field("image_pull_secret", &self.image_pull_secret)
             .field("volume_snapshot_class", &self.volume_snapshot_class)
+            .field("strict", &self.strict)
             .finish_non_exhaustive()
     }
 }
@@ -75,6 +85,7 @@ impl KubernetesBackend {
         retain_pvc_on_stop: bool,
         image_pull_secret: Option<String>,
         volume_snapshot_class: Option<String>,
+        strict: bool,
     ) -> Result<Self, BackendError> {
         // kube talks to the apiserver over rustls; the workspace pulls both aws-lc-rs and
         // ring, so rustls can't auto-select a provider — install aws-lc-rs (matching the
@@ -83,13 +94,16 @@ impl KubernetesBackend {
         let client = Client::try_default()
             .await
             .map_err(|e| BackendError::Other(format!("kube client (in-cluster config): {e}")))?;
-        let namespace = detect_namespace(&client);
+        // Fail CLOSED on the namespace (F6): if we are in-cluster but the ServiceAccount
+        // namespace file is unreadable, refuse rather than silently operating in `default`.
+        let namespace = detect_namespace(&client)?;
         tracing::info!(
             %namespace,
             ?storage_class,
             retain_pvc_on_stop,
             image_pull_secret = ?image_pull_secret,
             volume_snapshot_class = ?volume_snapshot_class,
+            strict,
             "kubernetes compute backend ready"
         );
         Ok(Self {
@@ -99,10 +113,14 @@ impl KubernetesBackend {
             retain_pvc_on_stop,
             image_pull_secret,
             volume_snapshot_class,
+            strict,
         })
     }
 
     /// Wrap an already-built client (tests / an embedder that resolved its own config).
+    /// Defaults to the hardened **strict** (multi-tenant) posture — the fail-safe default,
+    /// matching how the docker/container backends default `cap_add_allowed`/
+    /// `writable_root_allowed` to `false`; relax it with [`with_strict`](Self::with_strict).
     pub fn with_client(
         client: Client,
         namespace: impl Into<String>,
@@ -116,7 +134,15 @@ impl KubernetesBackend {
             retain_pvc_on_stop,
             image_pull_secret: None,
             volume_snapshot_class: None,
+            strict: true,
         }
+    }
+
+    /// Set the isolation posture (chainable, for tests/embedders). `true` = multi-tenant
+    /// (hardened); `false` = single-tenant/dev (honors `cap_add` + writable root).
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Set the operator-configured `imagePullSecret` (chainable, for tests/embedders).
@@ -142,11 +168,19 @@ impl KubernetesBackend {
             namespace: self.namespace.clone(),
             storage_class: self.storage_class.clone(),
             image_pull_secret: self.image_pull_secret.clone(),
+            strict: self.strict,
         }
     }
 
     /// Server-side-apply one object under boatramp's field manager (idempotent;
     /// reconcilable — a relaunch re-applies the identical object).
+    ///
+    /// **No `.force()`** (F2): a conflict (a `409` — the named object exists and a DIFFERENT
+    /// field manager owns a field this apply sets) FAILS CLOSED instead of silently stealing
+    /// the field / adopting a foreign object. boatramp's own idempotent re-apply uses the
+    /// SAME field manager, so it never conflicts; a clash can only mean a non-boatramp
+    /// object squats the name (which the injective naming already makes a mis-config, not a
+    /// cross-tenant collision) — and we refuse rather than overwrite it.
     async fn apply<K>(&self, obj: &K) -> Result<(), BackendError>
     where
         K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
@@ -164,25 +198,66 @@ impl KubernetesBackend {
         let api: Api<K> = Api::namespaced(self.client.clone(), &self.namespace);
         api.patch(
             &name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
+            &PatchParams::apply(FIELD_MANAGER),
             &Patch::Apply(obj),
         )
         .await
-        .map_err(|e| BackendError::Launch(format!("apply {name}: {e}")))?;
+        .map_err(|e| apply_error(&name, e))?;
         Ok(())
     }
 }
 
-/// Resolve the namespace to operate in: the mounted ServiceAccount namespace file first
-/// (the authoritative in-cluster signal), else the client's default namespace (which, for
-/// an in-cluster config, kube already derives from that same file; for a local kubeconfig
-/// it is the context namespace / `default`).
-fn detect_namespace(client: &Client) -> String {
-    std::fs::read_to_string(crate::SA_NAMESPACE_PATH)
+/// Map an apply error to a [`BackendError`], making a `409 Conflict` a clear fail-closed
+/// message (F2): a conflict means the named object already exists with a field owned by
+/// another field manager, so boatramp refuses to adopt/overwrite it rather than forcing.
+fn apply_error(name: &str, e: kube::Error) -> BackendError {
+    match &e {
+        kube::Error::Api(ae) if ae.code == 409 => BackendError::Launch(format!(
+            "apply {name}: 409 conflict — an object of this name exists and is owned by \
+             another field manager; refusing to adopt or overwrite it (fail closed): {ae}"
+        )),
+        _ => BackendError::Launch(format!("apply {name}: {e}")),
+    }
+}
+
+/// Resolve the namespace to operate in, failing CLOSED in-cluster (F6).
+///
+/// - If the mounted ServiceAccount namespace file is readable + non-empty, use it (the
+///   authoritative in-cluster signal).
+/// - Otherwise, if this process IS in-cluster ([`crate::in_cluster`]) — a pod WITH a mounted
+///   token but somehow NO readable namespace file — REFUSE: return an error so the backend
+///   does not register, rather than silently defaulting to the `default` namespace (where a
+///   managed-DB Secret/Service would land in the wrong, possibly shared, namespace). The
+///   old fallback to `default` was a fail-OPEN namespace resolution.
+/// - Otherwise (NOT in-cluster: a local kubeconfig, e.g. the live gate pointing kube at a
+///   kind cluster), use the client's default namespace (the kubeconfig context's).
+fn detect_namespace(client: &Client) -> Result<String, BackendError> {
+    let sa_ns = std::fs::read_to_string(crate::SA_NAMESPACE_PATH)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| client.default_namespace().to_string())
+        .filter(|s| !s.is_empty());
+    resolve_namespace(sa_ns, crate::in_cluster(), client.default_namespace())
+}
+
+/// Pure namespace resolution (unit-tested — see [`tests`]): the mounted SA namespace when
+/// present; else fail CLOSED when in-cluster (never default to `default`); else the client's
+/// default namespace (a local kubeconfig / the live gate, which are not in-cluster).
+fn resolve_namespace(
+    sa_ns: Option<String>,
+    in_cluster: bool,
+    default_ns: &str,
+) -> Result<String, BackendError> {
+    match sa_ns {
+        Some(ns) => Ok(ns),
+        None if in_cluster => Err(BackendError::Other(
+            "running in-cluster (KUBERNETES_SERVICE_HOST + a mounted ServiceAccount token) \
+             but the ServiceAccount namespace file is unreadable or empty; refusing to \
+             register the kubernetes backend rather than defaulting to the 'default' \
+             namespace (fail closed)"
+                .into(),
+        )),
+        None => Ok(default_ns.to_string()),
+    }
 }
 
 /// Treat a `404 Not Found` from the apiserver as success (the object is already gone), so
@@ -330,6 +405,25 @@ impl ComputeBackend for KubernetesBackend {
                 .delete(&plan::env_secret_name(&dep_name), &DeleteParams::default())
                 .await
                 .map(|_| ()),
+        )?;
+
+        // The per-workload allow NetworkPolicy (F3) under BOTH naming schemes; a missing one
+        // 404s harmlessly. The namespace default-deny is SHARED across every workload, so it
+        // is intentionally NOT deleted here (removing it would un-isolate the survivors).
+        let nps: Api<k8s_openapi::api::networking::v1::NetworkPolicy> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        ignore_not_found(
+            nps.delete(&plan::allow_policy_name(sts_name), &DeleteParams::default())
+                .await
+                .map(|_| ()),
+        )?;
+        ignore_not_found(
+            nps.delete(
+                &plan::allow_policy_name(&dep_name),
+                &DeleteParams::default(),
+            )
+            .await
+            .map(|_| ()),
         )?;
 
         // The stateful PVC is RETAINED by default (a database's data must survive a
@@ -495,11 +589,16 @@ impl KubernetesBackend {
             service,
             pvc,
             secret,
+            network_policies,
         } = plan::managed_db_plan(&ctx, &req.spec)
             .map_err(|e| BackendError::Launch(e.to_string()))?;
-        // Apply the env Secret first (the pod references its keys), then the PVC (the pod
-        // mounts it), then the workload, then the Service. Server-side apply is idempotent,
-        // so a relaunch reconciles each in place.
+        // Apply the NetworkPolicies first (fail closed: isolation is in place before the
+        // pod can accept a connection), then the env Secret (the pod references its keys),
+        // then the PVC (the pod mounts it), then the workload, then the Service. Server-side
+        // apply is idempotent, so a relaunch reconciles each in place.
+        for np in &network_policies {
+            self.apply(np).await?;
+        }
         if let Some(secret) = &secret {
             self.apply(secret).await?;
         }
@@ -518,9 +617,14 @@ impl KubernetesBackend {
             deployment,
             service,
             secret,
+            network_policies,
         } = plan::deployment_plan(&ctx, &req.spec)
             .map_err(|e| BackendError::Launch(e.to_string()))?;
-        // The env Secret first (the pod references its keys), then the Deployment + Service.
+        // NetworkPolicies first (isolation in place before the pod serves), then the env
+        // Secret (the pod references its keys), then the Deployment + Service.
+        for np in &network_policies {
+            self.apply(np).await?;
+        }
         if let Some(secret) = &secret {
             self.apply(secret).await?;
         }
@@ -830,6 +934,8 @@ impl KubernetesBackend {
             namespace: self.namespace.clone(),
             storage_class: self.storage_class.clone(),
             image_pull_secret: None,
+            // A snapshot/restore object has no pod; the posture is irrelevant to it.
+            strict: self.strict,
         }
     }
 
@@ -856,13 +962,71 @@ impl KubernetesBackend {
             .map_err(|e| BackendError::Other(format!("encode VolumeSnapshot: {e}")))?;
         let api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &ar);
+        // No `.force()` (F2): a name clash owned by another field manager fails closed
+        // rather than silently adopting/overwriting a foreign snapshot object.
         api.patch(
             &name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
+            &PatchParams::apply(FIELD_MANAGER),
             &Patch::Apply(&body),
         )
         .await
-        .map_err(|e| BackendError::Other(format!("apply VolumeSnapshot {name}: {e}")))?;
+        .map_err(|e| match &e {
+            kube::Error::Api(ae) if ae.code == 409 => BackendError::Other(format!(
+                "apply VolumeSnapshot {name}: 409 conflict — a snapshot of this name \
+                     exists and is owned by another field manager; refusing to overwrite it"
+            )),
+            _ => BackendError::Other(format!("apply VolumeSnapshot {name}: {e}")),
+        })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F6: namespace resolution fails CLOSED in-cluster rather than defaulting to `default`.
+    #[test]
+    fn resolve_namespace_uses_the_mounted_sa_namespace() {
+        let ns = resolve_namespace(Some("boatramp-compute".to_string()), true, "default").unwrap();
+        assert_eq!(ns, "boatramp-compute");
+    }
+
+    #[test]
+    fn resolve_namespace_fails_closed_in_cluster_without_sa_namespace() {
+        // In-cluster but the SA namespace file is unreadable/empty ⇒ REFUSE (do not fall
+        // back to `default`, the old fail-open behavior).
+        let err = resolve_namespace(None, true, "default").unwrap_err();
+        assert!(
+            matches!(err, BackendError::Other(ref m) if m.contains("fail closed")),
+            "expected a fail-closed refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_namespace_uses_client_default_when_not_in_cluster() {
+        // Not in-cluster (a local kubeconfig / the live gate): the client's default
+        // namespace is legitimate — this is not the fail-open path F6 closes.
+        let ns = resolve_namespace(None, false, "kube-local").unwrap();
+        assert_eq!(ns, "kube-local");
+    }
+
+    // F2: the apply error maps a 409 conflict to a clear fail-closed message.
+    #[test]
+    fn apply_error_maps_409_to_a_fail_closed_message() {
+        let api_err = kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "already exists".to_string(),
+            reason: "Conflict".to_string(),
+            code: 409,
+        });
+        let mapped = apply_error("web-0", api_err);
+        match mapped {
+            BackendError::Launch(m) => {
+                assert!(m.contains("409"), "msg: {m}");
+                assert!(m.contains("fail closed"), "msg: {m}");
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
     }
 }
