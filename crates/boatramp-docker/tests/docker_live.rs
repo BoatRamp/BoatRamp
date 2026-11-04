@@ -415,6 +415,20 @@ async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_projec
         "svc must resolve + connect by its FULL container name boatramp-redeploy-svc-0"
     );
 
+    // (5) AUTO-HEAL IDEMPOTENCY (Security MEDIUM-1): a correctly new-model container — primary-
+    //     attached to the project net — must NOT be flagged for redeploy. `needs_redeploy` keys on
+    //     an exact `HostConfig.NetworkMode` string compare against the live daemon; if that ever
+    //     mismatched for a correctly-deployed container, EVERY reconcile tick would stop+relaunch
+    //     EVERY container (a self-inflicted outage/churn loop with repeated managed-DB restarts).
+    //     This proves idempotency against the real daemon, not just a string unit test.
+    assert!(
+        !backend
+            .needs_redeploy(&svc_b.handle, &server_spec("BBB"))
+            .await,
+        "idempotency: a freshly relaunched container on the project net must report \
+         needs_redeploy=false, else reconcile would churn every tick"
+    );
+
     for h in [&app.handle, &svc_b.handle, &svc_a.handle] {
         let _ = backend.stop(h).await;
     }
