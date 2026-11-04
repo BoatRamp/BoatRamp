@@ -214,6 +214,17 @@ pub struct DeployStoreInner {
     /// a stale entry — keeping the host-hijack guard exact. Domain changes are rare,
     /// so a coarse whole-cache epoch beats per-key tracking.
     domain_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Boot-time control-plane KV degraded-state breadcrumb (v0.9.0 KV-recovery, C6; the same
+    /// `DEGRADED.json` snapshot surfaced on `GET /api/kv-status`). `Some` ⇒ a self-heal-on-open
+    /// quarantined a torn WAL tail (or rolled a manifest back) THIS boot, so the control-plane view
+    /// may be missing acked writes beyond the durable frontier. A DESTRUCTIVE `prune_project` apply
+    /// REFUSES in this state (Security review Finding C): a live site whose `current/`/`site/`
+    /// pointer is transiently absent in the quarantined view would be misclassified `DeadSite` and
+    /// its records deleted. A dry-run report still runs (read-only, advisory). `None` ⇒ clean (the
+    /// default for every `new()`-built store; set once at node boot via [`with_kv_degraded`]).
+    ///
+    /// [`with_kv_degraded`]: DeployStore::with_kv_degraded
+    kv_degraded: Option<crate::kv::DegradedMarker>,
 }
 
 /// Backing store for [`DeployStore::domain_cache`]: the generation the map was built
@@ -860,6 +871,28 @@ impl DeployStore {
             blob_body_cache: Arc::new(std::sync::RwLock::new(BlobBodyCache::default())),
             domain_cache: Arc::new(std::sync::RwLock::new(DomainResolveCache::default())),
             domain_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Healthy by default; the node boot sets the real breadcrumb via `with_kv_degraded`.
+            kv_degraded: None,
+        }))
+    }
+
+    /// Record the boot-time control-plane KV degraded-state breadcrumb (the `DEGRADED.json` snapshot
+    /// read once after the store opened; `None` ⇒ clean). Chained once at node boot right after
+    /// [`new`](Self::new), before the store is shared, so a destructive `project prune --apply` can
+    /// fail closed when the KV self-healed a torn WAL tail this boot (Security review Finding C).
+    /// Cheap — it re-wraps the same `Arc`'d sub-stores/locks/caches, only swapping the breadcrumb.
+    #[must_use]
+    pub fn with_kv_degraded(self, marker: Option<crate::kv::DegradedMarker>) -> Self {
+        let inner = &*self.0;
+        Self(Arc::new(DeployStoreInner {
+            storage: inner.storage.clone(),
+            kv: inner.kv.clone(),
+            domain_claim_lock: inner.domain_claim_lock.clone(),
+            site_config_cache: inner.site_config_cache.clone(),
+            blob_body_cache: inner.blob_body_cache.clone(),
+            domain_cache: inner.domain_cache.clone(),
+            domain_epoch: inner.domain_epoch.clone(),
+            kv_degraded: marker,
         }))
     }
 
@@ -3948,20 +3981,28 @@ impl DeployStore {
     ///   `secret/`, `tenant-secret/`, `tenant-secret-index/`, `email/`, and `managed-sql-cred/`) are
     ///   excluded STRUCTURALLY before any key is classified — never pruned.
     /// - Live project resources (`config/`, `database/`, `functions/`, `compute/`) are kept.
+    /// - The `dnsmanaged/` auto-DNS ledger is NEVER classified (Security review Finding A): each
+    ///   entry fronts an external provider DNS record whose retract-then-remove the reconcile sweep
+    ///   owns, so a raw prune-delete would strand it. Kept for a dead site AND a live foreign host.
     ///
     /// Prunes exactly two provable-orphan classes (see [`crate::project_prune::PruneReason`]):
     /// 1. **Dead-site leftovers** — the per-site routing/config keys (`site/`, `current-principal/`,
-    ///    `history/`, `sitecontexts/`, `alias/`, `domainverify/`, `dnsmanaged/`) of a site with NO
-    ///    resolvable config body AND NO `current/` deployment pointer. The `current/` pointer is the
-    ///    liveness anchor and is itself never pruned.
-    /// 2. **Foreign-domain entries** of a LIVE site — a `domainverify/<site>/<host>` or
-    ///    `dnsmanaged/<site>/<host>` whose `<host>` is not one the site's CURRENT config answers to
-    ///    ([`host_is_answered_by`](crate::project_prune::host_is_answered_by)).
+    ///    `history/`, `sitecontexts/`, `alias/`, `domainverify/`) of a site with NO resolvable config
+    ///    body AND NO `current/` deployment pointer. The `current/` pointer is the liveness anchor
+    ///    and is itself never pruned. (`dnsmanaged/` is excluded — see above.)
+    /// 2. **Foreign, provably-dead `domainverify/<site>/<host>` of a LIVE site** — a host NOT one the
+    ///    site's CURRENT config answers to ([`host_is_answered_by`](crate::project_prune::host_is_answered_by))
+    ///    AND whose stored challenge is **unverified AND expired** (Security review Finding B). A
+    ///    VERIFIED ownership proof (its removal is `domain rm`, and a DNS-verified ancestor still
+    ///    authorizes on-demand TLS for a subtree) and an UNEXPIRED pending challenge
+    ///    (verify-before-attach in flight) are both KEPT.
     ///
     /// With `apply == false` (the default) NOTHING is written — the returned plan lists exactly what
-    /// an `--apply` would remove. With `apply == true` the plan's keys are deleted in one
-    /// frontier-advancing batch (so a pruned routing/verification record cannot resurrect after a
-    /// crash) and `removed` is set. Idempotent: a second run on a clean project prunes nothing.
+    /// an `--apply` would remove, and runs even under a degraded KV. With `apply == true` the plan's
+    /// keys are deleted in one frontier-advancing batch (so a pruned routing/verification record
+    /// cannot resurrect after a crash) and `removed` is set; the apply is REFUSED (fail-closed) when
+    /// the control-plane KV booted into a self-healed/quarantined degraded state (Security review
+    /// Finding C). Idempotent: a second run on a clean project prunes nothing.
     pub async fn prune_project(
         &self,
         project: &str,
@@ -3972,12 +4013,35 @@ impl DeployStore {
         };
         let pref = ProjectRef::new(project);
 
+        // Fail-closed under a DEGRADED control-plane KV (Security review Finding C). Pass-1 liveness
+        // is derived from `list_prefix`/`get` over this store; if a self-heal-on-open quarantined a
+        // torn WAL tail this boot, a LIVE site's `current/`/`site/` pointer can be transiently
+        // absent in the recovered view, so the site would be misclassified `DeadSite` and its
+        // records deleted. So a destructive `--apply` is REFUSED whenever a boot-time degraded
+        // breadcrumb is present (the same state `GET /api/kv-status` surfaces) — the operator
+        // reviews + `boatramp kv status --ack`s first, then re-runs. The dry-run report is read-only
+        // + advisory, so it still runs (the operator WANTS to see the plan while degraded).
+        if apply && let Some(marker) = &self.kv_degraded {
+            return Err(DeployError::Conflict(format!(
+                "control-plane KV is in a degraded/quarantined state (self-heal at {stamp}; \
+                 loss window: {loss}); refusing to --apply a destructive project prune — a \
+                 transiently-absent site pointer in the recovered view could misclassify a live \
+                 site as dead and delete its records. Review `boatramp kv status`, acknowledge with \
+                 `boatramp kv status --ack`, then re-run. (A dry-run report still works.)",
+                stamp = marker.stamp,
+                loss = marker.loss_window,
+            )));
+        }
+
         // On the DESTRUCTIVE path, serialize the whole scan+delete against concurrent
         // site-config / domain writes under the SAME claim lock those writes take (mirrors
         // `delete_site` / `purge_project`) — so a site re-created (or a domain attached) mid-scan
-        // is not pruned from under the writer (the read-then-delete TOCTOU). The dry-run report is
-        // advisory + read-only, so it stays lock-free. (`get_site_config` / `write_batch_*` here do
-        // not themselves take this lock, so there is no re-entrancy.)
+        // is not pruned from under the writer (the read-then-delete TOCTOU). Activation
+        // (`activate_with_principal` + its `record_history`) takes the SAME lock, so a site being
+        // activated at snapshot cannot lose a freshly-written `history/` entry to our delete
+        // (Security review Finding D). The dry-run report is advisory + read-only, so it stays
+        // lock-free. (`get_site_config` / `write_batch_*` here do not themselves take this lock, so
+        // there is no re-entrancy.)
         let _claim = if apply {
             Some(self.domain_claim_lock.lock().await)
         } else {
@@ -4034,6 +4098,9 @@ impl DeployStore {
         }
         let is_live = |site: &str| current_sites.contains(site) || config_sites.contains_key(site);
 
+        // One wall-clock read for every `domainverify` expiry decision in this scan (Finding B).
+        let now = crate::time::now_unix();
+
         // Pass 2 — classify each per-site key. Non-per-site families (config/database/functions/
         // compute), the `current/` liveness anchor, and the sealed families are kept.
         let mut prunable: Vec<PrunableKey> = Vec::new();
@@ -4049,7 +4116,12 @@ impl DeployStore {
                 continue;
             };
             // Only the per-site routing/config families are classifiable. `current` is the liveness
-            // anchor — always kept. Everything else is a live resource — kept.
+            // anchor — always kept. `dnsmanaged` is DELIBERATELY ABSENT (Security review Finding A):
+            // each ledger entry fronts an EXTERNAL provider DNS record whose retract-then-remove
+            // lifecycle the auto-DNS reconcile sweep owns; a raw prune-delete would strand the
+            // provider record (a leaked dangling hostname the reconcile GC can then never reclaim).
+            // So every `dnsmanaged/` key is kept here — for BOTH a dead site and a live site's
+            // foreign host. Everything else off this list is a live resource — kept.
             let per_site = matches!(
                 family,
                 "site"
@@ -4058,7 +4130,6 @@ impl DeployStore {
                     | "sitecontexts"
                     | "alias"
                     | "domainverify"
-                    | "dnsmanaged"
             );
             if !per_site {
                 continue;
@@ -4079,11 +4150,12 @@ impl DeployStore {
                 continue;
             }
 
-            // A LIVE site: only a foreign-domain verification / managed-DNS ledger entry is an
-            // orphan, and only when the site has a RESOLVABLE config to compare the host against
-            // (a site live solely by a `current/` pointer with a dangling config is kept — nothing
-            // to prove the host foreign against). Everything else for a live site is kept.
-            if matches!(family, "domainverify" | "dnsmanaged") {
+            // A LIVE site: only a foreign-domain VERIFICATION entry can be an orphan, and only when
+            // the site has a RESOLVABLE config to compare the host against (a site live solely by a
+            // `current/` pointer with a dangling config is kept — nothing to prove the host foreign
+            // against). The managed-DNS ledger is handled above (never classified). Everything else
+            // for a live site is kept.
+            if family == "domainverify" {
                 let Some(host) = segs.next().filter(|h| !h.is_empty()) else {
                     continue;
                 };
@@ -4093,20 +4165,33 @@ impl DeployStore {
                 if contexts_uncertain.contains(site) {
                     continue; // contexts store present-but-corrupt — answered set unknown, keep
                 }
-                if !host_is_answered_by(host, cfg) {
-                    let (reason, label) = if family == "domainverify" {
-                        (PruneReason::ForeignDomainVerify, "domain-verification")
-                    } else {
-                        (PruneReason::ForeignManagedDns, "managed-DNS")
-                    };
-                    prunable.push(PrunableKey {
-                        key: key.clone(),
-                        reason,
-                        detail: format!(
-                            "host `{host}` is not answered by site `{site}`'s current config — a stale/foreign {label} record"
-                        ),
-                    });
+                if host_is_answered_by(host, cfg) {
+                    continue; // the current config answers this host — a live, referenced record
                 }
+                // The host is NOT in the current config — but that ALONE is not proof of an orphan
+                // (Security review Finding B). Load the challenge body and KEEP it when it is a
+                // VERIFIED ownership proof (its removal is `domain rm`, not GC — a DNS-verified
+                // ancestor still authorizes on-demand TLS for a subtree) OR an UNEXPIRED pending
+                // challenge (a verify-before-attach in flight). ONLY an unverified-AND-expired
+                // record for a not-in-config host is a provable dead orphan.
+                let Some(bytes) = self.kv.get(key).await? else {
+                    continue; // vanished between list and load — nothing to prune
+                };
+                match crate::domain_verify::DomainVerification::from_json(&bytes) {
+                    Ok(v) if v.verified => continue, // proven ownership — not GC's to reclaim
+                    Ok(v) if !v.is_expired(now) => continue, // unexpired pending — verify in flight
+                    Ok(_) => {} // unverified AND expired — a provable dead orphan, fall through
+                    Err(_) => continue, // unparseable body — keep, fail-closed
+                }
+                prunable.push(PrunableKey {
+                    key: key.clone(),
+                    reason: PruneReason::ForeignDomainVerify,
+                    detail: format!(
+                        "host `{host}` is not answered by site `{site}`'s current config and its \
+                         verification challenge is unverified + expired — a stale/foreign \
+                         domain-verification record"
+                    ),
+                });
             }
         }
 
@@ -4128,15 +4213,21 @@ impl DeployStore {
         };
 
         if apply && !plan.prunable.is_empty() {
+            // Finding E (no separate dry-run→apply digest needed): an `--apply` does NOT act on a
+            // report handed in from an earlier, lock-free dry-run — it RE-SCANS the live KV from
+            // scratch under the claim lock held above and re-classifies every key HERE, so each key
+            // in `plan.prunable` is a provable orphan as of THIS locked scan. A concurrent writer
+            // that re-created a site or re-attached a domain is serialized out by the same lock, so
+            // there is no dry-run/apply drift to reconcile.
             let ops: Vec<WriteOp> = plan
                 .prunable
                 .iter()
                 .map(|p| WriteOp::Delete(p.key.clone()))
                 .collect();
             let removed = ops.len();
-            // A pruned routing/verification/auto-DNS record must stay gone past a crash (it would
-            // otherwise resurrect and re-assert a claim the operator just reclaimed), so advance the
-            // durable frontier — matching `delete_site`'s crown-jewel discipline.
+            // A pruned routing/verification record must stay gone past a crash (it would otherwise
+            // resurrect and re-assert a claim the operator just reclaimed), so advance the durable
+            // frontier — matching `delete_site`'s crown-jewel discipline.
             self.kv.write_batch_checkpointed(ops).await?;
             plan.applied = true;
             plan.removed = removed;
@@ -4233,6 +4324,14 @@ impl DeployStore {
                 }
             }
         }
+        // Hold the SAME claim lock the destructive sweeps take (`prune_project`, `delete_site`,
+        // `purge_project`, `set_site_config`) across BOTH the `current`+principal batch AND the
+        // `history/` write below (Security review Finding D). Without it, an activation could
+        // interleave between a concurrent `prune_project`'s under-lock liveness snapshot and its
+        // deletes, so a site being activated at snapshot could have its freshly-written `history/`
+        // entry deleted. Serializing here closes that race. `record_history` runs under this guard
+        // and does NOT take the lock itself (it is only ever called from here), so no re-entrancy.
+        let _claim = self.domain_claim_lock.lock().await;
         self.kv.write_batch(batch).await?;
 
         // Record the activation. Best-effort: `current` above is the source of
@@ -8719,10 +8818,48 @@ mod tests {
         }
     }
 
+    /// A realistic `DomainVerification` JSON body for the prune tests (Security review Finding B:
+    /// prune loads the body and keeps a verified proof or an unexpired pending challenge). A bogus
+    /// placeholder value would simply fail to parse and be kept fail-closed — these build the three
+    /// shapes the classifier actually distinguishes.
+    fn dv_body(host: &str, verified: bool, created_at_unix: u64) -> Vec<u8> {
+        use crate::domain_verify::{DomainVerification, VerificationMethod};
+        DomainVerification {
+            version: crate::SCHEMA_VERSION,
+            host: crate::domain_verify::normalize_host(host),
+            token: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            method: VerificationMethod::Dns,
+            verified,
+            created_at_unix,
+        }
+        .to_json()
+        .unwrap()
+    }
+    /// An UNVERIFIED + EXPIRED challenge (`created_at_unix == 1` ⇒ older than the TTL vs wall-clock
+    /// now) — the ONLY `domainverify` shape prune may delete for a not-in-config host.
+    fn dv_unverified_expired(host: &str) -> Vec<u8> {
+        dv_body(host, false, 1)
+    }
+    /// A VERIFIED ownership proof (never expires) — KEPT even for a not-in-config host (`domain rm`).
+    fn dv_verified(host: &str) -> Vec<u8> {
+        dv_body(host, true, 1)
+    }
+    /// An UNEXPIRED pending challenge (stamped ~now) — KEPT (a verify-before-attach in flight).
+    fn dv_pending_fresh(host: &str) -> Vec<u8> {
+        dv_body(host, false, crate::time::now_unix())
+    }
+
     /// The motivating case: a `--force` clone commingle (or a `deploy apply` that rewrote a site's
-    /// domains) leaves verification + auto-DNS ledger entries for a FOREIGN host the current config
-    /// no longer answers to. Prune reports exactly those, keeps the active-domain records + config,
-    /// and `--apply` removes exactly the dry-run set (idempotent on a second run).
+    /// domains) leaves ledger entries for a FOREIGN host the current config no longer answers to.
+    /// Prune reclaims ONLY the provable orphan — a foreign host's UNVERIFIED + EXPIRED verification
+    /// challenge — and KEEPS everything else (Security review A + B):
+    ///   - the `dnsmanaged/` auto-DNS ledger (foreign OR active) is NEVER touched — the reconcile
+    ///     sweep owns its retract-then-remove, so prune leaving it avoids orphaning the provider
+    ///     record (Finding A);
+    ///   - a foreign host's VERIFIED ownership proof is kept (`domain rm`, not GC) and an UNEXPIRED
+    ///     pending challenge is kept (verify-before-attach in flight) (Finding B);
+    ///   - active-host records + the config are referenced, kept.
+    /// `--apply` removes exactly the dry-run set and is idempotent on a second run.
     #[tokio::test]
     async fn prune_project_prunes_foreign_domain_leftovers_and_keeps_active() {
         use crate::kv::MemoryKv;
@@ -8743,17 +8880,33 @@ mod tests {
 
         // Active-host verification + managed-DNS ledger entries (the config answers to these).
         let active_verify = keys::domain_verification(acme, "shop", "active.example.com");
-        kv.put(&active_verify, b"token".to_vec()).await.unwrap();
+        kv.put(&active_verify, dv_verified("active.example.com"))
+            .await
+            .unwrap();
         let active_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "active.example.com");
         kv.put(&active_dns, b"{}".to_vec()).await.unwrap();
 
-        // Foreign-domain leftovers a commingle left behind (NOT in the current config).
-        let foreign_verify = keys::domain_verification(acme, "shop", "foreign.example.net");
-        kv.put(&foreign_verify, b"token".to_vec()).await.unwrap();
+        // Foreign-host leftovers a commingle left behind (NOT in the current config):
+        //  - a stale, never-completed challenge (unverified + expired) — the ONLY provable orphan;
+        let foreign_stale = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign_stale, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
+        //  - a VERIFIED ownership proof for a no-longer-attached host — KEPT (Finding B);
+        let foreign_proof = keys::domain_verification(acme, "shop", "oldproof.example.net");
+        kv.put(&foreign_proof, dv_verified("oldproof.example.net"))
+            .await
+            .unwrap();
+        //  - an UNEXPIRED pending challenge for a not-yet-attached host — KEPT (Finding B);
+        let foreign_pending = keys::domain_verification(acme, "shop", "pending.example.net");
+        kv.put(&foreign_pending, dv_pending_fresh("pending.example.net"))
+            .await
+            .unwrap();
+        //  - the foreign host's auto-DNS ledger — KEPT (Finding A: reconcile owns it).
         let foreign_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "foreign.example.net");
         kv.put(&foreign_dns, b"{}".to_vec()).await.unwrap();
 
-        // Dry-run: reports exactly the two foreign keys, mutates nothing.
+        // Dry-run: reports ONLY the stale foreign challenge, mutates nothing.
         let plan = store.prune_project("acme", false).await.unwrap();
         assert!(
             !plan.applied && plan.removed == 0,
@@ -8761,44 +8914,57 @@ mod tests {
         );
         let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(
-            pruned.len(),
-            2,
-            "exactly two foreign leftovers: {:?}",
+            pruned,
+            BTreeSet::from([foreign_stale.as_str()]),
+            "only the unverified+expired foreign challenge is a provable orphan: {:?}",
             plan.prunable
         );
-        assert!(pruned.contains(foreign_verify.as_str()));
-        assert!(pruned.contains(foreign_dns.as_str()));
-        assert!(
-            !pruned.contains(active_verify.as_str()),
-            "active record is referenced — kept"
-        );
-        assert!(
-            !pruned.contains(active_dns.as_str()),
-            "active record is referenced — kept"
-        );
+        for kept in [
+            &active_verify,
+            &active_dns,
+            &foreign_proof,
+            &foreign_pending,
+            &foreign_dns,
+        ] {
+            assert!(
+                !pruned.contains(kept.as_str()),
+                "must be kept (Finding A/B): {kept}"
+            );
+        }
         assert_eq!(plan.live_sites, vec!["shop".to_string()]);
         // Nothing was deleted by the dry-run.
-        assert!(kv.get(&foreign_verify).await.unwrap().is_some());
+        assert!(kv.get(&foreign_stale).await.unwrap().is_some());
 
-        // Apply: removes EXACTLY the dry-run set.
+        // Apply: removes EXACTLY the dry-run set (the one stale challenge).
         let applied = store.prune_project("acme", true).await.unwrap();
-        assert!(applied.applied && applied.removed == 2);
-        assert!(kv.get(&foreign_verify).await.unwrap().is_none());
-        assert!(kv.get(&foreign_dns).await.unwrap().is_none());
-        // Active records + the site config are untouched.
-        assert!(kv.get(&active_verify).await.unwrap().is_some());
-        assert!(kv.get(&active_dns).await.unwrap().is_some());
+        assert!(applied.applied && applied.removed == 1);
+        assert!(kv.get(&foreign_stale).await.unwrap().is_none());
+        // Everything else — including BOTH dnsmanaged ledgers and the site config — is untouched.
+        for kept in [
+            &active_verify,
+            &active_dns,
+            &foreign_proof,
+            &foreign_pending,
+            &foreign_dns,
+        ] {
+            assert!(
+                kv.get(kept).await.unwrap().is_some(),
+                "must survive: {kept}"
+            );
+        }
         assert!(store.get_site_config(acme, "shop").await.unwrap().is_some());
 
-        // Idempotent: a clean project prunes nothing.
+        // Idempotent: a second run prunes nothing (the stale challenge is gone, the rest is kept).
         let again = store.prune_project("acme", true).await.unwrap();
         assert!(again.is_clean() && again.removed == 0);
     }
 
     /// A site with no resolvable config and no `current/` deployment pointer is dead: every per-site
     /// routing/config leftover it still owns (a dangling `site/` pointer, history, contexts, aliases,
-    /// the activator-class record, verification + managed-DNS ledgers) is a provable orphan. A LIVE
-    /// site alongside is untouched.
+    /// the activator-class record, verification ledger) is a provable orphan — EXCEPT its
+    /// `dnsmanaged/` auto-DNS ledger, which is kept even for a dead site (Security review Finding A:
+    /// the reconcile sweep retracts-then-removes it so the external provider record is not stranded).
+    /// A LIVE site alongside is untouched.
     #[tokio::test]
     async fn prune_project_prunes_dead_site_residuals_keeps_live_site() {
         use crate::kv::MemoryKv;
@@ -8813,26 +8979,34 @@ mod tests {
             .await
             .unwrap();
 
-        // GHOST site — leftover per-site keys only (no config body, no current pointer).
+        // GHOST site — leftover per-site keys only (no config body, no current pointer). The
+        // dangling `site/` pointer resolves to an absent body; everything else is a bare leftover.
         let dangling_pointer = keys::site_pointer(acme, "ghost"); // → a hash whose body is absent
-        let ghost_keys = [
+        let prunable_ghost_keys = [
             dangling_pointer.clone(),
             keys::current_principal(acme, "ghost"),
             keys::history(acme, "ghost"),
             keys::site_contexts(acme, "ghost"),
             keys::alias(acme, "ghost", "staging"),
             keys::domain_verification(acme, "ghost", "ghost.example.com"),
-            crate::dns_managed::dnsmanaged_key("acme", "ghost", "ghost.example.com"),
         ];
+        // The dead site's auto-DNS ledger — KEPT (Finding A), NOT a dead-site orphan.
+        let ghost_dns = crate::dns_managed::dnsmanaged_key("acme", "ghost", "ghost.example.com");
         kv.put(&dangling_pointer, b"deadbeefdeadbeef".to_vec())
             .await
             .unwrap();
-        for k in ghost_keys.iter().skip(1) {
+        for k in prunable_ghost_keys.iter().skip(1) {
             kv.put(k, b"x".to_vec()).await.unwrap();
         }
+        kv.put(&ghost_dns, b"{}".to_vec()).await.unwrap();
 
         let plan = store.prune_project("acme", true).await.unwrap();
-        assert_eq!(plan.removed, ghost_keys.len(), "every ghost key is pruned");
+        assert_eq!(
+            plan.removed,
+            prunable_ghost_keys.len(),
+            "every ghost key EXCEPT the dnsmanaged ledger is pruned: {:?}",
+            plan.prunable
+        );
         assert!(
             plan.prunable
                 .iter()
@@ -8840,12 +9014,17 @@ mod tests {
             "ghost keys are dead-site orphans: {:?}",
             plan.prunable
         );
-        for k in &ghost_keys {
+        for k in &prunable_ghost_keys {
             assert!(
                 kv.get(k).await.unwrap().is_none(),
                 "ghost key must be gone: {k}"
             );
         }
+        // The dead site's auto-DNS ledger is KEPT — prune never touches `dnsmanaged/` (Finding A).
+        assert!(
+            kv.get(&ghost_dns).await.unwrap().is_some(),
+            "a dead site's dnsmanaged ledger must survive prune (reconcile owns its retraction)"
+        );
         // The live site's config pointer survives (referenced).
         assert!(store.get_site_config(acme, "shop").await.unwrap().is_some());
         assert!(
@@ -8882,9 +9061,11 @@ mod tests {
         for k in &sealed {
             kv.put(k, b"SEALED-UNDER-KEK".to_vec()).await.unwrap();
         }
-        // A genuine orphan so the sweep has work to do.
+        // A genuine orphan so the sweep has work to do (unverified + expired foreign challenge).
         let foreign = keys::domain_verification(acme, "shop", "foreign.example.net");
-        kv.put(&foreign, b"token".to_vec()).await.unwrap();
+        kv.put(&foreign, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
 
         let plan = store.prune_project("acme", true).await.unwrap();
         let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
@@ -8926,9 +9107,11 @@ mod tests {
         for k in [&subgraph, &apq, &cfg_key, &fn_key] {
             kv.put(k, b"keep-me".to_vec()).await.unwrap();
         }
-        // A real orphan so the sweep runs.
+        // A real orphan so the sweep runs (unverified + expired foreign challenge).
         let foreign = keys::domain_verification(acme, "shop", "foreign.example.net");
-        kv.put(&foreign, b"token".to_vec()).await.unwrap();
+        kv.put(&foreign, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
 
         let plan = store.prune_project("acme", true).await.unwrap();
         let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
@@ -8964,11 +9147,31 @@ mod tests {
             .set_site_config(bravo, "s", &live_cfg("bravo.example.com", &[]))
             .await
             .unwrap();
-        let alpha_foreign = keys::domain_verification(alpha, "s", "foreign-a.example.net");
+        // Alpha carries all three `domainverify` shapes for not-in-config hosts (Finding B): a
+        // stale (unverified+expired) one that PRUNES, plus a verified proof and an unexpired pending
+        // challenge that are KEPT. Realistic bodies — a bogus value would just be kept fail-closed.
+        let alpha_stale = keys::domain_verification(alpha, "s", "foreign-a.example.net");
+        let alpha_proof = keys::domain_verification(alpha, "s", "proof-a.example.net");
+        let alpha_pending = keys::domain_verification(alpha, "s", "pending-a.example.net");
+        kv.put(&alpha_stale, dv_unverified_expired("foreign-a.example.net"))
+            .await
+            .unwrap();
+        kv.put(&alpha_proof, dv_verified("proof-a.example.net"))
+            .await
+            .unwrap();
+        kv.put(&alpha_pending, dv_pending_fresh("pending-a.example.net"))
+            .await
+            .unwrap();
+        // Bravo carries the same shapes (incl. a stale orphan + a dead-site ghost) — none may be
+        // touched by pruning alpha.
         let bravo_foreign = keys::domain_verification(bravo, "s", "foreign-b.example.net");
         let bravo_ghost = keys::history(bravo, "ghost");
-        kv.put(&alpha_foreign, b"t".to_vec()).await.unwrap();
-        kv.put(&bravo_foreign, b"t".to_vec()).await.unwrap();
+        kv.put(
+            &bravo_foreign,
+            dv_unverified_expired("foreign-b.example.net"),
+        )
+        .await
+        .unwrap();
         kv.put(&bravo_ghost, b"t".to_vec()).await.unwrap();
 
         // Snapshot ALL of bravo's keyspace before pruning alpha.
@@ -8980,8 +9183,21 @@ mod tests {
             .collect();
 
         let plan = store.prune_project("alpha", true).await.unwrap();
-        assert_eq!(plan.removed, 1, "only alpha's foreign leftover is pruned");
-        assert!(kv.get(&alpha_foreign).await.unwrap().is_none());
+        assert_eq!(
+            plan.removed, 1,
+            "only alpha's unverified+expired foreign leftover is pruned: {:?}",
+            plan.prunable
+        );
+        assert!(kv.get(&alpha_stale).await.unwrap().is_none());
+        // Alpha's verified proof + unexpired pending challenge are KEPT (Finding B).
+        assert!(
+            kv.get(&alpha_proof).await.unwrap().is_some(),
+            "a verified ownership proof is kept"
+        );
+        assert!(
+            kv.get(&alpha_pending).await.unwrap().is_some(),
+            "an unexpired pending challenge is kept"
+        );
 
         // ZERO of bravo's keys changed — no foreign byte removed from the other tenant.
         let bravo_after: BTreeSet<String> = kv
@@ -9011,13 +9227,16 @@ mod tests {
         let a = ProjectRef::new("a");
         let ab = ProjectRef::new("ab");
 
-        // `a` has a live site + a foreign leftover (so the sweep genuinely runs and deletes).
+        // `a` has a live site + a foreign leftover (so the sweep genuinely runs and deletes). The
+        // leftover is an unverified+expired challenge for a not-in-config host — a provable orphan.
         store
             .set_site_config(a, "s", &live_cfg("a.example.com", &[]))
             .await
             .unwrap();
         let a_foreign = keys::domain_verification(a, "s", "foreign.example.net");
-        kv.put(&a_foreign, b"t".to_vec()).await.unwrap();
+        kv.put(&a_foreign, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
 
         // `ab` has BOTH a live site and a dead-site ghost — exactly the shapes `a`'s prune would
         // classify as prunable if its scan ever reached `ab`'s keyspace.
@@ -9131,9 +9350,15 @@ mod tests {
         let apex_dv = keys::domain_verification(acme, "shop", "example.com");
         let wild_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "*.example.com");
         let foreign_dv = keys::domain_verification(acme, "shop", "elsewhere.net");
-        for k in [&sub_dv, &apex_dv, &wild_dns, &foreign_dv] {
+        // The wildcard-covered hosts are kept by the config-answers-this-host test BEFORE any body
+        // load, so a placeholder value is fine for them; the unrelated host needs a realistic
+        // unverified+expired body to be the one provable orphan.
+        for k in [&sub_dv, &apex_dv, &wild_dns] {
             kv.put(k, b"t".to_vec()).await.unwrap();
         }
+        kv.put(&foreign_dv, dv_unverified_expired("elsewhere.net"))
+            .await
+            .unwrap();
 
         let plan = store.prune_project("acme", true).await.unwrap();
         let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
@@ -9181,9 +9406,11 @@ mod tests {
         }
 
         // Sanity: with a HEALTHY contexts store, the context host is answered (kept) — only a truly
-        // foreign host prunes.
+        // foreign host (unverified + expired, not in config) prunes.
         let foreign = keys::domain_verification(acme, "shop", "nope.example.org");
-        kv.put(&foreign, b"t".to_vec()).await.unwrap();
+        kv.put(&foreign, dv_unverified_expired("nope.example.org"))
+            .await
+            .unwrap();
         let healthy = store.prune_project("acme", false).await.unwrap();
         let healthy_pruned: BTreeSet<&str> =
             healthy.prunable.iter().map(|p| p.key.as_str()).collect();
@@ -9215,5 +9442,124 @@ mod tests {
             );
             assert!(kv.get(k).await.unwrap().is_some());
         }
+    }
+
+    /// Security review Finding A — prune NEVER classifies or deletes a `dnsmanaged/` auto-DNS ledger
+    /// key, in EVERY risky position: a FOREIGN host on a live site, an ACTIVE host on a live site,
+    /// and a DEAD-site ledger. The auto-DNS reconcile sweep owns the retract-then-remove, so a raw
+    /// prune-delete here would strand the external provider record (a leaked dangling hostname the
+    /// reconcile GC can then never reclaim). A real `domainverify` orphan alongside confirms the
+    /// sweep genuinely runs and deletes — it just never touches `dnsmanaged/`.
+    #[tokio::test]
+    async fn prune_project_never_touches_dnsmanaged_ledger() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+
+        // dnsmanaged ledgers in every risky position — ALL must survive.
+        let live_foreign_dns =
+            crate::dns_managed::dnsmanaged_key("acme", "shop", "foreign.example.net");
+        let live_active_dns =
+            crate::dns_managed::dnsmanaged_key("acme", "shop", "shop.example.com");
+        let dead_dns = crate::dns_managed::dnsmanaged_key("acme", "ghost", "ghost.example.com");
+        for k in [&live_foreign_dns, &live_active_dns, &dead_dns] {
+            kv.put(k, b"{}".to_vec()).await.unwrap();
+        }
+        // A genuine domainverify orphan so the sweep really deletes something.
+        let foreign_dv = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign_dv, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        // The one domainverify orphan is reclaimed; NO dnsmanaged key is ever classified.
+        assert_eq!(
+            pruned,
+            BTreeSet::from([foreign_dv.as_str()]),
+            "only the domainverify orphan is pruned, never a dnsmanaged key: {:?}",
+            plan.prunable
+        );
+        for k in [&live_foreign_dns, &live_active_dns, &dead_dns] {
+            assert!(
+                kv.get(k).await.unwrap().is_some(),
+                "a dnsmanaged ledger must survive prune (reconcile owns its retraction): {k}"
+            );
+        }
+        assert!(kv.get(&foreign_dv).await.unwrap().is_none());
+    }
+
+    /// Security review Finding C — a destructive `--apply` is REFUSED under a degraded/quarantined
+    /// control-plane KV (the `DEGRADED.json` boot breadcrumb is present), so a live site whose
+    /// `current/`/`site/` pointer is transiently absent in the self-healed view can never be
+    /// misclassified dead and deleted. The read-only dry-run report still runs, and a CLEAN store
+    /// (no breadcrumb) applies normally.
+    #[tokio::test]
+    async fn prune_project_apply_refused_under_degraded_kv() {
+        use crate::kv::{DegradedMarker, MemoryKv};
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let marker = DegradedMarker {
+            stamp: 1_700_000_000,
+            quarantined_ids: vec![42, 43],
+            loss_window: "wal ids 42..=43 beyond the durable frontier".to_string(),
+            quarantine_dir: "/var/lib/boatramp/kv/wal-quarantine/1700000000".to_string(),
+            frontier: 41,
+            frontier_source: "wal_replay".to_string(),
+            rolled_back_to_generation: None,
+            quarantined_manifest_ids: Vec::new(),
+            orphaned_nonacked_objects: Vec::new(),
+            quarantined_compactions_ids: Vec::new(),
+        };
+        let store =
+            DeployStore::new(Arc::new(NullStorage), kv.clone()).with_kv_degraded(Some(marker));
+        let acme = ProjectRef::new("acme");
+
+        // A live site + a genuine orphan (unverified+expired foreign challenge) so a healthy apply
+        // WOULD have real work to do.
+        store
+            .set_site_config(acme, "shop", &live_cfg("shop.example.com", &[]))
+            .await
+            .unwrap();
+        let foreign = keys::domain_verification(acme, "shop", "foreign.example.net");
+        kv.put(&foreign, dv_unverified_expired("foreign.example.net"))
+            .await
+            .unwrap();
+
+        // The read-only dry-run report STILL runs while degraded (the operator wants the plan).
+        let report = store.prune_project("acme", false).await.unwrap();
+        assert!(
+            !report.applied && report.prunable.iter().any(|p| p.key == foreign),
+            "a dry-run report still works + lists the orphan while degraded: {:?}",
+            report.prunable
+        );
+
+        // The destructive apply is REFUSED (fail-closed) and deletes NOTHING.
+        let err = store.prune_project("acme", true).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::Conflict(_)),
+            "apply under a degraded KV must be refused: {err:?}"
+        );
+        assert!(
+            kv.get(&foreign).await.unwrap().is_some(),
+            "a refused apply must delete nothing"
+        );
+
+        // Control: a CLEAN store (no degraded breadcrumb) over the same KV applies normally.
+        let clean = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let applied = clean.prune_project("acme", true).await.unwrap();
+        assert!(
+            applied.applied && applied.removed == 1,
+            "a clean store applies the prune: {:?}",
+            applied.prunable
+        );
+        assert!(kv.get(&foreign).await.unwrap().is_none());
     }
 }

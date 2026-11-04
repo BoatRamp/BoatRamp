@@ -21,18 +21,31 @@
 //!   — every host its current config actually answers to.
 //! - **PRUNABLE** = PRESENT − REFERENCED, i.e. the provable orphans:
 //!   1. **Dead-site leftovers** — the per-site routing/config keys (`site/`, `current-principal/`,
-//!      `history/`, `sitecontexts/`, `alias/`, `domainverify/`, `dnsmanaged/`) of a site that has
-//!      NO resolvable config body AND NO `current/` deployment pointer. Such a site serves nothing
-//!      (a dangling `site/` pointer whose body was GC'd, or a commingled site whose config never
-//!      landed). A `current/` pointer makes a site live — it is the liveness anchor and is itself
-//!      never pruned.
-//!   2. **Foreign-domain entries** within a LIVE site — a `domainverify/<site>/<host>` or
-//!      `dnsmanaged/<site>/<host>` whose `<host>` is NOT one the site's CURRENT config answers to
-//!      (the motivating case: a `--force` clone commingle, or a `deploy apply` that rewrote the
-//!      site's domains, leaving the old/foreign host's verification + auto-DNS ledger behind).
+//!      `history/`, `sitecontexts/`, `alias/`, `domainverify/`) of a site that has NO resolvable
+//!      config body AND NO `current/` deployment pointer. Such a site serves nothing (a dangling
+//!      `site/` pointer whose body was GC'd, or a commingled site whose config never landed). A
+//!      `current/` pointer makes a site live — it is the liveness anchor and is itself never pruned.
+//!      (`dnsmanaged/` is deliberately NOT in this set — see below.)
+//!   2. **Foreign, provably-dead domain-verification entries** within a LIVE site — a
+//!      `domainverify/<site>/<host>` whose `<host>` is NOT one the site's CURRENT config answers to
+//!      AND whose stored challenge is **unverified AND expired** (the motivating case: a `--force`
+//!      clone commingle, or a `deploy apply` that rewrote the site's domains, leaving an old host's
+//!      stale, never-completed verification challenge behind). A VERIFIED record is a proven
+//!      ownership proof (removing it is `domain rm`, not GC) and an UNEXPIRED pending challenge is a
+//!      live verify-before-attach in flight; both are KEPT (Security review Finding B).
 //!
 //! # What this verb deliberately does NOT prune (and why)
 //!
+//! - **The managed-DNS ledger (`dnsmanaged/<site>/<host>`)** — NEVER classified, let alone pruned
+//!   (Security review Finding A). Each ledger entry records an EXTERNAL DNS record boatramp
+//!   published at a provider; its lifecycle is owned by the auto-DNS reconcile sweep, which
+//!   **retracts the provider record THEN removes the ledger** (see
+//!   [`DeployStore::remove_managed_dns`](crate::deploy::DeployStore::remove_managed_dns) /
+//!   [`list_managed_dns`](crate::deploy::DeployStore::list_managed_dns)). A raw prune-delete of the
+//!   ledger would strand the external record at the provider (a leaked dangling hostname the
+//!   reconcile GC can then never reclaim, because it reclaims from the ledger). So prune leaves
+//!   every `dnsmanaged/` key alone — the reconcile sweep retracts-then-removes a stale/foreign one
+//!   correctly — for BOTH a dead site and a live site's foreign host.
 //! - **Sealed secrets / managed-SQL credentials** ([`sealed_secret_prefixes`]) — excluded
 //!   STRUCTURALLY, before any key is classified. Losing one is unrecoverable; they are never
 //!   "unreferenced" in a way this verb may act on.
@@ -71,14 +84,12 @@ pub enum PruneReason {
     /// A per-site routing/config key whose site has no resolvable config body and no active
     /// deployment pointer — the site serves nothing, so the key is a dead leftover.
     DeadSite,
-    /// A `domainverify/<site>/<host>` ledger entry for a host the site's CURRENT config does not
-    /// answer to — a stale/foreign domain-verification record (e.g. a `--force` clone commingle
-    /// leftover, or a host dropped by a later `deploy apply`).
+    /// A `domainverify/<site>/<host>` challenge for a host the site's CURRENT config does not answer
+    /// to AND whose stored record is **unverified AND expired** — a stale/foreign, never-completed
+    /// domain-verification challenge (e.g. a `--force` clone commingle leftover, or a host dropped by
+    /// a later `deploy apply`). A verified ownership proof or an unexpired pending challenge for a
+    /// not-in-config host is KEPT, never classified here (Security review Finding B).
     ForeignDomainVerify,
-    /// A `dnsmanaged/<site>/<host>` auto-DNS ledger entry for a host the site's CURRENT config does
-    /// not answer to — a stale/foreign managed-DNS record of the same shape as
-    /// [`ForeignDomainVerify`](Self::ForeignDomainVerify).
-    ForeignManagedDns,
 }
 
 impl PruneReason {
@@ -88,7 +99,6 @@ impl PruneReason {
         match self {
             Self::DeadSite => "dead-site",
             Self::ForeignDomainVerify => "foreign-domain-verify",
-            Self::ForeignManagedDns => "foreign-managed-dns",
         }
     }
 }
@@ -284,10 +294,6 @@ mod tests {
         assert_eq!(
             PruneReason::ForeignDomainVerify.as_str(),
             "foreign-domain-verify"
-        );
-        assert_eq!(
-            PruneReason::ForeignManagedDns.as_str(),
-            "foreign-managed-dns"
         );
     }
 }
