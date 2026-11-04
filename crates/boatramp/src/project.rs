@@ -32,6 +32,9 @@ pub enum Error {
     /// A `project tenant-secrets` subcommand failure.
     #[error(transparent)]
     TenantSecrets(#[from] crate::project_tenant_secrets::Error),
+    /// A `project sync` subcommand failure.
+    #[error(transparent)]
+    Sync(#[from] crate::project_sync::Error),
 }
 
 /// `project` module result; `Err` is [`Error`].
@@ -283,6 +286,16 @@ enum ProjectCommand {
         #[arg(long, value_name = "MANIFEST")]
         only_blobs: Option<std::path::PathBuf>,
     },
+    /// Idempotent, selective, coherence-preserving project SYNC (the successor to `import
+    /// --clone-from` for environment replication; `Project·Admin`). Reconciles a target project
+    /// toward a `--from` source for a SELECTED set of pieces (`--include-<piece>` /
+    /// `--exclude-<piece>`), rewriting site configs so the result is always coherent.
+    ///
+    /// Increment 1 is the DRY-RUN PREFLIGHT: it validates the selection, DETECTS whether the
+    /// destination exists (planning to create + provision an absent one — never 404), and reports
+    /// the per-piece + per-item plan (carry / rewrite / re-derive / drop / preserve / skip) BEFORE
+    /// a byte moves. `--apply` (execution) is increment 2.
+    Sync(crate::project_sync::SyncArgs),
 }
 
 /// Whether a `--force` confirmation `typed` at the prompt authorizes deleting
@@ -715,6 +728,8 @@ pub enum ProjectOutput {
     Pruned {
         plan: boatramp_core::project_prune::ProjectPrunePlan,
     },
+    /// `project sync` (increment 1) — the dry-run preflight plan + operator notes.
+    Sync(crate::project_sync::SyncReport),
     /// The output was already written directly by this arm (a delegated subcommand's own
     /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
     Passthrough,
@@ -915,6 +930,7 @@ impl crate::output::Rendered for ProjectOutput {
                      node-global `boatramp prune` (System·Admin), not this per-project verb"
                 )
             }
+            Self::Sync(report) => crate::output::Rendered::render_human(report, w),
             Self::Passthrough => Ok(()),
         }
     }
@@ -929,8 +945,9 @@ pub async fn run(
     let (server, http) = client::connect(args.server, config)?;
     // The project-collection endpoints (list/create/get/delete) are not project-scoped, so
     // the resolved project is inert for them; `migrate`, however, targets the active
-    // `--project`'s migrate surface via its `project_seg`, so we resolve it here.
-    let cp = client::ControlPlane::new(server, http, client::resolve_project(config));
+    // `--project`'s migrate surface via its `project_seg`, so we resolve it here. `server` is
+    // kept (cloned) because `sync` resolves its own source/target-scoped clients from it.
+    let cp = client::ControlPlane::new(server.clone(), http, client::resolve_project(config));
 
     match args.command {
         ProjectCommand::Create {
@@ -1248,6 +1265,10 @@ pub async fn run(
         ProjectCommand::TenantSecrets(tsargs) => {
             crate::project_tenant_secrets::run(tsargs, &cp).await?;
             Ok(ProjectOutput::Passthrough)
+        }
+        ProjectCommand::Sync(sargs) => {
+            let report = crate::project_sync::run(sargs, config, server).await?;
+            Ok(ProjectOutput::Sync(report))
         }
     }
 }
