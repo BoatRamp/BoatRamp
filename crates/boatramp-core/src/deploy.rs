@@ -3972,6 +3972,18 @@ impl DeployStore {
         };
         let pref = ProjectRef::new(project);
 
+        // On the DESTRUCTIVE path, serialize the whole scan+delete against concurrent
+        // site-config / domain writes under the SAME claim lock those writes take (mirrors
+        // `delete_site` / `purge_project`) — so a site re-created (or a domain attached) mid-scan
+        // is not pruned from under the writer (the read-then-delete TOCTOU). The dry-run report is
+        // advisory + read-only, so it stays lock-free. (`get_site_config` / `write_batch_*` here do
+        // not themselves take this lock, so there is no re-entrancy.)
+        let _claim = if apply {
+            Some(self.domain_claim_lock.lock().await)
+        } else {
+            None
+        };
+
         // Structural exclusion: the sealed/credential families are NEVER classified. Concrete,
         // project-qualified prefixes built from the single source of truth.
         let sealed = crate::project_export::sealed_secret_prefixes(pref);
@@ -3990,6 +4002,13 @@ impl DeployStore {
         let mut current_sites: BTreeSet<String> = BTreeSet::new();
         let site_prefix = keys::site_prefix(pref); // project/<p>/site/
         let mut config_sites: std::collections::BTreeMap<String, SiteConfig> = Default::default();
+        // Sites whose `sitecontexts/<site>` value is PRESENT but does not parse (e.g. a torn-WAL /
+        // self-heal-quarantine state). Their answered-host set is UNCERTAIN — the runtime tenant
+        // context that binds a 1-domain:1-tenant storefront is unreadable — so the foreign-domain
+        // test must fail CLOSED for them (keep every domain record), never treat the site as
+        // "answers nothing". (`get_site_config` overlays contexts via `unwrap_or_default`, which
+        // would silently read an empty map; the destructive GC must not inherit that fail-open.)
+        let mut contexts_uncertain: BTreeSet<String> = BTreeSet::new();
         for key in &all_keys {
             if let Some(site) = key
                 .strip_prefix(&current_prefix)
@@ -4004,6 +4023,12 @@ impl DeployStore {
                 // (`get_site_config` → `None`) leaves it dead and the pointer itself prunable.
                 if let Some(cfg) = self.get_site_config(pref, site).await? {
                     config_sites.insert(site.to_string(), cfg);
+                    // Fail-closed guard: a present-but-corrupt contexts store ⇒ uncertain answered set.
+                    if let Some(bytes) = self.kv.get(&keys::site_contexts(pref, site)).await?
+                        && serde_json::from_slice::<BTreeMap<String, String>>(&bytes).is_err()
+                    {
+                        contexts_uncertain.insert(site.to_string());
+                    }
                 }
             }
         }
@@ -4065,6 +4090,9 @@ impl DeployStore {
                 let Some(cfg) = config_sites.get(site) else {
                     continue; // live via current pointer, no resolvable config — keep (fail-closed)
                 };
+                if contexts_uncertain.contains(site) {
+                    continue; // contexts store present-but-corrupt — answered set unknown, keep
+                }
                 if !host_is_answered_by(host, cfg) {
                     let (reason, label) = if family == "domainverify" {
                         (PruneReason::ForeignDomainVerify, "domain-verification")
@@ -8968,5 +8996,224 @@ mod tests {
         );
         assert!(kv.get(&bravo_foreign).await.unwrap().is_some());
         assert!(kv.get(&bravo_ghost).await.unwrap().is_some());
+    }
+
+    /// ADVERSARIAL (prefix over-capture): a project whose NAME is a prefix of a sibling's
+    /// (`a` vs `ab`). Pruning `a` must scan ONLY `project/a/…` and never over-capture `ab`'s keys.
+    /// The trailing `/` in `resource_prefix` (`project/a/`) is what makes `project/ab/…` out of
+    /// scope; this guards that invariant at the store level.
+    #[tokio::test]
+    async fn prune_project_does_not_over_capture_a_prefix_sibling() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let a = ProjectRef::new("a");
+        let ab = ProjectRef::new("ab");
+
+        // `a` has a live site + a foreign leftover (so the sweep genuinely runs and deletes).
+        store
+            .set_site_config(a, "s", &live_cfg("a.example.com", &[]))
+            .await
+            .unwrap();
+        let a_foreign = keys::domain_verification(a, "s", "foreign.example.net");
+        kv.put(&a_foreign, b"t".to_vec()).await.unwrap();
+
+        // `ab` has BOTH a live site and a dead-site ghost — exactly the shapes `a`'s prune would
+        // classify as prunable if its scan ever reached `ab`'s keyspace.
+        store
+            .set_site_config(ab, "s", &live_cfg("ab.example.com", &[]))
+            .await
+            .unwrap();
+        let ab_foreign = keys::domain_verification(ab, "s", "foreign.example.net");
+        let ab_ghost_hist = keys::history(ab, "ghost");
+        let ab_ghost_dv = keys::domain_verification(ab, "ghost", "ghost.example.com");
+        for k in [&ab_foreign, &ab_ghost_hist, &ab_ghost_dv] {
+            kv.put(k, b"t".to_vec()).await.unwrap();
+        }
+
+        let ab_before: BTreeSet<String> = kv
+            .list_prefix("project/ab/")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        let plan = store.prune_project("a", true).await.unwrap();
+        // Only `a`'s own foreign leftover — nothing from `ab`.
+        assert_eq!(
+            plan.removed, 1,
+            "only a's foreign leftover: {:?}",
+            plan.prunable
+        );
+        assert!(
+            plan.prunable
+                .iter()
+                .all(|p| p.key.starts_with("project/a/") && !p.key.starts_with("project/ab/")),
+            "every pruned key is under project/a/, none under project/ab/: {:?}",
+            plan.prunable
+        );
+        assert!(kv.get(&a_foreign).await.unwrap().is_none());
+
+        let ab_after: BTreeSet<String> = kv
+            .list_prefix("project/ab/")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(ab_before, ab_after, "pruning `a` must not touch `ab`");
+    }
+
+    /// ADVERSARIAL (fail-closed liveness): a site live SOLELY via a `current/<site>` deployment
+    /// pointer whose config body is NOT resolvable (a dangling `site/` pointer). There is no
+    /// current config to prove any host foreign against, so a foreign-looking `domainverify`/
+    /// `dnsmanaged` entry MUST be KEPT (not classified dead-site, not classified foreign) — the
+    /// uncertainty ⇒ keep stance. Also confirms the `current/` anchor itself is never pruned.
+    #[tokio::test]
+    async fn prune_project_keeps_records_when_site_live_by_current_but_config_unresolvable() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        // A `current/` pointer makes the site LIVE; the `site/` pointer dangles (body absent), so
+        // `get_site_config` → None (no resolvable config to compare hosts against).
+        let current = keys::current(acme, "shop");
+        kv.put(&current, b"deploy-id-xyz".to_vec()).await.unwrap();
+        let dangling_ptr = keys::site_pointer(acme, "shop");
+        kv.put(&dangling_ptr, b"deadbeefdeadbeef".to_vec())
+            .await
+            .unwrap();
+
+        // A record that WOULD look foreign if a config existed.
+        let maybe_foreign = keys::domain_verification(acme, "shop", "whatever.example.net");
+        kv.put(&maybe_foreign, b"t".to_vec()).await.unwrap();
+        let maybe_foreign_dns =
+            crate::dns_managed::dnsmanaged_key("acme", "shop", "whatever.example.net");
+        kv.put(&maybe_foreign_dns, b"{}".to_vec()).await.unwrap();
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        assert!(
+            plan.is_clean() && plan.removed == 0,
+            "nothing is provably orphaned — a live-by-current site with no resolvable config keeps \
+             everything (fail-closed): {:?}",
+            plan.prunable
+        );
+        for k in [&current, &dangling_ptr, &maybe_foreign, &maybe_foreign_dns] {
+            assert!(kv.get(k).await.unwrap().is_some(), "must be kept: {k}");
+        }
+    }
+
+    /// ADVERSARIAL (no false-foreign on a wildcard subdomain, end-to-end through the store): a
+    /// LIVE site whose config carries a `*.example.com` wildcard must KEEP a `domainverify` /
+    /// `dnsmanaged` entry for a subdomain (`shop.example.com`) and for the apex — only a genuinely
+    /// unrelated host is pruned. Exercises the normalization join (verification vs domain-entry)
+    /// against real stored key shapes, not just the pure helper.
+    #[tokio::test]
+    async fn prune_project_keeps_wildcard_covered_hosts() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        let cfg = crate::config::SiteConfig {
+            domains: crate::config::DomainConfig {
+                wildcards: vec!["*.example.com".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store.set_site_config(acme, "shop", &cfg).await.unwrap();
+
+        let sub_dv = keys::domain_verification(acme, "shop", "shop.example.com");
+        let apex_dv = keys::domain_verification(acme, "shop", "example.com");
+        let wild_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "*.example.com");
+        let foreign_dv = keys::domain_verification(acme, "shop", "elsewhere.net");
+        for k in [&sub_dv, &apex_dv, &wild_dns, &foreign_dv] {
+            kv.put(k, b"t".to_vec()).await.unwrap();
+        }
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(
+            pruned.len(),
+            1,
+            "only the unrelated host is foreign: {:?}",
+            plan.prunable
+        );
+        assert!(pruned.contains(foreign_dv.as_str()));
+        for k in [&sub_dv, &apex_dv, &wild_dns] {
+            assert!(
+                kv.get(k).await.unwrap().is_some(),
+                "a wildcard-covered host must be kept: {k}"
+            );
+        }
+    }
+
+    /// Fail-closed on a CORRUPT `sitecontexts/<site>` store (Security review FINDING 1): a live
+    /// storefront that answers a host ONLY via a runtime tenant context, whose contexts store is
+    /// present-but-unparsable, must have its domain-verification / auto-DNS records KEPT — the
+    /// answered-host set is uncertain, so the destructive GC must not treat the site as answering
+    /// nothing (which the serve-path `unwrap_or_default()` overlay would otherwise imply).
+    #[tokio::test]
+    async fn prune_project_fails_closed_on_corrupt_sitecontexts_store() {
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+
+        // A live site answering `tenant.example.net` ONLY through a tenant context (no
+        // primary/alias/wildcard covers it). `set_site_config` writes the context store.
+        let mut cfg = live_cfg("shop.example.com", &[]);
+        cfg.domains
+            .contexts
+            .insert("tenant.example.net".to_string(), "t".to_string());
+        store.set_site_config(acme, "shop", &cfg).await.unwrap();
+
+        // The context-answered host's verification + auto-DNS ledger records.
+        let ctx_dv = keys::domain_verification(acme, "shop", "tenant.example.net");
+        let ctx_dns = crate::dns_managed::dnsmanaged_key("acme", "shop", "tenant.example.net");
+        for k in [&ctx_dv, &ctx_dns] {
+            kv.put(k, b"t".to_vec()).await.unwrap();
+        }
+
+        // Sanity: with a HEALTHY contexts store, the context host is answered (kept) — only a truly
+        // foreign host prunes.
+        let foreign = keys::domain_verification(acme, "shop", "nope.example.org");
+        kv.put(&foreign, b"t".to_vec()).await.unwrap();
+        let healthy = store.prune_project("acme", false).await.unwrap();
+        let healthy_pruned: BTreeSet<&str> =
+            healthy.prunable.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(
+            healthy_pruned,
+            BTreeSet::from([foreign.as_str()]),
+            "healthy contexts: only the foreign host prunes, context host kept: {:?}",
+            healthy.prunable
+        );
+
+        // Now CORRUPT the contexts store (torn-WAL / quarantine shape): present but not JSON.
+        kv.put(
+            &keys::site_contexts(acme, "shop"),
+            b"\xff\xff not json".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let plan = store.prune_project("acme", true).await.unwrap();
+        let pruned: BTreeSet<&str> = plan.prunable.iter().map(|p| p.key.as_str()).collect();
+        // With the answered-host set unreadable, NO host of this site can be proven foreign — so the
+        // whole site's verification/auto-DNS records are kept, the plainly-foreign one included
+        // (it, too, could have been a context host we can no longer see). Maximally fail-closed.
+        for k in [&ctx_dv, &ctx_dns, &foreign] {
+            assert!(
+                !pruned.contains(k.as_str()),
+                "corrupt contexts must keep ALL of the site's domain records: {k} in {:?}",
+                plan.prunable
+            );
+            assert!(kv.get(k).await.unwrap().is_some());
+        }
     }
 }
