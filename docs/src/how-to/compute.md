@@ -603,6 +603,24 @@ compute: (
 )
 ```
 
+On the **remote-`docker`** backend the same name-resolution — and the same per-project
+isolation — is provided by Docker's own embedded DNS instead of the bridge resolver above:
+boatramp places every one of a project's workload containers on a **per-project user-defined
+network** (`boatramp-net-<project>`, created on first launch) and attaches each with a network
+**alias equal to its workload name**. A sibling in the same project then resolves `<workload>`
+over Docker's built-in DNS (the default bridge has none — which is why a name-based managed-DB
+DSN did not resolve on `docker` before v0.54.1). The network is **per-project**, so Docker's
+inter-network isolation is the tenancy boundary: a container can resolve and reach only its own
+project's workloads, never another project's, by name or by IP. The `compute.internal_dns`
+knobs above apply to the native bridge resolver; the `docker` backend needs no configuration for
+this. (Published-port host reach and the direct bridge-IP path for export/import are unchanged.)
+
+Each per-project network draws a subnet from the Docker daemon's address pool; a network is
+reclaimed when the project's last workload stops. On a host expected to run **many concurrent
+projects** on the `docker` backend, size the daemon's `default-address-pools` (in
+`/etc/docker/daemon.json`) for the peak number of simultaneously-active projects so new launches
+never hit "all predefined address pools have been fully subnetted".
+
 ## Known constraints
 
 - **Compute is leader-node-only for now.** The control plane schedules and

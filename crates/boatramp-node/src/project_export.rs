@@ -1093,6 +1093,9 @@ impl NodeProjectExport {
                 user,
                 password,
                 database,
+                // External DSN: the host is reachable directly (daemon NAT egress) — no project
+                // network to join.
+                ephemeral_network: None,
             })
         } else {
             Err(Perr::Other(format!(
@@ -1150,12 +1153,22 @@ impl NodeProjectExport {
             .password(&target.cred_project, &target.cred_workload)
             .await
             .map_err(Perr::Other)?;
+        // On the remote-Docker backend each project's workloads live on an ISOLATED per-project
+        // network, so a one-shot export/import client must JOIN that network to reach this managed
+        // DB (whether by the bridge IP in `host` or the DB's workload-name alias). Gate on the
+        // backend actually being `docker` — the native container backend keeps one shared bridge
+        // the ephemeral client already shares, so it needs no join. `endpoint_project` is the
+        // project the DB workload is registered under (the reserved default for a Shared default
+        // tenant), which is exactly the network the DB container joined at launch.
+        let ephemeral_network = (backend.id() == "docker")
+            .then(|| boatramp_docker::project_network_name(&target.endpoint_project));
         Ok(SqlEndpoint {
             host,
             port: replica.endpoint.port,
             user: target.user,
             password,
             database: target.database,
+            ephemeral_network,
         })
     }
 
@@ -1495,6 +1508,11 @@ struct SqlEndpoint {
     user: String,
     password: String,
     database: String,
+    /// The per-project docker network a one-shot client must JOIN to reach this endpoint — `Some`
+    /// only for a MANAGED DB on the remote-Docker backend (which isolates each project on its own
+    /// network). Flows into the [`PgConnection`]/[`MysqlConnection`] network-join hint; `None` for
+    /// an external DSN (reachable directly) or the native backend (one shared bridge).
+    ephemeral_network: Option<String>,
 }
 
 impl SqlEndpoint {
@@ -1506,6 +1524,7 @@ impl SqlEndpoint {
             password: self.password,
             database: self.database,
             connect_timeout_secs,
+            ephemeral_network: self.ephemeral_network,
         }
     }
 
@@ -1517,6 +1536,7 @@ impl SqlEndpoint {
             password: self.password,
             database: self.database,
             connect_timeout_secs,
+            ephemeral_network: self.ephemeral_network,
         }
     }
 }

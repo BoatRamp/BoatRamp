@@ -43,13 +43,22 @@ pub struct PgConnection {
     /// A bounded connect timeout (seconds) so a dump/restore against an unreachable DSN
     /// fails fast instead of pinning the ephemeral container until the backstop.
     pub connect_timeout_secs: u32,
+    /// The per-project docker network the one-shot client must JOIN to reach this managed DB
+    /// (`Some` only for a managed DB on the remote-Docker backend — the backend places each
+    /// workload on an isolated per-project network, so the client must be on it too). Carried to
+    /// the backend as the reserved [`EPHEMERAL_NETWORK_ENV`](boatramp_docker::EPHEMERAL_NETWORK_ENV)
+    /// env hint, which the backend consumes + strips (it never reaches the client). `None` for an
+    /// external DSN (reachable directly) or the native backend (one shared bridge, no join needed).
+    pub ephemeral_network: Option<String>,
 }
 
 impl PgConnection {
     /// The discrete `PG*` connection environment. The password is here (in the
-    /// environment), never in argv.
+    /// environment), never in argv. When this managed DB lives on an isolated per-project docker
+    /// network, the reserved network-join hint rides here too (the docker backend consumes +
+    /// strips it before the client runs).
     pub fn env(&self) -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("PGHOST".to_string(), self.host.clone()),
             ("PGPORT".to_string(), self.port.to_string()),
             ("PGUSER".to_string(), self.user.clone()),
@@ -59,7 +68,14 @@ impl PgConnection {
                 "PGCONNECT_TIMEOUT".to_string(),
                 self.connect_timeout_secs.to_string(),
             ),
-        ]
+        ];
+        if let Some(net) = &self.ephemeral_network {
+            env.push((
+                boatramp_docker::EPHEMERAL_NETWORK_ENV.to_string(),
+                net.clone(),
+            ));
+        }
+        env
     }
 }
 
@@ -301,17 +317,29 @@ pub struct MysqlConnection {
     pub database: String,
     /// A bounded connect timeout (seconds).
     pub connect_timeout_secs: u32,
+    /// The per-project docker network the one-shot client must JOIN to reach this managed DB — the
+    /// MySQL analogue of [`PgConnection::ephemeral_network`]. `Some` only for a managed DB on the
+    /// remote-Docker backend; carried as the reserved network-join env hint the backend consumes.
+    pub ephemeral_network: Option<String>,
 }
 
 impl MysqlConnection {
-    /// The connection ENVIRONMENT: `MYSQL_PWD` (the password) ONLY. The password is the
-    /// sole secret and goes in the env every MySQL client reads, never argv. Host/port/
-    /// user are NOT placed here — unlike libpq's `PGHOST` (honored by all libpq tools),
-    /// `MYSQL_HOST` is read by the `mysql` CLI ALONE; `mysqldump` ignores it and defaults
-    /// to the local unix socket ("Can't connect to local MySQL server through socket"),
-    /// so the host/port/user travel in argv via [`conn_args`](Self::conn_args).
+    /// The connection ENVIRONMENT: `MYSQL_PWD` (the password), plus — when this managed DB lives on
+    /// an isolated per-project docker network — the reserved network-join hint (consumed + stripped
+    /// by the docker backend, never seen by the client). The password is the sole secret and goes
+    /// in the env every MySQL client reads, never argv. Host/port/user are NOT placed here — unlike
+    /// libpq's `PGHOST` (honored by all libpq tools), `MYSQL_HOST` is read by the `mysql` CLI ALONE;
+    /// `mysqldump` ignores it and defaults to the local unix socket ("Can't connect to local MySQL
+    /// server through socket"), so the host/port/user travel in argv via [`conn_args`](Self::conn_args).
     pub fn env(&self) -> Vec<(String, String)> {
-        vec![("MYSQL_PWD".to_string(), self.password.clone())]
+        let mut env = vec![("MYSQL_PWD".to_string(), self.password.clone())];
+        if let Some(net) = &self.ephemeral_network {
+            env.push((
+                boatramp_docker::EPHEMERAL_NETWORK_ENV.to_string(),
+                net.clone(),
+            ));
+        }
+        env
     }
 
     /// The non-secret connection args every MySQL client (both `mysql` and `mysqldump`)
@@ -560,7 +588,46 @@ mod tests {
             password: "sup3r-s3cret-pw".to_string(),
             database: "app".to_string(),
             connect_timeout_secs: 10,
+            ephemeral_network: None,
         }
+    }
+
+    #[test]
+    fn env_carries_the_network_join_hint_only_when_set() {
+        // Baseline: an external / native connection carries no network-join hint.
+        assert!(
+            !conn()
+                .env()
+                .iter()
+                .any(|(k, _)| k == boatramp_docker::EPHEMERAL_NETWORK_ENV),
+            "no hint without a per-project network"
+        );
+        // A managed DB on the docker backend: the reserved hint rides in the env so the backend
+        // joins the one-shot client to the DB's isolated per-project network. Dropping the field
+        // plumbing turns this RED (anti-hollow: the client would then never reach the DB).
+        let mut c = conn();
+        c.ephemeral_network = Some("boatramp-net-acme".to_string());
+        let hint: Vec<_> = c
+            .env()
+            .into_iter()
+            .filter(|(k, _)| k == boatramp_docker::EPHEMERAL_NETWORK_ENV)
+            .collect();
+        assert_eq!(
+            hint,
+            vec![(
+                boatramp_docker::EPHEMERAL_NETWORK_ENV.to_string(),
+                "boatramp-net-acme".to_string()
+            )]
+        );
+        // Same for MySQL (host/port/user travel in argv, but the hint rides in env).
+        let mut m = myconn();
+        m.ephemeral_network = Some("boatramp-net-acme".to_string());
+        assert!(
+            m.env()
+                .iter()
+                .any(|(k, v)| k == boatramp_docker::EPHEMERAL_NETWORK_ENV
+                    && v == "boatramp-net-acme")
+        );
     }
 
     #[test]
@@ -969,6 +1036,7 @@ mod tests {
             password: "sup3r-s3cret-pw".to_string(),
             database: "app".to_string(),
             connect_timeout_secs: 10,
+            ephemeral_network: None,
         }
     }
 
