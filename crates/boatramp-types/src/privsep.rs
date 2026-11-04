@@ -288,6 +288,34 @@ impl HostAuthority {
         )
     }
 
+    /// Whether this authority is the **most-exposed public parser** — the hand-rolled HTTP/2+1
+    /// parse surface the WS-D Finding-2 de-coupling isolates (`listen.http-parse`). This is the
+    /// anchor of the Finding-2 hard refusal: an instance holding it must hold NEITHER
+    /// [`is_public_parser_forbidden_partner`](Self::is_public_parser_forbidden_partner) authority.
+    ///
+    /// Scoped to EXACTLY `listen.http-parse` (the finding's named target — "the most-exposed,
+    /// fuzzed surface"). The other group-C listeners (`listen.mail`/`overlay`/`gateway`/…) are the
+    /// SAME untrusted-byte character and remain an F8 *warning* when co-resident with a backend; the
+    /// design flags "promote the hard refusal to all group-C listeners" as an owner/Security decision
+    /// (`DESIGN-wsd.md` open decision 1), deliberately NOT taken here.
+    pub const fn is_public_http_parser(self) -> bool {
+        matches!(self, Self::ListenHttpParse)
+    }
+
+    /// Whether this authority is one the **public parser must NOT co-reside** (WS-D Finding-2): the
+    /// compute-plane spawn authority (`exec.compute` — fork/execve of arbitrary workloads) or the
+    /// control-plane KV (`backend.kv` — rw the source of truth: site config, deploy manifests,
+    /// tokens-at-rest, sealed-cred ciphertext). A parser RCE co-resident with either can fork the
+    /// pinned binary or tamper the whole control plane — exactly the blast radius the split removes.
+    ///
+    /// Scoped to EXACTLY `{exec.compute, backend.kv}` (the finding's named pair). NB `exec.wasmtime`
+    /// is deliberately NOT here — `listen.http-parse` + `exec.wasmtime` is the legitimate Phase-3
+    /// inverted frontend (no spawn, no KV). Widening to the other `backend.*` / `exec.wasmtime` is a
+    /// flagged owner/Security decision (`DESIGN-wsd.md` open decision 1).
+    pub const fn is_public_parser_forbidden_partner(self) -> bool {
+        matches!(self, Self::ExecCompute | Self::BackendKv)
+    }
+
     /// A one-line operator/reviewer description: what it materializes + its blast radius.
     pub const fn doc(self) -> &'static str {
         match self {
@@ -1104,6 +1132,22 @@ pub enum CompositionViolation {
         /// The co-resident exclusion-surface authorities.
         conflicts: Vec<HostAuthority>,
     },
+    /// The **most-exposed public parser** (`listen.http-parse`) co-resides the compute-plane spawn
+    /// authority (`exec.compute`) and/or the control-plane KV (`backend.kv`) on one instance — the
+    /// WS-D Finding-2 refusal (owner decision 2026-11-03, Phase-4 WS-C Security review). Least
+    /// privilege: the most-exposed, fuzzed HTTP parse surface must hold the LEAST authority, so a
+    /// parser RCE cannot fork the pinned binary (`exec.compute`) or rw the whole control plane
+    /// (`backend.kv`: site config, deploy manifests, tokens-at-rest, sealed-cred ciphertext). A
+    /// separate non-public backend instance holds spawn + KV, reached over the feature-link
+    /// (`DESIGN-wsd.md`). Fail-closed, in the root before any spawn: no on-disk composition can put
+    /// them in one address space.
+    PublicParserWithSpawnOrControlKv {
+        /// The offending instance label.
+        instance: String,
+        /// The forbidden authorities it co-resides with `listen.http-parse` (a non-empty subset of
+        /// `{exec.compute, backend.kv}`) — the ones to move onto a separate non-public backend.
+        forbidden: Vec<HostAuthority>,
+    },
     /// A link's endpoint (`from`/`to`) names an instance that no composition hosts (design
     /// §5 F7: "a `links` entry pointing at an unhosted instance / capability").
     LinkEndpointUnhosted {
@@ -1227,6 +1271,18 @@ impl std::fmt::Display for CompositionViolation {
                  excluded high-risk surfaces [{}] — a crown jewel must be isolatable alone",
                 tags(jewels),
                 tags(conflicts)
+            ),
+            Self::PublicParserWithSpawnOrControlKv {
+                instance,
+                forbidden,
+            } => write!(
+                f,
+                "instance {instance:?} co-resides the most-exposed public parser `listen.http-parse` \
+                 with [{}] — the public parser must hold NEITHER `exec.compute` (spawn) NOR \
+                 `backend.kv` (control-plane KV), so a parser RCE cannot fork the pinned binary or \
+                 rw the whole control plane; move spawn + KV onto a separate non-public backend \
+                 instance reached over a feature-link (WS-D Finding-2)",
+                tags(forbidden)
             ),
             Self::LinkEndpointUnhosted { link, endpoint } => write!(
                 f,
@@ -1418,6 +1474,11 @@ fn tags(authorities: &[HostAuthority]) -> String {
 /// - a crown jewel (group A) co-resident with any of
 ///   `{C listeners ∪ exec.wasmtime ∪ exec.compute ∪ control.admin-api ∪ acme.dns-control}`
 ///   (the widened exclusion, design §1.2 / §5 F7);
+/// - **(WS-D Finding-2)** the most-exposed public parser (`listen.http-parse`) co-resident with
+///   `exec.compute` and/or `backend.kv`
+///   ([`CompositionViolation::PublicParserWithSpawnOrControlKv`]) — the most-exposed, fuzzed parse
+///   surface must hold the least authority, so a parser RCE can neither fork the pinned binary nor
+///   rw the control-plane KV; spawn + KV live on a separate non-public backend reached over a link;
 /// - a link endpoint naming an unhosted instance;
 /// - an instance `links` entry referencing an undefined link;
 /// - **(Phase-4 WS-A)** a per-tenant TEMPLATE instance whose capability set is not exactly
@@ -1535,6 +1596,26 @@ pub fn check_composition_closure(
                     instance: name.clone(),
                     jewels,
                     conflicts,
+                });
+            }
+        }
+
+        // WS-D Finding-2 (REFUSE): the most-exposed public parser (`listen.http-parse`) must hold
+        // NEITHER `exec.compute` NOR `backend.kv`. A parser RCE co-resident with spawn or the
+        // control-plane KV can fork the pinned binary / rw the whole control plane — exactly the
+        // blast radius the split removes. The forbidden pair is `{exec.compute, backend.kv}` (NOT
+        // `exec.wasmtime` — `listen.http-parse` + `exec.wasmtime` is the legitimate Phase-3 inverted
+        // frontend). Collected (not short-circuited) so an operator sees it alongside the others.
+        if held.iter().any(|a| a.is_public_http_parser()) {
+            let forbidden: Vec<HostAuthority> = held
+                .iter()
+                .copied()
+                .filter(|a| a.is_public_parser_forbidden_partner())
+                .collect();
+            if !forbidden.is_empty() {
+                violations.push(CompositionViolation::PublicParserWithSpawnOrControlKv {
+                    instance: name.clone(),
+                    forbidden,
                 });
             }
         }
@@ -1860,16 +1941,24 @@ mod tests {
     }
 
     /// A clean, warning-free least-authority composition whose union == ALL:
-    /// - `edge`: all listeners + both exec + both control (C ∪ D ∪ E; no A, no B);
+    /// - `parser`: the public HTTP parse surface (`listen.public-tls` + `listen.http-parse`) — the
+    ///   most-exposed instance, holding NO spawn/KV (WS-D Finding-2; split off `edge` below);
+    /// - `edge`: the other listeners + both exec + both control (C∖{public-tls,http-parse} ∪ D ∪ E;
+    ///   no A, no B — `exec.compute` is deliberately kept HERE, off the public parser);
     /// - `data`: the four backends (B alone; no listen/exec ⇒ no F8 warning);
     /// - `signer`: the six crown jewels (A alone; co-resides only with A).
     fn clean_composition() -> PrivsepConfig {
         let mut instances = BTreeMap::new();
         instances.insert(
-            "edge".to_string(),
+            "parser".to_string(),
             inst(&[
                 HostAuthority::ListenPublicTls,
                 HostAuthority::ListenHttpParse,
+            ]),
+        );
+        instances.insert(
+            "edge".to_string(),
+            inst(&[
                 HostAuthority::ListenMail,
                 HostAuthority::ListenOverlay,
                 HostAuthority::ListenS3Ingress,
@@ -1917,6 +2006,94 @@ mod tests {
             "the clean composition must raise no flags, got {:?}",
             report.warnings
         );
+    }
+
+    // ---- WS-D Finding-2: the public parser must hold NEITHER exec.compute NOR backend.kv ----
+
+    #[test]
+    fn refuses_public_parser_co_resident_with_exec_compute() {
+        // Put `exec.compute` on the public-parser instance — the co-location the finding forbids (a
+        // parser RCE could fork the pinned binary). The composition is otherwise closed (exec.compute
+        // is also still on `edge`; duplication of a non-crown authority is fine).
+        let mut cfg = clean_composition();
+        cfg.instances
+            .get_mut("parser")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::ExecCompute);
+        let err = check_composition_closure(&cfg).unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| matches!(
+                v,
+                CompositionViolation::PublicParserWithSpawnOrControlKv { instance, forbidden }
+                    if instance == "parser" && forbidden.contains(&HostAuthority::ExecCompute)
+            )),
+            "a public parser co-resident with exec.compute must be refused, got {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn refuses_public_parser_co_resident_with_backend_kv() {
+        let mut cfg = clean_composition();
+        cfg.instances
+            .get_mut("parser")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::BackendKv);
+        let err = check_composition_closure(&cfg).unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| matches!(
+                v,
+                CompositionViolation::PublicParserWithSpawnOrControlKv { instance, forbidden }
+                    if instance == "parser" && forbidden.contains(&HostAuthority::BackendKv)
+            )),
+            "a public parser co-resident with backend.kv must be refused, got {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn refuses_public_parser_co_resident_with_both_spawn_and_kv() {
+        // The exact pre-WS-D per-tenant router shape: listen.http-parse + backend.kv + exec.compute.
+        let mut cfg = clean_composition();
+        cfg.instances
+            .get_mut("parser")
+            .unwrap()
+            .capabilities
+            .extend([HostAuthority::BackendKv, HostAuthority::ExecCompute]);
+        let err = check_composition_closure(&cfg).unwrap_err();
+        let forbidden = err.violations.iter().find_map(|v| match v {
+            CompositionViolation::PublicParserWithSpawnOrControlKv {
+                instance,
+                forbidden,
+            } if instance == "parser" => Some(forbidden.clone()),
+            _ => None,
+        });
+        let forbidden = forbidden.expect("the router shape must trip the Finding-2 refusal");
+        assert!(forbidden.contains(&HostAuthority::BackendKv));
+        assert!(forbidden.contains(&HostAuthority::ExecCompute));
+    }
+
+    #[test]
+    fn allows_public_parser_with_exec_wasmtime_the_inverted_frontend() {
+        // `listen.http-parse` + `exec.wasmtime` is the LEGITIMATE Phase-3 inverted frontend (no
+        // spawn, no KV) — it must NOT trip the Finding-2 refusal. (No per-tenant template here, so
+        // `exec.wasmtime` on a static instance is also unconstrained.)
+        let mut cfg = clean_composition();
+        cfg.instances
+            .get_mut("parser")
+            .unwrap()
+            .capabilities
+            .push(HostAuthority::ExecWasmtime);
+        let report = check_composition_closure(&cfg).expect(
+            "a public parser with exec.wasmtime (no spawn/KV) is the allowed inverted frontend",
+        );
+        // It raises no Finding-2-adjacent flag either.
+        assert!(report.warnings.iter().all(|w| !matches!(
+            w,
+            CompositionWarning::BackendCoResidentWithExposed { instance, .. } if instance == "parser"
+        )));
     }
 
     #[test]
@@ -2063,12 +2240,20 @@ mod tests {
     #[test]
     fn flags_backend_co_resident_with_exposed_surface_f8() {
         // Collapse edge+data: backends now co-reside with listeners/exec → F8 warning, no refusal.
+        // The public parser (`listen.http-parse`) is kept on its OWN instance (WS-D Finding-2 is a
+        // REFUSAL, not an F8 warning — a `fat-edge` holding http-parse + backend.kv + exec.compute
+        // would be refused outright, masking the F8 flag this test asserts).
         let mut instances = BTreeMap::new();
         instances.insert(
-            "fat-edge".to_string(),
+            "parser".to_string(),
             inst(&[
                 HostAuthority::ListenPublicTls,
                 HostAuthority::ListenHttpParse,
+            ]),
+        );
+        instances.insert(
+            "fat-edge".to_string(),
+            inst(&[
                 HostAuthority::ListenMail,
                 HostAuthority::ListenOverlay,
                 HostAuthority::ListenS3Ingress,
@@ -2459,10 +2644,15 @@ mod tests {
             template(&[HostAuthority::ExecWasmtime]),
         );
         instances.insert(
-            "edge".to_string(),
+            "parser".to_string(),
             inst(&[
                 HostAuthority::ListenPublicTls,
                 HostAuthority::ListenHttpParse,
+            ]),
+        );
+        instances.insert(
+            "edge".to_string(),
+            inst(&[
                 HostAuthority::ListenMail,
                 HostAuthority::ListenOverlay,
                 HostAuthority::ListenS3Ingress,
