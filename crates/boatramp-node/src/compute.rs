@@ -196,29 +196,101 @@ pub async fn build_compute(
         return (backends, empty_node(node_id));
     };
 
-    // Remote docker: register only if a daemon actually answers.
-    match boatramp_docker::DockerBackend::connect() {
-        Ok(docker) => {
-            // `writable_root` and `cap_add` are honored only under the single-tenant
-            // posture (`!strict`); the multi-tenant guard keeps the hardened read-only
-            // root and every capability dropped.
-            let docker = docker
-                .with_endpoint(cfg.docker_endpoint)
-                .with_volume_mode(cfg.docker_volume_mode)
-                .with_data_dir(data_dir)
-                .with_writable_root_allowed(!strict)
-                .with_cap_add_allowed(!strict)
-                .with_ephemeral_timeout(std::time::Duration::from_secs(
-                    cfg.docker_ephemeral_timeout_secs,
-                ));
-            if docker.reachable().await {
-                backends.insert("docker".to_string(), std::sync::Arc::new(docker));
+    // Compute-backend selection (mailroom #26): the `kubernetes` backend is used when it
+    // is explicitly pinned (`[compute].backend = "kubernetes"`) OR auto-detected
+    // in-cluster (`KUBERNETES_SERVICE_HOST` + a mounted ServiceAccount token, and no other
+    // backend explicitly pinned). When it is used, it is the node's sole compute backend:
+    // the capability-detected docker / native-container / VMM backends are suppressed (they
+    // don't fit boatramp running inside a pod — see the request). Only ever true in a build
+    // with the `k8s-backend` feature; otherwise the field is inspected only to warn on an
+    // unbuilt selection.
+    let explicit_backend = cfg.backend.as_deref().filter(|s| !s.is_empty());
+    #[cfg(feature = "k8s-backend")]
+    let use_k8s = match explicit_backend {
+        // An explicit `[compute].backend = "kubernetes"` pin is accepted ONLY when we are
+        // actually in-cluster (KUBERNETES_SERVICE_HOST + a mounted ServiceAccount token) OR
+        // the operator explicitly opts in to an out-of-cluster client
+        // (`[compute].k8s_allow_out_of_cluster`). Otherwise the pin is REFUSED (F6 — a pin
+        // alone must not make boatramp talk to whatever cluster a stray local kubeconfig
+        // happens to point at); we fall back to capability-detected backends and warn.
+        Some("kubernetes") => {
+            if boatramp_k8s::in_cluster() || cfg.k8s_allow_out_of_cluster {
+                true
             } else {
-                tracing::debug!("no reachable docker daemon; skipping docker backend");
+                tracing::warn!(
+                    "[compute].backend = \"kubernetes\" is pinned but this process is not \
+                     running in-cluster (no KUBERNETES_SERVICE_HOST + mounted ServiceAccount \
+                     token) and [compute].k8s_allow_out_of_cluster is false; REFUSING the pin \
+                     (fail closed) and falling back to capability-detected backends — set \
+                     k8s_allow_out_of_cluster to use an out-of-cluster kubeconfig deliberately"
+                );
+                false
             }
         }
-        Err(e) => tracing::debug!(%e, "docker backend unavailable"),
+        Some(_) => false, // another id ⇒ capability-detected, not pinned here
+        None => boatramp_k8s::in_cluster(),
+    };
+    #[cfg(not(feature = "k8s-backend"))]
+    let use_k8s = {
+        if explicit_backend == Some("kubernetes") {
+            tracing::warn!(
+                "[compute].backend = \"kubernetes\" selected but this build lacks the \
+                 `k8s-backend` feature; falling back to capability-detected backends"
+            );
+        }
+        false
+    };
+
+    // Register the Kubernetes backend (its own in-cluster client) when selected/detected.
+    #[cfg(feature = "k8s-backend")]
+    if use_k8s {
+        match boatramp_k8s::KubernetesBackend::connect(
+            cfg.k8s_storage_class.clone(),
+            cfg.k8s_retain_pvc,
+            cfg.k8s_image_pull_secret.clone(),
+            cfg.k8s_volume_snapshot_class.clone(),
+            // Isolation posture (F1): multi-tenant (`strict`) drops a tenant `cap_add` and
+            // forces a read-only root, mirroring the docker/container backends'
+            // `with_cap_add_allowed(!strict)` / `with_writable_root_allowed(!strict)`.
+            strict,
+        )
+        .await
+        {
+            Ok(k8s) => {
+                backends.insert(
+                    boatramp_k8s::BACKEND_ID.to_string(),
+                    std::sync::Arc::new(k8s),
+                );
+            }
+            Err(e) => tracing::warn!(%e, "kubernetes backend unavailable (selected/detected)"),
+        }
     }
+
+    // Remote docker: register only if a daemon actually answers (suppressed under k8s).
+    if !use_k8s {
+        match boatramp_docker::DockerBackend::connect() {
+            Ok(docker) => {
+                // `writable_root` and `cap_add` are honored only under the single-tenant
+                // posture (`!strict`); the multi-tenant guard keeps the hardened read-only
+                // root and every capability dropped.
+                let docker = docker
+                    .with_endpoint(cfg.docker_endpoint)
+                    .with_volume_mode(cfg.docker_volume_mode)
+                    .with_data_dir(data_dir)
+                    .with_writable_root_allowed(!strict)
+                    .with_cap_add_allowed(!strict)
+                    .with_ephemeral_timeout(std::time::Duration::from_secs(
+                        cfg.docker_ephemeral_timeout_secs,
+                    ));
+                if docker.reachable().await {
+                    backends.insert("docker".to_string(), std::sync::Arc::new(docker));
+                } else {
+                    tracing::debug!("no reachable docker daemon; skipping docker backend");
+                }
+            }
+            Err(e) => tracing::debug!(%e, "docker backend unavailable"),
+        }
+    } // end `if !use_k8s` (docker suppressed under the kubernetes backend)
 
     // Ensure the shared compute bridge exists before the backends that enslave a
     // veth/tap to it. boatramp creates it itself over netlink (needs `CAP_NET_ADMIN`)
@@ -240,24 +312,31 @@ pub async fn build_compute(
                 None
             }
         };
+    // Under the kubernetes backend, skip the bridge entirely — the native container +
+    // embedded-VMM backends are suppressed, and creating a host bridge inside a pod is
+    // neither possible (no CAP_NET_ADMIN) nor wanted.
     #[cfg(target_os = "linux")]
-    let bridge_ready = match &shared_ip_authority {
-        Some(authority) => {
-            match boatramp_container::ensure_bridge(
-                &cfg.bridge,
-                authority.gateway(),
-                authority.prefix_len(),
-            )
-            .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(%e, bridge = %cfg.bridge, "could not create the compute bridge (need CAP_NET_ADMIN); container + embedded-VMM backends disabled");
-                    false
+    let bridge_ready = if use_k8s {
+        false
+    } else {
+        match &shared_ip_authority {
+            Some(authority) => {
+                match boatramp_container::ensure_bridge(
+                    &cfg.bridge,
+                    authority.gateway(),
+                    authority.prefix_len(),
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(%e, bridge = %cfg.bridge, "could not create the compute bridge (need CAP_NET_ADMIN); container + embedded-VMM backends disabled");
+                        false
+                    }
                 }
             }
+            None => false,
         }
-        None => false,
     };
 
     // Native container backend (Linux only).
@@ -366,7 +445,7 @@ pub async fn build_compute(
     // Capability-detected + log-skipped on Intel / older macOS, exactly like the
     // `/dev/kvm` check gates the Linux VMM.
     #[cfg(target_os = "macos")]
-    if macos_supports_vz() {
+    if macos_supports_vz() && !use_k8s {
         match (
             worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())),
             boatramp_core::ipam::IpPool::new(&cfg.subnet),

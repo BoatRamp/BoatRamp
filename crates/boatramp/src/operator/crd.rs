@@ -29,6 +29,43 @@ pub enum ClusterMode {
     Stateless,
 }
 
+/// Opt-in placement for a cluster that **hosts its own managed compute** via the in-pod
+/// `kubernetes` compute backend (boatramp-on-k8s running managed databases / workloads as
+/// native k8s objects). Present ⇒ the operator runs the serve pods under the dedicated
+/// compute `ServiceAccount` (so the chart's namespace-scoped `computeBackend.kubernetes`
+/// RBAC binds — not the operator's cluster-wide SA) and stamps them with the
+/// `boatramp.dev/compute-consumer=true` label (so the per-workload NetworkPolicies the
+/// compute backend applies admit the serve pod to a managed workload's Service). The CR
+/// MUST be created in the **dedicated compute namespace** (the chart's
+/// `computeBackend.kubernetes.namespace`), never the operator's release namespace — that
+/// namespace holds the serve pod + its managed compute, never the operator's Site/TLS
+/// Secrets (mailroom #26 F4). Omit for a cluster that does not host its own managed compute.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputeBackendSpec {
+    /// The `ServiceAccount` the serve pods run as — the one the chart's
+    /// `computeBackend.kubernetes` Role/RoleBinding is bound to (default `boatramp-compute`).
+    /// It grants the namespace-scoped verbs the `kubernetes` compute backend needs
+    /// (statefulsets/deployments/services/pvcs/secrets/networkpolicies in THIS namespace),
+    /// and nothing cluster-wide.
+    #[serde(default = "default_compute_service_account")]
+    pub service_account_name: String,
+}
+
+impl Default for ComputeBackendSpec {
+    fn default() -> Self {
+        Self {
+            service_account_name: default_compute_service_account(),
+        }
+    }
+}
+
+/// The default compute `ServiceAccount` name — matches the chart's
+/// `computeBackend.kubernetes.serviceAccountName` default.
+fn default_compute_service_account() -> String {
+    "boatramp-compute".to_string()
+}
+
 /// A boatramp cluster managed by the operator.
 #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[kube(
@@ -80,6 +117,13 @@ pub struct BoatRampClusterSpec {
     /// the pods run without control-plane auth (dev only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_secret: Option<String>,
+    /// Opt-in: run this cluster's serve pods as the in-pod `kubernetes` compute backend —
+    /// under the dedicated compute `ServiceAccount` and labelled as the authorized compute
+    /// consumer (see [`ComputeBackendSpec`]). Omit for a cluster that does not host its own
+    /// managed compute (the serve pods then use the namespace `default` ServiceAccount, as
+    /// before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_backend: Option<ComputeBackendSpec>,
 }
 
 /// Observed state of a [`BoatRampCluster`] — surfaced in `kubectl get brc`.

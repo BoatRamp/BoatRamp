@@ -7,7 +7,41 @@ versions.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Kubernetes compute backend (`[compute].backend: kubernetes`).** A fifth `ComputeBackend`
+  (`boatramp-k8s`, id `"kubernetes"`) for boatramp running **as a pod** on Kubernetes/k3s, where k8s is
+  already the orchestrator and the VM / native-container / remote-docker backends don't fit. It
+  delegates boatramp's own managed compute to native k8s objects through the in-cluster API (kube-rs,
+  the serve pod's own ServiceAccount — the same in-cluster config the operator already uses, no second
+  auth path): a **managed database → `StatefulSet` + `Service`** (the `pg-<ident>` in-cluster DNS the
+  sql-shim/bindings resolve) **+ `PVC`** on the default (or configured) `StorageClass`
+  (CSI-snapshottable/resizable — closing remote-docker's node-local durability caveat); a **generic
+  stateless workload → `Deployment`**. Implements `launch`/`stop`/`health`, `exec` (pod exec
+  subresource), pod logs, PVC volume management, the orphan-reaper probe, and CSI `VolumeSnapshot`
+  snapshot/restore (gated on a configured `VolumeSnapshotClass`; a clean "unsupported" otherwise).
+  Selected by `[compute].backend: kubernetes`, env `BOATRAMP_COMPUTE_BACKEND`, or
+  `--compute-backend kubernetes`, **plus in-cluster auto-detect** (`KUBERNETES_SERVICE_HOST` + a mounted
+  ServiceAccount token); when used it is the node's sole compute backend (the capability-detected
+  docker / native-container / VMM backends are suppressed). A pod is shared-kernel
+  (`IsolationClass::Container`), so `require_strong_isolation` excludes it exactly like the other
+  shared-kernel backends. (mailroom cap-req #26)
+  - **Credentials via a k8s `Secret`:** the managed-DB server-init credential (and any workload env)
+    is written to a per-workload `Opaque` `Secret` (`<workload>-env`, namespace-scoped, deleted on
+    teardown) and referenced from the pod by `secretKeyRef` — **no credential is a plaintext value in
+    the StatefulSet/Pod spec**, so a reader with `get statefulsets/pods` no longer sees it.
+  - **Least-privilege RBAC:** the helm chart ships a **namespace-scoped** `Role` + `RoleBinding`
+    (+ optional `ServiceAccount`), gated on `computeBackend.kubernetes.enabled` (off by default). No
+    `ClusterRole`, no wildcards; pods are read-only to the backend. The only secret authority is a
+    **write-only** `secrets: [create, patch, delete]` (no `get`/`list`/`watch`, so the token can
+    neither enumerate nor read secret *values*), for the per-workload credential Secret above.
+  - **Hardening:** launched pods drop privilege escalation + all Linux capabilities (adding back only
+    an allowlisted `cap_add` under the single-tenant posture) + pin the runtime's default seccomp
+    profile, and do **not** auto-mount a ServiceAccount token. A per-project sealed pull credential is
+    **refused** (fail-closed) — the private-registry path is an operator-configured `imagePullSecret`
+    (`[compute].k8s_image_pull_secret`).
+  - **Default-inert:** without the `k8s-backend` cargo feature the crate is a shell that pulls none of
+    the kube-rs / k8s-openapi tree; the backend is registered only when selected or auto-detected.
 
 ## [0.54.0] - 2026-11-04
 

@@ -1,0 +1,155 @@
+{{- /*
+Kubernetes COMPUTE-BACKEND RBAC (mailroom #26).
+
+When boatramp runs AS a pod and uses the `kubernetes` compute backend, the serve pod
+manages its own managed compute (managed databases now; generic workloads in Phase 2) as
+native k8s objects in a DEDICATED namespace. This ships a LEAST-PRIVILEGE, NAMESPACE-SCOPED
+Role (never a ClusterRole) + a RoleBinding (and, by default, the ServiceAccount + the
+dedicated Namespace) for that pod. Gated on `.Values.computeBackend.kubernetes.enabled` so a
+non-k8s-backend install grants nothing.
+
+SECURITY — DEDICATED NAMESPACE (F4). The compute ServiceAccount holds namespace-wide
+create/patch/delete on Secrets (to mint the per-workload env Secret that carries the
+managed-DB credential). That blast radius MUST NOT reach the operator's Site / Function /
+TLS Secrets — so the compute SA/Role/RoleBinding are created in a DEDICATED namespace
+(`.Values.computeBackend.kubernetes.namespace`, default `boatramp-compute`), the serve pod
+MUST be deployed there, and this template REFUSES to render when that namespace equals the
+operator's release namespace (override only with `allowOperatorNamespace: true`).
+
+Point the serve pod's `serviceAccountName` at `.Values.computeBackend.kubernetes.serviceAccountName`
+and run it in the dedicated namespace. The serve pod must also carry the label
+`boatramp.dev/compute-consumer: "true"` so the per-workload NetworkPolicy (F3) admits it to
+a managed workload's Service.
+
+Non-helm installs: create the dedicated namespace and apply the equivalent Role/RoleBinding
+below to it + the ServiceAccount by hand.
+*/ -}}
+{{- if .Values.computeBackend.kubernetes.enabled }}
+{{- $ns := .Values.computeBackend.kubernetes.namespace | default "boatramp-compute" }}
+{{- if and (eq $ns .Release.Namespace) (not .Values.computeBackend.kubernetes.allowOperatorNamespace) }}
+{{- fail (printf "computeBackend.kubernetes.namespace (%q) must be a DEDICATED namespace distinct from the operator's release namespace (%q): the compute ServiceAccount has namespace-wide create/patch/delete on Secrets and must not share a namespace with the operator's Site/Function/TLS secrets (mailroom #26 F4). Set a different namespace, or set computeBackend.kubernetes.allowOperatorNamespace=true to override (not recommended)." $ns .Release.Namespace) }}
+{{- end }}
+{{- $sa := .Values.computeBackend.kubernetes.serviceAccountName }}
+{{- if .Values.computeBackend.kubernetes.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- if .Values.computeBackend.kubernetes.createServiceAccount }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+# Least-privilege Role for the serve pod's compute backend, scoped to the DEDICATED namespace.
+# Covers the exact resources/verbs the kubernetes backend applies + reads:
+#   - apps/statefulsets + apps/deployments: the managed-DB (stateful) + generic (stateless)
+#     workloads the backend server-side-applies.
+#   - services + persistentvolumeclaims: the per-workload routing Service + the data PVC
+#     (list/delete back the Phase-2 PVC volume-management + reaper surfaces).
+#   - pods + pods/log: pod readiness/liveness reads + the Phase-2 pod-log stream.
+#   - pods/exec: the Phase-2 `ComputeExec` (run a command inside a running pod).
+#   - secrets: the per-workload env Secret that holds the managed-DB credential — write
+#     (create/patch) + delete ONLY, never read (so a compromised token cannot enumerate or
+#     read secret values). The operator-configured imagePullSecret is still managed
+#     out-of-band (not created here).
+#   - snapshot.storage.k8s.io/volumesnapshots: the Phase-2 CSI VolumeSnapshot backup /
+#     restore (gated on a configured VolumeSnapshotClass; a no-op grant if unused).
+#   - networking.k8s.io/networkpolicies: the F3 per-workload network isolation (a namespace
+#     default-deny + a per-workload allow) the backend server-side-applies alongside each
+#     workload. No watch/update.
+# No wildcards; no cluster-scoped (ClusterRole) grants — a boatramp-owned expandable
+# StorageClass or a VolumeSnapshotClass, being cluster-scoped, is intentionally NOT granted
+# here (an explicit operator step). Non-helm installs: apply the equivalent Role below by
+# hand.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+rules:
+  # apps workloads: get (readiness/liveness reads) + server-side-apply (create+patch) +
+  # delete (teardown). No `watch` (the backend runs no informer) and no `update` (SSA is a
+  # PATCH, never a plain UPDATE); `list` kept as a cheap read for operator visibility.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # The per-workload routing Service + the data PVC: apply (create+patch), delete, and
+  # list (list_volumes enumerates the managed PVCs). No watch/update.
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # Pods are READ-ONLY to the backend: resolve_pod LISTs them and they are
+  # StatefulSet/Deployment-controller-managed — the backend never creates, mutates or
+  # deletes a pod directly. Granting only get+list stops a compromised serve token from
+  # touching (deleting/patching) co-located pods in the namespace.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Pod logs (get) + the exec subresource (create — exec is a POST/connect, not a writer).
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  # Per-workload env Secret (holds the managed-DB server-init credential) — the backend
+  # WRITES it (server-side apply = create+patch) and deletes it on teardown. It is NEVER
+  # read back: no `get`/`list`/`watch`, so a compromised serve token cannot enumerate or
+  # read secret VALUES — the minimal authority for storing creds in a Secret instead of
+  # inline in the pod spec. Namespace-scoped (this is a Role); no cluster-scope, no wildcard.
+  # Residual (standard k8s tradeoff, bounded to the DEDICATED namespace): the verbs aren't
+  # `resourceNames`-scoped (the `<workload>-env` names are dynamic), so the token could
+  # overwrite/delete OTHER secrets co-located in the serve pod's dedicated namespace — it
+  # still cannot READ any secret value. F4 bounds this to the dedicated compute namespace,
+  # which holds NO Site/Function/TLS secrets (those live in the operator's release namespace).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
+  # CSI VolumeSnapshot backup / restore (Phase 2): apply (create+patch) + get + delete
+  # (snapshot cleanup). Namespace-scoped; the cluster-scoped VolumeSnapshotClass is NOT
+  # granted (an operator step).
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "create", "patch", "delete"]
+  # F3 per-workload network isolation: the backend server-side-applies a namespace
+  # default-deny-ingress + a per-workload allow NetworkPolicy. apply (create+patch) + delete
+  # + list/get (reconcile visibility). No watch/update. Namespace-scoped.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+{{- end }}

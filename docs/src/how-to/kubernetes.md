@@ -185,10 +185,60 @@ write pause is a future optimization (openraft 0.9 has no simple transfer call).
 | `adminTokenSecret` | string | — | Secret (key `token`) with an admin control-plane token — enables the membership executor. |
 | `rootPubkey` | string | — | The cluster root anchor (`alg:hex`) a joining pod verifies against. |
 | `authSecret` | string | — | Secret wiring auth into the pods: `root-private-key` (the founder signs with it) + optional `bootstrap-secret`. |
+| `computeBackend` | object | — | Opt-in: this cluster **hosts its own managed compute** via the in-pod `kubernetes` backend. The operator then runs the serve pods under `computeBackend.serviceAccountName` (default `boatramp-compute` — the chart's `computeBackend.kubernetes` RBAC) and labels them `boatramp.dev/compute-consumer=true`. Such a CR **must** be created in the dedicated compute namespace (the chart's `computeBackend.kubernetes.namespace`), never the operator's release namespace. |
+
+### Hosting managed compute (boatramp-on-k8s)
+
+A cluster can run **its own managed databases / workloads** as native k8s objects
+(the [`kubernetes` compute backend](./compute.md#the-kubernetes-backend-boatramp-on-k8s)).
+That needs the serve pods to run under a least-privilege, namespace-scoped
+ServiceAccount (not the operator's cluster-wide one) **in a dedicated namespace**
+that holds no Site/TLS Secrets. Enable the chart's RBAC and set `spec.computeBackend`:
+
+```sh
+helm upgrade boatramp-operator ./charts/boatramp-operator --reuse-values \
+  --set computeBackend.kubernetes.enabled=true \
+  --set computeBackend.kubernetes.namespace=boatramp-compute
+```
+
+```yaml
+apiVersion: boatramp.dev/v1alpha1
+kind: BoatRampCluster
+metadata:
+  name: compute
+  namespace: boatramp-compute     # the dedicated compute namespace (NOT boatramp-system)
+spec:
+  mode: cluster
+  replicas: 3
+  storage: 10Gi
+  rootPubkey: "es256:…"
+  adminTokenSecret: compute-admin
+  computeBackend:
+    serviceAccountName: boatramp-compute   # the chart's compute SA
+```
+
+The operator sets the pod's `serviceAccountName` and adds the
+`boatramp.dev/compute-consumer=true` label so the compute backend's per-workload
+NetworkPolicies admit the serve pod to a managed workload's Service. **Tenant
+network isolation requires a NetworkPolicy-enforcing CNI** — see
+[Network isolation](./compute.md#network-isolation-networkpolicy--cni).
+
+> **Security — do not delegate `BoatRampCluster`.** A `BoatRampCluster` is a
+> **cluster-admin / infra** artifact. The operator stamps `spec.computeBackend.serviceAccountName`
+> **verbatim** onto the serve pod, and Kubernetes does not RBAC-gate a pod's *use*
+> of a ServiceAccount — so authority to **create or edit** a `BoatRampCluster` in a
+> namespace is effectively authority to run the serve image under **any**
+> ServiceAccount in that namespace (including a privileged one). The chart grants no
+> non-admin `create`/`update` on `boatrampclusters`; keep it that way — never delegate
+> `BoatRampCluster` write access to lesser (tenant) principals.
 
 ## See also
 
 - [Deploy a self-hosted cluster](./deploy-cluster.md) — the dynamic-join model the
   operator automates.
+- [The Kubernetes compute backend](./compute.md#the-kubernetes-backend-boatramp-on-k8s)
+  — when boatramp runs as a pod, it can run its own managed compute (managed DBs,
+  workloads) as native k8s objects; enable its least-privilege RBAC with the chart's
+  `computeBackend.kubernetes.enabled`.
 - [Mesh identity & the single root anchor](../explanation/SECURITY-mesh-identity.md).
 - [Deployment topologies](../explanation/topologies.md).

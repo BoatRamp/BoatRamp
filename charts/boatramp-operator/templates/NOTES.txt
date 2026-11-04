@@ -19,5 +19,40 @@ The operator watches the boatramp CRDs. Create a cluster with:
 Watch it come up:
 
   kubectl get boatrampcluster -n {{ .Release.Namespace }}
+{{- if .Values.computeBackend.kubernetes.enabled }}
+
+{{- $cns := .Values.computeBackend.kubernetes.namespace | default "boatramp-compute" }}
+
+────────────────────────────────────────────────────────────────────────────
+COMPUTE BACKEND (boatramp-on-k8s) — this install enabled the `kubernetes` compute
+backend RBAC in the DEDICATED namespace "{{ $cns }}" (ServiceAccount
+"{{ .Values.computeBackend.kubernetes.serviceAccountName }}").
+
+A cluster that HOSTS ITS OWN MANAGED COMPUTE must be created THERE (not in the
+operator's release namespace "{{ .Release.Namespace }}", which holds Site/TLS
+Secrets), and must set `spec.computeBackend` so the operator runs its serve pods
+under that ServiceAccount + labels them `boatramp.dev/compute-consumer=true`:
+
+  cat <<'EOF' | kubectl apply -f -
+  apiVersion: boatramp.dev/v1alpha1
+  kind: BoatRampCluster
+  metadata:
+    name: compute
+    namespace: {{ $cns }}             # the DEDICATED compute namespace
+  spec:
+    mode: cluster
+    replicas: 3
+    storage: 10Gi
+    rootPubkey: "es256:REPLACE_ME"
+    adminTokenSecret: compute-admin
+    computeBackend:                   # host managed compute in THIS cluster
+      serviceAccountName: {{ .Values.computeBackend.kubernetes.serviceAccountName }}
+  EOF
+
+NOTE: compute tenant network isolation depends on a NetworkPolicy-ENFORCING CNI
+(Calico/Cilium/Antrea/…); on a non-enforcing CNI (stock flannel) the policies are
+silent no-ops. See https://boatramp.dev/how-to/compute.html (Network isolation).
+────────────────────────────────────────────────────────────────────────────
+{{- end }}
 
 Docs: https://boatramp.dev/how-to/kubernetes.html
