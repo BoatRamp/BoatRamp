@@ -345,6 +345,13 @@ publish:
         continue
       fi
       echo "== publish $c@$ver =="
-      cargo publish -p "$c"
+      # `--no-verify`: skip cargo's per-crate verify BUILD. That build re-compiles each packaged
+      # crate from its tarball; done 24× in sequence it accumulates target artifacts until the
+      # top-level `boatramp` crate (the whole dep tree: aws-sdk/wasmtime/slatedb/oxc) overflows the
+      # runner disk ("No space left on device" — happened on the v0.55.0 publish). The build is
+      # redundant here: the Release's `preflight` (test --all-features), the 5 `build` targets, and
+      # the GHCR image builds all compile this exact tree, and `publish-dry` validates packaging —
+      # so verification already happened before this job runs. Publishing is package + upload only.
+      cargo publish -p "$c" --no-verify
     done
     echo "published all workspace crates at $ver"
