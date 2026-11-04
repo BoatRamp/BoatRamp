@@ -83,9 +83,12 @@ rules:
   # Per-workload env Secret (holds the managed-DB server-init credential) — the backend
   # WRITES it (server-side apply = create+patch) and DELETEs it on teardown. It is NEVER
   # read back: no `get`/`list`/`watch`, so a compromised serve token cannot enumerate or
-  # read secret VALUES (only overwrite the workloads' own, named `<workload>-env`, or
-  # delete them) — the minimal authority for storing creds in a Secret instead of inline
-  # in the pod spec. Namespace-scoped (this is a Role); no cluster-scope, no wildcard.
+  # read secret VALUES — the minimal authority for storing creds in a Secret instead of
+  # inline in the pod spec. Namespace-scoped (this is a Role); no cluster-scope, no wildcard.
+  # Residual (standard k8s tradeoff, bounded to THIS namespace): the verbs aren't
+  # `resourceNames`-scoped (the `<workload>-env` names are dynamic), so the token could
+  # overwrite/delete OTHER secrets co-located in the serve pod's own namespace — it still
+  # cannot READ any secret value. Isolate further by giving the serve pod its own namespace.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "patch", "delete"]
