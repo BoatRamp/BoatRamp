@@ -122,6 +122,13 @@ automatic certificate](./acme-cert.md). The on-demand engine then handles every
 line. For the provider names and their credential variables see [DNS providers &
 credentials](../reference/dns-providers.md).
 
+> **Customer domains in different zones?** On-demand per-SNI issuance uses the node's ACME
+> DNS provider, which `--acme-dns-provider` pins to **one** zone. To front domains in
+> **multiple** zones from one serve, configure a `[serve.dns_providers]` **list** (one
+> per-zone provider each, sealed-ref credentials); every DNS-01 challenge routes to the
+> provider whose `zone_root` is the longest suffix of the certificate's name. See
+> [`serve.dns_providers`](../reference/boatramp-cfg.md#servedns_providers).
+
 ### 3. Attach and verify a domain
 
 For each customer domain, attach and verify it once — and point its DNS at your

@@ -64,6 +64,7 @@ Top-level sections, all optional:
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
 | `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
 | `dns_publish` | table | — (off) | Host-held DNS provider backing the guest **`dns-publish` WRITE** capability (cap-req #24/#25). **Absent ⇒ no provider is wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed). See [`serve.dns_publish`](#servedns_publish). |
+| `dns_providers` | list | `[]` | A per-zone DNS provider **list** (cap-req #27): N providers, each a `type:value`-pointer-sourced identity + credential, routed by longest-suffix `zone_root` for BOTH ACME DNS-01 and guest `dns-publish`. Empty ⇒ the single env-seeded provider path, unchanged. `acme-dns` feature. See [`serve.dns_providers`](#servedns_providers). |
 | `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
@@ -682,6 +683,56 @@ serve: (
         provider: "cloudflare",        // or "manual" for an offline proof
         zone_root: "example.com",      // the apex the credential is authoritative over
     ),
+)
+```
+
+### `serve.dns_providers`
+
+A **list** of per-zone managed-DNS providers (cap-req #27). Generalizes the single
+env-seeded provider (one `CLOUDFLARE_ZONE_ID`/`CLOUDFLARE_API_TOKEN` per process ⇒ one
+zone) into N per-zone providers, each with its OWN `type:value` pointer-sourced identity +
+credential. **Both** the ACME DNS-01 cert issuer (`--tls acme-dns`) **and** the guest
+`dns-publish` capability route to the provider whose `zone_root` is the **longest
+label-boundary suffix** of the record's / certificate's owner name — so a single-tenant
+serve authoritative for several domains in **different** zones can manage DNS / issue
+per-SNI TLS for all of them. **Empty (the default) ⇒ the single env-seeded provider path is
+used unchanged** (`--acme-dns-provider` / `--dns-publish-provider` + the single
+`zone_root`) — full backward-compat; a single provider is a list of one.
+
+Each entry:
+
+- **`name`** — an operator label (diagnostics / boot log; not a credential).
+- **`kind`** — a quoted string, the SAME grammar + aliases as `--acme-dns-provider`
+  (`"manual"` | `"cloudflare"` | `"route53"` | `"oci"` | `"digitalocean"`/`"do"` |
+  `"hetzner"` | `"ns1"` | `"dnsimple"` | `"gcp-dns"`/`"gcp"` | `"azure-dns"`/`"azure"` |
+  `"akamai"`). It is a string (not a bare enum) so a hyphenated kind is expressible.
+- **`zone_root`** — the authoritative zone apex (e.g. `mailroom.pro`): the routing key AND
+  the apex passed to the `validate_writable` guardrail (so an apex `NS` is refused).
+- **per-kind fields** — each a `type:value` pointer (literal, `env:VAR`, `boatramp:NAME`),
+  resolved independently at startup against the control-plane KV + `[secrets]` envelope. A
+  **secret** field (`token`/`api_key`/`access_token`/`client_token`/`client_secret`) MUST
+  be a `env:`/`boatramp:` ref — a plaintext literal is refused (no secrets in config). A
+  `boatramp:` ref with no `[secrets]` envelope is a fail-closed startup error. The full
+  per-kind field table is in [DNS providers & credentials](dns-providers.md#per-kind-config-fields).
+
+Routing is per-record: no configured zone authoritative for a name ⇒ fail-closed (ACME
+skips that name; `dns-publish` returns access-denied). A duplicate `zone_root` is refused at
+startup. Only usable on a build with the `acme-dns` feature (a non-empty list without it is
+a logged no-op). For guest `dns-publish` over the registry, set `--dns-publish-provider
+list` (or `[serve.dns_publish].provider = "list"`); the posture `allow_guest_dns_publish` +
+the per-handler `dns_publish_zones` allowlist still gate every write.
+
+```ron
+// Two Cloudflare zones from one serve. Tokens sealed in [secrets]; zone ids are literals.
+serve: (
+    dns_providers: [
+        ( name: "mailroom-pro", kind: "cloudflare", zone_root: "mailroom.pro",
+          zone_id: "741f56…", token: "boatramp:CF_TOKEN_MAILROOM_PRO" ),
+        ( name: "cariello", kind: "cloudflare", zone_root: "cariello.name",
+          zone_id: "a1b2c3…", token: "boatramp:CF_TOKEN_CARIELLO" ),
+    ],
+    // Opt guest dns-publish into the same registry (still posture + allowlist gated):
+    dns_publish: ( provider: "list" ),
 )
 ```
 

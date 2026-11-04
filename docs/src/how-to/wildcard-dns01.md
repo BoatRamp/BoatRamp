@@ -45,6 +45,13 @@ see [DNS providers & credentials](../reference/dns-providers.md); for pointing
 custom domains at your server see
 [Automate DNS with a provider](./auto-dns.md).
 
+> **Several zones from one serve?** `--acme-dns-provider` + the env vars drive a
+> **single** zone. To issue wildcards across domains in **different** zones from one
+> `serve`, declare a `[serve.dns_providers]` **list** instead — one entry per zone, each
+> with its own sealed `token`/`boatramp:…` credential; issuance routes by the
+> certificate's longest-suffix `zone_root`. See
+> [`serve.dns_providers`](../reference/boatramp-cfg.md#servedns_providers).
+
 ## Add preview subdomains
 
 To serve by-id preview deployments over HTTPS, add `--acme-wildcard-preview`. It

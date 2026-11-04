@@ -107,6 +107,13 @@ host; anything else becomes a `CNAME` — the same convention as `configure-doma
 - is idempotent and self-healing — a per-host or per-provider failure is logged and
   retried next tick, never aborts the pass for every other site.
 
+> **Domains in several zones?** `--acme-dns-provider` + the env credentials drive **one**
+> zone, so the reconcile loop keeps one zone pointed. To auto-DNS verified domains across
+> **multiple** zones from one serve, declare a `[serve.dns_providers]` **list** (one entry
+> per zone, each with its own sealed-ref credential): each host is written through the
+> provider whose `zone_root` is its longest-suffix match. See
+> [`serve.dns_providers`](../reference/boatramp-cfg.md#servedns_providers).
+
 ## Wildcard on Cloudflare: disable Universal SSL first
 
 If you point a **wildcard** (`*.example.com`) at a Cloudflare **DNS-only** (grey-cloud)
