@@ -161,6 +161,7 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET`/`POST` | `/api/prune`, `/api/scrub` | `system` · `admin` |
 | `POST` | `/api/project-export` | `project` · `admin` *(proj, from `?project=`)* — stream a project to a `BRPROJ` bundle from a running node; a Project·Admin for X can export only X (`project-export` feature) |
 | `POST` | `/api/project-import` | `project` · `admin` *(proj, from `?project=`)* — import a `BRPROJ` bundle into a project on a running node; a Project·Admin for X can import only into X (`project-export` feature) |
+| `GET`/`POST` | `/api/project-prune` | `project` · `admin` *(proj, from `?project=`)* — GC a project's provably-orphaned control-plane state (`GET` reports, `POST` applies); a Project·Admin for X can prune only X. NOT the node-global `/api/prune` (that stays `system` · `admin`) |
 | `GET` | `/api/projects/<proj>/clone/manifest` | `project` · `admin` *(proj)* — streaming-clone **source** manifest (blob LIST + member paths) |
 | `POST` | `/api/projects/<proj>/clone/stream` | `project` · `admin` *(proj)* — streaming-clone **source** member stream |
 | `POST` | `/api/projects/<target>/clone/from` | `project` · `admin` *(target)* — streaming-clone **target** orchestrator (pulls from a live source node; the source bearer rides in a header) |

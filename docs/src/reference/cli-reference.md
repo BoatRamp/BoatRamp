@@ -2737,6 +2737,18 @@ Delete a project. Refused while it owns resources (unless `--force`) or if it is
 | `--dry-run` | — | — | — | Preview what a delete would remove and exit — mutate nothing |
 | `-y, --yes` | — | — | — | Skip the interactive confirmation prompt (required to `--force` when stdin is not a TTY) |
 
+### `boatramp project prune`
+
+GC this project's PROVABLY-orphaned control-plane state (`Project·Admin`)
+
+**Usage:** `boatramp project prune [OPTIONS] <NAME>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<NAME>` | — | — | — | The project to prune |
+| `--apply` | — | — | — | Execute the prune — delete the reported orphans. Without it, a safe dry-run only |
+| `-y, --yes` | — | — | — | Skip the interactive confirmation prompt on `--apply` (required to `--apply` when stdin is not a TTY). Deletes are irreversible, so `--apply` otherwise previews the plan and asks you to type the project name — parity with `project rm --force` |
+
 ### `boatramp project migrate`
 
 Drive this project's owner-gated schema migrations for a managed database (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's non-superuser owner role and need a `Project·Admin` token; `status` needs `Project·Read`
