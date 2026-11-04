@@ -160,7 +160,11 @@ log "Enable the compute-backend RBAC in the dedicated namespace ($CNS)"
 # --reuse-values keeps the image.* settings from the install above; the chart creates
 # the dedicated namespace + the compute SA + its namespace-scoped Role/RoleBinding, and
 # REFUSES (helm fail) if $CNS equals the operator release namespace ($NS).
-helm upgrade boatramp-operator "$ROOT/charts/boatramp-operator" --reuse-values \
+# NOTE: `--namespace "$NS"` is REQUIRED — the release was installed into $NS (line above),
+# and helm tracks releases per-namespace, so omitting it targets the `default` namespace
+# and fails with `"boatramp-operator" has no deployed releases`. $CNS (where the compute
+# RBAC lands) is set via the chart value, NOT the release namespace.
+helm upgrade boatramp-operator "$ROOT/charts/boatramp-operator" --namespace "$NS" --reuse-values \
   --set computeBackend.kubernetes.enabled=true \
   --set computeBackend.kubernetes.namespace="$CNS" --wait --timeout 120s
 kubectl get ns "$CNS" >/dev/null
