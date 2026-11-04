@@ -223,6 +223,15 @@ NetworkPolicies admit the serve pod to a managed workload's Service. **Tenant
 network isolation requires a NetworkPolicy-enforcing CNI** — see
 [Network isolation](./compute.md#network-isolation-networkpolicy--cni).
 
+> **Security — do not delegate `BoatRampCluster`.** A `BoatRampCluster` is a
+> **cluster-admin / infra** artifact. The operator stamps `spec.computeBackend.serviceAccountName`
+> **verbatim** onto the serve pod, and Kubernetes does not RBAC-gate a pod's *use*
+> of a ServiceAccount — so authority to **create or edit** a `BoatRampCluster` in a
+> namespace is effectively authority to run the serve image under **any**
+> ServiceAccount in that namespace (including a privileged one). The chart grants no
+> non-admin `create`/`update` on `boatrampclusters`; keep it that way — never delegate
+> `BoatRampCluster` write access to lesser (tenant) principals.
+
 ## See also
 
 - [Deploy a self-hosted cluster](./deploy-cluster.md) — the dynamic-join model the

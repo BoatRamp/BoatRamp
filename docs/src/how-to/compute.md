@@ -281,6 +281,11 @@ render** if that equals the operator's release namespace (override only with
 (a `BoatRampCluster` with `spec.computeBackend`, created in that namespace), it runs
 the serve pods under this SA and labels them `boatramp.dev/compute-consumer=true` —
 see [Hosting managed compute](./kubernetes.md#hosting-managed-compute-boatramp-on-k8s).
+Because the operator applies `spec.computeBackend.serviceAccountName` verbatim (and
+k8s does not RBAC-gate a pod's *use* of a ServiceAccount), authority to create/edit a
+`BoatRampCluster` is effectively ServiceAccount-selection authority in that namespace:
+a `BoatRampCluster` is a **cluster-admin / infra** artifact and its write access must
+**not** be delegated to tenant principals.
 
 The Role grants only the verbs the backend uses on `statefulsets`/`deployments`
 (apps), `services`/`persistentvolumeclaims`/`pods` (pods read-only), `pods/log`,
