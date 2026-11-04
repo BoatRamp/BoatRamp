@@ -9,6 +9,35 @@ versions.
 
 Nothing yet.
 
+## [0.54.0] - 2026-11-04
+
+This release makes DNS provider configuration a **per-zone provider list** so a single `serve` can be
+authoritative for **many zones at once** — the natural completion of the config surface the
+`dns-publish` and ACME DNS-01 features established, where the provider was *selected* in config but its
+identity + credential were still pinned to one zone by process-global environment variables.
+
+### Added
+
+- **Per-zone DNS provider list (`[serve.dns_providers]`).** A list of named providers, each with a
+  `zone_root` and its identifying + credential fields given as standard boatramp **`type:value`
+  pointers** — a bare literal, `env:VAR`, or a sealed-store `boatramp:NAME` reference — resolved
+  independently per provider. **Both** consumers route to the provider whose `zone_root` is the
+  **longest label-boundary suffix** of the record's / certificate's owner name: the guest
+  `dns-publish` writer (cap-req #24/#25) and the ACME DNS-01 certificate issuer (static set, renewals,
+  and the on-demand per-SNI engine). All 11 provider kinds are supported. Guest `dns-publish` opts into
+  the registry with `--dns-publish-provider list` (the per-handler `dns_publish_zones` allowlist and
+  the `allow_guest_dns_publish` posture still gate every write; the registry is node-global, so scope
+  each allowlist tightly — see the reference). (cap-req #27)
+  - **Secret hygiene:** a credential field must be a reference (`env:` / `boatramp:`) — a plaintext
+    secret literal is refused at startup; a `boatramp:` reference with no `[secrets]` envelope fails
+    closed; `env:`/ambient references are honored only under the posture's `allow_env_secret_refs`.
+    Per-zone scoped tokens need no account-wide credential. Resolved secrets are redacted from logs
+    and `Debug`.
+  - **Backward-compatible:** an empty/absent `dns_providers` is byte-for-byte the previous
+    single-provider, environment-seeded behavior; a single provider is simply a list of one. Duplicate
+    or malformed `zone_root`s, unknown provider kinds, and missing required fields are refused loudly
+    at startup; no authoritative zone for an owner name fails closed (no DNS write, no ACME order).
+
 ## [0.53.0] - 2026-11-03
 
 This release closes the **single-node / cluster capability gap**: the full guest-serving path is now

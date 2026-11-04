@@ -111,6 +111,13 @@ For **guest `dns-publish`** over the multi-zone registry, set
 `allow_guest_dns_publish` + the per-handler `dns_publish_zones` allowlist still gate every
 write. See [`serve.dns_providers`](boatramp-cfg.md#servedns_providers).
 
+> **Operator caution (multi-zone blast radius).** The registry is **node-global**: a single
+> `dns-publish` provider source now serves *every* configured zone, routed by the record's own
+> name. So a **wide** per-handler `dns_publish_zones` allowlist (e.g. `**`) exposes **all**
+> configured zones to that guest, not just one — a broader reach than the pre-registry single-zone
+> model. Keep each grant's `dns_publish_zones` scoped to the exact owner names it needs (the default
+> is deny-all); the allowlist, not the registry, is the per-guest least-privilege bound.
+
 ## See also
 
 - [Automate DNS with a provider](../how-to/auto-dns.md)
