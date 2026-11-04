@@ -669,6 +669,118 @@ impl KubernetesBackend {
             .map_err(|e| BackendError::Other(format!("logs for {pod}: {e}")))
     }
 
+    /// Human-readable bring-up diagnostics for a workload — WHY a pod is not Ready: each
+    /// managed pod's phase + conditions + per-container state (a `Waiting`/`Terminated`
+    /// reason+message surfaces `CreateContainerConfigError` from a bad `secretKeyRef`, an
+    /// `ImagePullBackOff`, a `CrashLoopBackOff` from a failed DB init, …), the namespace
+    /// Events (scheduling / volume-mount / probe failures), and a tail of the container
+    /// logs. Best-effort + read-only; used by the live gate on a readiness timeout (so CI
+    /// shows the cause, not just "never Ready") and available to operators.
+    pub async fn diagnose(&self, handle: &InstanceHandle) -> String {
+        use k8s_openapi::api::core::v1::{Event, Pod};
+        let mut out = String::new();
+        out.push_str(&format!(
+            "=== diagnose workload={} (replica {}) ns={} ===\n",
+            handle.workload, handle.replica, self.namespace
+        ));
+
+        // Every boatramp-managed pod in the namespace: phase, conditions, container states.
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let lp = ListParams::default().labels(&plan::managed_label_selector());
+        match pods.list(&lp).await {
+            Ok(list) => {
+                if list.items.is_empty() {
+                    out.push_str("(no managed pods found — the workload object may not have scheduled a pod yet)\n");
+                }
+                for p in &list.items {
+                    let name = p.metadata.name.clone().unwrap_or_default();
+                    let status = p.status.as_ref();
+                    let phase = status.and_then(|s| s.phase.clone()).unwrap_or_default();
+                    out.push_str(&format!("POD {name} phase={phase}\n"));
+                    for c in status
+                        .and_then(|s| s.conditions.as_ref())
+                        .into_iter()
+                        .flatten()
+                    {
+                        out.push_str(&format!(
+                            "  cond {}={}{}\n",
+                            c.type_,
+                            c.status,
+                            c.reason
+                                .as_deref()
+                                .map(|r| format!(" ({r})"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    for cs in status
+                        .and_then(|s| s.container_statuses.as_ref())
+                        .into_iter()
+                        .flatten()
+                    {
+                        let state = match cs.state.as_ref() {
+                            Some(st) if st.waiting.is_some() => {
+                                let w = st.waiting.as_ref().unwrap();
+                                format!(
+                                    "waiting[{}: {}]",
+                                    w.reason.as_deref().unwrap_or("?"),
+                                    w.message.as_deref().unwrap_or("")
+                                )
+                            }
+                            Some(st) if st.terminated.is_some() => {
+                                let t = st.terminated.as_ref().unwrap();
+                                format!(
+                                    "terminated[{} exit={} {}]",
+                                    t.reason.as_deref().unwrap_or("?"),
+                                    t.exit_code,
+                                    t.message.as_deref().unwrap_or("")
+                                )
+                            }
+                            Some(_) => "running".to_string(),
+                            None => "(no state)".to_string(),
+                        };
+                        out.push_str(&format!(
+                            "  container {} ready={} restarts={} {state}\n",
+                            cs.name, cs.ready, cs.restart_count
+                        ));
+                    }
+                }
+            }
+            Err(e) => out.push_str(&format!("list pods failed: {e}\n")),
+        }
+
+        // Recent namespace Events (scheduling, volume mount, secret resolution, probes).
+        let events: Api<Event> = Api::namespaced(self.client.clone(), &self.namespace);
+        match events.list(&ListParams::default()).await {
+            Ok(evs) => {
+                out.push_str("--- events (most recent last, up to 30) ---\n");
+                let n = evs.items.len();
+                for e in evs.items.iter().skip(n.saturating_sub(30)) {
+                    out.push_str(&format!(
+                        "EVENT {} {} {}/{}: {}\n",
+                        e.type_.as_deref().unwrap_or(""),
+                        e.reason.as_deref().unwrap_or(""),
+                        e.involved_object.kind.as_deref().unwrap_or(""),
+                        e.involved_object.name.as_deref().unwrap_or(""),
+                        e.message.as_deref().unwrap_or("")
+                    ));
+                }
+            }
+            Err(e) => out.push_str(&format!("list events failed: {e}\n")),
+        }
+
+        // Best-effort container logs (empty if the container never started).
+        match self.logs(handle, false, Some(50)).await {
+            Ok(logs) if !logs.trim().is_empty() => {
+                out.push_str("--- container logs (tail 50) ---\n");
+                out.push_str(&logs);
+                out.push('\n');
+            }
+            Ok(_) => out.push_str("(no container logs yet)\n"),
+            Err(e) => out.push_str(&format!("(logs unavailable: {e})\n")),
+        }
+        out
+    }
+
     /// Whether CSI snapshot/restore is enabled (a `VolumeSnapshotClass` is configured).
     pub fn snapshots_supported(&self) -> bool {
         self.volume_snapshot_class.is_some()

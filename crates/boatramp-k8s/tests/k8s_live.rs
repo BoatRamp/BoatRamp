@@ -171,6 +171,14 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
     let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
     spec.env
         .insert("POSTGRES_PASSWORD".to_string(), "livegate-pw".to_string());
+    // Run ROOTLESS as the image's DB user (uid:gid 999 for Postgres), exactly as the node's
+    // default `PrivilegeDirective::Rootless` sets at launch — `managed_db_spec` itself leaves
+    // `user` unset (the reconcile applies the privilege strategy). Without this the pod would
+    // run as root, and the hardened SecurityContext (cap_drop ALL + no-privilege-escalation)
+    // denies the root→postgres chown/setuid the entrypoint would then need. The backend maps
+    // this to runAsUser/runAsGroup/fsGroup so the pod runs as 999 and the kubelet group-owns
+    // the PVC to 999 — the k8s-native equivalent of the pre-owned volume on the other backends.
+    spec.user = Some("999:999".to_string());
     let image = spec.root.as_str().to_string();
     let req = LaunchRequest {
         project: "default".to_string(),
@@ -199,7 +207,13 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    assert!(ready, "managed postgres StatefulSet never went Ready");
+    if !ready {
+        // Surface WHY (pod phase/conditions/container states + Events + logs) so a bring-up
+        // failure shows its cause in CI instead of a bare "never Ready".
+        let diag = backend.diagnose(&handle).await;
+        eprintln!("{diag}");
+        panic!("managed postgres StatefulSet never went Ready — diagnostics above");
+    }
 
     // (3) the PVC shows up in list_volumes with the requested size.
     let vols = backend.list_volumes().await.expect("list volumes");
