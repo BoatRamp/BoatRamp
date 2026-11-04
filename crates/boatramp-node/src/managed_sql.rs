@@ -3879,6 +3879,7 @@ mod tests {
             },
             data_dir: None,
             snapshot: None,
+            active_spec: None,
         }
     }
 
