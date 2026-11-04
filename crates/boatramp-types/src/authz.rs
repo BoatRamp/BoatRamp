@@ -801,6 +801,24 @@ impl Right {
                 project_from_query(query).map(str::to_string),
                 Action::Admin,
             ),
+            // `boatramp project prune` (`GET /api/project-prune` dry-run report + `POST
+            // /api/project-prune` apply): GC the `?project=` target's PROVABLY-orphaned control-plane
+            // state (stale per-site routing/config leftovers + foreign-domain verification/auto-DNS
+            // records a `--force` clone commingle left). A destructive op over ONE project's OWN
+            // keyspace — gated **`Project·Admin` on the TARGET project** (scoped THROUGH `query`,
+            // uniform with the export/import/clone family: a Project·Admin for X may prune ONLY X,
+            // never node-global `System·Admin` and never another tenant). The GET report reads the
+            // same project-owned keyspace it would delete, so it carries the same scope (not a
+            // weaker Read grade). A target-less fallback (query absent) is satisfied by no scoped
+            // grant → fail-closed, and the handler 400s an empty project. Re-checked defense-in-depth
+            // at each handler, bound to the same target. NB global content-addressed reclamation
+            // (deploy blobs/manifests) stays the node-global `/api/prune` (`System·Admin`) — it is
+            // NOT folded into this per-project, project-scoped verb.
+            "/api/project-prune" => Self::new(
+                Resource::Project,
+                project_from_query(query).map(str::to_string),
+                Action::Admin,
+            ),
             // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
             // read-fallback secondary is attached (the node is mid-migration). A READ-only node
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
@@ -3043,6 +3061,70 @@ mod tests {
                 "a project admin must NOT reach the whole-control-plane {path}",
             );
         }
+    }
+
+    /// `boatramp project prune` (`GET`/`POST /api/project-prune`): a destructive GC of ONE project's
+    /// OWN control-plane keyspace, gated **`Project·Admin` on the `?project=` target** for BOTH the
+    /// dry-run report (GET) and the apply (POST) — uniform with export/import/clone. A Project·Admin
+    /// for X may prune ONLY X (never Y), never node-global `System·Admin`, and a scoped grant never
+    /// satisfies a target-less (malformed, no `?project=`) request. The node-global `/api/prune`
+    /// (deploy-blob/manifest CAS reclamation) stays `System·Admin` — a Project·Admin must NOT reach it.
+    #[test]
+    fn project_prune_is_project_admin_on_the_query_target_not_system() {
+        let policy = AuthzPolicy::default_policy();
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        let globex_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "globex")]);
+
+        for method in ["GET", "POST"] {
+            let req_acme =
+                Right::required_for(method, "/api/project-prune", Some("project=acme")).unwrap();
+            assert_eq!(
+                req_acme,
+                Right::new(Resource::Project, Some("acme".into()), Action::Admin),
+                "{method} /api/project-prune?project=acme must require Project·Admin on acme",
+            );
+            assert_ne!(
+                req_acme,
+                Right::new(Resource::System, None, Action::Admin),
+                "project prune must NOT be node-global System·Admin ({method})",
+            );
+            assert!(
+                acme_admin.allows(&req_acme),
+                "acme admin prunes acme ({method})"
+            );
+            let req_globex =
+                Right::required_for(method, "/api/project-prune", Some("project=globex")).unwrap();
+            assert!(
+                !acme_admin.allows(&req_globex),
+                "an acme Project·Admin must NOT prune globex ({method}) — cross-tenant hole",
+            );
+            assert!(
+                globex_admin.allows(&req_globex),
+                "globex admin prunes globex ({method})"
+            );
+            // Target-less (no `?project=`) ⇒ fail-closed.
+            let req_none = Right::required_for(method, "/api/project-prune", None).unwrap();
+            assert_eq!(
+                req_none.target, None,
+                "no query ⇒ target-less (fail-closed)"
+            );
+            assert!(
+                !acme_admin.allows(&req_none),
+                "a scoped project admin must NOT satisfy a target-less prune ({method})",
+            );
+        }
+
+        // REGRESSION GUARD: the node-global deploy-blob/manifest GC stays System·Admin — a
+        // Project·Admin must NOT reach it via the per-project prune's lower gate.
+        let node_prune = Right::required("POST", "/api/prune").unwrap();
+        assert_eq!(
+            node_prune,
+            Right::new(Resource::System, None, Action::Admin)
+        );
+        assert!(
+            !acme_admin.allows(&node_prune),
+            "a project admin must NOT reach the node-global /api/prune",
+        );
     }
 
     /// #501 Stage B — the DECLARATIVE managed-database front door (`/api/databases/…`) mints

@@ -7,7 +7,79 @@ versions.
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.55.0] - 2026-11-04
+
+### Added
+
+- **Kubernetes compute backend (`[compute].backend: kubernetes`).** A fifth `ComputeBackend`
+  (`boatramp-k8s`, id `"kubernetes"`) for boatramp running **as a pod** on Kubernetes/k3s, where k8s is
+  already the orchestrator and the VM / native-container / remote-docker backends don't fit. It
+  delegates boatramp's own managed compute to native k8s objects through the in-cluster API (kube-rs,
+  the serve pod's own ServiceAccount — the same in-cluster config the operator already uses, no second
+  auth path): a **managed database → `StatefulSet` + `Service`** (the `pg-<ident>` in-cluster DNS the
+  sql-shim/bindings resolve) **+ `PVC`** on the default (or configured) `StorageClass`
+  (CSI-snapshottable/resizable — closing remote-docker's node-local durability caveat); a **generic
+  stateless workload → `Deployment`**. Implements `launch`/`stop`/`health`, `exec` (pod exec
+  subresource), pod logs, PVC volume management, the orphan-reaper probe, and CSI `VolumeSnapshot`
+  snapshot/restore (gated on a configured `VolumeSnapshotClass`; a clean "unsupported" otherwise).
+  Selected by `[compute].backend: kubernetes`, env `BOATRAMP_COMPUTE_BACKEND`, or
+  `--compute-backend kubernetes`, **plus in-cluster auto-detect** (`KUBERNETES_SERVICE_HOST` + a mounted
+  ServiceAccount token); when used it is the node's sole compute backend (the capability-detected
+  docker / native-container / VMM backends are suppressed). A pod is shared-kernel
+  (`IsolationClass::Container`), so `require_strong_isolation` excludes it exactly like the other
+  shared-kernel backends. (mailroom cap-req #26)
+  - **Credentials via a k8s `Secret`:** the managed-DB server-init credential (and any workload env)
+    is written to a per-workload `Opaque` `Secret` (`<workload>-env`, namespace-scoped, deleted on
+    teardown) and referenced from the pod by `secretKeyRef` — **no credential is a plaintext value in
+    the StatefulSet/Pod spec**, so a reader with `get statefulsets/pods` no longer sees it.
+  - **Least-privilege RBAC:** the helm chart ships a **namespace-scoped** `Role` + `RoleBinding`
+    (+ optional `ServiceAccount`), gated on `computeBackend.kubernetes.enabled` (off by default). No
+    `ClusterRole`, no wildcards; pods are read-only to the backend. The only secret authority is a
+    **write-only** `secrets: [create, patch, delete]` (no `get`/`list`/`watch`, so the token can
+    neither enumerate nor read secret *values*), for the per-workload credential Secret above.
+  - **Hardening:** launched pods drop privilege escalation + all Linux capabilities (adding back only
+    an allowlisted `cap_add` under the single-tenant posture) + pin the runtime's default seccomp
+    profile, and do **not** auto-mount a ServiceAccount token. A per-project sealed pull credential is
+    **refused** (fail-closed) — the private-registry path is an operator-configured `imagePullSecret`
+    (`[compute].k8s_image_pull_secret`).
+  - **Multi-tenant isolation (`strict` posture).** Under a multi-tenant posture the launched pod's
+    `cap_add` is dropped entirely and its root filesystem is read-only (with `/tmp` + `/run`
+    `emptyDir` scratch so a stock image still boots), at parity with the docker / native-container
+    backends. Every managed workload is fenced by a default-deny-ingress `NetworkPolicy` plus a
+    per-workload allow admitting only same-project siblings and the serve pod (labelled
+    `boatramp.dev/compute-consumer`) — so one project's workloads cannot reach another's `Service`.
+    **This requires a NetworkPolicy-enforcing CNI** (Calico / Cilium / Antrea / …); on a
+    non-enforcing CNI such as stock flannel the policies are silent no-ops (logged at startup). The
+    operator places a compute-hosting cluster's serve pod in a **dedicated namespace** with the
+    namespace-scoped compute `ServiceAccount` (never the operator's cluster-wide SA) and the consumer
+    label; generic-workload object names are collision-resistant per `(project, workload, replica)`.
+    Creating a `BoatRampCluster` is cluster-admin-only and must not be delegated — its
+    `serviceAccountName` selects the serve pod's identity.
+  - **Default-inert:** without the `k8s-backend` cargo feature the crate is a shell that pulls none of
+    the kube-rs / k8s-openapi tree; the backend is registered only when selected or auto-detected.
+
+- **`project prune` — reclaim a project's provably-orphaned control-plane state.** A new
+  `Project·Admin` maintenance operation (CLI `boatramp project prune`, `GET`/`POST
+  /api/project-prune`) that garbage-collects a project's dead-site routing/config leftovers and
+  foreign-domain verification records that nothing live references. **Dry-run by default** — a report
+  enumerating every key with its reason; `--apply` performs the deletion and requires `-y` (or an
+  interactive confirmation). Strictly scoped to the project's own key prefix (sealed secrets and
+  managed-DB credentials are never touched); refuses to run when the control-plane KV is in a
+  degraded/recovering state (fail-closed); never removes a record a live site still answers; keeps
+  verified or in-flight domain-ownership proofs; and leaves managed-DNS ledgers to the auto-DNS
+  reconcile sweep, which retracts the external records before removing them.
+
+### Fixed
+
+- **Remote-Docker managed-DB DSN resolution.** The remote-Docker `ComputeBackend` placed every
+  container on the daemon default bridge, which has no embedded DNS, so a name-based managed-DB DSN
+  (`postgres://…@<db-workload>:5432/db`) never resolved and a dependent workload crash-looped (broken
+  since the v0.52.0 managed-DB DSN phase-1, only now exercised). Each project's workloads now share a
+  **per-project user-defined network** with a DNS alias equal to the workload name — docker's embedded
+  DNS resolves siblings by name, and its inter-network isolation keeps one project from resolving or
+  reaching another's. The managed-DB export/import one-shot additionally joins that network (keeping
+  default-network reach) so `pg_dump` / `pg_restore` / `psql` reach the DB whether it lives on a
+  per-project network or (external DSN / pre-upgrade) on the default bridge.
 
 ## [0.54.0] - 2026-11-04
 

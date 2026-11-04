@@ -147,3 +147,67 @@ kubectl -n "$NS" patch boatrampcluster prod --type merge -p '{"spec":{"replicas"
 assert_ready 3
 
 log "PASS — operator e2e (install → found → scale 3→5→3 → rolling upgrade → kill-pod recovery)"
+
+# ── Compute-backend serve-pod placement (mailroom #26 NEW-1) ─────────────────
+# A cluster that HOSTS ITS OWN MANAGED COMPUTE (spec.computeBackend) must have its
+# serve pods placed in a DEDICATED namespace, running as the least-privilege compute
+# ServiceAccount (NOT the operator's cluster-wide SA — F4) and labelled as the compute
+# consumer (so the per-workload NetworkPolicies bind — F3). Prove the operator does
+# this: assert the operator-rendered Deployment's POD TEMPLATE (the pod need not be
+# Ready — this gates the placement the operator applies, not image bring-up).
+CNS="boatramp-compute"
+log "Enable the compute-backend RBAC in the dedicated namespace ($CNS)"
+# --reuse-values keeps the image.* settings from the install above; the chart creates
+# the dedicated namespace + the compute SA + its namespace-scoped Role/RoleBinding, and
+# REFUSES (helm fail) if $CNS equals the operator release namespace ($NS).
+# NOTE: `--namespace "$NS"` is REQUIRED — the release was installed into $NS (line above),
+# and helm tracks releases per-namespace, so omitting it targets the `default` namespace
+# and fails with `"boatramp-operator" has no deployed releases`. $CNS (where the compute
+# RBAC lands) is set via the chart value, NOT the release namespace.
+helm upgrade boatramp-operator "$ROOT/charts/boatramp-operator" --namespace "$NS" --reuse-values \
+  --set computeBackend.kubernetes.enabled=true \
+  --set computeBackend.kubernetes.namespace="$CNS" --wait --timeout 120s
+kubectl get ns "$CNS" >/dev/null
+kubectl -n "$CNS" get serviceaccount boatramp-compute >/dev/null
+kubectl -n "$CNS" get role boatramp-compute >/dev/null
+
+log "Provision auth + admin secrets in $CNS"
+kubectl -n "$CNS" create secret generic compute-admin --from-literal=token="$admin_token" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$CNS" create secret generic compute-auth \
+  --from-literal=root-private-key="$root_priv" \
+  --from-literal=bootstrap-secret="$(openssl rand -hex 16)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+log "Deploy a compute-hosting cluster in $CNS (spec.computeBackend)"
+kubectl -n "$CNS" apply -f - <<EOF
+apiVersion: boatramp.dev/v1alpha1
+kind: BoatRampCluster
+metadata: { name: compute }
+spec:
+  mode: stateless
+  image: $IMAGE
+  replicas: 1
+  posture: dev
+  rootPubkey: "$root_pub"
+  authSecret: compute-auth
+  adminTokenSecret: compute-admin
+  computeBackend:
+    serviceAccountName: boatramp-compute
+EOF
+
+log "Assert the serve pod lands in $CNS with the compute SA + consumer label"
+dep_ok=0
+for _ in $(seq 1 30); do
+  kubectl -n "$CNS" get deploy compute >/dev/null 2>&1 && { dep_ok=1; break; }
+  sleep 2
+done
+[ "$dep_ok" = 1 ] || { echo "FAILED: operator never created deploy/compute in $CNS" >&2; exit 1; }
+sa="$(kubectl -n "$CNS" get deploy compute -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+consumer="$(kubectl -n "$CNS" get deploy compute -o jsonpath='{.spec.template.metadata.labels.boatramp\.dev/compute-consumer}')"
+[ "$sa" = "boatramp-compute" ] || { echo "FAILED: serve pod SA is '$sa', want boatramp-compute (F4)" >&2; exit 1; }
+[ "$consumer" = "true" ] || { echo "FAILED: serve pod missing boatramp.dev/compute-consumer=true (got '$consumer') (F3)" >&2; exit 1; }
+echo "ok: serve pod in $CNS runs as SA=$sa, compute-consumer=$consumer"
+
+log "PASS — operator compute placement (dedicated ns + compute SA + consumer label)"
+echo "OPERATOR COMPUTE-PLACEMENT OK"

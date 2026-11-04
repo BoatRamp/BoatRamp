@@ -104,6 +104,7 @@ default = [
   "dns-publish",
   "cluster",
   "operator",
+  "k8s-backend",
   "mcp",
   "project-export",
   "overlay",
@@ -395,6 +396,13 @@ operator = [
   # The membership executor mints + encodes join tickets (crate::join, cluster).
   "cluster",
 ]
+# The **Kubernetes compute backend** (mailroom #26): boatramp running AS a pod runs its
+# own managed compute (managed DBs → StatefulSet/Service/PVC) as native k8s resources via
+# the in-cluster API, selected by `[compute].backend: kubernetes` / `--compute-backend
+# kubernetes` or auto-detected in-cluster. Forwards to the node assembly's registration.
+# Reuses the kube-rs/k8s-openapi tree the operator already pulls — batteries-included so
+# the released image serves on k8s out of the box; the backend is inert unless selected.
+k8s-backend = ["boatramp-node/k8s-backend"]
 # The `boatramp mcp` subcommand: a Model Context Protocol server (stdio) that
 # drives one or more instances from an agent. The tool surface + transport live in
 # the separate `boatramp-mcp` crate (rmcp's schemars 1.x can't share the binary

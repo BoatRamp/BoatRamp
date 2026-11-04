@@ -2843,6 +2843,39 @@ impl ControlPlane {
             .json()
             .await?)
     }
+
+    /// `boatramp project prune <name>` — GC a project's PROVABLY-orphaned control-plane state
+    /// (`Project·Admin` on the target). `apply == false` is the safe dry-run: `GET
+    /// /api/project-prune?project=<name>` reports exactly what an apply would remove and mutates
+    /// NOTHING. `apply == true` is `POST …` and deletes exactly that set. Returns the typed plan
+    /// (dry-run or executed). A non-2xx surfaces the server's refusal text.
+    pub async fn project_prune(
+        &self,
+        name: &str,
+        apply: bool,
+    ) -> Result<boatramp_core::project_prune::ProjectPrunePlan> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let url = format!("{server}/api/project-prune");
+        let req = if apply {
+            client.post(&url)
+        } else {
+            client.get(&url)
+        };
+        let resp = req.query(&[("project", name)]).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "project prune refused ({status}): {}",
+                body.trim_end()
+            )));
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 #[cfg(test)]

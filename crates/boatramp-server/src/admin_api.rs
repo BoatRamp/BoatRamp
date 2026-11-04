@@ -5078,6 +5078,63 @@ fn prune_response(result: Result<GcReport, DeployError>) -> Response {
     }
 }
 
+/// Shared body of the two `project prune` arms: slug-validate the target, re-derive the
+/// `Project·Admin`-on-target gate defense-in-depth (so a table regression can't downgrade it below
+/// `Project·Admin` or to a wrong/target-less scope — the same guard the export/import/clone family
+/// uses), then run [`DeployStore::prune_project`](boatramp_core::deploy::DeployStore::prune_project)
+/// at `apply`. The op is confined to the project's OWN keyspace and never touches sealed secrets,
+/// another tenant, the global routing/TLS keyspace, or the shared content-addressed store.
+async fn project_prune_run(deploy: &DeployStore, project: &str, apply: bool) -> Response {
+    if project.is_empty() {
+        return (StatusCode::BAD_REQUEST, "project is required\n").into_response();
+    }
+    // Slug-validate before the name flows into `ProjectRef`/KV prefixes (a `..`/`/` would traverse
+    // or over-capture) — mirrors every project-scoped sibling.
+    if let Some(resp) = reject_invalid_name("project", project) {
+        return resp;
+    }
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        if apply { "POST" } else { "GET" },
+        "/api/project-prune",
+        project,
+        "project prune",
+    ) {
+        return forbidden;
+    }
+    match deploy.prune_project(project, apply).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// The target `?project=` of a `project prune` request, derived through the EXACT same
+/// [`project_from_query`](boatramp_core::authz::project_from_query) the authorizer used (the FIRST
+/// raw `project=` value) — NOT a serde-decoded `Query<_>`, which for a duplicated `project=` key
+/// would decode the LAST value and so could name a DIFFERENT project than the one the token was
+/// authorized against (Security review Finding F — hardening: the two extractors can now never
+/// desync). An absent/garbled target yields `""`, which `project_prune_run` rejects with a `400`.
+fn prune_target_from_raw_query(raw: Option<&str>) -> &str {
+    boatramp_core::authz::project_from_query(raw).unwrap_or("")
+}
+
+/// Report a project's provably-orphaned control-plane state WITHOUT deleting anything — the safe,
+/// read-only dry-run default (`boatramp project prune <p>`). `Project·Admin` on `?project=`.
+pub(super) async fn project_prune_report(
+    State(deploy): State<DeployStore>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    project_prune_run(&deploy, prune_target_from_raw_query(raw.as_deref()), false).await
+}
+
+/// Delete a project's provably-orphaned control-plane state (`boatramp project prune <p> --apply`).
+/// `Project·Admin` on `?project=`; the deleted set equals the dry-run report's.
+pub(super) async fn project_prune_apply(
+    State(deploy): State<DeployStore>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    project_prune_run(&deploy, prune_target_from_raw_query(raw.as_deref()), true).await
+}
+
 /// Verify every stored blob still hashes to its key (integrity scrub).
 /// Read-only; the JSON report lists any corrupted or unreadable blobs.
 pub(super) async fn scrub_blobs(State(deploy): State<DeployStore>) -> Response {

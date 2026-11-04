@@ -39,6 +39,7 @@ Run the HTTP server and publishing API
 | `--data-dir <DATA_DIR>` | `BOATRAMP_DATA_DIR` | — | — | Data directory for filesystem backends (blobs in `<dir>/blobs`, metadata in `<dir>/kv`). Flag/env > `serve.data_dir` > `./data` |
 | `--blobs <BLOBS>` | `BOATRAMP_BLOBS` | `fs` | fs \| s3 \| gcs \| azure | Blob storage backend |
 | `--kv <KV>` | `BOATRAMP_KV` | `slatedb` | slatedb \| memory \| cloudflare \| sql | Metadata (KV) backend |
+| `--compute-backend <COMPUTE_BACKEND>` | `BOATRAMP_COMPUTE_BACKEND` | — | — | Compute backend selection (mailroom #26). `kubernetes` pins the Kubernetes compute backend (managed compute as native k8s StatefulSet/Service/PVC via the in-cluster API) for boatramp running AS a pod; left unset, the node still auto-detects an in-cluster environment and defaults to it there. Maps to `[compute].backend`; only effective in a build with the `k8s-backend` feature |
 | `--auto-migrate` | — | — | — | Migrate a pre-0.2.0 (layout 1) control-plane store to the project-scoped layout at startup instead of refusing to serve. Off by default so the re-key is an explicit, one-time operator action (`boatramp migrate`) |
 | `--s3-bucket <S3_BUCKET>` | `BOATRAMP_S3_BUCKET` | — | — | S3 bucket (required for `--blobs s3`) |
 | `--s3-endpoint <S3_ENDPOINT>` | `BOATRAMP_S3_ENDPOINT` | — | — | S3 endpoint URL, e.g. a MinIO server (optional) |
@@ -2735,6 +2736,18 @@ Delete a project. Refused while it owns resources (unless `--force`) or if it is
 | `--force` | — | — | — | Cascade: tear down **everything** the project owns (sites, functions, compute + their volumes, secrets, GraphQL registry) and remove the project. Destructive and irreversible |
 | `--dry-run` | — | — | — | Preview what a delete would remove and exit — mutate nothing |
 | `-y, --yes` | — | — | — | Skip the interactive confirmation prompt (required to `--force` when stdin is not a TTY) |
+
+### `boatramp project prune`
+
+GC this project's PROVABLY-orphaned control-plane state (`Project·Admin`)
+
+**Usage:** `boatramp project prune [OPTIONS] <NAME>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<NAME>` | — | — | — | The project to prune |
+| `--apply` | — | — | — | Execute the prune — delete the reported orphans. Without it, a safe dry-run only |
+| `-y, --yes` | — | — | — | Skip the interactive confirmation prompt on `--apply` (required to `--apply` when stdin is not a TTY). Deletes are irreversible, so `--apply` otherwise previews the plan and asks you to type the project name — parity with `project rm --force` |
 
 ### `boatramp project migrate`
 

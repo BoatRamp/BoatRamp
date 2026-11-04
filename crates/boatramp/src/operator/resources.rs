@@ -60,6 +60,30 @@ fn labels(name: &str) -> BTreeMap<String, String> {
     .into()
 }
 
+/// The label a pod must carry to be an authorized CONSUMER of a managed compute workload's
+/// Service under the k8s compute backend's per-workload NetworkPolicy. Must match
+/// `boatramp_k8s::plan::CONSUMER_LABEL` / `CONSUMER_VALUE` and the chart's documented
+/// `computeBackend.kubernetes` consumer label (mailroom #26 F3). Stamped on the serve pod
+/// ONLY — never on `labels()` (the immutable Service/Workload selector).
+const COMPUTE_CONSUMER_LABEL: &str = "boatramp.dev/compute-consumer";
+const COMPUTE_CONSUMER_VALUE: &str = "true";
+
+/// The serve POD-TEMPLATE labels: the selector [`labels`] plus, when this cluster hosts its
+/// own managed compute (`spec.computeBackend`), the compute-consumer label so the per-
+/// workload NetworkPolicies admit the serve pod to a managed workload's Service. The extra
+/// label is added to the pod template ONLY (not to [`labels`]/the selector, which must stay
+/// an immutable subset).
+fn pod_labels(brc: &BoatRampCluster) -> BTreeMap<String, String> {
+    let mut l = labels(&instance(brc));
+    if brc.spec.compute_backend.is_some() {
+        l.insert(
+            COMPUTE_CONSUMER_LABEL.to_string(),
+            COMPUTE_CONSUMER_VALUE.to_string(),
+        );
+    }
+    l
+}
+
 /// `ObjectMeta` for a child object: named, namespaced, labelled, and
 /// **owned** by the CR (so `kubectl delete brc` garbage-collects it).
 fn child_meta(brc: &BoatRampCluster, name: String) -> ObjectMeta {
@@ -387,12 +411,23 @@ fn pod_template(brc: &BoatRampCluster, data_volume: Option<Volume>) -> PodTempla
         ..Default::default()
     }];
     volumes.extend(data_volume);
+    // When this cluster hosts its own managed compute, run the serve pods under the
+    // dedicated compute ServiceAccount (the chart's `computeBackend.kubernetes` RBAC is
+    // bound to it) so the k8s compute backend has its namespace-scoped authority — NOT the
+    // namespace `default` SA (which has no compute RBAC → 403) nor the operator's
+    // cluster-wide SA (F4). `None` ⇒ the default SA, unchanged (non-compute clusters).
+    let service_account_name = brc
+        .spec
+        .compute_backend
+        .as_ref()
+        .map(|c| c.service_account_name.clone());
     PodTemplateSpec {
         metadata: Some(ObjectMeta {
-            labels: Some(labels(&instance(brc))),
+            labels: Some(pod_labels(brc)),
             ..Default::default()
         }),
         spec: Some(PodSpec {
+            service_account_name,
             containers: vec![container(brc)],
             volumes: Some(volumes),
             ..Default::default()
@@ -550,11 +585,78 @@ mod tests {
                 admin_token_secret: None,
                 root_pubkey: None,
                 auth_secret: None,
+                compute_backend: None,
             },
         );
         brc.metadata.namespace = Some("tenant-a".to_string());
         brc.metadata.uid = Some("uid-123".to_string());
         brc
+    }
+
+    /// A cluster that hosts its own managed compute (opts into the k8s compute backend).
+    fn compute_cluster(name: &str, mode: ClusterMode) -> BoatRampCluster {
+        let mut brc = cluster(name, mode, 1);
+        brc.spec.compute_backend = Some(crate::operator::crd::ComputeBackendSpec::default());
+        brc
+    }
+
+    #[test]
+    fn non_compute_cluster_pod_has_no_sa_or_consumer_label() {
+        // Default (no compute backend): the serve pod uses the namespace default SA and
+        // carries NO compute-consumer label (unchanged behavior).
+        let brc = cluster("plain", ClusterMode::Stateless, 1);
+        let dep = deployment(&brc);
+        let tmpl = dep.spec.unwrap().template;
+        let pod = tmpl.spec.unwrap();
+        assert_eq!(pod.service_account_name, None);
+        assert!(
+            !tmpl
+                .metadata
+                .unwrap()
+                .labels
+                .unwrap()
+                .contains_key(COMPUTE_CONSUMER_LABEL)
+        );
+    }
+
+    #[test]
+    fn compute_cluster_pod_gets_the_compute_sa_and_consumer_label() {
+        // F4/F3 (NEW-1): a compute-hosting cluster's serve pod runs as the dedicated compute
+        // SA and carries the compute-consumer label (so the compute RBAC + per-workload
+        // NetworkPolicies bind). The label is on the POD TEMPLATE only, NOT the selector.
+        for (mode, is_sts) in [
+            (ClusterMode::Stateless, false),
+            (ClusterMode::Cluster, true),
+        ] {
+            let brc = compute_cluster("hosted", mode);
+            let (tmpl, selector_labels) = if is_sts {
+                let sts = stateful_set(&brc, 0);
+                let s = sts.spec.unwrap();
+                (s.template, s.selector.match_labels.unwrap())
+            } else {
+                let dep = deployment(&brc);
+                let s = dep.spec.unwrap();
+                (s.template, s.selector.match_labels.unwrap())
+            };
+            let pod = tmpl.spec.clone().unwrap();
+            assert_eq!(
+                pod.service_account_name.as_deref(),
+                Some("boatramp-compute"),
+                "compute cluster runs as the compute SA"
+            );
+            let pod_labels = tmpl.metadata.unwrap().labels.unwrap();
+            assert_eq!(
+                pod_labels.get(COMPUTE_CONSUMER_LABEL).map(String::as_str),
+                Some("true"),
+                "compute-consumer label on the pod template"
+            );
+            // The selector must NOT carry the mutable consumer label (it stays the
+            // immutable identity subset).
+            assert!(
+                !selector_labels.contains_key(COMPUTE_CONSUMER_LABEL),
+                "the consumer label must not leak into the immutable selector"
+            );
+        }
     }
 
     #[test]

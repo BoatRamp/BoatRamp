@@ -23,14 +23,15 @@ use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, KillContainerOptions, LogOutput,
-    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
+    NetworkingConfig, RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy,
-    RestartPolicyNameEnum,
+    EndpointSettings, HostConfig, Mount, MountTypeEnum, PortBinding,
+    RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
 };
+use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -297,6 +298,50 @@ impl DockerBackend {
         }
         Ok(mounts)
     }
+
+    /// Create a labeled user-defined `bridge` network named `name` if it does not already exist.
+    /// Idempotent: a 409 Conflict (the network already exists — from a prior/concurrent launch
+    /// into the same project) is treated as success, so two workloads of one project never race
+    /// each other to an error. `labels` tag it as boatramp-managed (and, for a project network,
+    /// which project) so an operator can identify + reclaim it.
+    async fn create_bridge_network(
+        &self,
+        name: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<(), BackendError> {
+        let options = CreateNetworkOptions {
+            name: name.to_string(),
+            driver: "bridge".to_string(),
+            check_duplicate: true,
+            labels,
+            ..Default::default()
+        };
+        match self.docker.create_network(options).await {
+            Ok(_) => Ok(()),
+            // Already exists — the idempotent, concurrency-safe success path.
+            Err(e) if is_network_conflict(&e) => Ok(()),
+            Err(e) => Err(BackendError::Launch(format!(
+                "create project network {name}: {e}"
+            ))),
+        }
+    }
+
+    /// Ensure the per-project user-defined network ([`project_network_name`]) exists (create-if-
+    /// absent) and return its name. Every workload of `project` joins this ONE network with a DNS
+    /// alias = its workload name, so siblings resolve each other by name over docker's embedded DNS
+    /// while a different project (a different network) can neither resolve nor reach them.
+    async fn ensure_project_network(&self, project: &str) -> Result<String, BackendError> {
+        let name = project_network_name(project);
+        self.create_bridge_network(
+            &name,
+            HashMap::from([
+                ("boatramp.managed".to_string(), "true".to_string()),
+                ("boatramp.project".to_string(), project.to_string()),
+            ]),
+        )
+        .await?;
+        Ok(name)
+    }
 }
 
 /// Container name for a workload replica (`boatramp-<id>`), where the id is
@@ -307,6 +352,80 @@ fn container_name(project: &str, workload: &str, replica: u32) -> String {
     format!(
         "boatramp-{}",
         compute_instance_id(project, workload, replica)
+    )
+}
+
+/// The reserved process-env key by which the node asks the remote-Docker backend to ALSO connect a
+/// one-shot [`run_ephemeral`](ComputeBackend::run_ephemeral) client container to a specific
+/// per-project network, so a `pg_dump`/`pg_restore`/`psql`/`mysql` client can reach a managed DB
+/// that lives on that isolated network (see [`project_network_name`]).
+///
+/// The backend **consumes** it: the pair is stripped from the process environment before the
+/// client is started, so the internal hint never reaches the client. Its value is the exact
+/// network name to join. The one-shot ALWAYS keeps the daemon's default network (NAT egress +
+/// default-bridge reach); when this hint is present it is ADDITIONALLY connected to the named
+/// per-project network. That dual attachment is deliberate: it lets the client reach the managed
+/// DB whether the DB sits on the default bridge (an external DSN, a managed DB launched before this
+/// backend grew per-project networks and not yet relaunched, or a colocated test DB) OR on its
+/// isolated per-project network (the relaunched shape) — the node cannot always know which, and a
+/// stale persisted endpoint must keep working across the upgrade. Absent ⇒ the one-shot runs on
+/// the daemon's default network alone (the external-DSN path, reachable via the daemon's NAT
+/// egress).
+pub const EPHEMERAL_NETWORK_ENV: &str = "BOATRAMP_EPHEMERAL_NETWORK";
+
+/// The deterministic, per-project user-defined docker network name for `project`.
+///
+/// The remote-Docker backend places every one of a project's workload containers on THIS network
+/// (create-if-absent at launch) and attaches each with a network ALIAS equal to its workload name,
+/// so a sibling in the same project resolves `<workload>:<port>` via docker's embedded DNS — which
+/// a user-defined network has and the default bridge does **not** (the managed-DB DSN is
+/// name-based). The network is **per-project**, so docker's inter-network isolation keeps one
+/// project's containers from resolving or reaching another project's: that boundary is the tenancy
+/// gate. The reserved `default` project (and an empty project id) share the one `default` network —
+/// a single-tenant install is still its own isolated network, never a shared node-wide one.
+///
+/// `project` is a validated resource slug (`[A-Za-z0-9][A-Za-z0-9_-]*`, ≤ 63 bytes), a subset of
+/// the docker network-name grammar (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), so the `boatramp-net-` prefix
+/// yields an always-valid name that can never clobber an unrelated network on a shared daemon.
+pub fn project_network_name(project: &str) -> String {
+    let p = if project.is_empty() {
+        boatramp_core::project::DEFAULT_PROJECT
+    } else {
+        project
+    };
+    format!("{PROJECT_NETWORK_PREFIX}{p}")
+}
+
+/// The fixed prefix every per-project network name carries (see [`project_network_name`]). Factored
+/// out so a holder of the name alone can recover the project (strip the prefix) — used by the
+/// export/import one-shot to label a create-if-absent network identically to the launch path.
+pub const PROJECT_NETWORK_PREFIX: &str = "boatramp-net-";
+
+/// Build the [`NetworkingConfig`] attaching a container to `network` with the given DNS `aliases`
+/// (the workload name for a server a sibling resolves by name; empty for a one-shot client that
+/// only needs to reach peers). Supplying this at container-create means the container joins ONLY
+/// this one network — never the shared default bridge — so docker's inter-network isolation is the
+/// tenancy boundary (a container can resolve/reach only its own project's peers).
+fn network_config(network: &str, aliases: Vec<String>) -> NetworkingConfig<String> {
+    let endpoint = EndpointSettings {
+        aliases: (!aliases.is_empty()).then_some(aliases),
+        ..Default::default()
+    };
+    NetworkingConfig {
+        endpoints_config: HashMap::from([(network.to_string(), endpoint)]),
+    }
+}
+
+/// Whether a docker API error is a **409 Conflict**. For `create_network`, a 409 means the network
+/// already exists, which the create-if-absent path treats as success (idempotent) — so a second
+/// workload launching into an existing per-project network never errors.
+fn is_network_conflict(err: &bollard::errors::Error) -> bool {
+    matches!(
+        err,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            ..
+        }
     )
 }
 
@@ -542,6 +661,17 @@ impl ComputeBackend for DockerBackend {
         }
         config.host_config = Some(host_config);
 
+        // Place the workload on its PER-PROJECT user-defined network (create-if-absent) and attach
+        // with a network ALIAS equal to the workload name. A sibling in the SAME project then
+        // resolves `<workload>:<port>` via docker's embedded DNS (the managed-DB DSN is name-based,
+        // and the default bridge — which this join replaces — has no embedded DNS). The network is
+        // per-project, so docker's inter-network isolation is the tenancy boundary: a different
+        // project's containers live on a different network and can neither resolve nor reach this
+        // one's. Published-port + bridge-IP reach (below) are unaffected — port publishing and
+        // container IPs work on a user-defined network exactly as on the default bridge.
+        let network = self.ensure_project_network(&req.project).await?;
+        config.networking_config = Some(network_config(&network, vec![req.workload.clone()]));
+
         // Best-effort clean of a stale container with the same name, then create.
         let _ = self
             .docker
@@ -612,6 +742,14 @@ impl ComputeBackend for DockerBackend {
             )
             .await
             .map_err(|e| BackendError::Stop(format!("remove {name}: {e}")))?;
+        // Best-effort GC of the per-project network: `remove_network` fails (ignored) while any
+        // sibling is still attached, so this reaps the network only once the LAST of a project's
+        // workloads has left — there is no dedicated project-teardown hook on the backend. A later
+        // launch re-creates it idempotently. Never fails the stop.
+        let _ = self
+            .docker
+            .remove_network(&project_network_name(&handle.project))
+            .await;
         Ok(())
     }
 
@@ -764,7 +902,32 @@ impl ComputeBackend for DockerBackend {
         let mut host_config = hardened_host_config(512, 1, RestartPolicy::Never, false, &[]);
         host_config.auto_remove = Some(true);
 
-        let env_strings: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // CONSUME the reserved per-project-network hint (see `EPHEMERAL_NETWORK_ENV`): a managed-DB
+        // export/import client must reach a DB that lives on an isolated per-project network, so the
+        // node asks us to join it. Strip the pair from the process env (it must NEVER reach the
+        // client) and remember the network to attach to; absent ⇒ the one-shot stays on the daemon
+        // default network (an external DSN, reachable via NAT egress), exactly as before.
+        let mut env_pairs: Vec<(String, String)> = env.to_vec();
+        // Strip EVERY occurrence of the reserved hint (not just the first) so no duplicate pair can
+        // ever survive into the client env; the last value wins as the network to join.
+        let mut ephemeral_network: Option<String> = None;
+        env_pairs.retain(|(k, v)| {
+            if k == EPHEMERAL_NETWORK_ENV {
+                ephemeral_network = Some(v.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        let env_strings: Vec<String> = env_pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // No `networking_config` at create: the one-shot comes up on the daemon's DEFAULT network
+        // (NAT egress), then — when a per-project network was hinted — is ALSO connected to that
+        // network below. Keeping the default attachment is what makes the client reach a managed DB
+        // that is NOT on a per-project network (an external DSN, a managed DB launched before the
+        // per-project-network change and not yet relaunched, or a colocated test DB on the default
+        // bridge) by the host its endpoint reports, exactly as before this backend grew per-project
+        // networks.
         let config = Config {
             image: Some(reference),
             cmd: Some(argv.to_vec()),
@@ -790,6 +953,49 @@ impl ComputeBackend for DockerBackend {
             )
             .await
             .map_err(|e| BackendError::Other(format!("ephemeral create: {e}")))?;
+
+        // DUAL-ATTACH: the one-shot already sits on the daemon default network (above); when the
+        // node hinted a per-project network, ALSO connect it there so it can reach a managed DB
+        // that lives on that isolated network (the post-relaunch shape — a per-project-network
+        // container IP or the DB's workload-name alias over the embedded DNS). Create-if-absent is
+        // robust to the network having been reaped between the DB's launch and this one-shot. The
+        // client is confined to NO single network: it keeps the default egress AND reaches the
+        // target project — which is correct, because the one-shot is boatramp's own operator tool
+        // (a fixed pg_dump/pg_restore/psql/mysqldump argv against ONE resolved DB), never guest
+        // code, so this is not a guest-tenancy seam; per-project WORKLOAD confinement (the launch
+        // path) is unchanged. Connect before start so the interface is present when the client
+        // runs; a failure here means the DB is unreachable, so force-remove + surface it.
+        if let Some(net) = &ephemeral_network {
+            // Create-if-absent with the SAME labels as the launch path (managed + project), so an
+            // operator's project-scoped GC/identification finds this network whether a one-shot or
+            // a workload launch won the create race. `net` is always `project_network_name(..)`-
+            // shaped, so recover the project by stripping the fixed prefix.
+            let project = net
+                .strip_prefix(PROJECT_NETWORK_PREFIX)
+                .unwrap_or(net.as_str());
+            let _ = self.ensure_project_network(project).await;
+            if let Err(e) = self
+                .docker
+                .connect_network(
+                    net,
+                    ConnectNetworkOptions {
+                        container: created.id.clone(),
+                        endpoint_config: EndpointSettings::default(),
+                    },
+                )
+                .await
+            {
+                self.force_remove_container(&name).await;
+                // Best-effort reap of the network if THIS call just created it (a fresh per-project
+                // network with no other endpoints). `remove_network` is a no-op error, ignored, when
+                // the network pre-existed and still has workloads attached — so we never tear down a
+                // live project network, only our own orphan.
+                let _ = self.docker.remove_network(net).await;
+                return Err(BackendError::Other(format!(
+                    "ephemeral join project network {net}: {e}"
+                )));
+            }
+        }
 
         // Attach BEFORE start so no output is missed, requesting a live bidirectional
         // stream. If attach (or start, below) fails, the container was CREATED but never
@@ -1343,6 +1549,75 @@ mod tests {
         // The monotonic sequence guarantees two back-to-back names never collide, even
         // within the same nanosecond — the daemon rejects a duplicate name.
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn project_network_name_is_deterministic_per_project_and_isolates() {
+        // Deterministic + prefixed so it never clobbers an unrelated network on a shared daemon.
+        assert_eq!(project_network_name("acme"), "boatramp-net-acme");
+        assert_eq!(project_network_name("acme"), project_network_name("acme"));
+        // The reserved default (and an empty id) share the one `default` network — still its OWN
+        // isolated network, never a shared node-wide one.
+        assert_eq!(project_network_name("default"), "boatramp-net-default");
+        assert_eq!(project_network_name(""), "boatramp-net-default");
+        // DISTINCT projects get DISTINCT networks — the tenancy boundary a single shared network
+        // would destroy. Regression guard for cross-project isolation.
+        assert_ne!(
+            project_network_name("acme"),
+            project_network_name("beta"),
+            "two projects must never share a network"
+        );
+        assert_ne!(
+            project_network_name("acme"),
+            project_network_name("default")
+        );
+    }
+
+    #[test]
+    fn network_config_attaches_with_the_workload_alias() {
+        // A workload server is attached with a DNS ALIAS equal to its workload name, so a sibling
+        // resolving `<workload>:<port>` over the embedded DNS finds it. One network, keyed exactly.
+        let cfg = network_config("boatramp-net-acme", vec!["pg".to_string()]);
+        assert_eq!(cfg.endpoints_config.len(), 1);
+        let ep = cfg
+            .endpoints_config
+            .get("boatramp-net-acme")
+            .expect("endpoint for the project network");
+        assert_eq!(ep.aliases.as_deref(), Some(["pg".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn network_config_without_aliases_leaves_aliases_unset() {
+        // A one-shot client is not a resolvable server: no alias, just membership.
+        let cfg = network_config("boatramp-net-acme", Vec::new());
+        let ep = cfg.endpoints_config.get("boatramp-net-acme").unwrap();
+        assert_eq!(ep.aliases, None);
+    }
+
+    #[test]
+    fn is_network_conflict_matches_only_409() {
+        // 409 ⇒ "already exists" ⇒ the idempotent create-if-absent success path.
+        assert!(is_network_conflict(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "network already exists".into(),
+            }
+        ));
+        // Any other status is a real error that must surface, not be swallowed.
+        assert!(!is_network_conflict(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "boom".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn ephemeral_network_env_key_is_stable() {
+        // The node sets this exact key (via `boatramp_docker::EPHEMERAL_NETWORK_ENV`); the backend
+        // strips + consumes it. A rename on one side without the other silently breaks the managed-
+        // DB export/import reach, so pin it.
+        assert_eq!(EPHEMERAL_NETWORK_ENV, "BOATRAMP_EPHEMERAL_NETWORK");
     }
 
     #[test]

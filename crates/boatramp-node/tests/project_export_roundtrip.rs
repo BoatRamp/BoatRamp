@@ -76,6 +76,8 @@ fn conn(user: &str, password: &str, host: &str, port: u16, db: &str) -> PgConnec
         password: password.to_string(),
         database: db.to_string(),
         connect_timeout_secs: 10,
+        // Test fixtures reach a real external Postgres directly — no per-project network join.
+        ephemeral_network: None,
     }
 }
 
@@ -1848,6 +1850,7 @@ async fn project_export_roundtrip_mysql() {
         password: password.clone(),
         database: db.to_string(),
         connect_timeout_secs: 10,
+        ephemeral_network: None,
     };
     // A maintenance connection (no default db) for CREATE/DROP DATABASE.
     let admin = mkconn("");
@@ -2062,6 +2065,7 @@ async fn project_export_mysql_chunked_shadow_live() {
         password: pw.to_string(),
         database: db.to_string(),
         connect_timeout_secs: 10,
+        ephemeral_network: None,
     };
     let admin = mkconn("", &user, &password); // superuser, no default db
 
@@ -3988,6 +3992,7 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
         password: password.clone(),
         database: db.to_string(),
         connect_timeout_secs: 10,
+        ephemeral_network: None,
     };
     let admin = mkconn("");
 
@@ -5315,6 +5320,7 @@ async fn project_export_mysql_true_delta_chain_live() {
         password: password.clone(),
         database: db.to_string(),
         connect_timeout_secs: 10,
+        ephemeral_network: None,
     };
     let admin = mkconn("");
 

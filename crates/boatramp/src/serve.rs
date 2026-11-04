@@ -425,6 +425,14 @@ pub struct ServeArgs {
     #[arg(long, value_enum, env = "BOATRAMP_KV", default_value_t = KvBackend::Slatedb)]
     kv: KvBackend,
 
+    /// Compute backend selection (mailroom #26). `kubernetes` pins the Kubernetes
+    /// compute backend (managed compute as native k8s StatefulSet/Service/PVC via the
+    /// in-cluster API) for boatramp running AS a pod; left unset, the node still
+    /// auto-detects an in-cluster environment and defaults to it there. Maps to
+    /// `[compute].backend`; only effective in a build with the `k8s-backend` feature.
+    #[arg(long, env = "BOATRAMP_COMPUTE_BACKEND")]
+    compute_backend: Option<String>,
+
     /// Migrate a pre-0.2.0 (layout 1) control-plane store to the project-scoped
     /// layout at startup instead of refusing to serve. Off by default so the
     /// re-key is an explicit, one-time operator action (`boatramp migrate`).

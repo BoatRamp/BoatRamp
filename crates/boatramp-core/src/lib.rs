@@ -76,6 +76,9 @@ pub mod project_delta;
 /// The operator-facing project export/import capability (native env-clone) — a core
 /// trait node implements and the admin API / CLI consume.
 pub mod project_export;
+/// `project prune` — GC a project's provably-orphaned control-plane state (fail-closed; the
+/// pure classification types + host-matching, applied over live KV by `DeployStore`).
+pub mod project_prune;
 pub mod redact;
 pub mod registry_auth;
 pub mod sealed_state;

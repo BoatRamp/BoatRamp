@@ -31,6 +31,13 @@ boatramp-firecracker = { workspace = true, features = [
 # no-op off macOS (the crate compiles to a shell whose `launch` is unreachable
 # because `build_compute` cfg-gates registration to macOS).
 boatramp-vz = { workspace = true, features = ["backend"] }
+# The Kubernetes compute backend (mailroom #26). OPTIONAL + gated behind this crate's
+# `k8s-backend` feature so a non-k8s build pulls none of the kube-rs / k8s-openapi tree;
+# `build_compute` registers it only when selected (`[compute].backend = "kubernetes"`)
+# or auto-detected in-cluster.
+boatramp-k8s = { workspace = true, optional = true, default-features = false, features = [
+  "k8s-backend",
+] }
 # Handler-runtime assembly (`handlers::build_handler_runtime`/`build_sql_backends`);
 # optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
 boatramp-handlers = { workspace = true, optional = true }
@@ -86,6 +93,10 @@ tokio-util = { workspace = true, features = ["compat", "rt"], optional = true }
 # features to the matching one here so the gating stays consistent.
 acme-dns = []
 azure = ["dep:boatramp-storage", "boatramp-storage/azure", "fallback"]
+# The Kubernetes compute backend (mailroom #26): `build_compute` registers the
+# `kubernetes` backend (managed compute as native k8s resources) when it is selected or
+# auto-detected in-cluster. Pulls `boatramp-k8s` + its kube-rs/k8s-openapi tree only here.
+k8s-backend = ["dep:boatramp-k8s"]
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
 cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]

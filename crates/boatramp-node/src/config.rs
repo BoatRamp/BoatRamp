@@ -744,6 +744,17 @@ impl ServerConfig {
 /// list so [`ServerConfig::apply_env_overrides`] can decide whether to materialise
 /// an absent section without repeating the names.
 const COMPUTE_ENV_VARS: &[&str] = &[
+    // Kubernetes compute backend (mailroom #26): backend selection + the k8s placement
+    // knobs. `BOATRAMP_COMPUTE_BACKEND` is also the env the `--compute-backend` serve flag
+    // maps through (the flag layer reuses this overlay), so wiring it here makes BOTH the
+    // documented env var AND the CLI flag select the backend. The k8s_* knobs are the
+    // idiomatic env/ConfigMap config path for a pod deployment.
+    "BOATRAMP_COMPUTE_BACKEND",
+    "BOATRAMP_COMPUTE_K8S_STORAGE_CLASS",
+    "BOATRAMP_COMPUTE_K8S_RETAIN_PVC",
+    "BOATRAMP_COMPUTE_K8S_IMAGE_PULL_SECRET",
+    "BOATRAMP_COMPUTE_K8S_VOLUME_SNAPSHOT_CLASS",
+    "BOATRAMP_COMPUTE_K8S_ALLOW_OUT_OF_CLUSTER",
     "BOATRAMP_COMPUTE_BRIDGE",
     "BOATRAMP_COMPUTE_SUBNET",
     "BOATRAMP_COMPUTE_VCPUS",
@@ -1130,6 +1141,61 @@ pub enum ManagedDbPrivilege {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComputeConfig {
+    /// **Compute backend selection** (mailroom #26). `Some("kubernetes")` pins the
+    /// Kubernetes backend (managed compute as native k8s StatefulSet/Service/PVC via the
+    /// in-cluster API) and suppresses the capability-detected docker / native-container /
+    /// VMM backends — for boatramp running AS a pod on k8s/k3s. `None` (default) keeps the
+    /// capability-detected behavior, BUT the node still auto-detects an in-cluster
+    /// environment (`KUBERNETES_SERVICE_HOST` + a mounted ServiceAccount token) and
+    /// defaults to the Kubernetes backend there. Set via `[compute] backend: "kubernetes"`,
+    /// env `BOATRAMP_COMPUTE_BACKEND`, or `--compute-backend kubernetes`. Consumed only when
+    /// the binary is built with the `k8s-backend` feature; an unknown value is ignored
+    /// (falls back to capability detection). Other backend ids are selected by capability,
+    /// not pinned here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// PVC `StorageClass` for the Kubernetes backend's managed-database data volumes.
+    /// `None` (default) ⇒ no `storageClassName` on the PVC, so the cluster's **default**
+    /// StorageClass is used (it must allow volume expansion for grow-in-place). Only read
+    /// by the `kubernetes` backend. Env: `BOATRAMP_COMPUTE_K8S_STORAGE_CLASS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_storage_class: Option<String>,
+    /// Whether the Kubernetes backend RETAINS a managed database's PVC on `stop` (default
+    /// `true` — a database's data must survive a routine teardown; an explicit destroy
+    /// deletes it). Only read by the `kubernetes` backend. Env:
+    /// `BOATRAMP_COMPUTE_K8S_RETAIN_PVC`.
+    #[serde(default = "default_k8s_retain_pvc")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_retain_pvc: bool,
+    /// The name of a pre-existing `kubernetes.io/dockerconfigjson` `Secret` in the serve
+    /// pod's namespace to attach to every launched pod as an `imagePullSecret`, so the
+    /// kubelet can pull an operand/workload image from a PRIVATE registry (Phase 2).
+    /// `None` (default) ⇒ anonymous/public pulls. The secret is managed outside boatramp
+    /// (the backend's least-privilege Role grants no `secrets` verb). Only read by the
+    /// `kubernetes` backend. Env: `BOATRAMP_COMPUTE_K8S_IMAGE_PULL_SECRET`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_image_pull_secret: Option<String>,
+    /// The CSI `VolumeSnapshotClass` the Kubernetes backend uses for volume snapshot /
+    /// restore (backup / clone-from-backup). `None` (default) ⇒ snapshot/restore is a
+    /// clean "unsupported" (the cluster's StorageClass CSI driver has no snapshot support,
+    /// or the operator did not opt in). Only read by the `kubernetes` backend. Env:
+    /// `BOATRAMP_COMPUTE_K8S_VOLUME_SNAPSHOT_CLASS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_volume_snapshot_class: Option<String>,
+    /// Allow an explicit `[compute].backend = "kubernetes"` pin to be accepted even when
+    /// this process is NOT running in-cluster (no `KUBERNETES_SERVICE_HOST` + mounted
+    /// ServiceAccount). `false` (default) ⇒ the pin is REFUSED out-of-cluster and boatramp
+    /// falls back to capability-detected backends, so a pin alone can't make it drive
+    /// whatever cluster a stray local kubeconfig points at (fail closed, mailroom #26
+    /// security F6). Set `true` to deliberately run boatramp out-of-cluster against a
+    /// kubeconfig-selected cluster. Only read by the `kubernetes` backend selection. Env:
+    /// `BOATRAMP_COMPUTE_K8S_ALLOW_OUT_OF_CLUSTER`.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub k8s_allow_out_of_cluster: bool,
     /// Bridge the container veths / VM taps attach to (default `br-boatramp`).
     pub bridge: String,
     /// Guest IP subnet (default `10.0.0.0/24`).
@@ -1326,6 +1392,11 @@ fn default_internal_dns() -> bool {
     true
 }
 
+/// Default for [`ComputeConfig::k8s_retain_pvc`] — retain a managed DB's PVC on stop.
+fn default_k8s_retain_pvc() -> bool {
+    true
+}
+
 /// Default upstream resolver for [`ComputeConfig::dns_upstream`].
 fn default_dns_upstream() -> String {
     "1.1.1.1:53".to_string()
@@ -1399,6 +1470,12 @@ fn default_allowed_kernel_hashes() -> Vec<String> {
 impl Default for ComputeConfig {
     fn default() -> Self {
         Self {
+            backend: None,
+            k8s_storage_class: None,
+            k8s_retain_pvc: default_k8s_retain_pvc(),
+            k8s_image_pull_secret: None,
+            k8s_volume_snapshot_class: None,
+            k8s_allow_out_of_cluster: false,
             bridge: "br-boatramp".to_string(),
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,

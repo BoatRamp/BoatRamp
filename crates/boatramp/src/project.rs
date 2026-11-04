@@ -99,6 +99,30 @@ enum ProjectCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// GC this project's PROVABLY-orphaned control-plane state (`Project·Admin`).
+    ///
+    /// Reclaims the leftovers a `clone --force` COMMINGLE — or a routine `deploy apply` that
+    /// rewrote a site's domains — leaves behind: stale per-site routing/config keys of a site that
+    /// serves nothing, and foreign-domain verification + auto-DNS ledger records a site's CURRENT
+    /// config no longer answers to. Fail-closed: ONLY provably-orphaned keys are touched — sealed
+    /// secrets, managed-DB credentials, another tenant's keys, the global routing/TLS keyspace,
+    /// live site config, GraphQL subgraphs and persisted APQ are ALL kept.
+    ///
+    /// DRY-RUN by default: reports every orphan + WHY, changing nothing. `--apply` deletes exactly
+    /// the reported set. Shared content-addressed deploy blobs/manifests are NOT reclaimed here —
+    /// that node-global GC is `boatramp prune` (`System·Admin`).
+    Prune {
+        /// The project to prune.
+        name: String,
+        /// Execute the prune — delete the reported orphans. Without it, a safe dry-run only.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the interactive confirmation prompt on `--apply` (required to `--apply` when stdin
+        /// is not a TTY). Deletes are irreversible, so `--apply` otherwise previews the plan and
+        /// asks you to type the project name — parity with `project rm --force`.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Drive this project's owner-gated schema migrations for a managed database
     /// (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's
     /// non-superuser owner role and need a `Project·Admin` token; `status` needs `Project·Read`.
@@ -267,6 +291,25 @@ enum ProjectCommand {
 /// TTY.
 fn confirmation_matches(project: &str, typed: &str) -> bool {
     typed.trim() == project
+}
+
+/// A concise human summary of a prune plan's provable orphans, shown before the `--apply`
+/// confirmation prompt (parity with `project rm`'s plan preview). Lists each key + why it is an
+/// orphan, plus the live sites the sweep kept.
+fn summarize_prune_plan(plan: &boatramp_core::project_prune::ProjectPrunePlan) -> String {
+    use std::fmt::Write;
+    let mut out = format!(
+        "project `{}`: {} orphaned control-plane key(s) would be deleted:\n",
+        plan.project,
+        plan.prunable.len(),
+    );
+    for p in &plan.prunable {
+        let _ = writeln!(out, "  - {} [{}]: {}", p.key, p.reason.as_str(), p.detail);
+    }
+    if !plan.live_sites.is_empty() {
+        let _ = writeln!(out, "keeping live site(s): {}", plan.live_sites.join(", "));
+    }
+    out
 }
 
 /// Render a clone plan's to-transfer byte count. A fallback backend with no per-object size makes
@@ -668,6 +711,10 @@ pub enum ProjectOutput {
         plan: boatramp_core::project_export::ClonePlan,
         report: boatramp_core::project_export::ImportReport,
     },
+    /// `project prune` — the provable-orphan plan (dry-run) or executed outcome (`--apply`).
+    Pruned {
+        plan: boatramp_core::project_prune::ProjectPrunePlan,
+    },
     /// The output was already written directly by this arm (a delegated subcommand's own
     /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
     Passthrough,
@@ -832,6 +879,42 @@ impl crate::output::Rendered for ProjectOutput {
                 }
                 Ok(())
             }
+            Self::Pruned { plan } => {
+                if plan.is_clean() {
+                    return writeln!(
+                        w,
+                        "project `{}` is clean — no provably-orphaned control-plane state found",
+                        plan.project
+                    );
+                }
+                let verb = if plan.applied { "pruned" } else { "prunable" };
+                writeln!(
+                    w,
+                    "project `{}`: {} orphaned control-plane key(s) [{}]",
+                    plan.project,
+                    plan.prunable.len(),
+                    verb,
+                )?;
+                for p in &plan.prunable {
+                    writeln!(w, "  - {} [{}]: {}", p.key, p.reason.as_str(), p.detail)?;
+                }
+                if plan.applied {
+                    writeln!(w, "removed {} key(s)", plan.removed)?;
+                } else {
+                    writeln!(
+                        w,
+                        "(dry-run — nothing deleted; re-run with --apply to remove the above)"
+                    )?;
+                }
+                if !plan.live_sites.is_empty() {
+                    writeln!(w, "kept live site(s): {}", plan.live_sites.join(", "))?;
+                }
+                writeln!(
+                    w,
+                    "note: shared content-addressed deploy blobs/manifests are reclaimed by the \
+                     node-global `boatramp prune` (System·Admin), not this per-project verb"
+                )
+            }
             Self::Passthrough => Ok(()),
         }
     }
@@ -936,6 +1019,41 @@ pub async fn run(
                     Err(e) => Err(e.into()),
                 }
             }
+        }
+        ProjectCommand::Prune { name, apply, yes } => {
+            if apply && !yes {
+                // Preview the provable-orphan plan first (a read-only dry-run), then require an
+                // interactive confirmation — deletes are irreversible. Parity with
+                // `project rm --force` (show the plan, type the project name to confirm).
+                let preview = cp.project_prune(&name, false).await?;
+                if preview.is_clean() {
+                    // Nothing to delete — report the clean plan, no prompt/apply needed.
+                    return Ok(ProjectOutput::Pruned { plan: preview });
+                }
+                println!("{}", summarize_prune_plan(&preview));
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    return Err(Error::Aborted(
+                        "refusing to --apply a prune non-interactively; pass --yes to confirm"
+                            .to_string(),
+                    ));
+                }
+                use std::io::Write;
+                print!(
+                    "this permanently deletes the above control-plane key(s) and cannot be undone; \
+                     type the project name to confirm: "
+                );
+                std::io::stdout().flush().map_err(Error::Io)?;
+                let mut typed = String::new();
+                std::io::stdin().read_line(&mut typed).map_err(Error::Io)?;
+                if !confirmation_matches(&name, &typed) {
+                    return Err(Error::Aborted(format!(
+                        "confirmation `{}` does not match project `{name}` — aborted",
+                        typed.trim()
+                    )));
+                }
+            }
+            let plan = cp.project_prune(&name, apply).await?;
+            Ok(ProjectOutput::Pruned { plan })
         }
         ProjectCommand::Migrate(margs) => {
             crate::project_migrate::run(margs, &cp).await?;
@@ -1191,6 +1309,30 @@ mod tests {
         }
         // `rm` requires a name.
         assert!(parse(&["project", "rm"]).is_err());
+    }
+
+    #[test]
+    fn prune_flags_parse() {
+        // Bare `prune <name>` → dry-run (no apply), no yes.
+        match parse(&["project", "prune", "acme"]) {
+            Ok(ProjectCommand::Prune { name, apply, yes }) => {
+                assert_eq!(name, "acme");
+                assert!(!apply && !yes);
+            }
+            other => panic!("expected prune, got {other:?}"),
+        }
+        // `--apply -y` (short `-y` for `--yes`, for automation).
+        match parse(&["project", "prune", "acme", "--apply", "-y"]) {
+            Ok(ProjectCommand::Prune { apply, yes, .. }) => assert!(apply && yes),
+            other => panic!("expected prune --apply -y, got {other:?}"),
+        }
+        // `--apply --yes` long form.
+        match parse(&["project", "prune", "acme", "--apply", "--yes"]) {
+            Ok(ProjectCommand::Prune { apply, yes, .. }) => assert!(apply && yes),
+            other => panic!("expected prune --apply --yes, got {other:?}"),
+        }
+        // `prune` requires a name.
+        assert!(parse(&["project", "prune"]).is_err());
     }
 
     #[test]

@@ -205,7 +205,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // runtime's managed compute-backed `sql` binding can resolve DB endpoints from
     // the same store the reconcile writes.
     let compute_storage = storage.clone();
-    let deploy = DeployStore::new(storage, kv.clone());
+    // Thread the boot-time KV degraded-state breadcrumb into the store so a destructive
+    // `project prune --apply` fails closed under a self-healed/quarantined control-plane KV
+    // (Security review Finding C). `None` on a clean boot / non-SlateDB backend ⇒ no gate.
+    let deploy =
+        DeployStore::new(storage, kv.clone()).with_kv_degraded(options.kv_degraded.clone());
     // **Crown-jewel frontier-sync (v0.9.0 KV-recovery, C2).** The sealed-secret / sealed-credential
     // stores below hold IRREPLACEABLE data (a dropped write = a lost secret with no client copy), so
     // rather than rely on per-call-site discipline we route them ALL through a `CheckpointKv`: every
