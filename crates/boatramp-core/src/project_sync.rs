@@ -22,13 +22,30 @@
 //!   per-item atomicity + skip-and-report (never refuse-all), with [`Selection::strict`] flipping
 //!   skip → refuse.
 //!
-//! **Execution (`--apply`) is increment 2.** Nothing here mutates: the data/KV transfer, the
-//! config-body rewrite, and the absent-destination create/provision are deliberately out of scope.
+//! ## Increment 2 — the `--apply` EXECUTION
+//!
+//! [`apply_sync`] is the mutating core: it EXECUTES the preflight [`SyncPlan`] — idempotently,
+//! coherently, and fail-closed on tenancy. It is deliberately a PURE orchestrator over a small
+//! side-effecting seam, [`SyncExecutor`]: the engine decides WHAT happens, in WHAT order, with
+//! WHICH target-scoped keys, and WHICH items atomically carry / rewrite / skip; the executor binds
+//! each effect to the real machinery (the export/import clone transport, the project-create +
+//! managed-DB provisioning seams, and [`crate::deploy::DeployStore::set_site_config`]) — or, in a
+//! unit test, to an in-memory fake. This keeps the risky, tenancy-sensitive logic unit-testable in
+//! isolation and lets the engine NEVER rebuild transport.
+//!
+//! The coherence CORE is [`rewrite_site_config_preserving_dest_domains`]: a `--include sites
+//! --exclude domains` carry mirrors the source `SiteConfig` body EXCEPT its `domains` field, which
+//! is preserved from the destination (or empty on a fresh dest) — a BODY rewrite, never a key drop,
+//! carrying ZERO source domains (the A/B-safe exclude). When domains ARE carried, the write seam's
+//! host-uniqueness guard refuses a second simultaneously-live claimant of a host
+//! ([`SyncApplyError::DomainConflict`]) — the exclusive-domain-ownership safety constraint.
 
 use std::collections::BTreeSet;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{DomainConfig, SiteConfig};
 use crate::project::ProjectRef;
 use crate::project_export::sealed_secret_prefixes;
 
@@ -637,6 +654,507 @@ pub fn plan_sync(
     }
 }
 
+// =============================================================================================
+// Increment 2 — the `--apply` EXECUTION
+// =============================================================================================
+
+/// Rewrite a carried SOURCE [`SiteConfig`] so the destination keeps its OWN domains (PLAN rule 2 —
+/// a `--include sites --exclude domains` carry). Everything in the source body is mirrored EXCEPT
+/// the `domains` field, which is REPLACED by `dest_domains` — the destination's current domains, or
+/// an EMPTY [`DomainConfig`] on a fresh/absent destination (nothing to preserve).
+///
+/// SAFETY INVARIANT (the reliability half of the domain layer, PLAN "Exclude is complete"): the
+/// result carries ZERO source domains — not `primary`, not an `alias`, not a `wildcard`, not a
+/// per-host context tag (the whole [`DomainConfig`] is replaced, so `contexts` come from the dest
+/// too). A resync therefore can never make the destination claim a source host, and never touches
+/// the dest's own `domainverify` proofs (no re-authorization). It is a BODY rewrite, never a key
+/// drop: the emitted body is re-pointed through the normal content-addressed `siteconfig/<hash>` +
+/// `site/`/`current/` machinery by the executor.
+#[must_use]
+pub fn rewrite_site_config_preserving_dest_domains(
+    source: &SiteConfig,
+    dest_domains: Option<&DomainConfig>,
+) -> SiteConfig {
+    let mut out = source.clone();
+    out.domains = dest_domains.cloned().unwrap_or_default();
+    out
+}
+
+/// The content-address (`siteconfig/<hash>` hash) of a `SiteConfig` body — byte-identical to what
+/// [`crate::deploy::DeployStore::set_site_config`] computes (`sha256_hex(to_json)`). So a rewrite
+/// that reproduces the destination's EXISTING body yields the dest's existing hash ⇒ the pointer
+/// flip is a no-op, which is what makes a second `--apply` of an unchanged source converge to
+/// nothing (idempotent resync). Used by a same-node executor that writes the body + pointer
+/// directly; the HTTP `put_site_config` path recomputes the same hash node-side.
+pub fn site_config_hash(cfg: &SiteConfig) -> Result<String, SyncApplyError> {
+    let body = cfg
+        .to_json()
+        .map_err(|e| SyncApplyError::Rewrite(e.to_string()))?;
+    Ok(crate::deploy::sha256_hex(&body))
+}
+
+/// A failure during [`apply_sync`]. A per-ITEM failure (a site that cannot carry coherently, or an
+/// exclusive-domain double-claim) is NOT one of these under the default posture — it is recorded in
+/// the [`SyncApplyReport`] as a skipped item and the run continues (PLAN semantics §3,
+/// skip-and-report). These variants are the RUN-level, abort-the-whole-sync failures: a data-plane
+/// transfer that failed, a provisioning failure, a `--strict` refusal, or an executor seam that is
+/// not available on this platform yet.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncApplyError {
+    /// The absent destination could not be created / provisioned.
+    #[error("destination create/provision failed: {0}")]
+    Provision(String),
+    /// A data-plane transfer (managed-DB contents or blobs) failed — run-level, not per-item.
+    #[error("{piece} transfer failed: {message}")]
+    Transfer {
+        /// `pg` or `blobs`.
+        piece: &'static str,
+        /// The underlying error text.
+        message: String,
+    },
+    /// A control-plane KV stratum carry failed.
+    #[error("carry of `{piece}` failed: {message}")]
+    Carry {
+        /// The piece whose stratum carry failed.
+        piece: &'static str,
+        /// The underlying error text.
+        message: String,
+    },
+    /// EXCLUSIVE-DOMAIN double-claim (PLAN "exclusive domain ownership"): a carried site's host is
+    /// already a LIVE owner in a different project/site, so writing it would create a second
+    /// simultaneously-live claimant. Surfaced by the write seam's host-uniqueness guard
+    /// ([`crate::deploy::DeployStore::set_site_config`] → `Conflict`). Under the default posture the
+    /// engine CATCHES this and records a skipped item; it only escapes as an error under `--strict`.
+    #[error("exclusive-domain conflict on site `{site}`: {message}")]
+    DomainConflict {
+        /// The site whose carried host is double-claimed.
+        site: String,
+        /// The conflict detail (which host, held by whom).
+        message: String,
+    },
+    /// A `SiteConfig` rewrite / (de)serialize failure.
+    #[error("site config rewrite failed: {0}")]
+    Rewrite(String),
+    /// A requested executor seam is not available on this platform/build yet (an HONEST stub — e.g.
+    /// a selective control-plane KV-stratum carry that needs a node-side sync endpoint). Carries the
+    /// piece so the operator sees exactly which part of the selection could not execute.
+    #[error("{0}")]
+    Unsupported(String),
+    /// `--strict` refusal: ≥1 item is incoherent or domain-conflicting, and strict is all-or-nothing.
+    #[error("strict apply refused: {count} item(s) would be skipped\n{detail}")]
+    StrictRefused {
+        /// How many items would be skipped.
+        count: usize,
+        /// Per-item reasons, one per line.
+        detail: String,
+    },
+    /// Any other executor failure.
+    #[error("{0}")]
+    Other(String),
+}
+
+/// The side-effecting seam [`apply_sync`] drives. The ENGINE decides WHAT happens, in WHAT order,
+/// with WHICH target-scoped keys, and WHICH items carry / rewrite / skip atomically; an executor
+/// binds each effect to the real machinery — or, in a unit test, to an in-memory fake.
+///
+/// FAIL-CLOSED TENANCY: the engine passes ONLY target-owned, structurally-scoped prefixes to
+/// [`carry_kv_stratum`](Self::carry_kv_stratum) (built from [`piece_kv_strata`], whose invariant
+/// test proves every prefix lies within [`project_owned_prefixes`](crate::project_export::project_owned_prefixes)).
+/// An executor can therefore never be ASKED to write outside the target project's owned keyspace;
+/// a real executor additionally re-applies the import-side
+/// [`enforce_target_scoped_kv`](crate::project_export::enforce_target_scoped_kv) as defence in depth.
+#[async_trait]
+pub trait SyncExecutor: Send {
+    /// Create + provision the ABSENT destination (the project record + its managed DB), reusing the
+    /// project-create + managed-DB provisioning seams. MUST be idempotent (a no-op if it already
+    /// exists), so a resync after a partial create converges.
+    async fn create_and_provision_dest(&mut self) -> Result<(), SyncApplyError>;
+
+    /// Transfer the managed-DB contents (pg/mysql/libsql SQL true-delta + atomic shadow+swap) from
+    /// source to target, reusing the export/import clone transport. MUST be idempotent (delta): a
+    /// re-run moves only what changed and a no-change re-run moves nothing.
+    async fn transfer_pg(&mut self) -> Result<(), SyncApplyError>;
+
+    /// Transfer the content-addressed blob store (integrity/delta). MUST be idempotent (by hash):
+    /// a blob already present content-matched is skipped.
+    async fn transfer_blobs(&mut self) -> Result<(), SyncApplyError>;
+
+    /// Carry a control-plane KV STRATUM: mirror the source's entries under this piece into the
+    /// target, structurally re-scoped to `target_prefixes` (which the engine built from
+    /// [`piece_kv_strata`] — all target-owned). The executor must reuse
+    /// [`scope_entries_to_project`](crate::project_export::scope_entries_to_project) /
+    /// [`enforce_target_scoped_kv`](crate::project_export::enforce_target_scoped_kv) so a crafted
+    /// source can never land a foreign key. `exclude_prefixes` are target keys the carry must NOT
+    /// write (a dropped/skipped site's `current/`/`alias/` dependants — coherence). A true mirror
+    /// MAY prune target-only entries within the stratum (source-authoritative). Returns the number
+    /// of KV records written. MUST be idempotent (same source ⇒ same bytes).
+    async fn carry_kv_stratum(
+        &mut self,
+        piece: Piece,
+        target_prefixes: &[String],
+        exclude_prefixes: &BTreeSet<String>,
+    ) -> Result<usize, SyncApplyError>;
+
+    /// Carry (declare + provision) one managed-database binding `name` from the source to the target,
+    /// reusing the declarative managed-DB seam. MUST be idempotent.
+    async fn carry_database(&mut self, name: &str) -> Result<(), SyncApplyError>;
+
+    /// Read the SOURCE site's `SiteConfig` (for a carry/rewrite). `None` ⇒ the source has no such
+    /// site (the item is reported, not written).
+    async fn read_source_site_config(
+        &mut self,
+        site: &str,
+    ) -> Result<Option<SiteConfig>, SyncApplyError>;
+
+    /// Read the DESTINATION site's current domains, to PRESERVE them on a domains-excluded rewrite.
+    /// `None` ⇒ a fresh/absent destination or a dest without that site (⇒ empty domains — nothing to
+    /// preserve).
+    async fn read_dest_site_domains(
+        &mut self,
+        site: &str,
+    ) -> Result<Option<DomainConfig>, SyncApplyError>;
+
+    /// Write a site's `SiteConfig` to the DESTINATION — content-address the body, re-point
+    /// `site/`+`current/`, rebuild the routing index, enforce the host-uniqueness hijack guard
+    /// ([`crate::deploy::DeployStore::set_site_config`]). MUST return
+    /// [`SyncApplyError::DomainConflict`] when a carried host is already a LIVE owner in a different
+    /// project/site (the exclusive-domain guard). MUST be idempotent (same body ⇒ same hash ⇒
+    /// pointer no-op). Returns `true` iff the write actually CHANGED the destination (so the report
+    /// can distinguish a real carry from an idempotent no-op).
+    async fn write_dest_site_config(
+        &mut self,
+        site: &str,
+        cfg: &SiteConfig,
+    ) -> Result<bool, SyncApplyError>;
+}
+
+/// One item the apply SKIPPED (did not write), with its reason — PLAN semantics §3 (skip-and-report,
+/// never half-applied). The destination's prior, coherent state for the item is left intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedItem {
+    /// Site or database.
+    pub kind: ItemKind,
+    /// The item name.
+    pub name: String,
+    /// Why it was skipped (incoherent dependency, or an exclusive-domain double-claim).
+    pub reason: String,
+}
+
+/// The outcome of an applied sync — what actually moved, and what was skipped/dropped. Mirrors
+/// [`crate::project_export::ImportReport`]'s legible-summary role.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncApplyReport {
+    /// The destination project was absent and was created + provisioned.
+    pub dest_created: bool,
+    /// Managed-DB contents were transferred (pg piece carried).
+    pub pg_transferred: bool,
+    /// The blob store was transferred (blobs piece carried).
+    pub blobs_transferred: bool,
+    /// Control-plane KV records written across the carried strata.
+    pub kv_records: usize,
+    /// Which KV-stratum pieces were carried.
+    pub kv_strata_carried: Vec<Piece>,
+    /// Managed databases carried (declared + provisioned).
+    pub databases_carried: Vec<String>,
+    /// Sites carried whole (domains included).
+    pub sites_carried: Vec<String>,
+    /// Sites carried with the domains field rewritten to the destination's own.
+    pub sites_rewritten: Vec<String>,
+    /// Sites/databases whose body the write left unchanged (idempotent no-op) — the convergence
+    /// signal a second `--apply` reports.
+    pub unchanged: Vec<String>,
+    /// Items SKIPPED (incoherent, or exclusive-domain) with reasons — never half-applied.
+    pub skipped: Vec<SkippedItem>,
+    /// Items explicitly dropped by a per-item `--exclude-site`/`--exclude-db`.
+    pub dropped: Vec<String>,
+    /// Whether identity was `fresh` (source-sealed secrets dropped).
+    pub identity_fresh: bool,
+    /// Whether `--strict` was in force.
+    pub strict: bool,
+    /// Operator notes (seams not wired on this platform, coherence caveats).
+    pub notes: Vec<String>,
+}
+
+impl SyncApplyReport {
+    /// How many items were skipped (incoherent / exclusive-domain). A human/CI gates on a non-zero
+    /// count (PLAN semantics §3 — "a non-zero skipped count a human/CI can gate on").
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.len()
+    }
+
+    /// Whether the apply completed WITH skips (the distinct "completed with N skipped" outcome).
+    #[must_use]
+    pub fn completed_with_skips(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+
+    /// Whether this apply changed NOTHING at the destination — every carried item was an idempotent
+    /// no-op and nothing was created/transferred. The converged resync signal.
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        !self.dest_created
+            && !self.pg_transferred
+            && !self.blobs_transferred
+            && self.kv_records == 0
+            && self.databases_carried.is_empty()
+            && self.sites_carried.is_empty()
+            && self.sites_rewritten.is_empty()
+    }
+}
+
+/// EXECUTE the preflight [`SyncPlan`] against `exec` — the mutating, tenancy-sensitive core of
+/// `project sync --apply`. Idempotent (a second run of an unchanged source converges to a no-op),
+/// coherent (per-item atomic carry/rewrite, incoherent items skipped-and-reported, never
+/// half-applied), and fail-closed on tenancy (every carried key is structurally target-scoped).
+///
+/// ORDER (dependency-aware): create+provision an absent dest → transfer the data plane (pg, blobs)
+/// → carry managed-DB bindings → carry the independent KV strata (settings, graphql) → carry/rewrite
+/// the sites per item → carry the site-DEPENDENT strata (domains' verification/alias records, then
+/// history's current pointers) → drop sealed secrets (identity fresh). A `--strict` plan with any
+/// pre-known incoherent item is refused up front; an exclusive-domain conflict discovered at write
+/// time is a skip under the default posture and a refusal under `--strict`.
+pub async fn apply_sync(
+    plan: &SyncPlan,
+    exec: &mut dyn SyncExecutor,
+) -> Result<SyncApplyReport, SyncApplyError> {
+    let target = plan.target.clone();
+    let pr = ProjectRef::new(&target);
+
+    // --- strict pre-check: a plan that already classified ≥1 incoherent item refuses as a whole
+    //     (PLAN semantics §3). The dry-run computed the full plan; here we refuse before mutating.
+    if plan.is_refused() {
+        let detail = plan
+            .skipped_items()
+            .iter()
+            .map(|i| {
+                format!(
+                    "  - {} `{}`: {}",
+                    item_kind_str(i.kind),
+                    i.name,
+                    reason_of(i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(SyncApplyError::StrictRefused {
+            count: plan.skipped_count(),
+            detail,
+        });
+    }
+
+    let mut report = SyncApplyReport {
+        identity_fresh: plan.identity_fresh,
+        strict: plan.strict,
+        ..Default::default()
+    };
+
+    // Helper: is a piece included (disposition is a real action, not preserve)?
+    let piece_plan = |p: Piece| plan.pieces.iter().find(|pp| pp.piece == p);
+    let included = |p: Piece| piece_plan(p).map(|pp| pp.included).unwrap_or(false);
+
+    // The site names the apply did NOT carry (skipped-or-dropped) — their `current/`/`alias/`
+    // dependants must be excluded from the history/domains stratum carries so a carry never leaves a
+    // pointer to a site body that was not written (coherence).
+    let uncarried_sites: BTreeSet<String> = plan
+        .items
+        .iter()
+        .filter(|i| {
+            i.kind == ItemKind::Site
+                && matches!(i.disposition, Disposition::Skip | Disposition::Drop)
+        })
+        .map(|i| i.name.clone())
+        .collect();
+
+    // --- 1) absent destination: create + provision -------------------------------------------
+    if plan.dest == DestPrecondition::CreateAndProvision {
+        exec.create_and_provision_dest().await?;
+        report.dest_created = true;
+    }
+
+    // --- 2) data plane: managed-DB contents + blobs (idempotent delta / by-hash) --------------
+    if included(Piece::Pg) {
+        exec.transfer_pg().await?;
+        report.pg_transferred = true;
+    }
+    if included(Piece::Blobs) {
+        exec.transfer_blobs().await?;
+        report.blobs_transferred = true;
+    }
+
+    // --- 3) managed-database bindings (per-item: carry declared+provisioned, or drop) ---------
+    if included(Piece::Databases) {
+        for it in plan.items.iter().filter(|i| i.kind == ItemKind::Database) {
+            match it.disposition {
+                Disposition::Drop => report.dropped.push(format!("db:{}", it.name)),
+                Disposition::Skip => report.skipped.push(SkippedItem {
+                    kind: ItemKind::Database,
+                    name: it.name.clone(),
+                    reason: reason_of(it),
+                }),
+                _ => {
+                    exec.carry_database(&it.name).await?;
+                    report.databases_carried.push(it.name.clone());
+                }
+            }
+        }
+    }
+
+    // --- 4) independent KV strata: settings, graphql -----------------------------------------
+    for piece in [Piece::Settings, Piece::Graphql] {
+        if included(piece) {
+            let strata = piece_plan(piece)
+                .map(|pp| pp.kv_strata.clone())
+                .unwrap_or_default();
+            let n = exec
+                .carry_kv_stratum(piece, &strata, &BTreeSet::new())
+                .await?;
+            report.kv_records += n;
+            report.kv_strata_carried.push(piece);
+        }
+    }
+
+    // --- 5) sites: per-item carry / rewrite / skip / drop (the coherence core) -----------------
+    let domains_included = included(Piece::Domains);
+    if included(Piece::Sites) {
+        for it in plan.items.iter().filter(|i| i.kind == ItemKind::Site) {
+            match it.disposition {
+                Disposition::Drop => {
+                    report.dropped.push(format!("site:{}", it.name));
+                    continue;
+                }
+                Disposition::Skip => {
+                    report.skipped.push(SkippedItem {
+                        kind: ItemKind::Site,
+                        name: it.name.clone(),
+                        reason: reason_of(it),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+            // Read the source body (the item is reported, not written, if the source lacks it).
+            let Some(source_cfg) = exec.read_source_site_config(&it.name).await? else {
+                report.skipped.push(SkippedItem {
+                    kind: ItemKind::Site,
+                    name: it.name.clone(),
+                    reason: "source has no such site config to carry".into(),
+                });
+                continue;
+            };
+            // Carry whole (domains included) vs rewrite the domains field (domains excluded).
+            let to_write = if domains_included {
+                source_cfg
+            } else {
+                let dest_domains = exec.read_dest_site_domains(&it.name).await?;
+                rewrite_site_config_preserving_dest_domains(&source_cfg, dest_domains.as_ref())
+            };
+            match exec.write_dest_site_config(&it.name, &to_write).await {
+                Ok(changed) => {
+                    if !changed {
+                        report.unchanged.push(format!("site:{}", it.name));
+                    } else if domains_included {
+                        report.sites_carried.push(it.name.clone());
+                    } else {
+                        report.sites_rewritten.push(it.name.clone());
+                    }
+                }
+                Err(SyncApplyError::DomainConflict { site, message }) => {
+                    // Exclusive-domain double-claim. Per-item atomic: nothing was written for this
+                    // site (the dest's prior state is intact). Default → skip-and-report; strict →
+                    // refuse the whole run.
+                    if plan.strict {
+                        return Err(SyncApplyError::StrictRefused {
+                            count: 1,
+                            detail: format!("  - site `{site}`: {message}"),
+                        });
+                    }
+                    report.skipped.push(SkippedItem {
+                        kind: ItemKind::Site,
+                        name: site,
+                        reason: format!("exclusive-domain conflict: {message}"),
+                    });
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    // --- 6) site-dependent KV strata: domains (verification/alias), then history (current/) ----
+    //     Carried AFTER the sites so a current/alias pointer never precedes its site body. A
+    //     skipped/dropped site's dependants are excluded (coherence).
+    //
+    //     DOMAINS: the hostnames (the `domains` FIELD) ride in the carried `SiteConfig` above, so a
+    //     domains-included carry already re-points the dest's routing index via the site write. The
+    //     `domainverify/`/`alias/` PROOF records are runtime-EARNED (ACME/DNS control proofs) and
+    //     environment-coupled; under `--identity fresh` the target RE-DERIVES them under its own
+    //     identity (like routing + TLS), so they are NOT carried. Only an `--identity adopt`
+    //     (same-environment recovery) carries the proofs verbatim.
+    if domains_included {
+        if plan.identity_fresh {
+            report.notes.push(
+                "domains carried: the hostnames ride in the site config (routing re-indexed on \
+                 write); the `domainverify`/`alias` proofs are re-earned under the target's own \
+                 identity (--identity fresh), not carried"
+                    .into(),
+            );
+        } else {
+            let strata = piece_plan(Piece::Domains)
+                .map(|pp| pp.kv_strata.clone())
+                .unwrap_or_default();
+            let excludes: BTreeSet<String> = uncarried_sites
+                .iter()
+                .map(|s| crate::deploy::keys::alias_prefix(pr, s))
+                .collect();
+            let n = exec
+                .carry_kv_stratum(Piece::Domains, &strata, &excludes)
+                .await?;
+            report.kv_records += n;
+            report.kv_strata_carried.push(Piece::Domains);
+        }
+    }
+    if included(Piece::History) {
+        let strata = piece_plan(Piece::History)
+            .map(|pp| pp.kv_strata.clone())
+            .unwrap_or_default();
+        let mut excludes: BTreeSet<String> = BTreeSet::new();
+        for s in &uncarried_sites {
+            excludes.insert(format!("project/{target}/current/{s}"));
+            excludes.insert(format!("project/{target}/current-principal/{s}"));
+        }
+        let n = exec
+            .carry_kv_stratum(Piece::History, &strata, &excludes)
+            .await?;
+        report.kv_records += n;
+        report.kv_strata_carried.push(Piece::History);
+    }
+
+    // --- 7) secrets: sealed under the source KEK — dropped under identity fresh (never carried) --
+    if included(Piece::Secrets) && !plan.identity_fresh {
+        return Err(SyncApplyError::Unsupported(
+            "carrying sealed secrets requires `--identity adopt` (install the source KEK); \
+             adopt is not implemented yet — re-run with `--identity fresh` to drop them and let \
+             the target re-provision its own"
+                .into(),
+        ));
+    }
+
+    Ok(report)
+}
+
+/// The stable token for an [`ItemKind`] in an operator message.
+fn item_kind_str(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Site => "site",
+        ItemKind::Database => "db",
+    }
+}
+
+/// The reason string of an [`ItemPlan`], defaulting when none was recorded.
+fn reason_of(i: &ItemPlan) -> String {
+    i.reason.clone().unwrap_or_else(|| "incoherent".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +1399,752 @@ mod tests {
             .map(|i| i.name.as_str())
             .collect();
         assert_eq!(skipped, vec!["legacy"]);
+    }
+
+    // ===== Increment 2 — the `--apply` execution engine =====================================
+
+    use crate::config::{DomainConfig, SiteConfig};
+    use std::collections::BTreeMap;
+
+    /// A `SiteConfig` with `primary` host `host` and a distinguishing non-domain field
+    /// (`security.https_redirect`), so a rewrite that preserves dest domains still visibly carries
+    /// the source's NON-domain body.
+    fn cfg_with(host: &str, https_redirect: bool) -> SiteConfig {
+        let mut c = SiteConfig {
+            domains: DomainConfig {
+                primary: Some(host.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        c.security.https_redirect = https_redirect;
+        c
+    }
+
+    /// An in-memory [`SyncExecutor`] for the apply-engine tests. It records every ACTUAL state
+    /// change in `writes` (cleared per apply via [`take_writes`](Self::take_writes)) so idempotency
+    /// is a concrete assertion (a second apply produces no writes), models the exclusive-domain
+    /// guard (`live_hosts_elsewhere` → [`SyncApplyError::DomainConflict`]), and preserves dest
+    /// domains out of `dest_sites`.
+    #[derive(Default)]
+    struct FakeExecutor {
+        dest_exists: bool,
+        pg_synced: bool,
+        blobs_synced: bool,
+        source_sites: BTreeMap<String, SiteConfig>,
+        dest_sites: BTreeMap<String, SiteConfig>,
+        carried_dbs: Vec<String>,
+        carried_strata: Vec<Piece>,
+        /// Hosts already LIVE-owned by a DIFFERENT owner — carrying one is an exclusive-domain
+        /// conflict (the write-time hijack guard).
+        live_hosts_elsewhere: BTreeSet<String>,
+        /// Target keyspace the engine asked a stratum carry to write — recorded for the tenancy
+        /// assertion (every prefix must be target-owned).
+        carried_prefixes: Vec<String>,
+        /// Prefixes the engine told a carry to EXCLUDE (coherence — dropped/skipped site dependants).
+        excluded_prefixes: Vec<String>,
+        /// Actual state changes this apply (idempotency witness).
+        writes: Vec<String>,
+    }
+
+    impl FakeExecutor {
+        fn take_writes(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.writes)
+        }
+    }
+
+    #[async_trait]
+    impl SyncExecutor for FakeExecutor {
+        async fn create_and_provision_dest(&mut self) -> Result<(), SyncApplyError> {
+            if !self.dest_exists {
+                self.dest_exists = true;
+                self.writes.push("create+provision dest".into());
+            }
+            Ok(())
+        }
+        async fn transfer_pg(&mut self) -> Result<(), SyncApplyError> {
+            if !self.pg_synced {
+                self.pg_synced = true;
+                self.writes.push("pg".into());
+            }
+            Ok(())
+        }
+        async fn transfer_blobs(&mut self) -> Result<(), SyncApplyError> {
+            if !self.blobs_synced {
+                self.blobs_synced = true;
+                self.writes.push("blobs".into());
+            }
+            Ok(())
+        }
+        async fn carry_kv_stratum(
+            &mut self,
+            piece: Piece,
+            target_prefixes: &[String],
+            exclude_prefixes: &BTreeSet<String>,
+        ) -> Result<usize, SyncApplyError> {
+            self.carried_strata.push(piece);
+            self.carried_prefixes
+                .extend(target_prefixes.iter().cloned());
+            self.excluded_prefixes
+                .extend(exclude_prefixes.iter().cloned());
+            // One synthetic record per target prefix (idempotency is modelled at the data level by
+            // the real executor; here a stratum carry is a single logical change the first time).
+            self.writes.push(format!("kv:{}", piece.as_str()));
+            Ok(target_prefixes.len())
+        }
+        async fn carry_database(&mut self, name: &str) -> Result<(), SyncApplyError> {
+            if !self.carried_dbs.iter().any(|d| d == name) {
+                self.carried_dbs.push(name.to_string());
+                self.writes.push(format!("db:{name}"));
+            }
+            Ok(())
+        }
+        async fn read_source_site_config(
+            &mut self,
+            site: &str,
+        ) -> Result<Option<SiteConfig>, SyncApplyError> {
+            Ok(self.source_sites.get(site).cloned())
+        }
+        async fn read_dest_site_domains(
+            &mut self,
+            site: &str,
+        ) -> Result<Option<DomainConfig>, SyncApplyError> {
+            Ok(self.dest_sites.get(site).map(|c| c.domains.clone()))
+        }
+        async fn write_dest_site_config(
+            &mut self,
+            site: &str,
+            cfg: &SiteConfig,
+        ) -> Result<bool, SyncApplyError> {
+            // Exclusive-domain hijack guard: refuse a carried host live-owned by another owner.
+            for host in cfg.domains.exact_hosts() {
+                if self.live_hosts_elsewhere.contains(host) {
+                    return Err(SyncApplyError::DomainConflict {
+                        site: site.to_string(),
+                        message: format!("{host} is already attached to another live project/site"),
+                    });
+                }
+            }
+            // Idempotent content-address: an unchanged body is a no-op.
+            let new_hash = site_config_hash(cfg)?;
+            let old_hash = self
+                .dest_sites
+                .get(site)
+                .map(site_config_hash)
+                .transpose()?;
+            if old_hash.as_deref() == Some(new_hash.as_str()) {
+                return Ok(false);
+            }
+            self.dest_sites.insert(site.to_string(), cfg.clone());
+            self.writes.push(format!("site:{site}"));
+            Ok(true)
+        }
+    }
+
+    /// Build a resolved selection from an include set (identity fresh, non-strict unless set).
+    fn selection_apply(
+        include: &[Piece],
+        exclude_sites: &[&str],
+        exclude_dbs: &[&str],
+        strict: bool,
+    ) -> Selection {
+        SelectionInput {
+            include: include.iter().copied().collect(),
+            exclude_sites: exclude_sites.iter().map(|s| (*s).to_string()).collect(),
+            exclude_dbs: exclude_dbs.iter().map(|s| (*s).to_string()).collect(),
+            identity_fresh: true,
+            strict,
+            ..Default::default()
+        }
+        .resolve()
+        .expect("selection resolves")
+    }
+
+    /// 1) ABSENT destination → the engine creates + provisions it, then transfers the data plane.
+    #[tokio::test]
+    async fn apply_creates_and_provisions_an_absent_destination() {
+        let selection = selection_apply(&[Piece::Pg, Piece::Blobs], &[], &[], false);
+        let plan = plan_sync(
+            &selection,
+            &SyncInventory::default(),
+            &DestState::Absent,
+            "src",
+            "acme-staging",
+        );
+        let mut exec = FakeExecutor::default();
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert!(report.dest_created, "absent dest is created");
+        assert!(report.pg_transferred && report.blobs_transferred);
+        assert!(exec.dest_exists);
+        // A fresh dest brings its own control plane: no KV strata, no secrets carried.
+        assert!(report.kv_strata_carried.is_empty());
+        assert!(report.identity_fresh);
+    }
+
+    /// 2) A per-piece carry: databases are declared+provisioned per item; a coherent site carries.
+    #[tokio::test]
+    async fn apply_carries_databases_and_a_coherent_site() {
+        let selection = selection_apply(
+            &[Piece::Sites, Piece::Databases, Piece::Domains],
+            &[],
+            &[],
+            false,
+        );
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec!["maindb".into()],
+            }],
+            databases: vec!["maindb".into()],
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("web".into(), cfg_with("web.example.com", true))]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert_eq!(report.databases_carried, vec!["maindb".to_string()]);
+        // domains included → the site is carried WHOLE (not rewritten).
+        assert_eq!(report.sites_carried, vec!["web".to_string()]);
+        assert!(report.sites_rewritten.is_empty());
+        assert_eq!(
+            exec.dest_sites
+                .get("web")
+                .unwrap()
+                .domains
+                .primary
+                .as_deref(),
+            Some("web.example.com"),
+            "domains included ⇒ source domains carried verbatim"
+        );
+    }
+
+    /// 3) THE COHERENCE CORE: `--include sites --exclude domains` rewrites the body to PRESERVE the
+    /// destination's own domains and carries ZERO source domains.
+    #[tokio::test]
+    async fn apply_rewrites_site_preserving_dest_domains_zero_source_carry() {
+        let selection = selection_apply(&[Piece::Sites], &[], &[], false); // domains EXCLUDED
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        // Dest EXISTS and already serves its own domain.
+        let dest = DestState::Present {
+            sites: ["web".into()].into_iter().collect(),
+            databases: BTreeSet::new(),
+        };
+        let plan = plan_sync(&selection, &inventory, &dest, "src", "dst");
+        let mut exec = FakeExecutor {
+            dest_exists: true,
+            // Source serves `source.live.example` and has https_redirect ON (a non-domain field).
+            source_sites: BTreeMap::from([("web".into(), cfg_with("source.live.example", true))]),
+            // Dest serves its OWN domain, https_redirect OFF.
+            dest_sites: BTreeMap::from([("web".into(), cfg_with("dst.own.example", false))]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert_eq!(report.sites_rewritten, vec!["web".to_string()]);
+        let written = exec.dest_sites.get("web").unwrap();
+        // Destination's OWN domains preserved…
+        assert_eq!(written.domains.primary.as_deref(), Some("dst.own.example"));
+        // …the SOURCE's non-domain body carried (https_redirect flipped on)…
+        assert!(written.security.https_redirect, "source body carried");
+        // …and ZERO source-domain carry (the SAFETY INVARIANT).
+        assert!(
+            written.domains.primary.as_deref() != Some("source.live.example")
+                && !written
+                    .domains
+                    .aliases
+                    .iter()
+                    .any(|a| a == "source.live.example")
+                && !written
+                    .domains
+                    .wildcards
+                    .iter()
+                    .any(|w| w == "source.live.example"),
+            "no source domain may appear in the rewritten dest config"
+        );
+    }
+
+    /// 4) EXCLUDED pieces are PRESERVED verbatim — the engine never carries/touches them.
+    #[tokio::test]
+    async fn apply_never_touches_excluded_pieces() {
+        // Carry ONLY pg; everything else (sites, settings, graphql, history, domains, secrets,
+        // databases, blobs) excluded → preserved.
+        let selection = selection_apply(&[Piece::Pg], &[], &[], false);
+        let plan = plan_sync(
+            &selection,
+            &SyncInventory::default(),
+            &DestState::Present {
+                sites: ["keep".into()].into_iter().collect(),
+                databases: BTreeSet::new(),
+            },
+            "src",
+            "dst",
+        );
+        let mut exec = FakeExecutor {
+            dest_exists: true,
+            dest_sites: BTreeMap::from([("keep".into(), cfg_with("keep.example", false))]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert!(report.pg_transferred);
+        assert!(
+            report.kv_strata_carried.is_empty(),
+            "no excluded stratum carried"
+        );
+        assert!(report.sites_carried.is_empty() && report.sites_rewritten.is_empty());
+        assert!(exec.carried_dbs.is_empty());
+        // The excluded site is untouched (its config object is byte-identical).
+        assert_eq!(
+            exec.dest_sites
+                .get("keep")
+                .unwrap()
+                .domains
+                .primary
+                .as_deref(),
+            Some("keep.example")
+        );
+    }
+
+    /// 5) IDEMPOTENT: a second `--apply` of an unchanged source converges to a no-op (no writes).
+    #[tokio::test]
+    async fn apply_is_idempotent_second_run_is_a_noop() {
+        // pg + blobs + sites (domains EXCLUDED → the rewrite path, which is content-idempotent).
+        let selection = selection_apply(&[Piece::Pg, Piece::Blobs, Piece::Sites], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("web".into(), cfg_with("web.example", true))]),
+            ..Default::default()
+        };
+        // First apply mutates.
+        let r1 = apply_sync(&plan, &mut exec).await.expect("apply1 ok");
+        assert!(r1.dest_created && !r1.sites_rewritten.is_empty());
+        let first_writes = exec.take_writes();
+        assert!(!first_writes.is_empty(), "first apply writes");
+
+        // The dest now exists; model a resync plan (dest Present) over the SAME, unchanged source.
+        let plan2 = plan_sync(
+            &selection,
+            &inventory,
+            &DestState::Present {
+                sites: ["web".into()].into_iter().collect(),
+                databases: BTreeSet::new(),
+            },
+            "src",
+            "dst",
+        );
+        let r2 = apply_sync(&plan2, &mut exec).await.expect("apply2 ok");
+        let second_writes = exec.take_writes();
+        assert!(
+            second_writes.is_empty(),
+            "second apply must be a no-op, got writes: {second_writes:?}"
+        );
+        assert!(!r2.dest_created, "dest already exists on resync");
+        assert_eq!(r2.unchanged, vec!["site:web".to_string()], "site converged");
+    }
+
+    /// 6) PER-ITEM SKIP-AND-REPORT on apply (NOT refuse-all): an incoherent site is skipped while
+    /// the coherent items still converge.
+    #[tokio::test]
+    async fn apply_skips_an_incoherent_item_and_reports_it() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![
+                SiteItem {
+                    name: "ok".into(),
+                    has_domains: true,
+                    db_bindings: vec![],
+                },
+                SiteItem {
+                    name: "broken".into(),
+                    has_domains: true,
+                    db_bindings: vec!["ghostdb".into()], // absent from source + dest → incoherent
+                },
+            ],
+            databases: vec![],
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([
+                ("ok".into(), cfg_with("ok.example", true)),
+                ("broken".into(), cfg_with("broken.example", true)),
+            ]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec)
+            .await
+            .expect("apply ok (skip, not refuse)");
+        assert_eq!(
+            report.sites_carried,
+            vec!["ok".to_string()],
+            "coherent site carried"
+        );
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.skipped[0].name, "broken");
+        assert!(report.skipped[0].reason.contains("ghostdb"));
+        // The skipped site was never written (atomic — dest's prior state intact).
+        assert!(!exec.dest_sites.contains_key("broken"));
+        assert!(report.completed_with_skips());
+    }
+
+    /// 7a) EXCLUSIVE DOMAIN: carrying domains that are still live elsewhere is a per-item skip under
+    /// the default posture (never a silent second live claimant).
+    #[tokio::test]
+    async fn apply_skips_an_exclusive_domain_double_claim() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("web".into(), cfg_with("live.example.com", true))]),
+            // The host is STILL live-owned by the source environment.
+            live_hosts_elsewhere: ["live.example.com".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok (skip)");
+        assert!(report.sites_carried.is_empty());
+        assert_eq!(report.skipped_count(), 1);
+        assert!(report.skipped[0].reason.contains("exclusive-domain"));
+        assert!(
+            !exec.dest_sites.contains_key("web"),
+            "nothing written for the conflicting site"
+        );
+    }
+
+    /// 7b) `--strict` turns the same exclusive-domain conflict into a whole-run refusal.
+    #[tokio::test]
+    async fn apply_strict_refuses_an_exclusive_domain_double_claim() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], true); // strict
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("web".into(), cfg_with("live.example.com", true))]),
+            live_hosts_elsewhere: ["live.example.com".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let err = apply_sync(&plan, &mut exec)
+            .await
+            .expect_err("strict refuses");
+        assert!(matches!(err, SyncApplyError::StrictRefused { .. }));
+    }
+
+    /// Strict with a pre-known incoherent item refuses UP FRONT, before mutating anything.
+    #[tokio::test]
+    async fn apply_strict_refuses_a_preknown_incoherent_item_before_mutating() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Databases], &[], &[], true);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "legacy".into(),
+                has_domains: true,
+                db_bindings: vec!["ghostdb".into()],
+            }],
+            databases: vec![],
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor::default();
+        let err = apply_sync(&plan, &mut exec)
+            .await
+            .expect_err("strict refuses up front");
+        assert!(matches!(err, SyncApplyError::StrictRefused { .. }));
+        assert!(!exec.dest_exists, "nothing provisioned on a strict refusal");
+    }
+
+    /// TENANCY: every KV-stratum carry the engine requests is confined to the TARGET's OWN owned
+    /// prefixes (reuses the `piece_kv_strata` ⊂ `project_owned_prefixes` invariant).
+    #[tokio::test]
+    async fn apply_only_carries_target_owned_prefixes() {
+        let selection = selection_apply(
+            &[Piece::Settings, Piece::Graphql, Piece::History],
+            &[],
+            &[],
+            false,
+        );
+        let plan = plan_sync(
+            &selection,
+            &SyncInventory::default(),
+            &DestState::Absent,
+            "src",
+            "acme",
+        );
+        let mut exec = FakeExecutor::default();
+        let _ = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        let owned = project_owned_prefixes(ProjectRef::new("acme"));
+        for prefix in &exec.carried_prefixes {
+            assert!(
+                owned.iter().any(|op| prefix.starts_with(op.as_str())),
+                "carried prefix {prefix:?} is outside the target's owned keyspace"
+            );
+        }
+        assert!(!exec.carried_prefixes.is_empty(), "strata were carried");
+    }
+
+    // ===== Integration: the engine against a REAL DeployStore write seam =====================
+    //
+    // These wire [`apply_sync`]'s site path to the real [`crate::deploy::DeployStore::set_site_config`]
+    // over an in-memory KV + blob store — the ACTUAL content-addressing, pointer re-point, routing
+    // index, and host-uniqueness hijack guard — rather than a fake. (pg/blob transport needs a live
+    // node and is out of scope here; the config-rewrite coherence core touches only the KV store.)
+
+    use std::sync::Arc;
+
+    /// A no-op blob [`crate::Storage`] — the site-config write path touches only the KV store, so
+    /// these never fire.
+    struct NullStorage;
+
+    #[async_trait]
+    impl crate::Storage for NullStorage {
+        async fn get(&self, _: &str) -> Result<crate::GetObject, crate::StorageError> {
+            Err(crate::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<crate::GetObject, crate::StorageError> {
+            Err(crate::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: crate::ByteStream,
+            _: crate::PutMeta,
+        ) -> Result<crate::ObjectMeta, crate::StorageError> {
+            Err(crate::StorageError::unsupported("null"))
+        }
+        async fn head(&self, _: &str) -> Result<crate::ObjectMeta, crate::StorageError> {
+            Err(crate::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), crate::StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<crate::ObjectMeta>, crate::StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A [`SyncExecutor`] whose site read/write go through a REAL [`crate::deploy::DeployStore`].
+    struct DeployBackedExecutor {
+        deploy: crate::deploy::DeployStore,
+        project: String,
+        source_sites: BTreeMap<String, SiteConfig>,
+    }
+
+    #[async_trait]
+    impl SyncExecutor for DeployBackedExecutor {
+        async fn create_and_provision_dest(&mut self) -> Result<(), SyncApplyError> {
+            Ok(())
+        }
+        async fn transfer_pg(&mut self) -> Result<(), SyncApplyError> {
+            Ok(())
+        }
+        async fn transfer_blobs(&mut self) -> Result<(), SyncApplyError> {
+            Ok(())
+        }
+        async fn carry_kv_stratum(
+            &mut self,
+            _p: Piece,
+            _t: &[String],
+            _e: &BTreeSet<String>,
+        ) -> Result<usize, SyncApplyError> {
+            Ok(0)
+        }
+        async fn carry_database(&mut self, _n: &str) -> Result<(), SyncApplyError> {
+            Ok(())
+        }
+        async fn read_source_site_config(
+            &mut self,
+            site: &str,
+        ) -> Result<Option<SiteConfig>, SyncApplyError> {
+            Ok(self.source_sites.get(site).cloned())
+        }
+        async fn read_dest_site_domains(
+            &mut self,
+            site: &str,
+        ) -> Result<Option<DomainConfig>, SyncApplyError> {
+            let pr = ProjectRef::new(&self.project);
+            Ok(self
+                .deploy
+                .get_site_config(pr, site)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.domains))
+        }
+        async fn write_dest_site_config(
+            &mut self,
+            site: &str,
+            cfg: &SiteConfig,
+        ) -> Result<bool, SyncApplyError> {
+            let pr = ProjectRef::new(&self.project);
+            let new_hash = site_config_hash(cfg)?;
+            if let Ok(Some(cur)) = self.deploy.get_site_config(pr, site).await
+                && site_config_hash(&cur).ok().as_deref() == Some(new_hash.as_str())
+            {
+                return Ok(false);
+            }
+            match self.deploy.set_site_config(pr, site, cfg).await {
+                Ok(()) => Ok(true),
+                // The REAL host-uniqueness hijack guard.
+                Err(crate::DeployError::Conflict(m)) => Err(SyncApplyError::DomainConflict {
+                    site: site.to_string(),
+                    message: m,
+                }),
+                Err(e) => Err(SyncApplyError::Other(e.to_string())),
+            }
+        }
+    }
+
+    fn deploy_store() -> crate::deploy::DeployStore {
+        crate::deploy::DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()))
+    }
+
+    /// INTEGRATION: `--include sites --exclude domains` against the real `set_site_config` — the dest
+    /// keeps serving its OWN domain, the source's non-domain body is carried, the content-addressed
+    /// `siteconfig/<hash>` + `site/` pointer are actually written, and ZERO source domains land.
+    #[tokio::test]
+    async fn integration_rewrite_preserves_dest_domains_via_real_deploy_store() {
+        let deploy = deploy_store();
+        let pr = ProjectRef::new("dst");
+        // Seed the dest's own site serving its own host.
+        deploy
+            .set_site_config(pr, "web", &cfg_with("dst.own.example", false))
+            .await
+            .expect("seed dest site");
+
+        let selection = selection_apply(&[Piece::Sites], &[], &[], false); // domains EXCLUDED
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let dest = DestState::Present {
+            sites: ["web".into()].into_iter().collect(),
+            databases: BTreeSet::new(),
+        };
+        let plan = plan_sync(&selection, &inventory, &dest, "src", "dst");
+        let mut exec = DeployBackedExecutor {
+            deploy: deploy.clone(),
+            project: "dst".into(),
+            // Source serves a DIFFERENT, live host and has https_redirect ON.
+            source_sites: BTreeMap::from([("web".into(), cfg_with("source.live.example", true))]),
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert_eq!(report.sites_rewritten, vec!["web".to_string()]);
+
+        // Read the config BACK through the real store.
+        let got = deploy
+            .get_site_config(pr, "web")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(got.domains.primary.as_deref(), Some("dst.own.example"));
+        assert!(got.security.https_redirect, "source body carried");
+        assert!(
+            !got.domains
+                .exact_hosts()
+                .any(|h| h == "source.live.example"),
+            "no source domain carried"
+        );
+        // The dest's host routes to the dest; the source host was never claimed.
+        assert!(
+            deploy
+                .resolve_site_by_host("dst.own.example")
+                .await
+                .expect("resolve")
+                .is_some(),
+            "dest still serves its own host"
+        );
+        assert!(
+            deploy
+                .resolve_site_by_host("source.live.example")
+                .await
+                .expect("resolve")
+                .is_none(),
+            "dest never claims the source host"
+        );
+    }
+
+    /// INTEGRATION: an exclusive-domain double-claim fires the REAL hijack guard
+    /// (`DeployError::Conflict`), which the engine maps to a per-item skip (default posture) — the
+    /// destination is never made a second live owner of a host another site already holds.
+    #[tokio::test]
+    async fn integration_exclusive_domain_guard_fires_against_real_store() {
+        let deploy = deploy_store();
+        let pr = ProjectRef::new("dst");
+        // A DIFFERENT dest site already owns the host.
+        deploy
+            .set_site_config(pr, "incumbent", &cfg_with("shared.example", false))
+            .await
+            .expect("seed incumbent");
+
+        // Carry a source site that ALSO claims the host (domains INCLUDED).
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let dest = DestState::Present {
+            sites: ["incumbent".into()].into_iter().collect(),
+            databases: BTreeSet::new(),
+        };
+        let plan = plan_sync(&selection, &inventory, &dest, "src", "dst");
+        let mut exec = DeployBackedExecutor {
+            deploy: deploy.clone(),
+            project: "dst".into(),
+            source_sites: BTreeMap::from([("web".into(), cfg_with("shared.example", true))]),
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok (skip)");
+        assert_eq!(report.skipped_count(), 1, "the double-claim is skipped");
+        assert!(report.skipped[0].reason.contains("exclusive-domain"));
+        // The incumbent still owns the host; `web` was NOT written.
+        let owner = deploy
+            .resolve_site_by_host("shared.example")
+            .await
+            .expect("resolve")
+            .expect("owned");
+        assert_eq!(owner.site, "incumbent", "incumbent retains the host");
+        assert!(
+            deploy
+                .get_site_config(pr, "web")
+                .await
+                .expect("read")
+                .is_none(),
+            "the conflicting site was never written (atomic — dest prior state intact)"
+        );
     }
 }

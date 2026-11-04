@@ -17,12 +17,14 @@
 //! body, or provisions an absent destination.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use boatramp_core::project_sync::{
-    self, Disposition, ItemKind, Piece, Selection, SelectionInput, SyncInventory, SyncPlan,
+    self, Disposition, ItemKind, Piece, Selection, SelectionInput, SyncApplyError, SyncApplyReport,
+    SyncExecutor, SyncInventory, SyncPlan, apply_sync,
 };
 
-use crate::client;
+use crate::client::{self, ControlPlane};
 use crate::config::ProjectConfig;
 
 /// A failure in `boatramp project sync` (the planning path).
@@ -40,13 +42,21 @@ pub enum Error {
          (adopt / same-environment recovery is increment 2)"
     )]
     IdentityUnsupported(String),
-    /// `--apply` — execution is increment 2.
+    /// `--apply` was requested without the `-y` confirmation.
     #[error(
-        "project sync --apply is not yet implemented (increment 2 — data/KV transfer, config \
-         rewrite, and absent-destination provisioning); re-run WITHOUT --apply to see the dry-run \
-         preflight plan"
+        "project sync --apply mutates the destination — pass -y to confirm (re-run WITHOUT --apply \
+         to see the dry-run preflight plan first)"
     )]
-    ApplyNotImplemented,
+    ApplyNeedsConfirmation,
+    /// The apply execution itself failed (a run-level failure; per-item skips are reported, not errored).
+    #[error(transparent)]
+    Apply(#[from] SyncApplyError),
+    /// A cross-node `--apply` needs the SOURCE node's Project-Admin token.
+    #[error(
+        "a cross-node `project sync --apply` needs the SOURCE node's Project-Admin token: pass \
+         --clone-source-token-file <path> or set BOATRAMP_CLONE_SOURCE_TOKEN"
+    )]
+    MissingSourceToken,
     /// `--strict` and the preflight found ≥1 incoherent item that would be skipped.
     #[error(
         "strict sync refused: {count} incoherent item(s) would be skipped (--strict is \
@@ -162,15 +172,20 @@ pub struct SyncArgs {
     #[arg(long)]
     strict: bool,
 
-    /// Execute the sync (increment 2). In this release it returns a not-yet-implemented message;
-    /// the default (no `--apply`) is the dry-run preflight.
+    /// Execute the sync (mutating). The default (no `--apply`) is the dry-run preflight; `--apply`
+    /// requires `-y`.
     #[arg(long)]
     apply: bool,
 
-    /// Skip the interactive confirmation on `--apply` (increment 2). Parsed now for surface
-    /// stability.
+    /// Confirm a mutating `--apply`. Required for `--apply` (there is no interactive prompt).
     #[arg(long, short = 'y')]
     yes: bool,
+
+    /// Path to a file holding the SOURCE node's Project-Admin token — required for a cross-node
+    /// (URL `--from`) `--apply` (reads + streams the source). Falls back to
+    /// `BOATRAMP_CLONE_SOURCE_TOKEN`. Never passed as a bare CLI argument.
+    #[arg(long, value_name = "PATH")]
+    clone_source_token_file: Option<PathBuf>,
 }
 
 impl SyncArgs {
@@ -223,12 +238,18 @@ impl SyncArgs {
 pub struct SyncReport {
     /// The preflight plan (destination precondition + per-piece + per-item classification).
     pub plan: SyncPlan,
-    /// Operator notes (what this increment does NOT yet do; where item rows come from).
+    /// Operator notes (seams not wired on this platform; where item rows come from).
     pub notes: Vec<String>,
+    /// The APPLY outcome when `--apply` executed; `None` for a dry-run preflight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<SyncApplyReport>,
 }
 
 impl crate::output::Rendered for SyncReport {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if let Some(a) = &self.applied {
+            return render_applied(&self.plan, a, &self.notes, w);
+        }
         let p = &self.plan;
         writeln!(w, "sync preflight: `{}` ← `{}`", p.target, p.source)?;
         let dest = match p.dest {
@@ -308,23 +329,110 @@ impl crate::output::Rendered for SyncReport {
         }
         writeln!(
             w,
-            "(dry-run preflight — nothing moved; `--apply` executes the plan in increment 2)"
+            "(dry-run preflight — nothing moved; re-run with `--apply -y` to execute this plan)"
         )
     }
 }
 
-/// Entry point for `boatramp project sync` (planning path).
+/// Render the APPLY outcome (what actually moved + what was skipped).
+fn render_applied(
+    plan: &SyncPlan,
+    a: &SyncApplyReport,
+    notes: &[String],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(w, "sync applied: `{}` ← `{}`", plan.target, plan.source)?;
+    if a.dest_created {
+        writeln!(w, "  destination: CREATED + provisioned (was absent)")?;
+    }
+    if a.pg_transferred {
+        writeln!(w, "  pg: managed-DB contents transferred (delta)")?;
+    }
+    if a.blobs_transferred {
+        writeln!(
+            w,
+            "  blobs: content-addressed store transferred (integrity/delta)"
+        )?;
+    }
+    if !a.databases_carried.is_empty() {
+        writeln!(w, "  databases carried: {}", a.databases_carried.join(", "))?;
+    }
+    if !a.kv_strata_carried.is_empty() {
+        let strata: Vec<&str> = a.kv_strata_carried.iter().map(|p| p.as_str()).collect();
+        writeln!(
+            w,
+            "  kv strata carried: {} ({} records)",
+            strata.join(", "),
+            a.kv_records
+        )?;
+    }
+    if !a.sites_carried.is_empty() {
+        writeln!(w, "  sites carried (whole): {}", a.sites_carried.join(", "))?;
+    }
+    if !a.sites_rewritten.is_empty() {
+        writeln!(
+            w,
+            "  sites rewritten (domains preserved): {}",
+            a.sites_rewritten.join(", ")
+        )?;
+    }
+    if !a.unchanged.is_empty() {
+        writeln!(
+            w,
+            "  unchanged (already converged): {}",
+            a.unchanged.join(", ")
+        )?;
+    }
+    if !a.dropped.is_empty() {
+        writeln!(w, "  dropped (per-item exclude): {}", a.dropped.join(", "))?;
+    }
+    if a.completed_with_skips() {
+        writeln!(
+            w,
+            "{} item(s) SKIPPED (incoherent / exclusive-domain):",
+            a.skipped_count()
+        )?;
+        for s in &a.skipped {
+            let kind = match s.kind {
+                ItemKind::Site => "site",
+                ItemKind::Database => "db",
+            };
+            writeln!(w, "  {kind} {}: {}", s.name, s.reason)?;
+        }
+    }
+    for note in a.notes.iter().chain(notes.iter()) {
+        writeln!(w, "note: {note}")?;
+    }
+    if a.is_noop() {
+        writeln!(
+            w,
+            "(converged — this apply changed nothing at the destination)"
+        )?;
+    } else if a.completed_with_skips() {
+        writeln!(
+            w,
+            "(applied WITH {} skipped — fix the dependency and resync, or --strict to refuse)",
+            a.skipped_count()
+        )?;
+    } else {
+        writeln!(w, "(applied)")?;
+    }
+    Ok(())
+}
+
+/// Entry point for `boatramp project sync` — the dry-run preflight (default) or the mutating
+/// `--apply` execution.
 pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Result<SyncReport> {
     // 1) Validate + resolve the selection FIRST (cheap, no I/O) — a contradictory/empty selection
-    //    is reported before any network round-trip or the apply stub.
+    //    is reported before any network round-trip.
     if args.identity != "fresh" {
         return Err(Error::IdentityUnsupported(args.identity.clone()));
     }
     let selection: Selection = args.selection_input().resolve()?;
 
-    // 2) `--apply` is increment 2 — a clear stub, after the selection is known to be valid.
-    if args.apply {
-        return Err(Error::ApplyNotImplemented);
+    // 2) `--apply` must be explicitly confirmed with `-y` (there is no interactive prompt).
+    if args.apply && !args.yes {
+        return Err(Error::ApplyNeedsConfirmation);
     }
 
     // 3) Resolve the target + source labels.
@@ -342,75 +450,119 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
 
     let mut notes: Vec<String> = Vec::new();
 
-    // 4) Destination precondition — DETECT an absent destination (plan to create + provision;
-    //    never 404). `list_projects` avoids the 404-vs-error ambiguity of a direct GET.
-    let token = client::token(config);
-    let dest_cp = client::ControlPlane::new(
+    // 4) Resolve the SOURCE token (cross-node reads + the data stream need the source node's
+    //    Project-Admin bearer; same-node reuses the operator's own dest token).
+    let dest_token = client::token(config);
+    let source_token: Option<Vec<u8>> = if source_is_url {
+        resolve_source_token(args.clone_source_token_file.as_deref())
+    } else {
+        dest_token.as_deref().map(|t| t.as_bytes().to_vec())
+    };
+
+    // 5) Build the dest + source control-plane clients. The source client is built ONLY when we
+    //    can actually read it (same-node always; cross-node only with a source token).
+    let dest_cp = ControlPlane::new(
         server.clone(),
-        client::http_client(token.as_deref()),
+        client::http_client(dest_token.as_deref()),
         target.clone(),
     );
+    let source_cp: Option<ControlPlane> = if source_is_url {
+        source_token.as_ref().map(|tok| {
+            let tok_str = String::from_utf8_lossy(tok).into_owned();
+            ControlPlane::new(
+                args.from.clone(),
+                client::http_client(Some(tok_str.as_str())),
+                source_project.clone(),
+            )
+        })
+    } else {
+        Some(ControlPlane::new(
+            server.clone(),
+            client::http_client(dest_token.as_deref()),
+            source_project.clone(),
+        ))
+    };
+
+    // 6) Destination precondition — DETECT an absent destination (plan to create + provision;
+    //    never 404). `list_projects` avoids the 404-vs-error ambiguity of a direct GET.
     let projects = dest_cp.list_projects().await?;
     let dest_present = projects
         .iter()
         .any(|p| p.get("name").and_then(|v| v.as_str()) == Some(target.as_str()));
 
     let dest = if dest_present {
-        // Databases already on the destination anchor the per-site coherence check. Dest site
-        // enumeration needs a list endpoint (increment 2), so dest sites are left empty here.
         let databases: BTreeSet<String> = dest_cp
             .list_databases()
             .await?
             .into_iter()
             .map(|d| d.name)
             .collect();
-        project_sync::DestState::Present {
-            sites: BTreeSet::new(),
-            databases,
-        }
+        // Enumerate the dest's own sites so an EXCLUDED piece's "preserve" and the coherence check
+        // reflect the real destination.
+        let sites: BTreeSet<String> = dest_cp
+            .list_sites()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        project_sync::DestState::Present { sites, databases }
     } else {
         notes.push(format!(
-            "destination project `{target}` does not exist — sync will create + provision it \
-             (increment 2); on a fresh destination there is nothing to preserve"
+            "destination project `{target}` does not exist — sync will create + provision it; on \
+             a fresh destination there is nothing to preserve"
         ));
         project_sync::DestState::Absent
     };
 
-    // 5) Source inventory. For a same-node project source we enumerate its declared databases now
-    //    (a real inventory for the per-item classification); site enumeration and cross-node (URL)
-    //    source enumeration land in increment 2.
+    // 7) Source inventory. Enumerate the source's declared databases and sites (with each site's
+    //    domain presence) for the per-item classification. Cross-node without a source token can't
+    //    be read, so the inventory is piece-level only there.
     let mut inventory = SyncInventory::default();
-    if source_is_url {
-        notes.push(format!(
-            "source `{}` is cross-node — its items are enumerated over the `--clone-from` \
-             transport in increment 2; this preflight shows the per-piece plan + destination \
-             precondition",
-            args.from
-        ));
-    } else {
-        let source_cp = client::ControlPlane::new(
-            server.clone(),
-            client::http_client(token.as_deref()),
-            source_project.clone(),
-        );
-        inventory.databases = source_cp
-            .list_databases()
-            .await?
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+    let mut source_dbs: Vec<boatramp_core::compute::ApplyDatabase> = Vec::new();
+    if let Some(scp) = &source_cp {
+        source_dbs = scp.list_databases().await?;
+        inventory.databases = source_dbs.iter().map(|d| d.name.clone()).collect();
+        // Sites: enumerate + read each config for the domain-presence flag. `db_bindings` are left
+        // empty (there is no cheap managed-DB-binding extraction from a SiteConfig today) — the
+        // set_site_config write still fail-closes on a genuinely incoherent binding at apply time.
+        match scp.list_sites().await {
+            Ok(sites) => {
+                for name in sites {
+                    let has_domains = scp
+                        .fetch_site_config(&name)
+                        .await
+                        .map(|c| {
+                            c.domains.primary.is_some()
+                                || !c.domains.aliases.is_empty()
+                                || !c.domains.wildcards.is_empty()
+                        })
+                        .unwrap_or(false);
+                    inventory.sites.push(project_sync::SiteItem {
+                        name,
+                        has_domains,
+                        db_bindings: Vec::new(),
+                    });
+                }
+            }
+            Err(e) => notes.push(format!("could not enumerate source sites: {e}")),
+        }
         notes.push(
-            "source site enumeration (and per-site managed-DB coherence) lands in increment 2; \
-             database item rows are shown from the same-node source's declared bindings"
+            "per-site managed-DB binding extraction is best-effort (bindings not enumerated); an \
+             incoherent binding still fails closed at the site write"
                 .to_string(),
         );
+    } else {
+        notes.push(format!(
+            "source `{}` is cross-node and no source token was provided — its items are not \
+             enumerated for this dry-run; pass --clone-source-token-file to read it",
+            args.from
+        ));
     }
 
-    // 6) Build the preflight plan via the pure core planner.
+    // 8) Build the preflight plan via the pure core planner.
     let plan = project_sync::plan_sync(&selection, &inventory, &dest, &source_label, &target);
 
-    // 7) `--strict`: a skip refuses the whole run (minimal refuse path — the dry-run still
-    //    computed the full plan, surfaced here as the refusal detail).
+    // 9) `--strict`: a pre-known incoherent item refuses the whole run BEFORE anything mutates.
     if plan.is_refused() {
         let detail = plan
             .skipped_items()
@@ -434,7 +586,237 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         });
     }
 
-    Ok(SyncReport { plan, notes })
+    // 10) Dry-run → return the preflight. `--apply` → execute the plan via the CLI executor.
+    if !args.apply {
+        return Ok(SyncReport {
+            plan,
+            notes,
+            applied: None,
+        });
+    }
+
+    // Cross-node apply requires a source token (to read + stream the source).
+    let Some(source_cp) = source_cp else {
+        return Err(Error::MissingSourceToken);
+    };
+    let source_token = source_token.ok_or(Error::MissingSourceToken)?;
+
+    let mut exec = CliSyncExecutor {
+        dest_cp,
+        source_cp,
+        target: target.clone(),
+        source_url: if source_is_url {
+            args.from.clone()
+        } else {
+            server.clone()
+        },
+        source_project,
+        source_token,
+        source_dbs,
+        pg_included: selection.includes(Piece::Pg),
+        blobs_included: selection.includes(Piece::Blobs),
+        data_transferred: false,
+    };
+    let applied = apply_sync(&plan, &mut exec).await?;
+    Ok(SyncReport {
+        plan,
+        notes,
+        applied: Some(applied),
+    })
+}
+
+/// Resolve the SOURCE node's Project-Admin token for a cross-node sync: the
+/// `--clone-source-token-file` contents, else `BOATRAMP_CLONE_SOURCE_TOKEN`. Never a bare CLI arg
+/// (a token on argv leaks into the process table). `None` when neither is set.
+fn resolve_source_token(file: Option<&std::path::Path>) -> Option<Vec<u8>> {
+    if let Some(p) = file
+        && let Ok(s) = std::fs::read_to_string(p)
+    {
+        let tok = s.trim_end_matches(['\n', '\r']).as_bytes().to_vec();
+        if !tok.is_empty() {
+            return Some(tok);
+        }
+    }
+    std::env::var("BOATRAMP_CLONE_SOURCE_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(String::into_bytes)
+}
+
+/// The CLI binding of [`SyncExecutor`] to the real control-plane + the clone/import transport. It
+/// REUSES — never rebuilds — the transport: the data plane rides the `clone --from` (data-only)
+/// path, managed-DB bindings ride `declare_database` (declare + provision), and site configs ride
+/// `fetch_site_config`/`put_site_config` (the latter is the node's `set_site_config`, with the
+/// host-uniqueness hijack guard that surfaces an exclusive-domain double-claim as a `409`).
+///
+/// GAP (surfaced honestly, not silently): a SELECTIVE control-plane KV-stratum carry (settings /
+/// graphql / history, and `domainverify` proofs under `--identity adopt`) has NO over-the-wire seam
+/// today — there is no per-key admin KV API, and the whole-slice clone is not piece-selective. Those
+/// strata return [`SyncApplyError::Unsupported`]; the pure engine supports them (unit-tested) and a
+/// node-side selective-sync endpoint is the follow-up.
+struct CliSyncExecutor {
+    dest_cp: ControlPlane,
+    source_cp: ControlPlane,
+    target: String,
+    source_url: String,
+    source_project: String,
+    source_token: Vec<u8>,
+    source_dbs: Vec<boatramp_core::compute::ApplyDatabase>,
+    pg_included: bool,
+    blobs_included: bool,
+    data_transferred: bool,
+}
+
+impl CliSyncExecutor {
+    /// Drive the data plane (managed-DB contents + blobs) through ONE data-only clone. The transport
+    /// carries pg AND blobs together, so a pg-only / blobs-only selection is refused (it would carry
+    /// the excluded half) rather than silently violating the exclude.
+    async fn transfer_data(&mut self) -> std::result::Result<(), SyncApplyError> {
+        if self.data_transferred {
+            return Ok(());
+        }
+        if self.pg_included != self.blobs_included {
+            return Err(SyncApplyError::Unsupported(
+                "the data-only clone transport carries managed-DB contents and blobs TOGETHER; a \
+                 pg-only or blobs-only sync would carry the excluded half — include or exclude \
+                 BOTH `pg` and `blobs`"
+                    .into(),
+            ));
+        }
+        self.dest_cp
+            .project_clone_from(
+                &self.target,
+                &self.source_url,
+                Some(&self.source_project),
+                &self.source_token,
+                true,  // apply
+                false, // verify
+                true,  // overwrite — sync's data plane is source-authoritative (mirror)
+                false, // force (data-only carries no control-plane KV)
+                true,  // data_only
+                client::MismatchFlags::default(),
+            )
+            .await
+            .map_err(|e| SyncApplyError::Transfer {
+                piece: "data",
+                message: e.to_string(),
+            })?;
+        self.data_transferred = true;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SyncExecutor for CliSyncExecutor {
+    async fn create_and_provision_dest(&mut self) -> std::result::Result<(), SyncApplyError> {
+        // The project ENTITY record is NOT created by the clone/import (it lives outside the
+        // project-owned export scope), so create it first, then provision the managed DB(s) the
+        // source declares — the clone's pg restore needs a provisioned target DB.
+        let body = serde_json::json!({ "name": self.target });
+        self.dest_cp.create_project(&body).await.map_err(|e| {
+            SyncApplyError::Provision(format!("create project `{}`: {e}", self.target))
+        })?;
+        for db in &self.source_dbs {
+            self.dest_cp
+                .declare_database(&db.name, db)
+                .await
+                .map_err(|e| {
+                    SyncApplyError::Provision(format!("declare + provision DB `{}`: {e}", db.name))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn transfer_pg(&mut self) -> std::result::Result<(), SyncApplyError> {
+        self.transfer_data().await
+    }
+
+    async fn transfer_blobs(&mut self) -> std::result::Result<(), SyncApplyError> {
+        self.transfer_data().await
+    }
+
+    async fn carry_kv_stratum(
+        &mut self,
+        piece: Piece,
+        _target_prefixes: &[String],
+        _exclude_prefixes: &BTreeSet<String>,
+    ) -> std::result::Result<usize, SyncApplyError> {
+        Err(SyncApplyError::Unsupported(format!(
+            "carrying the `{p}` control-plane KV stratum needs a node-side selective-sync endpoint \
+             (there is no per-key admin KV API, and the whole-slice clone is not piece-selective). \
+             For now carry it with a full `project import --clone-from`, or exclude `{p}` and let \
+             the destination's own `apply` bring it.",
+            p = piece.as_str()
+        )))
+    }
+
+    async fn carry_database(&mut self, name: &str) -> std::result::Result<(), SyncApplyError> {
+        let spec = self
+            .source_cp
+            .get_database(name)
+            .await
+            .map_err(|e| SyncApplyError::Other(format!("read source DB `{name}`: {e}")))?;
+        self.dest_cp
+            .declare_database(name, &spec)
+            .await
+            .map_err(|e| SyncApplyError::Other(format!("declare DB `{name}` on dest: {e}")))?;
+        Ok(())
+    }
+
+    async fn read_source_site_config(
+        &mut self,
+        site: &str,
+    ) -> std::result::Result<Option<boatramp_core::config::SiteConfig>, SyncApplyError> {
+        self.source_cp
+            .fetch_site_config(site)
+            .await
+            .map(Some)
+            .map_err(|e| SyncApplyError::Other(format!("read source site `{site}`: {e}")))
+    }
+
+    async fn read_dest_site_domains(
+        &mut self,
+        site: &str,
+    ) -> std::result::Result<Option<boatramp_core::config::DomainConfig>, SyncApplyError> {
+        // `fetch_site_config` returns defaults for an unset site, so a fresh dest yields empty
+        // domains (nothing to preserve).
+        match self.dest_cp.fetch_site_config(site).await {
+            Ok(cfg) => Ok(Some(cfg.domains)),
+            Err(e) => Err(SyncApplyError::Other(format!(
+                "read dest domains for site `{site}`: {e}"
+            ))),
+        }
+    }
+
+    async fn write_dest_site_config(
+        &mut self,
+        site: &str,
+        cfg: &boatramp_core::config::SiteConfig,
+    ) -> std::result::Result<bool, SyncApplyError> {
+        // Idempotency (best-effort detection; the node's set_site_config is itself idempotent):
+        // skip the PUT when the dest already serves a byte-identical body.
+        let new_hash = project_sync::site_config_hash(cfg)?;
+        if let Ok(current) = self.dest_cp.fetch_site_config(site).await
+            && project_sync::site_config_hash(&current).ok().as_deref() == Some(new_hash.as_str())
+        {
+            return Ok(false);
+        }
+        match self.dest_cp.put_site_config(site, cfg).await {
+            Ok(()) => Ok(true),
+            // The node's host-uniqueness hijack guard refuses a double-claim with `409 Conflict`.
+            Err(client::ClientError::Http(e))
+                if e.status() == Some(reqwest::StatusCode::CONFLICT) =>
+            {
+                Err(SyncApplyError::DomainConflict {
+                    site: site.to_string(),
+                    message: "a carried host is already attached to another live project/site \
+                              (exclusive domain ownership)"
+                        .to_string(),
+                })
+            }
+            Err(e) => Err(SyncApplyError::Other(format!("write site `{site}`: {e}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +912,83 @@ mod tests {
     #[test]
     fn from_is_required() {
         assert!(parse(&["sync", "acme"]).is_err(), "--from is required");
+    }
+
+    #[test]
+    fn apply_parses_yes_and_token_file_flags() {
+        let args = parse(&[
+            "sync",
+            "--from",
+            "https://prod.example.com",
+            "--include-pg",
+            "--include-blobs",
+            "--apply",
+            "-y",
+            "--clone-source-token-file",
+            "/tmp/tok",
+            "acme-staging",
+        ])
+        .expect("parses");
+        assert!(args.apply && args.yes);
+        assert_eq!(
+            args.clone_source_token_file.as_deref(),
+            Some(std::path::Path::new("/tmp/tok"))
+        );
+    }
+
+    /// Build a `CliSyncExecutor` with offline dummy control-planes (no server contacted) to exercise
+    /// the executor's node-free GUARDS.
+    fn dummy_exec(pg: bool, blobs: bool) -> CliSyncExecutor {
+        CliSyncExecutor {
+            dest_cp: ControlPlane::new(
+                "http://127.0.0.1:0".into(),
+                client::http_client(None),
+                "dst".into(),
+            ),
+            source_cp: ControlPlane::new(
+                "http://127.0.0.1:0".into(),
+                client::http_client(None),
+                "src".into(),
+            ),
+            target: "dst".into(),
+            source_url: "http://127.0.0.1:0".into(),
+            source_project: "src".into(),
+            source_token: Vec::new(),
+            source_dbs: Vec::new(),
+            pg_included: pg,
+            blobs_included: blobs,
+            data_transferred: false,
+        }
+    }
+
+    /// The data-only clone transport carries pg AND blobs together, so a pg-only (or blobs-only)
+    /// selection is REFUSED before any network I/O rather than silently carrying the excluded half.
+    #[tokio::test]
+    async fn data_transport_refuses_pg_without_blobs() {
+        let mut exec = dummy_exec(true, false);
+        let err = exec
+            .transfer_pg()
+            .await
+            .expect_err("pg-without-blobs refused");
+        assert!(matches!(err, SyncApplyError::Unsupported(_)));
+        // Both included → the guard passes (the network call is what would then run).
+        assert!(dummy_exec(true, true).pg_included && dummy_exec(true, true).blobs_included);
+    }
+
+    /// A selective control-plane KV-stratum carry has no over-the-wire seam today; the CLI reports
+    /// it honestly as unsupported (the pure engine supports it — this is the wiring gap).
+    #[tokio::test]
+    async fn kv_stratum_carry_is_honestly_unsupported_over_cli() {
+        let mut exec = dummy_exec(false, false);
+        let err = exec
+            .carry_kv_stratum(Piece::Settings, &[], &BTreeSet::new())
+            .await
+            .expect_err("no selective KV seam");
+        match err {
+            SyncApplyError::Unsupported(m) => {
+                assert!(m.contains("settings") && m.contains("selective-sync"))
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }
