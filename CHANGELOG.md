@@ -26,9 +26,15 @@ versions.
   docker / native-container / VMM backends are suppressed). A pod is shared-kernel
   (`IsolationClass::Container`), so `require_strong_isolation` excludes it exactly like the other
   shared-kernel backends. (mailroom cap-req #26)
+  - **Credentials via a k8s `Secret`:** the managed-DB server-init credential (and any workload env)
+    is written to a per-workload `Opaque` `Secret` (`<workload>-env`, namespace-scoped, deleted on
+    teardown) and referenced from the pod by `secretKeyRef` — **no credential is a plaintext value in
+    the StatefulSet/Pod spec**, so a reader with `get statefulsets/pods` no longer sees it.
   - **Least-privilege RBAC:** the helm chart ships a **namespace-scoped** `Role` + `RoleBinding`
     (+ optional `ServiceAccount`), gated on `computeBackend.kubernetes.enabled` (off by default). No
-    `ClusterRole`, no wildcards, no `secrets` verb; pods are read-only to the backend.
+    `ClusterRole`, no wildcards; pods are read-only to the backend. The only secret authority is a
+    **write-only** `secrets: [create, patch, delete]` (no `get`/`list`/`watch`, so the token can
+    neither enumerate nor read secret *values*), for the per-workload credential Secret above.
   - **Hardening:** launched pods drop privilege escalation + all Linux capabilities (adding back only
     an allowlisted `cap_add` under the single-tenant posture) + pin the runtime's default seccomp
     profile, and do **not** auto-mount a ServiceAccount token. A per-project sealed pull credential is

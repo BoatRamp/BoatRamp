@@ -143,12 +143,15 @@ async fn k8s_phase2_generic_exec_logs_volumes_round_trip() {
 /// equally from a CI runner host or in-cluster): `SELECT 1` answers and the `vector`
 /// extension loads. Marker `K8S COMPUTE BACKEND OK`.
 ///
-/// NB: a real boatramp deploy injects the server-init credential env
-/// (`POSTGRES_*`) from the sealed managed credential at launch (node-side machinery, not
-/// in `managed_db_spec`); this backend-level gate stands in `POSTGRES_HOST_AUTH_METHOD=trust`
-/// so the stock operand image boots without that node flow, isolating the k8s backend's
-/// own StatefulSet+PVC+Service lifecycle. The full declare→provision→seal→inject→`SELECT 1`
-/// over the injected DSN is the serve-level flow the real-cluster deploy exercises.
+/// NB: a real boatramp deploy injects the server-init credential env (`POSTGRES_*`) from
+/// the sealed managed credential at launch (node-side machinery, not in `managed_db_spec`);
+/// this backend-level gate stands in a `POSTGRES_PASSWORD` so the stock operand image boots.
+/// That password is carried into the pod the production way — through the per-workload
+/// k8s **`Secret`** the backend creates, referenced by **`secretKeyRef`** (never a plaintext
+/// value in the StatefulSet spec, the F4 fix) — so the pod reaching Ready at all PROVES the
+/// Secret→secretKeyRef→env path end to end (a broken Secret ⇒ empty `POSTGRES_PASSWORD` ⇒
+/// the entrypoint refuses to initialize ⇒ never Ready ⇒ this test fails). `SELECT 1` then
+/// runs over the pod's local socket (the image's default `local … trust`).
 #[tokio::test]
 #[ignore = "live: needs a real k8s/k3s cluster — set BOATRAMP_TEST_K8S=1 (marker: K8S COMPUTE BACKEND OK)"]
 async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
@@ -161,11 +164,13 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
         .expect("connect to the cluster");
 
     // The exact spec the managed-DB auto-registration builds for a managed Postgres
-    // (pgvector/pgvector:pg16, one `data` volume, port 5432), plus the stand-in auth env
-    // so the stock image boots without the node-side sealed-credential injection.
+    // (pgvector/pgvector:pg16, one `data` volume, port 5432), plus a stand-in password so
+    // the stock image boots. The password is delivered to the pod via the backend's env
+    // Secret + secretKeyRef (not the node-side sealed-credential flow), so the pod reaching
+    // Ready proves that Secret path works.
     let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
     spec.env
-        .insert("POSTGRES_HOST_AUTH_METHOD".to_string(), "trust".to_string());
+        .insert("POSTGRES_PASSWORD".to_string(), "livegate-pw".to_string());
     let image = spec.root.as_str().to_string();
     let req = LaunchRequest {
         project: "default".to_string(),

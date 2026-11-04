@@ -12,10 +12,11 @@ use std::collections::BTreeMap;
 use boatramp_core::compute::{ComputeSpec, RootSource, compute_instance_id};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, SeccompProfile, SecurityContext, Service, ServicePort, ServiceSpec,
-    TCPSocketAction, TypedLocalObjectReference, Volume, VolumeMount, VolumeResourceRequirements,
+    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, LocalObjectReference,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, SeccompProfile, Secret, SecretKeySelector,
+    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, TypedLocalObjectReference,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -103,6 +104,12 @@ pub struct ResourcePlan {
     pub service: Service,
     /// The data volume's claim (on the default / configured StorageClass).
     pub pvc: PersistentVolumeClaim,
+    /// The `Opaque` `Secret` holding the workload's env values (the managed-DB server-init
+    /// credential — `POSTGRES_PASSWORD` / `MYSQL_*` — included), referenced by the pod via
+    /// `secretKeyRef` so **no credential ever appears as a plaintext value in the
+    /// StatefulSet/Pod spec**. `None` when the spec declares no env (nothing to carry).
+    /// The backend applies this BEFORE the workload and deletes it on teardown.
+    pub secret: Option<Secret>,
 }
 
 /// Whether `s` is a valid RFC 1123 DNS label (a Kubernetes object/Service name).
@@ -203,11 +210,17 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     // The container running the operand image. The shared-kernel backends apply the
     // image filesystem, not its OCI config, so the explicit entrypoint from the spec is
     // the argv the pod runs (`command`), with the port + data mount wired through.
+    // The server-init env (incl. the managed-DB credential) lives in a per-workload
+    // Secret; the container pulls each value by `secretKeyRef` so no credential is written
+    // into the StatefulSet/Pod spec.
+    let secret = env_secret(ctx, spec);
+    let env = env_vars(spec, &env_secret_name(&ctx.workload));
+
     let container = Container {
         name: "db".to_string(),
         image: Some(image.clone()),
         command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
-        env: env_vars(spec),
+        env,
         ports: Some(vec![ContainerPort {
             container_port: i32::from(spec.port),
             name: Some("db".to_string()),
@@ -302,6 +315,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         stateful_set,
         service,
         pvc,
+        secret,
     })
 }
 
@@ -424,15 +438,50 @@ fn image_pull_secrets(ctx: &PlanContext) -> Option<Vec<LocalObjectReference>> {
         .map(|name| vec![LocalObjectReference { name: name.clone() }])
 }
 
-/// The spec's env map as the k8s `EnvVar` list (stable order from the `BTreeMap`).
-fn env_vars(spec: &ComputeSpec) -> Option<Vec<EnvVar>> {
+/// The name of the per-workload env `Secret` (`<workload>-env`). A valid DNS-1123
+/// subdomain (the workload is already a DNS-1123 label, so `<label>-env` fits), stable +
+/// namespace-scoped like every other object this plan emits.
+pub fn env_secret_name(workload: &str) -> String {
+    format!("{workload}-env")
+}
+
+/// The `Opaque` `Secret` carrying the spec's env values for the workload — the home for
+/// the managed-DB server-init credential (`POSTGRES_PASSWORD` / `MYSQL_*`) and any other
+/// env, so the pod references them by `secretKeyRef` and **no value is written as
+/// plaintext into the StatefulSet/Pod spec**. `None` when the spec declares no env.
+/// Uses `stringData` (the apiserver base64-encodes it into `data`); the backend WRITES
+/// this (its Role grants `create`/`patch`) but never READS a secret value back (no `get`).
+fn env_secret(ctx: &PlanContext, spec: &ComputeSpec) -> Option<Secret> {
+    if spec.env.is_empty() {
+        return None;
+    }
+    Some(Secret {
+        metadata: object_meta(env_secret_name(&ctx.workload), ctx),
+        type_: Some("Opaque".to_string()),
+        string_data: Some(spec.env.clone().into_iter().collect()),
+        ..Default::default()
+    })
+}
+
+/// The spec's env as a k8s `EnvVar` list where every value is pulled from the per-workload
+/// env `Secret` via `secretKeyRef` (never an inline `value`), so a credential never lands
+/// in the pod spec. Stable order from the `BTreeMap`. `None` when the spec declares no env
+/// (and then no Secret is created either).
+fn env_vars(spec: &ComputeSpec, secret_name: &str) -> Option<Vec<EnvVar>> {
     let env: Vec<EnvVar> = spec
         .env
-        .iter()
-        .map(|(k, v)| EnvVar {
+        .keys()
+        .map(|k| EnvVar {
             name: k.clone(),
-            value: Some(v.clone()),
-            ..Default::default()
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: secret_name.to_string(),
+                    key: k.clone(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
         })
         .collect();
     (!env.is_empty()).then_some(env)
@@ -495,6 +544,10 @@ pub struct DeploymentPlan {
     pub deployment: Deployment,
     /// The ClusterIP Service fronting it (the routable endpoint host).
     pub service: Service,
+    /// The `Opaque` env `Secret` the pod references by `secretKeyRef` (so no env value —
+    /// a generic workload's env may itself hold secrets — is a plaintext value in the
+    /// Deployment/Pod spec). `None` when the spec declares no env.
+    pub secret: Option<Secret>,
 }
 
 /// Build the generic stateless [`DeploymentPlan`]. `ctx.workload` MUST already be the
@@ -517,11 +570,16 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
     }
     let image = spec.root.as_str().to_string();
 
+    // Env (which may itself carry secrets) rides in a per-workload Secret, referenced by
+    // `secretKeyRef` — never an inline value in the Deployment/Pod spec.
+    let secret = env_secret(ctx, spec);
+    let env = env_vars(spec, &env_secret_name(&ctx.workload));
+
     let container = Container {
         name: "app".to_string(),
         image: Some(image),
         command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
-        env: env_vars(spec),
+        env,
         ports: Some(vec![ContainerPort {
             container_port: i32::from(spec.port),
             name: Some("app".to_string()),
@@ -593,6 +651,7 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
     Ok(DeploymentPlan {
         deployment,
         service,
+        secret,
     })
 }
 
@@ -1130,6 +1189,126 @@ mod tests {
         assert_eq!(
             sc.capabilities.as_ref().unwrap().add.as_deref(),
             Some(["NET_BIND_SERVICE".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn managed_db_credential_goes_into_a_secret_not_the_pod_spec() {
+        // F4 fix: the server-init credential rides in an Opaque, namespace-scoped Secret
+        // referenced by secretKeyRef — it is NEVER a plaintext value in the pod spec.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.env
+            .insert("POSTGRES_PASSWORD".to_string(), "s3cr3t".to_string());
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+
+        // The Secret: Opaque, in the serve namespace, named `<workload>-env`, carrying the
+        // credential in stringData + the managed-by label.
+        let secret = plan.secret.as_ref().expect("env secret created");
+        assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+        assert_eq!(secret.metadata.name.as_deref(), Some("pg-env"));
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("boatramp"));
+        assert_eq!(
+            secret
+                .metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get(MANAGED_BY_LABEL),
+            Some(&"boatramp".to_string())
+        );
+        let sd = secret.string_data.as_ref().unwrap();
+        assert_eq!(
+            sd.get("POSTGRES_PASSWORD").map(String::as_str),
+            Some("s3cr3t")
+        );
+
+        // The pod's env references the Secret by key — no inline `value` anywhere, so the
+        // credential never appears as plaintext in the StatefulSet/Pod spec.
+        let container = &plan
+            .stateful_set
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0];
+        let env = container.env.as_ref().expect("container env");
+        assert!(
+            env.iter().all(|e| e.value.is_none()),
+            "no plaintext env value may appear in the pod spec"
+        );
+        let pw = env
+            .iter()
+            .find(|e| e.name == "POSTGRES_PASSWORD")
+            .expect("POSTGRES_PASSWORD env entry");
+        let sel = pw
+            .value_from
+            .as_ref()
+            .and_then(|s| s.secret_key_ref.as_ref())
+            .expect("POSTGRES_PASSWORD via secretKeyRef");
+        assert_eq!(sel.name, "pg-env");
+        assert_eq!(sel.key, "POSTGRES_PASSWORD");
+        assert_eq!(sel.optional, Some(false));
+        // Belt-and-braces: the serialized StatefulSet must not contain the secret value.
+        let sts_json = serde_json::to_string(&plan.stateful_set).unwrap();
+        assert!(
+            !sts_json.contains("s3cr3t"),
+            "credential value leaked into the StatefulSet spec"
+        );
+    }
+
+    #[test]
+    fn generic_workload_env_also_goes_via_secret_key_ref() {
+        // A generic workload's env (which may itself hold secrets) rides the same Secret.
+        let plan = deployment_plan(&ctx("web-0"), &generic_spec()).unwrap();
+        let secret = plan.secret.as_ref().expect("env secret created");
+        assert_eq!(secret.metadata.name.as_deref(), Some("web-0-env"));
+        assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+        let env = plan
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0]
+            .env
+            .clone()
+            .expect("container env");
+        assert!(env.iter().all(|e| e.value.is_none()));
+        let port = env.iter().find(|e| e.name == "PORT").unwrap();
+        assert_eq!(
+            port.value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .name,
+            "web-0-env"
+        );
+    }
+
+    #[test]
+    fn no_env_yields_no_secret_and_no_env_list() {
+        // An env-less spec creates no Secret (nothing to carry) and no env list.
+        let mut spec = generic_spec();
+        spec.env.clear();
+        let plan = deployment_plan(&ctx("web-0"), &spec).unwrap();
+        assert!(plan.secret.is_none(), "no env ⇒ no Secret");
+        assert!(
+            plan.deployment
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .containers[0]
+                .env
+                .is_none(),
+            "no env ⇒ no env list"
         );
     }
 

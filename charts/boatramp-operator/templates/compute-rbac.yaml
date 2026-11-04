@@ -37,12 +37,16 @@ metadata:
 #     (list/delete back the Phase-2 PVC volume-management + reaper surfaces).
 #   - pods + pods/log: pod readiness/liveness reads + the Phase-2 pod-log stream.
 #   - pods/exec: the Phase-2 `ComputeExec` (run a command inside a running pod).
+#   - secrets: the per-workload env Secret that holds the managed-DB credential — write
+#     (create/patch) + delete ONLY, never read (so a compromised token cannot enumerate or
+#     read secret values). The operator-configured imagePullSecret is still managed
+#     out-of-band (not created here).
 #   - snapshot.storage.k8s.io/volumesnapshots: the Phase-2 CSI VolumeSnapshot backup /
 #     restore (gated on a configured VolumeSnapshotClass; a no-op grant if unused).
 # No wildcards; no cluster-scoped (ClusterRole) grants — a boatramp-owned expandable
 # StorageClass or a VolumeSnapshotClass, being cluster-scoped, is intentionally NOT granted
-# here (an explicit operator step), and NO `secrets` verb (the imagePullSecret is managed
-# out-of-band). Non-helm installs: apply the equivalent Role below by hand.
+# here (an explicit operator step). Non-helm installs: apply the equivalent Role below by
+# hand.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -76,6 +80,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["get", "create"]
+  # Per-workload env Secret (holds the managed-DB server-init credential) — the backend
+  # WRITES it (server-side apply = create+patch) and DELETEs it on teardown. It is NEVER
+  # read back: no `get`/`list`/`watch`, so a compromised serve token cannot enumerate or
+  # read secret VALUES (only overwrite the workloads' own, named `<workload>-env`, or
+  # delete them) — the minimal authority for storing creds in a Secret instead of inline
+  # in the pod spec. Namespace-scoped (this is a Role); no cluster-scope, no wildcard.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
   # CSI VolumeSnapshot backup / restore (Phase 2): apply (create+patch) + get + delete
   # (snapshot cleanup). Namespace-scoped; the cluster-scoped VolumeSnapshotClass is NOT
   # granted (an operator step).

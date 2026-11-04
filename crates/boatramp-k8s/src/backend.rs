@@ -21,7 +21,7 @@ use boatramp_core::compute::{
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject};
 use kube::{Api, Client};
@@ -292,6 +292,7 @@ impl ComputeBackend for KubernetesBackend {
         let sts: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
         let dep: Api<Deployment> = Api::namespaced(self.client.clone(), &self.namespace);
         let svc: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.namespace);
 
         // Stateful teardown: Service + StatefulSet named by the workload.
         ignore_not_found(
@@ -312,6 +313,21 @@ impl ComputeBackend for KubernetesBackend {
         )?;
         ignore_not_found(
             dep.delete(&dep_name, &DeleteParams::default())
+                .await
+                .map(|_| ()),
+        )?;
+        // The per-workload env Secret (holds the managed-DB credential) under BOTH naming
+        // schemes; a missing one 404s harmlessly. Deleting it removes the credential from
+        // the namespace on teardown.
+        ignore_not_found(
+            secrets
+                .delete(&plan::env_secret_name(sts_name), &DeleteParams::default())
+                .await
+                .map(|_| ()),
+        )?;
+        ignore_not_found(
+            secrets
+                .delete(&plan::env_secret_name(&dep_name), &DeleteParams::default())
                 .await
                 .map(|_| ()),
         )?;
@@ -478,10 +494,15 @@ impl KubernetesBackend {
             stateful_set,
             service,
             pvc,
+            secret,
         } = plan::managed_db_plan(&ctx, &req.spec)
             .map_err(|e| BackendError::Launch(e.to_string()))?;
-        // Apply the PVC first (the pod mounts it), then the workload, then the Service.
-        // Server-side apply is idempotent, so a relaunch reconciles in place.
+        // Apply the env Secret first (the pod references its keys), then the PVC (the pod
+        // mounts it), then the workload, then the Service. Server-side apply is idempotent,
+        // so a relaunch reconciles each in place.
+        if let Some(secret) = &secret {
+            self.apply(secret).await?;
+        }
         self.apply(&pvc).await?;
         self.apply(&stateful_set).await?;
         self.apply(&service).await?;
@@ -496,8 +517,13 @@ impl KubernetesBackend {
         let DeploymentPlan {
             deployment,
             service,
+            secret,
         } = plan::deployment_plan(&ctx, &req.spec)
             .map_err(|e| BackendError::Launch(e.to_string()))?;
+        // The env Secret first (the pod references its keys), then the Deployment + Service.
+        if let Some(secret) = &secret {
+            self.apply(secret).await?;
+        }
         self.apply(&deployment).await?;
         self.apply(&service).await?;
         Ok(name)

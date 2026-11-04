@@ -262,11 +262,13 @@ computeBackend:
 
 The Role grants only the verbs the backend uses on `statefulsets`/`deployments`
 (apps), `services`/`persistentvolumeclaims`/`pods` (pods read-only), `pods/log`,
-`pods/exec`, and `volumesnapshots` — no wildcards, no cluster-scoped grants, and
-no `secrets` verb. For a non-helm install, apply the equivalent `Role` +
-`RoleBinding` from the chart template by hand. The cluster-scoped
-`StorageClass`/`VolumeSnapshotClass` are a separate operator step (not granted to
-boatramp).
+`pods/exec`, and `volumesnapshots` — no wildcards and no cluster-scoped grants.
+The one secret authority is a **write-only** `secrets: [create, patch, delete]`
+(no `get`/`list`/`watch`, so the token can neither enumerate nor read secret
+*values*) for the per-workload credential `Secret` (below). For a non-helm install,
+apply the equivalent `Role` + `RoleBinding` from the chart template by hand. The
+cluster-scoped `StorageClass`/`VolumeSnapshotClass` are a separate operator step
+(not granted to boatramp).
 
 **Config knobs** (all under `[compute]`, each also
 [env-settable](../reference/env.md#compute-backend)):
@@ -282,9 +284,12 @@ With the backend selected, the managed-database experience is unchanged — decl
 `databases:` and boatramp provisions the `StatefulSet`+`Service`+`PVC`, waits for
 readiness, and injects the DSN — see
 [Use a managed Postgres/MySQL](#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn).
-Launched pods are hardened (privilege escalation denied, all Linux capabilities
-dropped, the runtime default seccomp profile, and no auto-mounted ServiceAccount
-token).
+The database credential (and any workload env) is written to a per-workload
+`Opaque` `Secret` (`<workload>-env`, deleted on teardown) and referenced from the
+pod by `secretKeyRef`, so **no credential is a plaintext value in the
+StatefulSet/Pod spec**. Launched pods are hardened (privilege escalation denied,
+all Linux capabilities dropped, the runtime default seccomp profile, and no
+auto-mounted ServiceAccount token).
 
 ## Set a workload from an existing source
 
