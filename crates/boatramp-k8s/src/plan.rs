@@ -523,11 +523,15 @@ fn image_pull_secrets(ctx: &PlanContext) -> Option<Vec<LocalObjectReference>> {
         .map(|name| vec![LocalObjectReference { name: name.clone() }])
 }
 
-/// The name of the per-workload env `Secret` (`<workload>-env`). A valid DNS-1123
-/// subdomain (the workload is already a DNS-1123 label, so `<label>-env` fits), stable +
-/// namespace-scoped like every other object this plan emits.
+/// The name of the per-workload env `Secret` (`<workload>-env`), passed through
+/// [`dns_safe_name`] so it is ALWAYS a valid RFC-1123 label even when a generic
+/// [`workload_object_name`] is already near the 63-char label budget (a bare
+/// `<label>-env` would overflow). For a short workload (`pg`, the `bramp-db-<digest>`
+/// managed-DB name, `web-0`) the input is already a valid label, so `dns_safe_name`
+/// returns `<workload>-env` byte-identical; only an over-long input is hashed down.
+/// Deterministic + injective (so two workloads never share one env Secret).
 pub fn env_secret_name(workload: &str) -> String {
-    format!("{workload}-env")
+    dns_safe_name(&format!("{workload}-env"))
 }
 
 /// The `Opaque` `Secret` carrying the spec's env values for the workload — the home for
@@ -869,9 +873,12 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
 /// namespace; idempotent server-side apply).
 pub const DEFAULT_DENY_POLICY_NAME: &str = "boatramp-compute-default-deny";
 
-/// The per-workload allow NetworkPolicy name for an object (`<object>-allow`).
+/// The per-workload allow NetworkPolicy name for an object (`<object>-allow`), passed
+/// through [`dns_safe_name`] so it stays a valid RFC-1123 label even for a near-63-char
+/// generic [`workload_object_name`] (a bare `<object>-allow` would overflow). Short object
+/// names pass through byte-identical; deterministic, so `stop` recomputes the same name.
 pub fn allow_policy_name(object_name: &str) -> String {
-    format!("{object_name}-allow")
+    dns_safe_name(&format!("{object_name}-allow"))
 }
 
 /// The network isolation for one workload (F3): a namespace **default-deny-ingress**
@@ -2285,6 +2292,24 @@ mod tests {
             sa.metadata.name, sb.metadata.name,
             "aliasing tenants must not share one env Secret"
         );
+    }
+
+    #[test]
+    fn derived_names_stay_valid_labels_for_a_near_max_workload_name() {
+        // A long (but valid) project + workload drives workload_object_name close to the
+        // 63-char label budget; the `-env` / `-allow` suffixes must NOT overflow it.
+        let object = workload_object_name(&"p".repeat(40), &"w".repeat(40), 7);
+        assert!(is_dns1123_label(&object), "object name: {object}");
+        let secret = env_secret_name(&object);
+        let allow = allow_policy_name(&object);
+        assert!(is_dns1123_label(&secret), "secret name overflow: {secret}");
+        assert!(
+            is_dns1123_label(&allow),
+            "allow policy name overflow: {allow}"
+        );
+        // Short names still pass through byte-identical (stable existing names).
+        assert_eq!(env_secret_name("pg"), "pg-env");
+        assert_eq!(allow_policy_name("pg"), "pg-allow");
     }
 
     // -----------------------------------------------------------------------
