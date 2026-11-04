@@ -41,7 +41,9 @@ const READY: &[u8] = b"READY";
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("privsep-vsock-guest is a Linux-only firecracker-guest init (AF_VSOCK); not supported on this target");
+    eprintln!(
+        "privsep-vsock-guest is a Linux-only firecracker-guest init (AF_VSOCK); not supported on this target"
+    );
     std::process::exit(1);
 }
 
