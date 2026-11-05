@@ -7,6 +7,50 @@ versions.
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-11-05
+
+### Added
+
+- **`project sync` now carries the control-plane KV strata (`settings` / `graphql` / `history`).**
+  Completes the v0.56.0 gap where these three were refused over the CLI ("not carried"). A new
+  project-scoped node-side endpoint `GET`/`POST /api/project-kv-stratum` (`Project·Admin` on both
+  ends, reusing the export/import key-scoping) lets `project sync --include-settings` /
+  `--include-graphql` / `--include-history --apply` reconcile them to a target, with structural
+  per-project key-scoping (only the authenticated project's prefixes; a fail-closed target-scope
+  gate on the write), the `history`→`siteconfig` dependency resolved per item (skip-and-report;
+  `--strict` refuses), and idempotent resync. KEK-sealed secret families are refused on both verbs.
+  The system-principal activation marker (`current-principal`) is **neutralized on every
+  control-plane carry** (sync dest-write and `project import`), so a replica never inherits the
+  source's system authority — a dest-side `System·Admin` activation is required to (re)grant it.
+- **Host-owned TCP `[serve.listeners]` listeners can serve the node-managed ACME cert
+  (`use_node_cert`).** A new per-listener `[serve.listeners.<name>.tls] use_node_cert = true` makes
+  the listener present the node's managed/on-demand cert for a verified+attached domain in its
+  `server_names` — cert parity with the `:443` HTTP path, reusing the same on-demand resolver,
+  issuance budget, verified-domain gate, and per-project scope. `cert_file`/`key_file` become
+  optional (a static cert, if present, stays the fallback for SNIs the node does not manage and for
+  an SNI-less handshake). Requires `[serve.on_demand_tls] enabled = true` and a non-empty
+  `server_names`. Fail-closed: a `tls` block with neither a static cert pair nor `use_node_cert` is
+  refused at config load; a managed SNI with no cert and no static fallback fails the handshake
+  rather than serving a wrong cert. (mailroom cap-req #29.)
+- **`compute status --project <p> <workload>` polls a workload's readiness per-project, without
+  node-global admin.** It now routes to the project-scoped `/api/projects/<p>/compute/status`
+  (authorized by `Project·Read`), returning the same `healthy`+`running` signal as the node-global
+  form — so a tenant's CI can gate its own deploy readiness with a `project_admin` token instead of
+  a node-global `admin` one. Bare `compute status` (no `--project`) stays node-global
+  (`System·Admin`), unchanged; the project-scoped reader is confined to the tenant's own compute
+  state (never another tenant's).
+
+### Fixed
+
+- **docker compute backend: an existing managed DB adopts the ≤63-octet network alias on upgrade,
+  with no manual recreate.** v0.57.0 fixed managed-DB DNS registration on Docker 29 for FRESH
+  deployments, but upgrading a managed DB created pre-v0.57.0 (with the old ~69-octet alias) left a
+  half-applied state — the reconcile recreated the consumer (new short DSN host) but not the
+  producer, so the DB kept answering only its old long alias and the consumer got NXDOMAIN. The
+  reconcile now also recreates a producer whose live network alias differs from the current
+  `managed_db_alias(workload)` (volume-preserving), so an upgraded deployment self-heals on the
+  first reconcile.
+
 ## [0.57.0] - 2026-11-05
 
 ### Added

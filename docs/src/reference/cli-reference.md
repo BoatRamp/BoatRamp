@@ -2009,7 +2009,7 @@ Remove a persistent volume by name. Refused if a registered workload still refer
 
 ### `boatramp compute status`
 
-Show observed per-replica runtime state — the reconcile plane's X-ray: stored health, lifecycle phase, assigned IP:port, age vs startup grace, backend. This is the record the endpoint resolver reads, so `HEALTHY=false` on a `running`, endpoint-bearing replica is the "reachable but not served" signature. Node-global (every tenant on the node); admin-scoped
+Show observed per-replica runtime state — the reconcile plane's X-ray: stored health, lifecycle phase, assigned IP:port, age vs startup grace, backend. This is the record the endpoint resolver reads, so `HEALTHY=false` on a `running`, endpoint-bearing replica is the "reachable but not served" signature. Project-scoped under `--project` (polls the tenant's OWN workloads; project_admin); node-global across every tenant without it (System·Admin)
 
 **Usage:** `boatramp compute status [WORKLOAD]`
 
