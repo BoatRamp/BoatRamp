@@ -660,13 +660,23 @@ struct CompositeResolver {
     /// gets per-domain on-demand issuance. This is transport-level only — nothing here knows or cares
     /// what protocol runs over the connection.
     default_cert: Option<Arc<CertifiedKey>>,
-    /// cap-req #29: the SNIs for which the **NODE-MANAGED** cert is PREFERRED — served (and triggered
-    /// for issuance) through `on_demand`, the SAME engine the `:443` edge uses — with the static cert
-    /// (if any) demoted to a FALLBACK for these. Empty at the edge and for a listener that did not opt
-    /// into `use_node_cert` (so the resolution order is byte-for-byte unchanged there). A listener sets
-    /// this to its `server_names` allowlist; the gate inside `on_demand` (verified+attached+project)
-    /// still applies, so listing a name here never lets the listener serve an unauthorized cert.
-    managed_names: std::collections::HashSet<String>,
+    /// cap-req #29: the SNI **patterns** for which the **NODE-MANAGED** cert is PREFERRED — served (and
+    /// triggered for issuance) through `on_demand`, the SAME engine the `:443` edge uses — with the
+    /// static cert (if any) demoted to a FALLBACK for these. Empty at the edge and for a listener that
+    /// did not opt into `use_node_cert` (so the resolution order is byte-for-byte unchanged there). A
+    /// listener sets this to its `server_names` allowlist; the gate inside `on_demand`
+    /// (verified+attached+project) still applies, so listing a name here never lets the listener serve
+    /// an unauthorized cert.
+    ///
+    /// Matched with the SAME [`sni_matches`] semantics as the static tier (Security review F1):
+    /// case-insensitive + single-label wildcard. A plain `HashSet::contains` would be a case-sensitive
+    /// EXACT match, so a wildcard or mixed-case `server_names` entry would silently MISS the managed
+    /// path and the static tier (which IS wildcard/case-aware) would serve the operator's static cert
+    /// instead — a silent node-managed→static downgrade. A wildcard managed pattern routes a covered
+    /// concrete SNI to the engine, which issues per-concrete-SNI under the verified gate (a
+    /// DNS-verified ancestor zone authorizes the subtree — see `is_host_issuance_authorized`), so
+    /// wildcard managed serving is sound.
+    managed_names: Vec<String>,
     /// Whether a NON-managed SNI may fall through to on-demand issuance (serve/trigger). `true` at the
     /// `:443` edge and for an `on_demand` catch-all listener (unchanged). `false` for a
     /// `use_node_cert`-only listener, so its managed serving/triggering is BOUNDED to `managed_names`
@@ -688,7 +698,11 @@ impl ResolvesServerCert for CompositeResolver {
         // cert, if configured, is only the fallback (while the managed cert warms, or for a name the
         // node cannot currently serve). On a TLS-ALPN-01 validation handshake serve ONLY the ephemeral
         // challenge cert (never the static cert, which would fail validation).
-        if self.managed_names.contains(sni) {
+        if self
+            .managed_names
+            .iter()
+            .any(|pattern| sni_matches(pattern, sni))
+        {
             let managed = self.on_demand.resolve_sni(sni, is_acme_alpn);
             if is_acme_alpn {
                 return managed;
@@ -797,7 +811,7 @@ pub fn build_server_config_composite(
         default_cert: None,
         // The public edge: no per-name node-managed preference (static wildcards win), and the on-demand
         // issuer is the catch-all for every verified SNI — unchanged (cap-req #29 fields inert here).
-        managed_names: std::collections::HashSet::new(),
+        managed_names: Vec::new(),
         catch_all_on_demand: true,
     });
     Ok(server_config_from(resolver))
@@ -849,7 +863,7 @@ pub fn build_listener_server_config_composite(
         static_resolver: Arc::new(SniCertResolver { entries }),
         on_demand,
         default_cert: own,
-        managed_names: managed_names.iter().cloned().collect(),
+        managed_names: managed_names.to_vec(),
         catch_all_on_demand,
     });
     // No ALPN: protocol-agnostic. Build the config directly rather than via `server_config_from`.
@@ -869,7 +883,7 @@ pub fn build_server_configs_composite(
         on_demand,
         default_cert: None,
         // Public edge (TCP + h3): unchanged — no per-name managed preference, on-demand is the catch-all.
-        managed_names: std::collections::HashSet::new(),
+        managed_names: Vec::new(),
         catch_all_on_demand: true,
     });
     let tcp = server_config_from(resolver.clone());
@@ -1337,6 +1351,174 @@ mod tests {
             println!(
                 "LISTENER USE-NODE-CERT OK: managed server_name served the node-managed cert (not static), \
                  out-of-allowlist SNI refused, SNI-less falls back to static or fails closed"
+            );
+        }
+
+        // Security review F1: a WILDCARD or MIXED-CASE `server_names` entry under `use_node_cert` must
+        // route a covered concrete SNI to the NODE-MANAGED path — not silently fall through to the
+        // static tier (which IS wildcard/case-aware via `sni_matches`) and serve the operator's static
+        // cert. MUTATION SENSE: the pre-fix membership check was a case-sensitive EXACT
+        // `HashSet::contains(sni)`, so `foo.wild.example.test` (not literally in the set) and
+        // `mixed.example.test` (lowercased SNI vs a `Mixed.Example.Test` entry) MISSED the managed path
+        // and the static cert was served. Here they are served the node-managed (cache) cert.
+        #[test]
+        fn use_node_cert_wildcard_and_mixed_case_route_to_managed() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            // The node-managed certs (as if the shared engine issued them for the concrete SNIs).
+            let (wild_managed_cert, wild_managed_key) = self_signed("foo.wild.example.test");
+            let (mixed_managed_cert, mixed_managed_key) = self_signed("mixed.example.test");
+            // A DIFFERENT static cert that ALSO covers both (a `*.wild` wildcard + the mixed name) —
+            // what the operator hand-fed and what the pre-fix bug would have served.
+            let (static_cert, static_key) = self_signed("static.example.test");
+
+            let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
+            cache.insert_issued(
+                "foo.wild.example.test",
+                std::sync::Arc::new(
+                    certified_key_from_pem(&wild_managed_cert, &wild_managed_key).unwrap(),
+                ),
+            );
+            cache.insert_issued(
+                "mixed.example.test",
+                std::sync::Arc::new(
+                    certified_key_from_pem(&mixed_managed_cert, &mixed_managed_key).unwrap(),
+                ),
+            );
+            let on_demand =
+                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(cache));
+
+            // A wildcard entry + a MIXED-CASE entry — exactly the shapes the EXACT `contains` missed.
+            let server_names = vec![
+                "*.wild.example.test".to_string(),
+                "Mixed.Example.Test".to_string(),
+            ];
+            let config = std::sync::Arc::new(
+                build_listener_server_config_composite(
+                    Some((&static_cert, &static_key)),
+                    &server_names,
+                    &server_names, // managed_names (use_node_cert)
+                    false,         // catch_all OFF
+                    on_demand,
+                )
+                .unwrap(),
+            );
+
+            // A concrete host under the wildcard managed entry → node-managed cert, not the static one.
+            assert_eq!(
+                served_cert(
+                    &config,
+                    ServerName::try_from("foo.wild.example.test").unwrap()
+                )
+                .as_deref(),
+                Some(leaf_der(&wild_managed_cert).as_slice()),
+                "a concrete SNI under a WILDCARD managed server_name is served the node-managed cert"
+            );
+            // The mixed-case managed entry → node-managed cert for the (lowercased) concrete SNI.
+            assert_eq!(
+                served_cert(&config, ServerName::try_from("mixed.example.test").unwrap())
+                    .as_deref(),
+                Some(leaf_der(&mixed_managed_cert).as_slice()),
+                "a MIXED-CASE managed server_name is matched case-insensitively → node-managed cert"
+            );
+            // Neither is the static cert (the pre-fix silent downgrade).
+            assert_ne!(
+                served_cert(
+                    &config,
+                    ServerName::try_from("foo.wild.example.test").unwrap()
+                )
+                .as_deref(),
+                Some(leaf_der(&static_cert).as_slice()),
+                "the static cert must NOT be served for a wildcard-covered managed name"
+            );
+            println!(
+                "LISTENER USE-NODE-CERT WILDCARD/CASE OK: wildcard + mixed-case server_names route to \
+                 the node-managed path (no silent static downgrade)"
+            );
+        }
+
+        // Security review F3: isolate the PROJECT-SCOPE gate for `use_node_cert`. A listener pinned to
+        // project `mine` whose `server_names` allowlist contains a domain OWNED by a DIFFERENT project
+        // (`other`) — and whose cert is already in the shared cache — must serve NOTHING and trigger NO
+        // issuance. The domain IS in the allowlist (so it reaches the managed/scoped path), so a pass
+        // here proves the scope gate refuses it independently of the allowlist gate.
+        #[tokio::test]
+        async fn use_node_cert_listener_refuses_a_cross_project_server_name() {
+            use boatramp_core::deploy::DeployStore;
+            use boatramp_core::project::ProjectRef;
+
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            let store = DeployStore::new(
+                std::sync::Arc::new(NullStorage),
+                std::sync::Arc::new(boatramp_core::kv::MemoryKv::new()),
+            );
+            // `cross.example.test` is owned + resolvable under project `other` (NOT `mine`).
+            let other_cfg = boatramp_core::config::SiteConfig {
+                domains: boatramp_core::config::DomainConfig {
+                    primary: Some("cross.example.test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            store
+                .set_site_config(ProjectRef::new("other"), "s", &other_cfg)
+                .await
+                .unwrap();
+            // Warm the synchronous owner cache the scope check reads → cached_owner resolves to `other`.
+            assert!(matches!(
+                store.resolve_site_by_host("cross.example.test").await,
+                Ok(Some(_))
+            ));
+
+            // Its cert is ALREADY in the shared cache (as if the edge issued it) — so the ONLY thing
+            // that can stop the listener serving it is the project-scope gate, not a cache miss.
+            let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
+            let (cross_cert, cross_key) = self_signed("cross.example.test");
+            cache.insert_issued(
+                "cross.example.test",
+                std::sync::Arc::new(certified_key_from_pem(&cross_cert, &cross_key).unwrap()),
+            );
+
+            // A scoped resolver for `mine` with a CALLER-OWNED trigger channel, so we can assert no
+            // issuance was triggered.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+            let scoped =
+                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::scoped_with_trigger(
+                    cache,
+                    "mine".to_string(),
+                    store.clone(),
+                    tx,
+                ));
+            // The listener's `server_names` allowlist CONTAINS the cross-project domain (so it IS routed
+            // to the managed path); NO static cert, catch-all OFF.
+            let server_names = vec!["cross.example.test".to_string()];
+            let config = std::sync::Arc::new(
+                build_listener_server_config_composite(
+                    None,
+                    &server_names,
+                    &server_names,
+                    false,
+                    scoped,
+                )
+                .unwrap(),
+            );
+
+            // The scope gate refuses: nothing is served for the cross-project domain…
+            assert_eq!(
+                served_cert(&config, ServerName::try_from("cross.example.test").unwrap()),
+                None,
+                "a cross-project server_name is NOT served, even though it is in the allowlist and cached"
+            );
+            // …and NO issuance was triggered (a CONFIRMED other-project owner is refused outright — no
+            // serve, no trigger).
+            assert!(
+                rx.try_recv().is_err(),
+                "a confirmed other-project server_name must trigger NO issuance (project-scope gate)"
+            );
+            println!(
+                "LISTENER USE-NODE-CERT CROSS-PROJECT OK: an allowlisted+cached domain owned by another \
+                 project is neither served nor triggered (project-scope gate isolated)"
             );
         }
     }

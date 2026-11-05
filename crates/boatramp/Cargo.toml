@@ -497,6 +497,10 @@ serde_yaml = { workspace = true, optional = true }
 # Generate a self-signed cert/key in the cluster-TLS bridge tests (avoids
 # embedding a base64 fixture). Already in the tree via boatramp-acme `acme`.
 rcgen = "0.13"
+# Parse the served leaf X.509 in the cap-req #29 listener node-cert live gate to assert it is
+# CA-ISSUED (issuer != subject), not a self-signed static cert (Security review F4). Already in the
+# dependency tree (transitive), so this pins the test build to the same build, not a new download.
+x509-parser = "0.18"
 # A trivial router for the `--tls rpk` client-pinning integration test.
 axum.workspace = true
 # The WAL clean-shutdown gate tests (A2-cluster / A3) implement a mock `KvStore`,

@@ -655,6 +655,23 @@ impl OnDemandResolver {
             scope: Some(ListenerScope { project, deploy }),
         }
     }
+
+    /// Like [`scoped_from_cache`](Self::scoped_from_cache) but with a CALLER-OWNED trigger channel, so a
+    /// test can assert whether a resolve TRIGGERED issuance (Security review F3: prove a confirmed
+    /// other-project SNI is refused AND triggers NO issuance — isolating the project-scope gate).
+    #[cfg(test)]
+    pub(crate) fn scoped_with_trigger(
+        cache: Arc<CertCache>,
+        project: String,
+        deploy: boatramp_core::deploy::DeployStore,
+        trigger: mpsc::Sender<String>,
+    ) -> Self {
+        Self {
+            cache,
+            trigger,
+            scope: Some(ListenerScope { project, deploy }),
+        }
+    }
 }
 
 /// Whether a `ClientHello` carries the `acme-tls/1` ALPN (a TLS-ALPN-01 validation handshake).
@@ -2307,14 +2324,17 @@ mod tests {
             leaf_der(&stored.chain_pem),
             "the listener serves the NODE-MANAGED cert (the exact leaf the node stored == `:443` serves)"
         );
-        // It is genuinely CA-issued (same ISSUER as the `:443` edge), not a self-signed static cert:
-        // the ONLY way a cert reaches `cert_store` here is a real ACME DNS-01 round-trip against the
-        // Pebble CA (this listener has NO static cert — `None` above — so there is no self-signed
-        // material to fall back to), and Pebble returns a leaf+intermediate chain (> 1 PEM block).
-        let chain_len = rustls_pemfile::certs(&mut stored.chain_pem.as_bytes()).count();
-        assert!(
-            chain_len >= 2,
-            "a CA-issued chain carries the issuer too (leaf + intermediate); got {chain_len} PEM blocks"
+        // It is genuinely CA-ISSUED (same ISSUER as the `:443` edge), not a self-signed static cert:
+        // the served leaf's issuer DN differs from its subject DN (Security review F4 — a self-signed
+        // listener cert, the pre-#29 behavior, would have issuer == subject). The ONLY way a cert
+        // reaches `cert_store` here is a real ACME round-trip against the Pebble CA (this listener has
+        // NO static cert — `None` above — so there is no self-signed material to fall back to).
+        let (_, parsed) =
+            x509_parser::parse_x509_certificate(&served).expect("the served leaf parses as X.509");
+        assert_ne!(
+            parsed.issuer().to_string(),
+            parsed.subject().to_string(),
+            "the served cert is CA-issued (issuer != subject), not a self-signed static cert"
         );
 
         // BOUND 1: an SNI OUTSIDE `server_names` is REFUSED — the listener never serves (nor triggers)
