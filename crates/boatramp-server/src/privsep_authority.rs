@@ -1446,8 +1446,11 @@ impl RevocationCheck for FileRevocationList {
             }
             Ok(meta) => {
                 let mtime = meta.modified().ok();
-                let need_reload =
-                    !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
+                // Reload on a changed mtime — OR whenever mtime is unavailable (a degenerate FS that
+                // reports none): never trust a cached feed we cannot prove is current, so a later
+                // delivered revocation is always picked up (fail-safe freshness for a security feed).
+                let need_reload = mtime.is_none()
+                    || !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
                 if need_reload {
                     match Self::load(&self.path) {
                         Ok((cti, subject)) => {
