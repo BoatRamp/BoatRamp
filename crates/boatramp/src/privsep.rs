@@ -196,9 +196,10 @@ pub struct InstanceSpawnSpec {
     /// The fine-grained authority set this instance materializes.
     pub capabilities: Vec<HostAuthority>,
     /// The ISOLATION SUBSTRATE this instance's spawn backend uses (design §7 "substrate is a spawn
-    /// backend"). The supervisor dispatches on it: `OsProcess` is the wired fork+exec backend;
-    /// `Container`/`Vm` are refused fail-closed by [`resolve_spawn_backend`] until their
-    /// compute-plane-backend wiring lands (a reported follow-on).
+    /// backend"). The supervisor dispatches on it: `OsProcess` is the Phase-1 fork+exec backend and
+    /// `Container` the Phase-3 one (the SAME fork+exec, the child additionally unsharing
+    /// NS/PID/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8); `Vm` is refused
+    /// fail-closed by [`resolve_spawn_backend`] until its vsock-crossing wiring lands.
     pub substrate: InstanceSubstrate,
     /// The re-exec argv TAIL (after `argv[0]`): `["__instance", "<label>", "--config", "<path>"]`.
     pub argv: Vec<String>,
@@ -561,6 +562,45 @@ fn resolve_instance_slice<'a>(
         .ok_or_else(|| PrivsepError::InstanceNotFound(label.to_string()))
 }
 
+/// Fail-closed CONFIRMATION that a `substrate: container` instance really entered the fresh
+/// namespaces the root unshared for it in its `pre_exec` (design-note Option C, the SIMPLE model).
+///
+/// The root did `unshare(CLONE_NEWNS|NEWPID|NEWIPC|NEWUTS|NEWCGROUP)` in THIS child before the
+/// re-exec. Four of those five (mount/ipc/uts/cgroup) take effect for the CALLING process
+/// immediately, so this process's own namespaces must DIFFER from its parent's — the parent being
+/// the root supervisor, which stays in the outer namespaces. We compare the `/proc/<pid>/ns/<type>`
+/// magic-symlink targets (the kernel's per-namespace inode identity). If any of the four MATCHES the
+/// parent's, the `unshare` did not take effect (a spawn-dispatch regression that spawned the
+/// Container instance like a plain OS process), and we refuse to serve unconfined.
+///
+/// `pid` is deliberately NOT asserted distinct: `unshare(CLONE_NEWPID)` does not move the CALLER into
+/// the new pid namespace — only its future children — so this process keeps its parent's pid
+/// namespace. That simple-model semantic is documented + flagged for Security in the design note
+/// (`crates/boatramp/DESIGN-privsep-phase3-container.md`); the pid-namespace isolation applies to any
+/// sub-processes the instance forks, not to the instance process itself. Reading the parent's
+/// `/proc/<ppid>/ns/*` needs ptrace-read access, which holds here (same-uid: both run as the root
+/// supervisor's uid, before this instance drops into its sandbox). Linux-only.
+#[cfg(target_os = "linux")]
+fn verify_container_namespaces_unshared(label: &str) -> Result<(), String> {
+    let ppid = unsafe { libc::getppid() };
+    for ns in ["mnt", "ipc", "uts", "cgroup"] {
+        let mine = std::fs::read_link(format!("/proc/self/ns/{ns}"))
+            .map_err(|e| format!("container substrate: reading /proc/self/ns/{ns}: {e}"))?;
+        let parent = std::fs::read_link(format!("/proc/{ppid}/ns/{ns}")).map_err(|e| {
+            format!("container substrate: reading parent /proc/{ppid}/ns/{ns} (ppid={ppid}): {e}")
+        })?;
+        if mine == parent {
+            return Err(format!(
+                "container-substrate instance {label:?} shares its parent's {ns} namespace \
+                 ({mine:?}) — the root supervisor's unshare did not take effect, so the \
+                 namespace/cgroup wall is NOT up. Refusing to serve unconfined (no silent downgrade \
+                 to an OS process) — FailNodeClosed"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run a feature-instance (`boatramp __instance <label>`, or the root's spawned child):
 /// resolve its slice, build its materialization gate, log the held/dropped authorities,
 /// then stop at the WS-C serving seam. Refuses a non-privsep node / an unknown label
@@ -608,6 +648,30 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
         label: label.to_string(),
         reason,
     };
+
+    // Phase-3 Container substrate (design-note Option C): if the operator selected
+    // `substrate: container` for this instance, CONFIRM — fail-closed, and BEFORE the Landlock wall
+    // goes up so `/proc` is still readable — that the root really unshared our mount/ipc/uts/cgroup
+    // namespaces in our `pre_exec`. A Container instance that finds itself still in its parent's
+    // namespaces (a spawn-dispatch regression that skipped the `unshare`) refuses to serve rather
+    // than run unconfined — the "no silent downgrade" invariant, now self-checked by the confined
+    // process itself (not merely asserted by the spawner). The namespace/cgroup wall is ADDITIVE: the
+    // per-capability seccomp/Landlock profile below is still THE filesystem/syscall wall.
+    #[cfg(target_os = "linux")]
+    if matches!(inst.substrate, InstanceSubstrate::Container) {
+        verify_container_namespaces_unshared(label).map_err(|reason| {
+            PrivsepError::InstanceServe {
+                label: label.to_string(),
+                reason,
+            }
+        })?;
+        tracing::info!(
+            instance = %label,
+            "[privsep] instance: container substrate CONFIRMED — mount/ipc/uts/cgroup namespaces \
+             unshared from the root supervisor (the namespace/cgroup wall is up UNDER the \
+             per-capability Landlock FS wall; net namespace deliberately shared for backend egress)"
+        );
+    }
 
     // Step 3 (design §2.1): install the per-capability seccomp/Landlock profile BEFORE the
     // runtime, fail-closed `Enforced` fleetwide. Done on THIS single main thread so every Tokio
@@ -775,52 +839,28 @@ fn instance_listener_addr(
 /// refused fail-closed before anything is allocated — never spawned part-way, never silently
 /// downgraded to an OS process (which would discard the operator's chosen isolation wall).
 ///
-/// **Phase-3 FOUNDATION scope.** [`InstanceSubstrate::OsProcess`] is the WIRED backend (the root's
-/// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] and
-/// [`InstanceSubstrate::Vm`] are the config vocabulary + this seam: they reuse the
-/// `boatramp-container` and `boatramp-firecracker` / `boatramp-vz` compute-plane backends
-/// respectively, whose supervisor wiring (the container/VM socketpair-equivalent — a vsock crossing
-/// for a VM; see `docs/privsep-substrate-benchmark.md` for the measured cost) is a reported follow-on.
-/// Until then this refuses them, naming the backend each reuses. Pure (host-testable).
+/// **Phase-3 scope.** [`InstanceSubstrate::OsProcess`] is the Phase-1 WIRED backend (the root's
+/// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] is NOW WIRED
+/// too, on the SIMPLE model (design-note Option C, owner-approved): the SAME `fork`+`exec`, with the
+/// child additionally unsharing the mount/pid/ipc/uts/cgroup namespaces in its `pre_exec` (no
+/// `pivot_root`, no new net namespace — the per-capability Landlock profile stays the FS wall, and a
+/// `backend.*` instance keeps host-net egress). [`InstanceSubstrate::Vm`] stays the reported
+/// follow-on: a VM has its OWN kernel, so the `local` socketpair cannot cross (unlike Container on one
+/// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport. Until then
+/// `Vm` is refused fail-closed, naming the backend it reuses — never silently downgraded to an OS
+/// process (which would discard the operator's chosen isolation wall). Pure (host-testable).
 fn resolve_spawn_backend(label: &str, substrate: InstanceSubstrate) -> Result<(), PrivsepError> {
     if substrate.is_wired() {
         return Ok(());
     }
     let backend = substrate.compute_plane_backend().unwrap_or("(none)");
-    // The `Container` substrate carries a SHARPENED refusal naming the specific TCB-critical design
-    // blockers a reviewer must resolve before it can be wired — NOT a generic "not wired" — and
-    // points at the crate-local design note that pins each one down. Container is strictly simpler
-    // than VM (the `local` socketpair + SCM_RIGHTS keep working cross-namespace on one kernel —
-    // design-note §2a), but it is still refused fail-closed, never silently downgraded to an OS
-    // process (which would discard the operator's chosen isolation wall). The blockers:
-    //   §1  the OCI-vs-own-binary reconciliation — `boatramp-container` is OCI/rootfs-oriented
-    //       (`pivot_root`), but a privsep instance must run the host's OWN static-musl binary in
-    //       `__instance` mode; the rootfs model (minimal synthetic / bind-mount / no-pivot) is the
-    //       load-bearing, un-ratified decision;
-    //   §2b the multi-fd pass — the backend hands exactly ONE inherited fd (onto fd 0), but a
-    //       privsep instance needs every root-wired link end + its listener at fixed fd numbers;
-    //   §5b the per-instance namespace/egress policy — a `backend.*` instance in a fresh netns has
-    //       no path to its DB/KV/blob backends.
-    if matches!(substrate, InstanceSubstrate::Container) {
-        return Err(PrivsepError::Supervise(format!(
-            "instance {label:?} selects the \"container\" isolation substrate, whose spawn backend is \
-             not wired in this Phase-3 cut. It reuses {backend}, but three TCB-critical design \
-             questions are unresolved and need owner + Security ratification: (1) the OCI-vs-own-binary \
-             rootfs reconciliation — the container worker `pivot_root`s into a rootfs, so running the \
-             host's OWN static-musl binary in `__instance` mode needs a ratified rootfs model; (2) the \
-             multi-fd pass — the backend hands one inherited fd, but a privsep instance needs every \
-             root-wired socketpair link end + its listener fd at fixed numbers; (3) the per-instance \
-             namespace/egress policy — a backend instance in a fresh network namespace cannot reach \
-             its data-plane backends. See crates/boatramp/DESIGN-privsep-phase3-container.md. Refusing \
-             fail-closed rather than silently downgrading to an OS process (which would discard the \
-             chosen isolation wall); use `substrate: OsProcess` (the default) until the backend lands"
-        )));
-    }
     Err(PrivsepError::Supervise(format!(
         "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is not wired in \
-         the Phase-3 foundation cut (it reuses {backend} — a reported follow-on). Refusing \
+         this cut (it reuses {backend} — a reported follow-on; a VM has its own kernel, so the `local` \
+         socketpair cannot cross and the whole link transport needs a vsock re-plumb). Refusing \
          fail-closed rather than silently downgrading to an OS process (which would discard the \
-         chosen isolation wall); use `substrate: OsProcess` (the default) until the {} backend lands",
+         chosen isolation wall); use `substrate: OsProcess` or `substrate: Container` until the {} \
+         backend lands",
         substrate.tag(),
         substrate.tag(),
     )))
@@ -1127,7 +1167,7 @@ mod per_tenant {
         LinkEndpointRelay, PerTenantInstanceRegistry, TenantInstanceLink,
     };
 
-    use super::{InstanceSpawnSpec, PRIVSEP_FDS_ENV, PrivsepChildFds};
+    use super::{InstanceSpawnSpec, InstanceSubstrate, PRIVSEP_FDS_ENV, PrivsepChildFds};
 
     /// Set `FD_CLOEXEC` on `fd` so a per-tenant child the router fork+exec's never INHERITS it. The
     /// root-passed listener fd is NOT CLOEXEC (it survived the frontend's OWN exec), so without this
@@ -1157,6 +1197,24 @@ mod per_tenant {
     /// `src == tgt` clears `CLOEXEC` in place WITHOUT a dup2 — how the router passes a single link fd
     /// at its own number, avoiding a target collision in its crowded fd table. The `dup2`/`fcntl`
     /// machinery is POSIX; only `PR_SET_PDEATHSIG` is Linux-gated.
+    ///
+    /// **Container substrate (Phase-3 SIMPLE model — design-note Option C).** When
+    /// `spec.substrate == Container`, the child additionally `unshare(2)`s the mount, pid, ipc, uts,
+    /// and cgroup namespaces at the TOP of its `pre_exec`, BEFORE the (byte-identical) dup / CLOEXEC /
+    /// `PR_SET_PDEATHSIG` sequence an OS-process child runs — so a Container child is nothing but an
+    /// OS-process child with a namespace/cgroup wall ADDED underneath. Deliberately NOT unshared:
+    /// `CLONE_NEWNET` (a `backend.*` instance must keep host-net egress to its DB/KV/blob — design §5b)
+    /// and `CLONE_NEWUSER` (the per-capability Landlock + seccomp wall + the existing privilege drop
+    /// already contain it — design §5b). `CLONE_NEWNS` gives a COPY of the mount table (no
+    /// `pivot_root`): the per-capability Landlock profile the child installs post-`exec` stays the FS
+    /// wall, unchanged (the paths it grants resolve to the same inodes), and the fd-pass is unaffected
+    /// — an `AF_UNIX` socketpair end is a plain open fd that crosses any of these namespaces on the one
+    /// shared kernel (design §2a). The `unshare` needs `CAP_SYS_ADMIN` (we do NOT add a user namespace),
+    /// which the root supervisor holds (it binds privileged listeners); if it FAILS the `pre_exec`
+    /// returns `Err` ⇒ `spawn()` fails ⇒ the caller tears the node down (`FailNodeClosed`) — NEVER a
+    /// silent downgrade to an unconfined OS process. Linux-only (the CLONE_* flags are Linux); a
+    /// Container spec on a non-Linux build is refused below rather than spawned unconfined (the live
+    /// path is already Linux+`sandbox`-gated at [`super::run_privsep`] / [`super::run_instance`]).
     pub(super) fn spawn_wired_instance(
         current_exe: &Path,
         spec: &InstanceSpawnSpec,
@@ -1167,12 +1225,39 @@ mod per_tenant {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are
-        // async-signal-safe and touch only this child's fd table + death-signal. The caller assigns
-        // target fds above every source (boot path) or uses `src == tgt` (per-tenant single link),
-        // so no `dup2` clobbers a not-yet-processed source.
+        let container = matches!(spec.substrate, InstanceSubstrate::Container);
+        // Fail CLOSED rather than spawn a Container instance unconfined on a build where we cannot
+        // install the namespace wall (the CLONE_* flags are Linux-only). The live privsep path is
+        // already Linux+`sandbox`-gated upstream, so this is a defensive backstop, never a real path.
+        #[cfg(not(target_os = "linux"))]
+        if container {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the container substrate needs Linux namespaces (CLONE_NEWNS/NEWPID/NEWIPC/NEWUTS/\
+                 NEWCGROUP); refusing to spawn it unconfined on a non-Linux build",
+            ));
+        }
+        // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `unshare`/`dup2`/`fcntl`/`prctl` are
+        // async-signal-safe and touch only this child's namespaces + fd table + death-signal. The
+        // caller assigns target fds above every source (boot path) or uses `src == tgt` (per-tenant
+        // single link), so no `dup2` clobbers a not-yet-processed source. The `unshare` precedes the
+        // fd dups, but none of the unshared namespaces (NS/PID/IPC/UTS/CGROUP — net deliberately
+        // EXCLUDED) touch the fd table, so the fd-pass is byte-identical to the OS-process path.
         unsafe {
             cmd.pre_exec(move || {
+                // Container substrate: add the namespace/cgroup wall FIRST, then run the identical
+                // OS-process fd-pass + death-signal sequence below. (No-op for OS-process children.)
+                #[cfg(target_os = "linux")]
+                if container {
+                    let flags = libc::CLONE_NEWNS
+                        | libc::CLONE_NEWPID
+                        | libc::CLONE_NEWIPC
+                        | libc::CLONE_NEWUTS
+                        | libc::CLONE_NEWCGROUP;
+                    if libc::unshare(flags) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 for (src, tgt) in &dups {
                     if *src != *tgt && libc::dup2(*src, *tgt) < 0 {
                         return Err(std::io::Error::last_os_error());
@@ -1772,9 +1857,11 @@ mod supervise {
             std::env::current_exe().map_err(|e| err(format!("resolving current exe: {e}")))?;
 
         // Phase-3 spawn-backend dispatch (design §7 "substrate is a spawn backend"): resolve EACH
-        // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process is the
-        // wired Phase-1 backend; container/VM are refused fail-closed here (never a partial spawn,
-        // never a silent downgrade) until their compute-plane-backend wiring lands (a follow-on).
+        // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process + the
+        // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is refused fail-closed here
+        // (never a partial spawn, never a silent downgrade) until its vsock-crossing wiring lands.
+        // Container reuses the SAME fork+exec below — it only adds the child-side `unshare` in
+        // `spawn_wired_instance`'s `pre_exec` (design-note Option C / §8).
         for (label, inst) in &privsep.instances {
             super::resolve_spawn_backend(label, inst.substrate)?;
         }
@@ -1931,7 +2018,17 @@ mod supervise {
                 &extra_env,
             ) {
                 Ok(child) => {
-                    tracing::info!(instance = %spec.label, pid = child.id(), "[privsep] root: spawned __instance (fds wired, scrubbed env)");
+                    tracing::info!(
+                        instance = %spec.label,
+                        pid = child.id(),
+                        substrate = spec.substrate.tag(),
+                        "[privsep] root: spawned __instance (fds wired, scrubbed env{})",
+                        if matches!(spec.substrate, super::InstanceSubstrate::Container) {
+                            "; unshared NS/PID/IPC/UTS/CGROUP — net shared for egress"
+                        } else {
+                            ""
+                        }
+                    );
                     children.push((spec.label.clone(), child));
                 }
                 Err(e) => {
@@ -4224,42 +4321,34 @@ mod tests {
         );
     }
 
-    // ---- Phase-3 foundation: the operator-selectable substrate spawn-backend seam ----
+    // ---- Phase-3: the operator-selectable substrate spawn-backend dispatch ----
 
     #[test]
-    fn resolve_spawn_backend_wires_os_process_and_refuses_the_follow_on_substrates() {
-        // OS-process is the wired Phase-1 backend.
+    fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm() {
+        // OS-process is the Phase-1 wired backend; Container is the Phase-3 wired backend (the SIMPLE
+        // model — the SAME fork+exec, with the child unsharing NS/PID/IPC/UTS/CGROUP in its pre_exec).
         resolve_spawn_backend("frontend", InstanceSubstrate::OsProcess)
-            .expect("os-process is the wired spawn backend");
-        // Container + VM are refused fail-closed, naming the compute-plane backend each reuses.
-        // Container carries the SHARPENED refusal (Phase-3): it names the three TCB-critical design
-        // blockers a reviewer must resolve (the OCI-vs-own-binary rootfs reconciliation, the multi-fd
-        // pass, the per-instance namespace/egress policy) + points at the crate-local design note, so
-        // the refusal is reviewer-useful, not a bare "not wired".
-        let c = resolve_spawn_backend("frontend", InstanceSubstrate::Container).unwrap_err();
-        let PrivsepError::Supervise(cm) = &c else {
-            panic!("container must be refused as a Supervise error, got {c:?}");
+            .expect("os-process is a wired spawn backend");
+        resolve_spawn_backend("core", InstanceSubstrate::Container)
+            .expect("container is now a wired spawn backend (Phase-3 simple model)");
+        // Both wired substrates report `is_wired()`.
+        assert!(InstanceSubstrate::OsProcess.is_wired());
+        assert!(InstanceSubstrate::Container.is_wired());
+        // VM stays refused fail-closed: its own kernel means the `local` socketpair cannot cross, so
+        // it needs a vsock re-plumb (a reported follow-on). The refusal names its reuse backend + the
+        // wired fallbacks, and stays fail-closed (never a silent OS-process downgrade).
+        assert!(!InstanceSubstrate::Vm.is_wired());
+        let v = resolve_spawn_backend("edge-vm", InstanceSubstrate::Vm).unwrap_err();
+        let PrivsepError::Supervise(vm) = &v else {
+            panic!("vm must be refused as a Supervise error, got {v:?}");
         };
         assert!(
-            cm.contains("boatramp-container") && cm.contains("fail-closed"),
-            "container refusal must name its reuse backend + stay fail-closed, got {cm:?}"
+            vm.contains("firecracker") && vm.contains("fail-closed"),
+            "vm refusal must name its reuse backend + stay fail-closed, got {vm:?}"
         );
         assert!(
-            cm.contains("rootfs") && cm.contains("multi-fd") && cm.contains("network namespace"),
-            "container refusal must name the three design blockers, got {cm:?}"
-        );
-        assert!(
-            cm.contains("DESIGN-privsep-phase3-container.md"),
-            "container refusal must point at the design note, got {cm:?}"
-        );
-        assert!(
-            cm.contains("OsProcess"),
-            "container refusal must offer the OsProcess fallback, got {cm:?}"
-        );
-        let v = resolve_spawn_backend("frontend", InstanceSubstrate::Vm).unwrap_err();
-        assert!(
-            matches!(&v, PrivsepError::Supervise(m) if m.contains("firecracker") && m.contains("OsProcess")),
-            "vm must be refused with its reuse backend named + the OsProcess fallback, got {v:?}"
+            vm.contains("OsProcess") && vm.contains("Container"),
+            "vm refusal must offer the wired OsProcess/Container fallbacks, got {vm:?}"
         );
     }
 

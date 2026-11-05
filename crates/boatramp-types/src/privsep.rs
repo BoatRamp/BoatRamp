@@ -762,10 +762,13 @@ impl TenantScope {
 ///   the `boatramp-firecracker` / `boatramp-vz` compute-plane backends. The strongest wall (survives a
 ///   guest-kernel RCE); a vsock crossing per request + a boot cost.
 ///
-/// **Phase-3 FOUNDATION scope:** only `OsProcess` is a WIRED spawn backend. `Container`/`Vm` parse +
-/// lint as valid composition vocabulary, but the supervisor REFUSES to spawn them fail-closed (naming
-/// the compute-plane backend each reuses) rather than silently downgrading to an OS process — a silent
-/// downgrade would discard the operator's chosen isolation wall. See [`InstanceSubstrate::is_wired`].
+/// **Phase-3 scope:** `OsProcess` (Phase-1) and `Container` (Phase-3 simple model — the SAME
+/// fork+exec, the child unsharing mount/pid/ipc/uts/cgroup namespaces in its `pre_exec`, no
+/// `pivot_root`, no new net namespace; the per-capability Landlock profile stays the FS wall) are
+/// WIRED spawn backends. `Vm` parses + lints as valid composition vocabulary but the supervisor
+/// REFUSES to spawn it fail-closed (naming its reuse backend) rather than silently downgrading — a VM
+/// has its own kernel, so the `local` socketpair cannot cross and the link transport needs a vsock
+/// re-plumb. See [`InstanceSubstrate::is_wired`] and `crates/boatramp/DESIGN-privsep-phase3-container.md`.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -773,7 +776,8 @@ pub enum InstanceSubstrate {
     /// A privilege-dropped OS process over the `local` socketpair (the Phase-1 spawn backend). Default.
     #[default]
     OsProcess,
-    /// A namespace/cgroup-confined process (reuses the `boatramp-container` backend). Follow-on.
+    /// A namespace/cgroup-confined process: the SAME fork+exec, the child unsharing
+    /// mount/pid/ipc/uts/cgroup namespaces in its `pre_exec` (Phase-3 simple model, WIRED).
     Container,
     /// A hardware-virtualized microVM guest (reuses `boatramp-firecracker` / `boatramp-vz`). Follow-on.
     Vm,
@@ -789,10 +793,15 @@ impl InstanceSubstrate {
         }
     }
 
-    /// Whether the Phase-3 FOUNDATION cut wires this substrate's spawn backend. Only `OsProcess` is
-    /// wired; `Container`/`Vm` are the reported follow-on (refused fail-closed by the supervisor).
+    /// Whether this substrate's spawn backend is WIRED. `OsProcess` is the Phase-1 fork+exec backend;
+    /// `Container` is the Phase-3 namespace/cgroup-confined backend (the root unshares
+    /// `CLONE_NEWNS|NEWPID|NEWIPC|NEWUTS|NEWCGROUP` in the child's `pre_exec` on the SIMPLE model —
+    /// no `pivot_root`, no new net namespace, the per-capability Landlock profile stays the FS wall;
+    /// see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` stays the reported follow-on
+    /// (its own kernel ⇒ the `local` socketpair cannot cross, so it needs a vsock re-plumb), refused
+    /// fail-closed by the supervisor.
     pub const fn is_wired(self) -> bool {
-        matches!(self, Self::OsProcess)
+        matches!(self, Self::OsProcess | Self::Container)
     }
 
     /// The compute-plane backend crate a NESTING substrate reuses — for the fail-closed follow-on
@@ -2821,9 +2830,10 @@ mod tests {
             cfg.instances["core"].substrate,
             InstanceSubstrate::OsProcess
         );
-        // The foundation cut wires only OsProcess; the nesting substrates name their reuse backend.
+        // `OsProcess` + `Container` (Phase-3 namespace/cgroup simple model) are WIRED backends; `Vm`
+        // stays the reported follow-on (its own kernel ⇒ the `local` socketpair cannot cross).
         assert!(InstanceSubstrate::OsProcess.is_wired());
-        assert!(!InstanceSubstrate::Container.is_wired());
+        assert!(InstanceSubstrate::Container.is_wired());
         assert!(!InstanceSubstrate::Vm.is_wired());
         assert!(
             InstanceSubstrate::OsProcess

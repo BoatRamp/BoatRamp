@@ -700,36 +700,44 @@ fn privsep_per_tenant_serves_end_to_end() {
     println!("PRIVSEP PER-TENANT OK");
 }
 
-/// Live gate for the Phase-3 **`substrate: container`** spawn-backend seam — asserting the
-/// fail-closed REFUSAL end-to-end (the substrate's actual wiring is DESIGN-ONLY this cut; see
-/// `crates/boatramp/DESIGN-privsep-phase3-container.md`). Forks `boatramp __root` against an
-/// otherwise-VALID 4-instance composition (union == `all`, grants disjoint, no crown co-resident
-/// with a listener/exec/control surface — the frontend-inversion topology) whose `core` instance is
-/// pinned `substrate: container`. The root passes the secret-blind screen, the composition-closure
-/// lint, the grant-disjointness check, and the Linux+`sandbox` platform gate, reaches
-/// `supervise::run`, and there `resolve_spawn_backend` REFUSES the container instance fail-closed —
-/// BEFORE any socketpair is created, any listener bound, or any instance forked. So the root exits
-/// non-zero naming the container substrate + its design blockers, and the node NEVER serves (no
-/// silent downgrade to an OS process, no partial spawn).
+/// Live gate for the Phase-3 **`substrate: container`** spawn backend — now WIRED on the SIMPLE model
+/// (design-note Option C, owner-approved; see `crates/boatramp/DESIGN-privsep-phase3-container.md`).
+/// Forks `boatramp __root` against the known-valid frontend-inversion topology (union == `all`, grants
+/// disjoint, no crown co-resident with a listener/exec/control surface) whose serving `core` is pinned
+/// `substrate: container`. The root does the SAME fork+exec the OsProcess path does, with the `core`
+/// child additionally `unshare`ing the mount/pid/ipc/uts/cgroup namespaces in its `pre_exec` (no
+/// `pivot_root`, no new net namespace — the per-capability Landlock profile stays the FS wall).
 ///
-/// **This gate INVERTS when the container spawn backend lands:** flip `core`'s expectation from "the
-/// root refuses" to "the node serves a real 200 over a namespace/cgroup-confined instance", rename
-/// the marker to `PRIVSEP CONTAINER SUBSTRATE OK`, and drop the refusal asserts. Until then it is a
-/// real regression guard: the composition must refuse CLEANLY (never partially spawn, never
-/// downgrade).
+/// Proves end-to-end, against the live kernel: a client `GET /` flows client → `frontend` listener fd
+/// → SCM_RIGHTS splice → the NAMESPACE/CGROUP-CONFINED `core` → hand-rolled HTTP → a real 200. Under
+/// `FailNodeClosed` + the confined instance's OWN fail-closed self-check
+/// (`verify_container_namespaces_unshared` — the container instance refuses to serve unless it
+/// confirms it entered fresh mount/ipc/uts/cgroup namespaces distinct from the root supervisor's), a
+/// 200 coming back PROVES: `core` forked+exec'd the own binary INTO the unshared namespaces, installed
+/// its nested per-capability sandbox `Enforced`, and served its slice — a sibling reached it over the
+/// cross-namespace socketpair (which works because an `AF_UNIX` socketpair end is a plain open fd on
+/// the one shared kernel — design §2a). Exactly the shape of the signer-unseal gate: the 200 is the
+/// proof because a failure at any step would have torn the node down.
 ///
-/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the per-tenant gate:
-/// the refusal is only reached on the build where the platform gate passes (otherwise the root
-/// refuses earlier with `UnsupportedPlatform`, a different message). The CI `live gate (privsep)`
-/// job runs it via `--include-ignored` and greps the `PRIVSEP CONTAINER SUBSTRATE REFUSED OK`
-/// marker + the pass count, so a silent skip / compile-out — or a regression that lets the
-/// unwired substrate stand up — fails the merge.
+/// **Root required.** The simple model unshares WITHOUT a user namespace, so the root supervisor needs
+/// `CAP_SYS_ADMIN` (the normal privsep posture — it binds privileged listeners). This gate runs the
+/// NODE under `sudo -n` when the harness itself is unprivileged (CI `runner`, lighthouse `jwk` — both
+/// have passwordless sudo), keeping the test harness unprivileged; it talks to the node only over
+/// loopback HTTP. If the root cannot unshare (no `CAP_SYS_ADMIN`, or a kernel without namespaces) the
+/// spawn fails and the node fail-closes — never a silent downgrade to an unconfined OS process.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the other live gates.
+/// The CI `live gate (privsep)` job runs it via `--include-ignored` and greps the
+/// `PRIVSEP CONTAINER SUBSTRATE OK` marker + the pass count, so a silent skip / compile-out — or a
+/// regression that drops the namespace wall — fails the merge.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 #[test]
-#[ignore = "live: forks boatramp __root for a composition pinning one instance to the unwired \
-            `substrate: container` and asserts the node refuses fail-closed (Linux + `sandbox`); \
-            run via --include-ignored in the `live gate (privsep)` job"]
-fn privsep_container_substrate_refuses_fail_closed_end_to_end() {
+#[ignore = "live: forks boatramp __root (as root, via sudo -n, for CAP_SYS_ADMIN) for a composition \
+            whose serving core is pinned `substrate: container`; the core unshares NS/PID/IPC/UTS/\
+            CGROUP, self-confirms the namespaces, installs its Enforced sandbox, and serves end-to-end \
+            over the cross-namespace splice (Linux + `sandbox`); run via --include-ignored in the \
+            `live gate (privsep)` job"]
+fn privsep_container_substrate_serves_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_boatramp");
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("boatramp-privsep-container-{}", std::process::id()));
@@ -740,9 +748,10 @@ fn privsep_container_substrate_refuses_fail_closed_end_to_end() {
 
     // The known-valid frontend-inversion topology (union == ALL; grants disjoint; no crown co-resident
     // with a listener/exec/control surface — so it clears every pre-supervise gate), with the one
-    // change under test: `core` is pinned to the UNWIRED `substrate: container`. The ONLY reason the
-    // node must refuse is that substrate — proving the refusal is the substrate's, not an unrelated
-    // lint failure.
+    // change under test: the serving `core` is pinned to the now-WIRED `substrate: container`. `core`
+    // holds the backends + crown jewels and serves the 200; `frontend` (OsProcess) binds the listener
+    // and splices the accepted client fd to `core` over the `local` socketpair that crosses `core`'s
+    // namespace boundary.
     let cfg = format!(
         r#"(
     serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
@@ -787,69 +796,125 @@ fn privsep_container_substrate_refuses_fail_closed_end_to_end() {
     );
     std::fs::write(&cfg_path, &cfg).expect("write the privsep config");
 
-    let mut root = Command::new(bin)
+    // The container substrate unshares WITHOUT a user namespace ⇒ the node needs CAP_SYS_ADMIN. Run it
+    // as root: directly if the harness is already root, else under passwordless `sudo -n` (keeping the
+    // harness itself unprivileged). The node's unique config path is the teardown token.
+    let as_root = process_is_root();
+    let mut cmd = if as_root {
+        Command::new(bin)
+    } else {
+        // `sudo -n` (non-interactive, passwordless): fail rather than block if no sudo. We do NOT ask
+        // sudo to preserve env (strict sudoers can refuse `--preserve-env`), so the node logs at its
+        // default level — enough for a failure to surface on the inherited stderr; the gate asserts on
+        // the HTTP 200, not on logs.
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg(bin);
+        c
+    };
+    let mut root = cmd
         .arg("__root")
         .arg("--config")
         .arg(&cfg_path)
-        .env("RUST_LOG", "boatramp=warn")
+        .env("RUST_LOG", "boatramp=info")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn `boatramp __root`");
+        .expect("spawn `boatramp __root` (via sudo -n when unprivileged)");
 
-    // The refusal is immediate (it fires at the top of `supervise::run`, before any live syscall),
-    // but bound the wait so a regression that lets the unwired substrate STAND UP fails loudly rather
-    // than hanging.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let status = loop {
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let response = loop {
         if Instant::now() > deadline {
-            let _ = root.kill();
-            let _ = root.wait();
-            let _ = std::fs::remove_dir_all(&tmp);
+            teardown_container_gate(&cfg_path, &mut root, &tmp, as_root);
             panic!(
-                "`boatramp __root` did not exit within 15s — the UNWIRED `substrate: container` was \
-                 allowed to stand up instead of refusing fail-closed (a Phase-3 spawn-backend regression)"
+                "the container-substrate node did not serve a response within 25s (unshare refused \
+                 for lack of CAP_SYS_ADMIN? the namespace self-check fail-closed? sudo -n unavailable?)"
             );
         }
-        match root.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => {
-                let _ = root.kill();
-                let _ = std::fs::remove_dir_all(&tmp);
-                panic!("waiting on `boatramp __root`: {e}");
-            }
+        // Fail-closed: if the node exited, the composition failed to stand up — most tellingly here,
+        // the `unshare` failed (no CAP_SYS_ADMIN) or the container instance's namespace self-check
+        // refused (FailNodeClosed). Don't keep polling a dead node.
+        if let Ok(Some(status)) = root.try_wait() {
+            teardown_container_gate(&cfg_path, &mut root, &tmp, as_root);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the container-substrate composition \
+                 failed to stand up (unshare refused for lack of CAP_SYS_ADMIN? namespace self-check \
+                 fail-closed? sandbox not Enforced? link/listener wiring?)"
+            );
+        }
+        match try_http_get(&addr) {
+            Ok(resp) if !resp.is_empty() => break resp,
+            _ => std::thread::sleep(Duration::from_millis(250)),
         }
     };
 
-    let mut stderr = String::new();
-    if let Some(mut e) = root.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
+    teardown_container_gate(&cfg_path, &mut root, &tmp, as_root);
+
+    assert!(
+        response.contains("200"),
+        "expected a 200 from the namespace/cgroup-confined core over the splice, got:\n{response}"
+    );
+    assert!(
+        response.contains("boatramp privsep backend"),
+        "expected the backend body marker (proving the SCM_RIGHTS splice reached the CONFINED core, \
+         which under its namespace self-check + FailNodeClosed means it served from inside the \
+         unshared namespaces), got:\n{response}"
+    );
+
+    // The marker the CI gate greps — reached only after a real 200 came back over the full path to a
+    // container-substrate instance that self-confirmed its fresh namespaces (else FailNodeClosed).
+    println!("PRIVSEP CONTAINER SUBSTRATE OK");
+}
+
+/// Whether THIS test process is running with effective uid 0 (read from `/proc/self/status`, so no
+/// `libc` dependency). Used by the container-substrate gate to decide whether the node must be
+/// launched under `sudo -n` to obtain the `CAP_SYS_ADMIN` the simple-model `unshare` needs.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn process_is_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                // `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; the effective uid is 2nd.
+                .and_then(|l| l.split_whitespace().nth(2).map(|u| u == "0"))
+        })
+        .unwrap_or(false)
+}
+
+/// Tear down the container-substrate node tree (root supervisor + every `__instance`) and remove its
+/// scratch dir. SIGKILL-ing the direct child would orphan a `sudo`-launched node (SIGKILL cannot be
+/// forwarded), so FIRST `pkill -TERM` the whole tree by its unique config path (as root when the node
+/// was sudo-launched, so it can signal the root-owned processes); the SIGTERM tears the node down
+/// (FailNodeClosed), then reap the direct child and remove the (possibly root-owned) scratch dir.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn teardown_container_gate(
+    cfg_path: &std::path::Path,
+    child: &mut std::process::Child,
+    tmp: &std::path::Path,
+    as_root: bool,
+) {
+    let token = cfg_path.display().to_string();
+    let mut pk = if as_root {
+        Command::new("pkill")
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg("pkill");
+        c
+    };
+    let _ = pk.arg("-TERM").arg("-f").arg(&token).status();
+    // Give the SIGTERM a moment to tear the tree down (FailNodeClosed), then reap the direct child.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = child.kill();
+    let _ = child.wait();
+    if std::fs::remove_dir_all(tmp).is_err() && !as_root {
+        let _ = Command::new("sudo")
+            .arg("-n")
+            .arg("rm")
+            .arg("-rf")
+            .arg(tmp)
+            .status();
     }
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    assert!(
-        !status.success(),
-        "the node must exit NON-zero refusing the unwired container substrate; exited {status} \
-         (stderr:\n{stderr})"
-    );
-    assert!(
-        stderr.contains("container") && stderr.contains("substrate"),
-        "the refusal must name the container substrate, got stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("fail-closed") && stderr.contains("DESIGN-privsep-phase3-container.md"),
-        "the refusal must be fail-closed + point at the design note, got stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("\"core\""),
-        "the refusal must name the offending instance (`core`), got stderr:\n{stderr}"
-    );
-
-    // The marker the CI gate greps — reached only after the node provably refused the unwired
-    // container substrate fail-closed, end-to-end. INVERT to `PRIVSEP CONTAINER SUBSTRATE OK` when the
-    // spawn backend lands (see the doc comment above + the design note).
-    println!("PRIVSEP CONTAINER SUBSTRATE REFUSED OK");
 }
 
 /// One blocking HTTP/1.1 `GET /` to `addr` with an explicit `Host`, returning the raw response text

@@ -1,8 +1,12 @@
 # DESIGN — privsep Phase-3 substrate: the **Container** spawn backend
 
-*Crate-local design note (privsep Phase-3). Branch `privsep-phase3-container`, built on
-`origin/feat/privsep` tip `808c2bd9`. Status: **DESIGN-FIRST — the hard reconciliation (#1) is
-FLAGGED, not built.** TCB-critical; goes to Security before any fold.*
+*Crate-local design note (privsep Phase-3). Branch `privsep-container-wire`, built on
+`privsep-phase3-container` tip `171114c3` (itself on `feat/privsep` `808c2bd9`). Status: **OPTION C
+WIRED (owner-approved simple model).** The Container substrate is now a wired spawn backend; the
+hard rootfs reconciliation (#1) is RESOLVED by choosing Option C (no `pivot_root`, no worker, no
+`SandboxPlan` change). TCB-critical; goes to Security before any fold. **§8 below documents exactly
+what was built + the Security flags** (read it first for the current state; §1–§7 are the original
+design reasoning that led to Option C).*
 
 ---
 
@@ -299,3 +303,87 @@ back the full backend networking machinery — an argument against containerizin
 at all in the first cut). Listener/relay frontends need no egress (they bind via the root-passed
 listener fd and relay inward over the socketpair), so they CAN take a net namespace. **This
 per-instance namespace policy is part of §1/§5b and must be ratified.**
+
+---
+
+## 8. WHAT WAS BUILT — Option C wired (owner-approved) + Security flags
+
+Owner approved **Option C**. The Container substrate is now a wired spawn backend. This section is
+the authoritative record of the implementation; §1–§7 above are the reasoning that led here.
+
+### 8.1 Exactly what the code does
+
+- **`InstanceSubstrate::is_wired`** (`boatramp-types/src/privsep.rs`): now
+  `matches!(self, OsProcess | Container)`. `Vm` stays `false` (its own kernel ⇒ the `local`
+  socketpair cannot cross — §6; a vsock re-plumb is the next increment).
+- **`resolve_spawn_backend`** (`boatramp/src/privsep.rs`): Container now returns `Ok` via the
+  `is_wired()` fast-path (the old sharpened Container refusal is removed as dead code). `Vm` keeps a
+  fail-closed refusal that now offers BOTH wired fallbacks (`OsProcess`/`Container`).
+- **`spawn_wired_instance`** (`boatramp/src/privsep.rs`, the root's OWN fork+exec primitive, shared
+  by the boot supervisor AND the per-tenant router): for a `spec.substrate == Container` child, the
+  child's `pre_exec` first runs
+  `unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWCGROUP)`, THEN the
+  byte-identical OsProcess sequence — the `(src→tgt)` `dup2` loop with `CLOEXEC` cleared, then
+  `PR_SET_PDEATHSIG(SIGKILL)`. The socketpair + `SCM_RIGHTS` fd-pass, the `env_clear().envs(scrubbed)`
+  (F11-B), `PR_SET_PDEATHSIG`, and the root's `try_wait` → `FailNodeClosed` supervision are
+  **unchanged** (for an OsProcess child the container branch is a no-op, so that path is literally
+  byte-identical). No change to `boatramp-container`'s `worker`, `SandboxPlan`, or the nested
+  per-capability profile. An `unshare` failure ⇒ `pre_exec` returns `Err` ⇒ `spawn()` fails ⇒ the
+  supervisor `kill_all`s + returns `Err` ⇒ node down (`FailNodeClosed`) — **never** a silent
+  downgrade to an unconfined OS process.
+- **Namespace self-check** (`verify_container_namespaces_unshared`, called from `run_instance`
+  before the sandbox install): a Container instance reads `/proc/self/ns/{mnt,ipc,uts,cgroup}` and
+  its parent's (`/proc/<getppid()>/ns/...`) and refuses to serve (`FailNodeClosed`) unless all four
+  DIFFER. This makes "a Container instance served" **imply** "it was in fresh namespaces": it catches
+  the one failure mode the spawner-side `unshare` cannot (a dispatch regression that spawns a
+  Container spec WITHOUT the `unshare`). The live gate's 200 is the proof, exactly as the
+  signer-unseal gate's 200 proves the unseal.
+- **Deliberately NOT unshared:** `CLONE_NEWNET` (a `backend.*` instance keeps host-net egress to its
+  DB/KV/blob — §5b/§egress corner) and `CLONE_NEWUSER` (no user namespace in the first cut — §5b).
+- **No `pivot_root`, no rootfs:** the per-capability **Landlock** profile remains the FS wall
+  (`CLONE_NEWNS` only gives a *copy* of the mount table; the Landlock grants resolve to the same
+  inodes, so the FS confinement is unchanged). The own-exe execute-pin is unchanged (`current_exe()`
+  still valid — no pivot), so the static-musl execute-pin the per-tenant router relies on still holds.
+
+### 8.2 FLAGS for the Security review
+
+1. **Root / `CAP_SYS_ADMIN` requirement (NEW operational precondition).** The simple model unshares
+   WITHOUT a user namespace, so the root supervisor needs `CAP_SYS_ADMIN` for the `unshare` to
+   succeed. This is the normal privsep posture (the root binds privileged listeners), but it is now a
+   HARD precondition for `substrate: container`: on a node lacking it, the container instance
+   fail-closes (correct, but operationally it means container substrate is root-only until a userns
+   increment lands). The live gate runs the node under `sudo -n` to obtain it.
+2. **PID-namespace simple-model semantic.** `unshare(CLONE_NEWPID)` does NOT move the CALLER into the
+   new pid namespace — only its future children. So the `__instance` process itself keeps the root's
+   pid namespace; the pid-ns isolation applies to any sub-processes it forks (e.g. a per-tenant
+   router's children), not to the instance process. The self-check therefore asserts mnt/ipc/uts/
+   cgroup (immediate) but NOT pid. A stricter model (fork a pid-ns init, as the container worker does)
+   is a possible future increment; it was deliberately NOT done here to keep `FailNodeClosed`/
+   PDEATHSIG/reaping byte-identical to OsProcess (the whole point of Option C).
+3. **Net namespace shared (egress decision — as instructed).** `CLONE_NEWNET` is NOT unshared, so a
+   `backend.*` instance keeps its path to Postgres/KV/blob and the already-connected client socket an
+   SCM_RIGHTS splice hands it still works. Net isolation is therefore NOT provided by this cut; if it
+   is ever added it must be opt-in and off by default (and it needs the veth/egress story in the
+   egress corner above). Flagged as the main containment gap vs. a full container.
+4. **Mount-namespace / Landlock interaction.** With `CLONE_NEWNS` but no `pivot_root` and no remount,
+   the instance gets a copy of the host mount table; it mounts nothing (seccomp kills `mount`), and
+   Landlock paths resolve identically. The live gate validates that the nested Landlock profile still
+   reaches `Enforced` inside the unshared mount namespace. No propagation hardening (e.g. recursively
+   `MS_PRIVATE`) is done — not needed for additive isolation, but noted.
+5. **Self-check reads `/proc/<ppid>/ns/*`.** Needs ptrace-read (same-uid) access to the parent; holds
+   because both run as the root supervisor's uid at that point (before the instance's sandbox drop).
+   If a future increment adds a userns/uid remap, revisit this read.
+6. **`per_tenant` + container interaction NOT exercised.** A `PerTenantTemplate` pinned
+   `substrate: container` would fork per-tenant children from inside the unshared namespaces via the
+   same `spawn_wired_instance`; the pid-ns semantic (#2) means those children WOULD get the new pid
+   namespace. Not tested in this cut (the gate uses a static `core`); flagged as a follow-on to
+   validate explicitly.
+
+### 8.3 Tests + gate
+
+- Unit: `resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm` (boatramp) +
+  `instance_substrate_defaults_to_os_process_and_round_trips_through_ron` (boatramp-types) assert
+  `is_wired(Container)==true`, `is_wired(OsProcess)==true`, `is_wired(Vm)==false`, and the Vm refusal.
+- Live gate: `privsep_container_substrate_serves_end_to_end` (was the fail-closed-refusal gate,
+  inverted per the original §7 note) — serves a real 200 from a `substrate: container` `core`; marker
+  `PRIVSEP CONTAINER SUBSTRATE OK`. CI `live-gate-privsep` grep + pass-count updated.
