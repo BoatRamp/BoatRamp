@@ -1446,7 +1446,8 @@ impl RevocationCheck for FileRevocationList {
             }
             Ok(meta) => {
                 let mtime = meta.modified().ok();
-                let need_reload = !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
+                let need_reload =
+                    !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
                 if need_reload {
                     match Self::load(&self.path) {
                         Ok((cti, subject)) => {
@@ -2121,16 +2122,16 @@ impl AuthorityServe<'_> {
     ///
     /// 1. receive one bounded, typed [`AuthorityCall`] (fail-closed on oversize / framing / a
     ///    mid-frame stall via the read deadline);
-    /// 1b. PRE-VERIFY flood throttle (residual #2) keyed on the cheap source — a throttled source ⇒
+    /// 2. PRE-VERIFY flood throttle (residual #2) keyed on the cheap source — a throttled source ⇒
     ///    `Refused` WITHOUT running the expensive `cose::verify`, LOG, keep serving;
-    /// 2. RE-VALIDATE its [`AuthorityContext`] (signature + `exp` + the tightened freshness bound) AND
+    /// 3. RE-VALIDATE its [`AuthorityContext`] (signature + `exp` + the tightened freshness bound) AND
     ///    its per-call PoP; a rejection ⇒ `Refused` (no bytes), LOG, keep serving;
-    /// 3. check the per-call anti-replay cache — a verbatim replay / saturation ⇒ audit `Replayed` +
+    /// 4. check the per-call anti-replay cache — a verbatim replay / saturation ⇒ audit `Replayed` +
     ///    `Refused`, keep serving;
-    /// 3b. check revocation (residual #3) — a revoked principal / unavailable feed ⇒ audit `Revoked` +
+    /// 5. check revocation (residual #3) — a revoked principal / unavailable feed ⇒ audit `Revoked` +
     ///    `Refused` (fail-closed), keep serving;
-    /// 4. check the per-verified-principal rate-limit — a trip ⇒ audit `RateLimited` + `Refused`;
-    /// 5. else acquire a global in-flight permit, dispatch to the per-capability handler, AUDIT the
+    /// 6. check the per-verified-principal rate-limit — a trip ⇒ audit `RateLimited` + `Refused`;
+    /// 7. else acquire a global in-flight permit, dispatch to the per-capability handler, AUDIT the
     ///    outcome keyed on the verified principal, and reply with the handler's bounded result.
     ///
     /// Loops until the peer closes the link (EOF). `link_name` is for the log only. A context
@@ -3285,13 +3286,19 @@ mod tests {
         let kek = Arc::new(LocalKek::from_bytes([3u8; 32])) as Arc<dyn KeyEnvelope>;
         let mut reg = AuthorityRegistry::new();
         let err = reg
-            .register(HostAuthority::TokenSigner, Arc::new(SealerHandler::new(kek)))
+            .register(
+                HostAuthority::TokenSigner,
+                Arc::new(SealerHandler::new(kek)),
+            )
             .unwrap_err();
         assert!(err.contains("does not"), "got {err}");
         // And the correct registration is accepted.
         let kek2 = Arc::new(LocalKek::from_bytes([3u8; 32])) as Arc<dyn KeyEnvelope>;
-        reg.register(HostAuthority::SecretsSealer, Arc::new(SealerHandler::new(kek2)))
-            .expect("the sealer registers under its own authority");
+        reg.register(
+            HostAuthority::SecretsSealer,
+            Arc::new(SealerHandler::new(kek2)),
+        )
+        .expect("the sealer registers under its own authority");
     }
 
     #[test]

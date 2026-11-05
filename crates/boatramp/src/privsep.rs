@@ -2476,7 +2476,8 @@ mod instance_serve {
         // BEFORE the expensive `cose::verify` so a forged-context flood on one link cannot exhaust CPU
         // (per-source + global token buckets; cloned into each link thread, so the global cap bounds
         // total verify load across all of this crown jewel's authority-serve links).
-        let pre_verify: Arc<dyn PreVerifyThrottle> = Arc::new(SourceBucketThrottle::with_defaults());
+        let pre_verify: Arc<dyn PreVerifyThrottle> =
+            Arc::new(SourceBucketThrottle::with_defaults());
         // WS-E residual #3: the revocation feed. The KV-blind crown jewel reads a PROJECTION of the
         // control-plane `authz/revoked/<cti>` markers from a file in its OWN data subtree (delivered
         // out-of-band — who projects it + the cadence is the owner/ops design, FLAGGED for Security;
@@ -3873,7 +3874,8 @@ mod tests {
         // The root wired the signer exactly the `to-signer` bootstrap-unseal link (fd 7).
         let mut wired = BTreeMap::new();
         wired.insert("to-signer".to_string(), 7);
-        let (name, fd) = super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
+        let (name, fd) =
+            super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
         assert_eq!(name, "to-signer");
         assert_eq!(fd, 7);
     }
@@ -3900,8 +3902,12 @@ mod tests {
         let mut wired = BTreeMap::new();
         wired.insert("to-signer".to_string(), 7);
         wired.insert("to-mint".to_string(), 9); // the minting-consumer link is also wired
-        let (name, fd) = super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
-        assert_eq!(name, "to-signer", "must pick the bootstrap link, not the mint link");
+        let (name, fd) =
+            super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
+        assert_eq!(
+            name, "to-signer",
+            "must pick the bootstrap link, not the mint link"
+        );
         assert_eq!(fd, 7);
     }
 
