@@ -85,7 +85,7 @@
 //! in [`crate::privsep_unseal`]. The full fork+spawn+sandbox composition stays gated Linux-only by the
 //! fail-closed sandbox install.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -595,12 +595,14 @@ impl ContextVerifier {
     /// `cnf`) and must NOT be a machine-minted authority output ([`ContextRejection::AuthorityIssued`],
     /// closing the mint→mint refresh chain).
     ///
-    /// **LOW-1 revocation residual (documented, inherent to the secret-blind split).** This verifier
-    /// checks signature + `exp` + freshness, NOT KV revocation (`cti` lookup) — it is IO-free and the
-    /// isolated crown jewel is deliberately control-plane-KV-blind. So a token REVOKED but still within
-    /// its freshness window is accepted. The freshness bound shrinks that residual to `max_age_secs`;
-    /// closing it fully would require handing the crown jewel a revocation feed (a bigger coupling).
-    /// Named so a reviewer sees it is a conscious bound, not an oversight.
+    /// **Revocation is a SEPARATE serve-loop step (WS-E residual #3), not done HERE.** This verifier
+    /// stays IO-free — signature + `exp` + freshness only — because the isolated crown jewel is
+    /// deliberately control-plane-KV-blind (it cannot do the platform's live `authz/revoked/<cti>` KV
+    /// lookup without re-coupling to the KV). Revocation within the freshness window is instead handled
+    /// by the serve loop's [`RevocationCheck`] (a KV-blind FEED — see [`FileRevocationList`]), keyed on
+    /// the verified `cti`/`subject`. So the former "revoked-but-fresh token is accepted" residual is
+    /// closed by that feed; the freshness bound here remains the fallback that bounds any feed-delivery
+    /// staleness.
     pub fn verify_context(
         &self,
         context: &AuthorityContext,
@@ -866,6 +868,10 @@ pub enum AuthorityOutcome {
     /// refused before dispatch — audited keyed on the verified principal (the signature verified; the
     /// call did not proceed).
     Replayed,
+    /// The verified principal was REVOKED — the token's `cti`/`subject` was on the revocation feed, or
+    /// the configured feed was UNAVAILABLE (fail-closed) — so the call was refused before dispatch
+    /// (WS-E residual #3). Audited keyed on the verified principal (the signature verified).
+    Revoked,
 }
 
 /// The **append-only, RECEIVER-SIDE audit sink** (design §3.4.2 / F9). It is **write-only from the
@@ -1297,6 +1303,182 @@ impl PreVerifyThrottle for SourceBucketThrottle {
             PreVerifyDecision::Proceed
         } else {
             PreVerifyDecision::Throttled
+        }
+    }
+}
+
+// =============================================================================
+// 3d. The revocation check (WS-E residual #3) — refuse a revoked principal within its freshness window
+// =============================================================================
+
+/// The revocation status of a verified principal, consulted on every authority call (WS-E residual #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationState {
+    /// Not revoked — the call may proceed.
+    Active,
+    /// The principal's token is REVOKED (its `cti` or `subject` is on the revocation feed) — refuse.
+    Revoked,
+    /// The configured revocation feed could not be consulted (unreadable / malformed) — refuse
+    /// FAIL-CLOSED. A crown jewel that cannot consult its revocation signal must not serve, else a
+    /// revoked principal would slip through.
+    Unavailable,
+}
+
+/// The **revocation check** (WS-E residual #3). [`ContextVerifier`] checks signature + `exp` + freshness
+/// but NOT revocation — the isolated crown jewel is deliberately control-plane-KV-BLIND (it holds no
+/// `backend.kv`), so it cannot do the platform's live `authz/revoked/<cti>` KV lookup
+/// ([`boatramp_server::auth`]) without re-coupling to the KV and collapsing the secret-blind split. This
+/// hook lets a revoked principal be refused EVEN WITHIN its freshness window, via a signal the crown
+/// jewel can consult WITHOUT opening the KV.
+///
+/// Keyed on the VERIFIED principal's credential — its `cti` (per-token revocation, the platform's unit)
+/// and/or `subject` (per-principal revocation) — never a caller-asserted field.
+///
+/// **Fail-closed:** a configured feed that cannot be consulted returns [`RevocationState::Unavailable`],
+/// which the serve loop refuses (an un-consultable revocation signal must not fail open).
+pub trait RevocationCheck: Send + Sync {
+    /// The revocation status of `principal` at call time.
+    fn status(&self, principal: &VerifiedPrincipal) -> RevocationState;
+}
+
+/// The default revocation check: every principal is [`RevocationState::Active`] (NO revocation signal).
+/// This is the documented Phase-1 residual made EXPLICIT — a composition that wires no feed accepts a
+/// revoked-but-fresh token until it ages out of the freshness window. The mechanism to close it is
+/// [`FileRevocationList`]; the DEFAULT serve wiring uses the file feed at a conventional path, so a
+/// composition only lands on `NoRevocation` by choosing it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoRevocation;
+
+impl RevocationCheck for NoRevocation {
+    fn status(&self, _principal: &VerifiedPrincipal) -> RevocationState {
+        RevocationState::Active
+    }
+}
+
+/// The on-disk revocation feed shape: a set of revoked token ids (`cti`, hex) and/or revoked principal
+/// subjects (`sub`). Both optional; an empty / omitted array revokes nothing.
+#[derive(Debug, Default, Deserialize)]
+struct RevocationFeed {
+    #[serde(default)]
+    cti: Vec<String>,
+    #[serde(default)]
+    subject: Vec<String>,
+}
+
+/// The last successfully-loaded feed state (behind the cache mutex).
+enum FeedState {
+    /// The feed file was absent at the last stat — NO revocations (matches the platform's
+    /// `authz/revoked/<cti>` absent ⇒ not-revoked semantics).
+    Absent,
+    /// The feed was loaded at modification time `mtime` with these revoked sets.
+    Present {
+        mtime: Option<std::time::SystemTime>,
+        cti: HashSet<String>,
+        subject: HashSet<String>,
+    },
+}
+
+/// A **file-backed revocation feed** (WS-E residual #3) the KV-blind crown jewel can consult without
+/// opening the control-plane KV. The authoritative revocation state is the platform's
+/// `authz/revoked/<cti>` KV markers; this file is a **projection** of them, DELIVERED into the crown
+/// jewel's OWN Landlock-granted state subtree out-of-band (who projects it + the cadence is the owner/
+/// ops design — flagged for Security; the delivery MUST be atomic, e.g. write-then-rename, so a reader
+/// never sees a half-written feed). The crown jewel only READS it — it never touches the KV, so the
+/// secret-blind split holds.
+///
+/// Semantics, mirroring the platform's revocation model:
+/// - **File absent** ⇒ [`RevocationState::Active`] (no revocations — exactly as an absent
+///   `authz/revoked/<cti>` marker reads as not-revoked).
+/// - **File present + readable + parseable** ⇒ a token whose `cti` or `subject` is listed is
+///   [`RevocationState::Revoked`]; otherwise [`RevocationState::Active`].
+/// - **File present but unreadable / malformed** ⇒ [`RevocationState::Unavailable`] (fail-closed — a
+///   configured-but-unconsultable feed must refuse, never fail open).
+///
+/// The feed is cached and reloaded only when its mtime changes (a `stat` per call; authority calls are
+/// infrequent and pre-verify-throttled). **Staleness bound (flagged):** a revocation propagates no
+/// faster than the feed is re-delivered, so within the freshness window a revoked token is refused only
+/// once the feed carries it; past the freshness window it is refused anyway (stale). The feed cadence is
+/// thus the revocation-latency knob the owner/ops set.
+pub struct FileRevocationList {
+    path: std::path::PathBuf,
+    cache: Mutex<FeedState>,
+}
+
+impl FileRevocationList {
+    /// A feed read from `path` (the crown jewel's own granted subtree). Opening is lazy (per-call stat);
+    /// construction never fails — an absent file is simply "no revocations" until one is delivered.
+    #[must_use]
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            cache: Mutex::new(FeedState::Absent),
+        }
+    }
+
+    /// Parse the feed file into its revoked sets.
+    fn load(path: &std::path::Path) -> std::io::Result<(HashSet<String>, HashSet<String>)> {
+        let bytes = std::fs::read(path)?;
+        let feed: RevocationFeed = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok((
+            feed.cti.into_iter().collect(),
+            feed.subject.into_iter().collect(),
+        ))
+    }
+}
+
+impl RevocationCheck for FileRevocationList {
+    fn status(&self, principal: &VerifiedPrincipal) -> RevocationState {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Refresh: stat the feed; reload on first use / mtime change; fail-closed on a read/parse error.
+        match std::fs::metadata(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                *cache = FeedState::Absent;
+            }
+            Err(e) => {
+                // A stat error other than "absent" (e.g. a permission error on a configured feed) is a
+                // consultation failure — fail-closed, and do NOT cache it (retry next call).
+                tracing::warn!(path = %self.path.display(), error = %e, "[privsep] revocation feed stat failed — refusing fail-closed");
+                return RevocationState::Unavailable;
+            }
+            Ok(meta) => {
+                let mtime = meta.modified().ok();
+                let need_reload = !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
+                if need_reload {
+                    match Self::load(&self.path) {
+                        Ok((cti, subject)) => {
+                            *cache = FeedState::Present {
+                                mtime,
+                                cti,
+                                subject,
+                            };
+                        }
+                        Err(e) => {
+                            // Readable-stat but unreadable/malformed content — fail-closed, uncached.
+                            tracing::warn!(path = %self.path.display(), error = %e, "[privsep] revocation feed unreadable/malformed — refusing fail-closed");
+                            return RevocationState::Unavailable;
+                        }
+                    }
+                }
+            }
+        }
+        match &*cache {
+            FeedState::Absent => RevocationState::Active,
+            FeedState::Present { cti, subject, .. } => {
+                let tok = principal.token();
+                if cti.contains(tok.cti.as_str()) {
+                    return RevocationState::Revoked;
+                }
+                if let Some(sub) = tok.subject.as_deref()
+                    && subject.contains(sub)
+                {
+                    return RevocationState::Revoked;
+                }
+                RevocationState::Active
+            }
         }
     }
 }
@@ -1855,7 +2037,11 @@ impl AuthorityHandler for AuthorityRegistry {
 /// deps so the serve loop takes a single, reviewable shape:
 /// - `verifier` — re-validates every call's context against the public trust root (F3), now also with
 ///   the tightened freshness bound;
+/// - `pre_verify` — the CHEAP pre-verify flood throttle keyed on the link/source (WS-E residual #2),
+///   consulted BEFORE `cose::verify` so a forged-context flood cannot exhaust CPU;
 /// - `replay` — the per-call `(cti, nonce)` anti-replay cache (mechanism (b));
+/// - `revocation` — the revocation check (WS-E residual #3), refusing a revoked principal (by
+///   `cti`/`subject`) even within its freshness window, fail-closed on an unavailable feed;
 /// - `limiter` — the per-verified-principal rate-limit (throttle / abuse-detection, F9);
 /// - `audit` — the append-only, receiver-side, principal-keyed sink;
 /// - `handler` — the per-capability dispatch (usually an [`AuthorityRegistry`]);
@@ -1899,9 +2085,11 @@ impl AuthorityHandler for AuthorityRegistry {
 ///
 /// The stand-up gate opens only when BOTH a PoP/cnf verifier is configured (precondition 2's host side
 /// is now present) AND the link is purpose-marked (precondition 4) — so the serve stays inert until
-/// both land. The **LOW-1 revocation residual** (a revoked-but-fresh token is accepted within the
-/// freshness window — inherent to the control-plane-KV-blind crown-jewel split) is documented on
-/// [`ContextVerifier::verify_context`].
+/// both land. The former **LOW-1 revocation residual** (a revoked-but-fresh token accepted within the
+/// freshness window) is now addressed by the serve loop's [`RevocationCheck`] (`revocation`) — a
+/// KV-blind feed keyed on the verified `cti`/`subject` ([`FileRevocationList`]); its delivery cadence
+/// (who projects the control-plane `authz/revoked/<cti>` markers into the crown jewel's feed) is the
+/// owner/ops design flagged for Security.
 pub struct AuthorityServe<'a> {
     /// The context verifier (public trust root + freshness bound).
     pub verifier: &'a ContextVerifier,
@@ -1911,6 +2099,9 @@ pub struct AuthorityServe<'a> {
     pub pre_verify: &'a dyn PreVerifyThrottle,
     /// The per-call anti-replay cache.
     pub replay: &'a ReplayCache,
+    /// The revocation check (WS-E residual #3) — refuses a revoked principal even within its freshness
+    /// window, consulted on the VERIFIED principal's `cti`/`subject` without opening the KV.
+    pub revocation: &'a dyn RevocationCheck,
     /// The per-principal rate-limit.
     pub limiter: &'a dyn AuthorityRateLimiter,
     /// The append-only principal-keyed audit sink.
@@ -1930,10 +2121,14 @@ impl AuthorityServe<'_> {
     ///
     /// 1. receive one bounded, typed [`AuthorityCall`] (fail-closed on oversize / framing / a
     ///    mid-frame stall via the read deadline);
-    /// 2. RE-VALIDATE its [`AuthorityContext`] (signature + `exp` + the tightened freshness bound);
-    ///    a rejection ⇒ `Refused` (no bytes), LOG, keep serving;
+    /// 1b. PRE-VERIFY flood throttle (residual #2) keyed on the cheap source — a throttled source ⇒
+    ///    `Refused` WITHOUT running the expensive `cose::verify`, LOG, keep serving;
+    /// 2. RE-VALIDATE its [`AuthorityContext`] (signature + `exp` + the tightened freshness bound) AND
+    ///    its per-call PoP; a rejection ⇒ `Refused` (no bytes), LOG, keep serving;
     /// 3. check the per-call anti-replay cache — a verbatim replay / saturation ⇒ audit `Replayed` +
     ///    `Refused`, keep serving;
+    /// 3b. check revocation (residual #3) — a revoked principal / unavailable feed ⇒ audit `Revoked` +
+    ///    `Refused` (fail-closed), keep serving;
     /// 4. check the per-verified-principal rate-limit — a trip ⇒ audit `RateLimited` + `Refused`;
     /// 5. else acquire a global in-flight permit, dispatch to the per-capability handler, AUDIT the
     ///    outcome keyed on the verified principal, and reply with the handler's bounded result.
@@ -2033,6 +2228,34 @@ impl AuthorityServe<'_> {
                         link,
                         &AuthorityResponse::Refused {
                             reason: "anti-replay: duplicate or cache-saturated call".to_string(),
+                        },
+                    )?;
+                    continue;
+                }
+            }
+
+            // (3b) REVOCATION (WS-E residual #3): refuse a revoked principal even within its freshness
+            // window. Keyed on the verified `cti`/`subject`, consulted WITHOUT opening the KV. A
+            // configured-but-unconsultable feed is `Unavailable` ⇒ refuse FAIL-CLOSED (an
+            // un-consultable revocation signal must not fail open). Audited keyed on the verified
+            // principal (the signature verified; the call did not proceed).
+            match self.revocation.status(&principal) {
+                RevocationState::Active => {}
+                state @ (RevocationState::Revoked | RevocationState::Unavailable) => {
+                    self.audit.record(&AuthorityAuditEntry {
+                        principal_id: principal_id.clone(),
+                        op,
+                        outcome: AuthorityOutcome::Revoked,
+                    });
+                    tracing::warn!(link = %link_name, principal = %principal_id, op, ?state, "[privsep] authority REFUSED: principal revoked (or revocation feed unavailable — fail-closed)");
+                    let reason = match state {
+                        RevocationState::Revoked => "revoked: the principal is revoked",
+                        _ => "revocation feed unavailable (fail-closed)",
+                    };
+                    self.send(
+                        link,
+                        &AuthorityResponse::Refused {
+                            reason: reason.to_string(),
                         },
                     )?;
                     continue;
@@ -2691,6 +2914,14 @@ mod tests {
         }
     }
 
+    /// A test revocation check with a fixed state (residual #3 serve-loop tests).
+    struct FixedRevocation(RevocationState);
+    impl RevocationCheck for FixedRevocation {
+        fn status(&self, _principal: &VerifiedPrincipal) -> RevocationState {
+            self.0
+        }
+    }
+
     #[test]
     fn rate_limit_keys_on_the_verified_principal() {
         let now = 1_000;
@@ -3079,6 +3310,75 @@ mod tests {
         assert!(!PingHandler.permits_authority(HostAuthority::SecretsSealer));
     }
 
+    // ---- WS-E residual #3: the revocation check (KV-blind, file-feed, fail-closed) ----
+
+    #[test]
+    fn no_revocation_is_always_active() {
+        let p = principal_with_subject("alice", vec![role("admin")], 1_000, 2_000);
+        assert_eq!(NoRevocation.status(&p), RevocationState::Active);
+    }
+
+    #[test]
+    fn file_revocation_missing_feed_is_active() {
+        // An absent feed ⇒ no revocations (matches `authz/revoked/<cti>` absent ⇒ not-revoked).
+        let path = std::env::temp_dir().join(format!("privsep-revoke-{}.json", fresh_nonce()));
+        let feed = FileRevocationList::at(&path);
+        let p = principal_with_subject("alice", vec![role("admin")], 1_000, 2_000);
+        assert_eq!(feed.status(&p), RevocationState::Active);
+    }
+
+    #[test]
+    fn file_revocation_picks_up_a_delivered_cti_feed() {
+        // Absent → Active; then DELIVER a feed revoking the principal's cti → Revoked (reload on the
+        // absent→present transition, no mtime-granularity dependence).
+        let dir = std::env::temp_dir().join(format!("privsep-revoke-{}", fresh_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked.json");
+        let feed = FileRevocationList::at(&path);
+        // `principal_with_subject` builds a principal whose cti is "test-cti".
+        let p = principal_with_subject("alice", vec![role("admin")], 1_000, 2_000);
+        assert_eq!(feed.status(&p), RevocationState::Active, "no feed yet");
+        std::fs::write(&path, br#"{"cti":["test-cti"]}"#).unwrap();
+        assert_eq!(
+            feed.status(&p),
+            RevocationState::Revoked,
+            "delivered feed revoking the cti"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_revocation_revokes_by_subject() {
+        let dir = std::env::temp_dir().join(format!("privsep-revoke-{}", fresh_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked.json");
+        std::fs::write(&path, br#"{"subject":["alice"]}"#).unwrap();
+        let feed = FileRevocationList::at(&path);
+        let alice = principal_with_subject("alice", vec![role("admin")], 1_000, 2_000);
+        let bob = principal_with_subject("bob", vec![role("admin")], 1_000, 2_000);
+        assert_eq!(feed.status(&alice), RevocationState::Revoked);
+        assert_eq!(
+            feed.status(&bob),
+            RevocationState::Active,
+            "a different subject is not revoked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_revocation_malformed_feed_is_unavailable_fail_closed() {
+        // A present-but-unparseable feed is a consultation failure ⇒ Unavailable (fail-closed), NOT a
+        // silent Active — an un-consultable revocation signal must never fail open.
+        let dir = std::env::temp_dir().join(format!("privsep-revoke-{}", fresh_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked.json");
+        std::fs::write(&path, b"this is not json").unwrap();
+        let feed = FileRevocationList::at(&path);
+        let p = principal_with_subject("alice", vec![role("admin")], 1_000, 2_000);
+        assert_eq!(feed.status(&p), RevocationState::Unavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- end-to-end over a real socketpair (unix) ----
 
     #[cfg(unix)]
@@ -3096,12 +3396,13 @@ mod tests {
             audit: Arc<CollectingAudit>,
             now: u64,
         ) -> std::thread::JoinHandle<Result<(), String>> {
-            spawn_server_throttled(
+            spawn_server_full(
                 end,
                 verifier,
                 handler,
                 limiter,
                 Arc::new(UnthrottledPreVerify),
+                Arc::new(NoRevocation),
                 audit,
                 now,
             )
@@ -3117,6 +3418,31 @@ mod tests {
             audit: Arc<CollectingAudit>,
             now: u64,
         ) -> std::thread::JoinHandle<Result<(), String>> {
+            spawn_server_full(
+                end,
+                verifier,
+                handler,
+                limiter,
+                pre_verify,
+                Arc::new(NoRevocation),
+                audit,
+                now,
+            )
+        }
+
+        /// As [`spawn_server`] but with explicit pre-verify throttle AND revocation check (residuals
+        /// #2/#3).
+        #[allow(clippy::too_many_arguments)]
+        fn spawn_server_full(
+            end: LinkEndpoint,
+            verifier: ContextVerifier,
+            handler: Arc<dyn AuthorityHandler>,
+            limiter: Arc<dyn AuthorityRateLimiter>,
+            pre_verify: Arc<dyn PreVerifyThrottle>,
+            revocation: Arc<dyn RevocationCheck>,
+            audit: Arc<CollectingAudit>,
+            now: u64,
+        ) -> std::thread::JoinHandle<Result<(), String>> {
             std::thread::spawn(move || {
                 let replay = ReplayCache::with_defaults();
                 let sem = tokio::sync::Semaphore::new(DEFAULT_MAX_IN_FLIGHT);
@@ -3124,6 +3450,7 @@ mod tests {
                     verifier: &verifier,
                     pre_verify: pre_verify.as_ref(),
                     replay: &replay,
+                    revocation: revocation.as_ref(),
                     limiter: limiter.as_ref(),
                     audit: audit.as_ref(),
                     handler: handler.as_ref(),
@@ -3488,6 +3815,83 @@ mod tests {
 
             drop(client_end);
             server.join().unwrap().expect("clean end");
+        }
+
+        #[test]
+        fn revoked_principal_is_refused_and_audited() {
+            // WS-E residual #3: a principal the revocation feed marks revoked is refused AFTER the
+            // context + PoP verify (so it is a verified principal) and BEFORE dispatch, audited `Revoked`.
+            let now = 1_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let call = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 9 },
+            );
+            let audit = Arc::new(CollectingAudit::default());
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server_full(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(PingHandler),
+                Arc::new(Unlimited),
+                Arc::new(UnthrottledPreVerify),
+                Arc::new(FixedRevocation(RevocationState::Revoked)),
+                audit.clone(),
+                now + 1,
+            );
+            let resp = client_end.relay(&call).expect("carried");
+            match resp {
+                AuthorityResponse::Refused { reason } => {
+                    assert!(reason.contains("revoked"), "got reason: {reason}");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            }
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+            let entries = audit.drain();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].outcome, AuthorityOutcome::Revoked);
+        }
+
+        #[test]
+        fn unavailable_revocation_feed_fails_closed_over_the_wire() {
+            // A configured-but-unconsultable feed (Unavailable) refuses the call fail-closed.
+            let now = 1_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let call = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 3 },
+            );
+            let audit = Arc::new(CollectingAudit::default());
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server_full(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(PingHandler),
+                Arc::new(Unlimited),
+                Arc::new(UnthrottledPreVerify),
+                Arc::new(FixedRevocation(RevocationState::Unavailable)),
+                audit.clone(),
+                now + 1,
+            );
+            let resp = client_end.relay(&call).expect("carried");
+            assert!(
+                matches!(resp, AuthorityResponse::Refused { .. }),
+                "an unavailable revocation feed must refuse fail-closed, got {resp:?}"
+            );
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+            assert_eq!(audit.drain()[0].outcome, AuthorityOutcome::Revoked);
         }
     }
 }

@@ -2063,8 +2063,8 @@ mod instance_serve {
     use boatramp_server::privsep_authority::{
         AuthorityAudit, AuthorityRateLimiter, AuthorityRegistry, AuthorityServe, ContextVerifier,
         DEFAULT_CONTEXT_MAX_AGE_SECS, DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT,
-        DurableAudit, PreVerifyThrottle, ReplayCache, SealerHandler, SignerHandler,
-        SourceBucketThrottle, TokenBucketLimiter,
+        DurableAudit, FileRevocationList, PreVerifyThrottle, ReplayCache, RevocationCheck,
+        SealerHandler, SignerHandler, SourceBucketThrottle, TokenBucketLimiter,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_tenant::{
@@ -2477,6 +2477,19 @@ mod instance_serve {
         // (per-source + global token buckets; cloned into each link thread, so the global cap bounds
         // total verify load across all of this crown jewel's authority-serve links).
         let pre_verify: Arc<dyn PreVerifyThrottle> = Arc::new(SourceBucketThrottle::with_defaults());
+        // WS-E residual #3: the revocation feed. The KV-blind crown jewel reads a PROJECTION of the
+        // control-plane `authz/revoked/<cti>` markers from a file in its OWN data subtree (delivered
+        // out-of-band — who projects it + the cadence is the owner/ops design, FLAGGED for Security;
+        // delivery MUST be atomic). Absent file ⇒ no revocations (matches absent-marker ⇒ not-revoked);
+        // present-but-unreadable ⇒ the serve refuses fail-closed. A composition wanting the explicit
+        // Phase-1 residual (no feed) can drop a `NoRevocation`; the default wiring is the file feed.
+        let revocation: Arc<dyn RevocationCheck> = {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            let path = super::normalized_data_dir(config, &cwd)
+                .join("privsep")
+                .join("revoked.json");
+            Arc::new(FileRevocationList::at(path))
+        };
         tracing::info!(
             instance = %label,
             served = ?registry.served().iter().map(|a| a.tag()).collect::<Vec<_>>(),
@@ -2542,6 +2555,7 @@ mod instance_serve {
             let max_in_flight = max_in_flight.clone();
             let limiter = limiter.clone();
             let pre_verify = pre_verify.clone();
+            let revocation = revocation.clone();
             let audit = audit.clone();
             threads.push(std::thread::spawn(move || {
                 // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
@@ -2563,6 +2577,7 @@ mod instance_serve {
                     verifier: &verifier,
                     pre_verify: pre_verify.as_ref(),
                     replay: &replay,
+                    revocation: revocation.as_ref(),
                     limiter: limiter.as_ref(),
                     audit: audit.as_ref(),
                     handler: registry.as_ref(),
