@@ -112,8 +112,8 @@ if [ -z "$remaining" ]; then
   exit 0
 fi
 echo "boatramp: REFUSING to start the managed database (cap-req #28 defect A migration)." >&2
-echo "The data volume ROOT is non-empty but has no 'pgdata' subdirectory:" >&2
-echo "$remaining" | sed 's/^/  - /' >&2
+echo "The data volume ROOT is non-empty but has no 'pgdata' subdirectory. Entries found:" >&2
+echo "$remaining" >&2
 echo "" >&2
 echo "Data provisioned by boatramp <= v0.55.0 lives at the PVC ROOT, while this version keeps" >&2
 echo "PGDATA under the 'pgdata' subPath. Starting now would run initdb on an empty 'pgdata' and" >&2
