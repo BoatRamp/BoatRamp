@@ -562,39 +562,68 @@ fn resolve_instance_slice<'a>(
         .ok_or_else(|| PrivsepError::InstanceNotFound(label.to_string()))
 }
 
+/// The namespaces the container substrate unshares + self-checks, in the fixed order of the baseline
+/// value (see [`PRIVSEP_CONTAINER_NS_ENV`] / [`read_own_ns_baseline`]).
+#[cfg(target_os = "linux")]
+const CONTAINER_NS_KINDS: [&str; 4] = ["mnt", "ipc", "uts", "cgroup"];
+
+/// The root's OWN namespace identities, read from `/proc/self/ns/<kind>` for each of
+/// [`CONTAINER_NS_KINDS`] and `;`-joined (the magic-symlink targets, e.g. `mnt:[4026531840]`, which
+/// contain no `;`). The root never unshares — it stays in the host namespaces — so this is the OUTER
+/// baseline a container-substrate instance must have moved OFF of. NON-SECRET (inode identities only),
+/// passed to each container instance via [`PRIVSEP_CONTAINER_NS_ENV`]. `None` if a readlink fails
+/// (then a container instance gets no baseline and fail-closes its self-check). Linux-only.
+#[cfg(target_os = "linux")]
+fn read_own_ns_baseline() -> Option<String> {
+    let mut parts = Vec::with_capacity(CONTAINER_NS_KINDS.len());
+    for ns in CONTAINER_NS_KINDS {
+        let link = std::fs::read_link(format!("/proc/self/ns/{ns}")).ok()?;
+        parts.push(link.to_string_lossy().into_owned());
+    }
+    Some(parts.join(";"))
+}
+
 /// Fail-closed CONFIRMATION that a `substrate: container` instance really entered the fresh
 /// namespaces the root unshared for it in its `pre_exec` (design-note Option C, the SIMPLE model).
 ///
-/// The root did `unshare(CLONE_NEWNS|NEWPID|NEWIPC|NEWUTS|NEWCGROUP)` in THIS child before the
-/// re-exec. Four of those five (mount/ipc/uts/cgroup) take effect for the CALLING process
-/// immediately, so this process's own namespaces must DIFFER from its parent's — the parent being
-/// the root supervisor, which stays in the outer namespaces. We compare the `/proc/<pid>/ns/<type>`
-/// magic-symlink targets (the kernel's per-namespace inode identity). If any of the four MATCHES the
-/// parent's, the `unshare` did not take effect (a spawn-dispatch regression that spawned the
-/// Container instance like a plain OS process), and we refuse to serve unconfined.
+/// The root did `unshare(CLONE_NEWNS|NEWIPC|NEWUTS|NEWCGROUP)` in THIS child before the re-exec; all
+/// four take effect for the CALLING process immediately, so this process's own namespaces must DIFFER
+/// from the root supervisor's (which stays in the outer namespaces). We read our OWN
+/// `/proc/self/ns/<kind>` magic-symlink targets (the kernel's per-namespace inode identity) and
+/// compare them to the root's baseline, which the root PUSHED DOWN via [`PRIVSEP_CONTAINER_NS_ENV`].
+/// If any of the four MATCHES the root's, the `unshare` did not take effect (a spawn-dispatch
+/// regression that spawned the Container instance like a plain OS process), and we refuse to serve.
 ///
-/// `pid` is deliberately NOT asserted distinct: `unshare(CLONE_NEWPID)` does not move the CALLER into
-/// the new pid namespace — only its future children — so this process keeps its parent's pid
-/// namespace. That simple-model semantic is documented + flagged for Security in the design note
-/// (`crates/boatramp/DESIGN-privsep-phase3-container.md`); the pid-namespace isolation applies to any
-/// sub-processes the instance forks, not to the instance process itself. Reading the parent's
-/// `/proc/<ppid>/ns/*` needs ptrace-read access, which holds here (same-uid: both run as the root
-/// supervisor's uid, before this instance drops into its sandbox). Linux-only.
+/// **Why the baseline is pushed down, not read up.** Reading the root's `/proc/<ppid>/ns/*` needs
+/// ptrace-read access, and the same-uid rule ALSO requires the caller's capabilities to be a superset
+/// of the target's — which this instance (whose caps were fully dropped in `pre_exec`, Finding 2) is
+/// NOT, against the full-capability root. Reading our OWN `/proc/self/ns` needs no ptrace, so it works
+/// after the cap drop. `pid` is deliberately NOT checked: `CLONE_NEWPID` is excluded on the simple
+/// model (see `spawn_wired_instance` + the design note). Linux-only.
 #[cfg(target_os = "linux")]
 fn verify_container_namespaces_unshared(label: &str) -> Result<(), String> {
-    let ppid = unsafe { libc::getppid() };
-    for ns in ["mnt", "ipc", "uts", "cgroup"] {
+    let baseline = std::env::var(PRIVSEP_CONTAINER_NS_ENV).map_err(|_| {
+        format!(
+            "container-substrate instance {label:?} has no namespace baseline \
+             ({PRIVSEP_CONTAINER_NS_ENV} unset) — cannot confirm the unshare; refusing to serve \
+             (FailNodeClosed)"
+        )
+    })?;
+    let root_ns: Vec<&str> = baseline.split(';').collect();
+    if root_ns.len() != CONTAINER_NS_KINDS.len() {
+        return Err(format!(
+            "container-substrate instance {label:?}: malformed namespace baseline \
+             ({PRIVSEP_CONTAINER_NS_ENV}={baseline:?}) — refusing to serve (FailNodeClosed)"
+        ));
+    }
+    for (ns, root) in CONTAINER_NS_KINDS.iter().zip(root_ns.iter()) {
         let mine = std::fs::read_link(format!("/proc/self/ns/{ns}"))
             .map_err(|e| format!("container substrate: reading /proc/self/ns/{ns}: {e}"))?;
-        let parent = std::fs::read_link(format!("/proc/{ppid}/ns/{ns}")).map_err(|e| {
-            format!("container substrate: reading parent /proc/{ppid}/ns/{ns} (ppid={ppid}): {e}")
-        })?;
-        if mine == parent {
+        if mine.to_string_lossy() == *root {
             return Err(format!(
-                "container-substrate instance {label:?} shares its parent's {ns} namespace \
-                 ({mine:?}) — the root supervisor's unshare did not take effect, so the \
-                 namespace/cgroup wall is NOT up. Refusing to serve unconfined (no silent downgrade \
-                 to an OS process) — FailNodeClosed"
+                "container-substrate instance {label:?} shares the root supervisor's {ns} namespace \
+                 ({root}) — the unshare did not take effect, so the namespace/cgroup wall is NOT up. \
+                 Refusing to serve unconfined (no silent downgrade to an OS process) — FailNodeClosed"
             ));
         }
     }
@@ -761,6 +790,14 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
 /// §3.3), not any token in the environment — so this var is non-secret and passes the spawn-env
 /// allowlist (`BOATRAMP_*`).
 pub const PRIVSEP_FDS_ENV: &str = "BOATRAMP_PRIVSEP_FDS";
+
+/// The env var the root sets on each `substrate: container` instance carrying the root's OWN
+/// namespace identities (the `;`-joined `/proc/self/ns/{mnt,ipc,uts,cgroup}` magic-symlink targets —
+/// see [`read_own_ns_baseline`]). The instance reads its OWN `/proc/self/ns` (no ptrace needed, so it
+/// works after the Finding-2 capability drop) and fail-closes unless each DIFFERS from this baseline,
+/// confirming it entered fresh namespaces. NON-SECRET (inode identities only), so it passes the
+/// `BOATRAMP_*` spawn-env allowlist. Absent for every non-container instance.
+pub const PRIVSEP_CONTAINER_NS_ENV: &str = "BOATRAMP_PRIVSEP_CONTAINER_NS";
 
 /// The env var the root sets on a crown-jewel (`secrets.sealer` / `token.signer`) instance naming the
 /// feature-links on which it should serve the WS-E **authority-API grammar** (seal/unseal/mint_token)
@@ -1965,6 +2002,14 @@ mod supervise {
         let current_exe =
             std::env::current_exe().map_err(|e| err(format!("resolving current exe: {e}")))?;
 
+        // Phase-3 Container substrate: the root's OWN namespace identities, read ONCE here (the root
+        // never unshares — it stays in the host namespaces). Pushed down to each container instance so
+        // it can self-confirm its fresh namespaces by reading only its OWN /proc/self/ns (a capless
+        // instance cannot ptrace-read the full-cap root's /proc/<ppid>/ns — Finding 2). `None` only if
+        // a readlink fails, in which case a container instance gets no baseline and fail-closes.
+        #[cfg(target_os = "linux")]
+        let container_ns_baseline = super::read_own_ns_baseline();
+
         // Phase-3 spawn-backend dispatch (design §7 "substrate is a spawn backend"): resolve EACH
         // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process + the
         // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is refused fail-closed here
@@ -2118,6 +2163,19 @@ mod supervise {
                 extra_env.insert(
                     super::PRIVSEP_AUTHORITY_LINKS_ENV.to_string(),
                     serde_json::to_string(links).expect("authority-serve link set serializes"),
+                );
+            }
+            // A `substrate: container` instance gets the root's own namespace baseline (names/inodes
+            // only) so it can self-confirm — reading only its OWN /proc/self/ns, which works after the
+            // capability drop — that it entered fresh namespaces. If the root could not read its own
+            // baseline the var is absent and the instance fail-closes its self-check.
+            #[cfg(target_os = "linux")]
+            if matches!(spec.substrate, super::InstanceSubstrate::Container)
+                && let Some(baseline) = &container_ns_baseline
+            {
+                extra_env.insert(
+                    super::PRIVSEP_CONTAINER_NS_ENV.to_string(),
+                    baseline.clone(),
                 );
             }
             match super::per_tenant::spawn_wired_instance(

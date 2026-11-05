@@ -332,12 +332,14 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
   supervisor `kill_all`s + returns `Err` ⇒ node down (`FailNodeClosed`) — **never** a silent
   downgrade to an unconfined OS process.
 - **Namespace self-check** (`verify_container_namespaces_unshared`, called from `run_instance`
-  before the sandbox install): a Container instance reads `/proc/self/ns/{mnt,ipc,uts,cgroup}` and
-  its parent's (`/proc/<getppid()>/ns/...`) and refuses to serve (`FailNodeClosed`) unless all four
-  DIFFER. This makes "a Container instance served" **imply** "it was in fresh namespaces": it catches
-  the one failure mode the spawner-side `unshare` cannot (a dispatch regression that spawns a
-  Container spec WITHOUT the `unshare`). The live gate's 200 is the proof, exactly as the
-  signer-unseal gate's 200 proves the unseal.
+  before the sandbox install): a Container instance reads its OWN `/proc/self/ns/{mnt,ipc,uts,cgroup}`
+  and refuses to serve (`FailNodeClosed`) unless each DIFFERS from the root supervisor's namespace
+  baseline, which the root reads once and PUSHES DOWN via `BOATRAMP_PRIVSEP_CONTAINER_NS` (see §8.2 #5
+  — pushed down, not read up, because a capless instance cannot ptrace-read the full-cap root). This
+  makes "a Container instance served" **imply** "it was in fresh namespaces": it catches the one
+  failure mode the spawner-side `unshare` cannot (a dispatch regression that spawns a Container spec
+  WITHOUT the `unshare`). The live gate's 200 is the proof, exactly as the signer-unseal gate's 200
+  proves the unseal.
 - **Deliberately NOT unshared:** `CLONE_NEWPID` (dropped — flag #2), `CLONE_NEWNET` (a `backend.*`
   instance keeps host-net egress to its DB/KV/blob — §5b/§egress corner) and `CLONE_NEWUSER` (no user
   namespace in the first cut — §5b).
@@ -395,10 +397,16 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
    `CAP_DAC_*`). (Correcting the §3/§5b phrasing: "Landlock is the FS wall" means the Landlock wall
    plus the cap drop; and the "existing privilege drop" §5b referenced did not exist until Finding 2
    added it.)
-5. **Self-check reads `/proc/<ppid>/ns/*`.** Needs ptrace-read (same-uid) access to the parent; holds
-   because both run as the root supervisor's uid at that point, and same-uid ptrace-read needs no
-   capability (so it survives the Finding-2 cap drop). If a future increment adds a userns/uid remap,
-   revisit this read.
+5. **Self-check reads only its OWN `/proc/self/ns/*`; the baseline is PUSHED DOWN (corrected).** An
+   earlier draft had the instance ptrace-read the parent's `/proc/<ppid>/ns/*`. The live gate proved
+   that fails after the Finding-2 cap drop: a same-uid ptrace-read ALSO requires the caller's caps to
+   be a SUPERSET of the target's, and a zero-cap instance is NOT a superset of the full-capability root
+   (`-EACCES`). So the root now reads its OWN namespace identities once
+   (`read_own_ns_baseline`) and passes them to each container instance via the non-secret
+   `BOATRAMP_PRIVSEP_CONTAINER_NS` env var (survives the inv10 env scrub — it is not secret-bearing);
+   the instance reads only its OWN `/proc/self/ns` (no ptrace needed) and refuses unless each of
+   mnt/ipc/uts/cgroup DIFFERS from the root's baseline. Works capless. If a future increment adds a
+   userns/uid remap, re-check that the baseline comparison still holds.
 6. **`per_tenant` + container now REFUSED fail-closed (Sec re-review Finding 1).** A `PerTenantTemplate`
    pinned `substrate: container` is now rejected by the composition-closure lint at config load, in
    the root, before any spawn (`CompositionViolation::PerTenantTemplateContainerUnsupported`). The
