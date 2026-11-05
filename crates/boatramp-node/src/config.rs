@@ -3655,8 +3655,9 @@ mod tests {
             check_composition_closure,
         };
         // A valid least-authority composition whose union == the full `all` set: an edge
-        // (listeners + exec + control), a data instance (backends), a signer (the six crown
-        // jewels, isolated). Carried through the REAL figment file → resolve pipeline.
+        // (listeners + exec.wasmtime + acme), a compute instance (exec.compute + control, off every
+        // public listener per the WIDENED WS-D Finding-2), a data instance (backends), a signer (the
+        // six crown jewels, isolated). Carried through the REAL figment file → resolve pipeline.
         let path = privsep_temp_cfg(
             r#"(
                 privsep: (
@@ -3665,11 +3666,13 @@ mod tests {
                             capabilities: [
                                 "listen.public-tls", "listen.http-parse", "listen.mail",
                                 "listen.overlay", "listen.s3ingress", "listen.inbound-tcp",
-                                "listen.gateway", "exec.wasmtime", "exec.compute",
-                                "control.admin-api", "acme.dns-control",
+                                "listen.gateway", "exec.wasmtime", "acme.dns-control",
                             ],
                             sandbox: Derived,
                             links: ["to-signer"],
+                        ),
+                        "compute": (
+                            capabilities: ["exec.compute", "control.admin-api"],
                         ),
                         "data": (
                             capabilities: ["backend.kv", "backend.sql", "backend.blob", "backend.messaging"],
@@ -3699,7 +3702,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let privsep = cfg.privsep.expect("[privsep] materialised");
-        assert_eq!(privsep.instances.len(), 3);
+        assert_eq!(privsep.instances.len(), 4);
         assert_eq!(
             privsep.instances["signer"].capabilities,
             vec![

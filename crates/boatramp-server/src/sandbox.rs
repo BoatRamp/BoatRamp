@@ -2343,10 +2343,14 @@ mod privsep_derivation_tests {
     #[test]
     fn wsd_finding2_public_parser_cannot_spawn_or_touch_kv_slate() {
         use std::path::Path;
-        // The most-exposed public parser, DE-COUPLED (WS-D Finding-2): `listen.http-parse` alone,
-        // holding NO `exec.compute` and NO `backend.kv` (the composition-closure lint guarantees
-        // this). The per-capability profile must make the containment physical.
-        let parser = caps(&[HostAuthority::ListenHttpParse]);
+        // The most-exposed public parser, DE-COUPLED (WS-D Finding-2): the SHIPPED parser cap-set
+        // `{listen.public-tls, listen.http-parse}` (the public-tls+parse co-location the live gate
+        // runs), holding NO `exec.compute` and NO `backend.kv` (the composition-closure lint
+        // guarantees this). The per-capability profile must make the containment physical.
+        let parser = caps(&[
+            HostAuthority::ListenPublicTls,
+            HostAuthority::ListenHttpParse,
+        ]);
         // (1) It CANNOT spawn: execve/execveat/fork/vfork are NOT in the allow-list, and ARE killed.
         let allow = derive_seccomp_allowlist(&parser);
         let kill = derive_seccomp_killlist(&parser);

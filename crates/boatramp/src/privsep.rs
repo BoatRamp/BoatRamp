@@ -2950,7 +2950,19 @@ mod instance_serve {
             );
         }
         // The supervisor's single boot-wired link is the inbound parser link (the per-tenant relay
-        // links to the templates are created LAZILY per tenant, not boot-wired). Fail-closed if absent.
+        // links to the templates are created LAZILY per tenant, not boot-wired). The supervisor assumes
+        // EXACTLY one inbound link, so refuse fail-closed if it was wired more than one (an ambiguous
+        // composition the root must reject rather than silently pick one via `.next()`) — F5.
+        if fds.links.len() > 1 {
+            let mut names: Vec<&String> = fds.links.keys().collect();
+            names.sort();
+            return Err(format!(
+                "a per-tenant supervisor was wired {} inbound feature-links {names:?}, but it expects \
+                 EXACTLY one (the parser relay); refusing the ambiguous composition fail-closed",
+                fds.links.len(),
+            ));
+        }
+        // Fail-closed if absent.
         let (link_name, inbound_fd) = fds
             .links
             .iter()
@@ -2969,6 +2981,19 @@ mod instance_serve {
         // SAME secret-scrubbed contract (F11-B) the root used — a per-tenant child inherits NO secret.
         let parent_env: Vec<(String, String)> = std::env::vars().collect();
         let plan = super::plan_root(config, config_path, parent_env).map_err(|e| e.to_string())?;
+        // The supervisor instantiates EXACTLY one per-tenant template. Refuse fail-closed if the
+        // composition defines more than one, rather than silently pick one via `.next()` — F5. (The
+        // closure lint already constrains every template to be `{exec.wasmtime}`; this guards the
+        // supervisor's single-template assumption against a multi-template composition.)
+        if plan.templates.len() > 1 {
+            let mut labels: Vec<&str> = plan.templates.iter().map(|t| t.label.as_str()).collect();
+            labels.sort_unstable();
+            return Err(format!(
+                "the composition defines {} per-tenant template specs {labels:?}, but a supervisor \
+                 instantiates EXACTLY one; refusing the ambiguous composition fail-closed",
+                plan.templates.len(),
+            ));
+        }
         let template_spec = plan.templates.into_iter().next().ok_or_else(|| {
             "the composition defines no per-tenant template spec (a supervisor needs one)"
                 .to_string()
@@ -3417,7 +3442,11 @@ mod tests {
         }
     }
 
-    /// A clean least-authority composition whose union == ALL (edge=C∪D∪E, data=B, signer=A).
+    /// A clean least-authority composition whose union == ALL. Restructured for the WIDENED WS-D
+    /// Finding-2 lint (a public listener holds no `exec.compute`/`control.admin-api`/`backend.*`):
+    /// parser=public-tls+http-parse, edge=the other listeners + `exec.wasmtime` + `acme.dns-control`
+    /// (none a forbidden partner), compute=`exec.compute`+`control.admin-api` (off every listener),
+    /// data=B, signer=A.
     fn clean_privsep() -> PrivsepConfig {
         let mut instances = BTreeMap::new();
         // The public HTTP parse surface on its OWN instance, holding NO spawn/KV (WS-D Finding-2).
@@ -3431,6 +3460,9 @@ mod tests {
                 &[],
             ),
         );
+        // The other public listeners. Keep `exec.wasmtime` (the inverted-frontend exception) and
+        // `acme.dns-control` (cert issuance) here — neither is a Finding-2 forbidden partner — but NOT
+        // `exec.compute`/`control.admin-api` (those move to `compute`, off every untrusted-byte surface).
         instances.insert(
             "edge".to_string(),
             inst(
@@ -3441,11 +3473,18 @@ mod tests {
                     HostAuthority::ListenInboundTcp,
                     HostAuthority::ListenGateway,
                     HostAuthority::ExecWasmtime,
-                    HostAuthority::ExecCompute,
-                    HostAuthority::ControlAdminApi,
                     HostAuthority::AcmeDnsControl,
                 ],
                 &["to-signer"],
+            ),
+        );
+        // The spawn + control plane, off every public listener (WS-D Finding-2, widened): no listener,
+        // no backend, no crown ⇒ no violation and no F8 warning.
+        instances.insert(
+            "compute".to_string(),
+            inst(
+                &[HostAuthority::ExecCompute, HostAuthority::ControlAdminApi],
+                &[],
             ),
         );
         instances.insert(
@@ -3525,8 +3564,8 @@ mod tests {
         let cfg = cfg_with(Some(clean_privsep()));
         let plan = plan_root(&cfg, Path::new("/etc/boatramp.cfg"), fake_env())
             .expect("clean composition authorized");
-        // clean_privsep has NO per-tenant template, so all four instances are STATIC (boot-forked).
-        assert_eq!(plan.static_instances.len(), 4);
+        // clean_privsep has NO per-tenant template, so all five instances are STATIC (boot-forked).
+        assert_eq!(plan.static_instances.len(), 5);
         assert!(plan.templates.is_empty());
         for spec in &plan.static_instances {
             // The re-exec argv is the __instance tail with the config path.
@@ -4057,11 +4096,12 @@ mod tests {
 
     /// A valid Phase-4 WS-C + WS-D composition (union == ALL), with the public parser DE-COUPLED from
     /// spawn + KV (Finding-2): `parser` = `{listen.public-tls, listen.http-parse}` (the most-exposed
-    /// instance, NO spawn/KV) forwards client fds inward; `supervisor` = `{backend.kv, exec.compute}`
-    /// (non-public, binds no listener) resolves Host→project + forks the per-tenant children;
-    /// `tenant-wasm` = `{exec.wasmtime}` PER-TENANT TEMPLATE; `core` = crown jewels + the other
-    /// backends; `aux` = the other listeners + control. `parser-sup` relays client fds parser→
-    /// supervisor; `to-tenant` relays them supervisor→template.
+    /// instance, NO spawn/KV) forwards client fds inward; `supervisor` =
+    /// `{backend.kv, exec.compute, control.admin-api}` (non-public, binds no listener) resolves
+    /// Host→project + forks the per-tenant children and holds the control-plane mutation surface off
+    /// every public listener (WIDENED Finding-2); `tenant-wasm` = `{exec.wasmtime}` PER-TENANT
+    /// TEMPLATE; `core` = crown jewels + the other backends; `aux` = the other listeners + acme.
+    /// `parser-sup` relays client fds parser→supervisor; `to-tenant` relays them supervisor→template.
     fn phase4_privsep() -> PrivsepConfig {
         let mut instances = BTreeMap::new();
         instances.insert(
@@ -4081,9 +4121,11 @@ mod tests {
                     // The non-public per-tenant SUPERVISOR: `backend.kv` to resolve Host→project and
                     // `exec.compute` to fork the per-tenant `exec.wasmtime` children. It binds no
                     // listener and parses no raw client bytes — it is reached over `parser-sup`
-                    // (Finding-2: spawn + KV live OFF the public parser).
+                    // (Finding-2: spawn + KV live OFF the public parser). `control.admin-api` rides
+                    // here (off every public listener, per the WIDENED Finding-2), not on `aux`.
                     HostAuthority::BackendKv,
                     HostAuthority::ExecCompute,
+                    HostAuthority::ControlAdminApi,
                 ],
                 &["parser-sup", "to-tenant"],
             ),
@@ -4118,7 +4160,8 @@ mod tests {
                     HostAuthority::ListenS3Ingress,
                     HostAuthority::ListenInboundTcp,
                     HostAuthority::ListenGateway,
-                    HostAuthority::ControlAdminApi,
+                    // `acme.dns-control` (cert issuance) is NOT a Finding-2 forbidden partner, so it
+                    // may ride the listener instance; `control.admin-api` moved to `supervisor`.
                     HostAuthority::AcmeDnsControl,
                 ],
                 &[],
@@ -4215,7 +4258,7 @@ mod tests {
         let plan = plan_root(&cfg, Path::new("boatramp.cfg"), fake_env())
             .expect("a no-template composition ignores the per_tenant policy");
         assert!(plan.templates.is_empty());
-        assert_eq!(plan.static_instances.len(), 4);
+        assert_eq!(plan.static_instances.len(), 5);
     }
 
     /// An empty [`per_tenant::ComputePlaneRegistry`] resolves EVERY scope to `None` — the WS-C

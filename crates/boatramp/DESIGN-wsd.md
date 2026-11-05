@@ -99,12 +99,31 @@ real client would trigger.
 ## The structural guarantee (the lint)
 
 `check_composition_closure` gains a fail-closed refusal (run in the root, before any spawn): an
-instance holding **`listen.http-parse`** must hold **neither `exec.compute` nor `backend.kv`**
-(`CompositionViolation::PublicParserWithSpawnOrControlKv`). This makes Finding-2 a boot-time-provable,
-restart-class invariant — no on-disk composition can put the public parser in the same address space
-as spawn or the control-plane KV. Together with the per-capability profile (execve killed + no kv-slate
-grant for a parser), the containment is structural, not conventional: a parser RCE provably cannot fork
-or rw the KV.
+instance holding **any public, untrusted-byte listener** (ANY group-C `listen.*`) must hold **none** of
+`exec.compute` (spawn), `control.admin-api` (the control-plane mutation surface), or any `backend.*`
+credential (`backend.kv`/`sql`/`blob`/`messaging`)
+(`CompositionViolation::PublicListenerWithSpawnControlOrBackend`). This makes Finding-2 a
+boot-time-provable, restart-class invariant — no on-disk composition can put a public parser in the same
+address space as spawn, control-plane mutation, or a data-plane credential. Together with the
+per-capability profile (execve killed + no kv-slate grant for a parser), the containment is structural,
+not conventional: a parser RCE provably cannot fork, drive control-plane mutations, or rw the data plane.
+
+**Anchor + forbidden set WIDENED in the WS-D re-review (owner/Security decision 1 — widen the lint).**
+The finding's exact target was `listen.http-parse`, but every group-C listener is the same
+untrusted-byte character, and `listen.public-tls` is SHARPER (it holds the live private cert key AND
+parses attacker TLS bytes). The narrow anchor left `{listen.public-tls | mail | overlay | gateway |
+s3ingress | inbound-tcp} + exec.compute + backend.kv` lint-clean; it no longer is. The forbidden set was
+widened from `{exec.compute, backend.kv}` to **all `backend.*` ∪ `{exec.compute, control.admin-api}`**
+(re-review preference for all `backend.*` — no shipped composition co-resides a listener with a backend,
+so it over-restricts nothing; both reference topologies isolate the backends onto a non-public instance).
+`exec.wasmtime` stays allowed with a listener — `listen.http-parse × exec.wasmtime` is the legitimate
+Phase-3 inverted frontend, governed by the Phase-4 template rules, not Finding-2. `acme.dns-control`
+stays allowed on a listener too (cert issuance is not a control-plane mutation).
+
+**Scope (F3).** This guarantee applies ONLY to an explicit `[privsep]` composition. The DEFAULT monolith
+(no `[privsep]` section) is NEVER linted — it is the one allowed all-in-one composition (§5.5), one
+process holding every authority. So Finding-2's split is an **opt-in hardened posture**: writing
+`[privsep]` is what turns the boot-time-provable wall on. The turnkey monolith is unchanged.
 
 ## Profile (already built; nailed down by a test)
 
@@ -113,17 +132,23 @@ by WS-D: a non-`exec.compute` instance kills `execve`/`execveat`/`fork`/`vfork`
 (`derive_seccomp_killlist`); a non-`backend.kv` instance gets no `kv-slate` grant
 (`backend_state_subdir` / `instance_backend_state_grants`); and an `exec.compute` holder's Landlock
 execute-pin covers only its own binary, never the writable `kv-slate`. WS-D adds a focused test nailing
-Finding-2's exact property for a `{listen.http-parse}` instance.
+Finding-2's exact property for the SHIPPED parser cap-set `{listen.public-tls, listen.http-parse}` (the
+public-tls+parse co-location the live gate runs — higher fidelity than `{listen.http-parse}` alone).
 
 ## Open decisions / flags for the owner + Security review
 
-1. **Lint scope — named parser vs all untrusted-byte listeners.** Implemented for the finding's exact
-   target, `listen.http-parse`. The same RCE argument applies to the other group-C parsers
-   (`listen.mail`, `listen.overlay`, `listen.gateway`, …): the design calls them "same character." The
-   F8 tier already *warns* on `backend.* × listen.*`. **Decision needed:** promote the hard refusal to
-   all group-C listeners (not just http-parse), and/or widen the forbidden-partner set beyond
-   `{exec.compute, backend.kv}` to all `backend.*` / `exec.wasmtime`. NB `listen.http-parse ×
-   exec.wasmtime` must stay allowed — that is the legitimate Phase-3 inverted frontend.
+1. **Lint scope — named parser vs all untrusted-byte listeners. RESOLVED in the WS-D re-review —
+   WIDEN the lint.** The anchor is now EVERY group-C listener (not just `listen.http-parse`), and the
+   forbidden-partner set is **all `backend.*` ∪ `{exec.compute, control.admin-api}`** (widened from
+   `{exec.compute, backend.kv}`; `backend.sql` was previously only an F8 warning and `control.admin-api`
+   was unflagged). Preferred all `backend.*` over the explicit four because no shipped composition
+   co-resides a listener with a backend — both reference topologies isolate the backends onto a
+   non-public instance — so it over-restricts nothing. `listen.http-parse × exec.wasmtime` stays allowed
+   (the legitimate Phase-3 inverted frontend; `exec.wasmtime` is NOT a forbidden partner, and its
+   co-residency is governed by the Phase-4 template rules). `acme.dns-control` stays allowed on a
+   listener (cert issuance, not a control-plane mutation — the re-review named only `control.admin-api`).
+   Implemented as `HostAuthority::is_public_listener` / `is_public_listener_forbidden_partner` →
+   `CompositionViolation::PublicListenerWithSpawnControlOrBackend`.
 
 2. **Host-head trust (parser → supervisor).** Chosen: the parser peeks + supplies the Host string; the
    supervisor re-resolves it authoritatively against the KV. Alternative considered: the supervisor

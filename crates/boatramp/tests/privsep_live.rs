@@ -53,12 +53,15 @@ fn privsep_two_instance_composition_serves_end_to_end() {
     let port = free_port();
     let cfg_path = tmp.join("boatramp.cfg");
 
-    // A minimal, VALID 3-instance composition (passes the closure lint: union == ALL; no crown
-    // jewel co-resident with a listener/exec/control surface; grants disjoint; WS-D Finding-2: the
-    // public parser holds NO exec.compute / backend.kv):
+    // A minimal, VALID 4-instance composition (passes the closure lint: union == ALL; no crown
+    // jewel co-resident with a listener/exec/control surface; grants disjoint; WS-D Finding-2
+    // (widened): no public listener co-resides exec.compute / control.admin-api / backend.*):
     //   - `edge`  = the public parse surface (`listen.public-tls` + `listen.http-parse`) — the
     //               FRONTEND (binds serve.addr, splices client fds inward); NO spawn, NO KV;
-    //   - `aux`   = the other listeners + both exec + both control (no keys, no backends) — parks;
+    //   - `aux`   = the other listeners + `exec.wasmtime` + `acme.dns-control` (neither a Finding-2
+    //               forbidden partner; no keys, no backends) — parks;
+    //   - `ops`   = `exec.compute` + `control.admin-api` (off every public listener, WS-D Finding-2
+    //               widened; no keys, no backends, no listeners) — parks;
     //   - `core`  = every crown jewel + every backend (group A ∪ B; a crown jewel may co-reside
     //               only with A ∪ B) — the serving BACKEND.
     let cfg = format!(
@@ -75,9 +78,13 @@ fn privsep_two_instance_composition_serves_end_to_end() {
                 capabilities: [
                     "listen.mail", "listen.overlay",
                     "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
-                    "exec.wasmtime", "exec.compute",
-                    "control.admin-api", "acme.dns-control",
+                    "exec.wasmtime", "acme.dns-control",
                 ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
                 sandbox: Derived,
                 links: [],
             ),
@@ -205,8 +212,11 @@ fn privsep_sealer_signer_unseal_serves_end_to_end() {
         std::fs::write(&sealed_file, &sealed).expect("write the sealed signer-key blob");
     }
 
-    // A VALID 4-instance composition (passes the closure lint + the sealed-signer closure lint):
-    //   - `edge`   = every listener + both exec + both control (C∪D∪E) — the FRONTEND;
+    // A VALID 6-instance composition (passes the closure lint + the sealed-signer closure lint;
+    // WS-D Finding-2 widened: no public listener co-resides exec.compute / control / backend.*):
+    //   - `edge`   = the public parse surface (`listen.public-tls` + `listen.http-parse`) — FRONTEND;
+    //   - `aux`    = the other listeners + `exec.wasmtime` + `acme.dns-control` (parks);
+    //   - `ops`    = `exec.compute` + `control.admin-api` (off every public listener; parks);
     //   - `core`   = the four backends (B) — the serving BACKEND (edge splices client fds here);
     //   - `sealer` = secrets.sealer + the OTHER crown jewels (A∖{token.signer}) — holds the KEK,
     //                serves unseal on `to-signer`;
@@ -230,9 +240,13 @@ fn privsep_sealer_signer_unseal_serves_end_to_end() {
                 capabilities: [
                     "listen.mail", "listen.overlay",
                     "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
-                    "exec.wasmtime", "exec.compute",
-                    "control.admin-api", "acme.dns-control",
+                    "exec.wasmtime", "acme.dns-control",
                 ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
                 sandbox: Derived,
                 links: [],
             ),
@@ -332,7 +346,7 @@ fn privsep_sealer_signer_unseal_serves_end_to_end() {
 /// operator-selectable SUBSTRATE field: `frontend` is pinned to `substrate: OsProcess` (the wired
 /// default backend) explicitly, proving the new config vocabulary parses + stands up end-to-end.
 ///
-/// Proves (against the live kernel, all three instances sandboxed `Enforced`): a client `GET /`
+/// Proves (against the live kernel, all four instances sandboxed `Enforced`): a client `GET /`
 /// flows client → frontend listener fd → SCM_RIGHTS splice → core → hand-rolled HTTP → a real 200.
 ///
 /// `#[ignore]`d like the gates above (forks + sandboxes against the live kernel); the CI
@@ -357,9 +371,10 @@ fn privsep_frontend_inversion_serves_end_to_end() {
     //   - `frontend` = ONLY listen.public-tls + listen.http-parse + exec.wasmtime (no keys, no
     //                  backends, no control, no exec.compute) — the INVERTED frontend. Pinned to the
     //                  OsProcess substrate explicitly. Binds serve.addr, splices client fds to core.
-    //   - `aux`      = the OTHER listeners + exec.compute + both control (C∖{public-tls,http-parse}
-    //                  ∪ exec.compute ∪ E) — no keys, no backends. Parks (Phase 1 binds only the
-    //                  public listener), present so the union closes.
+    //   - `aux`      = the OTHER listeners + acme.dns-control (C∖{public-tls,http-parse} ∪ acme) —
+    //                  no keys, no backends. Parks (Phase 1 binds only the public listener).
+    //   - `ops`      = exec.compute + control.admin-api (off every public listener, WS-D Finding-2
+    //                  widened) — no keys, no backends, no listeners. Parks; closes the union.
     //   - `core`     = every crown jewel + every backend (A ∪ B) — the serving BACKEND.
     let cfg = format!(
         r#"(
@@ -376,8 +391,13 @@ fn privsep_frontend_inversion_serves_end_to_end() {
                 capabilities: [
                     "listen.mail", "listen.overlay", "listen.s3ingress",
                     "listen.inbound-tcp", "listen.gateway",
-                    "exec.compute", "control.admin-api", "acme.dns-control",
+                    "acme.dns-control",
                 ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
                 sandbox: Derived,
                 links: [],
             ),
@@ -544,11 +564,13 @@ fn privsep_per_tenant_serves_end_to_end() {
     // spawn + KV (WS-D Finding-2):
     //   - `parser`     = listen.public-tls + listen.http-parse ONLY — the public parse surface, holds
     //                    NO backend.kv / exec.compute; it peeks Host + forwards client fds inward;
-    //   - `supervisor` = backend.kv + exec.compute (non-public, binds no listener) — RE-resolves
-    //                    Host→project (sole KV opener), instantiates + relays per tenant;
+    //   - `supervisor` = backend.kv + exec.compute + control.admin-api (non-public, binds no
+    //                    listener) — RE-resolves Host→project (sole KV opener), instantiates + relays
+    //                    per tenant, and holds the control-plane mutation surface off every public
+    //                    listener (WS-D Finding-2 widened);
     //   - `tenant-wasm` = ONLY exec.wasmtime, `lifecycle: PerTenantTemplate` — NOT boot-forked;
     //   - `core`        = every crown jewel + the other backends (A ∪ B∖{kv});
-    //   - `aux`         = the other listeners + control (closes the union).
+    //   - `aux`         = the other listeners + acme (closes the union).
     //   - `parser-sup`  = the parser→supervisor Relay link (client fds + peeked Host ride inward);
     //   - `to-tenant`   = the supervisor↔template Relay link (socketpaired per tenant at instantiation).
     let cfg = format!(
@@ -562,7 +584,7 @@ fn privsep_per_tenant_serves_end_to_end() {
                 links: ["parser-sup"],
             ),
             "supervisor": (
-                capabilities: ["backend.kv", "exec.compute"],
+                capabilities: ["backend.kv", "exec.compute", "control.admin-api"],
                 sandbox: Derived,
                 links: ["parser-sup", "to-tenant"],
             ),
@@ -585,7 +607,7 @@ fn privsep_per_tenant_serves_end_to_end() {
                 capabilities: [
                     "listen.mail", "listen.overlay", "listen.s3ingress",
                     "listen.inbound-tcp", "listen.gateway",
-                    "control.admin-api", "acme.dns-control",
+                    "acme.dns-control",
                 ],
                 sandbox: Derived,
                 links: [],
