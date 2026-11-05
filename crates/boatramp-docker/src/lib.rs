@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
     Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
-    Scheme, VolumeRef, compute_instance_id,
+    Scheme, VolumeRef, compute_instance_id, managed_db_alias,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
@@ -402,10 +402,12 @@ pub fn project_network_name(project: &str) -> String {
 pub const PROJECT_NETWORK_PREFIX: &str = "boatramp-net-";
 
 /// Build the [`NetworkingConfig`] attaching a container to `network` with the given DNS `aliases`
-/// (the workload name for a server a sibling resolves by name; empty for a one-shot client that
-/// only needs to reach peers). Supplying this at container-create means the container joins ONLY
-/// this one network — never the shared default bridge — so docker's inter-network isolation is the
-/// tenancy boundary (a container can resolve/reach only its own project's peers).
+/// (the workload's [`managed_db_alias`] for a server a sibling resolves by name; empty for a
+/// one-shot client that only needs to reach peers). Each alias MUST be a valid DNS label (≤ 63
+/// octets) — Docker 29's embedded DNS will not register a longer one (see [`managed_db_alias`]).
+/// Supplying this at container-create means the container joins ONLY this one network — never the
+/// shared default bridge — so docker's inter-network isolation is the tenancy boundary (a container
+/// can resolve/reach only its own project's peers).
 fn network_config(network: &str, aliases: Vec<String>) -> NetworkingConfig<String> {
     let endpoint = EndpointSettings {
         aliases: (!aliases.is_empty()).then_some(aliases),
@@ -711,7 +713,12 @@ impl ComputeBackend for DockerBackend {
         // loopback with an ephemeral host port (discovered after start), so a
         // host-native `serve` can reach it even when the bridge IP is not host-routable
         // (Docker Desktop / macOS). `Bridge` leaves the container unpublished.
-        if self.endpoint == DockerEndpoint::Published {
+        //
+        // Only when the workload actually HAS a port: a no-port workload (`port == 0`) must NOT
+        // emit a `0/tcp` spec — Docker 29.x rejects it with 400 ("invalid port specification:
+        // 0/tcp"), where Docker 28 tolerated it (the same 28→29 strictness class as the 63-octet
+        // DNS-label cap above). A port-0 workload publishes nothing and has no host endpoint.
+        if self.endpoint == DockerEndpoint::Published && port != 0 {
             config.exposed_ports = Some(HashMap::from([(port_key.clone(), HashMap::new())]));
             host_config.port_bindings = Some(HashMap::from([(
                 port_key.clone(),
@@ -742,10 +749,24 @@ impl ComputeBackend for DockerBackend {
         // port publishing and `container_ip` work on a user-defined bridge exactly as on the
         // default bridge (`container_ip` already falls back from the now-empty top-level
         // `IPAddress` — only set for the default bridge — to the per-project endpoint's IP).
+        //
+        // The DNS ALIAS is `managed_db_alias(&req.workload)`, NOT the raw workload name (Bug D,
+        // Docker 29): a DNS label is capped at 63 octets (RFC 1035), and Docker 29's libnetwork
+        // refuses to publish an embedded-DNS service-discovery record for a label over that cap
+        // (Docker 28 tolerated it — why this went unseen). A `Single`-isolation managed-DB
+        // workload name is `<compute>-<sanitized-ident>` with two 25-char digests ≈ 69 octets, so
+        // the raw-name alias silently failed to register on 29 and a sibling got NXDOMAIN. The
+        // short, stable alias fits a label and is the SAME string a consumer's DSN host resolves
+        // (`NodeTenantSqlResolver::connection_parts` applies the identical `managed_db_alias`), so
+        // the two always match. The long container NAME stays (it is identity, never resolved by a
+        // sibling once the short alias exists); a short/valid workload name is published unchanged.
         let network = self.ensure_project_network(&req.project).await?;
         host_config.network_mode = Some(network.clone());
         config.host_config = Some(host_config);
-        config.networking_config = Some(network_config(&network, vec![req.workload.clone()]));
+        config.networking_config = Some(network_config(
+            &network,
+            vec![managed_db_alias(&req.workload)],
+        ));
 
         // Best-effort clean of a stale container with the same name, then create.
         let _ = self
@@ -777,6 +798,8 @@ impl ComputeBackend for DockerBackend {
         // Reachable endpoint: the published host loopback port (default), or the
         // container's bridge IP + in-container port (`Bridge`).
         let (host, endpoint_port) = match self.endpoint {
+            // A no-port workload published nothing (see above) — no host port to discover.
+            DockerEndpoint::Published if port == 0 => ("127.0.0.1".to_string(), 0),
             DockerEndpoint::Published => (
                 "127.0.0.1".to_string(),
                 self.published_host_port(&created.id, &port_key).await?,
@@ -1794,6 +1817,40 @@ mod tests {
         let cfg = network_config("boatramp-net-acme", Vec::new());
         let ep = cfg.endpoints_config.get("boatramp-net-acme").unwrap();
         assert_eq!(ep.aliases, None);
+    }
+
+    /// Bug D (Docker 29 SD registration): the alias `launch` publishes for a workload MUST be a
+    /// valid DNS label (≤ 63 octets), or Docker 29's embedded DNS silently drops the record and a
+    /// sibling can never resolve it. This is a VERSION-INDEPENDENT guard at the emit site — it
+    /// fails on ANY host (no daemon needed), which the live gate on a Docker 28 box could not. A
+    /// short workload is published unchanged; a real `Single` managed-DB name (> 63 octets) is
+    /// shortened to a valid, stable label that `launch` attaches as the endpoint alias.
+    #[test]
+    fn launch_alias_is_always_a_valid_dns_label() {
+        use boatramp_core::compute::{DNS_LABEL_MAX_LEN, is_valid_dns_label};
+        // A short workload name is attached verbatim.
+        let short = managed_db_alias("web");
+        assert_eq!(short, "web");
+        assert!(is_valid_dns_label(&short));
+
+        // The real over-long `Single` managed-DB workload shape `<compute>-<ident>` (two 25-char
+        // digests ≈ 69 octets) — the alias `launch` would have published before the fix.
+        let h = "abcdefghijklmnopqrstuvwxy";
+        let workload = format!("bramp-db-{h}-mailroom_{h}");
+        assert!(
+            workload.len() > DNS_LABEL_MAX_LEN,
+            "fixture must reproduce the > 63-octet failure shape"
+        );
+        let alias = managed_db_alias(&workload);
+        assert!(
+            is_valid_dns_label(&alias) && alias.len() <= DNS_LABEL_MAX_LEN,
+            "launch must publish a DNS-valid alias, got {alias:?} ({} octets)",
+            alias.len()
+        );
+        // And `network_config` attaches exactly that alias for the endpoint.
+        let cfg = network_config("boatramp-net-mailroom", vec![alias.clone()]);
+        let ep = cfg.endpoints_config.get("boatramp-net-mailroom").unwrap();
+        assert_eq!(ep.aliases.as_deref(), Some([alias].as_slice()));
     }
 
     #[test]

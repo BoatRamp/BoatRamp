@@ -286,6 +286,117 @@ async fn docker_per_project_network_dns_and_cross_project_isolation() {
     );
 }
 
+/// The **long managed-DB workload SD** live gate (Bug D — Docker 29 RFC 1035 63-octet label cap).
+///
+/// The cross-project gate above launches a SHORT server workload (`db`), which registers an
+/// embedded-DNS service-discovery record on EVERY docker version — so it could never reproduce
+/// simertec's failure. A `Single`-isolation managed-DB workload is `bramp-db-<25>-<ident>_<25>`
+/// (≈ 69 octets); Docker 29.9.1's libnetwork refuses to publish an SD record for a label over 63
+/// octets (Docker 28 tolerated it, which is why the gate was green), so a sibling resolving the
+/// DB by that over-long name got NXDOMAIN and a managed-DB-bound workload crash-looped.
+///
+/// This launches a server under a RAW managed-DB-shaped name EXCEEDING 63 octets — exercising the
+/// real `launch()` path — and asserts a sibling resolves + connects to it by the SHORT
+/// [`managed_db_alias`](boatramp_core::compute::managed_db_alias) the fix publishes (the SAME short
+/// label a consumer's DSN host resolves). Version behavior: on Docker 28 it passes before and after
+/// the fix; on Docker 29.9.1 it FAILS before the fix (the > 63-octet alias never registers) and
+/// PASSES after (the short alias registers). It deliberately does NOT assert the raw long name
+/// fails to resolve — that is true only on 29.x, and the gate must stay green on the 28.x box too.
+///
+/// `#[ignore]` + env-gated; the capability gate greps the final marker, printed only after the
+/// assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   long_managed_db -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_resolves_long_managed_db_workload_by_short_alias() {
+    use boatramp_core::compute::{DNS_LABEL_MAX_LEN, is_valid_dns_label, managed_db_alias};
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+    let backend = DockerBackend::connect().expect("connect to docker");
+
+    async fn launch(
+        backend: &DockerBackend,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> boatramp_core::compute::Instance {
+        let artifact = backend
+            .materialize(project, workload, spec, None)
+            .await
+            .expect("materialize");
+        let req = LaunchRequest {
+            project: project.into(),
+            workload: workload.into(),
+            replica: 0,
+            spec: spec.clone(),
+            artifact,
+        };
+        backend.launch(&req).await.expect("launch")
+    }
+
+    // A RAW managed-DB-shaped server workload name OVER 63 octets (two 25-char digests), the exact
+    // shape that failed to register on Docker 29.9.1.
+    let h = "abcdefghijklmnopqrstuvwxy"; // 25 base-36 chars
+    let db_workload = format!("bramp-db-{h}-mailroom_{h}");
+    assert!(
+        db_workload.len() > DNS_LABEL_MAX_LEN,
+        "fixture must exceed the 63-octet DNS label cap (the bug): {} octets",
+        db_workload.len()
+    );
+    let alias = managed_db_alias(&db_workload);
+    assert!(
+        is_valid_dns_label(&alias) && alias.len() <= DNS_LABEL_MAX_LEN,
+        "the published alias must be a valid DNS label: {alias}"
+    );
+
+    // Launch the server under its RAW (> 63-octet) workload name + a short sibling client.
+    let db = launch(&backend, "longsd", &db_workload, &server_spec("LONGOK")).await;
+    let app = launch(&backend, "longsd", "app", &client_spec()).await;
+
+    // The sibling resolves + reads the server BY ITS SHORT ALIAS (what the fix publishes AND what a
+    // consumer's DSN host resolves) — NOT the > 63-octet workload name Docker 29 never registers.
+    // `nc <alias> 8080` exercises resolution + TCP connect; retry to absorb the listener's startup.
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "for i in $(seq 1 30); do R=$(nc -w3 {alias} 8080 </dev/null 2>/dev/null); \
+             if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+        ),
+    ];
+    let out = backend
+        .exec(&app.handle, &argv, None)
+        .await
+        .expect("exec nc by short alias");
+    assert_eq!(
+        out.exit_code, 0,
+        "app must resolve + reach the managed-DB server by its SHORT alias {alias} \
+         (the > 63-octet raw name {db_workload} is what Docker 29 refuses to register)"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "LONGOK",
+        "the sibling must read the server's body over the short alias"
+    );
+
+    for handle in [&app.handle, &db.handle] {
+        let _ = backend.stop(handle).await;
+    }
+    println!(
+        "DOCKER LONG MANAGED-DB SD OK: a {}-octet managed-DB workload resolved by its short alias \
+         {alias} (LONGOK) over the per-project network — the > 63-octet raw name is never used for \
+         resolution",
+        db_workload.len()
+    );
+}
+
 /// The **recreate-on-redeploy** live gate (Bug A). A redeploy that CHANGES a workload's
 /// spec must REPLACE the running container (stop + remove + relaunch), NOT restart the old
 /// one in place — otherwise `launch` (and, with it, the per-project-network attach) never
