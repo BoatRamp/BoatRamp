@@ -738,13 +738,30 @@ fn privsep_per_tenant_serves_end_to_end() {
             over the cross-namespace splice (Linux + `sandbox`); run via --include-ignored in the \
             `live gate (privsep)` job"]
 fn privsep_container_substrate_serves_end_to_end() {
-    let bin = env!("CARGO_BIN_EXE_boatramp");
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("boatramp-privsep-container-{}", std::process::id()));
-    let data_dir = tmp.join("data");
-    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let src_bin = env!("CARGO_BIN_EXE_boatramp");
+    let as_root = process_is_root();
+
+    // The node + EVERY instance now runs with ZERO capabilities (Finding 2), and the container
+    // substrate requires the node to be root. A capless root process is subject to normal DAC and
+    // holds no CAP_DAC_READ_SEARCH, so it cannot traverse an unprivileged user's `0700` home — which
+    // is exactly where this harness's build tree (and `CARGO_TARGET_TMPDIR`) lives on a dev box. In
+    // PRODUCTION a root node owns a world-traversable data dir (e.g. under `/var/lib`), so this is a
+    // gate artifact. Mirror production: stage the node tree (config, data dir, and a hardlink of the
+    // binary) under a world-traversable, root-owned base so the capless-root instances can reach it
+    // WITHOUT crossing the owner's home. (NOT under /tmp|/var/tmp|$TMPDIR — `derive_profile` refuses a
+    // data dir there.) The hardlink shares the built binary's inode (no multi-GB copy) and gives the
+    // instances a reachable `current_exe()` for the Landlock execute-pin + any re-exec.
+    let base = std::path::PathBuf::from(format!(
+        "/var/lib/boatramp-privsep-container-{}",
+        std::process::id()
+    ));
+    let node_bin = base.join("boatramp");
+    let data_dir = base.join("data");
+    let cfg_path = base.join("boatramp.cfg");
+    let tmp = base.clone();
+    stage_root_reachable_gate(src_bin, &base, &data_dir, &node_bin, as_root);
+    let bin = node_bin.to_str().expect("node bin path is utf-8");
     let port = free_port();
-    let cfg_path = tmp.join("boatramp.cfg");
 
     // The known-valid frontend-inversion topology (union == ALL; grants disjoint; no crown co-resident
     // with a listener/exec/control surface — so it clears every pre-supervise gate), with the one
@@ -799,7 +816,6 @@ fn privsep_container_substrate_serves_end_to_end() {
     // The container substrate unshares WITHOUT a user namespace ⇒ the node needs CAP_SYS_ADMIN. Run it
     // as root: directly if the harness is already root, else under passwordless `sudo -n` (keeping the
     // harness itself unprivileged). The node's unique config path is the teardown token.
-    let as_root = process_is_root();
     let mut cmd = if as_root {
         Command::new(bin)
     } else {
@@ -936,6 +952,53 @@ fn process_is_root() -> bool {
                 .and_then(|l| l.split_whitespace().nth(2).map(|u| u == "0"))
         })
         .unwrap_or(false)
+}
+
+/// Stage the container-gate node tree under a world-traversable, root-owned base so the
+/// capless-root instances (Finding 2 drops ALL caps) can reach the config/data/binary WITHOUT
+/// crossing the owner's `0700` home (where `CARGO_TARGET_TMPDIR` lives). Creates `<base>` +
+/// `<base>/data` mode 0777 (root-owned so the harness can still drop the config in and the
+/// capless-root node can create its state), and HARDLINKS the built binary to `<node_bin>` (same
+/// inode — no multi-GB copy; falls back to a copy across filesystems). Runs as root (directly when
+/// the harness is already root, else via `sudo -n`). Panics with the command output on failure — the
+/// gate cannot run without it. `/var/lib` is deliberately NOT under /tmp|/var/tmp|$TMPDIR (which
+/// `derive_profile` refuses for a data dir) and its ancestors are world-traversable.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn stage_root_reachable_gate(
+    src_bin: &str,
+    base: &std::path::Path,
+    data_dir: &std::path::Path,
+    node_bin: &std::path::Path,
+    as_root: bool,
+) {
+    let script = format!(
+        "set -e; install -d -m 0777 '{base}' '{data}'; \
+         (ln '{src}' '{node}' 2>/dev/null || cp '{src}' '{node}'); chmod 0755 '{node}'",
+        base = base.display(),
+        data = data_dir.display(),
+        src = src_bin,
+        node = node_bin.display(),
+    );
+    let mut cmd = if as_root {
+        Command::new("sh")
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg("sh");
+        c
+    };
+    let out = cmd
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run the container-gate staging command");
+    assert!(
+        out.status.success(),
+        "failed to stage the root-reachable container-gate base {} (is passwordless sudo + /var/lib \
+         available?):\nstdout: {}\nstderr: {}",
+        base.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
 /// Tear down the container-substrate node tree (root supervisor + every `__instance`) and remove its
