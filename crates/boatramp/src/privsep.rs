@@ -1167,7 +1167,9 @@ mod per_tenant {
         LinkEndpointRelay, PerTenantInstanceRegistry, TenantInstanceLink,
     };
 
-    use super::{InstanceSpawnSpec, InstanceSubstrate, PRIVSEP_FDS_ENV, PrivsepChildFds};
+    use super::{
+        HostAuthority, InstanceSpawnSpec, InstanceSubstrate, PRIVSEP_FDS_ENV, PrivsepChildFds,
+    };
 
     /// Set `FD_CLOEXEC` on `fd` so a per-tenant child the router fork+exec's never INHERITS it. The
     /// root-passed listener fd is NOT CLOEXEC (it survived the frontend's OWN exec), so without this
@@ -1219,17 +1221,42 @@ mod per_tenant {
     /// silent downgrade to an unconfined OS process. Linux-only (the CLONE_* flags are Linux); a
     /// Container spec on a non-Linux build is refused below rather than spawned unconfined (the live
     /// path is already Linux+`sandbox`-gated at [`super::run_privsep`] / [`super::run_instance`]).
+    ///
+    /// **Capability drop (Phase-3 Security re-review, Finding 2 — ALL instances).** When
+    /// `drop_privileges` is set AND the child is uid 0 (so it has caps to drop), the `pre_exec` drops
+    /// the FULL capability set so a served instance runs as uid 0 with ZERO capabilities — closing
+    /// the retained-root primitives seccomp/Landlock don't block (metadata ops on the un-pivoted host
+    /// mount table; `kill`/`tgkill` across the shared pid namespace). The BOOT caller passes
+    /// `drop_privileges = true` (its children fork from the unconfined root, so they hold the caps to
+    /// drop); the per-tenant router passes `false` (its children fork from the ALREADY-capless router
+    /// and inherit zero caps — re-dropping would `EPERM`). A non-root node self-skips via `geteuid`.
+    /// Done prctl-only (`SECBIT_NOROOT` + bounding-set drop + ambient clear) because `capset` is not
+    /// on the seccomp allow-list; a key-material instance's `RLIMIT_MEMLOCK` is raised first so its
+    /// best-effort key `mlock` still succeeds without `CAP_IPC_LOCK`.
     pub(super) fn spawn_wired_instance(
         current_exe: &Path,
         spec: &InstanceSpawnSpec,
         dups: Vec<(RawFd, RawFd)>,
         extra_env: &BTreeMap<String, String>,
+        drop_privileges: bool,
     ) -> std::io::Result<std::process::Child> {
         let mut cmd = spec.to_command(current_exe);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
         let container = matches!(spec.substrate, InstanceSubstrate::Container);
+        // Whether this instance mlocks key material (a crown jewel's sealing/signing key, or
+        // `listen.public-tls`'s live private cert key) — mirrors `boatramp_server::sandbox`'s own
+        // `holds_key_material`. Such an instance gets its RLIMIT_MEMLOCK raised before the cap drop so
+        // its best-effort mlock still succeeds without CAP_IPC_LOCK (Finding 2 caveat).
+        let holds_key_material = spec
+            .capabilities
+            .iter()
+            .any(|a| a.is_crown_jewel() || *a == HostAuthority::ListenPublicTls);
+        // The capability-drop + namespace blocks below are Linux-only; keep these inputs "used" on
+        // other targets so the OS-process path stays warning-clean everywhere.
+        #[cfg(not(target_os = "linux"))]
+        let _ = (drop_privileges, holds_key_material);
         // Fail CLOSED rather than spawn a Container instance unconfined on a build where we cannot
         // install the namespace wall (the CLONE_* flags are Linux-only). The live privsep path is
         // already Linux+`sandbox`-gated upstream, so this is a defensive backstop, never a real path.
@@ -1291,6 +1318,69 @@ mod per_tenant {
                 #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // Phase-3 Security re-review, Finding 2: DROP ALL CAPABILITIES so a served instance
+                // runs as uid 0 but with ZERO capabilities — closing the retained-root primitives
+                // that neither seccomp nor Landlock blocks (metadata ops — chmod/chown/utimensat — on
+                // the un-pivoted host mount table; kill/tgkill against host processes in the shared
+                // pid namespace). Applies to EVERY instance (OS-process + Container). Done only where
+                // we actually hold caps to drop: a root node's BOOT children fork from the UNCONFINED
+                // root (full caps) and drop here; a non-root node's children already have none
+                // (skipped via `geteuid`); a per-tenant child forked by the already-capless router
+                // inherits zero caps and is called with `drop_privileges == false` (attempting the
+                // drop would EPERM). Mechanism is prctl-ONLY — `capset` is NOT on the seccomp
+                // allow-list, so a per-tenant child's cap drop under the router's filter would EPERM
+                // and break cold-starts. `SECBIT_NOROOT` makes uid 0 gain NO caps at this execve, so
+                // for our non-file-caps binary P'(permitted)=P'(effective)=0; the bounding-set drop +
+                // ambient clear are belt-and-suspenders and give a clean `CapBnd`. Runs AFTER the
+                // container `unshare` (its sole CAP_SYS_ADMIN consumer) and AFTER raising
+                // RLIMIT_MEMLOCK for a key-material instance (so its best-effort mlock still locks the
+                // key without CAP_IPC_LOCK). The post-exec `/proc/<ppid>/ns` self-check still works
+                // (same-uid ptrace-read needs no cap). Setting `SECBIT_NOROOT` is load-bearing ⇒
+                // fail-closed on error; the bounding/ambient/rlimit ops are best-effort.
+                #[cfg(target_os = "linux")]
+                if drop_privileges && libc::geteuid() == 0 {
+                    if holds_key_material {
+                        // 16 MiB is ample for any realistic key set (keys are KBs) and bounds abuse.
+                        let lim = libc::rlimit {
+                            rlim_cur: 16 * 1024 * 1024,
+                            rlim_max: 16 * 1024 * 1024,
+                        };
+                        let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
+                    }
+                    // SECBIT_NOROOT (+ _LOCKED): uid 0 is no longer special at execve.
+                    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+                    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+                    if libc::prctl(
+                        libc::PR_SET_SECUREBITS,
+                        SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    ) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Empty the capability BOUNDING set (best-effort: high cap numbers EINVAL).
+                    let mut cap: libc::c_ulong = 0;
+                    while cap <= 63 {
+                        libc::prctl(
+                            libc::PR_CAPBSET_DROP,
+                            cap,
+                            0 as libc::c_ulong,
+                            0 as libc::c_ulong,
+                            0 as libc::c_ulong,
+                        );
+                        cap += 1;
+                    }
+                    // Clear the ambient set (ambient caps otherwise survive execve).
+                    libc::prctl(
+                        libc::PR_CAP_AMBIENT,
+                        libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    );
                 }
                 Ok(())
             });
@@ -1626,6 +1716,12 @@ mod per_tenant {
                 &self.template_spec,
                 vec![(back_fd, back_fd)],
                 &extra_env,
+                // The per-tenant router (the parent) has ALREADY dropped all capabilities at ITS own
+                // boot spawn, so this cold-start child inherits zero caps + a locked SECBIT_NOROOT.
+                // It must NOT re-attempt the drop: the capless child lacks CAP_SETPCAP, so the prctl
+                // would EPERM — and `capset` isn't on the router's seccomp allow-list anyway. Zero
+                // caps is already guaranteed by inheritance.
+                false,
             ) {
                 Ok(child) => child,
                 Err(e) => {
@@ -2029,6 +2125,10 @@ mod supervise {
                 spec,
                 wiring.dups.clone(),
                 &extra_env,
+                // Boot spawn: this child forks from the UNCONFINED root (full caps on a root node),
+                // so it drops ALL capabilities in its pre_exec (Finding 2). On a non-root node the
+                // child already has none and the drop self-skips via `geteuid`.
+                true,
             ) {
                 Ok(child) => {
                     tracing::info!(

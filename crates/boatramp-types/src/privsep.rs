@@ -1276,6 +1276,22 @@ pub enum CompositionViolation {
         /// template, while the composition defines at least one template).
         instance: String,
     },
+    /// A per-tenant TEMPLATE instance ([`InstanceLifecycle::PerTenantTemplate`]) also selects the
+    /// [`InstanceSubstrate::Container`] substrate (Phase-3 Security re-review, Finding 1). The
+    /// container substrate's `unshare` runs in the spawned child's `pre_exec`; a boot instance forks
+    /// from the UNCONFINED root so that is safe, but a per-tenant instance is cold-start-forked by the
+    /// per-tenant ROUTER, which has ALREADY installed its own seccomp filter — and that filter
+    /// hard-`SIGSYS`-KILLS `unshare` (only `execve`/`fork` are spared for an `exec.compute` holder).
+    /// `std::process::Command::spawn()` returns `Ok` for a `pre_exec` child killed by a signal (the
+    /// CLOEXEC error pipe merely EOFs), so the router would register a DEAD instance as live —
+    /// defeating `FailNodeClosed` and opening a tenant-wide DoS + corrupt registry. So the combination
+    /// is REFUSED fail-closed in the root, at config load, BEFORE any spawn, until the deferred
+    /// pid-ns-init container-worker model (which cold-starts differently) lands. `substrate: container`
+    /// on a STATIC (boot-forked) instance is unaffected.
+    PerTenantTemplateContainerUnsupported {
+        /// The offending per-tenant template instance label.
+        instance: String,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -1394,6 +1410,17 @@ impl std::fmt::Display for CompositionViolation {
                  per tenant); a shared, cross-tenant `exec.wasmtime` here would defeat the \
                  one-wasmtime-instance-per-tenant guarantee. Move `exec.wasmtime` onto a per-tenant \
                  template instance (lifecycle `per-tenant-template`)"
+            ),
+            Self::PerTenantTemplateContainerUnsupported { instance } => write!(
+                f,
+                "per-tenant template instance {instance:?} selects `substrate: container`, which is \
+                 not supported for a per-tenant template in this cut — the container `unshare` runs \
+                 in the cold-start child's pre_exec UNDER the per-tenant router's already-installed \
+                 seccomp (which SIGSYS-kills `unshare`), and a pre_exec signal-kill is invisible to \
+                 `spawn()`, so the router would register a dead instance as live (tenant-wide DoS, \
+                 defeating FailNodeClosed). Use `substrate: os-process` for the template, or keep \
+                 `container` only on static (boot-forked) instances, until the deferred pid-ns-init \
+                 container-worker model lands"
             ),
         }
     }
@@ -1586,6 +1613,20 @@ pub fn check_composition_closure(
                     holds_exec_wasmtime,
                     extra,
                 });
+            }
+
+            // Phase-3 Security re-review, Finding 1: a per-tenant template must NOT use the container
+            // substrate. Its cold-start `unshare` would run under the router's seccomp (which
+            // SIGSYS-kills `unshare`), and a pre_exec signal-kill is invisible to `spawn()`, so the
+            // router would register a dead instance as live (tenant-wide DoS, defeating
+            // FailNodeClosed). Refused fail-closed, in the root, before any spawn. (A STATIC instance
+            // forks from the unconfined root, so `substrate: container` there is unaffected.)
+            if inst.substrate == InstanceSubstrate::Container {
+                violations.push(
+                    CompositionViolation::PerTenantTemplateContainerUnsupported {
+                        instance: name.clone(),
+                    },
+                );
             }
         }
 
@@ -2965,6 +3006,40 @@ mod tests {
             report.warnings.is_empty(),
             "the valid template composition must raise no flags, got {:?}",
             report.warnings
+        );
+    }
+
+    #[test]
+    fn lint_rejects_per_tenant_template_with_container_substrate() {
+        // Phase-3 Security re-review, Finding 1: `lifecycle: per_tenant_template` + `substrate:
+        // container` must be refused fail-closed (the cold-start `unshare` would be SIGSYS-killed
+        // under the router's seccomp, and the signal-kill is invisible to `spawn()` ⇒ a dead
+        // instance registered live). The otherwise-identical composition with the template on
+        // `os-process` passes clean, proving the refusal is the substrate's.
+        let mut cfg = phase4_template_composition();
+        assert!(
+            check_composition_closure(&cfg).is_ok(),
+            "the template composition is clean on the default os-process substrate"
+        );
+        cfg.instances.get_mut("tenant-wasm").unwrap().substrate = InstanceSubstrate::Container;
+        assert!(
+            has_violation(&cfg, |v| matches!(
+                v,
+                CompositionViolation::PerTenantTemplateContainerUnsupported { instance }
+                    if instance == "tenant-wasm"
+            )),
+            "a per-tenant template on the container substrate must be refused fail-closed"
+        );
+        // A STATIC instance on the container substrate is UNAFFECTED (it boot-forks from the
+        // unconfined root): flipping `data` to container raises no PerTenantTemplate violation.
+        let mut ok = phase4_template_composition();
+        ok.instances.get_mut("data").unwrap().substrate = InstanceSubstrate::Container;
+        assert!(
+            !has_violation(&ok, |v| matches!(
+                v,
+                CompositionViolation::PerTenantTemplateContainerUnsupported { .. }
+            )),
+            "container on a static (boot-forked) instance must not trip the per-tenant refusal"
         );
     }
 

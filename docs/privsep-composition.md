@@ -242,11 +242,20 @@ instances: {
 A parser RCE on this `frontend` reaches no key, no backend credential, no control surface, and no
 `exec.compute` — it can only relay inward. The `substrate` grades the wall around it:
 
-- **`OsProcess`** (default, **wired today**) — a privilege-dropped process over the `local` socketpair;
+- **`OsProcess`** (default, **wired**) — a privilege-dropped process over the `local` socketpair;
   the separate address space + the fail-closed per-capability seccomp/Landlock profile is the wall, at
-  a flat ~7 µs per-request crossing (fd-pass). The right default for almost every node.
-- **`Container`** — namespace/cgroup confinement (reuses `boatramp-container`); a kernel-visible
-  boundary when the threat model excludes kernel-escape.
+  a flat ~7 µs per-request crossing (fd-pass). The right default for almost every node. The served
+  instance runs with zero Linux capabilities.
+- **`Container`** (**wired**, simple model) — the SAME fork+exec, the child additionally unsharing the
+  **mount, ipc, uts, and cgroup** namespaces in its `pre_exec` (no `pivot_root`; the per-capability
+  Landlock profile stays the filesystem wall). It adds those four namespaces and a zero-capability
+  served process; it does **NOT** add network isolation (net namespace SHARED, so a `backend.*`
+  instance keeps egress) nor pid isolation (pid namespace shared — a true pid namespace is a deferred
+  pid-ns-init increment). **Requires the node to run as root (`CAP_SYS_ADMIN` for the `unshare` — the
+  normal privsep posture; distinct from the listener-binding `CAP_NET_BIND_SERVICE`, which the root
+  does), and is NOT supported for a `lifecycle: per_tenant_template` instance** (refused fail-closed at
+  config load — a per-tenant cold-start forks under the router's seccomp, which kills `unshare`; use
+  `os-process` for templates).
 - **`Vm`** — a hardware-virtualized microVM with its own kernel (reuses `boatramp-firecracker` /
   `boatramp-vz`); survives a guest-kernel RCE. Reserve it for high-threat multi-tenant frontends whose
   latency budget absorbs the hypervisor crossing + VM boot.
@@ -254,10 +263,10 @@ A parser RCE on this `frontend` reaches no key, no backend credential, no contro
 Pick from REAL numbers, not estimates: the measured `local`-shape crossing cost across all four
 substrates, plus the re-run recipe, is in **`docs/privsep-substrate-benchmark.md`**.
 
-**Phase-3 foundation scope:** only `OsProcess` is a wired spawn backend today. `Container`/`Vm` parse
-and lint as valid vocabulary, but the supervisor **refuses them fail-closed** (naming the compute-plane
-backend each reuses) rather than silently downgrading to an OS process — a silent downgrade would
-discard the operator's chosen wall. Their spawn-backend wiring is a reported follow-on.
+**Scope:** `OsProcess` and `Container` are wired spawn backends. `Vm` parses and lints as valid
+vocabulary, but the supervisor **refuses it fail-closed** (a VM has its own kernel, so the `local`
+socketpair cannot cross — it needs a vsock re-plumb) rather than silently downgrading to an OS
+process. Its spawn-backend wiring is a reported follow-on.
 
 ## 8. Checklist
 
@@ -273,6 +282,7 @@ discard the operator's chosen wall. Their spawn-backend wiring is a reported fol
 - [ ] Each link's `purpose` is correct — `Relay` for a serving splice, `AuthorityServe` only on a
       crown↔non-crown link (and the live serve still needs the PoP verifier; the marker alone is inert).
 - [ ] Each instance's `substrate` matches its threat model + latency budget (default `OsProcess`;
-      `Container`/`Vm` are a reported follow-on) — see `docs/privsep-substrate-benchmark.md`.
+      `Container` wired — root-only, static instances only, mount/ipc/uts/cgroup isolation but NOT
+      net/pid; `Vm` a reported follow-on) — see `docs/privsep-substrate-benchmark.md`.
 </content>
 </invoke>

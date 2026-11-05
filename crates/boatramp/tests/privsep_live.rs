@@ -848,6 +848,12 @@ fn privsep_container_substrate_serves_end_to_end() {
         }
     };
 
+    // Finding 2 PROBE: while the node is still alive, read the container core's capability sets from
+    // /proc to confirm the pre_exec capability drop took effect — a served instance must hold ZERO
+    // capabilities (⇒ definitely no CAP_SYS_ADMIN), closing the retained-root metadata-tamper / kill
+    // primitives. The core runs as root (the node is root), so the probe reads /proc as root.
+    let core_caps = read_container_core_caps(&cfg_path, as_root);
+
     teardown_container_gate(&cfg_path, &mut root, &tmp, as_root);
 
     assert!(
@@ -861,9 +867,59 @@ fn privsep_container_substrate_serves_end_to_end() {
          unshared namespaces), got:\n{response}"
     );
 
+    // Finding 2 assertion: the served container core holds ZERO capabilities (CapEff/CapPrm/CapBnd
+    // all 0). Zero effective/permitted caps ⇒ no CAP_SYS_ADMIN and none of the retained-root
+    // primitives; a clean bounding set means no execve can regain one.
+    assert!(
+        core_caps.contains("PID="),
+        "could not locate the container `core` process to probe its capabilities (Finding 2); \
+         got:\n{core_caps}"
+    );
+    for field in ["CapEff:", "CapPrm:", "CapBnd:"] {
+        let val = core_caps
+            .lines()
+            .find(|l| l.starts_with(field))
+            .and_then(|l| l.split_whitespace().last())
+            .unwrap_or("<missing>");
+        assert_eq!(
+            val, "0000000000000000",
+            "served container core must hold ZERO {field} capabilities (Finding 2 cap drop) — a \
+             non-zero value means it retained uid-0 caps (metadata-tamper / kill primitives); \
+             got:\n{core_caps}"
+        );
+    }
+
     // The marker the CI gate greps — reached only after a real 200 came back over the full path to a
-    // container-substrate instance that self-confirmed its fresh namespaces (else FailNodeClosed).
+    // container-substrate instance that self-confirmed its fresh namespaces (else FailNodeClosed)
+    // AND was probed to hold zero capabilities.
     println!("PRIVSEP CONTAINER SUBSTRATE OK");
+}
+
+/// Read the container `core` instance's capability sets (CapEff/CapPrm/CapBnd) from `/proc`, for the
+/// Finding-2 zero-caps probe. Finds the process whose cmdline is `... __instance core --config
+/// <cfg_path>` (unique to this gate's node) and prints its `PID=` + `Cap*:` lines. The node runs as
+/// root, so the scan runs as root (directly when the harness is root, else via `sudo -n`).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn read_container_core_caps(cfg_path: &std::path::Path, as_root: bool) -> String {
+    let token = format!("__instance core --config {}", cfg_path.display());
+    // Scan /proc, NUL-translate each cmdline, match our unique token, emit PID + Cap* lines.
+    let script = format!(
+        "for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null); \
+         case \"$c\" in *'{token}'*) echo \"PID=${{p##*/}}\"; \
+         grep -E '^Cap(Inh|Prm|Eff|Bnd):' \"$p/status\" 2>/dev/null; break;; esac; done"
+    );
+    let mut cmd = if as_root {
+        Command::new("sh")
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n").arg("sh");
+        c
+    };
+    cmd.arg("-c").arg(&script);
+    match cmd.output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => format!("(capability probe failed to run: {e})"),
+    }
 }
 
 /// Whether THIS test process is running with effective uid 0 (read from `/proc/self/status`, so no

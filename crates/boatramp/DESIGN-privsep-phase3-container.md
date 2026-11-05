@@ -348,12 +348,18 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
 
 ### 8.2 FLAGS for the Security review
 
-1. **Root / `CAP_SYS_ADMIN` requirement (NEW operational precondition).** The simple model unshares
+1. **Root / `CAP_SYS_ADMIN` requirement (operational precondition).** The simple model unshares
    WITHOUT a user namespace, so the root supervisor needs `CAP_SYS_ADMIN` for the `unshare` to
-   succeed. This is the normal privsep posture (the root binds privileged listeners), but it is now a
+   succeed. This is the normal privsep posture (the root binds privileged listeners), but it is a
    HARD precondition for `substrate: container`: on a node lacking it, the container instance
    fail-closes (correct, but operationally it means container substrate is root-only until a userns
-   increment lands). The live gate runs the node under `sudo -n` to obtain it.
+   increment lands). The live gate runs the node under `sudo -n` to obtain it. **Clarification (Sec
+   re-review Finding 5):** `CAP_SYS_ADMIN` here is the `unshare` capability, which is NOT the
+   listener-binding capability — binding the privileged public listener needs `CAP_NET_BIND_SERVICE`
+   and is done by the ROOT supervisor, never the instance. And the served instance itself now holds
+   NEITHER (Finding 2 drops ALL capabilities post-`unshare`): `CAP_SYS_ADMIN` is consumed by the
+   `unshare` in `pre_exec` and then dropped before the re-exec, so the serving instance runs uid 0
+   with zero caps.
 2. **`CLONE_NEWPID` DROPPED (empirical — the live gate caught it).** The first cut included
    `CLONE_NEWPID` as instructed, but the live gate showed the Container `core` self-confirmed its
    namespaces and installed its Enforced sandbox, then **panicked at tokio runtime startup**:
@@ -374,25 +380,78 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
    SCM_RIGHTS splice hands it still works. Net isolation is therefore NOT provided by this cut; if it
    is ever added it must be opt-in and off by default (and it needs the veth/egress story in the
    egress corner above). Flagged as the main containment gap vs. a full container.
-4. **Mount-namespace / Landlock interaction.** With `CLONE_NEWNS` but no `pivot_root` and no remount,
-   the instance gets a copy of the host mount table; it mounts nothing (seccomp kills `mount`), and
-   Landlock paths resolve identically. The live gate validates that the nested Landlock profile still
-   reaches `Enforced` inside the unshared mount namespace. No propagation hardening (e.g. recursively
-   `MS_PRIVATE`) is done — not needed for additive isolation, but noted.
+4. **Mount-namespace / Landlock interaction + the `MS_PRIVATE` tripwire (Sec re-review Finding 5).**
+   With `CLONE_NEWNS` but no `pivot_root` and no remount, the instance gets a COPY of the host mount
+   table; it mounts nothing (seccomp kills `mount`), and Landlock paths resolve identically. The live
+   gate validates that the nested Landlock profile still reaches `Enforced` inside the unshared mount
+   namespace. No propagation hardening (recursively `MS_PRIVATE`) is done — and this is **safe ONLY
+   because `mount` is seccomp-killed**: a confined instance cannot mount, so shared mount propagation
+   is inert. **TRIPWIRE:** if a future increment ever un-kills `mount` (e.g. an Option-A/B rootfs model
+   that needs to set up its own mounts), a recursive `MS_PRIVATE` remount of `/` in the new mount
+   namespace becomes MANDATORY first, or a mount in the instance could propagate back to the host.
+   Also note Landlock does NOT gate file METADATA operations (chmod/chown/utimensat); that gap — a
+   uid-0 instance tampering with the host FS metadata — is NOT closed by Landlock but by the Finding-2
+   capability drop (a zero-cap uid-0 process is subject to normal DAC and holds no `CAP_FOWNER`/
+   `CAP_DAC_*`). (Correcting the §3/§5b phrasing: "Landlock is the FS wall" means the Landlock wall
+   plus the cap drop; and the "existing privilege drop" §5b referenced did not exist until Finding 2
+   added it.)
 5. **Self-check reads `/proc/<ppid>/ns/*`.** Needs ptrace-read (same-uid) access to the parent; holds
-   because both run as the root supervisor's uid at that point (before the instance's sandbox drop).
-   If a future increment adds a userns/uid remap, revisit this read.
-6. **`per_tenant` + container interaction NOT exercised.** A `PerTenantTemplate` pinned
-   `substrate: container` would fork per-tenant children from inside the unshared namespaces via the
-   same `spawn_wired_instance`; the pid-ns semantic (#2) means those children WOULD get the new pid
-   namespace. Not tested in this cut (the gate uses a static `core`); flagged as a follow-on to
-   validate explicitly.
+   because both run as the root supervisor's uid at that point, and same-uid ptrace-read needs no
+   capability (so it survives the Finding-2 cap drop). If a future increment adds a userns/uid remap,
+   revisit this read.
+6. **`per_tenant` + container now REFUSED fail-closed (Sec re-review Finding 1).** A `PerTenantTemplate`
+   pinned `substrate: container` is now rejected by the composition-closure lint at config load, in
+   the root, before any spawn (`CompositionViolation::PerTenantTemplateContainerUnsupported`). The
+   reason: a per-tenant cold-start is forked by the per-tenant ROUTER, whose seccomp has ALREADY been
+   installed and hard-`SIGSYS`-kills `unshare`; a `pre_exec` signal-kill is invisible to `spawn()`
+   (the CLOEXEC pipe EOFs, `spawn()` returns `Ok`), so the router would register a DEAD instance as
+   live — tenant-wide DoS + corrupt registry, defeating `FailNodeClosed`. (Correction to the earlier
+   draft of this flag: with `CLONE_NEWPID` DROPPED (#2), such children would NOT get a new pid
+   namespace — but the `unshare` SIGSYS-kill makes the combination unusable regardless, hence the hard
+   gate.) `substrate: container` on a STATIC (boot-forked, from the unconfined root) instance is
+   unaffected. Re-enabling per-tenant container needs the deferred pid-ns-init worker model.
 
 ### 8.3 Tests + gate
 
 - Unit: `resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm` (boatramp) +
   `instance_substrate_defaults_to_os_process_and_round_trips_through_ron` (boatramp-types) assert
   `is_wired(Container)==true`, `is_wired(OsProcess)==true`, `is_wired(Vm)==false`, and the Vm refusal.
-- Live gate: `privsep_container_substrate_serves_end_to_end` (was the fail-closed-refusal gate,
-  inverted per the original §7 note) — serves a real 200 from a `substrate: container` `core`; marker
-  `PRIVSEP CONTAINER SUBSTRATE OK`. CI `live-gate-privsep` grep + pass-count updated.
+- Unit (Finding 1): `lint_rejects_per_tenant_template_with_container_substrate` (boatramp-types)
+  asserts a `per_tenant_template` + `container` composition is refused
+  (`PerTenantTemplateContainerUnsupported`), while the same composition on `os-process` passes clean
+  and `container` on a static instance does NOT trip it.
+- Live gate: `privsep_container_substrate_serves_end_to_end` — serves a real 200 from a
+  `substrate: container` `core`; marker `PRIVSEP CONTAINER SUBSTRATE OK`. Finding-2 PROBE: while the
+  node is alive it reads the container `core`'s `/proc/<pid>/status` CapEff/CapPrm/CapBnd (via `sudo`,
+  since the node is root) and asserts all three are `0000000000000000` (zero caps ⇒ no CAP_SYS_ADMIN).
+  CI `live-gate-privsep` grep + pass-count updated.
+
+### 8.4 Security re-review (SHIP-WITH-FIXES) — applied
+
+The re-review found the boot-forked path sound/additive/fail-closed and `OsProcess` byte-identical,
+and asked for five fixes, all applied here:
+
+- **Finding 1 (HIGH)** — per-tenant-template + container is now a hard composition-closure refusal
+  (see §8.2 #6). `unshare` is confirmed in `sandbox::KILL_SURFACE` (SIGSYS-killed) and NOT spared for
+  `exec.compute`, so the router would indeed SIGSYS-kill a per-tenant cold-start's `unshare`, and the
+  signal-kill would be invisible to `spawn()`.
+- **Finding 2 (MED)** — every served instance (OS-process AND container) now drops the FULL capability
+  set in `pre_exec` so it runs uid 0 with ZERO caps, closing the uid-0 metadata-tamper (chmod/chown on
+  the un-pivoted host FS) and kill/tgkill primitives. Done prctl-only (`SECBIT_NOROOT` + bounding-set
+  drop + ambient clear) — `capset` is NOT on the seccomp allow-list, so using it would EPERM under the
+  per-tenant router's filter and break OS-process cold-starts. BOOT children (forked from the
+  unconfined root) do the drop; per-tenant children inherit zero caps from the already-capless router
+  (`drop_privileges=false`); a non-root node self-skips via `geteuid`. A key-material instance
+  (`holds_key_material`: crown jewel or `listen.public-tls`) has its `RLIMIT_MEMLOCK` raised first so
+  its best-effort key `mlock` still succeeds without `CAP_IPC_LOCK` (`mlock` is already best-effort —
+  `keyguard.rs` logs + continues on failure — so this preserves the lock rather than being a hard
+  dependency). CAVEAT for the reviewer: the live signer/sealer gate runs NON-root (jwk), so it does
+  not exercise the cap-drop+mlock interaction; the container gate (root) is probed to serve + hold
+  zero caps, and a key-holding `core` is in it. A dedicated root signer-gate that materializes a key
+  under the cap drop is a worthwhile follow-on.
+- **Findings 3/4/5 (doc)** — (3) §8.2 #6 corrected (NEWPID is dropped, so no per-tenant child "would
+  get a new pid namespace"; folded into the Finding-1 gate). (4) operator-facing config docs updated
+  (`docs/privsep-substrate-benchmark.md` §4/§6 + `docs/privsep-composition.md` §7 + the
+  `InstanceSubstrate` rustdoc) stating Container adds mount/ipc/uts/cgroup isolation ONLY — NO network,
+  NO pid. (5) the `MS_PRIVATE` tripwire recorded (§8.2 #4), and the §3/§5b "privilege drop" / "Landlock
+  is the FS wall" / CAP_SYS_ADMIN-vs-bind wording corrected (§8.2 #1 and #4).

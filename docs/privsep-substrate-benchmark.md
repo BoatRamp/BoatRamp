@@ -78,10 +78,24 @@ from the node's threat model and the serving latency budget, in that order:
   seccomp/Landlock profile already contain a frontend RCE from reaching any key/backend/control
   authority — at ~7 µs flat (fd-pass) it is free on the hot path. The right default for almost every
   node, and the only substrate the Phase-3 foundation cut spawns.
-- **`Container`.** Add namespace/cgroup confinement when the threat model wants a kernel-visible
-  boundary (resource caps, a scoped mount/net view) but excludes kernel-escape. The steady-state
-  crossing is essentially unchanged from `OsProcess`; the cost is operational (image/runtime), not
-  per-request. *(Spawn backend is a follow-on — see §6.)*
+- **`Container` (WIRED, simple model).** Add namespace/cgroup confinement on top of `OsProcess`. The
+  root does the SAME fork+exec, with the child additionally unsharing the **mount, ipc, uts, and
+  cgroup** namespaces in its `pre_exec` (no `pivot_root`; the per-capability Landlock profile stays the
+  filesystem wall). The steady-state crossing is unchanged from `OsProcess`; the isolation is additive.
+  **What it does and does NOT add — know this before choosing it:**
+  - Adds: a private mount namespace (a copy of the host mount table — the instance can't affect host
+    mounts), and private ipc/uts/cgroup namespaces. The served instance also runs with **zero Linux
+    capabilities** (uid 0 but no caps), closing uid-0 metadata/kill primitives seccomp/Landlock miss.
+  - Does **NOT** add: **network isolation** (the net namespace is deliberately SHARED, so a `backend.*`
+    instance keeps its egress to Postgres/KV/blob), nor **pid isolation** (the pid namespace is shared
+    in this cut — a true pid namespace needs a pid-ns-init fork model, a deferred increment).
+  - **Requires the node to run as root (`CAP_SYS_ADMIN`)** — the normal privsep posture (the root
+    binds privileged listeners). On a node without it, a container instance fail-closes (no silent
+    downgrade). `CAP_SYS_ADMIN` here is the `unshare` cap, NOT the listener-binding cap
+    (`CAP_NET_BIND_SERVICE`, exercised by the root only).
+  - **Not supported for a `lifecycle: per_tenant_template` instance** (refused fail-closed at config
+    load): a per-tenant cold-start forks under the router's seccomp, which kills `unshare`. Use
+    `os-process` for templates; `container` is for static (boot-forked) instances.
 - **`Vm` (firecracker / VZ).** A hardware wall that survives even a guest-kernel RCE. Reserve it for
   **high-threat multi-tenant** frontends whose latency budget can absorb ~4–5× the per-request crossing
   (hundreds of µs at image sizes) and the ~121 ms boot. Not a blanket choice (program caveat 4 — the
@@ -119,12 +133,14 @@ that fails to boot) reports `vsock-firecracker` as N/A with the reason rather th
 
 ## 6. Status — what is wired vs. a reported follow-on
 
-- **WIRED (Phase-3 foundation):** the `substrate` config vocabulary + lint + the supervisor's
-  spawn-backend dispatch seam; **`OsProcess`** is the fully-wired backend (the root's fork+exec over the
-  `local` socketpair). The benchmark compiles everywhere and runs live on lighthouse.
-- **Follow-on (DECOMPOSED):** the `Container` and `Vm` spawn backends reuse the existing
-  `boatramp-container` and `boatramp-firecracker` / `boatramp-vz` compute-plane backends. Until that
-  wiring lands, the supervisor **refuses** a `Container`/`Vm` instance fail-closed (naming the backend
-  it reuses) rather than silently downgrading to an OS process — a silent downgrade would discard the
-  operator's chosen wall. The crossing numbers above are what justify prioritizing that wiring for the
-  nodes that need the stronger wall.
+- **WIRED:** **`OsProcess`** (the root's fork+exec over the `local` socketpair) and **`Container`**
+  (Phase-3 simple model: the same fork+exec, the child unsharing mount/ipc/uts/cgroup namespaces in
+  its `pre_exec`, no `pivot_root`, no net/pid/user namespace; see §4 for exactly what it adds + the
+  root/`CAP_SYS_ADMIN` requirement and the per-tenant-template restriction). Both served instances run
+  with zero Linux capabilities. The benchmark compiles everywhere and runs live on lighthouse.
+- **Follow-on:** the **`Vm`** spawn backend reuses the `boatramp-firecracker` / `boatramp-vz`
+  compute-plane backends. A VM has its own kernel, so the `local` socketpair cannot cross (unlike
+  Container, which shares the kernel) — it needs a vsock re-plumb of the whole link transport. Until
+  that lands, the supervisor **refuses** a `Vm` instance fail-closed (naming the backend it reuses)
+  rather than silently downgrading to an OS process. A deferred **pid-ns-init** container increment
+  would add true pid-namespace isolation (and re-enable `container` for per-tenant templates).
