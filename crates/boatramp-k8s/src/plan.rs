@@ -74,6 +74,57 @@ pub const CONSUMER_VALUE: &str = "true";
 /// rootless DB uid:gid before the server starts.
 pub const PGDATA_SUBPATH: &str = "pgdata";
 
+/// Where the pre-flight guard ([`pgdata_preflight_init_container`]) mounts the data PVC's
+/// **ROOT** (no `subPath`), so it can see the root-level entries the server/chown mounts
+/// (bound to the [`PGDATA_SUBPATH`]) cannot. A fixed constant — never a spec-derived value —
+/// so the guard's shell script interpolates no caller input (cap-req #28 review, F4 / F5).
+pub const PGDATA_PVC_ROOT_MOUNT: &str = "/boatramp-pvc-root";
+
+/// The pre-flight data-stranding guard script (cap-req #28 review, F4). Run in an init
+/// container that mounts the data PVC's ROOT at [`PGDATA_PVC_ROOT_MOUNT`], BEFORE the
+/// chown init and the server container (which mount the [`PGDATA_SUBPATH`]).
+///
+/// # Why
+///
+/// The subPath fix (defect A) moved a managed DB's data from the PVC mount ROOT into a
+/// `pgdata` subdirectory. A database provisioned by a PRE-fix build (<= v0.55.0) wrote its
+/// `PGDATA` directly at the PVC ROOT. On upgrade, the server now mounts the empty `pgdata`
+/// subPath, `initdb` runs fresh, and the app SILENTLY sees an empty database while the old
+/// data is stranded (recoverable, but invisible). This guard turns that silent data loss
+/// into a LOUD, actionable refusal.
+///
+/// # Logic (pure constants — no interpolation)
+///
+/// - `pgdata` subdir already exists => already on the subPath layout (migrated, or the
+///   kubelet created it on a prior boot) => proceed.
+/// - Otherwise, if the PVC root holds anything beyond the ext4 `lost+found` => PRE-fix data
+///   is stranded at the root => REFUSE with migration guidance (a non-zero exit fails the
+///   init container, so the pod never reaches `initdb`).
+/// - Otherwise (empty, or only `lost+found`) => a fresh ext4 volume => proceed (the chown
+///   init / server then create + init the empty `pgdata`).
+const PGDATA_PREFLIGHT_SCRIPT: &str = r#"set -eu
+ROOT=/boatramp-pvc-root
+if [ -d "$ROOT/pgdata" ]; then
+  exit 0
+fi
+remaining=$(ls -A "$ROOT" 2>/dev/null | grep -vx 'lost+found' | grep -vx 'pgdata' || true)
+if [ -z "$remaining" ]; then
+  exit 0
+fi
+echo "boatramp: REFUSING to start the managed database (cap-req #28 defect A migration)." >&2
+echo "The data volume ROOT is non-empty but has no 'pgdata' subdirectory:" >&2
+echo "$remaining" | sed 's/^/  - /' >&2
+echo "" >&2
+echo "Data provisioned by boatramp <= v0.55.0 lives at the PVC ROOT, while this version keeps" >&2
+echo "PGDATA under the 'pgdata' subPath. Starting now would run initdb on an empty 'pgdata' and" >&2
+echo "STRAND the existing data at the root (recoverable, but the app would see an empty DB)." >&2
+echo "" >&2
+echo "To migrate: mount this PVC (e.g. a maintenance pod), move its root PGDATA contents into a" >&2
+echo "new 'pgdata/' subdirectory (keep 'lost+found' at the root), then restart the database." >&2
+echo "See the v0.57.0 release notes (cap-req #28 defect A)." >&2
+exit 1
+"#;
+
 /// Why building the resource plan failed (pure, no I/O).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
@@ -336,8 +387,16 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     // container starts — the k8s-native equivalent of the docker backend's host-side
     // pre-chown (`boatramp-docker` chowns the bind dir for the same reason). One-shot,
     // drops every capability except the three `chown -R` needs, and exits. In `caps` mode
-    // (no `user`; the entrypoint runs as root and chowns itself) no init container is added.
-    let init_containers = chown_init_container(spec, &image, volume).map(|c| vec![c]);
+    // (no `user`; the entrypoint runs as root and chowns itself) no chown init is added.
+    //
+    // The pre-flight data-stranding guard (cap-req #28 review, F4) runs FIRST, before the
+    // chown init and the server, for EVERY managed DB: it refuses-with-guidance when the PVC
+    // ROOT carries PRE-fix (<= v0.55.0) data that the defect-A subPath move would otherwise
+    // silently re-`initdb` and strand. Order matters — it must inspect the root before the
+    // chown/server mounts (bound to the `pgdata` subPath) make the kubelet create that subdir.
+    let mut init = vec![pgdata_preflight_init_container(&image, volume)];
+    init.extend(chown_init_container(spec, &image, volume));
+    let init_containers = Some(init);
 
     let pod_volume = Volume {
         name: volume.name.clone(),
@@ -711,6 +770,57 @@ fn is_safe_mount_path(p: &str) -> bool {
     }
     p.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+}
+
+/// A one-shot **pre-flight guard** init container (cap-req #28 review, F4) that REFUSES to
+/// start a managed DB whose data would be silently re-`initdb`'d and stranded by the defect-A
+/// subPath migration. It mounts the data PVC's ROOT (at [`PGDATA_PVC_ROOT_MOUNT`], NOT the
+/// [`PGDATA_SUBPATH`] the server/chown use) so it can inspect the root-level layout, and runs
+/// [`PGDATA_PREFLIGHT_SCRIPT`]: it proceeds for a fresh volume (empty / only `lost+found`) or
+/// one already on the subPath layout (a `pgdata` subdir present), and fails LOUDLY — with
+/// migration guidance — when the root holds PRE-fix (<= v0.55.0) data (non-empty beyond
+/// `lost+found`, no `pgdata` subdir).
+///
+/// Added for EVERY managed DB (rootless AND `caps` mode), because the subPath change strands
+/// root data regardless of the chown path. Runs BEFORE the chown init + server, as the first
+/// init container. It is read-only (the script only lists + tests), so it runs as root with
+/// ALL capabilities dropped and no privilege escalation; the script interpolates only
+/// compile-time constants (no spec-derived value), so the `sh -c` form carries no injection
+/// surface (the chown init's F5 exec-form concern does not apply here).
+fn pgdata_preflight_init_container(image: &str, volume: &VolumeRef) -> Container {
+    Container {
+        name: "pgdata-preflight".to_string(),
+        image: Some(image.to_string()),
+        // `sh -c` over a FIXED, constants-only script (see [`PGDATA_PREFLIGHT_SCRIPT`] / the
+        // [`PGDATA_PVC_ROOT_MOUNT`] doc) — no caller input reaches the shell.
+        command: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            PGDATA_PREFLIGHT_SCRIPT.to_string(),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: volume.name.clone(),
+            // Mount the PVC ROOT (no `subPath`), so the guard sees the root-level `lost+found`
+            // / stranded pre-fix data the server + chown mounts (bound to `pgdata`) never see.
+            mount_path: PGDATA_PVC_ROOT_MOUNT.to_string(),
+            ..Default::default()
+        }]),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            allow_privilege_escalation: Some(false),
+            // Read-only inspection — no added capabilities.
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// A one-shot **root** init container that `chown -R`'s the mounted data volume to the
@@ -1602,12 +1712,13 @@ mod tests {
         spec.user = Some("999:999".to_string());
         let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
         let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        // The chown init is no longer index 0 — the pre-flight guard (cap-req #28 review F4)
+        // runs first — so find it by name.
         let init = pod
             .init_containers
             .as_ref()
-            .and_then(|v| v.first())
+            .and_then(|v| v.iter().find(|c| c.name == "chown-data"))
             .expect("rootless managed DB gets a chown init container");
-        assert_eq!(init.name, "chown-data");
         let cmd = init.command.as_ref().unwrap().join(" ");
         assert!(
             cmd.contains("chown -R 999:999 /var/lib/postgresql/data"),
@@ -1674,7 +1785,7 @@ mod tests {
         let init = pod
             .init_containers
             .as_ref()
-            .and_then(|v| v.first())
+            .and_then(|v| v.iter().find(|c| c.name == "chown-data"))
             .expect("rootless managed DB gets a chown init container");
         let init_mount = &init.volume_mounts.as_ref().unwrap()[0];
         assert_eq!(
@@ -1692,19 +1803,110 @@ mod tests {
 
     #[test]
     fn caps_mode_managed_db_has_no_chown_init_container() {
-        // In `caps` mode (no rootless user) the root entrypoint chowns itself — no init.
+        // In `caps` mode (no rootless user) the root entrypoint chowns itself — no CHOWN init.
+        // The pre-flight data-stranding guard (cap-req #28 review F4) is still present though:
+        // the subPath migration strands root data regardless of the chown path, so the guard
+        // runs for every managed DB.
         let spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
         let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let inits = plan
+            .stateful_set
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .init_containers
+            .expect("the pre-flight guard is present even in caps mode");
         assert!(
-            plan.stateful_set
-                .spec
-                .unwrap()
-                .template
-                .spec
-                .unwrap()
-                .init_containers
-                .is_none(),
+            !inits.iter().any(|c| c.name == "chown-data"),
             "no rootless user ⇒ no chown init container"
+        );
+        assert!(
+            inits.iter().any(|c| c.name == "pgdata-preflight"),
+            "the pre-flight data-stranding guard runs for every managed DB"
+        );
+    }
+
+    #[test]
+    fn pgdata_preflight_guard_runs_first_mounts_the_pvc_root_and_refuses_stranding() {
+        // cap-req #28 review, F4: the defect-A subPath move strands a PRE-fix (<= v0.55.0)
+        // managed DB whose data is at the PVC ROOT — on upgrade the empty `pgdata` subPath is
+        // mounted, initdb runs fresh, and the app silently sees an empty DB. The pre-flight
+        // guard turns that into a loud refusal. This locks in its structure: it is the FIRST
+        // init container (runs before the chown init + server, which mount the `pgdata`
+        // subPath), it mounts the PVC ROOT (NO subPath — so it can SEE the root layout the
+        // other mounts hide), it is read-only (root, ALL caps dropped), and its script detects
+        // the stranded-root case (non-empty beyond `lost+found`, no `pgdata` subdir) and exits
+        // non-zero, while treating a fresh volume (empty / only `lost+found`) and an
+        // already-migrated one (a `pgdata` subdir present) as OK.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.user = Some("999:999".to_string()); // rootless ⇒ a chown init exists too
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        let inits = pod
+            .init_containers
+            .as_ref()
+            .expect("init containers present");
+
+        // Ordering: the guard MUST be index 0 (before chown + server).
+        assert_eq!(
+            inits[0].name, "pgdata-preflight",
+            "the guard must be the FIRST init container"
+        );
+        let guard = &inits[0];
+
+        // It mounts the PVC ROOT — the SAME volume as the data mount, but with NO subPath, so
+        // it sees the root-level `lost+found` / stranded data the server/chown mounts cannot.
+        let gm = &guard.volume_mounts.as_ref().unwrap()[0];
+        assert_eq!(gm.name, "data", "the guard mounts the data PVC");
+        assert_eq!(gm.mount_path, PGDATA_PVC_ROOT_MOUNT);
+        assert_eq!(
+            gm.sub_path, None,
+            "the guard must mount the PVC ROOT (no subPath), unlike the server/chown mounts"
+        );
+
+        // Read-only inspection: root, no privilege escalation, ALL caps dropped, no caps added.
+        let sc = guard.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_user, Some(0));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        let caps = sc.capabilities.as_ref().unwrap();
+        assert_eq!(caps.drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        assert!(
+            caps.add.as_deref().map(<[_]>::is_empty).unwrap_or(true),
+            "the read-only guard needs no added capabilities"
+        );
+
+        // The detection logic + the loud, actionable refusal live in the script.
+        let cmd = guard.command.as_ref().unwrap();
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        let script = &cmd[2];
+        // How it detects the stranded-root case: a `pgdata` subdir is the "already migrated"
+        // escape; `lost+found` (and `pgdata`) are excluded so a fresh ext4 volume passes;
+        // anything else remaining at the root ⇒ refuse (`exit 1`), with migration guidance.
+        assert!(
+            script.contains("$ROOT/pgdata"),
+            "checks for the pgdata subdir"
+        );
+        assert!(
+            script.contains("grep -vx 'lost+found'"),
+            "excludes the ext4 lost+found so a fresh volume passes"
+        );
+        assert!(script.contains("REFUSING"), "refuses loudly");
+        assert!(
+            script.contains("exit 1"),
+            "a non-zero exit fails the init container so the pod never reaches initdb"
+        );
+        assert!(
+            script.contains("exit 0"),
+            "a fresh / already-migrated volume proceeds"
+        );
+        // F5-adjacent: the guard script interpolates NO spec-derived value — only the fixed
+        // root-mount constant — so the `sh -c` form carries no injection surface.
+        assert!(
+            script.contains(PGDATA_PVC_ROOT_MOUNT),
+            "the script references only the fixed root-mount constant"
         );
     }
 
@@ -2580,7 +2782,12 @@ mod tests {
             .unwrap()
             .init_containers
             .unwrap();
-        let cmd = init[0].command.as_ref().unwrap();
+        // The CHOWN init (found by name — the pre-flight guard is index 0) stays exec-form.
+        let chown = init
+            .iter()
+            .find(|c| c.name == "chown-data")
+            .expect("rootless managed DB gets a chown init container");
+        let cmd = chown.command.as_ref().unwrap();
         // Exec form: `chown -R 999:999 <mount>` — NO `sh -c`, no shell string.
         assert_eq!(cmd[0], "chown");
         assert_eq!(cmd[1], "-R");

@@ -7,6 +7,35 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Kubernetes managed DB on ext4 PVCs (mailroom cap-req #28 defect A).** A managed database's
+  data directory is now bound to a `pgdata` **subPath** of its PVC rather than the mount root, so
+  an ext4 volume's root-level `lost+found` (the Hetzner CSI default and most cloud CSIs) no longer
+  makes Postgres `initdb` refuse `PGDATA` as "not empty" and CrashLoopBackOff the DB container. The
+  in-container mount path is unchanged. (`kind`-based CI uses `lost+found`-free local-path/hostPath
+  volumes, which is why this slipped.)
+- **Apply-declared databases are now wired as the runtime `sql` binding (mailroom cap-req #28
+  defect B).** A database declared through the manifest (e.g. `databases: [(name: "default", …)]`)
+  with no node-static `[handlers.bindings.sql.databases]` entry now resolves a handler's
+  `sql.open("")` to the managed server, instead of silently falling through to the built-in
+  libsql/SQLite store (the `no such table` mailroom symptom). A transient control-plane read while
+  resolving a declared binding is surfaced as the same retryable `503` readiness gate a
+  not-yet-ready managed DB uses (never a hard "sql not granted"), and the declared fallback is
+  attached only on a node that actually runs a compute backend (`[compute]` configured).
+
+### Changed
+
+- **MIGRATION — Kubernetes managed DB data location.** Because of the ext4 subPath fix above, a
+  managed database **provisioned by boatramp ≤ v0.55.0** kept its `PGDATA` at the **PVC root**;
+  this version expects it under the `pgdata` subPath. On upgrade, boatramp does **not** silently
+  re-`initdb` a blank database over the stranded root data: a pre-flight init-container guard
+  inspects the PVC root and, if it is non-empty but has no `pgdata` subdirectory (i.e. pre-fix data
+  is present), **refuses to start the DB with actionable guidance** rather than starting an empty
+  one. To migrate such a volume, mount the PVC (e.g. a maintenance pod), move its root `PGDATA`
+  contents into a new `pgdata/` subdirectory (keeping `lost+found` at the root), then restart the
+  database. Fresh volumes (empty, or only `lost+found`) and already-migrated volumes are unaffected.
+
 ## [0.56.0] - 2026-11-05
 
 ### Added
