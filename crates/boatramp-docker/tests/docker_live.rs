@@ -438,3 +438,175 @@ async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_projec
          the per-project network (container replaced + primary-attached, not restarted in place)"
     );
 }
+
+/// The **run_ephemeral default-bridge reachability** regression gate (v0.56.1).
+///
+/// v0.56.0 made the per-project network the PRIMARY attach for BOTH `launch()` (correct — DNS fix)
+/// AND `run_ephemeral()` (WRONG). For the one-shot export/import dump/restore client that is a
+/// regression: making the per-project net its `NetworkMode` DROPS the daemon default bridge, so the
+/// client can no longer reach a database that lives on the DEFAULT bridge — the real CI/live
+/// topology, where the export/import target is an external/BYO `postgres://` at `172.17.0.x`. That
+/// shape broke all 7 project-export/import live tests (connect timeout) and is why v0.56.0 was
+/// reverted.
+///
+/// This proves the corrected dual-attach: `run_ephemeral` keeps the DEFAULT bridge as the one-shot's
+/// PRIMARY network and attaches the hinted per-project net only as a SECONDARY endpoint. We stand up
+/// a TCP "database" on the DEFAULT bridge via the raw Engine API (the backend's own `launch()` always
+/// binds a workload to a per-project net, so it cannot produce a default-bridge target), then run the
+/// one-shot client WITH a per-project-net hint (`EPHEMERAL_NETWORK_ENV`) so it IS dual-attached —
+/// reproducing the exact regression condition — and assert the client still reaches the
+/// default-bridge DB (`nc -z` connect scan → exit 0). Under the reverted v0.56.0 shape the client
+/// would be confined to the per-project net and the scan would TIME OUT (non-zero).
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final marker, printed
+/// ONLY after the assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   ephemeral_reaches_default_bridge -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_ephemeral_reaches_default_bridge_db_when_dual_attached() {
+    use boatramp_docker::{EPHEMERAL_NETWORK_ENV, project_network_name};
+    use bollard::Docker;
+    use bollard::container::{
+        Config as BollardConfig, CreateContainerOptions, RemoveContainerOptions,
+    };
+    use bollard::image::CreateImageOptions;
+    use bollard::models::HostConfig;
+    use futures::StreamExt;
+
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+
+    let docker = Docker::connect_with_local_defaults().expect("raw docker client");
+
+    // Pull the image for the default-bridge "database" (idempotent; the backend caches it too).
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: "alpine".to_string(),
+            tag: "3.20".to_string(),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(step) = pull.next().await {
+        step.expect("pull alpine:3.20 for the default-bridge DB");
+    }
+
+    // A TCP "database" on the DEFAULT bridge (NO networking_config ⇒ daemon default network).
+    // `nc -lk` keeps accepting connections so the client's connect scan always finds a listener.
+    let db_name = format!("boatramp-ephv2-dbridge-db-{}", std::process::id());
+    let _ = docker
+        .remove_container(
+            &db_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: db_name.clone(),
+                platform: None,
+            }),
+            BollardConfig {
+                image: Some("alpine:3.20".to_string()),
+                cmd: Some(vec![
+                    "nc".into(),
+                    "-lk".into(),
+                    "-p".into(),
+                    "5432".into(),
+                    "-e".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    "printf PONG".into(),
+                ]),
+                host_config: Some(HostConfig {
+                    auto_remove: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create default-bridge DB container");
+    docker
+        .start_container::<String>(&db_name, None)
+        .await
+        .expect("start default-bridge DB container");
+
+    // Its DEFAULT-bridge IP — the host the export/import client must reach (mirrors the BYO
+    // `postgres://172.17.0.x` CI topology).
+    let info = docker
+        .inspect_container(&db_name, None)
+        .await
+        .expect("inspect default-bridge DB");
+    let db_ip = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .and_then(|nets| nets.get("bridge"))
+        .and_then(|ep| ep.ip_address.clone())
+        .filter(|ip| !ip.is_empty())
+        .expect("default-bridge IP of the DB container");
+
+    // The one-shot export/import client, DUAL-ATTACHED: a per-project-net hint forces the secondary
+    // attach (the exact regression condition), while the default bridge must stay PRIMARY so the
+    // client can still reach the default-bridge DB. The per-project net does NOT contain the DB, so
+    // the ONLY route to it is the default bridge — a reverted-v0.56.0 client (per-project net as
+    // NetworkMode, default bridge dropped) would time out here.
+    let net = project_network_name("ephv2dbridge");
+    let backend = DockerBackend::connect().expect("connect to docker");
+    let mut stdout = futures::io::sink();
+    let exit = backend
+        .run_ephemeral(
+            "alpine:3.20",
+            &[
+                "nc".into(),
+                "-z".into(),
+                "-w5".into(),
+                db_ip.clone(),
+                "5432".into(),
+            ],
+            &[(EPHEMERAL_NETWORK_ENV.to_string(), net.clone())],
+            None,
+            &mut stdout,
+        )
+        .await
+        .expect("run_ephemeral connect-scan");
+
+    // Cleanup (best-effort) BEFORE the assertion so a failure still tears down the fixture.
+    let _ = docker
+        .remove_container(
+            &db_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(&net).await;
+
+    assert_eq!(
+        exit, 0,
+        "dual-attached run_ephemeral must still reach the DEFAULT-bridge DB at {db_ip}:5432 — a \
+         non-zero (timeout) exit is the reverted-v0.56.0 regression (per-project net made PRIMARY, \
+         default bridge dropped)"
+    );
+
+    // The single success marker the capability gate greps for — printed ONLY after the one-shot
+    // reached the default-bridge DB while dual-attached to a per-project net.
+    println!(
+        "DOCKER EPHEMERAL DEFAULT-BRIDGE OK: dual-attached run_ephemeral reached the default-bridge \
+         DB at {db_ip}:5432 with per-project net {net} as a SECONDARY attach (default bridge stayed \
+         primary)"
+    );
+}

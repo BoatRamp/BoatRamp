@@ -26,6 +26,10 @@ tokio = { workspace = true, features = ["time", "io-util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 boatramp-types.workspace = true
 serde_json.workspace = true
+# The run_ephemeral default-bridge regression gate stands up a default-bridge target
+# via the raw Engine API and drives `run_ephemeral` (a `futures` AsyncWrite sink).
+bollard.workspace = true
+futures.workspace = true
 
 [lints]
 workspace = true

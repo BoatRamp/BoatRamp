@@ -31,7 +31,7 @@ use bollard::models::{
     ContainerState, ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig,
     Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
 };
-use bollard::network::CreateNetworkOptions;
+use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1013,32 +1013,14 @@ impl ComputeBackend for DockerBackend {
         });
 
         let env_strings: Vec<String> = env_pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        // Network (Bug C, symmetric with the launch path): when the node hinted a per-project
-        // network — a managed DB on an isolated net — make THAT net the one-shot's PRIMARY
-        // attachment (`NetworkMode` + an alias-less `networking_config` AT CREATE), so the
-        // client's `/etc/resolv.conf` is docker's embedded DNS (127.0.0.11) and it can RESOLVE
-        // the DB by its workload-name alias. A mere SECONDARY attach (the old dual-attach, kept
-        // on the default bridge as primary) does NOT get embedded DNS, so the name-based DSN
-        // never resolved — the exact failure this reverses. The per-project net is a non-internal
-        // bridge, so NAT egress still works through it. Absent a hint (an external DSN), NO
-        // `networking_config` is set and the one-shot comes up on the daemon's DEFAULT network,
-        // reaching the DSN's host by NAT egress — unchanged.
-        if let Some(net) = &ephemeral_network {
-            // The network must exist before create. `net` is always `project_network_name(..)`-
-            // shaped, so recover the project by stripping the fixed prefix (same create-if-absent
-            // + labels as the launch path).
-            let project = net
-                .strip_prefix(PROJECT_NETWORK_PREFIX)
-                .unwrap_or(net.as_str());
-            if let Err(e) = self.ensure_project_network(project).await {
-                return Err(BackendError::Other(format!(
-                    "ephemeral ensure project network {net}: {e}"
-                )));
-            }
-            host_config.network_mode = Some(net.clone());
-        }
-
-        let mut config = Config {
+        // No `networking_config` at create: the one-shot comes up on the daemon's DEFAULT network
+        // (NAT egress), then — when a per-project network was hinted — is ALSO connected to that
+        // network below. Keeping the default attachment is what makes the client reach a managed DB
+        // that is NOT on a per-project network (an external DSN, a managed DB launched before the
+        // per-project-network change and not yet relaunched, or a colocated test DB on the default
+        // bridge) by the host its endpoint reports, exactly as before this backend grew per-project
+        // networks.
+        let config = Config {
             image: Some(reference),
             cmd: Some(argv.to_vec()),
             env: Some(env_strings),
@@ -1050,11 +1032,6 @@ impl ComputeBackend for DockerBackend {
             stdin_once: Some(has_stdin),
             ..Default::default()
         };
-        if let Some(net) = &ephemeral_network {
-            // Primary attach at CREATE (no alias — a one-shot client is not a resolvable server;
-            // it only needs to RESOLVE the DB, which requires being primary on this net).
-            config.networking_config = Some(network_config(net, Vec::new()));
-        }
 
         let name = ephemeral_container_name();
         let created = self
@@ -1068,6 +1045,49 @@ impl ComputeBackend for DockerBackend {
             )
             .await
             .map_err(|e| BackendError::Other(format!("ephemeral create: {e}")))?;
+
+        // DUAL-ATTACH: the one-shot already sits on the daemon default network (above); when the
+        // node hinted a per-project network, ALSO connect it there so it can reach a managed DB
+        // that lives on that isolated network (the post-relaunch shape — a per-project-network
+        // container IP or the DB's workload-name alias over the embedded DNS). Create-if-absent is
+        // robust to the network having been reaped between the DB's launch and this one-shot. The
+        // client is confined to NO single network: it keeps the default egress AND reaches the
+        // target project — which is correct, because the one-shot is boatramp's own operator tool
+        // (a fixed pg_dump/pg_restore/psql/mysqldump argv against ONE resolved DB), never guest
+        // code, so this is not a guest-tenancy seam; per-project WORKLOAD confinement (the launch
+        // path) is unchanged. Connect before start so the interface is present when the client
+        // runs; a failure here means the DB is unreachable, so force-remove + surface it.
+        if let Some(net) = &ephemeral_network {
+            // Create-if-absent with the SAME labels as the launch path (managed + project), so an
+            // operator's project-scoped GC/identification finds this network whether a one-shot or
+            // a workload launch won the create race. `net` is always `project_network_name(..)`-
+            // shaped, so recover the project by stripping the fixed prefix.
+            let project = net
+                .strip_prefix(PROJECT_NETWORK_PREFIX)
+                .unwrap_or(net.as_str());
+            let _ = self.ensure_project_network(project).await;
+            if let Err(e) = self
+                .docker
+                .connect_network(
+                    net,
+                    ConnectNetworkOptions {
+                        container: created.id.clone(),
+                        endpoint_config: EndpointSettings::default(),
+                    },
+                )
+                .await
+            {
+                self.force_remove_container(&name).await;
+                // Best-effort reap of the network if THIS call just created it (a fresh per-project
+                // network with no other endpoints). `remove_network` is a no-op error, ignored, when
+                // the network pre-existed and still has workloads attached — so we never tear down a
+                // live project network, only our own orphan.
+                let _ = self.docker.remove_network(net).await;
+                return Err(BackendError::Other(format!(
+                    "ephemeral join project network {net}: {e}"
+                )));
+            }
+        }
 
         // Attach BEFORE start so no output is missed, requesting a live bidirectional
         // stream. If attach (or start, below) fails, the container was CREATED but never
