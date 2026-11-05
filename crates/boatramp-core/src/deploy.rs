@@ -8730,7 +8730,6 @@ mod tests {
                     readiness: crate::compute::Readiness::Provisioned,
                     data_dir: None,
                     snapshot: None::<Snapshot>,
-                    active_spec: None,
                 },
             )
             .await

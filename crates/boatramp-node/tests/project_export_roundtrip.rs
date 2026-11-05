@@ -1051,7 +1051,6 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -1285,7 +1284,6 @@ async fn project_export_pg_pgvector_roundtrip_via_driver_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -3433,7 +3431,6 @@ async fn project_export_pg_true_delta_roundtrip_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -3791,7 +3788,6 @@ async fn project_export_pg_true_delta_overlap_window_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -4098,7 +4094,6 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -5050,7 +5045,6 @@ async fn project_export_pg_true_delta_chain_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -5425,7 +5419,6 @@ async fn project_export_mysql_true_delta_chain_live() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await
@@ -6155,7 +6148,6 @@ async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
                 readiness: Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await

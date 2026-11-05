@@ -347,7 +347,6 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
                 readiness: boatramp_core::compute::Readiness::Provisioned,
                 data_dir: None,
                 snapshot: None,
-                active_spec: None,
             },
         )
         .await

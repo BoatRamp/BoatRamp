@@ -29,29 +29,6 @@ versions.
   `history` are not carried over the CLI yet and an `--apply` naming one is refused up front (never a
   half-sync).
 
-### Fixed
-
-- **docker compute backend — per-project-network DNS now actually resolves.** Each workload is
-  created with its per-project user-defined network as the **primary** attachment
-  (`HostConfig.NetworkMode`), not a post-create secondary connect, so docker's embedded DNS
-  (127.0.0.11) and service discovery publish it and siblings resolve each other by name/alias (e.g.
-  a managed-DB-bound workload reaching `@<db-workload>:5432`). The v0.55.0 secondary-attach left
-  names unresolvable. The default-bridge attachment is dropped — the per-project net is non-internal
-  so egress is preserved — which also makes cross-project isolation strictly stronger (the
-  per-project net is the sole tenancy boundary).
-- **docker compute backend — spec-change redeploys now recreate the container.** The reconcile had
-  no spec-change detection, so a redeploy (a new active spec hash) emitted no action and the
-  container was merely restarted in place by docker's own restart policy — `launch()` never re-ran,
-  so the per-project network (and any other launch-time change) never took effect on an existing
-  workload. Reconcile now recreates a replica when its launched spec differs from the project's
-  active spec, or when its actual primary network does not match the per-project net — the latter
-  auto-heals pre-upgrade workloads on the first reconcile after the upgrade, with the data volume
-  preserved across the recreate.
-- **docker compute backend — `compute status` reports actual container state.** Health now keys on
-  the container's real `State.Status` (and a declared healthcheck) rather than the `running` bool
-  alone, so a crash-looping or restarting container surfaces as unhealthy instead of a masked
-  "healthy".
-
 ## [0.55.0] - 2026-11-04
 
 ### Added

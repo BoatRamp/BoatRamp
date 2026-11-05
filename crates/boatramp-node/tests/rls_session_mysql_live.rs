@@ -291,7 +291,6 @@ async fn rls_session_guard_holds_live_mysql() {
         readiness: boatramp_core::compute::Readiness::Provisioned,
         data_dir: None,
         snapshot: None,
-        active_spec: None,
     };
     deploy
         .set_replica_state(ProjectRef::DEFAULT, &observed)
