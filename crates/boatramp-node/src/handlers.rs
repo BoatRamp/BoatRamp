@@ -884,26 +884,47 @@ async fn build_sql_backends(
     let default: Arc<dyn boatramp_core::sql::SqlBackends> =
         Arc::new(backend.with_preview_policy(preview_mode, preview_init));
 
-    // Overlay any external (bring-your-own) databases on the managed default.
-    // With none configured the default is returned unchanged (and a build
-    // without an external SQL engine never has to link the sqlx path).
+    // Overlay any external (bring-your-own) OR project-declared (apply-managed) databases
+    // on the managed libsql default. With NOTHING to overlay — no static `[databases]`
+    // entry and no declarative source wired — the default is returned unchanged (and a
+    // build without a SQL engine never links the sqlx composite path).
     let databases = cfg.map(|c| &c.databases);
-    if databases.is_none_or(std::collections::BTreeMap::is_empty) {
-        return Ok(default);
-    }
-    let databases = databases.expect("checked non-empty above");
 
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     {
         use boatramp_core::sql::SqlBackend;
         use boatramp_storage::sql_sqlx::{
-            CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions, connect,
+            CompositeSqlBackends, DeclaredDbResolver, ExternalSqlKind, ExternalSqlOptions, connect,
         };
+
+        // The serve-time bridge for a project-DECLARED (apply-managed) database (cap-req
+        // #28 B): a managed DB seals its credential, so it is wired only when the node has
+        // a secrets envelope — without one it could not be served regardless (the static
+        // managed arm below fails closed for the same reason). The static `databases` map
+        // is passed so the resolver refuses any name an operator declared statically
+        // (daemon-wins). Crucially this is attached EVEN WITH AN EMPTY `[databases]` — the
+        // mailroom case, where the declared `default` is MEANT to BE the `sql.open("")`
+        // binding — which the pre-fix empty-map early return skipped entirely.
+        let empty_static = std::collections::BTreeMap::new();
+        let static_dbs = databases.unwrap_or(&empty_static);
+        let declared_fallback: Option<Arc<dyn DeclaredDbResolver>> =
+            secrets_envelope.map(|envelope| {
+                Arc::new(crate::declared_sql::NodeDeclaredDbResolver::new(
+                    deploy.clone(),
+                    kv.clone(),
+                    envelope.clone(),
+                    static_dbs,
+                )) as Arc<dyn DeclaredDbResolver>
+            });
+
         let timeout = |db: &crate::config::ExternalDatabaseConfig| {
             db.connect_timeout_secs.map(std::time::Duration::from_secs)
         };
-        let mut composite = CompositeSqlBackends::new(default);
-        for (name, db) in databases {
+        let mut composite = CompositeSqlBackends::new(default.clone());
+        if let Some(fallback) = declared_fallback {
+            composite = composite.with_declared_fallback(fallback);
+        }
+        for (name, db) in static_dbs {
             let kind = ExternalSqlKind::parse(&db.kind).ok_or_else(|| Error::SqlExternalKind {
                 name: name.clone(),
                 kind: db.kind.clone(),
@@ -996,15 +1017,24 @@ async fn build_sql_backends(
                 composite = composite.with_external(name.clone(), external, db.allow_preview);
             }
         }
-        Ok(Arc::new(composite))
+        // Nothing to overlay (no declared fallback AND no static databases) ⇒ the plain
+        // libsql default; a pure pass-through composite would only add indirection.
+        if composite.has_external() {
+            Ok(Arc::new(composite))
+        } else {
+            Ok(default)
+        }
     }
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     {
-        // The compute-backed arm (the only consumer of these) is compiled out
-        // without a SQL engine; a `databases` entry then can't be served at all.
+        // No SQL engine: no composite, and no declared managed DB can be served. A static
+        // `[databases]` entry (the compute-backed arm's only consumer) then can't be served
+        // at all; with none configured, the plain libsql default stands.
         let _ = (deploy, kv, secrets_envelope);
-        let name = databases.keys().next().cloned().unwrap_or_default();
-        Err(Error::SqlExternalUnavailable(name))
+        if let Some(name) = databases.and_then(|d| d.keys().next().cloned()) {
+            return Err(Error::SqlExternalUnavailable(name));
+        }
+        Ok(default)
     }
 }
 

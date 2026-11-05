@@ -82,6 +82,12 @@ pub mod managed_db_declare;
 // a managed co-located pg/mysql database, delegating libsql/external bindings to the sql-shim.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod managed_db_dsn;
+// The serve-time bridge that wires a project-DECLARED (apply-managed) database as a runtime
+// `sql` binding (cap-req #28 B): a `DeclaredDbResolver` the composite consults for a name it
+// has no static binding for, so a handler's `sql.open("")` reaches the declared managed
+// Postgres instead of falling through to the built-in libsql default.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod declared_sql;
 pub mod node;
 /// Pure builders for the Postgres export/import client invocation (argv + `PG*` env);
 /// the credential non-leak rule (password in env, never argv) lives here.
