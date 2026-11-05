@@ -1700,7 +1700,7 @@ jobs:
           grep -q 'SANDBOX LIVE OK' sandbox-live.log \
             || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
 
-  # privsep LIVE GATE — THREE `#[ignore]`d end-to-end tests in `privsep_live.rs`:
+  # privsep LIVE GATE — FIVE `#[ignore]`d end-to-end tests in `privsep_live.rs`:
   #  (1) WS-C 2-INSTANCE COMPOSITION (marker `PRIVSEP LIVE OK`): forks `boatramp __root` against a
   #      minimal `[privsep]` config (a `listen.*` FRONTEND + a backend/crown-jewel CORE wired by one
   #      `local` socketpair link), proving the WHOLE WS-C runtime — the root screens + lints
@@ -1716,7 +1716,15 @@ jobs:
   #      inverted `frontend` holds ONLY public-tls + http-parse + exec.wasmtime (no keys/backends/
   #      control), pinned to the operator-selectable `substrate: OsProcess`, relaying inward to a
   #      crown+backend `core`; proves the least-authority frontend serves a real 200 end-to-end.
-  # All three are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
+  #  (4) PER-TENANT TEMPLATE (marker `PRIVSEP PER-TENANT OK`): a `lifecycle: PerTenantTemplate`
+  #      composition serves two distinct per-tenant instances, scope-keyed by Host header.
+  #  (5) CONTAINER SUBSTRATE — FAIL-CLOSED REFUSAL (marker `PRIVSEP CONTAINER SUBSTRATE REFUSED OK`,
+  #      Phase 3): pins `core` to the UNWIRED `substrate: container` on an otherwise-valid topology
+  #      and proves the root REFUSES fail-closed (names the substrate + its design blockers, never
+  #      partially spawns, never downgrades to an OS process). INVERT to `PRIVSEP CONTAINER SUBSTRATE
+  #      OK` (a real 200 over a confined instance) when the spawn backend lands — see
+  #      `crates/boatramp/DESIGN-privsep-phase3-container.md`.
+  # All five are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
   # runs them. Greps every marker + the pass count so a silent skip / compile-out fails the merge.
   live-gate-privsep:
     name: live gate (privsep)
@@ -1738,8 +1746,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 4 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all four tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 5 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all five tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
@@ -1748,6 +1756,8 @@ jobs:
             || { echo "::error::privsep frontend-inversion live gate never reached its marker (a least-authority frontend / substrate / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP PER-TENANT OK' privsep-live.log \
             || { echo "::error::privsep per-tenant live gate never reached its marker (a WS-C per-tenant compute-plane spawn / execute-pin / resolver regression)" >&2; exit 1; }
+          grep -q 'PRIVSEP CONTAINER SUBSTRATE REFUSED OK' privsep-live.log \
+            || { echo "::error::privsep container-substrate gate never reached its marker (the UNWIRED substrate: container must refuse fail-closed end-to-end; INVERT this gate to 'PRIVSEP CONTAINER SUBSTRATE OK' when the spawn backend lands — see crates/boatramp/DESIGN-privsep-phase3-container.md)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into

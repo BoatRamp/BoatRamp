@@ -787,6 +787,35 @@ fn resolve_spawn_backend(label: &str, substrate: InstanceSubstrate) -> Result<()
         return Ok(());
     }
     let backend = substrate.compute_plane_backend().unwrap_or("(none)");
+    // The `Container` substrate carries a SHARPENED refusal naming the specific TCB-critical design
+    // blockers a reviewer must resolve before it can be wired — NOT a generic "not wired" — and
+    // points at the crate-local design note that pins each one down. Container is strictly simpler
+    // than VM (the `local` socketpair + SCM_RIGHTS keep working cross-namespace on one kernel —
+    // design-note §2a), but it is still refused fail-closed, never silently downgraded to an OS
+    // process (which would discard the operator's chosen isolation wall). The blockers:
+    //   §1  the OCI-vs-own-binary reconciliation — `boatramp-container` is OCI/rootfs-oriented
+    //       (`pivot_root`), but a privsep instance must run the host's OWN static-musl binary in
+    //       `__instance` mode; the rootfs model (minimal synthetic / bind-mount / no-pivot) is the
+    //       load-bearing, un-ratified decision;
+    //   §2b the multi-fd pass — the backend hands exactly ONE inherited fd (onto fd 0), but a
+    //       privsep instance needs every root-wired link end + its listener at fixed fd numbers;
+    //   §5b the per-instance namespace/egress policy — a `backend.*` instance in a fresh netns has
+    //       no path to its DB/KV/blob backends.
+    if matches!(substrate, InstanceSubstrate::Container) {
+        return Err(PrivsepError::Supervise(format!(
+            "instance {label:?} selects the \"container\" isolation substrate, whose spawn backend is \
+             not wired in this Phase-3 cut. It reuses {backend}, but three TCB-critical design \
+             questions are unresolved and need owner + Security ratification: (1) the OCI-vs-own-binary \
+             rootfs reconciliation — the container worker `pivot_root`s into a rootfs, so running the \
+             host's OWN static-musl binary in `__instance` mode needs a ratified rootfs model; (2) the \
+             multi-fd pass — the backend hands one inherited fd, but a privsep instance needs every \
+             root-wired socketpair link end + its listener fd at fixed numbers; (3) the per-instance \
+             namespace/egress policy — a backend instance in a fresh network namespace cannot reach \
+             its data-plane backends. See crates/boatramp/DESIGN-privsep-phase3-container.md. Refusing \
+             fail-closed rather than silently downgrading to an OS process (which would discard the \
+             chosen isolation wall); use `substrate: OsProcess` (the default) until the backend lands"
+        )));
+    }
     Err(PrivsepError::Supervise(format!(
         "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is not wired in \
          the Phase-3 foundation cut (it reuses {backend} — a reported follow-on). Refusing \
@@ -4203,10 +4232,29 @@ mod tests {
         resolve_spawn_backend("frontend", InstanceSubstrate::OsProcess)
             .expect("os-process is the wired spawn backend");
         // Container + VM are refused fail-closed, naming the compute-plane backend each reuses.
+        // Container carries the SHARPENED refusal (Phase-3): it names the three TCB-critical design
+        // blockers a reviewer must resolve (the OCI-vs-own-binary rootfs reconciliation, the multi-fd
+        // pass, the per-instance namespace/egress policy) + points at the crate-local design note, so
+        // the refusal is reviewer-useful, not a bare "not wired".
         let c = resolve_spawn_backend("frontend", InstanceSubstrate::Container).unwrap_err();
+        let PrivsepError::Supervise(cm) = &c else {
+            panic!("container must be refused as a Supervise error, got {c:?}");
+        };
         assert!(
-            matches!(&c, PrivsepError::Supervise(m) if m.contains("boatramp-container") && m.contains("fail-closed")),
-            "container must be refused with its reuse backend named, got {c:?}"
+            cm.contains("boatramp-container") && cm.contains("fail-closed"),
+            "container refusal must name its reuse backend + stay fail-closed, got {cm:?}"
+        );
+        assert!(
+            cm.contains("rootfs") && cm.contains("multi-fd") && cm.contains("network namespace"),
+            "container refusal must name the three design blockers, got {cm:?}"
+        );
+        assert!(
+            cm.contains("DESIGN-privsep-phase3-container.md"),
+            "container refusal must point at the design note, got {cm:?}"
+        );
+        assert!(
+            cm.contains("OsProcess"),
+            "container refusal must offer the OsProcess fallback, got {cm:?}"
         );
         let v = resolve_spawn_backend("frontend", InstanceSubstrate::Vm).unwrap_err();
         assert!(

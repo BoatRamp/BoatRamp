@@ -700,6 +700,158 @@ fn privsep_per_tenant_serves_end_to_end() {
     println!("PRIVSEP PER-TENANT OK");
 }
 
+/// Live gate for the Phase-3 **`substrate: container`** spawn-backend seam — asserting the
+/// fail-closed REFUSAL end-to-end (the substrate's actual wiring is DESIGN-ONLY this cut; see
+/// `crates/boatramp/DESIGN-privsep-phase3-container.md`). Forks `boatramp __root` against an
+/// otherwise-VALID 4-instance composition (union == `all`, grants disjoint, no crown co-resident
+/// with a listener/exec/control surface — the frontend-inversion topology) whose `core` instance is
+/// pinned `substrate: container`. The root passes the secret-blind screen, the composition-closure
+/// lint, the grant-disjointness check, and the Linux+`sandbox` platform gate, reaches
+/// `supervise::run`, and there `resolve_spawn_backend` REFUSES the container instance fail-closed —
+/// BEFORE any socketpair is created, any listener bound, or any instance forked. So the root exits
+/// non-zero naming the container substrate + its design blockers, and the node NEVER serves (no
+/// silent downgrade to an OS process, no partial spawn).
+///
+/// **This gate INVERTS when the container spawn backend lands:** flip `core`'s expectation from "the
+/// root refuses" to "the node serves a real 200 over a namespace/cgroup-confined instance", rename
+/// the marker to `PRIVSEP CONTAINER SUBSTRATE OK`, and drop the refusal asserts. Until then it is a
+/// real regression guard: the composition must refuse CLEANLY (never partially spawn, never
+/// downgrade).
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the per-tenant gate:
+/// the refusal is only reached on the build where the platform gate passes (otherwise the root
+/// refuses earlier with `UnsupportedPlatform`, a different message). The CI `live gate (privsep)`
+/// job runs it via `--include-ignored` and greps the `PRIVSEP CONTAINER SUBSTRATE REFUSED OK`
+/// marker + the pass count, so a silent skip / compile-out — or a regression that lets the
+/// unwired substrate stand up — fails the merge.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a composition pinning one instance to the unwired \
+            `substrate: container` and asserts the node refuses fail-closed (Linux + `sandbox`); \
+            run via --include-ignored in the `live gate (privsep)` job"]
+fn privsep_container_substrate_refuses_fail_closed_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-container-{}", std::process::id()));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The known-valid frontend-inversion topology (union == ALL; grants disjoint; no crown co-resident
+    // with a listener/exec/control surface — so it clears every pre-supervise gate), with the one
+    // change under test: `core` is pinned to the UNWIRED `substrate: container`. The ONLY reason the
+    // node must refuse is that substrate — proving the refusal is the substrate's, not an unrelated
+    // lint failure.
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "frontend": (
+                capabilities: ["listen.public-tls", "listen.http-parse", "exec.wasmtime"],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay", "listen.s3ingress",
+                    "listen.inbound-tcp", "listen.gateway",
+                    "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: Container,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "frontend", to: "core", transport: Local, purpose: Relay) }},
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    // The refusal is immediate (it fires at the top of `supervise::run`, before any live syscall),
+    // but bound the wait so a regression that lets the unwired substrate STAND UP fails loudly rather
+    // than hanging.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` did not exit within 15s — the UNWIRED `substrate: container` was \
+                 allowed to stand up instead of refusing fail-closed (a Phase-3 spawn-backend regression)"
+            );
+        }
+        match root.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                let _ = root.kill();
+                let _ = std::fs::remove_dir_all(&tmp);
+                panic!("waiting on `boatramp __root`: {e}");
+            }
+        }
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut e) = root.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        !status.success(),
+        "the node must exit NON-zero refusing the unwired container substrate; exited {status} \
+         (stderr:\n{stderr})"
+    );
+    assert!(
+        stderr.contains("container") && stderr.contains("substrate"),
+        "the refusal must name the container substrate, got stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fail-closed") && stderr.contains("DESIGN-privsep-phase3-container.md"),
+        "the refusal must be fail-closed + point at the design note, got stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"core\""),
+        "the refusal must name the offending instance (`core`), got stderr:\n{stderr}"
+    );
+
+    // The marker the CI gate greps — reached only after the node provably refused the unwired
+    // container substrate fail-closed, end-to-end. INVERT to `PRIVSEP CONTAINER SUBSTRATE OK` when the
+    // spawn backend lands (see the doc comment above + the design note).
+    println!("PRIVSEP CONTAINER SUBSTRATE REFUSED OK");
+}
+
 /// One blocking HTTP/1.1 `GET /` to `addr` with an explicit `Host`, returning the raw response text
 /// (the router routes on this Host).
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
