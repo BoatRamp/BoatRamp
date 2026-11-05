@@ -249,6 +249,7 @@ async fn drive(
         ManagedSqlCredentials::new(kv.clone(), envelope.clone()),
         ManagedDbPrivilege::Rootless,
         deploy.clone(),
+        std::collections::BTreeSet::new(),
     );
     let server_env = env.managed_db_env(PROJECT, &workload).await;
     if server_env.is_empty() {
