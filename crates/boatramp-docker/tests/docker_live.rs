@@ -924,7 +924,9 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
     //     was `false` (the producer's spec is unchanged → never recreated → keeps the long alias →
     //     the consumer's short-alias DSN lookup NXDOMAINs). That is simertec's live failure.
     assert!(
-        backend.needs_redeploy(&db_handle, &server_spec("HEAL")).await,
+        backend
+            .needs_redeploy(&db_handle, &server_spec("HEAL"))
+            .await,
         "a producer primary on the project net but carrying a STALE long alias ({db_workload}) \
          instead of the current short alias ({short_alias}) MUST be flagged for recreate — \
          before the fix this was false and the upgrade left the producer unresolvable"

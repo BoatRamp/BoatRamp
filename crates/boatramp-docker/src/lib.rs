@@ -1568,8 +1568,7 @@ mod tests {
     #[test]
     fn container_alias_current_only_when_it_advertises_the_current_managed_db_alias() {
         // A long (>63-octet) managed-DB workload name whose current alias is the short hash.
-        let workload =
-            "bramp-db-0ba8mhgah7gfb4e2ivmj05ixx-simertec-stg_backoffice_db_0123456789";
+        let workload = "bramp-db-0ba8mhgah7gfb4e2ivmj05ixx-simertec-stg_backoffice_db_0123456789";
         assert!(workload.len() > 63, "fixture must exceed the DNS label cap");
         let current = managed_db_alias(workload); // the <=63 alias `launch` now publishes
         assert!(current.len() <= 63);
