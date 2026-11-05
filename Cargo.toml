@@ -81,7 +81,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.56.0"
+version = "0.56.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
@@ -123,40 +123,40 @@ result_large_err = "allow"
 double_must_use = "allow"
 
 [workspace.dependencies]
-boatramp-types = { path = "crates/boatramp-types", version = "0.56.0" }
-boatramp-core = { path = "crates/boatramp-core", version = "0.56.0" }
-boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.56.0" }
-boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.56.0" }
-boatramp-overlay = { path = "crates/boatramp-overlay", version = "0.56.0" }
-boatramp-overlay-client = { path = "crates/boatramp-overlay-client", version = "0.56.0" }
-boatramp-overlay-tunnel = { path = "crates/boatramp-overlay-tunnel", version = "0.56.0" }
-boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.56.0" }
-boatramp-storage = { path = "crates/boatramp-storage", version = "0.56.0" }
-boatramp-server = { path = "crates/boatramp-server", version = "0.56.0" }
-boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.56.0" }
-boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.56.0" }
-boatramp-acme = { path = "crates/boatramp-acme", version = "0.56.0" }
-boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.56.0" }
-boatramp-container = { path = "crates/boatramp-container", version = "0.56.0" }
-boatramp-docker = { path = "crates/boatramp-docker", version = "0.56.0" }
-boatramp-vz = { path = "crates/boatramp-vz", version = "0.56.0" }
-boatramp-k8s = { path = "crates/boatramp-k8s", version = "0.56.0" }
-boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.56.0" }
-boatramp-node = { path = "crates/boatramp-node", version = "0.56.0" }
-boatramp-http = { path = "crates/boatramp-http", version = "0.56.0" }
+boatramp-types = { path = "crates/boatramp-types", version = "0.56.1" }
+boatramp-core = { path = "crates/boatramp-core", version = "0.56.1" }
+boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.56.1" }
+boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.56.1" }
+boatramp-overlay = { path = "crates/boatramp-overlay", version = "0.56.1" }
+boatramp-overlay-client = { path = "crates/boatramp-overlay-client", version = "0.56.1" }
+boatramp-overlay-tunnel = { path = "crates/boatramp-overlay-tunnel", version = "0.56.1" }
+boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.56.1" }
+boatramp-storage = { path = "crates/boatramp-storage", version = "0.56.1" }
+boatramp-server = { path = "crates/boatramp-server", version = "0.56.1" }
+boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.56.1" }
+boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.56.1" }
+boatramp-acme = { path = "crates/boatramp-acme", version = "0.56.1" }
+boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.56.1" }
+boatramp-container = { path = "crates/boatramp-container", version = "0.56.1" }
+boatramp-docker = { path = "crates/boatramp-docker", version = "0.56.1" }
+boatramp-vz = { path = "crates/boatramp-vz", version = "0.56.1" }
+boatramp-k8s = { path = "crates/boatramp-k8s", version = "0.56.1" }
+boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.56.1" }
+boatramp-node = { path = "crates/boatramp-node", version = "0.56.1" }
+boatramp-http = { path = "crates/boatramp-http", version = "0.56.1" }
 # Connect / gRPC-web wire-framing codec (PLAN-connect-grpc §7 / IU-4). Published to crates.io from
 # the v0.52.0 Connect release on: `boatramp-server` (a published crate) depends on it, so it must
 # publish ahead of the server (it leads the `just publish` crate_order — the crate-order gotcha).
 # The explicit `version` is required regardless (cargo-deny's `wildcards = "deny"` rejects a
 # version-less path dep, and crates.io disallows path deps); it tracks the workspace version and the
 # `bump-version` recipe carries it.
-boatramp-connect-frame = { path = "crates/boatramp-connect-frame", version = "0.56.0" }
+boatramp-connect-frame = { path = "crates/boatramp-connect-frame", version = "0.56.1" }
 # Connect / gRPC-web CLIENT shim (PLAN-connect-grpc §9 / IU-5): the client-direction analog of the
 # `boatramp-connect` serving shim, built on `boatramp-connect-frame`. Also published from the
 # v0.52.0 Connect release so customers can generate + build client code from .proto against it. It
 # is only a dev-dependency of the server here (the client e2e gate + generated-client examples), so
 # it never enters the published control-plane binary unless a caller opts in.
-boatramp-connect-client = { path = "crates/boatramp-connect-client", version = "0.56.0" }
+boatramp-connect-client = { path = "crates/boatramp-connect-client", version = "0.56.1" }
 # Protobuf runtime for the Connect/gRPC-web message types (the client shim + generated code). PINNED
 # EXACT to match the `boatramp-connect` serving shim + the Nix-pinned `prost-build` codegen, so the
 # generated message bytes are reproducible across both repos (PLAN-connect-grpc §11.3).

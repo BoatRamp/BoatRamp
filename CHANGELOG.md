@@ -7,6 +7,27 @@ versions.
 
 ## [Unreleased]
 
+## [0.56.1] - 2026-11-05
+
+### Fixed
+
+- **docker compute backend — per-project-network DNS now resolves for workloads.** Long-lived
+  workloads are created with their per-project user-defined network as the PRIMARY attachment
+  (`HostConfig.NetworkMode`), so docker's embedded DNS (127.0.0.11) + service discovery publish
+  them and siblings resolve each other by name/alias (e.g. a managed-DB-bound workload reaching
+  `@<db-workload>:5432`). The v0.55.0 secondary-attach left names unresolvable. The export/import
+  one-shot keeps its dual-attach (default bridge + per-project net) so it still reaches a DB on any
+  network.
+- **docker compute backend — spec-change redeploys now recreate the container.** The reconcile had
+  no spec-change detection, so a redeploy (a new active spec hash) emitted no action and `launch()`
+  never re-ran. Reconcile now recreates a replica when its launched spec differs from the active
+  spec, or when its actual primary network does not match the per-project net — auto-healing
+  pre-upgrade workloads on the first reconcile after the upgrade, with the data volume preserved
+  across the recreate.
+- **docker compute backend — `compute status` reports actual container state.** Health keys on the
+  container's real `State.Status` (and a declared healthcheck) rather than the `running` bool alone,
+  so a crash-looping or restarting container surfaces as unhealthy instead of a masked "healthy".
+
 ## [0.56.0] - 2026-11-05
 
 ### Added
