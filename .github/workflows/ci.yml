@@ -950,8 +950,8 @@ jobs:
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features acme-dns,cluster acme_dns::tests::listener_composite \
             -- --nocapture 2>&1 | tee listener-composite.log
-          grep -qE 'test result: ok\. 1 passed' listener-composite.log \
-            || { echo "::error::listener on-demand composite gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 4 passed' listener-composite.log \
+            || { echo "::error::listener on-demand composite gate did not run all 4 cases (silent skip/rename, or the cap-req #29 use_node_cert cases regressed)" >&2; exit 1; }
           grep -q 'LISTENER ON-DEMAND TLS COMPOSITE OK' listener-composite.log \
             || { echo "::error::listener on-demand composite gate never reached its marker (a per-SNI listener cert-dispatch regression)" >&2; exit 1; }
 
