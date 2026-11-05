@@ -1202,6 +1202,19 @@ pub trait AuthorityHandler: Send + Sync {
         request: AuthorityRequest,
         now_unix: u64,
     ) -> AuthorityResponse;
+
+    /// Whether this handler is PERMITTED to serve the request kinds that require `authority` (WS-E
+    /// residual #4 — kind-gating COMPLETION). The [`AuthorityRegistry`] VERIFIES at registration that a
+    /// handler registered under authority `A` declares `permits_authority(A)` — a composition that
+    /// registers a handler under an authority it does not serve is refused FAIL-CLOSED, at composition,
+    /// before any call ([`AuthorityRegistry::register`]). Combined with each handler's own internal
+    /// kind-gate (every `handle` arm but its grammar's returns [`refused_wrong_kind`]), this makes the
+    /// kind-gate STRUCTURAL rather than convention: a handler can never be ROUTED a request kind outside
+    /// its declared grant (the registry dispatches by [`AuthorityRequest::required_authority`] to a
+    /// handler that has declared it serves exactly that authority), and even a hand-constructed
+    /// misdispatch is caught by the internal kind-gate. There is deliberately NO default impl — a NEW
+    /// capability handler MUST consciously declare its grant here, itself a review tripwire.
+    fn permits_authority(&self, authority: HostAuthority) -> bool;
 }
 
 /// The authority-free liveness handler: answers [`AuthorityRequest::Ping`] with a matching
@@ -1223,6 +1236,14 @@ impl AuthorityHandler for PingHandler {
             AuthorityRequest::Ping { witness } => AuthorityResponse::Pong { witness },
             other => refused_wrong_kind("ping", &other),
         }
+    }
+
+    /// The liveness handler holds NO authority: it serves only the authority-FREE
+    /// [`AuthorityRequest::Ping`] (routed via the registry's `None` arm, never registered under any
+    /// [`HostAuthority`]). So it permits no held authority — it must never be registered as a capability
+    /// handler (the registry's `register` would refuse it).
+    fn permits_authority(&self, _authority: HostAuthority) -> bool {
+        false
     }
 }
 
@@ -1379,6 +1400,12 @@ impl AuthorityHandler for SealerHandler {
             other => refused_wrong_kind("secrets.sealer", &other),
         }
     }
+
+    /// The sealer serves ONLY the `secrets.sealer` grammar (seal/unseal) — never any other authority's
+    /// kinds.
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::SecretsSealer)
+    }
 }
 
 // =============================================================================
@@ -1527,6 +1554,12 @@ impl AuthorityHandler for SignerHandler {
             other => refused_wrong_kind("token.signer", &other),
         }
     }
+
+    /// The signer serves ONLY the `token.signer` grammar (mint_token) — never any other authority's
+    /// kinds.
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::TokenSigner)
+    }
 }
 
 /// The per-principal seal/unseal SCOPE — the verified principal's **stable IDENTITY**, read SOLELY
@@ -1613,10 +1646,28 @@ impl AuthorityRegistry {
         Self::default()
     }
 
-    /// Register `handler` as the grammar for `authority`. A second registration for the same authority
-    /// replaces the first (the composition holds one handler per authority per instance).
-    pub fn register(&mut self, authority: HostAuthority, handler: Arc<dyn AuthorityHandler>) {
+    /// Register `handler` as the grammar for `authority` — **CHECKED fail-closed (WS-E residual #4).**
+    /// The handler MUST declare it [`permits_authority`](AuthorityHandler::permits_authority)`(authority)`;
+    /// a handler registered under an authority it does not serve (a composition bug that would otherwise
+    /// let a request kind be routed to the wrong grammar, caught only by the handler's internal kind-gate
+    /// as defense-in-depth) is REFUSED here, at composition, before any call. A second registration for
+    /// the same authority replaces the first (the composition holds one handler per authority per
+    /// instance). The stand-up propagates the error → the instance exits → `FailNodeClosed`.
+    pub fn register(
+        &mut self,
+        authority: HostAuthority,
+        handler: Arc<dyn AuthorityHandler>,
+    ) -> Result<(), String> {
+        if !handler.permits_authority(authority) {
+            return Err(format!(
+                "refusing to register an authority handler under the {} authority it does not \
+                 permit (kind-gating completion, WS-E residual #4): a handler serves ONLY its own \
+                 declared authority's request kinds",
+                authority.tag()
+            ));
+        }
         self.handlers.insert(authority, handler);
+        Ok(())
     }
 
     /// Whether any capability handler is registered (an instance with none stands up no authority
@@ -1657,6 +1708,16 @@ impl AuthorityHandler for AuthorityRegistry {
                 },
             },
         }
+    }
+
+    /// The registry (a composite handler) permits `authority` iff it holds a registered handler that
+    /// itself permits it — tautological post-[`register`](Self::register) (register refuses a mismatch),
+    /// but keeps the composite consistent with the trait contract. The registry is never itself
+    /// registered inside another registry; this exists for trait-completeness.
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        self.handlers
+            .get(&authority)
+            .is_some_and(|h| h.permits_authority(authority))
     }
 }
 
@@ -2756,7 +2817,8 @@ mod tests {
         reg.register(
             HostAuthority::SecretsSealer,
             Arc::new(SealerHandler::new(kek)),
-        );
+        )
+        .unwrap();
         // A Seal routes to the sealer (served).
         let out = runtime().block_on(reg.handle(
             &p,
@@ -2785,6 +2847,40 @@ mod tests {
         // Ping (authority-free liveness) is always answered.
         let out = runtime().block_on(reg.handle(&p, AuthorityRequest::Ping { witness: 5 }, now));
         assert_eq!(out, AuthorityResponse::Pong { witness: 5 });
+    }
+
+    // ---- WS-E residual #4: registration is kind-gated (a handler can't serve a foreign authority) ----
+
+    #[test]
+    fn register_refuses_a_handler_under_an_authority_it_does_not_serve() {
+        // A SealerHandler registered under the token.signer authority is a composition bug: the sealer
+        // serves no token.signer kind. The CHECKED register refuses it fail-closed, at composition.
+        let kek = Arc::new(LocalKek::from_bytes([3u8; 32])) as Arc<dyn KeyEnvelope>;
+        let mut reg = AuthorityRegistry::new();
+        let err = reg
+            .register(HostAuthority::TokenSigner, Arc::new(SealerHandler::new(kek)))
+            .unwrap_err();
+        assert!(err.contains("does not"), "got {err}");
+        // And the correct registration is accepted.
+        let kek2 = Arc::new(LocalKek::from_bytes([3u8; 32])) as Arc<dyn KeyEnvelope>;
+        reg.register(HostAuthority::SecretsSealer, Arc::new(SealerHandler::new(kek2)))
+            .expect("the sealer registers under its own authority");
+    }
+
+    #[test]
+    fn handlers_permit_only_their_own_authority() {
+        let kek = Arc::new(LocalKek::from_bytes([4u8; 32])) as Arc<dyn KeyEnvelope>;
+        let sealer = SealerHandler::new(kek);
+        assert!(sealer.permits_authority(HostAuthority::SecretsSealer));
+        assert!(!sealer.permits_authority(HostAuthority::TokenSigner));
+        let signer = SignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        assert!(signer.permits_authority(HostAuthority::TokenSigner));
+        assert!(!signer.permits_authority(HostAuthority::SecretsSealer));
+        // The liveness handler holds no authority — it must never register as a capability handler.
+        assert!(!PingHandler.permits_authority(HostAuthority::SecretsSealer));
     }
 
     // ---- end-to-end over a real socketpair (unix) ----
@@ -2866,11 +2962,13 @@ mod tests {
             reg.register(
                 HostAuthority::SecretsSealer,
                 Arc::new(SealerHandler::new(kek)),
-            );
+            )
+            .unwrap();
             reg.register(
                 HostAuthority::TokenSigner,
                 Arc::new(SignerHandler::new(signer_key, DEFAULT_CONTEXT_MAX_AGE_SECS)),
-            );
+            )
+            .unwrap();
 
             let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
             let server = spawn_server(

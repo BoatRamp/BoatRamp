@@ -2350,7 +2350,7 @@ mod instance_serve {
             registry.register(
                 HostAuthority::SecretsSealer,
                 Arc::new(SealerHandler::new(envelope)),
-            );
+            )?;
         }
         if gate.may_materialize(HostAuthority::TokenSigner) {
             let signer = unlocked_signer.ok_or_else(|| {
@@ -2363,7 +2363,7 @@ mod instance_serve {
             registry.register(
                 HostAuthority::TokenSigner,
                 Arc::new(SignerHandler::new(signer, DEFAULT_CONTEXT_MAX_AGE_SECS)),
-            );
+            )?;
         }
         if registry.is_empty() {
             return Err(
