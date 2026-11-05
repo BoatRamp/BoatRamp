@@ -776,11 +776,24 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                     .as_ref()
                     .map(|c| c.managed_db_privilege)
                     .unwrap_or_default();
+                // The operator trusted-extension allowlist — the only extensions the
+                // post-ready provisioning pass may auto-create for a declared managed DB
+                // (cap-req #28 B3). Same source the migration `Extension` step reads
+                // (`handlers.bindings.sql.migrate_trusted_extensions`), so the two agree.
+                let trusted_extensions: std::collections::BTreeSet<String> = config
+                    .handlers
+                    .as_ref()
+                    .and_then(|h| h.bindings.sql.as_ref())
+                    .and_then(|sql| sql.migrate_trusted_extensions.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 let env = crate::managed_sql::ManagedDbEnv::from_config(
                     &static_dbs,
                     creds,
                     privilege,
                     deploy.clone(),
+                    trusted_extensions,
                 );
                 Some(Arc::new(env) as Arc<_>)
             }

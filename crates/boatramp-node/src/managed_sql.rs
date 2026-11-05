@@ -249,6 +249,14 @@ struct ManagedDbSpec {
     /// per-tenant workload (its per-tenant databases live inside the base server), so
     /// only its exact base name resolves.
     tenant: crate::config::TenantIsolation,
+    /// The database's DECLARED extensions (Postgres), from an applied `databases:` entry
+    /// (`ApplyDatabase.extensions`); empty for a node-static binding (which has no such
+    /// field). The reconcile's post-ready provisioning creates each one that is ALSO on
+    /// the operator trusted-extension allowlist, so a declared `extensions: ["vector"]`
+    /// is actually present once the replica is first healthy (cap-req #28 B3). A declared
+    /// extension NOT on the allowlist is skipped (owner-gated — the operator must permit
+    /// it), never silently created.
+    extensions: Vec<String>,
 }
 
 /// The node's [`ManagedDbEnvResolver`]: the set of managed databases (from the
@@ -275,6 +283,12 @@ pub struct ManagedDbEnv {
     /// endpoint and connect directly to it to probe + provision (the `Provisioned`-gate
     /// carve-out: this connection must reach a not-yet-`Provisioned` replica).
     deploy: DeployStore,
+    /// The operator trusted-extension allowlist (`handlers.bindings.sql.
+    /// migrate_trusted_extensions`) — the ONLY extensions the post-ready provisioning pass
+    /// may `CREATE EXTENSION` for a declared managed DB (cap-req #28 B3). A declared
+    /// extension absent from this set is skipped (never auto-created); the SAME allowlist
+    /// the owner-gated migration `Extension` step enforces, so the two paths agree.
+    trusted_extensions: std::collections::BTreeSet<String>,
 }
 
 /// The uid:gid a stock DB image runs its server process as — both the official
@@ -309,6 +323,7 @@ impl ManagedDbEnv {
         creds: ManagedSqlCredentials,
         privilege: ManagedDbPrivilege,
         deploy: DeployStore,
+        trusted_extensions: std::collections::BTreeSet<String>,
     ) -> Self {
         let mut dbs = HashMap::new();
         for db in databases.values() {
@@ -330,6 +345,9 @@ impl ManagedDbEnv {
                     database,
                     user,
                     tenant: db.tenant,
+                    // A node-static `[databases]` binding has no `extensions` field; only an
+                    // applied declaration declares extensions (populated in `resolve_applied`).
+                    extensions: Vec::new(),
                 },
             );
         }
@@ -339,6 +357,7 @@ impl ManagedDbEnv {
             creds,
             privilege,
             deploy,
+            trusted_extensions,
         }
     }
 
@@ -381,6 +400,82 @@ impl ManagedDbEnv {
             false,
             Some(std::time::Duration::from_secs(10)),
         )
+    }
+
+    /// Create the declared, allowlisted Postgres extensions for a just-ready managed DB
+    /// (cap-req #28 B3). Called from the reconcile's post-ready provisioning pass, so it
+    /// only fires once the replica actually answers — a crash-looping DB (e.g. the ext4
+    /// `lost+found` `initdb` refusal, defect A) never reaches `provision_managed` at all,
+    /// which is exactly why the declared `vector` extension was never created live. It
+    /// connects as the init SUPERUSER to the database's OWN database and runs an idempotent
+    /// `CREATE EXTENSION IF NOT EXISTS` for each declared extension that is ALSO on the
+    /// operator trusted-extension allowlist (`migrate_trusted_extensions`) — the SAME gate
+    /// the owner-gated migration `Extension` step enforces. A declared extension NOT on the
+    /// allowlist is logged + SKIPPED (owner-gated — the operator must permit it), never
+    /// silently created; MySQL has no `CREATE EXTENSION`, so a declared extension there is
+    /// ignored. A creation failure for an ALLOWLISTED extension fails the provision
+    /// (surfaced as `ProvisionFailed`), so a mis-declared/unavailable extension is a visible
+    /// error rather than a silent gap.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    async fn create_declared_extensions(
+        &self,
+        project: &str,
+        workload: &str,
+        db: &ManagedDbSpec,
+        password: String,
+    ) -> Result<(), String> {
+        use boatramp_storage::tenant_provision::quote_ident;
+        if db.extensions.is_empty() {
+            return Ok(());
+        }
+        // Extensions are a Postgres concept; MySQL has no CREATE EXTENSION.
+        if !matches!(db.kind, ExternalSqlKind::Postgres) {
+            for ext in &db.extensions {
+                tracing::warn!(
+                    database = %db.database,
+                    extension = %ext,
+                    "managed db: declared extension ignored — the engine has no CREATE EXTENSION"
+                );
+            }
+            return Ok(());
+        }
+        // Partition declared extensions into allowlisted (create) vs not (skip + warn).
+        let to_create: Vec<&str> = db
+            .extensions
+            .iter()
+            .filter_map(|ext| {
+                if self.trusted_extensions.contains(ext) {
+                    Some(ext.as_str())
+                } else {
+                    tracing::warn!(
+                        database = %db.database,
+                        extension = %ext,
+                        "managed db: declared extension is NOT on the operator trusted-extension \
+                         allowlist (handlers.bindings.sql.migrate_trusted_extensions) — skipped, \
+                         not auto-created"
+                    );
+                    None
+                }
+            })
+            .collect();
+        if to_create.is_empty() {
+            return Ok(());
+        }
+        // Connect as the init superuser to the DB's OWN database (NOT the maintenance db):
+        // `CREATE EXTENSION` installs into the connected database.
+        let admin =
+            self.admin_backend(project, workload, db.kind, &db.database, &db.user, password);
+        for ext in to_create {
+            let create = format!(
+                "CREATE EXTENSION IF NOT EXISTS {};",
+                quote_ident(db.kind, ext)
+            );
+            admin
+                .run_script(&create)
+                .await
+                .map_err(|e| format!("create extension {ext:?} on {}: {e}", db.database))?;
+        }
+        Ok(())
     }
 
     /// Resolve the launched `(project, workload)` to the [`ManagedDbSpec`] whose
@@ -504,6 +599,9 @@ impl ManagedDbEnv {
                 database,
                 user,
                 tenant: lowered.tenant,
+                // Carry the DECLARED extensions through so the post-ready provisioning pass
+                // can create the allowlisted ones (cap-req #28 B3).
+                extensions: apply_db.extensions.clone(),
             });
         }
         None
@@ -586,12 +684,25 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         let Some(db) = self.resolve_spec(project, workload).await else {
             return Ok(());
         };
+        // The init superuser's sealed password (same key the server-init env + the
+        // readiness probe use), needed both to confirm the database and to create the
+        // declared extensions as the superuser.
+        let password = self
+            .creds
+            .password(project, workload)
+            .await
+            .map_err(|e| format!("credential ({workload}): {e}"))?;
         match db.tenant {
             // The shared server hosts every tenant's per-tenant database inside itself;
             // those provision lazily on first connect (`provision_shared`) / via `ensure`,
             // NOT from the server workload's reconcile pass. The server's own default
-            // database comes from its image init. So there is nothing to create here.
-            crate::config::TenantIsolation::Shared => Ok(()),
+            // database comes from its image init — so there is no `CREATE DATABASE` to run
+            // here, but a declared extension on the server's OWN (default) database is still
+            // created (cap-req #28 B3).
+            crate::config::TenantIsolation::Shared => {
+                self.create_declared_extensions(project, workload, &db, password)
+                    .await
+            }
             // A dedicated per-tenant (or single-install) container: ensure its declared
             // database exists on it, authoritatively, every launch. The stock image's
             // `initdb` (POSTGRES_DB) usually already created it, so this is a confirming,
@@ -599,11 +710,6 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
             // post-launch action (not relying solely on the image init) is what lets an
             // operator migrate before any component runs, and makes existence observable.
             crate::config::TenantIsolation::Single => {
-                let password = self
-                    .creds
-                    .password(project, workload)
-                    .await
-                    .map_err(|e| format!("credential ({workload}): {e}"))?;
                 // `CREATE DATABASE` cannot run inside the database being created → connect
                 // to the always-present maintenance database as the init superuser.
                 let admin = self.admin_backend(
@@ -612,7 +718,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                     db.kind,
                     crate::tenant_sql::maintenance_database(db.kind),
                     &db.user,
-                    password,
+                    password.clone(),
                 );
                 let db_id = boatramp_storage::tenant_provision::quote_ident(db.kind, &db.database);
                 let stmt = match db.kind {
@@ -621,13 +727,14 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                     ExternalSqlKind::Postgres => format!("CREATE DATABASE {db_id};"),
                     ExternalSqlKind::Mysql => format!("CREATE DATABASE IF NOT EXISTS {db_id};"),
                 };
-                if let Err(e) = admin.run_script(&stmt).await {
-                    if crate::tenant_sql::is_database_exists_error(&e) {
-                        return Ok(());
-                    }
+                if let Err(e) = admin.run_script(&stmt).await
+                    && !crate::tenant_sql::is_database_exists_error(&e)
+                {
                     return Err(format!("provision {}: {e}", db.database));
                 }
-                Ok(())
+                // The database now exists → create its declared, allowlisted extensions.
+                self.create_declared_extensions(project, workload, &db, password)
+                    .await
             }
         }
     }
@@ -3310,6 +3417,7 @@ mod tests {
             ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope)),
             ManagedDbPrivilege::default(),
             deploy,
+            std::collections::BTreeSet::new(),
         );
 
         // Live set holds only replica -1 → only -0 is an orphan.
@@ -3394,6 +3502,7 @@ mod tests {
             ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope)),
             ManagedDbPrivilege::default(),
             deploy,
+            std::collections::BTreeSet::new(),
         );
 
         // Precondition: the two (project, workload) splits DO alias on one instance_id.
@@ -3576,6 +3685,7 @@ mod tests {
             creds,
             ManagedDbPrivilege::default(),
             DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            std::collections::BTreeSet::new(),
         );
         assert!(!env.is_empty());
 
@@ -3665,6 +3775,7 @@ mod tests {
             creds,
             ManagedDbPrivilege::default(),
             deploy.clone(),
+            std::collections::BTreeSet::new(),
         );
         assert!(
             env.is_empty(),
@@ -3786,6 +3897,7 @@ mod tests {
             creds,
             ManagedDbPrivilege::default(),
             DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            std::collections::BTreeSet::new(),
         );
 
         // A per-tenant workload of `pg-metrics` matches both `pg` and `pg-metrics`;
@@ -3806,6 +3918,78 @@ mod tests {
         assert_eq!(
             env.managed_db_privilege("acme", "pg-metrics-acme").await,
             Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
+        );
+    }
+
+    // --- cap-req #28 B3: declared-extension auto-creation (owner-gated) ---
+
+    fn env_with_allowlist(trusted: &[&str]) -> ManagedDbEnv {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
+        ManagedDbEnv::from_config(
+            &BTreeMap::new(),
+            creds,
+            ManagedDbPrivilege::default(),
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            trusted.iter().map(|s| (*s).to_string()).collect(),
+        )
+    }
+
+    fn pg_spec_with_extensions(extensions: &[&str]) -> ManagedDbSpec {
+        ManagedDbSpec {
+            kind: ExternalSqlKind::Postgres,
+            database: "appdb".into(),
+            user: "app".into(),
+            tenant: crate::config::TenantIsolation::Single,
+            extensions: extensions.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_extensions_not_on_the_allowlist_are_skipped_not_created() {
+        // The owner-gated contract: a declared extension absent from the operator
+        // trusted-extension allowlist is NOT auto-created. With an empty allowlist nothing
+        // is allowlisted, so `create_declared_extensions` returns Ok WITHOUT attempting any
+        // superuser connection (a connect would fail — there is no live endpoint — proving
+        // the skip happened before it).
+        let env = env_with_allowlist(&[]);
+        let spec = pg_spec_with_extensions(&["vector"]);
+        let out = env
+            .create_declared_extensions("default", "bramp-db-x", &spec, "pw".into())
+            .await;
+        assert!(
+            out.is_ok(),
+            "a non-allowlisted extension is skipped, not an error: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_declared_extensions_is_a_noop() {
+        let env = env_with_allowlist(&["vector"]);
+        let spec = pg_spec_with_extensions(&[]);
+        assert!(
+            env.create_declared_extensions("default", "bramp-db-x", &spec, "pw".into())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_extensions_on_mysql_are_ignored() {
+        // MySQL has no CREATE EXTENSION — a declared extension there is ignored (no error,
+        // no connection), even if it is on the allowlist.
+        let env = env_with_allowlist(&["vector"]);
+        let spec = ManagedDbSpec {
+            kind: ExternalSqlKind::Mysql,
+            database: "appdb".into(),
+            user: "app".into(),
+            tenant: crate::config::TenantIsolation::Single,
+            extensions: vec!["vector".to_string()],
+        };
+        assert!(
+            env.create_declared_extensions("default", "bramp-db-x", &spec, "pw".into())
+                .await
+                .is_ok()
         );
     }
 
