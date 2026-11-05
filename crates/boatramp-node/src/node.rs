@@ -293,6 +293,17 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
     // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
+    // Whether this node runs a compute backend at all (cap-req #28 review, F2). `[compute]`
+    // present is the config-level precondition for ANY compute backend: `build_compute`
+    // returns an EMPTY registry when `config.compute` is `None` (even the in-cluster k8s
+    // auto-detect requires a `[compute]` section), so a node with no `[compute]` can never
+    // run a managed database — and the serve-time DECLARED-DB fallback (which puts a
+    // per-project DeployStore/KV read on the SQL hot path for any name with no static
+    // binding) would be pure overhead there, needlessly widening the KV-degradation blast
+    // radius. Gating the fallback on this keeps the mailroom case intact (a k8s/compute node
+    // with an apply-declared `default` and no static binding still gets it) while a
+    // compute-less node stays on the unchanged plain-libsql path.
+    let has_managed_compute_backend = config.compute.is_some();
     let handlers = crate::handlers::build_handler_runtime(
         kv.clone(),
         compute_storage.clone(),
@@ -315,6 +326,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         options.posture.allow_cross_tenant_db,
         &deploy,
         secrets_envelope.clone(),
+        has_managed_compute_backend,
     )
     .await?;
     // JWKS pre-warm (federated-gateway overhead fix): fetch the configured first-party (`own`-tier)
@@ -776,11 +788,24 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                     .as_ref()
                     .map(|c| c.managed_db_privilege)
                     .unwrap_or_default();
+                // The operator trusted-extension allowlist — the only extensions the
+                // post-ready provisioning pass may auto-create for a declared managed DB
+                // (cap-req #28 B3). Same source the migration `Extension` step reads
+                // (`handlers.bindings.sql.migrate_trusted_extensions`), so the two agree.
+                let trusted_extensions: std::collections::BTreeSet<String> = config
+                    .handlers
+                    .as_ref()
+                    .and_then(|h| h.bindings.sql.as_ref())
+                    .and_then(|sql| sql.migrate_trusted_extensions.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 let env = crate::managed_sql::ManagedDbEnv::from_config(
                     &static_dbs,
                     creds,
                     privilege,
                     deploy.clone(),
+                    trusted_extensions,
                 );
                 Some(Arc::new(env) as Arc<_>)
             }

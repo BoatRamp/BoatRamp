@@ -2291,6 +2291,26 @@ pub(super) async fn get_database(
     }
 }
 
+/// The derived managed-DB **server workload** handle for `(project, name)` — the name any
+/// replica of that managed database is actually recorded under. Delegates to the SINGLE
+/// canonical derivation ([`boatramp_storage::tenant_provision::derived_managed_db_workload`],
+/// a collision-resistant digest of the length-prefixed pair) the provisioner + reconcile +
+/// `OperatorSql` all use, so a status view reads replica states by the SAME key they were
+/// written under (cap-req #28 B2 — a naive `bramp-db-{project}-{name}` join never matched).
+///
+/// In a build with no managed-SQL engine linked, `tenant_provision` is not compiled and no
+/// managed DB can ever be provisioned (so no replica is recorded under any workload); the
+/// handle is then advisory only, and the readable historical form is kept rather than
+/// pulling the gated derivation into a lean build.
+#[cfg(feature = "sql-postgres")]
+fn derived_managed_db_workload_handle(project: &str, name: &str) -> String {
+    boatramp_storage::tenant_provision::derived_managed_db_workload(project, name)
+}
+#[cfg(not(feature = "sql-postgres"))]
+fn derived_managed_db_workload_handle(project: &str, name: &str) -> String {
+    format!("bramp-db-{project}-{name}")
+}
+
 /// `GET /api/projects/{proj}/databases/{name}/status` — a read-only status view of a
 /// declared managed database: the stored declaration plus whether it is registered as a
 /// compute workload yet (a coarse "provisioned" signal for `boatramp db status`), and
@@ -2301,6 +2321,7 @@ pub(super) async fn database_status(
     State(deploy): State<DeployStore>,
     Extension(project): Extension<ProjectContext>,
     Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
     Path(name): Path<String>,
 ) -> Response {
     if let Some(bad) = reject_invalid_db(&name) {
@@ -2317,25 +2338,41 @@ pub(super) async fn database_status(
         }
         Err(err) => return deploy_error_response(err),
     };
-    // The derived per-project server workload name (same derivation as the declare path,
-    // `bramp-db-<project>-<name>`) — the operator-visible handle for the managed server.
-    // A read-only view: it reports the DECLARATION only, never a secret. Where the
-    // workload is registered (default project for `Shared`, the caller's project for a
-    // `Single` tenant) varies by isolation, so the coarse "declared" fact is what a status
-    // view honestly asserts.
-    let workload = format!("bramp-db-{}-{}", project.as_ref().as_str(), name);
-    // Surface the workload's live readiness (distinct from the bare declaration): read its
-    // replica states and reduce them to a single honest signal. This is what lets an
-    // operator see "declared but not yet ready to migrate" vs "ready", and turns a
-    // can't-serve-but-looks-running container (e.g. a data-dir-ownership failure) into a
-    // visible `provision_failed` instead of a silent healthy. A workload registered under
-    // a different scope (a `Shared` server lives in the default project) or not yet
-    // launched has no replicas here → `pending` (honest: this view doesn't track it).
+    // The derived per-project server workload name — the operator-visible handle for the
+    // managed server. This MUST be the SAME derivation the provisioner + reconcile use
+    // (`derived_managed_db_workload`, a collision-resistant digest of the `(project, name)`
+    // pair), NOT a naive `bramp-db-{project}-{name}` hyphen-join: the hyphen-join is neither
+    // injective nor the name any replica is actually recorded under, so reading replica
+    // states by it ALWAYS found nothing → `readiness: pending` stuck forever, disagreeing
+    // with `/api/sql/{db}/status` which resolves the workload correctly (cap-req #28 B2).
+    let workload = derived_managed_db_workload_handle(project.as_ref().as_str(), &name);
+    // The workload's recorded replica states — used for the `data_dir` health signal below
+    // and as the readiness fallback when no `OperatorSql` is wired. Now read under the REAL
+    // derived workload (so a default-project managed DB's replicas are actually found).
     let states = deploy
         .list_replica_states(project.as_ref(), &workload)
         .await
         .unwrap_or_default();
-    let readiness = summarize_readiness(&states);
+    // Readiness: delegate to the SAME `OperatorSql::readiness` resolution `/api/sql/{db}/
+    // status` uses whenever it is wired, so the two surfaces report the IDENTICAL signal by
+    // construction (cap-req #28 B2 — they previously disagreed: this view said `pending`
+    // forever while `/api/sql/{db}/status` said `provisioned`). That path resolves the
+    // binding through the daemon/declared merge point and the correct endpoint-project
+    // scope (a `Shared` server lives under the default project), which the bare
+    // per-caller-project replica read cannot see. Fall back to the local replica-state
+    // reduction only when no managed SQL is wired, or if that resolution errors (e.g. a
+    // transient store read) — never 500 a read-only status view.
+    let readiness = match &op {
+        Some(op) => match op.readiness(project.as_ref().as_str(), &name).await {
+            Ok(boatramp_core::sql::SqlReadiness::Managed(r)) => readiness_to_json(r.as_ref()),
+            // A declared DB is always managed; a `NotManaged` verdict (or an error) is not a
+            // reason to regress to the blind local read — but be defensive and fall back.
+            Ok(boatramp_core::sql::SqlReadiness::NotManaged) | Err(_) => {
+                summarize_readiness(&states)
+            }
+        },
+        None => summarize_readiness(&states),
+    };
     // `pending_restart`: whether the current declaration would re-mint a different
     // content-addressed spec than what is actually active (PLAN-sql-true-delta Stage
     // 1b) — `false` (never an error) if no restart capability is wired, the database
@@ -6302,6 +6339,102 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// cap-req #28 B2: `boatramp db status` (`/api/.../databases/{name}/status`) and
+    /// `/api/sql/{db}/status` must report the SAME readiness for the same declared DB. The
+    /// bug was a naive `bramp-db-{project}-{name}` workload join in `database_status` that
+    /// never matched the real digest-derived workload any replica is recorded under → it
+    /// read zero replicas → `readiness: pending` forever, while `/api/sql/{db}/status`
+    /// (via `OperatorSql::readiness`) correctly said `provisioned`.
+    #[cfg(feature = "sql-postgres")]
+    #[tokio::test]
+    async fn database_status_readiness_agrees_with_sql_status() {
+        use boatramp_core::compute::{
+            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
+            ApplyDatabaseTenant, Readiness,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::SqlReadiness;
+
+        let project = "exampleorg";
+        let declared = ApplyDatabase {
+            name: "default".to_string(),
+            kind: ApplyDatabaseKind::Postgres,
+            version: None,
+            extensions: vec![],
+            size: ApplyDatabaseSize::Small,
+            tenant: ApplyDatabaseTenant::Single,
+            tenant_scope: ApplyDatabaseScope::Project,
+            read_only: false,
+            rls_session: false,
+            tenant_guc: None,
+            session_guc: None,
+            tenant_all_marker: None,
+            pool_max: None,
+            connect_timeout_secs: None,
+            startup_grace_secs: None,
+            readiness_gate: Default::default(),
+            delta_capture: false,
+            restart_policy: Default::default(),
+        };
+        let deploy = store();
+        deploy
+            .set_project_database(ProjectRef::new(project), &declared)
+            .await
+            .expect("seed declaration");
+
+        // The status view reports the REAL digest-derived workload, never the naive join.
+        let naive = format!("bramp-db-{project}-default");
+        let derived =
+            boatramp_storage::tenant_provision::derived_managed_db_workload(project, "default");
+        assert_ne!(
+            derived, naive,
+            "the derived workload must not be the naive join"
+        );
+
+        // (a) With `OperatorSql` wired, readiness is delegated to it → the SAME source
+        //     `/api/sql/{db}/status` uses: `provisioned`, NOT `pending`.
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakeReadinessSql(
+            std::sync::Mutex::new(Ok(SqlReadiness::Managed(Some(Readiness::Provisioned)))),
+        ));
+        let resp = database_status(
+            State(deploy.clone()),
+            Extension(ProjectContext(project.into())),
+            Extension(None),
+            Extension(Some(op)),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["declared"], true);
+        assert_eq!(body["workload"], derived);
+        assert_eq!(
+            body["readiness"]["state"], "provisioned",
+            "readiness must agree with /api/sql/:db/status, not be stuck pending: {body}"
+        );
+
+        // (b) Fallback (no OperatorSql wired): the replica-state read now uses the REAL
+        //     derived workload, so a healthy replica recorded under it reports
+        //     `provisioned` too — the pre-fix naive join read nothing → `pending`.
+        deploy
+            .set_replica_state(
+                ProjectRef::new(project),
+                &obs(project, &derived, 0, "10.0.0.2", true, None),
+            )
+            .await
+            .expect("seed replica");
+        let resp = database_status(
+            State(deploy),
+            Extension(ProjectContext(project.into())),
+            Extension(None),
+            Extension(None),
+            Path("default".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["readiness"]["state"], "provisioned");
     }
 
     /// An `OperatorSql` whose `dependents_of_workload` returns a canned list — so the WS5
