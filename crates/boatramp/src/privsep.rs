@@ -848,6 +848,87 @@ fn compute_unseal_allowlists(
     out
 }
 
+/// Deterministically select the SEALER (bootstrap-unseal) feature-link a split `token.signer` instance
+/// asks its `secrets.sealer` over (signer-key unlock, [`run_signer_unlock`]). **WS-E residual #5.**
+///
+/// Phase 1 picked `fds.links.next()` — fine while a split signer had exactly ONE link (to its sealer).
+/// But a `token.signer` now also gains WS-E **minting-consumer** links (an `AuthorityServe`-marked
+/// frontend→signer authority link), so "the first link" is no longer unambiguously the sealer link —
+/// a blind `.next()` could grab a minting-consumer link and send the sealed signer-key request down
+/// the wrong peer. This selects the bootstrap-unseal link by its PURPOSE in the resolved on-disk
+/// topology (restart-class, never control-plane-derived): the UNIQUE link wired to `label` whose PEER
+/// holds [`HostAuthority::SecretsSealer`] and which is NOT purpose-marked
+/// [`LinkPurpose::AuthorityServe`]/[`LinkPurpose::Relay`] (those are the minting-consumer / serving-splice
+/// shapes, never the sealer-unlock link — and the closure lint already forbids marking a two-crown
+/// signer↔sealer link `authority-serve`). It is intersected with the links the root actually wired to
+/// this instance ([`PrivsepChildFds::links`]), so a topology link with no handed fd is never selected.
+///
+/// **Fail-closed, mirroring the WS-D per-tenant supervisor's >1-link refusal** (`run_per_tenant_supervisor`):
+/// ZERO candidates ⇒ refuse (a sealed-key signer with no sealer link is a broken composition — the
+/// closure lint requires one); MORE THAN ONE ⇒ refuse the ambiguous composition rather than silently
+/// pick one via `.next()`. Pure (host-testable).
+fn select_sealer_link(
+    config: &ServerConfig,
+    label: &str,
+    wired: &BTreeMap<String, i32>,
+) -> Result<(String, i32), String> {
+    let Some(privsep) = config.privsep.as_ref() else {
+        return Err(
+            "a sealed-key signer requires a [privsep] composition to locate its secrets.sealer link"
+                .to_string(),
+        );
+    };
+    let holds = |lbl: &str, authority: HostAuthority| -> bool {
+        privsep
+            .instances
+            .get(lbl)
+            .is_some_and(|i| i.capabilities.contains(&authority))
+    };
+    let mut candidates: Vec<(String, i32)> = Vec::new();
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to {
+            continue;
+        }
+        // A minting-consumer (authority-serve) or serving-splice (relay) link is NEVER the
+        // sealer-unlock link — exclude them explicitly so the unlock request can only ride the
+        // bootstrap-unseal link.
+        if link.is_authority_serve() || link.is_relay() {
+            continue;
+        }
+        let peer = if link.from == label {
+            &link.to
+        } else if link.to == label {
+            &link.from
+        } else {
+            continue;
+        };
+        if !holds(peer, HostAuthority::SecretsSealer) {
+            continue;
+        }
+        // Only a link the root actually wired an fd for is usable.
+        if let Some(&fd) = wired.get(link_name) {
+            candidates.push((link_name.clone(), fd));
+        }
+    }
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!(
+            "a sealed-key signer instance {label:?} has no root-wired feature-link to a \
+             secrets.sealer (the composition-closure lint requires one); refusing fail-closed"
+        )),
+        _ => {
+            let mut names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+            names.sort_unstable();
+            Err(format!(
+                "a sealed-key signer instance {label:?} is wired to {} candidate secrets.sealer \
+                 links {names:?}, but it expects EXACTLY one (the bootstrap-unseal link); refusing \
+                 the ambiguous composition fail-closed rather than picking one via `.next()`",
+                candidates.len(),
+            ))
+        }
+    }
+}
+
 /// Compute the per-instance WS-E **authority-serve link** designation the root wires onto each
 /// crown-jewel (`secrets.sealer` / `token.signer`) instance: the feature-links on which that instance
 /// should serve the seal/unseal/mint_token grammar to a relayed end principal. Secret-blind (link
@@ -2225,15 +2306,13 @@ mod instance_serve {
                 .map_err(|e| format!("building a runtime for in-process unseal: {e}"))?;
             rt.block_on(resolver.resolve(key_ref))?
         } else {
-            // Split signer: ask the sealer over its single feature-link.
-            let (lname, link_fd) = fds.links.iter().next().ok_or_else(|| {
-                "a sealed-key signer instance has no feature-link to a secrets.sealer (the \
-                     composition-closure lint requires one)"
-                    .to_string()
-            })?;
-            tracing::info!(instance = %label, link = %lname, "[privsep] signer: asking the sealer to unseal its signing key over the link");
+            // Split signer: ask the sealer over its SEALER link, selected EXPLICITLY by purpose (WS-E
+            // residual #5) — NEVER a blind `.next()`, now that the signer also gains WS-E
+            // minting-consumer links. Fail-closed if absent/ambiguous.
+            let (lname, link_fd) = super::select_sealer_link(config, label, &fds.links)?;
+            tracing::info!(instance = %label, link = %lname, "[privsep] signer: asking the sealer to unseal its signing key over the explicitly-selected sealer link");
             // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
-            let link = unsafe { LinkEndpoint::from_inherited_fd(*link_fd) };
+            let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
             boatramp_server::privsep_unseal::request_unseal(&link, key_ref)
                 .map_err(|e| format!("unsealing the signing key over the link: {e}"))?
         };
@@ -3760,6 +3839,81 @@ mod tests {
         // No `[serve.signer]` sealed source ⇒ no allowlist wired at all (AwsKms/ambient/absent).
         let cfg = cfg_with(Some(split_signer_privsep()));
         assert!(compute_unseal_allowlists(&cfg).is_empty());
+    }
+
+    // ---- WS-E residual #5: the signer selects its SEALER link explicitly (by purpose) ----
+
+    #[test]
+    fn select_sealer_link_picks_the_bootstrap_link_for_a_split_signer() {
+        let cfg = cfg_with(Some(split_signer_privsep()));
+        // The root wired the signer exactly the `to-signer` bootstrap-unseal link (fd 7).
+        let mut wired = BTreeMap::new();
+        wired.insert("to-signer".to_string(), 7);
+        let (name, fd) = super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
+        assert_eq!(name, "to-signer");
+        assert_eq!(fd, 7);
+    }
+
+    #[test]
+    fn select_sealer_link_ignores_an_authority_serve_minting_link() {
+        // The signer gains a WS-E minting-consumer link (frontend→signer, AuthorityServe). The selector
+        // must IGNORE it and still pick the bootstrap-unseal link — never send the key request there.
+        let mut p = split_signer_privsep();
+        p.instances.insert(
+            "frontend".to_string(),
+            inst(&[HostAuthority::ListenPublicTls], &["to-mint"]),
+        );
+        p.links.insert(
+            "to-mint".to_string(),
+            PrivsepLink {
+                from: "frontend".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        let cfg = cfg_with(Some(p));
+        let mut wired = BTreeMap::new();
+        wired.insert("to-signer".to_string(), 7);
+        wired.insert("to-mint".to_string(), 9); // the minting-consumer link is also wired
+        let (name, fd) = super::select_sealer_link(&cfg, "signer", &wired).expect("one sealer link");
+        assert_eq!(name, "to-signer", "must pick the bootstrap link, not the mint link");
+        assert_eq!(fd, 7);
+    }
+
+    #[test]
+    fn select_sealer_link_refused_when_absent() {
+        // A signer with no root-wired link to a secrets.sealer is refused fail-closed.
+        let cfg = cfg_with(Some(split_signer_privsep()));
+        let wired = BTreeMap::new(); // nothing wired
+        let err = super::select_sealer_link(&cfg, "signer", &wired).unwrap_err();
+        assert!(err.contains("no root-wired feature-link"), "got {err}");
+    }
+
+    #[test]
+    fn select_sealer_link_refused_when_ambiguous() {
+        // Two sealer-shaped links to the signer ⇒ ambiguous ⇒ refuse rather than `.next()`.
+        let mut p = split_signer_privsep();
+        // A second, separate sealer instance also linked to the signer (an unusual, ambiguous shape).
+        p.instances.insert(
+            "sealer2".to_string(),
+            inst(&[HostAuthority::SecretsSealer], &["to-sealer2"]),
+        );
+        p.links.insert(
+            "to-sealer2".to_string(),
+            PrivsepLink {
+                from: "sealer2".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
+            },
+        );
+        let cfg = cfg_with(Some(p));
+        let mut wired = BTreeMap::new();
+        wired.insert("to-signer".to_string(), 7);
+        wired.insert("to-sealer2".to_string(), 8);
+        let err = super::select_sealer_link(&cfg, "signer", &wired).unwrap_err();
+        assert!(err.contains("ambiguous"), "got {err}");
     }
 
     #[test]
