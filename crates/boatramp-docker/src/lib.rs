@@ -713,7 +713,12 @@ impl ComputeBackend for DockerBackend {
         // loopback with an ephemeral host port (discovered after start), so a
         // host-native `serve` can reach it even when the bridge IP is not host-routable
         // (Docker Desktop / macOS). `Bridge` leaves the container unpublished.
-        if self.endpoint == DockerEndpoint::Published {
+        //
+        // Only when the workload actually HAS a port: a no-port workload (`port == 0`) must NOT
+        // emit a `0/tcp` spec — Docker 29.x rejects it with 400 ("invalid port specification:
+        // 0/tcp"), where Docker 28 tolerated it (the same 28→29 strictness class as the 63-octet
+        // DNS-label cap above). A port-0 workload publishes nothing and has no host endpoint.
+        if self.endpoint == DockerEndpoint::Published && port != 0 {
             config.exposed_ports = Some(HashMap::from([(port_key.clone(), HashMap::new())]));
             host_config.port_bindings = Some(HashMap::from([(
                 port_key.clone(),
@@ -793,6 +798,8 @@ impl ComputeBackend for DockerBackend {
         // Reachable endpoint: the published host loopback port (default), or the
         // container's bridge IP + in-container port (`Bridge`).
         let (host, endpoint_port) = match self.endpoint {
+            // A no-port workload published nothing (see above) — no host port to discover.
+            DockerEndpoint::Published if port == 0 => ("127.0.0.1".to_string(), 0),
             DockerEndpoint::Published => (
                 "127.0.0.1".to_string(),
                 self.published_host_port(&created.id, &port_key).await?,
