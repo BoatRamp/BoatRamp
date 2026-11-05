@@ -508,6 +508,18 @@ pub fn router_with_fast(
             "/api/project-prune",
             get(project_prune_report).post(project_prune_apply),
         )
+        // `project sync` selective control-plane KV transport (PLAN-project-sync): carry the
+        // NON-SECRET KV strata (settings / graphql / history) one named project + piece at a time.
+        // `GET` = SOURCE read of the `?project=`+`?piece=` slice; `POST` = DEST write of a slice onto
+        // the `?project=` target. `Project·Admin` on the `?project=` target (scoped THROUGH `query`,
+        // uniform with the export/import/prune/clone family — NEVER node-global `System·Admin`,
+        // NEVER another tenant), re-checked defense-in-depth at the handler. The read/write prefixes
+        // are built from the AUTHENTICATED project binding + the piece taxonomy, never a client key
+        // path; sealed-secret families can never cross (the `secrets` piece is refused).
+        .route(
+            "/api/project-kv-stratum",
+            get(kv_stratum_read).post(kv_stratum_write),
+        )
         // Streaming project CLONE (PLAN-project-clone, increment 1): the SOURCE manifest + filtered
         // member stream, and the TARGET orchestrator. Reached as `/api/projects/<proj>/clone/…`
         // (project-scoped, rewritten here by `project_scope`), so authz gates the family at

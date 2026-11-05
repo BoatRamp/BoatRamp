@@ -657,6 +657,57 @@ impl<'a> OpScope<'a> {
     }
 }
 
+/// One control-plane KV record on the selective-sync wire (`/api/project-kv-stratum`): the key
+/// verbatim + its value base64-encoded. The CLI RELAYS these opaquely (source → dest) and never
+/// inspects a value — so it needs no base64 dependency, and the value never lands in a log/argv.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KvStratumEntry {
+    /// The control-plane KV key, exactly as the source stored it.
+    pub key: String,
+    /// The value bytes, base64 (standard alphabet) — relayed opaquely.
+    pub value_b64: String,
+}
+
+/// The `GET /api/project-kv-stratum` response shape (the source slice).
+#[derive(Debug, serde::Deserialize)]
+struct KvStratumReadBody {
+    #[serde(default)]
+    entries: Vec<KvStratumEntry>,
+}
+
+/// The `POST /api/project-kv-stratum` request body (land a slice on the target).
+#[derive(Debug, serde::Serialize)]
+struct KvStratumWriteBody<'a> {
+    source_project: &'a str,
+    exclude_prefixes: &'a [String],
+    entries: &'a [KvStratumEntry],
+}
+
+/// One entry the DEST write skipped (incoherent / excluded), relayed back for the operator report.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct KvStratumSkip {
+    /// The target key that was not written.
+    pub key: String,
+    /// Why it was skipped.
+    pub reason: String,
+}
+
+/// The `POST /api/project-kv-stratum` outcome: records landed, entries skipped-and-reported, and
+/// system-principal markers the dest neutralized.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct KvStratumWriteOutcome {
+    /// Records actually written to the destination.
+    pub written: usize,
+    /// Entries skipped (incoherent / excluded) — never half-applied; drives `--strict`.
+    #[serde(default)]
+    pub skipped: Vec<KvStratumSkip>,
+    /// System-principal markers (`current-principal/<site>`) the dest refused to write (always,
+    /// fail-closed) — a `Project·Admin` carry can never grant a site the System principal.
+    /// Informational only; NEVER triggers a `--strict` refuse.
+    #[serde(default)]
+    pub neutralized: Vec<String>,
+}
+
 impl ControlPlane {
     /// Wrap an already-built client and resolved server base.
     pub fn new(base: String, http: ApiClient, project: String) -> Self {
@@ -1524,6 +1575,83 @@ impl ControlPlane {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    // ---- selective-sync control-plane KV strata (PLAN-project-sync) --------
+    //
+    // The per-stratum, project-scoped admin KV transport `project sync` uses to carry the
+    // NON-SECRET control-plane strata (settings / graphql / history) it could not before. Both
+    // verbs are `Project·Admin` on this ControlPlane's project (the dest token on `self`, or the
+    // SOURCE node's forwarded Project-Admin token when `self` is a cross-node source client).
+
+    /// SOURCE read: fetch this project's `piece` KV slice
+    /// (`GET /api/project-kv-stratum?project=<p>&piece=<piece>`). Returns the opaque wire entries
+    /// (key + base64 value); the CLI relays them to the dest WITHOUT decoding. A server refusal
+    /// (a non-carryable piece, a scope guard, a degraded read) surfaces as a [`ClientError`]
+    /// carrying the server's reason.
+    pub async fn get_kv_stratum(&self, piece: &str) -> Result<Vec<KvStratumEntry>> {
+        let Self {
+            http: client,
+            base: server,
+            project,
+            ..
+        } = self;
+        let resp = client
+            .get(format!("{server}/api/project-kv-stratum"))
+            .query(&[("project", project.as_str()), ("piece", piece)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "kv-stratum read of `{piece}` for project `{project}` refused ({status}): {}",
+                text.trim_end()
+            )));
+        }
+        let body: KvStratumReadBody = resp.json().await?;
+        Ok(body.entries)
+    }
+
+    /// DEST write: land a `piece` KV slice on this project
+    /// (`POST /api/project-kv-stratum?project=<p>&piece=<piece>`). `source_project` re-keys the
+    /// leading segment (a no-op for a same-name sync); `exclude_prefixes` are the engine's
+    /// coherence excludes. The server STRUCTURALLY re-validates every key against the target's own
+    /// piece prefixes and applies the history→siteconfig dependency, so the returned
+    /// [`KvStratumWriteOutcome`] reports what landed + what was skipped. A run-level refusal (a
+    /// scope-guard rejection, a write failure) surfaces as a [`ClientError`].
+    pub async fn put_kv_stratum(
+        &self,
+        piece: &str,
+        source_project: &str,
+        exclude_prefixes: &[String],
+        entries: &[KvStratumEntry],
+    ) -> Result<KvStratumWriteOutcome> {
+        let Self {
+            http: client,
+            base: server,
+            project,
+            ..
+        } = self;
+        let resp = client
+            .post(format!("{server}/api/project-kv-stratum"))
+            .query(&[("project", project.as_str()), ("piece", piece)])
+            .json(&KvStratumWriteBody {
+                source_project,
+                exclude_prefixes,
+                entries,
+            })
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "kv-stratum write of `{piece}` to project `{project}` refused ({status}): {}",
+                text.trim_end()
+            )));
+        }
+        Ok(resp.json().await?)
     }
 
     /// Fetch the read-only status view of a declared managed database

@@ -31,6 +31,11 @@ name: CI
 #                       REAL router() pipeline — access-denied with no provider source installed, then
 #                       applied + captured once serve's boot wiring installs it — so the serve seam
 #                       can't regress to inert again),
+#                       live-gate-kv-stratum-sync (PLAN-project-sync: the node-side selective-sync KV
+#                       endpoint carrying settings/graphql/history between two in-process router()
+#                       nodes — round-trip + coherence, the history→siteconfig dependency skip, an
+#                       idempotent resync, and the ≥2-tenant cross-tenant zero-leak that is mandatory
+#                       for a KV transport),
 #                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
 #                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
 #                       that must never compression-mangle a framed body),
@@ -1723,6 +1728,41 @@ jobs:
             || { echo "::error::dns-publish serve-install boot smoke did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'DNS-PUBLISH SERVE-INSTALL-BOOT OK' dns-publish-install-boot.log \
             || { echo "::error::serve did NOT call install_dns_publish_source at boot — the #24 inert-ship call-site regressed (cap-req #25)" >&2; exit 1; }
+
+  # PLAN-project-sync KV-STRATUM SYNC LIVE GATE (marker `KV STRATUM SYNC GATE OK`). The node-side
+  # selective-sync KV endpoint (`GET`/`POST /api/project-kv-stratum`) `project sync` carries the
+  # NON-SECRET control-plane strata over (settings / graphql / history). Stands up TWO in-process
+  # nodes (two `router()`s over two DeployStores) and drives the REAL endpoints end-to-end via
+  # `tower::oneshot` — no Docker, no managed DB (the transport is pure control-plane KV). It asserts
+  # the round-trip + coherence, the history→siteconfig dependency skip-and-report (PLAN rule 3), an
+  # idempotent resync, AND — mandatory for a KV transport — the ≥2-tenant cross-tenant isolation:
+  # with the source holding BOTH `acme` and `globex`, a sync of `acme` reads ZERO globex keys and a
+  # crafted globex/global/sealed write under an `acme`-scoped request is REFUSED fail-closed,
+  # leaving `globex` with ZERO bytes on the dest. `#[ignore]`d + greped here (marker + pass count),
+  # so a silent skip or a scoping regression fails the merge (ignore-gated-tests-not-evidence).
+  live-gate-kv-stratum-sync:
+    name: live gate (project-sync KV strata)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-kv-stratum-sync-musl
+
+      - name: "project-sync KV-stratum gate (settings/graphql/history carry coherent+idempotent; history→siteconfig dependency; ≥2-tenant zero-leak, through router())"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --test project_kv_stratum_sync_live \
+            -- --ignored --nocapture 2>&1 | tee kv-stratum-sync.log
+          grep -qE 'test result: ok\. 1 passed' kv-stratum-sync.log \
+            || { echo "::error::project-sync KV-stratum gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'KV STRATUM SYNC GATE OK' kv-stratum-sync.log \
+            || { echo "::error::KV-stratum sync gate never reached its marker (a carry/coherence regression, a history→siteconfig dependency break, or a CROSS-TENANT leak in the selective-sync KV endpoint)" >&2; exit 1; }
 
   # PLAN-connect-grpc §9 IU-1 CONNECT-UNARY LIVE GATE (marker `CONNECT UNARY LIVE OK`). The
   # Connect / gRPC-web transport's milestone-1 end-to-end proof: a REAL compiled guest component

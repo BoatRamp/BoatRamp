@@ -90,6 +90,51 @@ pub fn sealed_secret_prefixes(project: ProjectRef<'_>) -> Vec<String> {
     ]
 }
 
+/// Whether `key` is a site's **system-principal activation marker**
+/// (`project/<p>/current-principal/<site>`, [`crate::deploy::keys::current_principal`]) — the record
+/// [`DeployStore::current_activator_is_system`](crate::deploy::DeployStore::current_activator_is_system)
+/// reads to decide whether a `run_as: deployer` workload runs with the node-global **System**
+/// principal (base-partition / write-global / system-signed-context).
+///
+/// This marker MUST NEVER be carried across a control-plane transport — not `project sync`'s KV
+/// stratum, nor an export/import bundle's control-plane slice. BOTH are gated **`Project·Admin`**
+/// (never node-global `System·Admin`), so writing the marker verbatim on the destination would let
+/// a tenant Project·Admin GRANT a site the System principal — either by FORGING the slice (the
+/// POST / bundle body is attacker-controlled) or by INHERITING a source site's marker — WITHOUT
+/// ever holding `System·Admin` (a privilege escalation that defeats the id-bound / fail-closed-clear
+/// activation machinery and the "never inherit a node-global authority through a per-project
+/// mapping" rule). The marker may only be (re)granted by a **dest-side `System·Admin` activation**,
+/// so every control-plane IMPORT/WRITE side strips it and the destination fails closed. Project-
+/// agnostic (matches any `project/<any>/current-principal/…`), so a single call guards a slice that
+/// a crafted bundle mis-labels. `current/` and `history/` still carry — zero data-plane fidelity
+/// lost.
+#[must_use]
+pub fn is_system_principal_marker_key(key: &str) -> bool {
+    let mut seg = key.split('/');
+    seg.next() == Some("project")
+        && seg.next().is_some() // the <project> segment
+        && seg.next() == Some("current-principal")
+}
+
+/// Strip every [`is_system_principal_marker_key`] entry from a re-keyed, already-tenancy-enforced
+/// control-plane KV slice IN PLACE, returning the removed keys (for an audit note). The fail-closed
+/// neutralization every control-plane carry applies on its DEST/IMPORT side (`project sync`'s dest
+/// write + the `project import` full-slice and delta-upsert arms) so the system-activation marker
+/// can never cross a `Project·Admin` seam. Leaving a DELTA *tombstone* that deletes the marker is
+/// safe (it only ever CLEARS authority), so this is applied to upserts, never to tombstones.
+pub fn strip_system_principal_markers(entries: &mut Vec<crate::kv::KvDumpEntry>) -> Vec<String> {
+    let mut removed = Vec::new();
+    entries.retain(|e| {
+        if is_system_principal_marker_key(&e.key) {
+            removed.push(e.key.clone());
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 /// Scope a whole-store KV scan down to the keys a single `project` owns — the C1 cross-tenant
 /// isolation filter applied to the exported control-plane slice. Keeps ONLY [`project_owns_key`]
 /// matches plus the content-addressed site-config bodies (`siteconfig/<hash>`) this project's own
@@ -1180,5 +1225,54 @@ mod tests {
                 _ => panic!("event variant changed across the round-trip"),
             }
         }
+    }
+
+    /// The system-principal marker predicate recognises `project/<p>/current-principal/<site>` for
+    /// ANY project (so a crafted/mis-labelled slice is caught) and nothing else — not the sibling
+    /// `current/` deploy pointer, not `history/`, not a secret.
+    #[test]
+    fn is_system_principal_marker_key_matches_only_current_principal() {
+        assert!(is_system_principal_marker_key(
+            "project/acme/current-principal/web"
+        ));
+        assert!(is_system_principal_marker_key(
+            "project/globex/current-principal/shop"
+        ));
+        // NOT the deploy pointer or history list (these DO still carry).
+        assert!(!is_system_principal_marker_key("project/acme/current/web"));
+        assert!(!is_system_principal_marker_key("project/acme/history/web"));
+        assert!(!is_system_principal_marker_key(
+            "project/acme/config/tenancy"
+        ));
+        assert!(!is_system_principal_marker_key(
+            "project/acme/secret/current-principal"
+        ));
+    }
+
+    /// `strip_system_principal_markers` removes exactly the marker entries IN PLACE and reports
+    /// them, leaving `current/` + `history/` (and everything else) untouched — the fail-closed
+    /// neutralization every control-plane IMPORT/WRITE side applies so a `Project·Admin` seam can
+    /// never GRANT a site the System principal.
+    #[test]
+    fn strip_system_principal_markers_drops_only_the_marker() {
+        let mut entries = vec![
+            e("project/acme/current/web", b"deploy-1"),
+            e("project/acme/current-principal/web", b"system:deploy-1"),
+            e("project/acme/history/web", b"[]"),
+            e("project/acme/current-principal/shop", b"system:deploy-9"),
+        ];
+        let removed = strip_system_principal_markers(&mut entries);
+        assert_eq!(
+            removed,
+            vec![
+                "project/acme/current-principal/web".to_string(),
+                "project/acme/current-principal/shop".to_string(),
+            ]
+        );
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["project/acme/current/web", "project/acme/history/web"]
+        );
     }
 }

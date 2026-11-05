@@ -57,15 +57,6 @@ pub enum Error {
          --clone-source-token-file <path> or set BOATRAMP_CLONE_SOURCE_TOKEN"
     )]
     MissingSourceToken,
-    /// The selection names a control-plane KV stratum the CLI cannot carry over the wire yet — a
-    /// PRE-write refusal (fail-fast), so a half-sync can never be left behind (HIGH-1).
-    #[error(
-        "`project sync` cannot carry the {0} control-plane KV stratum over the CLI yet: there is \
-         no per-key admin KV API and the whole-slice clone is not piece-selective. Exclude it (the \
-         destination's own `apply` brings it), or carry it with a full `project import \
-         --clone-from`. A node-side selective-sync endpoint is the follow-up."
-    )]
-    StratumUnsupported(String),
     /// A cross-node `--include-domains` carry without the explicit cutover intent (LOW-5).
     #[error(
         "refusing a cross-node `--include-domains` carry: the destination's host-uniqueness guard \
@@ -262,32 +253,18 @@ impl SyncArgs {
     }
 }
 
-/// The included KV-stratum pieces the CLI cannot carry over the wire yet (no per-key admin KV API;
-/// the whole-slice clone is not piece-selective). The pure engine supports them; this is the CLI
-/// WIRING gap. A `--apply` naming any of these is refused up front (HIGH-1); the dry-run shows them
-/// honestly as "not carried", never `carry`.
-fn cli_unsupported_strata(selection: &Selection) -> Vec<Piece> {
-    [Piece::Settings, Piece::Graphql, Piece::History]
-        .into_iter()
-        .filter(|p| selection.includes(*p))
-        .collect()
-}
-
 /// The typed result of `project sync`: the preflight plan + operator notes, and (on `--apply`) the
 /// apply outcome. Rendered by [`crate::output`].
 #[derive(Debug, serde::Serialize)]
 pub struct SyncReport {
     /// The preflight plan (destination precondition + per-piece + per-item classification).
     pub plan: SyncPlan,
-    /// Operator notes (seams not wired on this platform; where item rows come from).
+    /// Operator notes (seams not wired on this platform; where item rows come from; any KV-stratum
+    /// records the dest skipped-and-reported).
     pub notes: Vec<String>,
     /// The APPLY outcome when `--apply` executed; `None` for a dry-run preflight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<SyncApplyReport>,
-    /// Included KV strata the CLI cannot carry over the wire yet — shown honestly in the dry-run as
-    /// "not carried" rather than `carry` (the pure engine supports them; this is the wiring gap).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cli_unsupported: Vec<Piece>,
 }
 
 impl crate::output::Rendered for SyncReport {
@@ -315,18 +292,6 @@ impl crate::output::Rendered for SyncReport {
 
         writeln!(w, "pieces:")?;
         for pp in &p.pieces {
-            // HIGH-1: the CLI cannot carry some included KV strata yet — tell the truth here
-            // instead of echoing the engine's `carry` disposition (the dry-run must not lie).
-            if pp.included && self.cli_unsupported.contains(&pp.piece) {
-                writeln!(
-                    w,
-                    "  [{:<9}] {:<10} NOT carried over the CLI — needs a node-side selective-sync \
-                     endpoint; exclude it or use `project import --clone-from` (`--apply` is refused)",
-                    "unsupported",
-                    pp.piece.as_str(),
-                )?;
-                continue;
-            }
             writeln!(
                 w,
                 "  [{:<9}] {:<10} {}",
@@ -507,20 +472,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
 
     let mut notes: Vec<String> = Vec::new();
 
-    // 3a) HIGH-1 (fail-fast): a selection naming a KV stratum the CLI cannot carry is refused BEFORE
-    //     any network I/O or mutation — never a half-sync after pg+blobs have already moved. The
-    //     dry-run does NOT refuse; it shows those strata honestly as "not carried" (see render).
-    let cli_unsupported = cli_unsupported_strata(&selection);
-    if args.apply && !cli_unsupported.is_empty() {
-        let list = cli_unsupported
-            .iter()
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::StratumUnsupported(list));
-    }
-
-    // 3b) LOW-5: a cross-node `--include-domains` carry can create a second live owner of a host the
+    // 3a) LOW-5: a cross-node `--include-domains` carry can create a second live owner of a host the
     //     remote source still serves (the dest's hijack guard is same-node only). Refuse an apply
     //     without the explicit cutover intent, and always note the hazard loudly.
     let cross_node_domains = source_is_url && selection.includes(Piece::Domains);
@@ -691,7 +643,6 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
             plan,
             notes,
             applied: None,
-            cli_unsupported,
         });
     }
 
@@ -715,14 +666,18 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         source_dbs,
         pg_included: selection.includes(Piece::Pg),
         blobs_included: selection.includes(Piece::Blobs),
+        strict: selection.strict,
         data_transferred: false,
+        kv_skip_notes: Vec::new(),
     };
     let applied = apply_sync(&plan, &mut exec).await?;
+    // Surface any KV-stratum records the dest skipped-and-reported (PLAN rule 3) in the operator
+    // notes (under `--strict` a skip already aborted the run inside `carry_kv_stratum`).
+    notes.append(&mut exec.kv_skip_notes);
     Ok(SyncReport {
         plan,
         notes,
         applied: Some(applied),
-        cli_unsupported, // empty on the apply path (a non-empty set was refused up front)
     })
 }
 
@@ -746,15 +701,12 @@ fn resolve_source_token(file: Option<&std::path::Path>) -> Option<Vec<u8>> {
 
 /// The CLI binding of [`SyncExecutor`] to the real control-plane + the clone/import transport. It
 /// REUSES — never rebuilds — the transport: the data plane rides the `clone --from` (data-only)
-/// path, managed-DB bindings ride `declare_database` (declare + provision), and site configs ride
+/// path, managed-DB bindings ride `declare_database` (declare + provision), site configs ride
 /// `fetch_site_config`/`put_site_config` (the latter is the node's `set_site_config`, with the
-/// host-uniqueness hijack guard that surfaces an exclusive-domain double-claim as a `409`).
-///
-/// GAP (surfaced honestly, not silently): a SELECTIVE control-plane KV-stratum carry (settings /
-/// graphql / history, and `domainverify` proofs under `--identity adopt`) has NO over-the-wire seam
-/// today — there is no per-key admin KV API, and the whole-slice clone is not piece-selective. Those
-/// strata return [`SyncApplyError::Unsupported`]; the pure engine supports them (unit-tested) and a
-/// node-side selective-sync endpoint is the follow-up.
+/// host-uniqueness hijack guard that surfaces an exclusive-domain double-claim as a `409`), and the
+/// NON-SECRET control-plane KV strata (settings / graphql / history) ride the node-side
+/// selective-sync KV endpoint ([`ControlPlane::get_kv_stratum`] on the source /
+/// [`ControlPlane::put_kv_stratum`] on the dest) — the gap this closes.
 struct CliSyncExecutor {
     dest_cp: ControlPlane,
     source_cp: ControlPlane,
@@ -765,7 +717,12 @@ struct CliSyncExecutor {
     source_dbs: Vec<boatramp_core::compute::ApplyDatabase>,
     pg_included: bool,
     blobs_included: bool,
+    /// `--strict`: a KV-stratum record the dest skips-and-reports aborts the whole run (PLAN rule 3).
+    strict: bool,
     data_transferred: bool,
+    /// KV-stratum records the dest skipped-and-reported under the default (non-strict) posture,
+    /// drained into the operator report by `run()`.
+    kv_skip_notes: Vec<String>,
 }
 
 /// MEDIUM-2 (cross-tenant path-traversal guard): validate a SOURCE-derived resource `name` BEFORE
@@ -855,15 +812,68 @@ impl SyncExecutor for CliSyncExecutor {
         &mut self,
         piece: Piece,
         _target_prefixes: &[String],
-        _exclude_prefixes: &BTreeSet<String>,
+        exclude_prefixes: &BTreeSet<String>,
     ) -> std::result::Result<usize, SyncApplyError> {
-        Err(SyncApplyError::Unsupported(format!(
-            "carrying the `{p}` control-plane KV stratum needs a node-side selective-sync endpoint \
-             (there is no per-key admin KV API, and the whole-slice clone is not piece-selective). \
-             For now carry it with a full `project import --clone-from`, or exclude `{p}` and let \
-             the destination's own `apply` bring it.",
-            p = piece.as_str()
-        )))
+        let tok = piece.as_str();
+        // READ the source slice (the SOURCE endpoint scopes it to the piece's own project prefixes)…
+        let entries =
+            self.source_cp
+                .get_kv_stratum(tok)
+                .await
+                .map_err(|e| SyncApplyError::Carry {
+                    piece: tok,
+                    message: e.to_string(),
+                })?;
+        // …and WRITE it to the dest. The DEST endpoint re-keys source→target, STRUCTURALLY enforces
+        // the target's own piece prefixes (fail-closed), and applies the engine's coherence excludes
+        // + the history→siteconfig dependency, returning what landed + what it skipped.
+        let excludes: Vec<String> = exclude_prefixes.iter().cloned().collect();
+        let outcome = self
+            .dest_cp
+            .put_kv_stratum(tok, &self.source_project, &excludes, &entries)
+            .await
+            .map_err(|e| SyncApplyError::Carry {
+                piece: tok,
+                message: e.to_string(),
+            })?;
+        if !outcome.skipped.is_empty() {
+            if self.strict {
+                // PLAN rule 3: `--strict` flips skip → refuse-all.
+                let detail = outcome
+                    .skipped
+                    .iter()
+                    .map(|s| format!("  - {}: {}", s.key, s.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(SyncApplyError::StrictRefused {
+                    count: outcome.skipped.len(),
+                    detail,
+                });
+            }
+            // Default posture: skip-and-report — surface the skipped records in the operator notes.
+            self.kv_skip_notes.push(format!(
+                "{tok}: {} control-plane record(s) skipped (incoherent / excluded): {}",
+                outcome.skipped.len(),
+                outcome
+                    .skipped
+                    .iter()
+                    .map(|s| format!("{} ({})", s.key, s.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        // ALWAYS surface neutralized system-principal markers (Security F1) — informational, never a
+        // `--strict` refuse: a `Project·Admin` sync can't grant System authority, so the dest dropped
+        // these `current-principal/<site>` markers; re-grant via a dest-side System·Admin activation.
+        if !outcome.neutralized.is_empty() {
+            self.kv_skip_notes.push(format!(
+                "{tok}: {} system-principal marker(s) NOT carried (a Project·Admin sync never grants \
+                 a site the System principal; re-grant via a dest-side System·Admin activation): {}",
+                outcome.neutralized.len(),
+                outcome.neutralized.join(", ")
+            ));
+        }
+        Ok(outcome.written)
     }
 
     async fn carry_database(&mut self, name: &str) -> std::result::Result<(), SyncApplyError> {
@@ -1077,7 +1087,9 @@ mod tests {
             source_dbs: Vec::new(),
             pg_included: pg,
             blobs_included: blobs,
+            strict: false,
             data_transferred: false,
+            kv_skip_notes: Vec::new(),
         }
     }
 
@@ -1095,21 +1107,199 @@ mod tests {
         assert!(dummy_exec(true, true).pg_included && dummy_exec(true, true).blobs_included);
     }
 
-    /// A selective control-plane KV-stratum carry has no over-the-wire seam today; the CLI reports
-    /// it honestly as unsupported (the pure engine supports it — this is the wiring gap).
+    /// The selective control-plane KV-stratum carry is now WIRED over the node-side endpoint: the
+    /// executor READS the source and WRITES the dest. Against an unroutable source it fails at the
+    /// SOURCE READ transport (a `Carry` error naming the piece) — no longer the old honest
+    /// "unsupported" stub. (The real carry path is exercised end-to-end over two in-process nodes by
+    /// `crates/boatramp-server/tests/project_kv_stratum_sync_live.rs`.)
     #[tokio::test]
-    async fn kv_stratum_carry_is_honestly_unsupported_over_cli() {
+    async fn kv_stratum_carry_is_wired_and_hits_the_source_read_transport() {
         let mut exec = dummy_exec(false, false);
         let err = exec
             .carry_kv_stratum(Piece::Settings, &[], &BTreeSet::new())
             .await
-            .expect_err("no selective KV seam");
+            .expect_err("unroutable source read fails");
         match err {
-            SyncApplyError::Unsupported(m) => {
-                assert!(m.contains("settings") && m.contains("selective-sync"));
+            SyncApplyError::Carry { piece, message } => {
+                assert_eq!(piece, "settings");
+                assert!(
+                    !message.contains("selective-sync endpoint"),
+                    "must be a real transport failure, not the old unsupported stub: {message}"
+                );
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected a Carry transport error, got {other:?}"),
         }
+    }
+
+    /// End-to-end over a RECORDING mock node (the `medium3` idiom): the executor reads the source
+    /// slice, relays it to the dest WITHOUT decoding the values, and passes `source_project` +
+    /// `exclude_prefixes` in the write body — proving the full read→relay→write shape and that a
+    /// dest-reported skip surfaces (default posture) rather than aborting.
+    #[tokio::test]
+    async fn kv_stratum_carry_reads_source_then_writes_dest_and_reports_skips() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Seen {
+            get_q: Vec<String>,
+            post_q: Vec<String>,
+            post_body: Vec<serde_json::Value>,
+        }
+        let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Seen::default()));
+
+        async fn handler(
+            axum::extract::State(seen): axum::extract::State<Arc<Mutex<Seen>>>,
+            axum::extract::RawQuery(raw): axum::extract::RawQuery,
+            req: axum::extract::Request,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let q = raw.unwrap_or_default();
+            if req.method() == axum::http::Method::GET {
+                seen.lock().unwrap().get_q.push(q);
+                // Return one settings record (opaque base64 value).
+                return axum::Json(serde_json::json!({
+                    "entries": [{ "key": "project/src/config/tenancy", "value_b64": "dgo=" }],
+                }))
+                .into_response();
+            }
+            // POST: record the query + the parsed body, answer with a skip to exercise reporting.
+            let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            {
+                let mut g = seen.lock().unwrap();
+                g.post_q.push(q);
+                g.post_body.push(v);
+            }
+            axum::Json(serde_json::json!({
+                "written": 1,
+                "skipped": [{ "key": "project/dst/current/web", "reason": "history→siteconfig dependency: no config for site `web`" }],
+                "neutralized": ["project/dst/current-principal/web"],
+            }))
+            .into_response()
+        }
+
+        let app = axum::Router::new()
+            .route(
+                "/api/project-kv-stratum",
+                axum::routing::get(handler).post(handler),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        let mut exec = CliSyncExecutor {
+            dest_cp: ControlPlane::new(base.clone(), client::http_client(None), "dst".into()),
+            source_cp: ControlPlane::new(base.clone(), client::http_client(None), "src".into()),
+            target: "dst".into(),
+            source_url: base.clone(),
+            source_project: "src".into(),
+            source_token: Vec::new(),
+            source_dbs: Vec::new(),
+            pg_included: false,
+            blobs_included: false,
+            strict: false,
+            data_transferred: false,
+            kv_skip_notes: Vec::new(),
+        };
+
+        let mut excludes = BTreeSet::new();
+        excludes.insert("project/dst/current/legacy".to_string());
+        let written = exec
+            .carry_kv_stratum(Piece::History, &[], &excludes)
+            .await
+            .expect("carry ok (skip reported, not aborted)");
+        assert_eq!(written, 1, "the dest reported one record written");
+
+        let g = seen.lock().unwrap();
+        // The GET named the SOURCE project + the piece; the POST named the DEST project + piece.
+        assert!(
+            g.get_q
+                .iter()
+                .any(|q| q.contains("project=src") && q.contains("piece=history"))
+        );
+        assert!(
+            g.post_q
+                .iter()
+                .any(|q| q.contains("project=dst") && q.contains("piece=history"))
+        );
+        // The write body carried source_project + the exclude prefix + the relayed (undecoded) entry.
+        let body = &g.post_body[0];
+        assert_eq!(body["source_project"], "src");
+        assert_eq!(body["exclude_prefixes"][0], "project/dst/current/legacy");
+        assert_eq!(
+            body["entries"][0]["value_b64"], "dgo=",
+            "value relayed opaque, not decoded"
+        );
+        // The dest-reported skip surfaced in the executor's notes (default posture, not aborted).
+        assert!(exec_has_skip_note(&exec, "web"));
+        // The dest-reported system-principal neutralization (Security F1) ALSO surfaced as a note.
+        assert!(
+            exec_has_skip_note(&exec, "current-principal/web")
+                && exec_has_skip_note(&exec, "System principal"),
+            "neutralized marker must surface as an operator note: {:?}",
+            exec.kv_skip_notes
+        );
+
+        fn exec_has_skip_note(exec: &CliSyncExecutor, needle: &str) -> bool {
+            exec.kv_skip_notes.iter().any(|n| n.contains(needle))
+        }
+    }
+
+    /// `--strict` turns a dest-reported KV-stratum skip into a whole-run refusal (PLAN rule 3).
+    #[tokio::test]
+    async fn kv_stratum_carry_strict_refuses_on_a_dest_reported_skip() {
+        use axum::response::IntoResponse;
+        async fn handler(req: axum::extract::Request) -> axum::response::Response {
+            if req.method() == axum::http::Method::GET {
+                return axum::Json(serde_json::json!({
+                    "entries": [{ "key": "project/src/history/web", "value_b64": "W10=" }],
+                }))
+                .into_response();
+            }
+            axum::Json(serde_json::json!({
+                "written": 0,
+                "skipped": [{ "key": "project/dst/history/web", "reason": "no config for site `web`" }],
+            }))
+            .into_response()
+        }
+        let app = axum::Router::new().route(
+            "/api/project-kv-stratum",
+            axum::routing::get(handler).post(handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let mut exec = CliSyncExecutor {
+            dest_cp: ControlPlane::new(base.clone(), client::http_client(None), "dst".into()),
+            source_cp: ControlPlane::new(base.clone(), client::http_client(None), "src".into()),
+            target: "dst".into(),
+            source_url: base.clone(),
+            source_project: "src".into(),
+            source_token: Vec::new(),
+            source_dbs: Vec::new(),
+            pg_included: false,
+            blobs_included: false,
+            strict: true, // <-- strict
+            data_transferred: false,
+            kv_skip_notes: Vec::new(),
+        };
+        let err = exec
+            .carry_kv_stratum(Piece::History, &[], &BTreeSet::new())
+            .await
+            .expect_err("strict refuses on a skip");
+        assert!(matches!(
+            err,
+            SyncApplyError::StrictRefused { count: 1, .. }
+        ));
     }
 
     // ===== Security review fixes =============================================================
@@ -1208,7 +1398,9 @@ mod tests {
             source_dbs: Vec::new(),
             pg_included: true,
             blobs_included: true,
+            strict: false,
             data_transferred: false,
+            kv_skip_notes: Vec::new(),
         };
 
         let cfg = boatramp_core::config::SiteConfig::default();
@@ -1233,10 +1425,12 @@ mod tests {
         );
     }
 
-    /// HIGH-1: `--apply` naming a KV stratum the CLI cannot carry is refused UP FRONT (before any
-    /// network I/O or mutation) — restoring fail-fast, never a half-sync after pg+blobs moved.
+    /// `--include-settings --apply` is NO LONGER refused up front: the stratum is now wired over the
+    /// node-side endpoint, so `run()` proceeds into the network (failing here only because the test
+    /// server is unroutable) rather than returning the old pre-write `StratumUnsupported` refusal —
+    /// proving the gap is closed. (The successful carry is exercised by the live gate.)
     #[tokio::test]
-    async fn high1_apply_with_unsupported_stratum_refuses_pre_write() {
+    async fn apply_with_a_kv_stratum_is_wired_not_refused_up_front() {
         let args = parse(&[
             "sync",
             "--from",
@@ -1247,13 +1441,14 @@ mod tests {
             "dst",
         ])
         .expect("parses");
-        // An unroutable server: if the refusal were NOT pre-write, run() would hit the network.
+        // An unroutable server: the apply now reaches the network (list_projects) and fails there —
+        // a `Client` transport error, NOT a pre-write stratum refusal.
         let err = run(args, &ProjectConfig::default(), "http://127.0.0.1:0".into())
             .await
-            .expect_err("refused up front");
+            .expect_err("fails at the network, not a pre-write refusal");
         assert!(
-            matches!(err, Error::StratumUnsupported(ref s) if s.contains("settings")),
-            "got {err:?}"
+            matches!(err, Error::Client(_)),
+            "settings is wired now — expected a network error, got {err:?}"
         );
     }
 
@@ -1281,10 +1476,10 @@ mod tests {
         );
     }
 
-    /// HIGH-1 (dry-run truthfulness): a dry-run that includes an un-wireable stratum shows it as
-    /// "NOT carried", never `carry`.
+    /// Now that the stratum is wired, a dry-run including `settings` shows it as `carry` (the engine
+    /// disposition) — the old "NOT carried over the CLI" honesty-stub is gone.
     #[test]
-    fn dry_run_shows_unsupported_stratum_as_not_carried_not_carry() {
+    fn dry_run_shows_a_kv_stratum_as_carry_now_that_it_is_wired() {
         use crate::output::Rendered;
         let selection = parse(&["sync", "--from", "prod", "--include-settings", "dst"])
             .expect("parses")
@@ -1302,24 +1497,21 @@ mod tests {
             plan,
             notes: Vec::new(),
             applied: None,
-            cli_unsupported: vec![Piece::Settings],
         };
         let mut buf = Vec::new();
         report.render_human(&mut buf).expect("render");
         let out = String::from_utf8(buf).unwrap();
-        // The settings row is honest…
         assert!(
-            out.contains("NOT carried over the CLI"),
-            "dry-run must flag the unsupported stratum:\n{out}"
+            !out.contains("NOT carried over the CLI"),
+            "the unsupported-stratum stub must be gone:\n{out}"
         );
-        // …and the settings line is NOT shown as `carry`.
         let settings_line = out
             .lines()
             .find(|l| l.contains("settings"))
             .expect("settings row present");
         assert!(
-            !settings_line.contains("[carry"),
-            "settings must not render as carry: {settings_line}"
+            settings_line.contains("[carry"),
+            "settings must now render as carry: {settings_line}"
         );
     }
 }

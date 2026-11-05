@@ -5172,6 +5172,368 @@ pub(super) async fn project_prune_apply(
     project_prune_run(&deploy, prune_target_from_raw_query(raw.as_deref()), true).await
 }
 
+// ---------------------------------------------------------------------------
+// Node-side SELECTIVE-SYNC KV endpoint (`GET`/`POST /api/project-kv-stratum`)
+// ---------------------------------------------------------------------------
+//
+// The per-stratum, project-scoped admin KV transport that lets `project sync` carry the
+// NON-SECRET control-plane KV strata it could not before — `settings` (`project/<p>/config/`),
+// `graphql` (`graphql/<p>/` + `hapq/<p>/`), `history` (`project/<p>/current/`,
+// `current-principal/`, `history/`) — one named project, one piece at a time, between nodes.
+//
+// `GET`  = the SOURCE read: scan + return the named piece's slice for `?project=`.
+// `POST` = the DEST write: re-key the slice to the authenticated target, STRUCTURALLY enforce the
+//          target's own piece prefixes (fail-closed), honour the engine's coherence excludes + the
+//          history→siteconfig dependency (skip-and-report), then write it atomically.
+//
+// SECURITY (mirrors the export/import/clone family + the tenancy lessons):
+//   - `Project·Admin` on the `?project=` target, re-checked defence-in-depth in-handler.
+//   - The read/write key prefixes are built ONLY from the AUTHENTICATED project binding and the
+//     compile-time piece taxonomy ([`piece_kv_strata`]), NEVER from a client-supplied key path —
+//     scope is enforced structurally or refused.
+//   - The endpoint can never read or write a KEK-sealed family (`secret/`/`tenant-secret/`/
+//     `email/`/`managed-sql-cred/`): the carryable-piece gate refuses the `secrets` piece, and a
+//     sealed-prefix assertion backstops both ends.
+//   - Fail-closed on a degraded/partial source scan; the dest write is a single atomic batch (never
+//     a half-written stratum), and idempotent (same source ⇒ same bytes).
+
+/// One KV record on the selective-sync wire: the key verbatim + the value base64-encoded (KV values
+/// are arbitrary bytes — sealed envelopes elsewhere, UTF-8 hashes here — so never assume UTF-8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct KvStratumEntryWire {
+    /// The control-plane KV key, exactly as stored on the source.
+    pub key: String,
+    /// The value bytes, base64 (standard alphabet).
+    pub value_b64: String,
+}
+
+/// `GET /api/project-kv-stratum` response: the named piece's project-scoped KV slice.
+#[derive(Debug, Serialize)]
+pub(super) struct KvStratumReadResponse {
+    /// The source project the slice was read from.
+    pub project: String,
+    /// The piece token (`settings` / `graphql` / `history` / …).
+    pub piece: String,
+    /// The slice entries (every key lies under the piece's own `project`-scoped prefixes).
+    pub entries: Vec<KvStratumEntryWire>,
+}
+
+/// `POST /api/project-kv-stratum` request body: a source slice to land on the `?project=` TARGET.
+#[derive(Debug, Deserialize)]
+pub(super) struct KvStratumWriteBody {
+    /// The SOURCE project the slice was read from — used ONLY to re-key the leading project segment
+    /// to the authenticated target; the write is then re-validated against the target's own piece
+    /// prefixes, so a wrong/crafted `source_project` can only make keys FAIL the scope check, never
+    /// escape it.
+    #[serde(default)]
+    pub source_project: String,
+    /// Target KEY PREFIXES the carry must NOT write (the engine's coherence excludes — e.g. an
+    /// uncarried/skipped site's `current/`/`alias/` dependants). Applied after re-key, in the
+    /// target's key space.
+    #[serde(default)]
+    pub exclude_prefixes: Vec<String>,
+    /// The slice entries to land.
+    #[serde(default)]
+    pub entries: Vec<KvStratumEntryWire>,
+}
+
+/// One entry the DEST write SKIPPED (did not land), with its reason — PLAN rule 3 (skip-and-report,
+/// never half-applied). The destination's prior state for the entry is left intact.
+#[derive(Debug, Serialize)]
+pub(super) struct KvStratumSkip {
+    /// The target key that was not written.
+    pub key: String,
+    /// Why (an incoherent history→siteconfig dependency, or an engine coherence exclude).
+    pub reason: String,
+}
+
+/// `POST /api/project-kv-stratum` response: how many records landed, what was skipped, and which
+/// system-principal markers were neutralized.
+#[derive(Debug, Serialize)]
+pub(super) struct KvStratumWriteResponse {
+    /// Records written (idempotent: re-writing the same bytes still counts them, but changes
+    /// nothing on the store).
+    pub written: usize,
+    /// Entries skipped (incoherent / excluded) — a non-zero count a human/CI can gate on; drives
+    /// the CLI's `--strict` refuse.
+    pub skipped: Vec<KvStratumSkip>,
+    /// System-principal activation markers (`current-principal/<site>`) the dest refused to write
+    /// (always, fail-closed): a `Project·Admin` carry can never grant a site the System principal —
+    /// re-grant only via a dest-side System·Admin activation. Distinct from `skipped` so it is
+    /// purely informational and NEVER triggers a `--strict` refuse (a benign sync of a
+    /// system-activated source site legitimately reports these).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutralized: Vec<String>,
+}
+
+/// The target `?project=` of a kv-stratum request, derived through the EXACT same
+/// [`project_from_query`](boatramp_core::authz::project_from_query) the authorizer used (the FIRST
+/// raw `project=` value), so the two extractors can never desync on a duplicated key (the prune
+/// Finding-F hardening). An absent/garbled target yields `""`, rejected `400` by the handler.
+fn kv_stratum_target_from_raw_query(raw: Option<&str>) -> &str {
+    boatramp_core::authz::project_from_query(raw).unwrap_or("")
+}
+
+/// The FIRST raw `piece=` value from the request query (un-decoded; a conforming piece token is
+/// ASCII, so no decode is needed), paralleling [`project_from_query`]. `""` when absent.
+fn kv_stratum_piece_from_raw_query(raw: Option<&str>) -> &str {
+    raw.and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("piece=")))
+        .unwrap_or("")
+}
+
+/// Shared preamble for BOTH kv-stratum verbs: validate the `?project=` + `?piece=`, re-check
+/// `Project·Admin` on the target defence-in-depth, and resolve the carryable [`Piece`]. Returns the
+/// `(project, piece)` on success, or the ready [`Response`] to return on refusal.
+fn kv_stratum_preamble(
+    method: &str,
+    raw: Option<&str>,
+) -> Result<(String, boatramp_core::project_sync::Piece), Response> {
+    use boatramp_core::project_sync::{Piece, kv_stratum_is_endpoint_carryable};
+    let project = kv_stratum_target_from_raw_query(raw).to_string();
+    if project.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "project is required\n").into_response());
+    }
+    // Slug-validate before the name flows into `ProjectRef`/KV prefixes (a `..`/`/` would traverse
+    // or over-capture) — mirrors every project-scoped sibling.
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return Err(resp);
+    }
+    if let Some(forbidden) = assert_project_export_is_project_admin(
+        method,
+        "/api/project-kv-stratum",
+        &project,
+        "project kv-stratum",
+    ) {
+        return Err(forbidden);
+    }
+    let piece_tok = kv_stratum_piece_from_raw_query(raw);
+    let Some(piece) = Piece::parse(piece_tok) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown or missing ?piece= {piece_tok:?} (expected one of: settings, graphql, \
+                 history, sites, domains, databases)\n"
+            ),
+        )
+            .into_response());
+    };
+    if !kv_stratum_is_endpoint_carryable(piece) {
+        // pg/blobs (no KV stratum) and secrets (sealed under the source KEK) never cross here.
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the `{}` piece is not carryable over the selective-sync KV endpoint (pg/blobs \
+                 have no KV stratum; secrets are sealed under the source KEK and never cross this \
+                 seam)\n",
+                piece.as_str()
+            ),
+        )
+            .into_response());
+    }
+    Ok((project, piece))
+}
+
+/// SOURCE — read the named NON-SECRET control-plane KV stratum for `?project=` (`Project·Admin` on
+/// the target, re-checked in-handler). Scans ONLY the prefixes [`piece_kv_strata`] derives for the
+/// AUTHENTICATED project (never a client key path) and returns them base64-wrapped. Fail-closed:
+/// a scan error refuses the whole read (never a partial slice), and a sealed-prefix key anywhere in
+/// the result aborts loud (it can't happen structurally — this is the defence-in-depth backstop).
+pub(super) async fn kv_stratum_read(
+    State(deploy): State<DeployStore>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    use base64::Engine;
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::project_sync::piece_kv_strata;
+    let (project, piece) = match kv_stratum_preamble("GET", raw.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let pr = ProjectRef::new(&project);
+    let sealed = boatramp_core::project_export::sealed_secret_prefixes(pr);
+    let mut entries: Vec<KvStratumEntryWire> = Vec::new();
+    for prefix in piece_kv_strata(piece, pr) {
+        // Fail-closed on a degraded/partial read: a scan error aborts the whole read.
+        let slice = match deploy.kv().scan_prefix(&prefix).await {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("kv-stratum read of {prefix:?} failed (fail-closed, no partial slice): {e}\n"),
+                )
+                    .into_response();
+            }
+        };
+        for (key, value) in slice {
+            // Backstop: a sealed-family key must never leave this endpoint.
+            if sealed.iter().any(|s| key.starts_with(s.as_str())) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "kv-stratum read refused: key {key:?} lies under a sealed-secret prefix \
+                         (the endpoint must never expose KEK-sealed material)\n"
+                    ),
+                )
+                    .into_response();
+            }
+            entries.push(KvStratumEntryWire {
+                key,
+                value_b64: base64::engine::general_purpose::STANDARD.encode(value),
+            });
+        }
+    }
+    Json(KvStratumReadResponse {
+        project,
+        piece: piece.as_str().to_string(),
+        entries,
+    })
+    .into_response()
+}
+
+/// DEST — land a source stratum slice on `?project=` (`Project·Admin` on the target, re-checked
+/// in-handler). Re-keys the slice to the authenticated target, STRUCTURALLY enforces the target's
+/// OWN piece prefixes ([`enforce_stratum_scoped_kv`], fail-closed — refuses a sealed / cross-tenant
+/// / global / wrong-piece key), honours the engine's coherence `exclude_prefixes` + the
+/// history→siteconfig dependency (skip-and-report, PLAN rule 3), then writes the survivors in one
+/// atomic batch (never a half-written stratum; idempotent). Returns the written count + skips.
+pub(super) async fn kv_stratum_write(
+    State(deploy): State<DeployStore>,
+    RawQuery(raw): RawQuery,
+    Json(body): Json<KvStratumWriteBody>,
+) -> Response {
+    use base64::Engine;
+    use boatramp_core::kv::{KvDumpEntry, WriteOp};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::project_export::rekey_entries_to_target;
+    use boatramp_core::project_sync::{Piece, enforce_stratum_scoped_kv, history_key_site};
+
+    let (target, piece) = match kv_stratum_preamble("POST", raw.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // The source project only re-keys the leading segment; validate it so a `..`/`/` can't reshape
+    // a key before the (authoritative) target-scope check runs.
+    if !body.source_project.is_empty()
+        && let Some(resp) = reject_invalid_name("source_project", &body.source_project)
+    {
+        return resp;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut entries: Vec<KvDumpEntry> = Vec::with_capacity(body.entries.len());
+    for e in &body.entries {
+        let value = match b64.decode(e.value_b64.as_bytes()) {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "kv-stratum write: entry {:?} has invalid base64 value: {err}\n",
+                        e.key
+                    ),
+                )
+                    .into_response();
+            }
+        };
+        entries.push(KvDumpEntry {
+            key: e.key.clone(),
+            value,
+            version: 1,
+        });
+    }
+    // Re-key the SOURCE project segment to the authenticated TARGET (a no-op for a same-name sync),
+    // then STRUCTURALLY enforce the target's own piece prefixes — the fail-closed tenancy gate.
+    let src = if body.source_project.is_empty() {
+        target.clone()
+    } else {
+        body.source_project.clone()
+    };
+    rekey_entries_to_target(&mut entries, &src, &target);
+    let pr = ProjectRef::new(&target);
+    if let Err(msg) = enforce_stratum_scoped_kv(&entries, piece, pr) {
+        return (StatusCode::FORBIDDEN, format!("{msg}\n")).into_response();
+    }
+
+    // SYSTEM-PRINCIPAL NEUTRALIZATION (Security F1, release-gating): a `current-principal/<site>`
+    // marker (`system:<id>`) is NEVER written over this `Project·Admin`-gated seam — else a tenant
+    // Project·Admin could GRANT a site the node-global System principal by forging the POST body
+    // (or by inheriting a source site's marker) without holding `System·Admin`. Strip them
+    // unconditionally here (the authoritative, fail-closed dest-side drop); the marker can only be
+    // (re)granted by a dest-side System·Admin activation. `current/`/`history/` still carry.
+    let neutralized = boatramp_core::project_export::strip_system_principal_markers(&mut entries);
+
+    // Coherence: drop any entry under an engine-supplied exclude prefix (uncarried-site dependants),
+    // and — for the HISTORY piece — any per-site pointer whose site has no config body on the dest
+    // (the `current/`/`history/` → `siteconfig/<hash>` dependency, PLAN rule 3). Skipped, reported,
+    // never written; the dest's prior state for the entry stays intact.
+    let mut skipped: Vec<KvStratumSkip> = Vec::new();
+    let mut ops: Vec<WriteOp> = Vec::with_capacity(entries.len());
+    for e in entries {
+        // Engine coherence excludes (uncarried-site dependants): drop + report.
+        if let Some(pre) = body
+            .exclude_prefixes
+            .iter()
+            .find(|p| e.key.starts_with(p.as_str()))
+        {
+            let reason = format!("excluded by the sync's coherence rule (prefix {pre:?})");
+            skipped.push(KvStratumSkip { key: e.key, reason });
+            continue;
+        }
+        // History→siteconfig dependency (PLAN rule 3): a per-site pointer whose site has no config
+        // body on the dest is incoherent — skip + report, leaving the dest's prior state intact.
+        if piece == Piece::History {
+            let site = history_key_site(&e.key, pr).map(str::to_string);
+            if let Some(site) = site
+                && !dest_has_site_config(&deploy, pr, &site).await
+            {
+                let reason = format!(
+                    "history→siteconfig dependency: the destination has no config body for site \
+                     `{site}`; carry the site (or resync after it exists), leaving the dest's prior \
+                     state intact"
+                );
+                skipped.push(KvStratumSkip { key: e.key, reason });
+                continue;
+            }
+        }
+        ops.push(WriteOp::Put(e.key, e.value));
+    }
+
+    // Submit the survivors as ONE `write_batch` — atomic where the backend supports it (SlateDB /
+    // SQL), and ALWAYS idempotent (same source ⇒ same bytes), so a resync completes any partial a
+    // non-transactional backend might leave. Each individual record write is atomic regardless.
+    let written = ops.len();
+    if !ops.is_empty()
+        && let Err(e) = deploy.kv().write_batch(ops).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "kv-stratum write failed (resync to complete; each record write is atomic): {e}\n"
+            ),
+        )
+            .into_response();
+    }
+    Json(KvStratumWriteResponse {
+        written,
+        skipped,
+        neutralized,
+    })
+    .into_response()
+}
+
+/// Whether the destination already holds `site`'s content-addressed config body — i.e. the
+/// `site/<site>` pointer resolves to a `siteconfig/<hash>` body that is present on the dest. The
+/// coherence predicate the history carry's `current/`/`history/` → `siteconfig/<hash>` dependency
+/// gates on (PLAN dependency model). Uses the public [`DeployStore::get_site_config`], which returns
+/// `Ok(Some(_))` ONLY when BOTH the pointer and its body are present (a dangling pointer yields
+/// `Ok(None)`), so it is exactly the "config body present" test.
+async fn dest_has_site_config(
+    deploy: &DeployStore,
+    project: boatramp_core::project::ProjectRef<'_>,
+    site: &str,
+) -> bool {
+    matches!(deploy.get_site_config(project, site).await, Ok(Some(_)))
+}
+
 /// Verify every stored blob still hashes to its key (integrity scrub).
 /// Read-only; the JSON report lists any corrupted or unreadable blobs.
 pub(super) async fn scrub_blobs(State(deploy): State<DeployStore>) -> Response {

@@ -172,6 +172,98 @@ pub fn piece_kv_strata(piece: Piece, project: ProjectRef<'_>) -> Vec<String> {
     }
 }
 
+/// Whether a `piece` may cross the **node-side selective-sync KV endpoint** (the per-stratum,
+/// project-scoped admin KV read/write that carries [`Piece::Settings`]/[`Piece::Graphql`]/
+/// [`Piece::History`] — and, under `--identity adopt`, the domain-proof stratum — between nodes).
+/// TRUE iff the piece governs a NON-SECRET control-plane KV stratum: the data-plane pieces
+/// ([`Piece::Pg`]/[`Piece::Blobs`]) govern no KV stratum, and [`Piece::Secrets`] is sealed under the
+/// source KEK and must NEVER cross this seam (it is dropped under `--identity fresh`; an
+/// `--identity adopt` installs the source KEK through the export identity container, never this KV
+/// endpoint). Derived from [`piece_kv_strata`] so the rule can never drift from the taxonomy.
+#[must_use]
+pub fn kv_stratum_is_endpoint_carryable(piece: Piece) -> bool {
+    piece != Piece::Secrets && !piece_kv_strata(piece, ProjectRef::new("_")).is_empty()
+}
+
+/// STRUCTURAL project + piece scoping for a selective-sync KV write — the fail-closed gate the
+/// node-side DEST endpoint applies to every incoming entry AFTER it has been re-keyed to the
+/// authenticated TARGET project ([`crate::project_export::rekey_entries_to_target`]) and BEFORE a
+/// byte is written. The STRICTER, piece-restricted sibling of
+/// [`enforce_target_scoped_kv`](crate::project_export::enforce_target_scoped_kv): where that admits
+/// any target-owned key (sealed secrets INCLUDED — correct for a full bundle restore), this admits
+/// ONLY keys under the named NON-SECRET piece's own [`piece_kv_strata`] prefixes for the target, so
+/// a crafted settings/graphql/history slice can never smuggle a sealed `secret/` key, another
+/// tenant's key, or a global routing/TLS key onto the destination.
+///
+/// Two fail-closed refusals, each naming the offending key:
+///   1. the `piece` is not [`kv_stratum_is_endpoint_carryable`] (pg/blobs/secrets) — the endpoint
+///      refuses the whole request; and
+///   2. ANY entry whose key is outside the target's `piece` prefixes — including (asserted
+///      explicitly, defence in depth) anything under [`sealed_secret_prefixes`].
+///
+/// The scope is built from the AUTHENTICATED `target` binding and the compile-time piece taxonomy,
+/// NEVER from a client-supplied key path — the tenancy lesson: scope is enforced structurally or
+/// refused, never by trusting a client string.
+pub fn enforce_stratum_scoped_kv(
+    entries: &[crate::kv::KvDumpEntry],
+    piece: Piece,
+    target: ProjectRef<'_>,
+) -> Result<(), String> {
+    if !kv_stratum_is_endpoint_carryable(piece) {
+        return Err(format!(
+            "selective-sync KV endpoint refused the `{}` piece: only non-secret control-plane KV \
+             strata (settings / graphql / history / sites / domains / databases) may cross — \
+             pg/blobs have no KV stratum, and secrets are sealed under the source KEK and never \
+             cross this seam",
+            piece.as_str()
+        ));
+    }
+    let allowed = piece_kv_strata(piece, target);
+    let sealed = sealed_secret_prefixes(target);
+    for e in entries {
+        // Defence in depth: a sealed-prefix key must NEVER be written here, even if some future
+        // piece's stratum ever overlapped the sealed set.
+        if sealed.iter().any(|s| e.key.starts_with(s.as_str())) {
+            return Err(format!(
+                "selective-sync KV write refused: entry {:?} lies under a sealed-secret prefix — \
+                 this endpoint must never write KEK-sealed material",
+                e.key
+            ));
+        }
+        if !allowed.iter().any(|p| e.key.starts_with(p.as_str())) {
+            return Err(format!(
+                "selective-sync KV write refused: entry {:?} is outside target project {target}'s \
+                 `{}` stratum prefixes after re-key — a crafted / foreign / cross-tenant key is \
+                 never written (structural project+piece scoping)",
+                e.key,
+                piece.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// For a HISTORY-piece key (`project/<target>/current/<site>`, `current-principal/<site>`, or
+/// `history/<site>`), the `<site>` segment it points at — the site whose content-addressed config
+/// body MUST already exist on the destination for the pointer to be coherent (PLAN dependency
+/// model: `current/`/`history/` → `siteconfig/<hash>`; a `current/<site>` for a site the dest has
+/// no config for would dangle). `None` for any key that is not one of those per-site pointers.
+/// Pure string parsing over the canonical key shapes so the DEST endpoint's skip-and-report
+/// coherence check (PLAN rule 3) is unit-testable without a KV store.
+#[must_use]
+pub fn history_key_site<'a>(key: &'a str, target: ProjectRef<'_>) -> Option<&'a str> {
+    for infix in ["current-principal/", "current/", "history/"] {
+        let pref = format!("project/{target}/{infix}");
+        if let Some(rest) = key.strip_prefix(&pref) {
+            let site = rest.split('/').next().unwrap_or("");
+            if !site.is_empty() {
+                return Some(site);
+            }
+        }
+    }
+    None
+}
+
 /// What `sync` does with a piece or a single project-owned item — the CLOSED classification
 /// vocabulary the preflight reports (PLAN semantics §1–3 + the taxonomy table's "On sync" column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1256,6 +1348,110 @@ mod tests {
         // Data-plane pieces govern no KV stratum.
         assert!(piece_kv_strata(Piece::Pg, pr).is_empty());
         assert!(piece_kv_strata(Piece::Blobs, pr).is_empty());
+    }
+
+    /// Only non-secret KV-stratum pieces cross the node-side selective-sync endpoint: pg/blobs (no
+    /// stratum) and secrets (sealed under the source KEK) are refused; settings/graphql/history
+    /// (and sites/domains/databases) are carryable.
+    #[test]
+    fn kv_stratum_endpoint_carryability_excludes_data_plane_and_secrets() {
+        for p in [Piece::Settings, Piece::Graphql, Piece::History] {
+            assert!(kv_stratum_is_endpoint_carryable(p), "{p:?} must carry");
+        }
+        for p in [Piece::Pg, Piece::Blobs, Piece::Secrets] {
+            assert!(
+                !kv_stratum_is_endpoint_carryable(p),
+                "{p:?} must NOT cross the KV endpoint"
+            );
+        }
+    }
+
+    fn kv_entry(key: &str) -> crate::kv::KvDumpEntry {
+        crate::kv::KvDumpEntry {
+            key: key.to_string(),
+            value: b"v".to_vec(),
+            version: 1,
+        }
+    }
+
+    /// The DEST write gate admits ONLY keys under the named piece's own target prefixes, refusing a
+    /// sealed-secret key, another tenant's key, a global routing key, and a wrong-piece key — the
+    /// structural project+piece scoping, fail-closed with the offending key named.
+    #[test]
+    fn enforce_stratum_scoped_kv_admits_only_the_target_pieces_prefixes() {
+        let target = ProjectRef::new("acme");
+
+        // A legitimate settings slice (project/<p>/config/) passes.
+        assert!(
+            enforce_stratum_scoped_kv(
+                &[kv_entry("project/acme/config/tenancy")],
+                Piece::Settings,
+                target
+            )
+            .is_ok()
+        );
+        // A legitimate graphql slice (graphql/<p>/ + hapq/<p>/) passes.
+        assert!(
+            enforce_stratum_scoped_kv(
+                &[kv_entry("graphql/acme/web"), kv_entry("hapq/acme/abc123")],
+                Piece::Graphql,
+                target
+            )
+            .is_ok()
+        );
+
+        // A sealed secret smuggled into a settings slice is refused (defence in depth) …
+        let sealed = enforce_stratum_scoped_kv(
+            &[kv_entry("project/acme/secret/stripe")],
+            Piece::Settings,
+            target,
+        )
+        .expect_err("sealed refused");
+        assert!(sealed.contains("sealed-secret") && sealed.contains("project/acme/secret/stripe"));
+
+        // … another tenant's key is refused (cross-tenant) …
+        let foreign = enforce_stratum_scoped_kv(
+            &[kv_entry("project/globex/config/tenancy")],
+            Piece::Settings,
+            target,
+        )
+        .expect_err("cross-tenant refused");
+        assert!(foreign.contains("globex") && foreign.contains("structural"));
+
+        // … a global routing key is refused …
+        assert!(
+            enforce_stratum_scoped_kv(&[kv_entry("domain/acme.example")], Piece::Settings, target)
+                .is_err()
+        );
+
+        // … and a WRONG-piece key (graphql SDL offered under the settings piece) is refused.
+        assert!(
+            enforce_stratum_scoped_kv(&[kv_entry("graphql/acme/web")], Piece::Settings, target)
+                .is_err()
+        );
+
+        // pg/blobs/secrets pieces are refused outright (not carryable over this seam).
+        for p in [Piece::Pg, Piece::Blobs, Piece::Secrets] {
+            assert!(enforce_stratum_scoped_kv(&[], p, target).is_err(), "{p:?}");
+        }
+    }
+
+    /// The history-dependency site extractor recognises `current/`, `current-principal/` and
+    /// `history/` per-site pointers (and only those), returning the `<site>` leaf.
+    #[test]
+    fn history_key_site_extracts_the_site_for_the_dependency_check() {
+        let t = ProjectRef::new("acme");
+        assert_eq!(history_key_site("project/acme/current/web", t), Some("web"));
+        assert_eq!(
+            history_key_site("project/acme/current-principal/web", t),
+            Some("web")
+        );
+        assert_eq!(history_key_site("project/acme/history/web", t), Some("web"));
+        // Not a per-site history pointer.
+        assert_eq!(history_key_site("project/acme/config/x", t), None);
+        assert_eq!(history_key_site("project/acme/site/web", t), None);
+        // A foreign project never matches this target's infix.
+        assert_eq!(history_key_site("project/globex/current/web", t), None);
     }
 
     #[test]

@@ -202,11 +202,11 @@ impl Right {
     }
 
     /// Like [`required`](Self::required) but also given the request's `query` string, so an
-    /// endpoint whose TARGET lives in a query param (the native `/api/project-export` /
-    /// `/api/project-import`, scoped by `?project=`) resolves to a per-project
-    /// `Project·Admin` on that exact target — binding the authorization to the specific
-    /// project a Project·Admin may export/import (a Project·Admin for X must never reach Y).
-    /// `query` is consulted ONLY for those two endpoints; every other mapping is path-only.
+    /// endpoint whose TARGET lives in a query param (scoped by `?project=`) resolves to a
+    /// per-project `Project·Admin` on that exact target — binding the authorization to the specific
+    /// project a Project·Admin may act on (a Project·Admin for X must never reach Y). `query` is
+    /// consulted ONLY for the query-scoped family — `/api/project-export`, `/api/project-import`,
+    /// `/api/project-prune`, and `/api/project-kv-stratum`; every other mapping is path-only.
     pub fn required_for(method: &str, path: &str, query: Option<&str>) -> Option<Self> {
         let m = method.to_ascii_uppercase();
         let get = m == "GET";
@@ -815,6 +815,25 @@ impl Right {
             // (deploy blobs/manifests) stays the node-global `/api/prune` (`System·Admin`) — it is
             // NOT folded into this per-project, project-scoped verb.
             "/api/project-prune" => Self::new(
+                Resource::Project,
+                project_from_query(query).map(str::to_string),
+                Action::Admin,
+            ),
+            // `project sync` selective control-plane KV transport (`GET`/`POST
+            // /api/project-kv-stratum`): carries ONE project's NON-SECRET control-plane KV strata
+            // (settings / graphql / history) in/out, one piece at a time. Moves the SAME grade of
+            // state the project's own `apply`/CLI writes — gated **`Project·Admin` on the TARGET
+            // project** (scoped THROUGH `query`, uniform with the export/import/prune/clone family:
+            // a Project·Admin for X may sync ONLY X, never node-global `System·Admin` and never
+            // another tenant). The GET read scans only the project-owned, piece-scoped keyspace it
+            // returns; the POST write lands only the target's own piece prefixes (both enforced
+            // structurally in-handler). A target-less fallback (query absent) is satisfied by no
+            // scoped grant → fail-closed, and the handler 400s an empty project. Re-checked
+            // defense-in-depth at the handler, bound to the same target. NB sealed-secret families
+            // (`secret/`/`tenant-secret/`/`email/`/`managed-sql-cred/`) can never cross — the
+            // handler refuses the `secrets` piece — so this per-project admin grant never widens to
+            // KEK-sealed material.
+            "/api/project-kv-stratum" => Self::new(
                 Resource::Project,
                 project_from_query(query).map(str::to_string),
                 Action::Admin,
