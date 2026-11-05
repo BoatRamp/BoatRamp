@@ -687,6 +687,17 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         // The init superuser's sealed password (same key the server-init env + the
         // readiness probe use), needed both to confirm the database and to create the
         // declared extensions as the superuser.
+        //
+        // F5 (cap-req #28 review): the B3 refactor made this read UNCONDITIONAL — the
+        // `Shared` arm below now needs it too, where it was previously a no-op `Ok(())`. The
+        // read fails GRACEFULLY: `password()` threads every error through `map_err` (a corrupt
+        // / undecryptable / non-UTF-8 blob, a KV error) and NEVER panics, so a bad credential
+        // surfaces here as a clear `Err(String)` the reconcile loop reports (it skips the
+        // post-ready pass and retries), not a crash. And it is not a new reachability risk:
+        // this post-ready pass runs only AFTER the replica is first confirmed healthy, which
+        // it could only become because its server-init env resolved the SAME sealed credential
+        // at launch — so the credential is already present and `password()` always takes its
+        // read branch here (it never mints a fresh, mismatched one on this path).
         let password = self
             .creds
             .password(project, workload)
