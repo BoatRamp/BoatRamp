@@ -2063,7 +2063,8 @@ mod instance_serve {
     use boatramp_server::privsep_authority::{
         AuthorityAudit, AuthorityRateLimiter, AuthorityRegistry, AuthorityServe, ContextVerifier,
         DEFAULT_CONTEXT_MAX_AGE_SECS, DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT,
-        DurableAudit, ReplayCache, SealerHandler, SignerHandler, TokenBucketLimiter,
+        DurableAudit, PreVerifyThrottle, ReplayCache, SealerHandler, SignerHandler,
+        SourceBucketThrottle, TokenBucketLimiter,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_tenant::{
@@ -2471,6 +2472,11 @@ mod instance_serve {
             })?)
         };
         let limiter: Arc<dyn AuthorityRateLimiter> = Arc::new(TokenBucketLimiter::with_defaults());
+        // WS-E residual #2: a shared PRE-VERIFY flood throttle keyed on the cheap link/source, checked
+        // BEFORE the expensive `cose::verify` so a forged-context flood on one link cannot exhaust CPU
+        // (per-source + global token buckets; cloned into each link thread, so the global cap bounds
+        // total verify load across all of this crown jewel's authority-serve links).
+        let pre_verify: Arc<dyn PreVerifyThrottle> = Arc::new(SourceBucketThrottle::with_defaults());
         tracing::info!(
             instance = %label,
             served = ?registry.served().iter().map(|a| a.tag()).collect::<Vec<_>>(),
@@ -2535,6 +2541,7 @@ mod instance_serve {
             let replay = replay.clone();
             let max_in_flight = max_in_flight.clone();
             let limiter = limiter.clone();
+            let pre_verify = pre_verify.clone();
             let audit = audit.clone();
             threads.push(std::thread::spawn(move || {
                 // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
@@ -2550,9 +2557,11 @@ mod instance_serve {
                     }
                 };
                 // Phase-2 HARDENING: the PRODUCTION token-bucket limiter + durable append-only audit
-                // sink (shared across links, cloned in above) — the Wave-1 defaults are gone.
+                // sink + the pre-verify flood throttle (all shared across links, cloned in above) —
+                // the Wave-1 defaults are gone.
                 let serve = AuthorityServe {
                     verifier: &verifier,
+                    pre_verify: pre_verify.as_ref(),
                     replay: &replay,
                     limiter: limiter.as_ref(),
                     audit: audit.as_ref(),

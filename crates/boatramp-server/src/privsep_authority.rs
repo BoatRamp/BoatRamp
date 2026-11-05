@@ -1063,15 +1063,27 @@ impl Bucket {
 /// throttled — a flood of distinct principals cannot grow memory unbounded (fail-closed under flood,
 /// matching the replay cache).
 pub struct TokenBucketLimiter {
-    per_principal: RateQuota,
-    state: Mutex<LimiterState>,
+    inner: KeyedRateBuckets,
+}
+
+/// The shared **per-key + global token-bucket** core (consolidated, not mirrored — the one
+/// parameterized path behind BOTH the post-verify [`TokenBucketLimiter`] (keyed on the VERIFIED
+/// principal) AND the pre-verify [`SourceBucketThrottle`] (keyed on the cheap link/source). A unit is
+/// admitted only if BOTH the per-key bucket AND the global bucket have a token; a token is consumed
+/// from each only when both allow (so a throttled key never drains the global bucket). The per-key map
+/// is bounded (`max_tracked`): when full, idle (refilled-to-capacity) buckets are pruned, and if it is
+/// still full a brand-new key is throttled — a flood of distinct keys cannot grow memory unbounded
+/// (fail-closed under flood, matching the replay cache).
+struct KeyedRateBuckets {
+    per_key: RateQuota,
+    state: Mutex<KeyedRateState>,
     max_tracked: usize,
 }
 
-struct LimiterState {
+struct KeyedRateState {
     global: Bucket,
     global_quota: RateQuota,
-    principals: HashMap<String, Bucket>,
+    keys: HashMap<String, Bucket>,
 }
 
 /// The default per-principal token-bucket capacity (burst) — generous, as authority calls are infrequent.
@@ -1085,18 +1097,77 @@ pub const DEFAULT_RATE_GLOBAL_PER_SEC: f64 = 50.0;
 /// The default cap on distinct principals tracked at once (bounds the limiter's memory).
 pub const DEFAULT_RATE_MAX_TRACKED: usize = 65_536;
 
+impl KeyedRateBuckets {
+    /// Build with explicit per-key + global quotas and a tracking-table bound.
+    fn new(per_key: RateQuota, global: RateQuota, max_tracked: usize) -> Self {
+        Self {
+            per_key,
+            state: Mutex::new(KeyedRateState {
+                global: Bucket::full(global, std::time::Instant::now()),
+                global_quota: global,
+                keys: HashMap::new(),
+            }),
+            max_tracked,
+        }
+    }
+
+    /// Check-and-consume one unit for `key`. `true` ⇒ admitted (a token taken from BOTH the global and
+    /// the per-key bucket); `false` ⇒ throttled (no token taken anywhere). Fail-closed under flood.
+    fn try_admit(&self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let per_key = self.per_key;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // The global bucket first (peek by refilling; only consume if the per-key bucket also allows).
+        let global_quota = state.global_quota;
+        let mut global = state.global;
+        let global_elapsed = now.saturating_duration_since(global.last).as_secs_f64();
+        let global_tokens = (global.tokens + global_elapsed * global_quota.refill_per_sec)
+            .min(global_quota.capacity);
+        if global_tokens < 1.0 {
+            // Even refilled, the global bucket is empty: throttle (do not touch the per-key bucket).
+            global.tokens = global_tokens;
+            global.last = now;
+            state.global = global;
+            return false;
+        }
+
+        // Bound the tracking table: if full and this key is new, prune idle (full) buckets.
+        if state.keys.len() >= self.max_tracked && !state.keys.contains_key(key) {
+            state.keys.retain(|_, b| !b.is_full(per_key, now));
+            if state.keys.len() >= self.max_tracked {
+                // Still full of ACTIVE buckets — a genuine many-key flood. Fail-closed (throttle)
+                // rather than grow unbounded or evict an active (debt-carrying) bucket.
+                return false;
+            }
+        }
+
+        let bucket = state
+            .keys
+            .entry(key.to_string())
+            .or_insert_with(|| Bucket::full(per_key, now));
+        if bucket.refill_and_take(per_key, now) {
+            // The per-key bucket allowed — now actually consume the global token too.
+            global.tokens = global_tokens - 1.0;
+            global.last = now;
+            state.global = global;
+            true
+        } else {
+            // The per-key bucket is throttled — leave the global bucket untouched.
+            false
+        }
+    }
+}
+
 impl TokenBucketLimiter {
     /// Build with explicit per-principal + global quotas and a tracking-table bound.
     #[must_use]
     pub fn new(per_principal: RateQuota, global: RateQuota, max_tracked: usize) -> Self {
         Self {
-            per_principal,
-            state: Mutex::new(LimiterState {
-                global: Bucket::full(global, std::time::Instant::now()),
-                global_quota: global,
-                principals: HashMap::new(),
-            }),
-            max_tracked,
+            inner: KeyedRateBuckets::new(per_principal, global, max_tracked),
         }
     }
 
@@ -1119,54 +1190,113 @@ impl TokenBucketLimiter {
 
 impl AuthorityRateLimiter for TokenBucketLimiter {
     fn check(&self, principal_id: &str) -> RateLimitDecision {
-        let now = std::time::Instant::now();
-        let per_principal = self.per_principal;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // The global bucket first (peek by refilling; only consume if the principal also allows).
-        let global_quota = state.global_quota;
-        let mut global = state.global;
-        let global_elapsed = now.saturating_duration_since(global.last).as_secs_f64();
-        let global_tokens = (global.tokens + global_elapsed * global_quota.refill_per_sec)
-            .min(global_quota.capacity);
-        if global_tokens < 1.0 {
-            // Even refilled, the global bucket is empty: throttle (do not touch the principal bucket).
-            global.tokens = global_tokens;
-            global.last = now;
-            state.global = global;
-            return RateLimitDecision::Throttled;
-        }
-
-        // Bound the tracking table: if full and this principal is new, prune idle (full) buckets.
-        if state.principals.len() >= self.max_tracked
-            && !state.principals.contains_key(principal_id)
-        {
-            state
-                .principals
-                .retain(|_, b| !b.is_full(per_principal, now));
-            if state.principals.len() >= self.max_tracked {
-                // Still full of ACTIVE buckets — a genuine many-principal flood. Fail-closed (throttle)
-                // rather than grow unbounded or evict an active (debt-carrying) bucket.
-                return RateLimitDecision::Throttled;
-            }
-        }
-
-        let bucket = state
-            .principals
-            .entry(principal_id.to_string())
-            .or_insert_with(|| Bucket::full(per_principal, now));
-        if bucket.refill_and_take(per_principal, now) {
-            // The principal allowed — now actually consume the global token too.
-            global.tokens = global_tokens - 1.0;
-            global.last = now;
-            state.global = global;
+        if self.inner.try_admit(principal_id) {
             RateLimitDecision::Allow
         } else {
-            // The principal is throttled — leave the global bucket untouched.
             RateLimitDecision::Throttled
+        }
+    }
+}
+
+// =============================================================================
+// 3c. The PRE-VERIFY flood throttle (WS-E residual #2) — cheap, BEFORE the signature verify
+// =============================================================================
+
+/// The pre-verify throttle decision for one cheap SOURCE key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreVerifyDecision {
+    /// The call may proceed to the (expensive) context re-validation.
+    Proceed,
+    /// The source has exceeded its pre-verify budget — refuse WITHOUT running the expensive verify.
+    Throttled,
+}
+
+/// The **pre-verify flood throttle** (design §3.4 / WS-E residual #2). A forged [`AuthorityContext`] is
+/// rejected by [`ContextVerifier::verify_call`] — but that re-runs `cose::verify` (an asymmetric
+/// signature check), which is EXPENSIVE, so a flood of forged calls on a link is a CPU-exhaustion DoS.
+/// This hook is consulted on a CHEAP attribute — the link/SOURCE the call arrived on — BEFORE any
+/// deserialization or signature verification, so a forged-context flood is bounded to a cheap
+/// refusal-rate and cannot burn the receiver's CPU on `cose::verify`.
+///
+/// **It NEVER weakens the real verification.** A call that passes this throttle still goes through the
+/// full [`ContextVerifier::verify_call`]; this only ever refuses EXTRA load pre-verify. It is keyed on
+/// the source (the *calling instance / link*), NOT the end principal — the principal is unknown until
+/// after verification, which is the whole point. The post-verify per-principal
+/// [`AuthorityRateLimiter`] is the orthogonal second layer.
+///
+/// For the `local` transport the source key is the link name (one root-wired socketpair = one peer).
+/// For the networked transports (later) the source is the peer address / dial-cap holder.
+pub trait PreVerifyThrottle: Send + Sync {
+    /// Check-and-consume one unit for the cheap `source` key, BEFORE any expensive verify. Returns
+    /// whether the call may proceed to re-validation.
+    fn check(&self, source: &str) -> PreVerifyDecision;
+}
+
+/// The default pre-verify throttle: never throttles (for tests + compositions that rely solely on the
+/// post-verify limiter). A production composition swaps in [`SourceBucketThrottle`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnthrottledPreVerify;
+
+impl PreVerifyThrottle for UnthrottledPreVerify {
+    fn check(&self, _source: &str) -> PreVerifyDecision {
+        PreVerifyDecision::Proceed
+    }
+}
+
+/// The default per-SOURCE pre-verify burst — the number of back-to-back calls one link may present
+/// before the expensive verify is rate-gated. Larger than the per-principal burst: a single source
+/// (e.g. a listener frontend) may legitimately relay calls for MANY principals.
+pub const DEFAULT_PREVERIFY_PER_SOURCE_BURST: f64 = 200.0;
+/// The default per-source sustained pre-verify rate (calls/sec admitted to verification).
+pub const DEFAULT_PREVERIFY_PER_SOURCE_PER_SEC: f64 = 50.0;
+/// The default GLOBAL pre-verify burst across all of the instance's authority-serve links.
+pub const DEFAULT_PREVERIFY_GLOBAL_BURST: f64 = 2_000.0;
+/// The default GLOBAL sustained pre-verify rate (calls/sec admitted to verification).
+pub const DEFAULT_PREVERIFY_GLOBAL_PER_SEC: f64 = 500.0;
+/// The default cap on distinct sources tracked at once (bounds the throttle's memory).
+pub const DEFAULT_PREVERIFY_MAX_TRACKED: usize = 4_096;
+
+/// The **real per-source + global pre-verify token-bucket throttle** (WS-E residual #2) — the
+/// production [`PreVerifyThrottle`]. It rides the SAME consolidated [`KeyedRateBuckets`] core as
+/// [`TokenBucketLimiter`] (keyed on the source instead of the principal), so a per-source flood is
+/// gated AND a total flood across links is globally capped, both before any `cose::verify`. Shared
+/// across an instance's authority-serve link threads (one instance, cloned in).
+pub struct SourceBucketThrottle {
+    inner: KeyedRateBuckets,
+}
+
+impl SourceBucketThrottle {
+    /// Build with explicit per-source + global quotas and a tracking-table bound.
+    #[must_use]
+    pub fn new(per_source: RateQuota, global: RateQuota, max_tracked: usize) -> Self {
+        Self {
+            inner: KeyedRateBuckets::new(per_source, global, max_tracked),
+        }
+    }
+
+    /// Build with the documented defaults.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(
+            RateQuota {
+                capacity: DEFAULT_PREVERIFY_PER_SOURCE_BURST,
+                refill_per_sec: DEFAULT_PREVERIFY_PER_SOURCE_PER_SEC,
+            },
+            RateQuota {
+                capacity: DEFAULT_PREVERIFY_GLOBAL_BURST,
+                refill_per_sec: DEFAULT_PREVERIFY_GLOBAL_PER_SEC,
+            },
+            DEFAULT_PREVERIFY_MAX_TRACKED,
+        )
+    }
+}
+
+impl PreVerifyThrottle for SourceBucketThrottle {
+    fn check(&self, source: &str) -> PreVerifyDecision {
+        if self.inner.try_admit(source) {
+            PreVerifyDecision::Proceed
+        } else {
+            PreVerifyDecision::Throttled
         }
     }
 }
@@ -1775,6 +1905,10 @@ impl AuthorityHandler for AuthorityRegistry {
 pub struct AuthorityServe<'a> {
     /// The context verifier (public trust root + freshness bound).
     pub verifier: &'a ContextVerifier,
+    /// The CHEAP pre-verify flood throttle (WS-E residual #2) — consulted on the link/source BEFORE
+    /// any deserialization or signature verification, so a forged-context flood cannot burn CPU on
+    /// `cose::verify`. Never weakens the real verify (it only ever refuses extra load pre-verify).
+    pub pre_verify: &'a dyn PreVerifyThrottle,
     /// The per-call anti-replay cache.
     pub replay: &'a ReplayCache,
     /// The per-principal rate-limit.
@@ -1828,6 +1962,24 @@ impl AuthorityServe<'_> {
                 }
                 Err(e) => return Err(format!("recv on link {link_name:?}: {e}")),
             };
+
+            // (1b) PRE-VERIFY FLOOD THROTTLE (WS-E residual #2). Keyed on the CHEAP source (the link),
+            // consulted BEFORE deserialization + the expensive `cose::verify`, so a forged-context flood
+            // cannot exhaust CPU on signature verification. Fail-closed: a throttled source is refused
+            // here (a cheap, non-secret refusal — there is no verified principal yet, so this is LOGGED
+            // but not principal-keyed-audited, mirroring a context rejection). This never weakens the
+            // real verify — a frame that passes still goes through the full `verify_call` below.
+            if self.pre_verify.check(link_name) == PreVerifyDecision::Throttled {
+                tracing::warn!(link = %link_name, "[privsep] authority REFUSED pre-verify: source flood throttle tripped (no cose::verify run)");
+                self.send(
+                    link,
+                    &AuthorityResponse::Refused {
+                        reason: "pre-verify throttle: source call rate exceeded".to_string(),
+                    },
+                )?;
+                continue;
+            }
+
             let call: AuthorityCall = match serde_json::from_slice(&frame) {
                 Ok(c) => c,
                 Err(e) => {
@@ -2443,6 +2595,50 @@ mod tests {
         assert_eq!(limiter.check("alice"), RateLimitDecision::Throttled);
     }
 
+    // ---- WS-E residual #2: the pre-verify flood throttle (keyed on the cheap source) ----
+
+    #[test]
+    fn pre_verify_throttle_gates_per_source() {
+        // Per-source burst of 2, no refill: a source gets 2 then is throttled; a DIFFERENT source has
+        // its own independent bucket.
+        let t = SourceBucketThrottle::new(
+            RateQuota {
+                capacity: 2.0,
+                refill_per_sec: 0.0,
+            },
+            RateQuota {
+                capacity: 1_000.0,
+                refill_per_sec: 0.0,
+            },
+            16,
+        );
+        assert_eq!(t.check("link-a"), PreVerifyDecision::Proceed);
+        assert_eq!(t.check("link-a"), PreVerifyDecision::Proceed);
+        assert_eq!(t.check("link-a"), PreVerifyDecision::Throttled);
+        // A different source is unaffected by link-a's flood.
+        assert_eq!(t.check("link-b"), PreVerifyDecision::Proceed);
+    }
+
+    #[test]
+    fn pre_verify_throttle_global_cap_bounds_total_verify_load() {
+        // A global cap of 2 (no refill) bounds TOTAL admitted-to-verify load across DISTINCT sources —
+        // so a flood spread across many links cannot exhaust CPU on cose::verify.
+        let t = SourceBucketThrottle::new(
+            RateQuota {
+                capacity: 100.0,
+                refill_per_sec: 0.0,
+            },
+            RateQuota {
+                capacity: 2.0,
+                refill_per_sec: 0.0,
+            },
+            16,
+        );
+        assert_eq!(t.check("link-a"), PreVerifyDecision::Proceed);
+        assert_eq!(t.check("link-b"), PreVerifyDecision::Proceed);
+        assert_eq!(t.check("link-c"), PreVerifyDecision::Throttled);
+    }
+
     // ---- audit sink: append-only + receiver-side, keyed on the verified principal ----
 
     /// A receiver-side collecting sink for the harness. The append-only CALLER-FACING contract is the
@@ -2900,11 +3096,33 @@ mod tests {
             audit: Arc<CollectingAudit>,
             now: u64,
         ) -> std::thread::JoinHandle<Result<(), String>> {
+            spawn_server_throttled(
+                end,
+                verifier,
+                handler,
+                limiter,
+                Arc::new(UnthrottledPreVerify),
+                audit,
+                now,
+            )
+        }
+
+        /// As [`spawn_server`] but with an explicit pre-verify throttle (WS-E residual #2).
+        fn spawn_server_throttled(
+            end: LinkEndpoint,
+            verifier: ContextVerifier,
+            handler: Arc<dyn AuthorityHandler>,
+            limiter: Arc<dyn AuthorityRateLimiter>,
+            pre_verify: Arc<dyn PreVerifyThrottle>,
+            audit: Arc<CollectingAudit>,
+            now: u64,
+        ) -> std::thread::JoinHandle<Result<(), String>> {
             std::thread::spawn(move || {
                 let replay = ReplayCache::with_defaults();
                 let sem = tokio::sync::Semaphore::new(DEFAULT_MAX_IN_FLIGHT);
                 let serve = AuthorityServe {
                     verifier: &verifier,
+                    pre_verify: pre_verify.as_ref(),
                     replay: &replay,
                     limiter: limiter.as_ref(),
                     audit: audit.as_ref(),
@@ -3200,6 +3418,76 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].outcome, AuthorityOutcome::RateLimited);
             assert_eq!(entries[0].op, "ping");
+        }
+
+        #[test]
+        fn pre_verify_throttle_refuses_before_the_expensive_verify() {
+            // WS-E residual #2: the pre-verify throttle short-circuits BEFORE cose::verify. A per-source
+            // burst of 1 admits the first (valid) call; a SECOND call — a FORGED context the real trust
+            // root would reject at verify — is refused with the PRE-VERIFY reason, proving the throttle
+            // ran and `cose::verify` did NOT (a verified rejection would carry the "unverifiable" reason).
+            let now = 1_000;
+            let real = LocalSigner::generate(TokenAlg::Es256);
+            let attacker = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            // Per-source budget of exactly ONE admission to verify; global ample.
+            let throttle = Arc::new(SourceBucketThrottle::new(
+                RateQuota {
+                    capacity: 1.0,
+                    refill_per_sec: 0.0,
+                },
+                RateQuota {
+                    capacity: 1_000.0,
+                    refill_per_sec: 0.0,
+                },
+                16,
+            ));
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server_throttled(
+                server_end,
+                ContextVerifier::new(real.public_key()),
+                Arc::new(PingHandler),
+                Arc::new(Unlimited),
+                throttle,
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+
+            // First call (valid) consumes the single source token and is served.
+            let good = signed_call(
+                &real,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 1 },
+            );
+            assert_eq!(
+                client_end.relay(&good).expect("carried"),
+                AuthorityResponse::Pong { witness: 1 }
+            );
+
+            // Second call: a FORGED context. If it reached verify it would be refused as unverifiable;
+            // instead the pre-verify throttle (now out of source tokens) refuses it WITHOUT verifying.
+            let forged = signed_call(
+                &attacker,
+                &holder,
+                now,
+                Some(300),
+                Vec::new(),
+                AuthorityRequest::Ping { witness: 2 },
+            );
+            let resp = client_end.relay(&forged).expect("carried");
+            match resp {
+                AuthorityResponse::Refused { reason } => assert!(
+                    reason.contains("pre-verify throttle"),
+                    "expected a pre-verify refusal (verify skipped), got reason: {reason}"
+                ),
+                other => panic!("expected Refused, got {other:?}"),
+            }
+
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
         }
     }
 }
