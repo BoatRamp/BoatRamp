@@ -53,6 +53,27 @@ pub const CONSUMER_LABEL: &str = "boatramp.dev/compute-consumer";
 /// The value for [`CONSUMER_LABEL`].
 pub const CONSUMER_VALUE: &str = "true";
 
+/// The sub-directory of the managed-DB data PVC the engine's data dir is bound to
+/// (`subPath`), rather than the PVC's mount ROOT.
+///
+/// A freshly provisioned PVC on an **ext4** filesystem (the Hetzner CSI default and most
+/// cloud CSIs) carries a `lost+found` directory at its root. Postgres `initdb` REFUSES a
+/// data directory that "exists but is not empty" (it would see that `lost+found` and
+/// error: *"Create a subdirectory under the mount point"*), so mounting the PVC root
+/// directly at `PGDATA` crash-loops the DB container on any ext4 volume — the exact
+/// failure `kind`-based CI (local-path / hostPath, no `lost+found`) could never surface
+/// (mailroom cap-req #28 defect A).
+///
+/// Binding the data mount to a `subPath` of the PVC gives Postgres a directory the
+/// kubelet creates fresh and EMPTY (`lost+found` lives at the PVC root, never inside a
+/// subdir), so `initdb` runs clean on the default ext4 StorageClass with no operator xfs
+/// discovery. The in-container mount path is UNCHANGED (still the engine data dir, = the
+/// `PGDATA` the synthesized spec sets), so nothing downstream of the mount shifts — only
+/// which directory of the PVC backs it. The chown init container uses the SAME `subPath`
+/// so it (a) triggers the kubelet's subdir creation and (b) chowns that subdir to the
+/// rootless DB uid:gid before the server starts.
+pub const PGDATA_SUBPATH: &str = "pgdata";
+
 /// Why building the resource plan failed (pure, no I/O).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
@@ -270,6 +291,10 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     let mut volume_mounts = vec![VolumeMount {
         name: volume.name.clone(),
         mount_path: volume.mount.clone(),
+        // Bind the engine data dir to a `subPath` of the PVC, not its mount ROOT, so an
+        // ext4 volume's root-level `lost+found` never lands inside `PGDATA` and crash-loops
+        // `initdb` (cap-req #28 defect A — see [`PGDATA_SUBPATH`]).
+        sub_path: Some(PGDATA_SUBPATH.to_string()),
         ..Default::default()
     }];
     volume_mounts.extend(scratch_mounts);
@@ -714,6 +739,11 @@ fn chown_init_container(spec: &ComputeSpec, image: &str, volume: &VolumeRef) -> 
         volume_mounts: Some(vec![VolumeMount {
             name: volume.name.clone(),
             mount_path: volume.mount.clone(),
+            // SAME `subPath` as the server container's data mount: mounting the subdir
+            // here makes the kubelet CREATE it (owned root:root), and the `chown -R` below
+            // then hands it to the rootless DB uid:gid — so the server container finds its
+            // `PGDATA` subdir already owned and empty (cap-req #28 defect A).
+            sub_path: Some(PGDATA_SUBPATH.to_string()),
             ..Default::default()
         }]),
         security_context: Some(SecurityContext {
@@ -1359,6 +1389,10 @@ mod tests {
         let mount = &container.volume_mounts.as_ref().unwrap()[0];
         assert_eq!(mount.name, "data");
         assert_eq!(mount.mount_path, "/var/lib/postgresql/data");
+        // ext4 fix (cap-req #28 A): the data dir is bound to the `pgdata` subPath of the
+        // PVC, not its mount root, so a root-level `lost+found` on an ext4 volume never
+        // lands inside `PGDATA` and crash-loops `initdb`.
+        assert_eq!(mount.sub_path.as_deref(), Some("pgdata"));
         let pod_vol = &sspec
             .template
             .spec
@@ -1580,10 +1614,12 @@ mod tests {
             "chown command: {cmd}"
         );
         // It mounts the data volume and runs as root with only the chown caps.
-        assert_eq!(
-            init.volume_mounts.as_ref().unwrap()[0].mount_path,
-            "/var/lib/postgresql/data"
-        );
+        let init_mount = &init.volume_mounts.as_ref().unwrap()[0];
+        assert_eq!(init_mount.mount_path, "/var/lib/postgresql/data");
+        // ext4 fix (cap-req #28 A): the chown init mounts the SAME `subPath` as the server
+        // container, so the kubelet creates the `pgdata` subdir and the chown owns IT (not
+        // the PVC root, which carries `lost+found`).
+        assert_eq!(init_mount.sub_path.as_deref(), Some("pgdata"));
         let sc = init.security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_user, Some(0));
         assert_eq!(sc.allow_privilege_escalation, Some(false));
@@ -1599,6 +1635,58 @@ mod tests {
                 ]
                 .as_slice()
             )
+        );
+    }
+
+    #[test]
+    fn data_dir_is_bound_to_a_pvc_subpath_not_the_mount_root_for_ext4() {
+        // cap-req #28 defect A: on an ext4 PVC (the Hetzner CSI default + most cloud CSIs)
+        // the mount ROOT carries a `lost+found`, which makes Postgres `initdb` refuse the
+        // data dir as "not empty" → db container CrashLoopBackOff. `kind`-based CI uses
+        // local-path/hostPath (no `lost+found`), which is exactly why this slipped. Binding
+        // the engine data dir to a `pgdata` subPath of the PVC — a directory the kubelet
+        // creates fresh and empty, since `lost+found` lives only at the PVC root — makes
+        // `initdb` run clean on the default ext4 SC with no operator xfs discovery.
+        //
+        // The regression guard: the server container's data mount AND the chown init
+        // container's data mount must BOTH carry the SAME non-empty subPath (so the chown
+        // owns the very directory the server then runs `initdb` in), while the in-container
+        // mount path stays the engine data dir (= the `PGDATA` the spec sets), so nothing
+        // downstream of the mount shifts.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.user = Some("999:999".to_string());
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+
+        let data_mount = &pod.containers[0].volume_mounts.as_ref().unwrap()[0];
+        assert_eq!(data_mount.name, "data");
+        assert_eq!(data_mount.mount_path, "/var/lib/postgresql/data");
+        assert_eq!(
+            data_mount.sub_path.as_deref(),
+            Some(PGDATA_SUBPATH),
+            "the server data mount must use the pgdata subPath, not the ext4 PVC root"
+        );
+        assert!(
+            !PGDATA_SUBPATH.is_empty(),
+            "an empty subPath would re-mount the PVC root and reintroduce the lost+found refusal"
+        );
+
+        let init = pod
+            .init_containers
+            .as_ref()
+            .and_then(|v| v.first())
+            .expect("rootless managed DB gets a chown init container");
+        let init_mount = &init.volume_mounts.as_ref().unwrap()[0];
+        assert_eq!(
+            init_mount.sub_path.as_deref(),
+            data_mount.sub_path.as_deref(),
+            "the chown init must own the SAME subPath the server runs initdb in"
+        );
+        // The chown argv still targets the in-container mount path (which maps to the
+        // subPath), so the rootless uid owns its data dir.
+        assert_eq!(
+            init.command.as_ref().unwrap()[3],
+            "/var/lib/postgresql/data"
         );
     }
 
