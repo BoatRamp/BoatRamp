@@ -503,6 +503,20 @@ fn primary_network_is_current(network_mode: Option<&str>, expected_net: &str) ->
     network_mode == Some(expected_net)
 }
 
+/// Whether a container already advertises `expected_alias` among its live DNS `aliases` on the
+/// per-project network — the second idempotency check behind `needs_redeploy`, for the UPGRADE
+/// path (Bug D).
+///
+/// `launch` publishes [`managed_db_alias`]`(workload)` as the container's `--network-alias`. A
+/// container created before that alias was applied (or under a longer workload name) carries its
+/// OLD alias here and lacks the current one, so a sibling resolving the CURRENT alias gets
+/// NXDOMAIN until the producer is recreated. A workload whose name already fits a DNS label
+/// computes the SAME alias, so it is reported current (no spurious recreate). `None`/absent
+/// aliases ⇒ not current (recreate), matching `primary_network_is_current` for a mis-attached one.
+fn container_alias_is_current(aliases: Option<&[String]>, expected_alias: &str) -> bool {
+    aliases.is_some_and(|a| a.iter().any(|x| x == expected_alias))
+}
+
 /// Map a docker `inspect` container `State` to the runner-level [`Health`], GROUNDED in
 /// the container's ACTUAL state rather than its desired one.
 ///
@@ -869,8 +883,10 @@ impl ComputeBackend for DockerBackend {
         // per-project net was created by a release before that net became the primary
         // attachment — it is up but cannot resolve siblings by name. Report it as needing a
         // recreate so the reconcile stops + relaunches it (volume-safe), re-running `launch`
-        // with the per-project net as primary. Idempotent: a container already primary on the
-        // net returns `false`. Inspect failure / gone ⇒ `false` (the normal plan path owns it).
+        // with the per-project net as primary. A second check (Bug D, below) also recreates a
+        // container that is primary on the net but still advertises a STALE DNS alias. Idempotent:
+        // a container already primary on the net AND advertising the current alias returns
+        // `false`. Inspect failure / gone ⇒ `false` (the normal plan path owns it).
         let name = match decode_ref(&handle.backend_ref) {
             Some((n, _, _)) => n,
             None => container_name(&handle.project, &handle.workload, handle.replica),
@@ -878,11 +894,32 @@ impl ComputeBackend for DockerBackend {
         let Ok(info) = self.docker.inspect_container(&name, None).await else {
             return false;
         };
+        let project_net = project_network_name(&handle.project);
         let network_mode = info
             .host_config
             .as_ref()
             .and_then(|hc| hc.network_mode.as_deref());
-        !primary_network_is_current(network_mode, &project_network_name(&handle.project))
+        if !primary_network_is_current(network_mode, &project_net) {
+            return true;
+        }
+        // Auto-heal (Bug D, UPGRADE path): the container is primary on the per-project net but
+        // advertises a STALE DNS alias — it was launched before `managed_db_alias` applied (or
+        // under a longer workload name), so its `--network-alias` is the OLD value while a
+        // consumer now resolves the CURRENT `managed_db_alias(workload)`. Recreate (volume-safe)
+        // so the producer relaunches with the current alias; an existing deployment then adopts
+        // the <=63-octet alias on upgrade with NO manual recreate. The CONSUMER got recreated on
+        // its own spec change (new DSN host), but the producer's spec is unchanged, so without
+        // this check the half-applied state (consumer dials the short alias, producer answers only
+        // the old long one) persists. A workload whose name already fits a label computes the SAME
+        // alias, so this never spuriously recreates it.
+        let expected_alias = managed_db_alias(&handle.workload);
+        let live_aliases = info
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.get(&project_net))
+            .and_then(|ep| ep.aliases.as_deref());
+        !container_alias_is_current(live_aliases, &expected_alias)
     }
 
     /// Run a one-shot command **inside** the running container via the Engine
@@ -1521,6 +1558,37 @@ mod tests {
         assert!(!primary_network_is_current(
             Some("boatramp-net-other"),
             &expected
+        ));
+    }
+
+    /// Bug D upgrade-path auto-heal idempotency: a container is "alias-current" only when it
+    /// advertises the CURRENT `managed_db_alias(workload)` on its net. A pre-fix container still
+    /// carrying its OLD (long) `--network-alias` is stale (→ recreate so the producer re-aliases),
+    /// while a short-named workload computes the SAME alias and is never spuriously recreated.
+    #[test]
+    fn container_alias_current_only_when_it_advertises_the_current_managed_db_alias() {
+        // A long (>63-octet) managed-DB workload name whose current alias is the short hash.
+        let workload =
+            "bramp-db-0ba8mhgah7gfb4e2ivmj05ixx-simertec-stg_backoffice_db_0123456789";
+        assert!(workload.len() > 63, "fixture must exceed the DNS label cap");
+        let current = managed_db_alias(workload); // the <=63 alias `launch` now publishes
+        assert!(current.len() <= 63);
+        assert_ne!(current, workload);
+        // Current alias present among the live aliases (Docker also lists the short id) → current.
+        let live_current = vec!["0123456789ab".to_string(), current.clone()];
+        assert!(container_alias_is_current(Some(&live_current), &current));
+        // Pre-fix container: only the OLD raw (long) workload-name alias is published → stale.
+        let live_old = vec![workload.to_string()];
+        assert!(!container_alias_is_current(Some(&live_old), &current));
+        // No aliases / empty ⇒ stale (recreate), matching the net-mismatch heal.
+        assert!(!container_alias_is_current(None, &current));
+        assert!(!container_alias_is_current(Some(&[]), &current));
+        // A short workload name maps to itself, so a container carrying it is current.
+        let short_alias = managed_db_alias("pg");
+        assert_eq!(short_alias, "pg");
+        assert!(container_alias_is_current(
+            Some(&["pg".to_string()]),
+            &short_alias
         ));
     }
 
