@@ -7,6 +7,11 @@ blobs — can be streamed off a running node as a single portable **BRPROJ bundl
 imported into a project on the same node or a different one. This is how you **clone** a
 project into another environment (staging → prod, a per-customer copy) or recover one.
 
+> For a **repeatable, selective** mirror — keep a staging/preview/DR copy in step by syncing
+> only the pieces you choose, idempotently — see [Sync a project between
+> environments](./project-sync.md). This page covers the one-shot export/import/clone; both
+> remain supported.
+
 Both verbs run against a **running node** and are gated at **`Project·Admin` on the `?project=`
 target** — self-serve for a project's own admin (a Project·Admin for project X can export/import X,
 never another project Y), **not** node-global `System·Admin`. A project publisher or deployer still
@@ -96,6 +101,10 @@ $ boatramp project import acme \
 `--clone-from` turns `project import` into a third mode (alongside `--in <file>` and
 `--resumable <dir>`, and mutually exclusive with both). Like every import it is a **dry-run by
 default** — add `--apply` to execute.
+
+> **Replicating repeatedly?** `--clone-from` is a one-shot copy. To mirror only selected pieces
+> and re-run it to converge just what changed (e.g. sync prod app data into staging without
+> touching staging's own domains), use [`project sync`](./project-sync.md) instead.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -387,6 +396,8 @@ cap refuses the import outright, naming the cap it hit.
 
 ## See also
 
+- [Sync a project between environments](./project-sync.md) — the idempotent, piece-selective
+  successor to one-shot `--clone-from`, which reuses this page's clone transport.
 - [Declare a managed database](./managed-databases.md) — the same trusted-extension allowlist
   and managed-vs-external/single-vs-shared distinctions this page relies on.
 - [In-app schema migrations](./in-app-migrations.md#enable-an-extension) — the

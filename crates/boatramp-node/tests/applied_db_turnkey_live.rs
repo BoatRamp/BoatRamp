@@ -249,6 +249,7 @@ async fn drive(
         ManagedSqlCredentials::new(kv.clone(), envelope.clone()),
         ManagedDbPrivilege::Rootless,
         deploy.clone(),
+        std::collections::BTreeSet::new(),
     );
     let server_env = env.managed_db_env(PROJECT, &workload).await;
     if server_env.is_empty() {
@@ -474,6 +475,7 @@ async fn launch_with_env(
         readiness: boatramp_core::compute::Readiness::Provisioned,
         data_dir: None,
         snapshot: None,
+        active_spec: None,
     };
     deploy
         .set_replica_state(proj, &observed)

@@ -121,6 +121,7 @@ mod overlay;
 mod project;
 mod project_migrate;
 mod project_repair;
+mod project_sync;
 mod project_tenant_secrets;
 mod secrets;
 mod security;

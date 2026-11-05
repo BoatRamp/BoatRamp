@@ -742,6 +742,25 @@ impl ControlPlane {
             .await?)
     }
 
+    /// List the project's site names (`GET /api/{seg}` sites). Read-only; the server returns the
+    /// union of the project's `site/`/`current/`/`history/` pointers as a `Vec<String>`. Used by
+    /// `project sync` to enumerate the source's sites for the per-site carry/rewrite.
+    pub async fn list_sites(&self) -> Result<Vec<String>> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Fetch a site's config (server returns defaults if unset).
     pub async fn fetch_site_config(&self, site: &str) -> Result<SiteConfig> {
         let seg = self.sites_seg();

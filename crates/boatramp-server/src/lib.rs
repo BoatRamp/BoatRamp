@@ -5518,6 +5518,7 @@ mod tests {
                 replica: 0,
                 data_ref: "snap-0".into(),
             }),
+            active_spec: None,
         }
     }
 

@@ -7,6 +7,103 @@ versions.
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-11-05
+
+### Added
+
+- **Apply-declared databases are auto-wired as the runtime `sql` binding (mailroom cap-req #28).**
+  A database declared through the manifest (e.g. `databases: [(name: "default", …)]`) with no
+  node-static `[handlers.bindings.sql.databases]` entry now resolves a handler's `sql.open("")` to
+  the managed server, instead of silently falling through to the built-in libsql/SQLite store (the
+  `no such table` mailroom symptom). A transient control-plane read while resolving a declared
+  binding surfaces as the same retryable `503` readiness gate a not-yet-ready managed DB uses
+  (never a hard "sql not granted"), and the declared fallback is attached only on a node that
+  actually runs a compute backend (`[compute]` configured).
+- **Declared managed-DB extensions are auto-created once the replica is ready (mailroom cap-req
+  #28).** Extensions listed on a declared database (e.g. `extensions: ["vector"]`) that are also on
+  the `migrate_trusted_extensions` allowlist are created with `CREATE EXTENSION IF NOT EXISTS` by an
+  owner-gated post-ready provisioning pass — so a declared `vector` is present without a manual
+  migration step; non-allowlisted extensions are skipped.
+
+### Fixed
+
+- **docker compute backend — managed-DB per-project-network DNS now registers on Docker 29.x.** The
+  per-project-net alias (and the DSN host a consumer resolves) is now a ≤63-octet, DNS-valid label.
+  A long managed-DB workload name (`bramp-db-<hash>-<project>_<id>`, ~69 octets) exceeded the RFC
+  1035 single-label cap, which Docker 29.x libnetwork refuses to publish as an embedded-DNS
+  service-discovery record (Docker 28 tolerated it) — so the name never resolved and a managed-DB-
+  bound workload crash-looped on an unresolvable DSN. `launch()` now emits a stable 34-octet
+  `bramp-db-<hash>` alias (128-bit collision-resistant, injective per project) as both the
+  `--network-alias` and the DSN host; short/valid workload names pass through unchanged.
+- **docker compute backend — no-port workloads launch on Docker 29.x.** `launch()` no longer emits
+  a `0/tcp` port specification for a workload with no port — Docker 29.x rejects it with a 400
+  (`invalid port specification: "0/tcp"`) where Docker 28 tolerated it.
+- **Kubernetes managed DB on ext4 PVCs (mailroom cap-req #28 defect A).** A managed database's data
+  directory is now bound to a `pgdata` **subPath** of its PVC rather than the mount root, so an
+  ext4 volume's root-level `lost+found` (the Hetzner CSI default and most cloud CSIs) no longer
+  makes Postgres `initdb` refuse `PGDATA` as "not empty" and CrashLoopBackOff the DB container. The
+  in-container mount path is unchanged. (`kind`-based CI uses `lost+found`-free local-path/hostPath
+  volumes, which is why this slipped.)
+- **Kubernetes managed-DB readiness surfaces now agree (mailroom cap-req #28 defect B2).** `boatramp
+  db status <db>` and `GET /api/sql/<db>/status` now report the same readiness (both resolved via
+  the canonical digest workload), instead of `db status` stalling at `pending` forever while the
+  `/api/sql` surface reported `provisioned`.
+
+### Changed
+
+- **MIGRATION — Kubernetes managed DB data location.** Because of the ext4 subPath fix above, a
+  managed database **provisioned by boatramp ≤ v0.56.1** kept its `PGDATA` at the **PVC root**;
+  this version expects it under the `pgdata` subPath. On upgrade, boatramp does **not** silently
+  re-`initdb` a blank database over the stranded root data: a pre-flight init-container guard
+  inspects the PVC root and, if it is non-empty but has no `pgdata` subdirectory (i.e. pre-fix data
+  is present), **refuses to start the DB with actionable guidance** rather than starting an empty
+  one. To migrate such a volume, mount the PVC (e.g. a maintenance pod), move its root `PGDATA`
+  contents into a new `pgdata/` subdirectory (keeping `lost+found` at the root), then restart the
+  database. Fresh volumes (empty, or only `lost+found`) and already-migrated volumes are unaffected.
+
+## [0.56.1] - 2026-11-05
+
+### Fixed
+
+- **docker compute backend — per-project-network DNS now resolves for workloads.** Long-lived
+  workloads are created with their per-project user-defined network as the PRIMARY attachment
+  (`HostConfig.NetworkMode`), so docker's embedded DNS (127.0.0.11) + service discovery publish
+  them and siblings resolve each other by name/alias (e.g. a managed-DB-bound workload reaching
+  `@<db-workload>:5432`). The v0.55.0 secondary-attach left names unresolvable. The export/import
+  one-shot keeps its dual-attach (default bridge + per-project net) so it still reaches a DB on any
+  network.
+- **docker compute backend — spec-change redeploys now recreate the container.** The reconcile had
+  no spec-change detection, so a redeploy (a new active spec hash) emitted no action and `launch()`
+  never re-ran. Reconcile now recreates a replica when its launched spec differs from the active
+  spec, or when its actual primary network does not match the per-project net — auto-healing
+  pre-upgrade workloads on the first reconcile after the upgrade, with the data volume preserved
+  across the recreate.
+- **docker compute backend — `compute status` reports actual container state.** Health keys on the
+  container's real `State.Status` (and a declared healthcheck) rather than the `running` bool alone,
+  so a crash-looping or restarting container surfaces as unhealthy instead of a masked "healthy".
+
+## [0.56.0] - 2026-11-05
+
+### Added
+
+- **`project sync`** — idempotent, selective, coherence-preserving project replication, the
+  successor to the one-shot `import --clone-from` for environment replication. Reconciles a target
+  project toward a source for a selected set of pieces (`--include-<piece>` / `--exclude-<piece>`
+  over `pg`, `blobs`, `sites`, `domains`, `settings`, `databases`, `graphql`, `history`, `secrets`;
+  plus per-item `--exclude-site` / `--exclude-db`), rewriting site configs so the result is always
+  coherent — excluded pieces are preserved verbatim, and the `domains` field inside an included
+  site config is preserved from the destination under `--exclude-domains` (no re-authorization on a
+  resync). Dry-run preflight is the default; `--apply` requires `-y`. The source may be another node
+  (reuses the `--clone-from` URL transport; `Project·Admin` on both ends; source token via
+  `--clone-source-token-file` / `BOATRAMP_CLONE_SOURCE_TOKEN`). An absent destination is created and
+  provisioned. Coherence is resolved per item (atomic skip-and-report with a non-zero skipped count
+  for CI); `--strict` flips skip into refuse-all. A cross-node `--include-domains --apply` is refused
+  without `--allow-domain-cutover` (the destination's host-uniqueness guard is same-node only, so a
+  blind carry risks a second simultaneously-live owner). Every source-derived site/database name is
+  validated before URL interpolation (cross-tenant path-traversal guard); `settings`/`graphql`/
+  `history` are not carried over the CLI yet and an `--apply` naming one is refused up front (never a
+  half-sync).
+
 ## [0.55.0] - 2026-11-04
 
 ### Added

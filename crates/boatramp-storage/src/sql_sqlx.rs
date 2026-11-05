@@ -250,6 +250,45 @@ pub trait PerTenantSqlResolver: Send + Sync {
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError>;
 }
 
+/// Resolves a **project-declared** (apply-managed) database that the node operator did
+/// NOT register statically — the `databases:` entries an `apply` / `db declare` persists
+/// to the per-project declarative store (`project/{project}/database/{name}`).
+///
+/// This is the serve-time bridge for cap-req #28 defect B: a managed DB declared through
+/// the manifest front door is provisioned + listed, but until now was NEVER wired as a
+/// runtime `sql` binding — a handler's `sql.open("")` fell through to the built-in libsql
+/// default instead of reaching the declared Postgres. The composite consults this resolver
+/// for a name it has no STATIC binding for, BEFORE falling through to the libsql default,
+/// so a declared `default` (or any declared name) resolves to its managed server per the
+/// request's `(project, site)` — exactly the per-tenant isolation a static managed binding
+/// gets, just sourced from the declarative store.
+///
+/// `name` arrives default-ALIASED (an empty `sql.open("")` is passed as the reserved
+/// [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME), `"default"`), so the
+/// implementation looks the declared record up by its stored key directly. `Ok(None)`
+/// means "this project declared no managed DB by that name" — the caller then uses the
+/// libsql default, isolation intact. The daemon-static merge point still WINS: the
+/// composite only reaches this resolver for a name absent from its static maps, and the
+/// implementation additionally refuses a name the operator declared statically (so a
+/// manifest can never shadow a BYO operator binding through this seam).
+///
+/// Security: like [`PerTenantSqlResolver`], the implementation MUST derive the
+/// endpoint/credential from `(project, site)` + the stored declaration alone, so one
+/// tenant's request can only ever resolve to its own managed database.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait::async_trait]
+pub trait DeclaredDbResolver: Send + Sync {
+    /// The backend for the declared managed database `name` (already default-aliased) for
+    /// the request's `(project, site)`, or `None` if the project declared none by that
+    /// name (fall through to the libsql default).
+    async fn resolve(
+        &self,
+        project: &str,
+        site: &str,
+        name: &str,
+    ) -> Result<Option<Arc<dyn boatramp_core::sql::SqlBackend>>, SqlError>;
+}
+
 /// A [`SqlBackends`](boatramp_core::sql::SqlBackends) that overlays
 /// operator-configured **external** databases on a managed `default` (libsql).
 ///
@@ -274,6 +313,11 @@ pub struct CompositeSqlBackends {
     default: Arc<dyn boatramp_core::sql::SqlBackends>,
     external: std::collections::HashMap<String, ExternalEntry>,
     per_tenant: std::collections::HashMap<String, PerTenantEntry>,
+    /// The project-declared (apply-managed) database fallback (cap-req #28 B): consulted
+    /// for a name with no STATIC binding, before the libsql default, so a declared managed
+    /// DB resolves as the runtime `sql` binding. `None` ⇒ no declarative source wired (the
+    /// historical behavior: a non-static name falls straight through to libsql).
+    declared: Option<Arc<dyn DeclaredDbResolver>>,
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -322,7 +366,19 @@ impl CompositeSqlBackends {
             default,
             external: std::collections::HashMap::new(),
             per_tenant: std::collections::HashMap::new(),
+            declared: None,
         }
+    }
+
+    /// Attach the project-declared (apply-managed) database fallback (cap-req #28 B). A
+    /// name with no static binding is resolved through `resolver` before the libsql
+    /// default, so a managed DB declared via `apply` / `db declare` is reachable as a
+    /// runtime `sql` binding (e.g. a declared `default` becomes `sql.open("")`). The
+    /// daemon-static maps still win (they are matched first); see [`DeclaredDbResolver`].
+    #[must_use]
+    pub fn with_declared_fallback(mut self, resolver: Arc<dyn DeclaredDbResolver>) -> Self {
+        self.declared = Some(resolver);
+        self
     }
 
     /// Register a named **shared external** backend (built via [`connect`]) — a
@@ -371,10 +427,10 @@ impl CompositeSqlBackends {
         self
     }
 
-    /// Whether any external or per-tenant database is registered (else the composite
-    /// is a pure pass-through and the caller may use the `default` directly).
+    /// Whether any external, per-tenant, or declared-DB overlay is registered (else the
+    /// composite is a pure pass-through and the caller may use the `default` directly).
     pub fn has_external(&self) -> bool {
-        !self.external.is_empty() || !self.per_tenant.is_empty()
+        !self.external.is_empty() || !self.per_tenant.is_empty() || self.declared.is_some()
     }
 
     /// Resolve a per-tenant binding for `(project, site)`, caching the result by the
@@ -417,6 +473,21 @@ impl CompositeSqlBackends {
 /// it keys its per-site file/namespace off the *original* empty name (`{site}.db`), so
 /// renaming there would move physical data (handled by the libsql move tool, a
 /// separate deliverable).
+/// The name a guest-opened `name` is looked up under in the declarative store: the
+/// empty default-DB name (`sql.open("")`) maps to the reserved real name
+/// [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME) (`"default"`), under which
+/// a declared default database is stored (`project/{project}/database/default`); any other
+/// name is used verbatim. The inverse alias (`"default"` → `""`) the static-map [`lookup`]
+/// does is unnecessary here because the declarative store always keys by the real name.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn declared_name(name: &str) -> &str {
+    if name.is_empty() {
+        boatramp_core::project::DEFAULT_DB_NAME
+    } else {
+        name
+    }
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn lookup<'a, V>(map: &'a std::collections::HashMap<String, V>, name: &str) -> Option<&'a V> {
     if let Some(v) = map.get(name) {
@@ -452,6 +523,17 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         if let Some(entry) = lookup(&self.external, name) {
             return Ok(entry.backend.clone());
         }
+        // A project-DECLARED (apply-managed) database with no static binding (cap-req #28
+        // B): resolve it as this `(project, site)`'s managed server BEFORE falling through
+        // to libsql, so a declared `default` becomes the guest's `sql.open("")`. The name
+        // is default-aliased for the declarative store lookup (`""` → the reserved
+        // `default`). `Ok(None)` ⇒ the project declared no managed DB by that name →
+        // libsql default, isolation intact.
+        if let Some(declared) = &self.declared
+            && let Some(backend) = declared.resolve(project, site, declared_name(name)).await?
+        {
+            return Ok(backend);
+        }
         // Fall-through: the managed `default` (per-site libsql), which qualifies the
         // site by `project` itself. Pass the ORIGINAL `name` (no default-alias) so the
         // libsql path derivation is unchanged.
@@ -486,6 +568,11 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
                  (set `allow_preview` on it to permit that)"
             )));
         }
+        // The project-declared fallback is deliberately NOT consulted for previews: a
+        // declared managed DB is never a preview target (it lowers with `allow_preview =
+        // false`), so a preview deployment gets an isolated libsql preview database rather
+        // than touching the live managed data (cap-req #28 B — the safe-by-default preview
+        // posture, matching the per-tenant/external `allow_preview` refusal above).
         self.default
             .preview_database(project, site, name, preview)
             .await
@@ -1851,5 +1938,95 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, SqlError::Other(m) if m.contains("not available to preview")));
+    }
+
+    // A fake declared-DB fallback that resolves ONLY the names it was given (tagged
+    // "DECLARED"), and `None` for everything else — so a routing test can prove the
+    // composite consults it for an unmatched name before the libsql default, and does NOT
+    // for a static-bound name or on the preview path (cap-req #28 B).
+    struct DeclaredTagResolver {
+        declared: std::collections::HashSet<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeclaredDbResolver for DeclaredTagResolver {
+        async fn resolve(
+            &self,
+            _project: &str,
+            _site: &str,
+            name: &str,
+        ) -> Result<Option<std::sync::Arc<dyn boatramp_core::sql::SqlBackend>>, SqlError> {
+            Ok(self
+                .declared
+                .contains(name)
+                .then(|| std::sync::Arc::new(TagBackend("DECLARED")) as _))
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_fallback_backs_the_default_binding_before_libsql() {
+        use boatramp_core::sql::SqlBackends;
+
+        // A project-declared `default` managed DB, no static binding (the mailroom case).
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_declared_fallback(std::sync::Arc::new(DeclaredTagResolver {
+                declared: ["default"].into_iter().collect(),
+            }));
+        // The declared fallback alone is enough to make the composite non-pass-through.
+        assert!(composite.has_external());
+
+        // `sql.open("")` default-aliases to the declared `default` → the managed backend,
+        // NOT the built-in libsql default (the exact defect-B symptom, now fixed).
+        assert_eq!(
+            tag(composite.database("default", "s", "").await).await,
+            "sql error: DECLARED"
+        );
+        // `sql.open("default")` reaches the same declared backend.
+        assert_eq!(
+            tag(composite.database("default", "s", "default").await).await,
+            "sql error: DECLARED"
+        );
+        // A name the project did NOT declare falls through to the libsql default, isolation
+        // intact.
+        assert_eq!(
+            tag(composite.database("default", "s", "other").await).await,
+            "sql error: DEFAULT"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_static_binding_wins_over_the_declared_fallback() {
+        use boatramp_core::sql::SqlBackends;
+
+        // Both a static external `default` AND a declared fallback claiming `default`: the
+        // static (operator) binding must win (daemon-config-wins — a manifest may never
+        // shadow a BYO operator binding).
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_external("default", std::sync::Arc::new(TagBackend("STATIC")), false)
+            .with_declared_fallback(std::sync::Arc::new(DeclaredTagResolver {
+                declared: ["default"].into_iter().collect(),
+            }));
+        assert_eq!(
+            tag(composite.database("default", "s", "").await).await,
+            "sql error: STATIC",
+            "a static operator binding must win over a project declaration"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_fallback_is_not_consulted_on_the_preview_path() {
+        use boatramp_core::sql::SqlBackends;
+
+        // A declared managed DB lowers with allow_preview = false, so a preview deployment
+        // must get the isolated libsql preview DB, never the live managed data.
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_declared_fallback(std::sync::Arc::new(DeclaredTagResolver {
+                declared: ["default"].into_iter().collect(),
+            }));
+        assert_eq!(
+            tag(composite.preview_database("default", "s", "", "pr1").await).await,
+            "sql error: DEFAULT",
+            "a preview must not reach the declared managed DB"
+        );
     }
 }

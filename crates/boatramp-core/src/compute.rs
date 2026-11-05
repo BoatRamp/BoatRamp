@@ -163,6 +163,84 @@ pub fn compute_instance_id(project: &str, workload: &str, replica: u32) -> Strin
     }
 }
 
+/// The RFC 1035 single-label limit: one dot-separated component of a hostname is at most
+/// **63 octets**. Docker 29's libnetwork refuses to publish an embedded-DNS service-discovery
+/// record for a label longer than this (Docker 28 and earlier silently tolerated it), so a
+/// per-project-network ALIAS over 63 octets never resolves on 29.x — a sibling gets NXDOMAIN
+/// even though the container's endpoint joined the network and `docker inspect` shows the
+/// alias. This was empirically confirmed on a Docker 29.9.1 host (a 69-char alias failed to
+/// register; a 13-char one resolved; the only discriminator was the length, not the charset).
+pub const DNS_LABEL_MAX_LEN: usize = 63;
+
+/// Whether `s` is a resolvable single DNS label on a docker embedded-DNS network: 1..=63
+/// octets, each byte ASCII alphanumeric or `-`/`_`, not starting or ending with `-`. (`_`
+/// is deliberately accepted — boatramp's sanitized tenant idents contain it and Docker 29's
+/// embedded DNS registers it fine; the empirically-decisive constraint is the 63-octet
+/// length, which this enforces as [`DNS_LABEL_MAX_LEN`].)
+pub fn is_valid_dns_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > DNS_LABEL_MAX_LEN {
+        return false;
+    }
+    if b[0] == b'-' || b[b.len() - 1] == b'-' {
+        return false;
+    }
+    b.iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// The service-discovery ALIAS a co-located workload is published under on its per-project
+/// docker network — and, identically, the hostname a sibling composes into the managed-DB
+/// DSN it resolves. It MUST be a valid DNS label (≤ [`DNS_LABEL_MAX_LEN`] octets) or Docker
+/// 29's embedded DNS will not register it (see [`DNS_LABEL_MAX_LEN`]).
+///
+/// The compute workload NAME is the stable identity (container name, deploy-store key,
+/// per-tenant volume, sealed credential) and is intentionally left long and byte-stable. For
+/// a `Single`-isolation managed database that name is `<compute>-<sanitized-tenant-ident>`
+/// where BOTH halves already carry a 25-char digest, so it routinely exceeds 63 octets
+/// (`bramp-db-<25>-<body>_<25>` ≈ 69). Resolving a workload by that over-long name is exactly
+/// what broke on Docker 29.9.1 — the alias was the full workload name.
+///
+/// This maps a workload name to a short, STABLE, DNS-valid alias used for BOTH the network
+/// endpoint alias (`boatramp-docker`'s `launch`) AND the DSN host a consumer resolves
+/// (`NodeTenantSqlResolver::connection_parts`), so the two always MATCH:
+///
+/// - A name that already fits (≤ 63 octets) is returned UNCHANGED — so every current working
+///   name (a short user workload, a `Shared` server's plain `<compute>`) stays byte-identical
+///   and behavior/existing deployments are unaffected. This is also why Docker 28 was always
+///   fine: its names registered regardless of length.
+/// - A longer name is replaced by `bramp-db-<25-char base-36 digest of the full name>` (34
+///   octets): a fixed-width, collision-resistant (128-bit SHA-256-derived) label in the
+///   `[a-z0-9-]` grammar with a letter lead. Being a pure function of the workload name, the
+///   launch alias and the DSN host derive the IDENTICAL string.
+///
+/// Uniqueness only has to hold WITHIN one project's isolated network; the 128-bit digest makes
+/// a collision between two distinct workload names cryptographically negligible, and colliding
+/// with a short literal `bramp-db-<…>` workload would require an operator to name a workload
+/// the exact 25-char digest — not a reachable accident.
+pub fn managed_db_alias(workload: &str) -> String {
+    if workload.len() <= DNS_LABEL_MAX_LEN {
+        return workload.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    // Leading 128 bits of SHA-256, re-encoded base-36 at a fixed 25-char width (36^25 > 2^128),
+    // mirroring the managed-DB workload digest scheme so operators see a familiar shape.
+    let hex = hex::encode(Sha256::digest(workload.as_bytes()));
+    let mut n = u128::from_str_radix(&hex[..32], 16).expect("32 hex chars are a valid u128");
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = [b'0'; 25];
+    let mut i = buf.len();
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = DIGITS[(n % 36) as usize];
+        n /= 36;
+    }
+    format!(
+        "bramp-db-{}",
+        String::from_utf8(buf.to_vec()).expect("base-36 digits are ASCII")
+    )
+}
+
 /// The **per-(project, workload) scope** a backend keys a persistent volume's host
 /// backing directory under, so two co-located workloads that name a volume identically
 /// never collide on one host directory. It identifies `(project, workload)` (a volume
@@ -595,6 +673,23 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Liveness/readiness of a running replica.
     async fn health(&self, handle: &InstanceHandle) -> Result<Health, BackendError>;
+
+    /// Whether a RUNNING replica's live **deployment shape** is OUTDATED versus `spec` and
+    /// must be RECREATED even though its spec pointer is unchanged and it is healthy —
+    /// a backend-specific auto-heal signal the reconcile folds into its recreate decision
+    /// (see [`reconcile_plan`]'s `force_recreate`). The docker backend returns `true` for a
+    /// container whose PRIMARY network is not the per-project network: such a container (one
+    /// created by a release before the per-project net became the *primary* attachment) is
+    /// up but cannot resolve its siblings by name, and only a recreate — which re-runs
+    /// `launch` with the net as primary — fixes it. This lets the fix auto-heal pre-upgrade
+    /// containers on the first reconcile after the upgrade, with NO manual `docker rm`.
+    /// Idempotent: once the replica is on the current deployment shape it returns `false`
+    /// and the reconcile is a no-op. The recreate is volume-SAFE (`stop` removes only the
+    /// container, never its persistent volume). Default `false` — a backend with nothing to
+    /// re-shape never forces a recreate, so non-docker backends are unaffected.
+    async fn needs_redeploy(&self, _handle: &InstanceHandle, _spec: &ComputeSpec) -> bool {
+        false
+    }
 
     /// **Affirmative liveness** of a replica's backing container/VM, for the orphan
     /// reaper's fail-closed "is it gone?" decision — DISTINCT from [`health`](Self::health),
@@ -1238,6 +1333,24 @@ pub struct ObservedInstance {
     /// The snapshot to restore from — `Some` iff `phase == Zero`.
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
+    /// The workload's **active spec pointer** ([`ComputeWorkload::active`], a
+    /// `computever/<hash>` id) this replica was LAUNCHED from — recorded by
+    /// `launch_one`. It is what lets the reconcile detect a REDEPLOY: when the
+    /// workload's `active` later differs from this (an operator flipped the pointer to
+    /// a new spec), [`reconcile_plan`] RECREATES the replica (stop + relaunch) so the
+    /// NEW spec actually runs. Without it a spec change was invisible — an already-
+    /// `healthy` replica was kept, and a shared-kernel backend's own restart policy
+    /// (docker `restart: always`) merely restarted the OLD container IN PLACE, so the
+    /// redeploy never re-ran `launch` (and, for docker, never re-attached the
+    /// per-project network). The recreate is volume-SAFE: `stop` removes only the
+    /// container/VM, never its persistent volume, so a managed DB's data survives.
+    /// `None` — a legacy record written before this field, or a restored replica whose
+    /// source spec is unknown — is treated as "matches" (never a spurious recreate);
+    /// the reconcile BACKFILLS it to the current `active` on the next observation so a
+    /// SUBSEQUENT redeploy is still detected. `#[serde(default)]` keeps older records
+    /// deserializing — schema stays v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_spec: Option<String>,
 }
 
 /// The observed-state key for a workload's replica, **project-scoped** (0.2.0):
@@ -1323,6 +1436,12 @@ pub enum WorkloadActivity {
 ///
 /// `now` is the current wall-clock unix seconds, compared against each replica's
 /// `started_at` for the startup-grace check.
+///
+/// `force_recreate` is the set of in-range replica ordinals the driver has independently
+/// determined must be RECREATED regardless of health or spec pointer — the backend's
+/// [`needs_redeploy`](ComputeBackend::needs_redeploy) auto-heal signal (e.g. a docker
+/// container stuck on the wrong PRIMARY network). Such a replica is stopped and relaunched
+/// exactly like a spec-changed one. Empty ⇒ the recreate trigger is the spec pointer alone.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_plan(
     workload: &ComputeWorkload,
@@ -1333,6 +1452,7 @@ pub fn reconcile_plan(
     activity: WorkloadActivity,
     caps: &BTreeMap<String, Capabilities>,
     now: u64,
+    force_recreate: &BTreeSet<u32>,
 ) -> Vec<Action> {
     let desired = workload.replicas;
     let mut actions = Vec::new();
@@ -1352,6 +1472,23 @@ pub fn reconcile_plan(
         .filter(|i| i.handle.workload == workload.name)
     {
         let ord = inst.handle.replica;
+        // A REDEPLOY check: this replica was launched from a spec pointer that no
+        // longer matches the workload's current `active` (an operator flipped it to a
+        // new spec). It must be RECREATED (stopped here → relaunched below from the new
+        // spec), NOT kept — keeping it is the bug where a changed spec was invisible and
+        // a shared-kernel backend's own restart policy merely restarted the OLD
+        // container in place (so the redeploy never re-ran `launch`). `None` (legacy /
+        // restored record whose source spec is unknown) never counts as stale, so it is
+        // never spuriously recreated — the reconcile backfills it to the current
+        // `active` on observation. Does NOT apply to a `Zero` (parked) replica: it has
+        // no live container and wakes via `Restore`, handled below.
+        let stale_spec = inst
+            .active_spec
+            .as_deref()
+            .is_some_and(|launched| launched != workload.active)
+            // …or the driver flagged this ordinal for an auto-heal recreate (the backend's
+            // `needs_redeploy` — e.g. a docker container on the wrong primary network).
+            || force_recreate.contains(&ord);
         if ord >= desired {
             // Out of range (also discards a Zero replica's snapshot — Stop is
             // idempotent and the driver forgets the state).
@@ -1370,7 +1507,7 @@ pub fn reconcile_plan(
                     backend: inst.backend.clone(),
                 });
             }
-        } else if inst.healthy {
+        } else if inst.healthy && !stale_spec {
             healthy.insert(ord);
             // Sleep on sustained idle (opt-in + capable backend).
             if matches!(activity, WorkloadActivity::Idle) && sleeps(&inst.backend) {
@@ -1378,8 +1515,20 @@ pub fn reconcile_plan(
                     handle: inst.handle.clone(),
                 });
             }
-        } else if matches!(spec.restart, RestartPolicy::Never) {
-            terminal.insert(ord); // run-to-completion: leave it, don't replace
+        } else if matches!(spec.restart, RestartPolicy::Never) && !inst.healthy {
+            // Run-to-completion that has EXITED (unhealthy + `Never`): leave it terminal,
+            // never relaunch — even on a spec change (re-running a finished batch job on a
+            // redeploy is not the intent; a new spec for a run-to-completion workload takes
+            // effect when it is next launched, not by resurrecting a completed run).
+            terminal.insert(ord);
+        } else if stale_spec {
+            // REDEPLOY: a running (healthy, starting, or merely unhealthy-and-restartable)
+            // replica of a now-superseded spec. Stop it so its ordinal is relaunched below
+            // from the new spec — the recreate the in-place restart never did. The data
+            // volume survives (`stop` removes only the container, never its volume).
+            actions.push(Action::Stop {
+                handle: inst.handle.clone(),
+            });
         } else if inst
             .started_at
             .is_some_and(|t| now.saturating_sub(t) < spec.startup_grace_secs as u64)
@@ -2201,6 +2350,10 @@ pub async fn reconcile_once(
         // Observed replica state + a health refresh (skipping parked Zero
         // replicas — they're intentionally down).
         let mut observed = deploy.list_replica_states(project, &workload.name).await?;
+        // Ordinals the backend reports as running an OUTDATED deployment shape (the
+        // `needs_redeploy` auto-heal — e.g. a docker container on the wrong primary
+        // network): the planner recreates them like a spec-changed replica.
+        let mut force_recreate: BTreeSet<u32> = BTreeSet::new();
         for state in &mut observed {
             if state.phase == ReplicaPhase::Zero {
                 // Record the parked replica so the A2 GC keeps its IP reserved.
@@ -2213,6 +2366,12 @@ pub async fn reconcile_once(
             }
             if let Some(backend) = backends.get(&state.backend) {
                 let mut changed = false;
+                // Auto-heal probe: a backend may report that this running replica's live
+                // deployment shape is stale (docker: wrong primary network) and must be
+                // recreated even though it is healthy and its spec pointer is unchanged.
+                if backend.needs_redeploy(&state.handle, &spec).await {
+                    force_recreate.insert(state.handle.replica);
+                }
                 // 1) Refresh the runner/TCP-level health. The endpoint/DNS resolvers read
                 // `healthy` from the STORE, not from this in-memory refresh, so a replica
                 // that becomes reachable *after* launch must have that recovery written
@@ -2272,6 +2431,17 @@ pub async fn reconcile_once(
                     state.data_dir = data_dir;
                     changed = true;
                 }
+                // 4) Backfill the active-spec pointer on a legacy record (written before
+                //    the field existed). Adopt the workload's CURRENT `active` — the
+                //    conservative choice: it never spuriously RECREATES an already-running
+                //    replica, and from here the field tracks real redeploys, so a
+                //    SUBSEQUENT spec change is detected (`reconcile_plan`). A newly launched
+                //    replica already carries its pointer (set by `launch_one`), so this is a
+                //    one-time catch-up per pre-upgrade replica, never a steady-state write.
+                if state.active_spec.is_none() {
+                    state.active_spec = Some(workload.active.clone());
+                    changed = true;
+                }
                 if changed && let Err(e) = deploy.set_replica_state(project, state).await {
                     report.errors.push(format!(
                         "{}/{}: persist state: {e}",
@@ -2311,6 +2481,7 @@ pub async fn reconcile_once(
             workload_activity,
             &caps,
             crate::time::now_unix(),
+            &force_recreate,
         ) {
             match action {
                 Action::Launch {
@@ -2416,6 +2587,7 @@ pub async fn reconcile_once(
                         node,
                         node_region,
                         &spec,
+                        &workload.active,
                         &launch_env,
                         privilege.as_ref(),
                         pull_auth.as_ref(),
@@ -2568,6 +2740,10 @@ pub async fn reconcile_once(
                                 // Recomputed by the next reconcile tick's readiness pass.
                                 data_dir: None,
                                 snapshot: None,
+                                // A woken replica is brought back as the workload's CURRENT
+                                // active spec (restore converges to desired state), so it is
+                                // not immediately flagged stale and recreated.
+                                active_spec: Some(workload.active.clone()),
                             };
                             match deploy.set_replica_state(project, &state).await {
                                 Ok(()) => report.woke += 1,
@@ -2725,6 +2901,7 @@ async fn launch_one(
     node: u64,
     node_region: Option<String>,
     spec: &ComputeSpec,
+    active_spec: &str,
     extra_env: &[(String, String)],
     privilege: Option<&PrivilegeDirective>,
     pull_auth: Option<&RegistryAuth>,
@@ -2807,6 +2984,9 @@ async fn launch_one(
         // Diagnosed by the reconcile only if this replica stays stuck up-but-not-answering.
         data_dir: None,
         snapshot: None,
+        // Stamp the spec pointer this replica was launched from, so the next time the
+        // workload's `active` differs the reconcile RECREATES it (the redeploy path).
+        active_spec: Some(active_spec.to_string()),
     })
 }
 
@@ -2927,6 +3107,63 @@ mod tests {
             compute_instance_id("acme", "web", 0),
             compute_instance_id("default", "web", 0)
         );
+    }
+
+    /// The Docker-29 service-discovery fix (RFC 1035 63-octet label cap): a short, valid
+    /// workload name is published as-is (so every pre-existing deployment and the green gate
+    /// are byte-unchanged), while a name over 63 octets — the real `Single` managed-DB shape
+    /// `bramp-db-<25>-<body>_<25>` — is mapped to a short, STABLE, DNS-valid alias. This is the
+    /// VERSION-INDEPENDENT guard: it fails on ANY host (no docker needed) if the emitted alias
+    /// could ever exceed a DNS label, which is exactly what Docker 29.9.1 refuses to register.
+    #[test]
+    fn managed_db_alias_fits_a_dns_label_and_is_stable() {
+        // Short/valid names pass straight through — no behavior change anywhere.
+        assert_eq!(managed_db_alias("web"), "web");
+        assert_eq!(managed_db_alias("pg"), "pg");
+        let shared = "bramp-db-abcdefghijklmnopqrstuvwxy"; // 34 octets (≤ 63): unchanged
+        assert!(shared.len() <= DNS_LABEL_MAX_LEN);
+        assert_eq!(managed_db_alias(shared), shared);
+
+        // A realistic >63-octet `Single` managed-DB workload name: `<compute>-<ident>` where
+        // BOTH halves carry a 25-char digest — the exact shape that broke on Docker 29.9.1.
+        let h = "abcdefghijklmnopqrstuvwxy"; // 25 base-36 chars
+        let long = format!("bramp-db-{h}-acme_{h}");
+        assert!(
+            long.len() > DNS_LABEL_MAX_LEN,
+            "fixture must exceed the 63-octet DNS label cap (the bug): got {}",
+            long.len()
+        );
+        let alias = managed_db_alias(&long);
+        assert!(
+            alias.len() <= DNS_LABEL_MAX_LEN,
+            "the emitted alias MUST fit a DNS label or Docker 29 drops its SD record: {alias} ({} octets)",
+            alias.len()
+        );
+        assert!(
+            is_valid_dns_label(&alias),
+            "the emitted alias must be a valid DNS label: {alias}"
+        );
+        assert!(alias.starts_with("bramp-db-"), "greppable prefix: {alias}");
+        // Pure + stable across calls (the launch alias and the DSN host must agree, forever).
+        assert_eq!(alias, managed_db_alias(&long));
+        // Distinct long workloads ⇒ distinct aliases (per-project uniqueness).
+        let long2 = format!("bramp-db-{h}-beta_{h}");
+        assert_ne!(
+            managed_db_alias(&long),
+            managed_db_alias(&long2),
+            "distinct managed-DB workloads must not collide on their SD alias"
+        );
+    }
+
+    #[test]
+    fn is_valid_dns_label_enforces_the_63_octet_cap() {
+        assert!(is_valid_dns_label("pg"));
+        assert!(is_valid_dns_label("bramp-db-acme_0123456789abcdef")); // `_` is accepted
+        assert!(is_valid_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN)));
+        assert!(!is_valid_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN + 1))); // 64 octets: invalid
+        assert!(!is_valid_dns_label("")); // empty
+        assert!(!is_valid_dns_label("-lead")); // leading hyphen
+        assert!(!is_valid_dns_label("trail-")); // trailing hyphen
     }
 
     #[test]
@@ -3509,6 +3746,9 @@ mod tests {
             },
             data_dir: None,
             snapshot: None,
+            // Baseline helper: unset (treated as "matches" — the spec-change tests set
+            // this explicitly to exercise the recreate path).
+            active_spec: None,
         }
     }
 
@@ -3546,6 +3786,7 @@ mod tests {
             WorkloadActivity::Active,
             &BTreeMap::new(),
             u64::MAX,
+            &BTreeSet::new(),
         )
     }
 
@@ -3587,6 +3828,7 @@ mod tests {
             WorkloadActivity::Idle,
             &s2z_caps(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], Action::Snapshot { handle } if handle.replica == 0));
@@ -3606,6 +3848,7 @@ mod tests {
             WorkloadActivity::Idle,
             &BTreeMap::new(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         assert!(no_cap.is_empty(), "no capable backend: {no_cap:?}");
         // Capable backend, but the spec didn't opt in → no snapshot.
@@ -3618,6 +3861,7 @@ mod tests {
             WorkloadActivity::Idle,
             &s2z_caps(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         assert!(no_opt.is_empty(), "not opted in: {no_opt:?}");
     }
@@ -3635,6 +3879,7 @@ mod tests {
             WorkloadActivity::Active,
             &s2z_caps(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert!(
@@ -3655,6 +3900,7 @@ mod tests {
             WorkloadActivity::Idle,
             &s2z_caps(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         // Idle → no restore, and crucially no Launch (the parked ordinal is not
         // treated as a missing replica).
@@ -3677,6 +3923,7 @@ mod tests {
             WorkloadActivity::Active,
             &s2z_caps(),
             u64::MAX,
+            &BTreeSet::new(),
         );
         assert!(
             actions
@@ -3722,6 +3969,158 @@ mod tests {
             &obs,
         );
         assert!(actions.is_empty(), "already converged");
+    }
+
+    /// Bug A: a REDEPLOY (the workload's `active` spec pointer changed) must RECREATE an
+    /// existing healthy replica — Stop the old one AND relaunch its ordinal from the new
+    /// spec — not keep it. This is the path the pre-fix planner was blind to (a healthy
+    /// replica was simply kept, so a changed spec never re-ran `launch`, and docker's own
+    /// restart policy merely restarted the stale container in place).
+    #[test]
+    fn reconcile_recreates_on_spec_hash_change() {
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        // Workload's active is "h" (the `workload` helper), but the replica was launched
+        // from an older pointer → stale → recreate.
+        let obs = vec![ObservedInstance {
+            active_spec: Some("computever/old".into()),
+            ..observed("w", 0, 1, true)
+        }];
+        let actions = plan(
+            &workload(1, Default::default()),
+            &spec(1, 256),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
+            "the stale replica is stopped: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 0, .. })),
+            "and its ordinal relaunched from the new spec: {actions:?}"
+        );
+    }
+
+    /// Bug A idempotency: when the replica's recorded spec pointer MATCHES the workload's
+    /// current `active`, a healthy at-desired workload stays a strict no-op (no spurious
+    /// recreate even though the field is now populated).
+    #[test]
+    fn reconcile_is_noop_when_spec_hash_unchanged() {
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let obs = vec![ObservedInstance {
+            active_spec: Some("h".into()), // == workload().active
+            ..observed("w", 0, 1, true)
+        }];
+        let actions = plan(
+            &workload(1, Default::default()),
+            &spec(1, 256),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+        );
+        assert!(actions.is_empty(), "unchanged spec → no-op: {actions:?}");
+    }
+
+    /// Bug A back-compat: a legacy record with no recorded spec pointer (`None`) is never
+    /// counted stale, so it is never spuriously recreated (the reconcile backfills it to
+    /// the current `active` so a *subsequent* real change is caught).
+    #[test]
+    fn reconcile_does_not_recreate_a_legacy_none_spec_replica() {
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let obs = vec![observed("w", 0, 1, true)]; // active_spec: None
+        let actions = plan(
+            &workload(1, Default::default()),
+            &spec(1, 256),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+        );
+        assert!(
+            actions.is_empty(),
+            "legacy None spec left alone: {actions:?}"
+        );
+    }
+
+    /// Bug A scope guard: an EXITED run-to-completion job (`RestartPolicy::Never`,
+    /// unhealthy) is left terminal even when its spec pointer is stale — a redeploy must
+    /// not resurrect a finished batch run (the new spec takes effect on its next launch).
+    #[test]
+    fn reconcile_does_not_resurrect_an_exited_never_job_on_spec_change() {
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let mut s = spec(1, 256);
+        s.restart = RestartPolicy::Never;
+        let obs = vec![ObservedInstance {
+            active_spec: Some("computever/old".into()),
+            ..observed("w", 0, 1, false) // exited (unhealthy) run-to-completion
+        }];
+        let actions = plan(
+            &workload(1, Default::default()),
+            &s,
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+        );
+        assert!(
+            actions.is_empty(),
+            "an exited Never job is not recreated on a spec change: {actions:?}"
+        );
+    }
+
+    /// Bug A auto-heal (Bug C companion): a HEALTHY replica whose spec pointer MATCHES the
+    /// desired `active` is still RECREATED when the driver flags its ordinal in
+    /// `force_recreate` (the backend's `needs_redeploy` — a docker container stuck on the
+    /// wrong primary network). With an empty set the same replica is a strict no-op, so the
+    /// signal is the only thing that moves it (idempotent once re-shaped).
+    #[test]
+    fn reconcile_recreates_when_force_recreate_flags_the_ordinal() {
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        // Healthy, spec pointer == workload().active ("h") → normally kept.
+        let obs = vec![ObservedInstance {
+            active_spec: Some("h".into()),
+            ..observed("w", 0, 1, true)
+        }];
+        // Empty set → no-op (the baseline the auto-heal must not disturb).
+        let none = reconcile_plan(
+            &workload(1, Default::default()),
+            &spec(1, 256),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            u64::MAX,
+            &BTreeSet::new(),
+        );
+        assert!(none.is_empty(), "no force flag → no-op: {none:?}");
+        // Ordinal 0 flagged → recreate (Stop + relaunch).
+        let forced = reconcile_plan(
+            &workload(1, Default::default()),
+            &spec(1, 256),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            u64::MAX,
+            &BTreeSet::from([0u32]),
+        );
+        assert!(
+            forced
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
+            "the flagged replica is stopped: {forced:?}"
+        );
+        assert!(
+            forced
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 0, .. })),
+            "and relaunched (re-running launch → correct primary network): {forced:?}"
+        );
     }
 
     #[test]
@@ -3798,6 +4197,7 @@ mod tests {
             WorkloadActivity::Active,
             &BTreeMap::new(),
             now,
+            &BTreeSet::new(),
         );
         // Mid-init: neither stopped nor relaunched (it counts toward `desired`).
         assert!(
@@ -3823,6 +4223,7 @@ mod tests {
             WorkloadActivity::Active,
             &BTreeMap::new(),
             now,
+            &BTreeSet::new(),
         );
         assert!(
             actions
@@ -3855,6 +4256,7 @@ mod tests {
             WorkloadActivity::Active,
             &BTreeMap::new(),
             1_000_000,
+            &BTreeSet::new(),
         );
         assert!(
             actions
@@ -3886,6 +4288,7 @@ mod tests {
             WorkloadActivity::Active,
             &BTreeMap::new(),
             now,
+            &BTreeSet::new(),
         );
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Launch { .. })),
@@ -4094,6 +4497,7 @@ mod tests {
             1,
             None,
             &s,
+            "computever/h",
             &[],
             None,
             None,
@@ -4115,6 +4519,7 @@ mod tests {
             1,
             None,
             &s,
+            "computever/h",
             &[],
             None,
             None,
@@ -4151,6 +4556,7 @@ mod tests {
             WorkloadActivity::Active,
             &caps,
             past_grace,
+            &BTreeSet::new(),
         );
         assert!(
             actions
@@ -4776,6 +5182,7 @@ mod tests {
                 replica: 0,
                 data_ref: "snap".into(),
             }),
+            active_spec: None,
         };
         deploy
             .set_replica_state(crate::project::ProjectRef::DEFAULT, &parked)

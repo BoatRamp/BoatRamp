@@ -857,3 +857,52 @@ jobs:
             || { echo "::error::blob cold fan-out gate did not pass (serialized, or a failure)" >&2; exit 1; }
           grep -q 'CONCURRENT-COLD FAN-OUT OK' fanout.log \
             || { echo "::error::blob cold fan-out never reached the success marker (silent skip or serialization?)" >&2; exit 1; }
+
+  docker-compute-net:
+    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability
+    # The docker compute backend puts every long-lived workload on its per-project user-defined
+    # network as the PRIMARY attachment (the sole tenancy boundary) so siblings resolve each other
+    # by name over docker's embedded DNS. The one-shot export/import client (run_ephemeral), by
+    # contrast, stays PRIMARY on the daemon default bridge (reaching a BYO/external DB there) and
+    # only ALSO joins a per-project net as a SECONDARY attach. These live gates run against the
+    # runner's REAL docker daemon and are HARD markers: v0.55.0 shipped the launch net as a mere
+    # SECONDARY attach (inert — names never resolved + a managed-DB-bound sibling crash-looped), and
+    # v0.56.0 over-corrected run_ephemeral to per-project-net PRIMARY (default bridge dropped →
+    # default-bridge DB unreachable → export/import broke, hence the v0.56.0 revert). alpine:3.20
+    # test-double only; no private artifact.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-docker-compute-net
+
+      - name: Pre-pull the alpine test-double image
+        run: docker pull alpine:3.20
+
+      - name: Per-project-net DNS + cross-project isolation + recreate/resolution + ephemeral default-bridge (hard gate)
+        run: |
+          set -o pipefail
+          # All ignored gates in one run: (1) two workloads in one project resolve by name over
+          # the per-project net, a SECOND project's same-named workload is a DIFFERENT container
+          # with NO cross-project DNS leak AND no raw-IP reach (the tenancy boundary); (2) a
+          # spec-change redeploy RECREATES the container onto the net (new body served, resolvable
+          # by alias + full name) and needs_redeploy()==false afterwards (auto-heal idempotency —
+          # no reconcile churn loop); (3) a DUAL-ATTACHED run_ephemeral one-shot (per-project-net
+          # hint set) still reaches a DB on the DEFAULT bridge (the v0.56.0 regression shape); (4) a
+          # managed-DB workload whose RAW name exceeds the 63-octet DNS-label cap resolves by its
+          # SHORT alias (the Docker-29 RFC-1035 SD-registration fix). Each marker prints ONLY after
+          # every assertion holds.
+          BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+            -- --ignored --nocapture 2>&1 | tee docker-net.log
+          grep -qE 'test result: ok' docker-net.log \
+            || { echo "::error::docker compute-net gates did not pass (a failure or silent skip)" >&2; exit 1; }
+          grep -q 'DOCKER PROJECT-NET DNS + CROSS-PROJECT ISOLATION OK' docker-net.log \
+            || { echo "::error::per-project-net DNS / cross-project isolation never reached its success marker (silent skip or a cross-project leak?)" >&2; exit 1; }
+          grep -q 'DOCKER RECREATE-ON-REDEPLOY + RESOLUTION OK' docker-net.log \
+            || { echo "::error::recreate-on-redeploy + resolution never reached its success marker (silent skip or a restart-in-place / non-resolving regression?)" >&2; exit 1; }
+          grep -q 'DOCKER EPHEMERAL DEFAULT-BRIDGE OK' docker-net.log \
+            || { echo "::error::dual-attached run_ephemeral never reached its default-bridge success marker (silent skip or the v0.56.0 per-project-net-PRIMARY regression — default-bridge DB unreachable)" >&2; exit 1; }
+          grep -q 'DOCKER LONG MANAGED-DB SD OK' docker-net.log \
+            || { echo "::error::long managed-DB workload (> 63-octet name) never reached its short-alias resolution marker (silent skip or the Docker-29 RFC-1035 label-cap regression — SD record for the over-long alias not published)" >&2; exit 1; }

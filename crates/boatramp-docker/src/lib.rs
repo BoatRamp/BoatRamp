@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
     Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
-    Scheme, VolumeRef, compute_instance_id,
+    Scheme, VolumeRef, compute_instance_id, managed_db_alias,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
@@ -28,8 +28,8 @@ use bollard::container::{
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    EndpointSettings, HostConfig, Mount, MountTypeEnum, PortBinding,
-    RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
+    ContainerState, ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig,
+    Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
 use futures::StreamExt;
@@ -402,10 +402,12 @@ pub fn project_network_name(project: &str) -> String {
 pub const PROJECT_NETWORK_PREFIX: &str = "boatramp-net-";
 
 /// Build the [`NetworkingConfig`] attaching a container to `network` with the given DNS `aliases`
-/// (the workload name for a server a sibling resolves by name; empty for a one-shot client that
-/// only needs to reach peers). Supplying this at container-create means the container joins ONLY
-/// this one network — never the shared default bridge — so docker's inter-network isolation is the
-/// tenancy boundary (a container can resolve/reach only its own project's peers).
+/// (the workload's [`managed_db_alias`] for a server a sibling resolves by name; empty for a
+/// one-shot client that only needs to reach peers). Each alias MUST be a valid DNS label (≤ 63
+/// octets) — Docker 29's embedded DNS will not register a longer one (see [`managed_db_alias`]).
+/// Supplying this at container-create means the container joins ONLY this one network — never the
+/// shared default bridge — so docker's inter-network isolation is the tenancy boundary (a container
+/// can resolve/reach only its own project's peers).
 fn network_config(network: &str, aliases: Vec<String>) -> NetworkingConfig<String> {
     let endpoint = EndpointSettings {
         aliases: (!aliases.is_empty()).then_some(aliases),
@@ -485,6 +487,71 @@ fn restart_policy(policy: RestartPolicy) -> DockerRestartPolicy {
     DockerRestartPolicy {
         name: Some(name),
         maximum_retry_count: None,
+    }
+}
+
+/// Whether a container's live PRIMARY network (`HostConfig.NetworkMode`) is already the
+/// expected per-project network — the auto-heal idempotency check behind `needs_redeploy`.
+///
+/// A container created by the current launch path has `NetworkMode == "boatramp-net-<proj>"`
+/// (current → no recreate). One created before the per-project net became the PRIMARY
+/// attachment has `"bridge"` / `"default"` / an empty/absent mode (stale → recreate so a
+/// relaunch puts it primary on the per-project net, where embedded DNS + service discovery
+/// make `<workload>` resolve). Anything that is not exactly the expected net is treated as
+/// stale.
+fn primary_network_is_current(network_mode: Option<&str>, expected_net: &str) -> bool {
+    network_mode == Some(expected_net)
+}
+
+/// Map a docker `inspect` container `State` to the runner-level [`Health`], GROUNDED in
+/// the container's ACTUAL state rather than its desired one.
+///
+/// The bug this fixes: a crash-looping container (the app can't reach its DB) is kept
+/// alive IN PLACE by its `restart: always` policy and docker reports it as
+/// `Status: "restarting"`. The old check read only the `State.Running` bool — which is
+/// momentarily `true` during each restart's brief up-window (and which docker's own API
+/// docs warn is *also* `true` for a merely *paused* container) — so a crash loop was
+/// masked as `Healthy`, and both the reconcile's health refresh and `boatramp compute
+/// status` reported a dead workload as up.
+///
+/// We instead key on the authoritative `Status` string: only a genuinely `running`
+/// container is `Healthy`; `restarting` (the crash loop), `exited`, `dead`, `created`,
+/// `paused`, and `removing` are all `Unhealthy`. A declared HEALTHCHECK that is reporting
+/// `unhealthy` overrides a bare "running" (the app itself says it is not serving); a
+/// `starting` healthcheck does NOT (runner-level health is "the process is up" — the
+/// reconcile's separate readiness pass owns service-level readiness). `Status` absent (an
+/// older daemon) falls back to the `Running` bool.
+fn health_from_state(state: Option<&ContainerState>) -> Health {
+    let Some(state) = state else {
+        return Health::Unhealthy;
+    };
+    // A healthcheck that has gone unhealthy is decisive, regardless of run state.
+    if matches!(
+        state.health.as_ref().and_then(|h| h.status),
+        Some(HealthStatusEnum::UNHEALTHY)
+    ) {
+        return Health::Unhealthy;
+    }
+    match state.status {
+        Some(ContainerStateStatusEnum::RUNNING) => Health::Healthy,
+        // A restart loop lands in RESTARTING — the crash loop the old check masked.
+        Some(
+            ContainerStateStatusEnum::RESTARTING
+            | ContainerStateStatusEnum::EXITED
+            | ContainerStateStatusEnum::DEAD
+            | ContainerStateStatusEnum::CREATED
+            | ContainerStateStatusEnum::PAUSED
+            | ContainerStateStatusEnum::REMOVING
+            | ContainerStateStatusEnum::EMPTY,
+        ) => Health::Unhealthy,
+        // Older daemon without a Status string: fall back to the Running bool.
+        None => {
+            if state.running.unwrap_or(false) {
+                Health::Healthy
+            } else {
+                Health::Unhealthy
+            }
+        }
     }
 }
 
@@ -649,7 +716,12 @@ impl ComputeBackend for DockerBackend {
         // loopback with an ephemeral host port (discovered after start), so a
         // host-native `serve` can reach it even when the bridge IP is not host-routable
         // (Docker Desktop / macOS). `Bridge` leaves the container unpublished.
-        if self.endpoint == DockerEndpoint::Published {
+        //
+        // Only when the workload actually HAS a port: a no-port workload (`port == 0`) must NOT
+        // emit a `0/tcp` spec — Docker 29.x rejects it with 400 ("invalid port specification:
+        // 0/tcp"), where Docker 28 tolerated it (the same 28→29 strictness class as the 63-octet
+        // DNS-label cap above). A port-0 workload publishes nothing and has no host endpoint.
+        if self.endpoint == DockerEndpoint::Published && port != 0 {
             config.exposed_ports = Some(HashMap::from([(port_key.clone(), HashMap::new())]));
             host_config.port_bindings = Some(HashMap::from([(
                 port_key.clone(),
@@ -659,18 +731,45 @@ impl ComputeBackend for DockerBackend {
                 }]),
             )]));
         }
-        config.host_config = Some(host_config);
-
-        // Place the workload on its PER-PROJECT user-defined network (create-if-absent) and attach
-        // with a network ALIAS equal to the workload name. A sibling in the SAME project then
-        // resolves `<workload>:<port>` via docker's embedded DNS (the managed-DB DSN is name-based,
-        // and the default bridge — which this join replaces — has no embedded DNS). The network is
-        // per-project, so docker's inter-network isolation is the tenancy boundary: a different
-        // project's containers live on a different network and can neither resolve nor reach this
-        // one's. Published-port + bridge-IP reach (below) are unaffected — port publishing and
-        // container IPs work on a user-defined network exactly as on the default bridge.
+        // Create-if-absent the PER-PROJECT user-defined network and make it the container's
+        // PRIMARY network (`HostConfig.NetworkMode`), attaching it AT CREATE with a DNS ALIAS
+        // equal to the workload name (`networking_config` for that SAME network).
+        //
+        // This is the load-bearing DNS fix (Bug C). v0.55.0 set `networking_config` for the
+        // per-project net but left `NetworkMode` at its default, so the container's PRIMARY
+        // attachment was the DEFAULT bridge and the per-project net was merely SECONDARY. Two
+        // consequences made name resolution FAIL on the real workloads even though the network
+        // and the DNS aliases existed: (1) the container's `/etc/resolv.conf` pointed at the
+        // default-bridge/host resolver, NOT docker's embedded DNS (127.0.0.11); and (2) docker
+        // publishes a container into a user-defined network's service discovery ONLY when that
+        // net is the container's PRIMARY attachment — a secondary endpoint carrying DNSNames is
+        // not enough. Making the per-project net PRIMARY fixes BOTH: embedded DNS in resolv.conf
+        // AND SD publication, so a sibling resolves `<workload>:<port>` (the managed-DB DSN is
+        // name-based). The per-project net is a non-internal bridge, so egress still NATs out of
+        // it — the default bridge is not needed and is intentionally NOT attached (one network
+        // per project is also the tenancy boundary: docker's inter-network isolation keeps one
+        // project's containers off another's). Published-port + bridge-IP reach are unaffected:
+        // port publishing and `container_ip` work on a user-defined bridge exactly as on the
+        // default bridge (`container_ip` already falls back from the now-empty top-level
+        // `IPAddress` — only set for the default bridge — to the per-project endpoint's IP).
+        //
+        // The DNS ALIAS is `managed_db_alias(&req.workload)`, NOT the raw workload name (Bug D,
+        // Docker 29): a DNS label is capped at 63 octets (RFC 1035), and Docker 29's libnetwork
+        // refuses to publish an embedded-DNS service-discovery record for a label over that cap
+        // (Docker 28 tolerated it — why this went unseen). A `Single`-isolation managed-DB
+        // workload name is `<compute>-<sanitized-ident>` with two 25-char digests ≈ 69 octets, so
+        // the raw-name alias silently failed to register on 29 and a sibling got NXDOMAIN. The
+        // short, stable alias fits a label and is the SAME string a consumer's DSN host resolves
+        // (`NodeTenantSqlResolver::connection_parts` applies the identical `managed_db_alias`), so
+        // the two always match. The long container NAME stays (it is identity, never resolved by a
+        // sibling once the short alias exists); a short/valid workload name is published unchanged.
         let network = self.ensure_project_network(&req.project).await?;
-        config.networking_config = Some(network_config(&network, vec![req.workload.clone()]));
+        host_config.network_mode = Some(network.clone());
+        config.host_config = Some(host_config);
+        config.networking_config = Some(network_config(
+            &network,
+            vec![managed_db_alias(&req.workload)],
+        ));
 
         // Best-effort clean of a stale container with the same name, then create.
         let _ = self
@@ -702,6 +801,8 @@ impl ComputeBackend for DockerBackend {
         // Reachable endpoint: the published host loopback port (default), or the
         // container's bridge IP + in-container port (`Bridge`).
         let (host, endpoint_port) = match self.endpoint {
+            // A no-port workload published nothing (see above) — no host port to discover.
+            DockerEndpoint::Published if port == 0 => ("127.0.0.1".to_string(), 0),
             DockerEndpoint::Published => (
                 "127.0.0.1".to_string(),
                 self.published_host_port(&created.id, &port_key).await?,
@@ -760,14 +861,31 @@ impl ComputeBackend for DockerBackend {
         };
         let info = match self.docker.inspect_container(&name, None).await {
             Ok(info) => info,
+            // Inspect failed (gone / unreachable): not serving.
             Err(_) => return Ok(Health::Unhealthy),
         };
-        let running = info.state.and_then(|s| s.running).unwrap_or(false);
-        Ok(if running {
-            Health::Healthy
-        } else {
-            Health::Unhealthy
-        })
+        Ok(health_from_state(info.state.as_ref()))
+    }
+
+    async fn needs_redeploy(&self, handle: &InstanceHandle, _spec: &ComputeSpec) -> bool {
+        // Auto-heal (Bug A/C): a container whose live PRIMARY network is not this project's
+        // per-project net was created by a release before that net became the primary
+        // attachment — it is up but cannot resolve siblings by name. Report it as needing a
+        // recreate so the reconcile stops + relaunches it (volume-safe), re-running `launch`
+        // with the per-project net as primary. Idempotent: a container already primary on the
+        // net returns `false`. Inspect failure / gone ⇒ `false` (the normal plan path owns it).
+        let name = match decode_ref(&handle.backend_ref) {
+            Some((n, _, _)) => n,
+            None => container_name(&handle.project, &handle.workload, handle.replica),
+        };
+        let Ok(info) = self.docker.inspect_container(&name, None).await else {
+            return false;
+        };
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|hc| hc.network_mode.as_deref());
+        !primary_network_is_current(network_mode, &project_network_name(&handle.project))
     }
 
     /// Run a one-shot command **inside** the running container via the Engine
@@ -1299,6 +1417,116 @@ impl DockerBackend {
 mod tests {
     use super::*;
 
+    /// Build a `ContainerState` with a given `Status` (+ optional running bool / health),
+    /// the shape `inspect` returns, for the pure health-mapping tests.
+    fn state(
+        status: Option<ContainerStateStatusEnum>,
+        running: Option<bool>,
+        health: Option<HealthStatusEnum>,
+    ) -> ContainerState {
+        ContainerState {
+            status,
+            running,
+            health: health.map(|status| bollard::models::Health {
+                status: Some(status),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Bug B: health reflects the ACTUAL container state. A crash-looping container
+    /// (`Status: "restarting"`, kept alive in place by its restart policy) must report
+    /// `Unhealthy`, NOT the masked `Healthy` the old `Running`-bool-only check produced —
+    /// so `compute status` surfaces a crash loop instead of a dead workload reading "up".
+    #[test]
+    fn health_maps_restarting_and_exited_to_unhealthy() {
+        use ContainerStateStatusEnum::*;
+        // The bug: a restart loop. `Running` can even be momentarily true mid-restart.
+        assert_eq!(
+            health_from_state(Some(&state(Some(RESTARTING), Some(true), None))),
+            Health::Unhealthy,
+            "a restarting (crash-looping) container is NOT healthy"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(EXITED), Some(false), None))),
+            Health::Unhealthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(DEAD), Some(false), None))),
+            Health::Unhealthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(CREATED), Some(false), None))),
+            Health::Unhealthy
+        );
+        // A paused container reports Running=true but is not serving — Status rules.
+        assert_eq!(
+            health_from_state(Some(&state(Some(PAUSED), Some(true), None))),
+            Health::Unhealthy
+        );
+    }
+
+    /// Bug B: only a genuinely running container (healthcheck not reporting unhealthy) is
+    /// `Healthy`; a declared healthcheck that has gone unhealthy overrides a bare running,
+    /// while a `starting` healthcheck does not (runner-level health is "process up").
+    #[test]
+    fn health_maps_running_respecting_the_healthcheck() {
+        use ContainerStateStatusEnum::RUNNING;
+        assert_eq!(
+            health_from_state(Some(&state(Some(RUNNING), Some(true), None))),
+            Health::Healthy,
+            "a plain running container with no healthcheck is healthy"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(
+                Some(RUNNING),
+                Some(true),
+                Some(HealthStatusEnum::STARTING)
+            ))),
+            Health::Healthy,
+            "a still-starting healthcheck does not fail runner-level health"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(
+                Some(RUNNING),
+                Some(true),
+                Some(HealthStatusEnum::UNHEALTHY)
+            ))),
+            Health::Unhealthy,
+            "an app declaring itself unhealthy overrides a bare running"
+        );
+        // Older daemon (no Status string): fall back to the Running bool.
+        assert_eq!(
+            health_from_state(Some(&state(None, Some(true), None))),
+            Health::Healthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(None, Some(false), None))),
+            Health::Unhealthy
+        );
+        // No State at all (gone / unreachable): unhealthy.
+        assert_eq!(health_from_state(None), Health::Unhealthy);
+    }
+
+    /// Bug A/C auto-heal idempotency: only a container already on its per-project net as
+    /// PRIMARY is current; a bridge/default/absent primary is stale (→ recreate).
+    #[test]
+    fn primary_network_current_only_when_it_is_the_project_net() {
+        let expected = project_network_name("acme"); // "boatramp-net-acme"
+        assert!(primary_network_is_current(Some(&expected), &expected));
+        // Pre-fix shapes a v0.55.0/earlier container would report:
+        assert!(!primary_network_is_current(Some("bridge"), &expected));
+        assert!(!primary_network_is_current(Some("default"), &expected));
+        assert!(!primary_network_is_current(Some(""), &expected));
+        assert!(!primary_network_is_current(None, &expected));
+        // A DIFFERENT project's net is also not current (never cross-heal).
+        assert!(!primary_network_is_current(
+            Some("boatramp-net-other"),
+            &expected
+        ));
+    }
+
     #[test]
     fn docker_credentials_maps_registry_auth_and_never_leaks_the_secret() {
         // The resolved credential maps 1:1 to bollard's basic-auth fields…
@@ -1592,6 +1820,40 @@ mod tests {
         let cfg = network_config("boatramp-net-acme", Vec::new());
         let ep = cfg.endpoints_config.get("boatramp-net-acme").unwrap();
         assert_eq!(ep.aliases, None);
+    }
+
+    /// Bug D (Docker 29 SD registration): the alias `launch` publishes for a workload MUST be a
+    /// valid DNS label (≤ 63 octets), or Docker 29's embedded DNS silently drops the record and a
+    /// sibling can never resolve it. This is a VERSION-INDEPENDENT guard at the emit site — it
+    /// fails on ANY host (no daemon needed), which the live gate on a Docker 28 box could not. A
+    /// short workload is published unchanged; a real `Single` managed-DB name (> 63 octets) is
+    /// shortened to a valid, stable label that `launch` attaches as the endpoint alias.
+    #[test]
+    fn launch_alias_is_always_a_valid_dns_label() {
+        use boatramp_core::compute::{DNS_LABEL_MAX_LEN, is_valid_dns_label};
+        // A short workload name is attached verbatim.
+        let short = managed_db_alias("web");
+        assert_eq!(short, "web");
+        assert!(is_valid_dns_label(&short));
+
+        // The real over-long `Single` managed-DB workload shape `<compute>-<ident>` (two 25-char
+        // digests ≈ 69 octets) — the alias `launch` would have published before the fix.
+        let h = "abcdefghijklmnopqrstuvwxy";
+        let workload = format!("bramp-db-{h}-mailroom_{h}");
+        assert!(
+            workload.len() > DNS_LABEL_MAX_LEN,
+            "fixture must reproduce the > 63-octet failure shape"
+        );
+        let alias = managed_db_alias(&workload);
+        assert!(
+            is_valid_dns_label(&alias) && alias.len() <= DNS_LABEL_MAX_LEN,
+            "launch must publish a DNS-valid alias, got {alias:?} ({} octets)",
+            alias.len()
+        );
+        // And `network_config` attaches exactly that alias for the endpoint.
+        let cfg = network_config("boatramp-net-mailroom", vec![alias.clone()]);
+        let ep = cfg.endpoints_config.get("boatramp-net-mailroom").unwrap();
+        assert_eq!(ep.aliases.as_deref(), Some([alias].as_slice()));
     }
 
     #[test]

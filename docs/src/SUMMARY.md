@@ -84,6 +84,7 @@
   - [Alert on node & system health](./how-to/node-health-alerting.md)
   - [Back up & restore](./how-to/backup.md)
   - [Export, import & clone a project](./how-to/clone-project.md)
+  - [Sync a project between environments](./how-to/project-sync.md)
   - [Incremental & true-delta export](./how-to/delta-export.md)
   - [Prune a project's orphaned control-plane state](./how-to/prune-project.md)
   - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)

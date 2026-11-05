@@ -285,3 +285,439 @@ async fn docker_per_project_network_dns_and_cross_project_isolation() {
          projb/app->projb/db by name (WORLD); proja/app denied projb/db by ip {b_db_ip} and by name"
     );
 }
+
+/// The **long managed-DB workload SD** live gate (Bug D — Docker 29 RFC 1035 63-octet label cap).
+///
+/// The cross-project gate above launches a SHORT server workload (`db`), which registers an
+/// embedded-DNS service-discovery record on EVERY docker version — so it could never reproduce
+/// simertec's failure. A `Single`-isolation managed-DB workload is `bramp-db-<25>-<ident>_<25>`
+/// (≈ 69 octets); Docker 29.9.1's libnetwork refuses to publish an SD record for a label over 63
+/// octets (Docker 28 tolerated it, which is why the gate was green), so a sibling resolving the
+/// DB by that over-long name got NXDOMAIN and a managed-DB-bound workload crash-looped.
+///
+/// This launches a server under a RAW managed-DB-shaped name EXCEEDING 63 octets — exercising the
+/// real `launch()` path — and asserts a sibling resolves + connects to it by the SHORT
+/// [`managed_db_alias`](boatramp_core::compute::managed_db_alias) the fix publishes (the SAME short
+/// label a consumer's DSN host resolves). Version behavior: on Docker 28 it passes before and after
+/// the fix; on Docker 29.9.1 it FAILS before the fix (the > 63-octet alias never registers) and
+/// PASSES after (the short alias registers). It deliberately does NOT assert the raw long name
+/// fails to resolve — that is true only on 29.x, and the gate must stay green on the 28.x box too.
+///
+/// `#[ignore]` + env-gated; the capability gate greps the final marker, printed only after the
+/// assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   long_managed_db -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_resolves_long_managed_db_workload_by_short_alias() {
+    use boatramp_core::compute::{DNS_LABEL_MAX_LEN, is_valid_dns_label, managed_db_alias};
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+    let backend = DockerBackend::connect().expect("connect to docker");
+
+    async fn launch(
+        backend: &DockerBackend,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> boatramp_core::compute::Instance {
+        let artifact = backend
+            .materialize(project, workload, spec, None)
+            .await
+            .expect("materialize");
+        let req = LaunchRequest {
+            project: project.into(),
+            workload: workload.into(),
+            replica: 0,
+            spec: spec.clone(),
+            artifact,
+        };
+        backend.launch(&req).await.expect("launch")
+    }
+
+    // A RAW managed-DB-shaped server workload name OVER 63 octets (two 25-char digests), the exact
+    // shape that failed to register on Docker 29.9.1.
+    let h = "abcdefghijklmnopqrstuvwxy"; // 25 base-36 chars
+    let db_workload = format!("bramp-db-{h}-mailroom_{h}");
+    assert!(
+        db_workload.len() > DNS_LABEL_MAX_LEN,
+        "fixture must exceed the 63-octet DNS label cap (the bug): {} octets",
+        db_workload.len()
+    );
+    let alias = managed_db_alias(&db_workload);
+    assert!(
+        is_valid_dns_label(&alias) && alias.len() <= DNS_LABEL_MAX_LEN,
+        "the published alias must be a valid DNS label: {alias}"
+    );
+
+    // Launch the server under its RAW (> 63-octet) workload name + a short sibling client.
+    let db = launch(&backend, "longsd", &db_workload, &server_spec("LONGOK")).await;
+    let app = launch(&backend, "longsd", "app", &client_spec()).await;
+
+    // The sibling resolves + reads the server BY ITS SHORT ALIAS (what the fix publishes AND what a
+    // consumer's DSN host resolves) — NOT the > 63-octet workload name Docker 29 never registers.
+    // `nc <alias> 8080` exercises resolution + TCP connect; retry to absorb the listener's startup.
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "for i in $(seq 1 30); do R=$(nc -w3 {alias} 8080 </dev/null 2>/dev/null); \
+             if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+        ),
+    ];
+    let out = backend
+        .exec(&app.handle, &argv, None)
+        .await
+        .expect("exec nc by short alias");
+    assert_eq!(
+        out.exit_code, 0,
+        "app must resolve + reach the managed-DB server by its SHORT alias {alias} \
+         (the > 63-octet raw name {db_workload} is what Docker 29 refuses to register)"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "LONGOK",
+        "the sibling must read the server's body over the short alias"
+    );
+
+    for handle in [&app.handle, &db.handle] {
+        let _ = backend.stop(handle).await;
+    }
+    println!(
+        "DOCKER LONG MANAGED-DB SD OK: a {}-octet managed-DB workload resolved by its short alias \
+         {alias} (LONGOK) over the per-project network — the > 63-octet raw name is never used for \
+         resolution",
+        db_workload.len()
+    );
+}
+
+/// The **recreate-on-redeploy** live gate (Bug A). A redeploy that CHANGES a workload's
+/// spec must REPLACE the running container (stop + remove + relaunch), NOT restart the old
+/// one in place — otherwise `launch` (and, with it, the per-project-network attach) never
+/// re-runs on the normal redeploy path. The reconcile DECISION (stale spec → recreate) is
+/// unit-tested in `boatramp-core` (`reconcile_recreates_on_spec_hash_change`); this gate
+/// proves the docker EXECUTION end-to-end against a real daemon:
+///
+/// 1. A server workload `svc` serving `AAA` is launched; a sibling `app` resolves it by
+///    NAME over the project network and reads `AAA` (baseline — the launch attached the
+///    per-project net).
+/// 2. `svc` is RELAUNCHED for the SAME `(project, workload, replica)` serving `BBB` — the
+///    redeploy's recreate (the reconcile emits Stop then Launch; `launch` itself also
+///    force-removes the stale same-name container).
+/// 3. The sibling resolves `svc` by name again and now reads `BBB`. That it reads the NEW
+///    body — reachable BY NAME — proves the old container was REPLACED (a restart-in-place
+///    would still serve `AAA`) AND that the relaunch re-attached the per-project network
+///    (name resolution only works there). A restart-in-place fails BOTH.
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final marker,
+/// printed ONLY after the assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   recreate_on_spec_change -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_project_net() {
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+    let backend = DockerBackend::connect().expect("connect to docker");
+
+    async fn launch(
+        backend: &DockerBackend,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> boatramp_core::compute::Instance {
+        let artifact = backend
+            .materialize(project, workload, spec, None)
+            .await
+            .expect("materialize");
+        let req = LaunchRequest {
+            project: project.into(),
+            workload: workload.into(),
+            replica: 0,
+            spec: spec.clone(),
+            artifact,
+        };
+        backend.launch(&req).await.expect("launch")
+    }
+
+    // Resolve the `svc` workload BY NAME over the project net and read back its body.
+    let fetch_svc = |h: &boatramp_core::compute::InstanceHandle| {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 1 30); do R=$(nc -w3 svc 8080 </dev/null 2>/dev/null); \
+             if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+                .to_string(),
+        ];
+        let h = h.clone();
+        let backend = &backend;
+        async move { backend.exec(&h, &argv, None).await.expect("exec nc svc") }
+    };
+
+    // (1) Deploy svc=AAA + a client; the client reads AAA by name.
+    let svc_a = launch(&backend, "redeploy", "svc", &server_spec("AAA")).await;
+    let app = launch(&backend, "redeploy", "app", &client_spec()).await;
+    let out = fetch_svc(&app.handle).await;
+    assert_eq!(out.exit_code, 0, "app must reach svc by name");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "AAA",
+        "baseline: svc serves AAA"
+    );
+
+    // (2) REDEPLOY: relaunch svc with a changed spec (serves BBB) for the SAME identity.
+    let svc_b = launch(&backend, "redeploy", "svc", &server_spec("BBB")).await;
+
+    // (3) The client now reads BBB by name — proving the container was REPLACED (a
+    //     restart-in-place would still serve AAA) and the relaunch re-attached the net.
+    let out = fetch_svc(&app.handle).await;
+    assert_eq!(out.exit_code, 0, "app must reach the recreated svc by name");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "BBB",
+        "after a spec-change redeploy, svc must serve the NEW body BBB (the container was \
+         recreated + re-attached to the project net), never the stale AAA"
+    );
+
+    // (4) RESOLUTION gate (reproduces simertec's exact failure): the recreated svc must be
+    //     resolvable by BOTH its network ALIAS (the workload name `svc`, what the managed-DB
+    //     DSN uses) AND its full container NAME (`boatramp-redeploy-svc-0`). A zero-I/O `nc`
+    //     connect scan succeeds only when the name RESOLVES (embedded DNS) and the port is
+    //     reachable — exactly what a bridge-primary (secondary-net) container could NOT do.
+    //     This assertion, not endpoint metadata, is the success marker.
+    let connect_by = |name: &str| {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "for i in $(seq 1 30); do if nc -z -w3 {name} 8080; then exit 0; fi; sleep 1; done; exit 1"
+            ),
+        ];
+        let h = app.handle.clone();
+        let backend = &backend;
+        async move {
+            backend
+                .exec(&h, &argv, None)
+                .await
+                .expect("exec nc resolve")
+        }
+    };
+    let by_alias = connect_by("svc").await;
+    assert_eq!(
+        by_alias.exit_code, 0,
+        "svc must resolve + connect by its ALIAS (workload name)"
+    );
+    // Default-less project "redeploy" → container name `boatramp-<project>-<workload>-<replica>`.
+    let by_name = connect_by("boatramp-redeploy-svc-0").await;
+    assert_eq!(
+        by_name.exit_code, 0,
+        "svc must resolve + connect by its FULL container name boatramp-redeploy-svc-0"
+    );
+
+    // (5) AUTO-HEAL IDEMPOTENCY (Security MEDIUM-1): a correctly new-model container — primary-
+    //     attached to the project net — must NOT be flagged for redeploy. `needs_redeploy` keys on
+    //     an exact `HostConfig.NetworkMode` string compare against the live daemon; if that ever
+    //     mismatched for a correctly-deployed container, EVERY reconcile tick would stop+relaunch
+    //     EVERY container (a self-inflicted outage/churn loop with repeated managed-DB restarts).
+    //     This proves idempotency against the real daemon, not just a string unit test.
+    assert!(
+        !backend
+            .needs_redeploy(&svc_b.handle, &server_spec("BBB"))
+            .await,
+        "idempotency: a freshly relaunched container on the project net must report \
+         needs_redeploy=false, else reconcile would churn every tick"
+    );
+
+    for h in [&app.handle, &svc_b.handle, &svc_a.handle] {
+        let _ = backend.stop(h).await;
+    }
+    println!(
+        "DOCKER RECREATE-ON-REDEPLOY + RESOLUTION OK: svc redeployed AAA->BBB; app read the NEW \
+         body and resolved svc by BOTH alias 'svc' and full name 'boatramp-redeploy-svc-0' over \
+         the per-project network (container replaced + primary-attached, not restarted in place)"
+    );
+}
+
+/// The **run_ephemeral default-bridge reachability** regression gate (v0.56.1).
+///
+/// v0.56.0 made the per-project network the PRIMARY attach for BOTH `launch()` (correct — DNS fix)
+/// AND `run_ephemeral()` (WRONG). For the one-shot export/import dump/restore client that is a
+/// regression: making the per-project net its `NetworkMode` DROPS the daemon default bridge, so the
+/// client can no longer reach a database that lives on the DEFAULT bridge — the real CI/live
+/// topology, where the export/import target is an external/BYO `postgres://` at `172.17.0.x`. That
+/// shape broke all 7 project-export/import live tests (connect timeout) and is why v0.56.0 was
+/// reverted.
+///
+/// This proves the corrected dual-attach: `run_ephemeral` keeps the DEFAULT bridge as the one-shot's
+/// PRIMARY network and attaches the hinted per-project net only as a SECONDARY endpoint. We stand up
+/// a TCP "database" on the DEFAULT bridge via the raw Engine API (the backend's own `launch()` always
+/// binds a workload to a per-project net, so it cannot produce a default-bridge target), then run the
+/// one-shot client WITH a per-project-net hint (`EPHEMERAL_NETWORK_ENV`) so it IS dual-attached —
+/// reproducing the exact regression condition — and assert the client still reaches the
+/// default-bridge DB (`nc -z` connect scan → exit 0). Under the reverted v0.56.0 shape the client
+/// would be confined to the per-project net and the scan would TIME OUT (non-zero).
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final marker, printed
+/// ONLY after the assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   ephemeral_reaches_default_bridge -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_ephemeral_reaches_default_bridge_db_when_dual_attached() {
+    use boatramp_docker::{EPHEMERAL_NETWORK_ENV, project_network_name};
+    use bollard::Docker;
+    use bollard::container::{
+        Config as BollardConfig, CreateContainerOptions, RemoveContainerOptions,
+    };
+    use bollard::image::CreateImageOptions;
+    use bollard::models::HostConfig;
+    use futures::StreamExt;
+
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+
+    let docker = Docker::connect_with_local_defaults().expect("raw docker client");
+
+    // Pull the image for the default-bridge "database" (idempotent; the backend caches it too).
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: "alpine".to_string(),
+            tag: "3.20".to_string(),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(step) = pull.next().await {
+        step.expect("pull alpine:3.20 for the default-bridge DB");
+    }
+
+    // A TCP "database" on the DEFAULT bridge (NO networking_config ⇒ daemon default network).
+    // `nc -lk` keeps accepting connections so the client's connect scan always finds a listener.
+    let db_name = format!("boatramp-ephv2-dbridge-db-{}", std::process::id());
+    let _ = docker
+        .remove_container(
+            &db_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: db_name.clone(),
+                platform: None,
+            }),
+            BollardConfig {
+                image: Some("alpine:3.20".to_string()),
+                cmd: Some(vec![
+                    "nc".into(),
+                    "-lk".into(),
+                    "-p".into(),
+                    "5432".into(),
+                    "-e".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    "printf PONG".into(),
+                ]),
+                host_config: Some(HostConfig {
+                    auto_remove: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create default-bridge DB container");
+    docker
+        .start_container::<String>(&db_name, None)
+        .await
+        .expect("start default-bridge DB container");
+
+    // Its DEFAULT-bridge IP — the host the export/import client must reach (mirrors the BYO
+    // `postgres://172.17.0.x` CI topology).
+    let info = docker
+        .inspect_container(&db_name, None)
+        .await
+        .expect("inspect default-bridge DB");
+    let db_ip = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .and_then(|nets| nets.get("bridge"))
+        .and_then(|ep| ep.ip_address.clone())
+        .filter(|ip| !ip.is_empty())
+        .expect("default-bridge IP of the DB container");
+
+    // The one-shot export/import client, DUAL-ATTACHED: a per-project-net hint forces the secondary
+    // attach (the exact regression condition), while the default bridge must stay PRIMARY so the
+    // client can still reach the default-bridge DB. The per-project net does NOT contain the DB, so
+    // the ONLY route to it is the default bridge — a reverted-v0.56.0 client (per-project net as
+    // NetworkMode, default bridge dropped) would time out here.
+    let net = project_network_name("ephv2dbridge");
+    let backend = DockerBackend::connect().expect("connect to docker");
+    let mut stdout = futures::io::sink();
+    let exit = backend
+        .run_ephemeral(
+            "alpine:3.20",
+            &[
+                "nc".into(),
+                "-z".into(),
+                "-w5".into(),
+                db_ip.clone(),
+                "5432".into(),
+            ],
+            &[(EPHEMERAL_NETWORK_ENV.to_string(), net.clone())],
+            None,
+            &mut stdout,
+        )
+        .await
+        .expect("run_ephemeral connect-scan");
+
+    // Cleanup (best-effort) BEFORE the assertion so a failure still tears down the fixture.
+    let _ = docker
+        .remove_container(
+            &db_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(&net).await;
+
+    assert_eq!(
+        exit, 0,
+        "dual-attached run_ephemeral must still reach the DEFAULT-bridge DB at {db_ip}:5432 — a \
+         non-zero (timeout) exit is the reverted-v0.56.0 regression (per-project net made PRIMARY, \
+         default bridge dropped)"
+    );
+
+    // The single success marker the capability gate greps for — printed ONLY after the one-shot
+    // reached the default-bridge DB while dual-attached to a per-project net.
+    println!(
+        "DOCKER EPHEMERAL DEFAULT-BRIDGE OK: dual-attached run_ephemeral reached the default-bridge \
+         DB at {db_ip}:5432 with per-project net {net} as a SECONDARY attach (default bridge stayed \
+         primary)"
+    );
+}

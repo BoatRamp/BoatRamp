@@ -139,7 +139,6 @@ overlay = [
   "dep:boatramp-overlay-client",
   "dep:boatramp-overlay-tunnel",
   "boatramp-node/overlay",
-  "dep:async-trait",
 ]
 # The TUN virtual-interface front-end for `boatramp tunnel --tun` (overlay-service-tunneler plan
 # §3) — default OFF, mirroring `boatramp-overlay-tunnel`'s own `tun` feature (default OFF there
@@ -237,7 +236,6 @@ acme-dns = [
   # The on-demand per-SNI TLS issuer (`on_demand_tls`) is now `acme-dns`-gated (not `cluster`), and its
   # `IssuanceGate`/`CertIssuer`/`ChallengeSolver` traits are `#[async_trait]` — so `acme-dns` must pull
   # `async-trait` itself (previously it rode in via `cluster`/`overlay`).
-  "dep:async-trait",
   "dep:boatramp-acme",
   "boatramp-acme/acme",
   "boatramp-acme/cloudflare",
@@ -378,7 +376,6 @@ cluster = [
   "boatramp-cluster/overlay",
   "dep:axum",
   # The `MeshAdmitter` impl bridging the join route to `ClusterNode::admit`.
-  "dep:async-trait",
 ]
 # In-binary **Kubernetes operator** (`boatramp operator …`): a kube-rs
 # controller-runtime + single-sourced CRD types (`BoatRampCluster`/`Site`/
@@ -491,7 +488,7 @@ hyper = { workspace = true, optional = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, optional = true, features = ["tokio"] }
 boatramp-acme = { workspace = true, optional = true }
 boatramp-cluster = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util.workspace = true
 futures.workspace = true

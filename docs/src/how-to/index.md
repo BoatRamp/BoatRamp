@@ -151,6 +151,7 @@ Backup, export, and clone are one family — pick the one that matches your goal
 
 - [Back up & restore](./backup.md) — snapshot a node and restore it.
 - [Export, import & clone a project](./clone-project.md) — move a whole project between servers.
+- [Sync a project between environments](./project-sync.md) — idempotent, selective mirror (the successor to one-shot clone).
 - [Incremental & true-delta export](./delta-export.md) — repeatable, delta-only exports.
 
 #### Observe & alert

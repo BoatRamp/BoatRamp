@@ -80,7 +80,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    BackendRegistry, ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_spec,
+    BackendRegistry, ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_alias,
+    managed_db_spec,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
@@ -1606,9 +1607,13 @@ impl NodeTenantSqlResolver {
     ///
     /// # Reachability — the internal-DNS name, not a bridge IP
     ///
-    /// `host` is the managed DB **workload's own name** ([`TenantNames::workload`]) — the
-    /// per-project internal-DNS name a sibling resolves to the DB's live healthy replica
-    /// (`compute.internal_dns`, on by default). Deliberately NOT the numeric replica IP:
+    /// `host` is the managed DB's per-project SD **alias** — [`managed_db_alias`] of its workload
+    /// name ([`TenantNames::workload`]), the SAME short, DNS-valid label `boatramp-docker`'s
+    /// `launch` publishes as the endpoint alias (both derive it from `names.workload`, so they
+    /// always match). It is the alias, not the raw workload name, because a `Single` managed-DB
+    /// name can exceed the 63-octet DNS-label cap and Docker 29 then refuses to register it.
+    /// A sibling resolves this name to the DB's live healthy replica (`compute.internal_dns`, on
+    /// by default). Deliberately NOT the numeric replica IP:
     /// the DSN is injected into the sibling's env at launch and is static for its life, so
     /// a name (which re-resolves at connect time, and survives a DB relaunch onto a new
     /// bridge IP) is correct where a captured IP would go stale. `port` is the engine's
@@ -1668,7 +1673,10 @@ impl NodeTenantSqlResolver {
             {
                 return Ok(SqlConnParts {
                     kind: self.kind,
-                    host: names.workload,
+                    // The DSN host is the DB's SD ALIAS, not its (possibly > 63-octet) workload
+                    // name — see `managed_db_alias`. It MUST equal the alias `boatramp-docker`
+                    // publishes (both derive it from `names.workload`), or Docker 29 won't resolve.
+                    host: managed_db_alias(&names.workload),
                     port,
                     user: names.owner_role,
                     password,
@@ -1709,7 +1717,11 @@ impl NodeTenantSqlResolver {
 
         Ok(SqlConnParts {
             kind: self.kind,
-            host: names.workload,
+            // The DSN host is the DB's SD ALIAS (`managed_db_alias`), which equals the alias
+            // `boatramp-docker`'s `launch` publishes — a valid DNS label even when the workload
+            // name exceeds the 63-octet cap Docker 29's embedded DNS enforces. `names.workload`
+            // (the long identity) still keys the sealed credential above (`cred_workload`).
+            host: managed_db_alias(&names.workload),
             port,
             user,
             password,
@@ -1744,7 +1756,8 @@ pub(crate) enum ConnRole {
 pub(crate) struct SqlConnParts {
     /// Engine (selects the DSN scheme + default port).
     pub kind: ExternalSqlKind,
-    /// The reachable host — the managed DB workload's internal-DNS name (see
+    /// The reachable host — the managed DB's per-project SD alias ([`managed_db_alias`] of the
+    /// workload name), a valid DNS label matching the endpoint alias docker publishes (see
     /// [`NodeTenantSqlResolver::connection_parts`]).
     pub host: String,
     /// The engine's standard bridge port.
@@ -2176,6 +2189,56 @@ mod tests {
             "distinct tenants ⇒ distinct per-tenant credentials"
         );
         assert_ne!(acme.dsn(), globex.dsn());
+    }
+
+    /// Bug D (Docker 29 SD registration), VERSION-INDEPENDENT: when the managed-DB `compute` is a
+    /// derived `bramp-db-<25>` name (an auto-registered `database` declaration), a `Single`
+    /// non-default tenant's workload is `bramp-db-<25>-<ident>_<25>` — OVER the 63-octet DNS-label
+    /// cap Docker 29.9.1 enforces. The resolved DSN `host` MUST be the SHORT alias
+    /// (`managed_db_alias` of that workload), a valid DNS label ≤ 63 octets, so a sibling can
+    /// resolve it — AND it must equal the alias `boatramp-docker` publishes (both apply the same
+    /// function to the same workload name). No docker daemon needed; this catches the regression on
+    /// any host. The credential key still uses the full long workload (identity), unaffected.
+    #[tokio::test]
+    async fn connection_parts_host_is_a_dns_valid_alias_for_a_long_managed_db_workload() {
+        use boatramp_core::compute::{DNS_LABEL_MAX_LEN, is_valid_dns_label};
+        // `compute` = the real auto-registered derived managed-DB server name (`bramp-db-<25>`).
+        let compute =
+            boatramp_storage::tenant_provision::derived_managed_db_workload("acme", "orders");
+        assert!(compute.starts_with("bramp-db-"));
+        let binding = ExternalDatabaseConfig {
+            compute: Some(compute.clone()),
+            ..single_pg_binding()
+        };
+        let (_kv, resolver) = build_resolver(&binding);
+        // Reconstruct the RAW workload name the DB launches under (= container identity) to prove
+        // it really exceeds the DNS-label cap — the precondition for the bug.
+        let raw_workload =
+            tenant_names(TenantIsolation::Single, &compute, "appdb", "acme", false).workload;
+        assert!(
+            raw_workload.len() > DNS_LABEL_MAX_LEN,
+            "fixture must reproduce the > 63-octet managed-DB workload (the bug): {} octets ({raw_workload})",
+            raw_workload.len()
+        );
+
+        let parts = resolver
+            .connection_parts("acme", "simertec", ConnRole::Runtime)
+            .await
+            .unwrap();
+        // The DSN host is a valid DNS label (≤ 63) — NOT the raw > 63-octet workload name.
+        assert!(
+            is_valid_dns_label(&parts.host) && parts.host.len() <= DNS_LABEL_MAX_LEN,
+            "DSN host must be a resolvable DNS label, got {:?} ({} octets)",
+            parts.host,
+            parts.host.len()
+        );
+        // And it is EXACTLY `managed_db_alias(workload)` — the string docker publishes as the alias.
+        assert_eq!(
+            parts.host,
+            managed_db_alias(&raw_workload),
+            "the DSN host and the published SD alias must be the identical string"
+        );
+        assert!(parts.dsn().contains(&format!("@{}:", parts.host)));
     }
 
     /// The MySQL analogue: `mysql://` scheme + the MySQL bridge port.

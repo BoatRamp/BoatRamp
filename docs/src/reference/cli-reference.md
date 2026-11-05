@@ -2920,6 +2920,44 @@ Import a BRPROJ bundle into a project on the RUNNING node (`Project·Admin` on t
 | `--continue-on-error <KINDS>` | — | — | — | Clone robustness — GET THE TRANSFER THROUGH past a per-blob FAILURE (not just an integrity mismatch): forgive the listed error kinds (warn, record, skip that one blob, then continue) instead of aborting the whole op. Bare `--continue-on-error` forgives EVERY kind; `--continue-on-error=backend,member-mismatch` forgives only those. The kinds are `backend` (a blob target-write that survived the backend's retries and the complete HEAD-recovery) and `member-mismatch` (the integrity mismatch — the generalised home of `--skip-member-mismatch`). Each skipped blob lands in a skip MANIFEST the op reports, for `--only-blobs` repair. Default off (hard-fail the first failure) |
 | `--only-blobs <MANIFEST>` | — | — | — | Clone robustness — REPAIR: re-stream ONLY the blob keys named in this skip MANIFEST (the file a prior `--continue-on-error` run wrote), restoring nothing else. The blobs are pulled again from the source over the SAME streaming path (no local copy, no spool). The manifest is the JSON the op reported; read locally and its keys forwarded to the node |
 
+### `boatramp project sync`
+
+Idempotent, selective, coherence-preserving project SYNC (the successor to `import --clone-from` for environment replication; `Project·Admin`). Reconciles a target project toward a `--from` source for a SELECTED set of pieces (`--include-<piece>` / `--exclude-<piece>`), rewriting site configs so the result is always coherent
+
+**Usage:** `boatramp project sync [OPTIONS] [TARGET]`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `[TARGET]` | — | — | — | The TARGET (destination) project. Defaults to the active `--project` (or `default`) |
+| `--from <URL_OR_PROJECT>` | — | — | — | The SOURCE: a cross-node base URL (reusing the `--clone-from` transport) or a same-node project name. URL sources route through the clone transport; a bare name is a project on this control plane |
+| `--from-project <PROJECT>` | — | — | — | The source PROJECT when `--from` is a URL (defaults to the target project — the common same-name cross-environment move) |
+| `--include-pg` | — | — | — | Include managed-DB contents |
+| `--include-blobs` | — | — | — | Include the content-addressed blob store |
+| `--include-sites` | — | — | — | Include site configs |
+| `--include-domains` | — | — | — | Include the domain layer (domains field + verification/alias records) |
+| `--include-settings` | — | — | — | Include imperative project settings |
+| `--include-databases` | — | — | — | Include declarative managed-database bindings |
+| `--include-graphql` | — | — | — | Include the GraphQL registry + APQ safelist |
+| `--include-history` | — | — | — | Include runtime deploy history/current pointers |
+| `--include-secrets` | — | — | — | Include KEK-sealed secrets (dropped under `--identity fresh`; the target re-provisions) |
+| `--exclude-pg` | — | — | — | Exclude managed-DB contents (preserve the destination's) |
+| `--exclude-blobs` | — | — | — | Exclude the blob store |
+| `--exclude-sites` | — | — | — | Exclude site configs |
+| `--exclude-domains` | — | — | — | Exclude the domain layer — carries ZERO source domains (the A/B-safe exclude) |
+| `--exclude-settings` | — | — | — | Exclude imperative project settings |
+| `--exclude-databases` | — | — | — | Exclude declarative managed-database bindings |
+| `--exclude-graphql` | — | — | — | Exclude the GraphQL registry + APQ safelist |
+| `--exclude-history` | — | — | — | Exclude runtime deploy history/current pointers |
+| `--exclude-secrets` | — | — | — | Exclude KEK-sealed secrets |
+| `--exclude-site <NAME>` | — | — | — | Drop a specific site by name rather than carry it (repeatable) |
+| `--exclude-db <NAME>` | — | — | — | Drop a specific managed database by name rather than carry it (repeatable) |
+| `--identity <MODE>` | — | `fresh` | — | Identity decision. Only `fresh` is available in this release (the target mints/keeps its own KEK and source-sealed secrets are dropped); `adopt` is increment 2 |
+| `--strict` | — | — | — | All-or-nothing: refuse the whole run if ANY item is incoherent, instead of converging the coherent items and reporting the skipped ones |
+| `--apply` | — | — | — | Execute the sync (mutating). The default (no `--apply`) is the dry-run preflight; `--apply` requires `-y` |
+| `-y, --yes` | — | — | — | Confirm a mutating `--apply`. Required for `--apply` (there is no interactive prompt) |
+| `--clone-source-token-file <PATH>` | — | — | — | Path to a file holding the SOURCE node's Project-Admin token — required for a cross-node (URL `--from`) `--apply` (reads + streams the source). Falls back to `BOATRAMP_CLONE_SOURCE_TOKEN`. Never passed as a bare CLI argument |
+| `--allow-domain-cutover` | — | — | — | Intend a cross-node DOMAIN CUTOVER. Carrying `--include-domains` from a URL (cross-node) source is refused without this flag: the dest node's host-uniqueness guard is same-node only and cannot see whether the remote source still LIVE-owns the host, so a carry could create a second simultaneously-live owner. Pass this only when the operator has taken the source down (DR) or is deliberately yielding the host (blue-green cutover) |
+
 ## `boatramp dns`
 
 Configure DNS + issue wildcard preview certs (requires `--features acme-dns`)

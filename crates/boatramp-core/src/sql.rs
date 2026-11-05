@@ -121,9 +121,11 @@ pub enum SqlError {
     /// The backend is **not ready yet** — a host-MANAGED database that is still starting,
     /// recovering, or has no healthy replica (distinct from a permanent config/transport error).
     /// This is **transient**: the caller should retry, or return a retryable `503` — never treat it
-    /// as a permanent "not configured"/"not granted" failure. Emitted only by the managed-compute
-    /// resolver; an external/local backend's outages stay [`Other`](SqlError::Other) (per-DB
-    /// resilience, no readiness gate).
+    /// as a permanent "not configured"/"not granted" failure. Emitted by the managed-compute
+    /// resolver (a replica still starting / with no healthy endpoint) and by the project-declared
+    /// (apply-managed) database resolver for a transient control-plane read blip while resolving a
+    /// declared binding (so the same readiness-gated retry applies); an external/local backend's
+    /// outages stay [`Other`](SqlError::Other) (per-DB resilience, no readiness gate).
     #[error("sql backend not ready: {0}")]
     Unavailable(String),
 }

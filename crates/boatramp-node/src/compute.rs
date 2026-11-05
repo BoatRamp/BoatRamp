@@ -768,8 +768,9 @@ impl boatramp_container::dns_server::InternalDnsSource for DeployDnsSource {
             // Reverse map: EVERY replica (running or parked) owns its IP, so a source
             // that is a real container is always recognised (never treated as unknown
             // and answered internal names it shouldn't be — the isolation depends on
-            // this being complete).
-            fleet.owners.insert(ip, key.clone());
+            // this being complete). Keyed by the real workload (source identity / project
+            // scoping); the FORWARD map below keys by the DNS alias instead.
+            fleet.owners.insert(ip, key);
             // Forward map: only a healthy, running replica is a valid answer target
             // (matches DeployEndpointResolver — a parked/unhealthy replica is not a
             // live endpoint). Ordered by replica index (primary-first) via the KV
@@ -786,9 +787,20 @@ impl boatramp_container::dns_server::InternalDnsSource for DeployDnsSource {
             // `service_ready` needs the node-global DNS source to become config-aware —
             // a follow-up; routing + migration are already per-DB-configurable.)
             if st.phase == ReplicaPhase::Running && st.healthy && st.readiness.is_provisioned() {
+                // Forward map KEY is the workload's DNS ALIAS ([`managed_db_alias`]) — the SAME
+                // short, RFC-1035-valid label a consumer's injected DSN host carries (and the docker
+                // backend publishes). Identity for a name ≤ 63 octets (every short / non-managed-DB
+                // workload is byte-unchanged), so this only affects a `Single` managed-DB workload
+                // whose name exceeds 63 octets — which cannot be a DNS label on ANY backend (the
+                // 63-octet cap is RFC 1035, enforced in the DNS wire format itself), so resolving it
+                // by its alias is the only form that works here too.
+                let dns_key = (
+                    st.handle.project.clone(),
+                    boatramp_core::compute::managed_db_alias(&st.handle.workload),
+                );
                 fleet
                     .addrs
-                    .entry(key)
+                    .entry(dns_key)
                     .or_insert_with(ResolvedAddrs::default)
                     .v4
                     .push(ip);
@@ -1802,6 +1814,7 @@ mod tests {
                     readiness: boatramp_core::compute::Readiness::Provisioned,
                     data_dir: None,
                     snapshot: None,
+                    active_spec: None,
                 },
             )
         };
@@ -1966,6 +1979,7 @@ mod tests {
             readiness: Readiness::Starting,
             data_dir: None,
             snapshot: None,
+            active_spec: None,
         }
     }
 
