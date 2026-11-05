@@ -106,7 +106,7 @@ pub fn sealed_secret_prefixes(project: ProjectRef<'_>) -> Vec<String> {
 /// mapping" rule). The marker may only be (re)granted by a **dest-side `System·Admin` activation**,
 /// so every control-plane IMPORT/WRITE side strips it and the destination fails closed. Project-
 /// agnostic (matches any `project/<any>/current-principal/…`), so a single call guards a slice that
-/// a crafted bundle mis-labels. `current/` and `history/` still carry — zero data-plane fidelity
+/// a crafted bundle mislabels. `current/` and `history/` still carry — zero data-plane fidelity
 /// lost.
 #[must_use]
 pub fn is_system_principal_marker_key(key: &str) -> bool {

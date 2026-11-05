@@ -512,7 +512,7 @@ fn primary_network_is_current(network_mode: Option<&str>, expected_net: &str) ->
 /// OLD alias here and lacks the current one, so a sibling resolving the CURRENT alias gets
 /// NXDOMAIN until the producer is recreated. A workload whose name already fits a DNS label
 /// computes the SAME alias, so it is reported current (no spurious recreate). `None`/absent
-/// aliases ⇒ not current (recreate), matching `primary_network_is_current` for a mis-attached one.
+/// aliases ⇒ not current (recreate), matching `primary_network_is_current` for a wrongly-attached one.
 fn container_alias_is_current(aliases: Option<&[String]>, expected_alias: &str) -> bool {
     aliases.is_some_and(|a| a.iter().any(|x| x == expected_alias))
 }
@@ -1568,7 +1568,7 @@ mod tests {
     #[test]
     fn container_alias_current_only_when_it_advertises_the_current_managed_db_alias() {
         // A long (>63-octet) managed-DB workload name whose current alias is the short hash.
-        let workload = "bramp-db-0ba8mhgah7gfb4e2ivmj05ixx-simertec-stg_backoffice_db_0123456789";
+        let workload = "bramp-db-0xk8mhgah7gfb4e2ivmj05ixx-simertec-stg_backoffice_db_0123456789";
         assert!(workload.len() > 63, "fixture must exceed the DNS label cap");
         let current = managed_db_alias(workload); // the <=63 alias `launch` now publishes
         assert!(current.len() <= 63);
