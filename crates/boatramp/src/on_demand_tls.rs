@@ -1930,4 +1930,416 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         println!("SINGLE-NODE ON-DEMAND TLS OK");
     }
+
+    /// cap-req #29 LIVE GATE: a host-owned TCP **listener** with `use_node_cert = true`, a
+    /// verified+attached `server_names` domain, and NO static `cert_file` serves the NODE-MANAGED
+    /// (ACME) cert for that domain — the SAME cert the `:443` edge serves — via the SAME shared
+    /// on-demand engine, over a REAL rustls handshake.
+    ///
+    /// It stands up the single-node on-demand engine through the production seam [`from_serve_config`]
+    /// (DNS-01 against a throwaway local Pebble CA, behind the REAL [`DeployGate`] #02 allowlist),
+    /// mints the listener's PROJECT-SCOPED resolver, builds the listener TLS config through the exact
+    /// `serve.rs` call ([`crate::acme_dns::build_listener_server_config_composite`] with a `None` static
+    /// cert + the `server_names` managed allowlist + `catch_all_on_demand = false`), then drives an
+    /// in-memory TLS handshake on that config and asserts the served leaf is the Pebble-issued cert the
+    /// node stored for the domain (== what the edge serves), NOT a static/self-signed cert.
+    ///
+    /// MUTATION SENSE (what #29 changes): BEFORE the fix, this listener either (a) refused config-load
+    /// (`cert_file` was required), or (b) served the listener's own STATIC cert for a `server_name`
+    /// (never the node-managed one). Here there is NO static cert at all, and the handshake succeeds
+    /// serving the Pebble-issued node-managed cert — only possible with the fix. Two bound assertions
+    /// pin the security envelope: an SNI OUTSIDE `server_names` is refused (no serve, bounded to the
+    /// allowlist), and an SNI-less handshake refuses cleanly (no static fallback → fail-closed).
+    ///
+    /// `#[ignore]`d — needs `pebble` + `pebble-challtestsrv` on PATH (nix dev shell) + binds local
+    /// ports. Run on lighthouse:
+    /// `cargo test -p boatramp --features acme-dns listener_use_node_cert_against_pebble -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
+    async fn listener_use_node_cert_against_pebble() {
+        use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{ClientConnection, DigitallySignedStruct, ServerConnection, SignatureScheme};
+        use std::time::Duration;
+
+        // Distinct ports from the other Pebble gates in this module (so a name-filtered `--ignored`
+        // run of this gate never collides with theirs).
+        const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8155";
+        const DIRECTORY_URL: &str = "https://localhost:14100/dir";
+
+        struct ChallTestSrv {
+            client: reqwest::Client,
+        }
+        #[async_trait]
+        impl DnsProvider for ChallTestSrv {
+            async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.kind.flat_value() }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+            async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/clear-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+        }
+        struct Child(tokio::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.start_kill();
+            }
+        }
+        fn on_path(bin: &str) -> bool {
+            std::process::Command::new(bin)
+                .arg("-help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+        fn mint_certs(dir: &std::path::Path) -> std::path::PathBuf {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+            let ca_path = dir.join("ca.pem");
+            std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+            std::fs::write(dir.join("cert.pem"), leaf_cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem()).unwrap();
+            ca_path
+        }
+
+        // ---- a minimal in-memory rustls handshake harness (no sockets; the cert RESOLUTION path is
+        // identical to a real listener accept — `ServerConnection` drives the composite resolver). ----
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &ServerName<'_>,
+                _: &[u8],
+                _: UnixTime,
+            ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+        fn served_leaf(
+            config: &Arc<rustls::ServerConfig>,
+            name: ServerName<'static>,
+        ) -> Option<Vec<u8>> {
+            let client_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth();
+            let mut client = ClientConnection::new(Arc::new(client_config), name).ok()?;
+            let mut server = ServerConnection::new(config.clone()).ok()?;
+            for _ in 0..32 {
+                let mut c2s = Vec::new();
+                while client.wants_write() {
+                    client.write_tls(&mut c2s).ok()?;
+                }
+                if !c2s.is_empty() {
+                    let mut rd: &[u8] = &c2s;
+                    while !rd.is_empty() {
+                        server.read_tls(&mut rd).ok()?;
+                    }
+                    server.process_new_packets().ok()?;
+                }
+                let mut s2c = Vec::new();
+                while server.wants_write() {
+                    server.write_tls(&mut s2c).ok()?;
+                }
+                if !s2c.is_empty() {
+                    let mut rd: &[u8] = &s2c;
+                    while !rd.is_empty() {
+                        client.read_tls(&mut rd).ok()?;
+                    }
+                    client.process_new_packets().ok()?;
+                }
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    return client
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| c.as_ref().to_vec());
+                }
+            }
+            None
+        }
+        /// The leaf DER of a PEM chain.
+        fn leaf_der(cert_pem: &str) -> Vec<u8> {
+            rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap()
+                .to_vec()
+        }
+
+        if !on_path("pebble") || !on_path("pebble-challtestsrv") {
+            eprintln!(
+                "skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)"
+            );
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!(
+            "br-listener-nodecert-pebble-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = mint_certs(&dir);
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": "[::]:14100", "managementListenAddress": "[::]:15100",
+            "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
+            "httpPort": 5102, "tlsPort": 5101, "ocspResponderURL": "" } });
+        let config_path = dir.join("pebble.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let _challtestsrv = Child(
+            tokio::process::Command::new("pebble-challtestsrv")
+                .args([
+                    "-dnsserver",
+                    "127.0.0.1:8153",
+                    "-management",
+                    "127.0.0.1:8155",
+                ])
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble-challtestsrv"),
+        );
+        let _pebble = Child(
+            tokio::process::Command::new("pebble")
+                .args(["-config", config_path.to_str().unwrap()])
+                .args(["-dnsserver", "127.0.0.1:8153"])
+                .env("PEBBLE_VA_NOSLEEP", "1")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble"),
+        );
+        let probe = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .user_agent("boatramp-listener-nodecert-pebble-test")
+            .build()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if probe
+                .get(DIRECTORY_URL)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(ready, "Pebble directory did not become ready");
+        for _ in 0..50 {
+            if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Seed the #02 allowlist for the listener's project: a verified+attached custom domain that is
+        // the listener's ONE declared `server_name`. `set_site_config` (primary) makes it resolvable —
+        // which warms the synchronous owner cache the project-SCOPE check reads — BEFORE the additive
+        // verify+attach that authorizes issuance (order per `single_node_on_demand_against_pebble`).
+        const PROJECT: &str = "mailroom";
+        const DOMAIN: &str = "mail.listener.test";
+        let deploy = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        let proj = ProjectRef::new(PROJECT);
+        let site = SiteName::new("mx");
+        let cfg = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some(DOMAIN.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        deploy.set_site_config(proj, "mx", &cfg).await.unwrap();
+        deploy
+            .start_domain_verification(
+                proj,
+                &site,
+                DOMAIN,
+                boatramp_core::domain_verify::VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        deploy
+            .mark_domain_verified(proj, &site, DOMAIN)
+            .await
+            .unwrap();
+        deploy
+            .attach_verified_domain(proj, &site, DOMAIN)
+            .await
+            .unwrap();
+        // Warm the synchronous owner cache the listener SCOPE reads (`cached_owner`): it must resolve
+        // DOMAIN to PROJECT, else the scoped resolver would refuse to serve its OWN project's cert.
+        assert!(
+            matches!(deploy.resolve_site_by_host(DOMAIN).await, Ok(Some(_))),
+            "the seeded domain must resolve (to warm the project-scope owner cache)"
+        );
+
+        // Build the on-demand engine through the SINGLE-NODE production seam (the SAME call `run` makes
+        // for `--tls acme-dns` + an enabled `[serve.on_demand_tls]`), then mint the listener's
+        // PROJECT-SCOPED resolver — exactly what `spawn_listeners` does.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let cert_store: Arc<dyn CertStore> =
+            Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone()));
+        let provider: Arc<dyn DnsProvider> = Arc::new(ChallTestSrv {
+            client: reqwest::Client::new(),
+        });
+        let od_cfg = boatramp_node::config::OnDemandTlsConfig {
+            enabled: true,
+            challenge: boatramp_node::config::OnDemandChallenge::Dns01,
+            directory_url: Some(DIRECTORY_URL.to_string()),
+            contact_email: Some("ops@example.test".to_string()),
+            propagation_wait_secs: Some(2),
+            propagation_poll_interval_secs: Some(1),
+            rate_limit_per_hour: Some(0),
+            ..Default::default()
+        };
+        let engine = from_serve_config(
+            &od_cfg,
+            deploy.clone(),
+            cert_store.clone(),
+            Arc::new(|| true),
+            Some(provider),
+            kv.clone(),
+            None,
+            Some(ca_path),
+        )
+        .expect("single-node on-demand engine MUST build when enabled (anti-inert)");
+        let scoped = engine.scoped_resolver(PROJECT.to_string(), deploy.clone());
+
+        // The listener TLS config EXACTLY as `serve.rs` builds it for `use_node_cert = true`: NO static
+        // cert, `server_names` = the managed allowlist, `catch_all_on_demand = false`.
+        let server_names = vec![DOMAIN.to_string()];
+        let listener_config = Arc::new(
+            crate::acme_dns::build_listener_server_config_composite(
+                None, // NO static cert_file — pure node-managed (impossible to build before #29)
+                &server_names,
+                &server_names, // managed_names
+                false,         // catch_all_on_demand OFF — bounded to server_names
+                scoped.clone(),
+            )
+            .expect("listener composite builds with no static cert (#29)"),
+        );
+
+        // Drive issuance by polling the scoped resolver (a real handshake triggers the same way); the
+        // worker issues the node-managed cert via Pebble DNS-01 and caches it for the retry.
+        let _ = scoped.resolve_sni(DOMAIN, false);
+        let mut issued = false;
+        for _ in 0..80 {
+            if scoped.resolve_sni(DOMAIN, false).is_some() {
+                issued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            issued,
+            "the listener's verified+attached server_name must issue the node-managed cert on first use"
+        );
+
+        // THE #29 assertion: a REAL handshake on the listener config for its server_name is served the
+        // NODE-MANAGED (Pebble-issued) cert — the SAME leaf the node stored (what `:443` serves) — over
+        // a listener that has NO static cert at all.
+        let sni = ServerName::try_from(DOMAIN).unwrap();
+        let served =
+            served_leaf(&listener_config, sni).expect("the listener completes the handshake");
+        let stored = match cert_store.get(DOMAIN).await {
+            Ok(Some(c)) => c,
+            other => panic!("node-managed cert must be stored: {other:?}"),
+        };
+        assert_eq!(
+            served,
+            leaf_der(&stored.chain_pem),
+            "the listener serves the NODE-MANAGED cert (the exact leaf the node stored == `:443` serves)"
+        );
+        // It is genuinely CA-issued (same ISSUER as the `:443` edge), not a self-signed static cert:
+        // the ONLY way a cert reaches `cert_store` here is a real ACME DNS-01 round-trip against the
+        // Pebble CA (this listener has NO static cert — `None` above — so there is no self-signed
+        // material to fall back to), and Pebble returns a leaf+intermediate chain (> 1 PEM block).
+        let chain_len = rustls_pemfile::certs(&mut stored.chain_pem.as_bytes()).count();
+        assert!(
+            chain_len >= 2,
+            "a CA-issued chain carries the issuer too (leaf + intermediate); got {chain_len} PEM blocks"
+        );
+
+        // BOUND 1: an SNI OUTSIDE `server_names` is REFUSED — the listener never serves (nor triggers)
+        // a cert for a domain it did not declare (catch-all OFF). This holds even though the engine
+        // would happily issue for any verified in-project domain at the edge.
+        assert_eq!(
+            served_leaf(
+                &listener_config,
+                ServerName::try_from("other.listener.test").unwrap()
+            ),
+            None,
+            "an SNI outside server_names is refused (bounded to the allowlist)"
+        );
+        // BOUND 2: an SNI-less handshake refuses cleanly (no static fallback → fail-closed).
+        assert_eq!(
+            served_leaf(&listener_config, ServerName::try_from("127.0.0.1").unwrap()),
+            None,
+            "an SNI-less handshake on a no-static-cert listener refuses cleanly (fail-closed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "LISTENER NODE-CERT LIVE GATE OK: use_node_cert listener (no static cert) served the \
+             Pebble-issued node-managed cert for its verified+attached server_name (== :443), \
+             out-of-allowlist + SNI-less refused fail-closed"
+        );
+    }
 }

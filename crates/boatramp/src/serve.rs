@@ -3832,39 +3832,83 @@ fn spawn_listeners(
         #[cfg(feature = "tls")]
         let tls_config = if let Some(t) = &l.tls {
             let build = || -> Result<std::sync::Arc<rustls::ServerConfig>> {
-                let cert = t
-                    .cert_file
-                    .as_ref()
-                    .ok_or_else(|| Error::NoCert("<listener tls: cert_file unset>".into()))?;
-                let key = t
-                    .key_file
-                    .as_ref()
-                    .ok_or_else(|| Error::NoPrivateKey("<listener tls: key_file unset>".into()))?;
                 install_crypto_provider();
-                // On-demand per-SNI issuance for this listener (cap-req 03 #4): when it opts in AND
-                // the node on-demand engine runs, serve through the composite resolver (own static cert
-                // for its `server_names` + SNI-less handshakes; the shared engine issues for a verified
-                // custom-domain SNI). Protocol-agnostic: the composite advertises no ALPN and knows
-                // nothing of what speaks over the connection.
+                // The listener's own static cert is now OPTIONAL (cap-req #29): a `(cert, key)` PEM pair
+                // when configured (served for `server_names` + SNI-less, and the fallback under
+                // `use_node_cert`), `None` for a pure node-managed listener. A half pair is refused at
+                // config load, so `(Some, None)` / `(None, Some)` never reaches here.
+                let static_pem: Option<(String, String)> = match (&t.cert_file, &t.key_file) {
+                    (Some(cert), Some(key)) => Some((
+                        std::fs::read_to_string(cert)?,
+                        std::fs::read_to_string(key)?,
+                    )),
+                    _ => None,
+                };
+                // Does this listener consume the node on-demand engine? `use_node_cert` serves the
+                // NODE-MANAGED cert for its `server_names` (cap-req #29); `on_demand` issues per-SNI for
+                // this project's OTHER verified domains (cap-req 03 #4, the catch-all). Either needs the
+                // engine. Protocol-agnostic: the composite advertises no ALPN and knows nothing of what
+                // speaks over the connection.
                 #[cfg(feature = "acme-dns")]
-                if t.on_demand
-                    && let Some(engine) = on_demand.clone()
-                {
-                    let cert_pem = std::fs::read_to_string(cert)?;
-                    let key_pem = std::fs::read_to_string(key)?;
-                    // Mint a PROJECT-SCOPED resolver from the shared engine (Finding B): this listener
-                    // serves on-demand certs only for its own project's verified domains, never another
-                    // project's — even though all certs share one engine + cache.
-                    let scoped = engine.scoped_resolver(l.project.clone(), deploy.clone());
-                    let cfg = crate::acme_dns::build_listener_server_config_composite(
-                        &cert_pem,
-                        &key_pem,
-                        t.server_names.as_deref(),
-                        scoped,
-                    )?;
-                    return Ok(std::sync::Arc::new(cfg));
+                if t.use_node_cert || t.on_demand {
+                    match on_demand.clone() {
+                        Some(engine) => {
+                            // Mint a PROJECT-SCOPED resolver from the shared engine (Finding B): this
+                            // listener serves on-demand certs only for its own project's verified
+                            // domains, never another project's — even though all certs share one engine
+                            // + cache. cap-req #29 layers the `server_names` allowlist on top: with
+                            // `use_node_cert` the node-managed cert is served (and issuance triggered)
+                            // ONLY for `server_names`; the catch-all issuer runs for other SNIs ONLY when
+                            // `on_demand` is also set — so a `use_node_cert`-only listener is bounded to
+                            // its declared names.
+                            let scoped = engine.scoped_resolver(l.project.clone(), deploy.clone());
+                            let server_names = t.server_names.clone().unwrap_or_default();
+                            let managed_names: Vec<String> = if t.use_node_cert {
+                                server_names.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            let static_ref =
+                                static_pem.as_ref().map(|(c, k)| (c.as_str(), k.as_str()));
+                            let cfg = crate::acme_dns::build_listener_server_config_composite(
+                                static_ref,
+                                &server_names,
+                                &managed_names,
+                                t.on_demand, // catch_all_on_demand
+                                scoped,
+                            )?;
+                            return Ok(std::sync::Arc::new(cfg));
+                        }
+                        // The listener asked for node-managed certs but this node runs no on-demand
+                        // engine (not `--tls acme-dns`, or on-demand disabled/unbuilt). For
+                        // `use_node_cert` this is fail-closed (do NOT silently serve a static cert the
+                        // operator may not have intended as primary); for an `on_demand`-only listener
+                        // the historical graceful fallback to its (always-present) static cert is kept.
+                        None if t.use_node_cert => {
+                            return Err(Error::NoCert(
+                                "<listener use_node_cert: this node runs no on-demand TLS engine \
+                                 (serve with `--tls acme-dns` and `[serve.on_demand_tls] enabled`)>"
+                                    .into(),
+                            ));
+                        }
+                        None => { /* on_demand-only: fall through to the static cert below */ }
+                    }
                 }
-                let (certs, private_key) = load_cert_chain_and_key(cert, key)?;
+                // No engine wanted/available: plaintext-terminating static-cert listener (unchanged).
+                // A `use_node_cert` listener on a build WITHOUT the acme-dns engine must fail closed
+                // rather than silently serve a static cert.
+                #[cfg(not(feature = "acme-dns"))]
+                if t.use_node_cert {
+                    return Err(Error::NoCert(
+                        "<listener use_node_cert: this build lacks the acme-dns on-demand TLS engine>"
+                            .into(),
+                    ));
+                }
+                let (cert_pem, key_pem) = static_pem.ok_or_else(|| {
+                    Error::NoCert("<listener tls: no static cert_file/key_file>".into())
+                })?;
+                let (certs, private_key) =
+                    load_cert_chain_and_key_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
                 // Transport-level: one listener = one fixed cert, served regardless of SNI; no ALPN,
                 // no client auth. Protocol-agnostic — nothing here depends on what runs over the TLS.
                 let cfg = rustls::ServerConfig::builder()
@@ -5697,14 +5741,28 @@ fn load_cert_chain_and_key(
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
     let cert_pem = std::fs::read(cert)?;
+    let key_pem = std::fs::read(key)?;
+    load_cert_chain_and_key_from_pem(&cert_pem, &key_pem)
+}
+
+/// Parse an already-read PEM cert chain + private key as DER (cap-req #29: a listener's static cert is
+/// now read into memory first, since it is OPTIONAL and composed with the node-managed resolver, so the
+/// static fallback path parses the bytes rather than re-reading the files).
+#[cfg(feature = "tls")]
+fn load_cert_chain_and_key_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     let certs =
         rustls_pemfile::certs(&mut &cert_pem[..]).collect::<std::result::Result<Vec<_>, _>>()?;
     if certs.is_empty() {
-        return Err(Error::NoCert(cert.display().to_string()));
+        return Err(Error::NoCert("<listener tls: empty PEM cert chain>".into()));
     }
-    let key_pem = std::fs::read(key)?;
     let key = rustls_pemfile::private_key(&mut &key_pem[..])?
-        .ok_or_else(|| Error::NoPrivateKey(key.display().to_string()))?;
+        .ok_or_else(|| Error::NoPrivateKey("<listener tls: no PEM private key>".into()))?;
     Ok((certs, key))
 }
 

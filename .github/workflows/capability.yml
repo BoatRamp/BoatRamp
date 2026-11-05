@@ -804,6 +804,57 @@ jobs:
           grep -q 'ACME-DNS-PERSIST GATE OK' pebble.log \
             || { echo "::error::pebble gate never reached the success marker (silent skip or dns-persist-01 regression?)" >&2; exit 1; }
 
+  # Tier — cap-req #29: a host-owned TCP LISTENER with `use_node_cert = true` + a verified+attached
+  # `server_names` domain + NO static cert_file serves the NODE-MANAGED (ACME) cert for that domain —
+  # the SAME cert the `:443` edge serves, via the SAME shared on-demand engine. The gate stands up the
+  # single-node on-demand engine (DNS-01 against a local Pebble CA, behind the REAL #02 verified-domain
+  # allowlist), builds the listener TLS config through the exact serve.rs seam (no static cert +
+  # server_names managed allowlist + catch-all OFF), drives a REAL rustls handshake on it, and asserts
+  # the served leaf is the Pebble-issued cert the node stored (what `:443` serves), with an SNI outside
+  # server_names and an SNI-less handshake both refused fail-closed. MUTATION SENSE: before #29 this
+  # listener could not even load (cert_file was required) and a server_name was always served the
+  # STATIC cert — here there is NO static cert and the node-managed cert is served. HARD marker gate
+  # (`--ignored` + the marker greps, so a silent skip when pebble is absent fails the job). A local
+  # Pebble test-double only — no privileges, no secrets, no egress.
+  listener-node-cert:
+    name: listener use_node_cert — node-managed cert on a TCP listener (Pebble)
+    runs-on: ubuntu-latest
+    env:
+      PEBBLE_VERSION: "2.10.1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-listener-node-cert
+
+      - name: Install Pebble + pebble-challtestsrv (>= 2.10.0)
+        run: |
+          set -o pipefail
+          base="https://github.com/letsencrypt/pebble/releases/download/v${PEBBLE_VERSION}"
+          mkdir -p "$HOME/pebble-bin"
+          for b in pebble pebble-challtestsrv; do
+            curl -fsSL "${base}/${b}-linux-amd64.tar.gz" -o "/tmp/${b}.tar.gz"
+            tar -xzf "/tmp/${b}.tar.gz" -C /tmp
+            install -m 0755 "$(find /tmp -type f -name "$b" | head -n1)" "$HOME/pebble-bin/$b"
+          done
+          echo "$HOME/pebble-bin" >> "$GITHUB_PATH"
+          "$HOME/pebble-bin/pebble" -version
+
+      - name: Listener serves the node-managed cert for its verified server_name (hard gate)
+        run: |
+          set -o pipefail
+          # In-crate live gate (reaches the private acme-dns cert-resolution modules). It spawns pebble
+          # + pebble-challtestsrv from PATH, issues the node-managed cert via DNS-01, and drives a real
+          # handshake on the `use_node_cert` listener config. `--ignored` (it binds local ports); the
+          # marker prints ONLY after the node-managed cert is served, so a silent skip fails the grep.
+          cargo test -p boatramp --features acme-dns listener_use_node_cert_against_pebble \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tee listener-nodecert.log
+          grep -qE 'test result: ok' listener-nodecert.log \
+            || { echo "::error::listener use_node_cert gate did not pass" >&2; exit 1; }
+          grep -q 'LISTENER NODE-CERT LIVE GATE OK' listener-nodecert.log \
+            || { echo "::error::listener node-cert gate never reached the success marker (silent skip, or the listener did not serve the node-managed cert)" >&2; exit 1; }
+
   # Tier — the blob `/img` COLD-PATH FAN-OUT gate (image-serve-latency Ask 3c). N concurrent COLD
   # fetches through the REAL `aws_sdk_s3` backend must FAN OUT, not serialize at the connector. MinIO is
   # the local S3-compatible endpoint (a real aws client, real TCP — the `benchmark-must-exercise-real

@@ -658,15 +658,56 @@ impl ServerConfig {
                      is firewalled to the proxy) set `proxy_protocol_trust_any = true`",
                 );
             }
-            // Host-side per-listener TLS termination (cap-req 06): a declared `tls` block is honored,
-            // but it MUST name both a cert and a key (the host loads them + terminates TLS, handing the
-            // guest a decrypted plaintext stream). This holds for BOTH implicit TLS (465/993) and
-            // STARTTLS (25/587/143) — STARTTLS still terminates TLS after the in-band upgrade.
+            // Host-side per-listener TLS termination (cap-req 06 + cap-req #29): a declared `tls` block
+            // is honored, but it MUST name a usable cert SOURCE (the host terminates TLS, handing the
+            // guest a decrypted plaintext stream). The source is EITHER a static `cert_file`/`key_file`
+            // pair OR the node-managed cert (`use_node_cert` — cap-req #29). A block with NEITHER is
+            // refused (fail-closed: never a silent plaintext / unservable listener). This holds for BOTH
+            // implicit TLS (465/993) and STARTTLS (25/587/143) — STARTTLS still terminates TLS after the
+            // in-band upgrade.
             if let Some(tls) = &l.tls {
-                if tls.cert_file.is_none() || tls.key_file.is_none() {
+                let on_demand_enabled = serve.on_demand_tls.as_ref().is_some_and(|o| o.enabled);
+                // A static cert is a PAIR: a half-declared pair is always a misconfiguration.
+                if tls.cert_file.is_some() != tls.key_file.is_some() {
                     return err(
-                        "listener `tls` requires both `cert_file` and `key_file`",
-                        " — set cert_file/key_file (PEM), or remove the `tls` block for a plaintext listener",
+                        "listener `tls` needs BOTH `cert_file` and `key_file` (a static cert is a pair)",
+                        " — set both, or omit both and set `use_node_cert = true` for the node-managed cert",
+                    );
+                }
+                let has_static_pair = tls.cert_file.is_some() && tls.key_file.is_some();
+                // cap-req #29: the node-managed cert path. It is the OTHER valid cert source, so a block
+                // with a static pair OR `use_node_cert` is accepted; neither is refused.
+                if !has_static_pair && !tls.use_node_cert {
+                    return err(
+                        "listener `tls` has neither a static `cert_file`/`key_file` pair nor \
+                         `use_node_cert = true`",
+                        " — set cert_file/key_file (PEM), or set use_node_cert = true to serve the \
+                         node-managed cert, or remove the `tls` block for a plaintext listener",
+                    );
+                }
+                // `use_node_cert` shares the node's one on-demand engine (same budget / single-flight as
+                // `:443`), so it is meaningless unless that engine runs — refuse fail-closed if not.
+                if tls.use_node_cert && !on_demand_enabled {
+                    return err(
+                        "listener `tls.use_node_cert` requires `[serve.on_demand_tls] enabled = true`",
+                        " — enable node on-demand TLS (and serve with `--tls acme-dns`), or provide a \
+                         static cert_file/key_file instead",
+                    );
+                }
+                // `server_names` is the per-listener node-managed ALLOWLIST under `use_node_cert`; an
+                // empty allowlist authorizes no domain, so the listener could serve nothing managed —
+                // refuse it (fail-closed) rather than bind a dead listener.
+                if tls.use_node_cert
+                    && tls
+                        .server_names
+                        .as_ref()
+                        .is_none_or(|s| s.iter().all(|n| n.trim().is_empty()))
+                {
+                    return err(
+                        "listener `tls.use_node_cert` requires a non-empty `server_names` (the \
+                         per-listener allowlist of node-managed domains)",
+                        " — list the verified+attached domain(s) this listener serves, e.g. \
+                         server_names = [\"mail.example.com\"]",
                     );
                 }
                 // Declarative STARTTLS grammar (cap-req 06, Stage B): the one piece of protocol data.
@@ -2827,14 +2868,22 @@ pub enum ListenerMode {
 /// Per-listener host-side TLS material (cap-req 06). The host terminates TLS and hands the guest a
 /// decrypted plaintext stream (the guest does no crypto). With `starttls` absent this is **implicit
 /// TLS** (handshake at accept — 465/993); with `starttls` present it is **STARTTLS** (plaintext
-/// dialog, in-band upgrade on the declared trigger — 25/587/143). Either way requires both
-/// `cert_file` and `key_file`. File-only (never set from the env overlay).
+/// dialog, in-band upgrade on the declared trigger — 25/587/143).
+///
+/// The cert source is EITHER a static `cert_file`/`key_file` pair OR the NODE-MANAGED cert
+/// (`use_node_cert`, cap-req #29) — a `tls` block must declare at least one (a block with neither is
+/// refused at config load, fail-closed; never a silent plaintext/unservable listener). File-only
+/// (never set from the env overlay).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerTlsConfig {
-    /// PEM certificate chain path.
+    /// PEM certificate chain path. Optional since cap-req #29: omit it (with `key_file`) when the node
+    /// serves the managed cert (`use_node_cert = true`). When present it is a static `(cert, key)` pair
+    /// (both required together) serving `server_names` + SNI-less handshakes — and, under
+    /// `use_node_cert`, the FALLBACK for an SNI the node does not currently manage.
     pub cert_file: Option<PathBuf>,
-    /// PEM private-key path.
+    /// PEM private-key path. Required together with `cert_file` (a static cert is a pair); omit both for
+    /// a pure node-managed listener (`use_node_cert = true`).
     pub key_file: Option<PathBuf>,
     /// Absent ⇒ implicit TLS (handshake at accept). Present ⇒ STARTTLS (plaintext until the declared
     /// trigger, then an in-band upgrade). Still requires `cert_file` + `key_file`.
@@ -2856,9 +2905,34 @@ pub struct ListenerTlsConfig {
     /// project's domains.
     #[serde(default)]
     pub on_demand: bool,
+    /// Serve the **NODE-MANAGED** (ACME/on-demand) cert for the verified+attached domains in
+    /// `server_names` (cap-req #29) — giving this host-owned TCP listener the SAME cert the public
+    /// `:443` edge serves, via the SAME shared on-demand engine (`[serve.on_demand_tls]`), instead of a
+    /// hand-fed static `cert_file`. With it set, `server_names` is the per-listener **allowlist** of
+    /// node-managed domains: the listener serves (and triggers issuance for) the managed cert for an SNI
+    /// ONLY when that SNI is (a) present in `server_names`, (b) ownership-**verified** + attached, and
+    /// (c) owned by this listener's `project` — the exact gate the `:443` path applies (reused, not
+    /// forked). An SNI outside that set is never served or issued a managed cert by this flag.
+    ///
+    /// Makes `cert_file`/`key_file` OPTIONAL: omit them for a pure node-managed listener, or keep them
+    /// as the static FALLBACK for an SNI the node does not manage (and for an SNI-less handshake).
+    /// Requires `[serve.on_demand_tls] enabled = true` AND a non-empty `server_names`; the node must
+    /// actually run the on-demand engine (`--tls acme-dns`) or the listener fails closed (it does NOT
+    /// silently fall back to a static cert). Default `false` ⇒ unchanged (the static cert serves
+    /// `server_names`). Composes with `on_demand`: set both to ALSO issue per-SNI for this project's
+    /// OTHER verified domains (the catch-all); `use_node_cert` alone keeps managed serving bounded to
+    /// `server_names`. Transport-level only — it carries no notion of what protocol runs over the
+    /// listener.
+    #[serde(default)]
+    pub use_node_cert: bool,
     /// SNI names the listener's own static `cert_file` serves directly (an SNI match here wins before
     /// on-demand). Absent/empty ⇒ the static cert serves only SNI-less handshakes (via the no-SNI
     /// fallback); every presented SNI then goes to on-demand. Only meaningful with `on_demand = true`.
+    ///
+    /// Under `use_node_cert = true` (cap-req #29) this list flips role: it is the allowlist of domains
+    /// the listener serves the **node-managed** cert for (each still gated verified+attached+project),
+    /// and the static `cert_file`, if present, demotes to the fallback for these. Required non-empty
+    /// then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_names: Option<Vec<String>>,
 }
@@ -5101,6 +5175,61 @@ mod tests {
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", conn_rate_ipv6_prefix: 56 ) } ) )"#,
         )
         .expect("a valid conn_rate_ipv6_prefix parses");
+
+        // ---- cap-req #29: node-managed listener cert (cert_file XOR use_node_cert) ----------------
+        // (p) THE #29 core: `use_node_cert = true` + node on-demand TLS enabled + a non-empty
+        //     `server_names` + NO static cert_file/key_file is now VALID — the listener serves the
+        //     node-managed cert. (Before #29 this was refused for "requires both cert_file and key_file".)
+        ServerConfig::parse(
+            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true, server_names: ["mail.example.test"] ) ) } ) )"#,
+        )
+        .expect("use_node_cert with node on-demand + server_names and no static cert is valid (#29)");
+        // (q) `use_node_cert = true` WITHOUT node on-demand TLS enabled is refused (the shared engine
+        //     it would serve from does not exist — fail-closed, never a silent plaintext listener).
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true, server_names: ["mail.example.test"] ) ) } ) )"#,
+        )
+        .expect_err("use_node_cert without [serve.on_demand_tls] enabled must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (r) `use_node_cert = true` with an EMPTY/absent `server_names` is refused — the allowlist of
+        //     node-managed domains must name at least one host (an empty allowlist serves nothing).
+        let err = ServerConfig::parse(
+            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true ) ) } ) )"#,
+        )
+        .expect_err("use_node_cert with no server_names must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (s) `use_node_cert = true` WITH a static cert_file/key_file (kept as the fallback for SNIs the
+        //     node does not manage, and for SNI-less handshakes) is valid.
+        ServerConfig::parse(
+            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", use_node_cert: true, server_names: ["mail.example.test"] ) ) } ) )"#,
+        )
+        .expect("use_node_cert WITH a static fallback cert is valid (#29)");
+        // (t) a `tls` block with a HALF static pair (cert_file but no key_file) and no use_node_cert is
+        //     refused — a static cert is a pair.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( key_file: "y.pem" ) ) } ) )"#,
+        )
+        .expect_err("a tls block with key_file but no cert_file must be refused (half pair)");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (u) a `tls` block with NEITHER a static pair NOR use_node_cert (here: on_demand catch-all only,
+        //     no cert) is refused — there is no cert source, so it would be an unservable listener.
+        let err = ServerConfig::parse(
+            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( on_demand: true ) ) } ) )"#,
+        )
+        .expect_err("a tls block with no static cert and no use_node_cert must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
