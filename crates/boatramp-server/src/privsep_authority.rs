@@ -186,6 +186,58 @@ pub enum AuthorityRequest {
         /// The requested token lifetime (seconds). Clamped to [`MAX_MINTED_TOKEN_TTL_SECS`].
         ttl_secs: u64,
     },
+    /// **`image.signer` grammar (Phase 2 Wave 2):** sign an OCI image/manifest `digest` for the
+    /// repository `repo`, where `repo` MUST be within the VERIFIED end principal's authorized target
+    /// scope (the handler refuses a `repo` the principal holds no granted `target` for, BEFORE signing).
+    /// Returns [`AuthorityResponse::ImageSigned`] (a DETACHED signature over `(repo, digest)` — a
+    /// RESULT; the image-signing key is type-foreclosed from ever being returned). Served only by an
+    /// instance holding [`HostAuthority::ImageSigner`].
+    SignImage {
+        /// The OCI image/manifest digest to sign (e.g. `sha256:<64 hex>`).
+        digest: String,
+        /// The repository the image belongs to — the scope checked against the principal's granted
+        /// targets. A `repo` outside the verified principal's scope makes the whole call `Refused`.
+        repo: String,
+    },
+    /// **`overlay.dial-signer` grammar (Phase 2 Wave 2):** mint a holder-bound overlay-dial capability
+    /// authorizing `holder_pubkey` to dial the in-cluster service `scope`, where `scope` MUST be within
+    /// the VERIFIED end principal's authorized target scope. Returns
+    /// [`AuthorityResponse::DialCapMinted`] (the dial cap — a RESULT; the signing key is
+    /// type-foreclosed). Served only by a [`HostAuthority::OverlayDialSigner`].
+    MintDialCap {
+        /// The DIALING CLIENT's own overlay public key (`ed25519:<hex>`) the cap is `cnf`-bound to — a
+        /// key the relaying frontend does NOT hold.
+        holder_pubkey: String,
+        /// The in-cluster service the cap authorizes dialing (e.g. `svc/db`). A `"*"` wildcard is
+        /// refused; the scope is checked against the principal's granted targets.
+        scope: String,
+        /// The requested cap lifetime (seconds). Clamped to the handler's max dial TTL ∩ the context's
+        /// remaining freshness.
+        ttl_secs: u64,
+    },
+    /// **`s3ingress.root` grammar (Phase 2 Wave 2):** derive the per-credential S3-ingress SigV4 secret
+    /// for an already-minted, fleet-signed `session_token` + its `access_key_id`. The handler verifies
+    /// the session token, refuses one whose host-stamped project/site scope is outside the VERIFIED end
+    /// principal's authorized target scope (BEFORE deriving), then derives the secret from the HKDF ROOT
+    /// bound to `(access_key_id, session.cti)`. Returns [`AuthorityResponse::S3IngressSecretDerived`]
+    /// (the DERIVED per-credential secret — a RESULT; the HKDF root is type-foreclosed). Served only by
+    /// a [`HostAuthority::S3IngressRoot`].
+    DeriveS3IngressSecret {
+        /// The fleet-signed `s3-session` COSE token (base64url) carrying the host-stamped scope + `cti`.
+        session_token: String,
+        /// The generated public access-key id (`BRUP…`) the derived secret is bound to.
+        access_key_id: String,
+    },
+    /// **`cluster.join-signer` grammar (Phase 2 Wave 2):** mint a single-use mesh-join token. Join is
+    /// operator-driven NODE bootstrap (not per-tenant): the handler refuses unless the VERIFIED end
+    /// principal holds a GLOBAL (targetless) operator role (the handler's configured operator-role name).
+    /// Returns [`AuthorityResponse::JoinTokenMinted`] (the join token — a RESULT; the signing key is
+    /// type-foreclosed). Served only by a [`HostAuthority::ClusterJoinSigner`].
+    MintJoinToken {
+        /// The requested join-token lifetime (seconds). Clamped to the handler's max join TTL ∩ the
+        /// context's remaining freshness (the monolith path has no TTL cap — this grammar adds one).
+        ttl_secs: u64,
+    },
 }
 
 /// The hard ceiling on a minted token's TTL (seconds). The signer clamps a `MintToken` request to
@@ -202,6 +254,10 @@ impl AuthorityRequest {
             Self::Seal { .. } => "seal",
             Self::Unseal { .. } => "unseal",
             Self::MintToken { .. } => "mint_token",
+            Self::SignImage { .. } => "sign_image",
+            Self::MintDialCap { .. } => "mint_dial_cap",
+            Self::DeriveS3IngressSecret { .. } => "derive_s3_ingress_secret",
+            Self::MintJoinToken { .. } => "mint_join_token",
         }
     }
 
@@ -215,6 +271,10 @@ impl AuthorityRequest {
             Self::Ping { .. } => None,
             Self::Seal { .. } | Self::Unseal { .. } => Some(HostAuthority::SecretsSealer),
             Self::MintToken { .. } => Some(HostAuthority::TokenSigner),
+            Self::SignImage { .. } => Some(HostAuthority::ImageSigner),
+            Self::MintDialCap { .. } => Some(HostAuthority::OverlayDialSigner),
+            Self::DeriveS3IngressSecret { .. } => Some(HostAuthority::S3IngressRoot),
+            Self::MintJoinToken { .. } => Some(HostAuthority::ClusterJoinSigner),
         }
     }
 }
@@ -254,6 +314,38 @@ pub enum AuthorityResponse {
     /// which no variant can carry (the type-level exfiltration foreclosure).
     Minted {
         /// The minted token (base64url `COSE_Sign1` CWT).
+        token: String,
+    },
+    /// The RESULT of a [`AuthorityRequest::SignImage`]: a DETACHED signature (hex) over the
+    /// domain-separated `(repo, digest)` message, produced with the image-signing key. **This is the
+    /// op's output — a signature — NOT the signing key**, which no variant can carry (the type-level
+    /// exfiltration foreclosure).
+    ImageSigned {
+        /// The detached signature (hex) over the signed image message.
+        signature: String,
+    },
+    /// The RESULT of a [`AuthorityRequest::MintDialCap`]: the minted, holder-bound overlay-dial
+    /// capability (base64url `COSE_Sign1` CWT). **This is the op's output — a scoped capability — NOT
+    /// the signing key** (type-foreclosed).
+    DialCapMinted {
+        /// The minted overlay-dial capability.
+        capability: String,
+    },
+    /// The RESULT of a [`AuthorityRequest::DeriveS3IngressSecret`]: the DERIVED per-credential
+    /// S3-ingress SigV4 secret (hex), scoped to the verified principal and bound to one
+    /// `(access_key_id, session.cti)` pair. **This is the op's output — a scoped per-credential secret,
+    /// analogous to a minted token — NOT the HKDF ROOT** (`s3ingress.root`'s own key material), which
+    /// no variant can carry (type-foreclosed). Held zeroizing on the wire (the transient copy is wiped
+    /// after the send), as an [`Unsealed`](Self::Unsealed) plaintext is.
+    S3IngressSecretDerived {
+        /// The derived `secret_access_key` (hex) — a per-credential SigV4 HMAC key, never the root.
+        secret_access_key: String,
+    },
+    /// The RESULT of a [`AuthorityRequest::MintJoinToken`]: the minted single-use mesh-join token
+    /// (base64url `COSE_Sign1` CWT). **This is the op's output — a bounded join token — NOT the signing
+    /// key** (type-foreclosed).
+    JoinTokenMinted {
+        /// The minted mesh-join token.
         token: String,
     },
     /// A fail-closed refusal — the context was absent / unverifiable / expired / stale, the call was
@@ -1933,6 +2025,497 @@ fn refused_internal(op: &str, detail: &str) -> AuthorityResponse {
 }
 
 // =============================================================================
+// Wave-2 grammars (Phase 2 Wave 2): image.signer / overlay.dial-signer /
+// s3ingress.root / cluster.join-signer. Each mirrors the Wave-1 pattern: a typed
+// op + a RESULT-only response (never key material — the type forecloses it), kind-
+// gated, scoped SOLELY to the re-validated VerifiedPrincipal, fail-closed.
+// =============================================================================
+
+/// The hard ceiling on a privsep-minted mesh-join token's TTL (seconds). The monolith `mint_join` path
+/// has NO server-side cap today (`[cluster.mesh].join_token_ttl` is unconsumed), so an admin could mint
+/// a near-immortal join token; the `cluster.join-signer` grammar clamps to this (∩ the context's
+/// remaining freshness), matching the dial-cap and `mint_token` clamps. One hour is ample for bootstrap.
+pub const MAX_JOIN_TOKEN_TTL_SECS: u64 = 3600;
+
+/// The default operator role name the `cluster.join-signer` grammar requires the verified principal to
+/// hold GLOBALLY (targetless) before minting a join token. A node-config constant (NOT per-tenant
+/// policy) — the built-in `admin` role. The composition may configure a different operator role.
+pub const DEFAULT_CLUSTER_OPERATOR_ROLE: &str = "admin";
+
+/// **The Wave-2 shared scope check (settled decision: scope on `GrantedRole.target`, fail-closed if
+/// targetless).** Whether the VERIFIED principal is authorized for the resource `requested` by one of
+/// its granted role `target`s. `requested` is authorized iff the principal holds a role whose `target`
+/// EQUALS it, OR a project role whose bare `<project>` target covers a `<project>/<site>` `requested`
+/// (the project wildcard). A principal with NO targeted role authorizes nothing (fail-closed); a
+/// targetless (GLOBAL) role is deliberately NOT treated as an all-targets wildcard — the crown jewel is
+/// control-plane-policy-blind and must never infer breadth from a global role (that inference belongs to
+/// the control plane that issued the credential). Consolidated: the one scope primitive the resource-
+/// scoped Wave-2 grammars (image / overlay / s3) share, never mirrored per handler.
+fn scope_target_authorized(principal: &VerifiedPrincipal, requested: &str) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    principal
+        .token()
+        .roles
+        .iter()
+        .any(|r| match r.target.as_deref() {
+            Some(t) if t == requested => true,
+            // A project role (`<project>`) covers any `<project>/<site>` under it (ProjectWildcard).
+            Some(project) => requested
+                .strip_prefix(project)
+                .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1),
+            None => false,
+        })
+}
+
+/// Clamp a requested TTL to `max_ttl` ∩ the context's REMAINING freshness (by `iat`, also bounded by the
+/// context's `exp`) — mirroring `SignerHandler::mint_token`'s MEDIUM-1 binding so an observed near-stale
+/// context cannot be amplified into a durable capability. Returns 0 (⇒ the caller refuses) when no
+/// freshness remains. The one TTL-binding primitive the dial-cap + join grammars share.
+fn clamp_ttl_to_context(
+    requested: u64,
+    max_ttl: u64,
+    context_max_age_secs: u64,
+    principal: &VerifiedPrincipal,
+    now_unix: u64,
+) -> u64 {
+    let remaining = match principal.token().iat {
+        Some(iat) => context_max_age_secs.saturating_sub(now_unix.saturating_sub(iat)),
+        // A verified context always has iat (verify_context refuses otherwise); treat a missing one as
+        // no freshness (fail-closed), exactly as `mint_token` does.
+        None => 0,
+    };
+    let remaining = match principal.token().exp {
+        Some(exp) => remaining.min(exp.saturating_sub(now_unix)),
+        None => remaining,
+    };
+    requested.min(max_ttl).min(remaining)
+}
+
+/// A fail-closed refusal when the requested resource is outside the verified principal's authorized
+/// target scope (the Wave-2 scope check). Non-secret; no bytes.
+fn refused_out_of_scope(op: &str, what: &str) -> AuthorityResponse {
+    tracing::warn!(
+        op,
+        what,
+        "[privsep] authority REFUSED: requested resource is outside the verified principal's authorized scope (fail-closed, pre-crypto)"
+    );
+    AuthorityResponse::Refused {
+        reason: format!(
+            "{op} refused: the requested {what} is outside the verified principal's authorized scope"
+        ),
+    }
+}
+
+/// A fail-closed refusal when a context has no remaining freshness to bind a bounded (TTL'd) output.
+fn refused_no_freshness(op: &str) -> AuthorityResponse {
+    tracing::warn!(
+        op,
+        "[privsep] authority REFUSED: the context has no remaining freshness to bind a bounded output (fail-closed)"
+    );
+    AuthorityResponse::Refused {
+        reason: format!("{op} refused: the authority context has no remaining freshness"),
+    }
+}
+
+// --- image.signer: sign an image digest for an authorized repo -----------------------------------
+
+/// The domain-separated, length-framed bytes the `image.signer` grammar signs for `(repo, digest)`. The
+/// length prefixes make distinct `(repo, digest)` pairs sign distinct messages regardless of field
+/// widths (the same anti-ambiguity invariant as the S3-ingress HKDF salt), and the `boatramp-image-sign`
+/// domain tag separates these bytes from any COSE `ToBeSigned` so a dedicated image key signs only
+/// images (and could not be confused even if the key were ever shared).
+fn image_sign_tbs(repo: &str, digest: &str) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"boatramp-image-sign/v1";
+    let mut tbs = Vec::with_capacity(DOMAIN.len() + 8 + repo.len() + digest.len());
+    tbs.extend_from_slice(DOMAIN);
+    tbs.extend_from_slice(&(repo.len() as u32).to_be_bytes());
+    tbs.extend_from_slice(repo.as_bytes());
+    tbs.extend_from_slice(&(digest.len() as u32).to_be_bytes());
+    tbs.extend_from_slice(digest.as_bytes());
+    tbs
+}
+
+/// A light `"<algo>:<hex>"` OCI-digest well-formedness check (defense-in-depth against signing arbitrary
+/// bytes framed as a digest). Accepts `sha256:`/`sha512:` + a lowercase hex body of the right length.
+fn is_wellformed_image_digest(digest: &str) -> bool {
+    let Some((algo, body)) = digest.split_once(':') else {
+        return false;
+    };
+    let expected = match algo {
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => return false,
+    };
+    body.len() == expected && body.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The **`image.signer` serving grammar** (design §3.4 `sign_image(ctx, digest, authorized_repo) -> sig`).
+/// Holds the dedicated image-signing key ([`Signer`]) and produces a DETACHED signature over the
+/// domain-separated `(repo, digest)` message. The signing key is held here and NEVER representable in a
+/// response (type-foreclosed). The load-bearing scope check: `repo` MUST be within the re-validated
+/// principal's authorized target scope ([`scope_target_authorized`]), refused BEFORE any signing — so a
+/// frontend RCE can only sign images for repos the relayed principal is actually scoped to.
+pub struct ImageSignerHandler {
+    /// The image-signing key (never reachable over any link).
+    signer: Arc<dyn Signer>,
+}
+
+impl ImageSignerHandler {
+    /// Build from the image-signing key.
+    #[must_use]
+    pub fn new(signer: Arc<dyn Signer>) -> Self {
+        Self { signer }
+    }
+
+    async fn sign_image(
+        &self,
+        principal: &VerifiedPrincipal,
+        digest: String,
+        repo: String,
+    ) -> AuthorityResponse {
+        // THE SCOPE CHECK: the repo must be within the verified principal's authorized targets, BEFORE
+        // any signing. Fail-closed if the principal holds no matching targeted role.
+        if !scope_target_authorized(principal, &repo) {
+            return refused_out_of_scope("sign_image", "repo");
+        }
+        // Defense-in-depth: refuse a malformed digest rather than sign arbitrary bytes framed as one.
+        if !is_wellformed_image_digest(&digest) {
+            return AuthorityResponse::Refused {
+                reason: "sign_image refused: malformed image digest (expected <algo>:<hex>)"
+                    .to_string(),
+            };
+        }
+        let tbs = image_sign_tbs(&repo, &digest);
+        match self.signer.sign(&tbs).await {
+            Ok(sig) => AuthorityResponse::ImageSigned {
+                signature: hex::encode(sig),
+            },
+            // A signer failure is non-secret; never echo the key-side error verbatim.
+            Err(_) => refused_internal("sign_image", "image signer error"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityHandler for ImageSignerHandler {
+    async fn handle(
+        &self,
+        principal: &VerifiedPrincipal,
+        request: AuthorityRequest,
+        _now_unix: u64,
+    ) -> AuthorityResponse {
+        match request {
+            AuthorityRequest::SignImage { digest, repo } => {
+                self.sign_image(principal, digest, repo).await
+            }
+            other => refused_wrong_kind("image.signer", &other),
+        }
+    }
+
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::ImageSigner)
+    }
+}
+
+// --- overlay.dial-signer: mint a holder-bound dial capability for an authorized scope --------------
+
+/// The **`overlay.dial-signer` serving grammar** (design §3.4 `mint_dial_cap(ctx, holder, scope, ttl≤max)
+/// -> cap`). Holds the dial-cap signing key ([`Signer`]) and mints a holder-bound overlay-dial capability
+/// via [`cose::mint_overlay_dial`]. The signing key is held here and NEVER representable in a response
+/// (type-foreclosed). Scope check: `scope` MUST be within the re-validated principal's authorized target
+/// scope; a `"*"` wildcard is refused (the relayed grammar never mints a wildcard dial — that stays with
+/// the offline operator CLI). The cap TTL is clamped to `max_dial_ttl_secs` ∩ the context's remaining
+/// freshness so an observed near-stale context cannot be amplified into a durable dial cap.
+pub struct DialSignerHandler {
+    /// The dial-capability signing key (the control-plane/fleet root in current compositions).
+    signer: Arc<dyn Signer>,
+    /// The server-side maximum dial-cap TTL (seconds) — e.g. `[overlay] max_dial_ttl_secs`.
+    max_dial_ttl_secs: u64,
+    /// The context freshness max-age (pass the paired [`ContextVerifier`]'s `max_age_secs`).
+    context_max_age_secs: u64,
+}
+
+impl DialSignerHandler {
+    /// Build from the dial-cap signing key + the max dial TTL + the context freshness max-age.
+    #[must_use]
+    pub fn new(signer: Arc<dyn Signer>, max_dial_ttl_secs: u64, context_max_age_secs: u64) -> Self {
+        Self {
+            signer,
+            max_dial_ttl_secs,
+            context_max_age_secs,
+        }
+    }
+
+    async fn mint_dial_cap(
+        &self,
+        principal: &VerifiedPrincipal,
+        holder_pubkey: String,
+        scope: String,
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        // No wildcard / empty scope over the relayed grammar (decision 3).
+        if scope.is_empty() || scope == "*" {
+            return AuthorityResponse::Refused {
+                reason: "mint_dial_cap refused: a wildcard/empty scope is not mintable over the \
+                         relayed authority grammar"
+                    .to_string(),
+            };
+        }
+        // THE SCOPE CHECK: the service scope must be within the principal's authorized targets.
+        if !scope_target_authorized(principal, &scope) {
+            return refused_out_of_scope("mint_dial_cap", "scope");
+        }
+        // The holder is the DIALING CLIENT's own key (the frontend does not hold it) — parse it.
+        let holder = match TokenPublicKey::from_hex(&holder_pubkey) {
+            Ok(h) => h,
+            Err(_) => {
+                return AuthorityResponse::Refused {
+                    reason: "mint_dial_cap refused: malformed holder public key".to_string(),
+                };
+            }
+        };
+        let ttl = clamp_ttl_to_context(
+            ttl_secs,
+            self.max_dial_ttl_secs,
+            self.context_max_age_secs,
+            principal,
+            now_unix,
+        );
+        if ttl == 0 {
+            return refused_no_freshness("mint_dial_cap");
+        }
+        match cose::mint_overlay_dial(&holder, &scope, ttl, now_unix, self.signer.as_ref()).await {
+            Ok(capability) => AuthorityResponse::DialCapMinted { capability },
+            Err(_) => refused_internal("mint_dial_cap", "dial signer error"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityHandler for DialSignerHandler {
+    async fn handle(
+        &self,
+        principal: &VerifiedPrincipal,
+        request: AuthorityRequest,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        match request {
+            AuthorityRequest::MintDialCap {
+                holder_pubkey,
+                scope,
+                ttl_secs,
+            } => {
+                self.mint_dial_cap(principal, holder_pubkey, scope, ttl_secs, now_unix)
+                    .await
+            }
+            other => refused_wrong_kind("overlay.dial-signer", &other),
+        }
+    }
+
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::OverlayDialSigner)
+    }
+}
+
+// --- s3ingress.root: derive a per-credential S3-ingress secret from the HKDF root -----------------
+
+/// The **`s3ingress.root` serving grammar**: derive the per-credential S3-ingress SigV4 secret for an
+/// already-minted, fleet-signed `s3-session` token + its `access_key_id`. Holds the HKDF ROOT
+/// ([`crate::s3_ingress::credential::S3IngressSecret`]) and the fleet PUBLIC verify key (non-secret). The
+/// HKDF root is held here and NEVER representable in a response (type-foreclosed) — only a DERIVED
+/// per-credential secret is returned (decision 5). The scope-bearing session token is a SEPARATE
+/// authority's output (`token.signer`), so this grammar takes it as INPUT, re-verifies it, and refuses
+/// a session whose host-stamped project/site is outside the re-validated principal's authorized target
+/// scope BEFORE deriving — so a frontend RCE can only derive credentials for sessions within the relayed
+/// principal's scope.
+pub struct S3IngressRootHandler {
+    /// The S3-ingress HKDF root (never reachable over any link).
+    secret: Arc<crate::s3_ingress::credential::S3IngressSecret>,
+    /// The fleet PUBLIC key that signed the `s3-session` tokens — non-secret, used to re-verify the
+    /// input session token (recovering its host-stamped scope + `cti`).
+    session_verify_key: TokenPublicKey,
+}
+
+impl S3IngressRootHandler {
+    /// Build from the HKDF root + the fleet public verify key.
+    #[must_use]
+    pub fn new(
+        secret: Arc<crate::s3_ingress::credential::S3IngressSecret>,
+        session_verify_key: TokenPublicKey,
+    ) -> Self {
+        Self {
+            secret,
+            session_verify_key,
+        }
+    }
+
+    async fn derive(
+        &self,
+        principal: &VerifiedPrincipal,
+        session_token: String,
+        access_key_id: String,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        // Re-verify the fleet-signed session token (signature + mandatory exp + kind) — recovers the
+        // host-stamped scope + the `cti` that salts the HKDF. A forged/expired/wrong-kind token refuses.
+        let session =
+            match cose::verify_s3_session(&session_token, &self.session_verify_key, now_unix) {
+                Ok(s) => s,
+                Err(_) => {
+                    return AuthorityResponse::Refused {
+                        reason:
+                            "derive_s3_ingress_secret refused: the session token did not verify"
+                                .to_string(),
+                    };
+                }
+            };
+        // THE SCOPE CHECK: the session's host-stamped `<project>/<site>` must be within the verified
+        // principal's authorized targets (a project role covers its sites), BEFORE any derivation.
+        let target = format!("{}/{}", session.scope.project, session.scope.site);
+        if !scope_target_authorized(principal, &target) {
+            return refused_out_of_scope("derive_s3_ingress_secret", "session scope");
+        }
+        // Derive the per-credential secret bound to (access_key_id, session.cti). Synchronous HKDF.
+        match self.secret.derive_secret(&access_key_id, &session.cti) {
+            Ok(secret_access_key) => {
+                AuthorityResponse::S3IngressSecretDerived { secret_access_key }
+            }
+            Err(_) => refused_internal("derive_s3_ingress_secret", "HKDF derive error"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityHandler for S3IngressRootHandler {
+    async fn handle(
+        &self,
+        principal: &VerifiedPrincipal,
+        request: AuthorityRequest,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        match request {
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token,
+                access_key_id,
+            } => {
+                self.derive(principal, session_token, access_key_id, now_unix)
+                    .await
+            }
+            other => refused_wrong_kind("s3ingress.root", &other),
+        }
+    }
+
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::S3IngressRoot)
+    }
+}
+
+// --- cluster.join-signer: mint a single-use mesh-join token (operator-gated) -----------------------
+
+/// The **`cluster.join-signer` serving grammar**: mint a single-use mesh-join token via
+/// [`cose::mint_join`]. Holds the cluster/auth-root signing key ([`Signer`]) — NEVER representable in a
+/// response (type-foreclosed). **Authorization axis differs from the per-tenant grammars (decision 6):**
+/// cluster join is operator-driven NODE bootstrap, not a tenant-serving relay, so the policy-blind crown
+/// jewel gates on the re-validated principal holding a GLOBAL (targetless) operator role (the configured
+/// `operator_role`), fail-closed otherwise. The TTL is clamped to `max_join_ttl_secs` ∩ the context's
+/// remaining freshness — the monolith `mint_join` path has NO TTL cap, so this grammar adds one
+/// (decision 7).
+pub struct JoinSignerHandler {
+    /// The cluster/auth-root join-token signing key (never reachable over any link).
+    signer: Arc<dyn Signer>,
+    /// The GLOBAL role name a principal must hold to mint a join token (a node-config constant, NOT
+    /// per-tenant policy) — default [`DEFAULT_CLUSTER_OPERATOR_ROLE`].
+    operator_role: String,
+    /// The server-side maximum join-token TTL (seconds) — default [`MAX_JOIN_TOKEN_TTL_SECS`].
+    max_join_ttl_secs: u64,
+    /// The context freshness max-age (pass the paired [`ContextVerifier`]'s `max_age_secs`).
+    context_max_age_secs: u64,
+}
+
+impl JoinSignerHandler {
+    /// Build from the join signing key + the required operator role + the max join TTL + the context
+    /// freshness max-age.
+    #[must_use]
+    pub fn new(
+        signer: Arc<dyn Signer>,
+        operator_role: impl Into<String>,
+        max_join_ttl_secs: u64,
+        context_max_age_secs: u64,
+    ) -> Self {
+        Self {
+            signer,
+            operator_role: operator_role.into(),
+            max_join_ttl_secs,
+            context_max_age_secs,
+        }
+    }
+
+    async fn mint_join_token(
+        &self,
+        principal: &VerifiedPrincipal,
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        // THE OPERATOR GATE (decision 6): require a GLOBAL (targetless) operator role. Join is node-
+        // global, not per-tenant — a targeted role authorizes a tenant, never the cluster. Fail-closed.
+        let is_operator = principal
+            .token()
+            .roles
+            .iter()
+            .any(|r| r.target.is_none() && r.name == self.operator_role);
+        if !is_operator {
+            tracing::warn!(
+                principal = %principal.principal_id(),
+                "[privsep] join-signer REFUSED mint_join_token: the verified principal holds no global operator role (fail-closed)"
+            );
+            return AuthorityResponse::Refused {
+                reason: "mint_join_token refused: the verified principal is not a node operator \
+                         (no global operator role)"
+                    .to_string(),
+            };
+        }
+        let ttl = clamp_ttl_to_context(
+            ttl_secs,
+            self.max_join_ttl_secs,
+            self.context_max_age_secs,
+            principal,
+            now_unix,
+        );
+        if ttl == 0 {
+            return refused_no_freshness("mint_join_token");
+        }
+        match cose::mint_join(ttl, now_unix, self.signer.as_ref()).await {
+            Ok(token) => AuthorityResponse::JoinTokenMinted { token },
+            Err(_) => refused_internal("mint_join_token", "join signer error"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorityHandler for JoinSignerHandler {
+    async fn handle(
+        &self,
+        principal: &VerifiedPrincipal,
+        request: AuthorityRequest,
+        now_unix: u64,
+    ) -> AuthorityResponse {
+        match request {
+            AuthorityRequest::MintJoinToken { ttl_secs } => {
+                self.mint_join_token(principal, ttl_secs, now_unix).await
+            }
+            other => refused_wrong_kind("cluster.join-signer", &other),
+        }
+    }
+
+    fn permits_authority(&self, authority: HostAuthority) -> bool {
+        matches!(authority, HostAuthority::ClusterJoinSigner)
+    }
+}
+
+// =============================================================================
 // The per-capability registry + the hardened receiver-side serve loop
 // =============================================================================
 
@@ -2292,10 +2875,16 @@ impl AuthorityServe<'_> {
                 outcome: AuthorityOutcome::Served,
             });
             let send = self.send(link, &response);
-            // Wipe the transient plaintext copy an `Unsealed` result carries (hygiene, like
-            // `privsep_unseal`) regardless of the send outcome.
-            if let AuthorityResponse::Unsealed { plaintext } = &mut response {
-                zeroize::Zeroize::zeroize(plaintext);
+            // Wipe the transient sensitive copy a result carries (hygiene, like `privsep_unseal`)
+            // regardless of the send outcome: an `Unsealed` plaintext (principal data) or a
+            // `S3IngressSecretDerived` secret (a per-credential SigV4 HMAC key). Neither is the
+            // instance's own key/KEK/root (those are type-foreclosed) — this wipes the derived output.
+            match &mut response {
+                AuthorityResponse::Unsealed { plaintext } => zeroize::Zeroize::zeroize(plaintext),
+                AuthorityResponse::S3IngressSecretDerived { secret_access_key } => {
+                    zeroize::Zeroize::zeroize(secret_access_key);
+                }
+                _ => {}
             }
             send?;
         }
@@ -2423,14 +3012,32 @@ mod tests {
             AuthorityResponse::Sealed { sealed: vec![1] },
             AuthorityResponse::Unsealed { plaintext: vec![2] },
             AuthorityResponse::Minted { token: "t".into() },
+            AuthorityResponse::ImageSigned {
+                signature: "s".into(),
+            },
+            AuthorityResponse::DialCapMinted {
+                capability: "c".into(),
+            },
+            AuthorityResponse::S3IngressSecretDerived {
+                secret_access_key: "k".into(),
+            },
+            AuthorityResponse::JoinTokenMinted { token: "j".into() },
             AuthorityResponse::Refused { reason: "x".into() },
         ] {
             match resp {
-                // Each arm affirms: a bounded-op RESULT, never the instance's key/KEK/seed.
+                // Each arm affirms: a bounded-op RESULT, never the instance's key/KEK/seed/root.
                 AuthorityResponse::Pong { witness: _ } => {} // round-trip witness only
                 AuthorityResponse::Sealed { sealed: _ } => {} // ciphertext (not the KEK)
                 AuthorityResponse::Unsealed { plaintext: _ } => {} // principal data (not the KEK)
                 AuthorityResponse::Minted { token: _ } => {} // a token (not the signing key)
+                AuthorityResponse::ImageSigned { signature: _ } => {} // a signature (not the image key)
+                AuthorityResponse::DialCapMinted { capability: _ } => {} // a dial cap (not the signing key)
+                // a DERIVED per-credential secret scoped to the principal — NOT the HKDF ROOT
+                // (`s3ingress.root`'s own key, which no variant can carry). See DESIGN decision 5.
+                AuthorityResponse::S3IngressSecretDerived {
+                    secret_access_key: _,
+                } => {}
+                AuthorityResponse::JoinTokenMinted { token: _ } => {} // a join token (not the signing key)
                 AuthorityResponse::Refused { reason: _ } => {} // a non-secret reason, no bytes
             }
         }
@@ -3382,6 +3989,617 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- Wave-2 grammars: image.signer / overlay.dial-signer / s3ingress.root / cluster.join-signer ----
+
+    /// A verified principal carrying `roles` with explicit `iat`/`exp` (the Wave-2 resource grammars key
+    /// on role TARGETS, not the subject; the subject is a stable throwaway).
+    fn principal_roles(roles: Vec<GrantedRole>, iat: u64, exp: u64) -> VerifiedPrincipal {
+        principal_with_subject("op", roles, iat, exp)
+    }
+
+    // --- image.signer ---
+
+    #[test]
+    fn image_signer_signs_for_an_authorized_repo_and_refuses_others() {
+        let now = 1_000;
+        let key = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = key.public_key();
+        let handler = ImageSignerHandler::new(Arc::new(key));
+        let digest = format!("sha256:{}", "ab".repeat(32)); // 64 hex chars
+        // Authorized: the principal holds a role targeting the repo.
+        let p = principal_roles(
+            vec![GrantedRole::scoped("publisher", "myproj/site")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::SignImage {
+                digest: digest.clone(),
+                repo: "myproj/site".into(),
+            },
+            now,
+        ));
+        let AuthorityResponse::ImageSigned { signature } = out else {
+            panic!("expected ImageSigned, got {out:?}");
+        };
+        // The detached signature verifies against the image key over the domain-separated message.
+        let sig = hex::decode(&signature).unwrap();
+        pubkey
+            .verify(&image_sign_tbs("myproj/site", &digest), &sig)
+            .expect("the detached image signature verifies against the image key");
+        // A repo OUTSIDE the principal's scope is refused (pre-signing).
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::SignImage {
+                digest,
+                repo: "other/site".into(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "an out-of-scope repo must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_signer_fail_closed_when_targetless() {
+        let now = 1_000;
+        let handler = ImageSignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let digest = format!("sha256:{}", "cd".repeat(32));
+        // ONLY a global (targetless) role ⇒ authorizes no target (fail-closed).
+        let p = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::SignImage {
+                digest,
+                repo: "myproj/site".into(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a targetless principal signs nothing (fail-closed), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_signer_refuses_a_malformed_digest() {
+        let now = 1_000;
+        let handler = ImageSignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let p = principal_roles(
+            vec![GrantedRole::scoped("publisher", "myproj/site")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::SignImage {
+                digest: "not-a-digest".into(),
+                repo: "myproj/site".into(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a malformed digest must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_signer_kind_gates() {
+        let now = 1_000;
+        let handler = ImageSignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        let p = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintToken {
+                requested_roles: vec![],
+                ttl_secs: 60,
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a mint_token sent to the image signer is refused, got {out:?}"
+        );
+    }
+
+    // --- overlay.dial-signer ---
+
+    #[test]
+    fn dial_signer_mints_for_an_authorized_scope_and_binds_the_holder() {
+        let now = 1_000;
+        let key = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = key.public_key();
+        let handler = DialSignerHandler::new(Arc::new(key), 3600, DEFAULT_CONTEXT_MAX_AGE_SECS);
+        let holder = LocalSigner::generate(TokenAlg::Ed25519).public_key();
+        let p = principal_roles(
+            vec![GrantedRole::scoped("overlay", "svc/db")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintDialCap {
+                holder_pubkey: holder.to_hex(),
+                scope: "svc/db".into(),
+                ttl_secs: 300,
+            },
+            now,
+        ));
+        let AuthorityResponse::DialCapMinted { capability } = out else {
+            panic!("expected DialCapMinted, got {out:?}");
+        };
+        // The minted cap verifies against the dial signer key, bound to the holder + scope.
+        let v = cose::verify_overlay_dial(&capability, &pubkey, now + 1)
+            .expect("the dial cap verifies against the dial signer key");
+        assert_eq!(v.scope, "svc/db");
+        assert_eq!(v.holder, holder.to_hex());
+    }
+
+    #[test]
+    fn dial_signer_refuses_scope_outside_principal_and_wildcard() {
+        let now = 1_000;
+        let handler = DialSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            3600,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        let holder = LocalSigner::generate(TokenAlg::Ed25519)
+            .public_key()
+            .to_hex();
+        let p = principal_roles(
+            vec![GrantedRole::scoped("overlay", "svc/db")],
+            now,
+            now + 1_000,
+        );
+        // A scope the principal has no role for is refused.
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintDialCap {
+                holder_pubkey: holder.clone(),
+                scope: "svc/other".into(),
+                ttl_secs: 300,
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "an out-of-scope dial must refuse, got {out:?}"
+        );
+        // A wildcard scope is refused even for a scoped principal (decision 3).
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintDialCap {
+                holder_pubkey: holder,
+                scope: "*".into(),
+                ttl_secs: 300,
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a wildcard dial must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn dial_signer_clamps_ttl_to_context_freshness() {
+        let max_age = 120;
+        let iat = 1_000;
+        let now = iat + 100; // only 20s of context freshness remain
+        let key = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = key.public_key();
+        let handler = DialSignerHandler::new(Arc::new(key), 3600, max_age);
+        let p = principal_roles(
+            vec![GrantedRole::scoped("overlay", "svc/db")],
+            iat,
+            iat + 1_000_000,
+        );
+        let holder = LocalSigner::generate(TokenAlg::Ed25519)
+            .public_key()
+            .to_hex();
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintDialCap {
+                holder_pubkey: holder,
+                scope: "svc/db".into(),
+                ttl_secs: 3600, // asks for an hour...
+            },
+            now,
+        ));
+        let AuthorityResponse::DialCapMinted { capability } = out else {
+            panic!("got {out:?}");
+        };
+        // ...but the cap expires at ~now+20 (the remaining freshness), not now+3600.
+        assert!(
+            cose::verify_overlay_dial(&capability, &pubkey, now + 19).is_ok(),
+            "valid within the remaining freshness"
+        );
+        assert!(
+            cose::verify_overlay_dial(&capability, &pubkey, now + 25).is_err(),
+            "expired past the remaining freshness"
+        );
+    }
+
+    #[test]
+    fn dial_signer_kind_gates() {
+        let now = 1_000;
+        let handler = DialSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            3600,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        let p = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintToken {
+                requested_roles: vec![],
+                ttl_secs: 60,
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "got {out:?}"
+        );
+    }
+
+    // --- s3ingress.root ---
+
+    fn s3_scope(project: &str, site: &str) -> boatramp_core::cose::S3SessionScope {
+        use boatramp_core::cose::{S3Constraints, S3Perm, S3SessionScope, S3Target};
+        S3SessionScope {
+            project: project.into(),
+            site: site.into(),
+            container: "c".into(),
+            target: S3Target::Prefix("uploads/".into()),
+            perms: vec![S3Perm::Put],
+            constraints: S3Constraints::default(),
+        }
+    }
+
+    #[test]
+    fn s3_ingress_derives_for_an_authorized_session_and_refuses_others() {
+        use crate::s3_ingress::credential::S3IngressSecret;
+        let now = 1_000;
+        let fleet = LocalSigner::generate(TokenAlg::Es256);
+        let fleet_pub = fleet.public_key();
+        let secret = Arc::new(S3IngressSecret::new([5u8; 32]));
+        let handler = S3IngressRootHandler::new(secret.clone(), fleet_pub.clone());
+        let token = runtime()
+            .block_on(cose::mint_s3_session(
+                &s3_scope("proj", "site"),
+                300,
+                now,
+                &fleet,
+            ))
+            .unwrap();
+        let session = cose::verify_s3_session(&token, &fleet_pub, now + 1).unwrap();
+        let akid = "BRUPTESTACCESSKEYID0";
+        // Authorized: the principal is scoped to proj/site.
+        let p = principal_roles(
+            vec![GrantedRole::scoped("publisher", "proj/site")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token: token.clone(),
+                access_key_id: akid.into(),
+            },
+            now + 1,
+        ));
+        let AuthorityResponse::S3IngressSecretDerived { secret_access_key } = out else {
+            panic!("expected S3IngressSecretDerived, got {out:?}");
+        };
+        // The derived secret is exactly what the HKDF root derives for (akid, cti).
+        assert_eq!(
+            secret_access_key,
+            secret.derive_secret(akid, &session.cti).unwrap(),
+            "derived secret must match the HKDF root for (access_key_id, session.cti)"
+        );
+        // A principal scoped ELSEWHERE cannot derive for this session (scope refusal pre-crypto).
+        let other = principal_roles(
+            vec![GrantedRole::scoped("publisher", "other/site")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &other,
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token: token,
+                access_key_id: akid.into(),
+            },
+            now + 1,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a session outside the principal's scope must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn s3_ingress_project_role_covers_the_site_and_targetless_fails_closed() {
+        use crate::s3_ingress::credential::S3IngressSecret;
+        let now = 1_000;
+        let fleet = LocalSigner::generate(TokenAlg::Es256);
+        let fleet_pub = fleet.public_key();
+        let handler =
+            S3IngressRootHandler::new(Arc::new(S3IngressSecret::new([6u8; 32])), fleet_pub.clone());
+        let token = runtime()
+            .block_on(cose::mint_s3_session(
+                &s3_scope("proj", "site"),
+                300,
+                now,
+                &fleet,
+            ))
+            .unwrap();
+        // A bare PROJECT role covers any <project>/<site> under it (ProjectWildcard).
+        let proj = principal_roles(
+            vec![GrantedRole::scoped("publisher", "proj")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &proj,
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token: token.clone(),
+                access_key_id: "BRUPX".into(),
+            },
+            now + 1,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::S3IngressSecretDerived { .. }),
+            "a project role must cover its site, got {out:?}"
+        );
+        // A targetless (global) role authorizes nothing (fail-closed).
+        let global = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &global,
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token: token,
+                access_key_id: "BRUPX".into(),
+            },
+            now + 1,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a targetless principal derives nothing (fail-closed), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn s3_ingress_refuses_a_forged_session_token() {
+        use crate::s3_ingress::credential::S3IngressSecret;
+        let now = 1_000;
+        let fleet = LocalSigner::generate(TokenAlg::Es256);
+        let attacker = LocalSigner::generate(TokenAlg::Es256);
+        // The handler trusts `fleet`'s public key, but the session is signed by `attacker`.
+        let handler = S3IngressRootHandler::new(
+            Arc::new(S3IngressSecret::new([7u8; 32])),
+            fleet.public_key(),
+        );
+        let forged = runtime()
+            .block_on(cose::mint_s3_session(
+                &s3_scope("proj", "site"),
+                300,
+                now,
+                &attacker,
+            ))
+            .unwrap();
+        let p = principal_roles(
+            vec![GrantedRole::scoped("publisher", "proj/site")],
+            now,
+            now + 1_000,
+        );
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::DeriveS3IngressSecret {
+                session_token: forged,
+                access_key_id: "BRUPX".into(),
+            },
+            now + 1,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a session token not signed by the trusted fleet key must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn s3_ingress_kind_gates() {
+        use crate::s3_ingress::credential::S3IngressSecret;
+        let now = 1_000;
+        let handler = S3IngressRootHandler::new(
+            Arc::new(S3IngressSecret::new([8u8; 32])),
+            LocalSigner::generate(TokenAlg::Es256).public_key(),
+        );
+        let p = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintToken {
+                requested_roles: vec![],
+                ttl_secs: 60,
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "got {out:?}"
+        );
+    }
+
+    // --- cluster.join-signer ---
+
+    #[test]
+    fn join_signer_mints_for_a_global_operator_and_refuses_non_operators() {
+        let now = 1_000;
+        let key = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = key.public_key();
+        let handler = JoinSignerHandler::new(
+            Arc::new(key),
+            DEFAULT_CLUSTER_OPERATOR_ROLE,
+            MAX_JOIN_TOKEN_TTL_SECS,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        // A GLOBAL admin principal is a node operator.
+        let op = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &op,
+            AuthorityRequest::MintJoinToken { ttl_secs: 300 },
+            now,
+        ));
+        let AuthorityResponse::JoinTokenMinted { token } = out else {
+            panic!("expected JoinTokenMinted, got {out:?}");
+        };
+        cose::verify_join(&token, &pubkey, now + 1)
+            .expect("the join token verifies against the signer key");
+        // A non-operator (viewer) is refused.
+        let viewer = principal_roles(vec![role("viewer")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &viewer,
+            AuthorityRequest::MintJoinToken { ttl_secs: 300 },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a non-operator must refuse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn join_signer_refuses_a_targeted_operator_role() {
+        // A SCOPED admin (admin@proj) is NOT a node operator — join is node-global, not per-tenant.
+        let now = 1_000;
+        let handler = JoinSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CLUSTER_OPERATOR_ROLE,
+            MAX_JOIN_TOKEN_TTL_SECS,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        let p = principal_roles(vec![GrantedRole::scoped("admin", "proj")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::MintJoinToken { ttl_secs: 300 },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "a target-scoped admin is not a node operator (fail-closed), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn join_signer_clamps_ttl_to_context_freshness() {
+        let max_age = 120;
+        let iat = 1_000;
+        let now = iat + 100; // only 20s remain
+        let key = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = key.public_key();
+        let handler = JoinSignerHandler::new(
+            Arc::new(key),
+            DEFAULT_CLUSTER_OPERATOR_ROLE,
+            MAX_JOIN_TOKEN_TTL_SECS,
+            max_age,
+        );
+        let op = principal_roles(vec![role("admin")], iat, iat + 1_000_000);
+        let out = runtime().block_on(handler.handle(
+            &op,
+            AuthorityRequest::MintJoinToken { ttl_secs: 3600 },
+            now,
+        ));
+        let AuthorityResponse::JoinTokenMinted { token } = out else {
+            panic!("got {out:?}");
+        };
+        assert!(cose::verify_join(&token, &pubkey, now + 19).is_ok());
+        assert!(
+            cose::verify_join(&token, &pubkey, now + 25).is_err(),
+            "clamped to the remaining context freshness"
+        );
+    }
+
+    #[test]
+    fn join_signer_kind_gates() {
+        let now = 1_000;
+        let handler = JoinSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CLUSTER_OPERATOR_ROLE,
+            MAX_JOIN_TOKEN_TTL_SECS,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        let p = principal_roles(vec![role("admin")], now, now + 1_000);
+        let out = runtime().block_on(handler.handle(
+            &p,
+            AuthorityRequest::Seal {
+                plaintext: b"x".to_vec(),
+            },
+            now,
+        ));
+        assert!(
+            matches!(out, AuthorityResponse::Refused { .. }),
+            "got {out:?}"
+        );
+    }
+
+    // --- the Wave-2 handlers permit only their own authority + checked registration ---
+
+    #[test]
+    fn wave2_handlers_permit_only_their_own_authority() {
+        let img = ImageSignerHandler::new(Arc::new(LocalSigner::generate(TokenAlg::Es256)));
+        assert!(img.permits_authority(HostAuthority::ImageSigner));
+        assert!(!img.permits_authority(HostAuthority::TokenSigner));
+        let dial = DialSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            3600,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        assert!(dial.permits_authority(HostAuthority::OverlayDialSigner));
+        assert!(!dial.permits_authority(HostAuthority::ImageSigner));
+        let s3 = S3IngressRootHandler::new(
+            Arc::new(crate::s3_ingress::credential::S3IngressSecret::new(
+                [1u8; 32],
+            )),
+            LocalSigner::generate(TokenAlg::Es256).public_key(),
+        );
+        assert!(s3.permits_authority(HostAuthority::S3IngressRoot));
+        assert!(!s3.permits_authority(HostAuthority::ClusterJoinSigner));
+        let join = JoinSignerHandler::new(
+            Arc::new(LocalSigner::generate(TokenAlg::Es256)),
+            DEFAULT_CLUSTER_OPERATOR_ROLE,
+            MAX_JOIN_TOKEN_TTL_SECS,
+            DEFAULT_CONTEXT_MAX_AGE_SECS,
+        );
+        assert!(join.permits_authority(HostAuthority::ClusterJoinSigner));
+        assert!(!join.permits_authority(HostAuthority::S3IngressRoot));
+    }
+
+    #[test]
+    fn wave2_registration_is_kind_gated() {
+        let mut reg = AuthorityRegistry::new();
+        // Registering the image handler under the join authority is a composition bug — refused.
+        let err = reg
+            .register(
+                HostAuthority::ClusterJoinSigner,
+                Arc::new(ImageSignerHandler::new(Arc::new(LocalSigner::generate(
+                    TokenAlg::Es256,
+                )))),
+            )
+            .unwrap_err();
+        assert!(err.contains("does not"), "got {err}");
+        // The correct registration is accepted.
+        reg.register(
+            HostAuthority::ImageSigner,
+            Arc::new(ImageSignerHandler::new(Arc::new(LocalSigner::generate(
+                TokenAlg::Es256,
+            )))),
+        )
+        .expect("the image handler registers under its own authority");
+    }
+
     // ---- end-to-end over a real socketpair (unix) ----
 
     #[cfg(unix)]
@@ -3895,6 +5113,281 @@ mod tests {
             drop(client_end);
             server.join().unwrap().expect("clean end");
             assert_eq!(audit.drain()[0].outcome, AuthorityOutcome::Revoked);
+        }
+
+        // ---- Wave-2 grammars over a real socketpair (success + a scope/operator refusal each) ----
+
+        #[test]
+        fn image_signer_grammar_round_trips_over_the_wire() {
+            let now = 2_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let img_key = LocalSigner::generate(TokenAlg::Es256);
+            let img_pub = img_key.public_key();
+            let mut reg = AuthorityRegistry::new();
+            reg.register(
+                HostAuthority::ImageSigner,
+                Arc::new(ImageSignerHandler::new(Arc::new(img_key))),
+            )
+            .unwrap();
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(reg),
+                Arc::new(Unlimited),
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+            let digest = format!("sha256:{}", "ab".repeat(32));
+            // SUCCESS: the principal is scoped to the repo; the detached signature verifies.
+            let ok = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("publisher", "proj/site")],
+                AuthorityRequest::SignImage {
+                    digest: digest.clone(),
+                    repo: "proj/site".into(),
+                },
+            );
+            let resp = client_end
+                .relay(&ok)
+                .expect("the sign_image call round-trips");
+            let AuthorityResponse::ImageSigned { signature } = resp else {
+                panic!("expected ImageSigned, got {resp:?}");
+            };
+            img_pub
+                .verify(
+                    &image_sign_tbs("proj/site", &digest),
+                    &hex::decode(&signature).unwrap(),
+                )
+                .expect("the detached signature verifies against the image key");
+            // REFUSAL: an out-of-scope repo.
+            let bad = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("publisher", "proj/site")],
+                AuthorityRequest::SignImage {
+                    digest,
+                    repo: "other/site".into(),
+                },
+            );
+            assert!(matches!(
+                client_end.relay(&bad).expect("carried"),
+                AuthorityResponse::Refused { .. }
+            ));
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+        }
+
+        #[test]
+        fn dial_signer_grammar_round_trips_over_the_wire() {
+            let now = 2_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let dial_key = LocalSigner::generate(TokenAlg::Es256);
+            let dial_pub = dial_key.public_key();
+            let mut reg = AuthorityRegistry::new();
+            reg.register(
+                HostAuthority::OverlayDialSigner,
+                Arc::new(DialSignerHandler::new(
+                    Arc::new(dial_key),
+                    3600,
+                    DEFAULT_CONTEXT_MAX_AGE_SECS,
+                )),
+            )
+            .unwrap();
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(reg),
+                Arc::new(Unlimited),
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+            let dial_holder = LocalSigner::generate(TokenAlg::Ed25519).public_key();
+            // SUCCESS: scoped to the service; the cap verifies, bound to the holder + scope.
+            let ok = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("overlay", "svc/db")],
+                AuthorityRequest::MintDialCap {
+                    holder_pubkey: dial_holder.to_hex(),
+                    scope: "svc/db".into(),
+                    ttl_secs: 120,
+                },
+            );
+            let resp = client_end
+                .relay(&ok)
+                .expect("the mint_dial_cap call round-trips");
+            let AuthorityResponse::DialCapMinted { capability } = resp else {
+                panic!("expected DialCapMinted, got {resp:?}");
+            };
+            let v = cose::verify_overlay_dial(&capability, &dial_pub, now + 2)
+                .expect("the dial cap verifies against the dial signer key");
+            assert_eq!(v.scope, "svc/db");
+            assert_eq!(v.holder, dial_holder.to_hex());
+            // REFUSAL: a scope the principal is not granted.
+            let bad = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("overlay", "svc/db")],
+                AuthorityRequest::MintDialCap {
+                    holder_pubkey: dial_holder.to_hex(),
+                    scope: "svc/secret".into(),
+                    ttl_secs: 120,
+                },
+            );
+            assert!(matches!(
+                client_end.relay(&bad).expect("carried"),
+                AuthorityResponse::Refused { .. }
+            ));
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+        }
+
+        #[test]
+        fn s3_ingress_grammar_round_trips_over_the_wire() {
+            use crate::s3_ingress::credential::S3IngressSecret;
+            let now = 2_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let fleet = LocalSigner::generate(TokenAlg::Es256);
+            let fleet_pub = fleet.public_key();
+            let secret = Arc::new(S3IngressSecret::new([3u8; 32]));
+            let mut reg = AuthorityRegistry::new();
+            reg.register(
+                HostAuthority::S3IngressRoot,
+                Arc::new(S3IngressRootHandler::new(secret.clone(), fleet_pub.clone())),
+            )
+            .unwrap();
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(reg),
+                Arc::new(Unlimited),
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+            let token = runtime()
+                .block_on(cose::mint_s3_session(
+                    &s3_scope("proj", "site"),
+                    300,
+                    now,
+                    &fleet,
+                ))
+                .unwrap();
+            let session = cose::verify_s3_session(&token, &fleet_pub, now + 1).unwrap();
+            let akid = "BRUPWIREACCESSKEY";
+            // SUCCESS: scoped to the session's project/site; derived secret matches the HKDF root.
+            let ok = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("publisher", "proj/site")],
+                AuthorityRequest::DeriveS3IngressSecret {
+                    session_token: token.clone(),
+                    access_key_id: akid.into(),
+                },
+            );
+            let resp = client_end.relay(&ok).expect("the derive call round-trips");
+            let AuthorityResponse::S3IngressSecretDerived { secret_access_key } = resp else {
+                panic!("expected S3IngressSecretDerived, got {resp:?}");
+            };
+            assert_eq!(
+                secret_access_key,
+                secret.derive_secret(akid, &session.cti).unwrap()
+            );
+            // REFUSAL: a principal scoped elsewhere cannot derive for this session.
+            let bad = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![GrantedRole::scoped("publisher", "elsewhere/site")],
+                AuthorityRequest::DeriveS3IngressSecret {
+                    session_token: token,
+                    access_key_id: akid.into(),
+                },
+            );
+            assert!(matches!(
+                client_end.relay(&bad).expect("carried"),
+                AuthorityResponse::Refused { .. }
+            ));
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
+        }
+
+        #[test]
+        fn join_signer_grammar_round_trips_over_the_wire() {
+            let now = 2_000;
+            let root = LocalSigner::generate(TokenAlg::Es256);
+            let holder = LocalSigner::generate(TokenAlg::Es256);
+            let join_key = LocalSigner::generate(TokenAlg::Es256);
+            let join_pub = join_key.public_key();
+            let mut reg = AuthorityRegistry::new();
+            reg.register(
+                HostAuthority::ClusterJoinSigner,
+                Arc::new(JoinSignerHandler::new(
+                    Arc::new(join_key),
+                    DEFAULT_CLUSTER_OPERATOR_ROLE,
+                    MAX_JOIN_TOKEN_TTL_SECS,
+                    DEFAULT_CONTEXT_MAX_AGE_SECS,
+                )),
+            )
+            .unwrap();
+            let (server_end, client_end) = LinkEndpoint::socketpair().unwrap();
+            let server = spawn_server(
+                server_end,
+                ContextVerifier::new(root.public_key()),
+                Arc::new(reg),
+                Arc::new(Unlimited),
+                Arc::new(CollectingAudit::default()),
+                now + 1,
+            );
+            // SUCCESS: a GLOBAL admin operator; the join token verifies.
+            let ok = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![role("admin")],
+                AuthorityRequest::MintJoinToken { ttl_secs: 120 },
+            );
+            let resp = client_end
+                .relay(&ok)
+                .expect("the mint_join_token call round-trips");
+            let AuthorityResponse::JoinTokenMinted { token } = resp else {
+                panic!("expected JoinTokenMinted, got {resp:?}");
+            };
+            cose::verify_join(&token, &join_pub, now + 2)
+                .expect("the join token verifies against the join signer key");
+            // REFUSAL: a non-operator principal (viewer).
+            let bad = signed_call(
+                &root,
+                &holder,
+                now,
+                Some(300),
+                vec![role("viewer")],
+                AuthorityRequest::MintJoinToken { ttl_secs: 120 },
+            );
+            assert!(matches!(
+                client_end.relay(&bad).expect("carried"),
+                AuthorityResponse::Refused { .. }
+            ));
+            drop(client_end);
+            server.join().unwrap().expect("clean end");
         }
     }
 }
