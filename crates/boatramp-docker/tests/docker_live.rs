@@ -721,3 +721,292 @@ async fn docker_ephemeral_reaches_default_bridge_db_when_dual_attached() {
          primary)"
     );
 }
+
+/// The **managed-DB alias UPGRADE auto-heal** live gate (Bug D, upgrade path — the fix on this
+/// branch). v0.57.0's [`managed_db_alias`] publishes a short (≤ 63-octet) network alias for a long
+/// managed-DB workload name, which is correct for FRESH deployments. But a managed DB created
+/// BEFORE that fix kept its OLD raw (~69-octet) `--network-alias`; the v0.57.0 reconcile recreated
+/// the CONSUMER (its DSN host changed → spec change) but NOT the PRODUCER PG (its spec is
+/// unchanged), so the producer kept answering only its old long name while the consumer dialed the
+/// new short one → NXDOMAIN. simertec hit this live on Docker 29.9.1 (recreating both by hand fixed
+/// it).
+///
+/// The fix adds a SECOND auto-heal to [`ComputeBackend::needs_redeploy`]: a container that is
+/// primary on the per-project net but whose live DNS alias
+/// (`NetworkSettings.Networks.<net>.Aliases`) does NOT contain the current
+/// `managed_db_alias(workload)` is reported as needing a recreate, so the producer re-launches with
+/// the current short alias on upgrade with NO manual recreate.
+///
+/// This gate reproduces the pre-fix → post-fix UPGRADE end-to-end against a real daemon:
+///
+/// 1. A "pre-fix" managed-DB producer is created DIRECTLY via the Engine API, mirroring `launch`'s
+///    create (primary on the per-project net, a busybox-`nc` listener) but with its endpoint
+///    `--network-alias` set to the RAW LONG workload name (> 63 octets) instead of the short
+///    `managed_db_alias` the current `launch` would publish — the exact pre-fix on-wire state.
+/// 2. `needs_redeploy` MUST report `true` for it: it is primary on the net (so the net-mismatch heal
+///    does not fire) but advertises a STALE long alias, not the current short one. BEFORE the fix
+///    this returned `false` (the producer's spec is unchanged → never recreated → stays on the long
+///    alias → the consumer's short-alias lookup NXDOMAINs); that `false`→`true` flip is simertec's
+///    live failure, caught.
+/// 3. The reconcile heal is driven (stop + `launch`), then three things are asserted: (a) the
+///    recreated container's LIVE alias on the project net now CONTAINS `managed_db_alias(workload)`
+///    (the short one), (b) a sibling resolves + reaches it by that short alias (`nc <short> 8080`),
+///    and (c) `needs_redeploy` now returns `false` — idempotent, so the reconcile does not churn.
+///
+/// Version independence: the recreate TRIGGER (stale-alias detection via `inspect`) is
+/// Docker-version-agnostic, so Docker 28 validates it too; the gate deliberately does NOT assert
+/// the long name fails to resolve (that > 63-octet DNS-registration symptom is Docker-29-specific).
+/// It asserts the TRIGGER + the re-aliasing + idempotency — the parts the fix owns.
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final marker, printed
+/// ONLY after every assertion holds.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   alias_upgrade_heal -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_upgrade() {
+    use std::collections::HashMap;
+
+    use boatramp_core::compute::{
+        DNS_LABEL_MAX_LEN, Instance, InstanceHandle, compute_instance_id, is_valid_dns_label,
+        managed_db_alias,
+    };
+    use boatramp_docker::project_network_name;
+    use bollard::Docker;
+    use bollard::container::{
+        Config as BollardConfig, CreateContainerOptions, NetworkingConfig, RemoveContainerOptions,
+    };
+    use bollard::image::CreateImageOptions;
+    use bollard::models::{EndpointSettings, HostConfig};
+    use futures::StreamExt;
+
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+    let backend = DockerBackend::connect().expect("connect to docker");
+    let docker = Docker::connect_with_local_defaults().expect("raw docker client");
+
+    async fn launch(
+        backend: &DockerBackend,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> Instance {
+        let artifact = backend
+            .materialize(project, workload, spec, None)
+            .await
+            .expect("materialize");
+        let req = LaunchRequest {
+            project: project.into(),
+            workload: workload.into(),
+            replica: 0,
+            spec: spec.clone(),
+            artifact,
+        };
+        backend.launch(&req).await.expect("launch")
+    }
+
+    let project = "aliasheal";
+    let project_net = project_network_name(project);
+
+    // A RAW managed-DB-shaped PRODUCER workload name OVER 63 octets (two 25-char digests), so its
+    // current alias is the SHORT hash — distinct from the raw name. This is the shape that kept a
+    // long `--network-alias` across the pre-fix era.
+    let h = "abcdefghijklmnopqrstuvwxy"; // 25 base-36 chars
+    let db_workload = format!("bramp-db-{h}-aliasheal_{h}");
+    assert!(
+        db_workload.len() > DNS_LABEL_MAX_LEN,
+        "fixture must exceed the 63-octet DNS label cap: {} octets",
+        db_workload.len()
+    );
+    let short_alias = managed_db_alias(&db_workload); // what the CURRENT launch publishes
+    assert!(
+        is_valid_dns_label(&short_alias) && short_alias.len() <= DNS_LABEL_MAX_LEN,
+        "the current alias must be a valid DNS label: {short_alias}"
+    );
+    assert_ne!(
+        short_alias, db_workload,
+        "the short alias must differ from the raw long name (else there is nothing to heal)"
+    );
+
+    // Launch the sibling CONSUMER first — this create-if-absents the per-project network and pulls
+    // the image, so the pre-fix producer we create by hand can attach to an existing network.
+    let app = launch(&backend, project, "app", &client_spec()).await;
+
+    // Belt-and-braces image pull for the raw-created producer (idempotent; `app`'s materialize
+    // already pulled it).
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: "alpine".to_string(),
+            tag: "3.20".to_string(),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(step) = pull.next().await {
+        step.expect("pull alpine:3.20 for the pre-fix producer");
+    }
+
+    // (1) Create the PRE-FIX producer DIRECTLY, mirroring `launch`'s create (primary on the
+    //     per-project net, a busybox-`nc` listener serving HEAL on :8080) BUT with the endpoint
+    //     `--network-alias` set to the RAW LONG workload name — the exact pre-fix on-wire state a
+    //     v0.57.0 upgrade would leave the producer in. The container name is the SAME one `launch`
+    //     derives, so the reconcile's stop + relaunch targets this very container.
+    let db_name = format!("boatramp-{}", compute_instance_id(project, &db_workload, 0));
+    let _ = docker
+        .remove_container(
+            &db_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let stale_endpoint = EndpointSettings {
+        // THE PRE-FIX STATE: the long raw workload name, not the short managed_db_alias.
+        aliases: Some(vec![db_workload.clone()]),
+        ..Default::default()
+    };
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: db_name.clone(),
+                platform: None,
+            }),
+            BollardConfig {
+                image: Some("alpine:3.20".to_string()),
+                cmd: Some(vec![
+                    "nc".into(),
+                    "-lk".into(),
+                    "-p".into(),
+                    "8080".into(),
+                    "-e".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    "printf HEAL".into(),
+                ]),
+                host_config: Some(HostConfig {
+                    // Primary on the per-project net, exactly like `launch`.
+                    network_mode: Some(project_net.clone()),
+                    ..Default::default()
+                }),
+                networking_config: Some(NetworkingConfig {
+                    endpoints_config: HashMap::from([(project_net.clone(), stale_endpoint)]),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create pre-fix producer with a STALE long alias");
+    docker
+        .start_container::<String>(&db_name, None)
+        .await
+        .expect("start pre-fix producer");
+
+    // The handle the deploy store would hold for this producer (backend_ref decodes to the
+    // container name; the ip:port is unused by `needs_redeploy`).
+    let db_handle = InstanceHandle {
+        project: project.into(),
+        workload: db_workload.clone(),
+        replica: 0,
+        backend_ref: format!("{db_name}@127.0.0.1:0"),
+    };
+
+    // (2) THE TRIGGER. The producer is primary on the per-project net (so the net-mismatch heal does
+    //     NOT fire) but advertises the STALE long alias, not the current short one → recreate.
+    //     MUTATION SENSE: BEFORE the fix, `needs_redeploy` had ONLY the net-mismatch check, so this
+    //     was `false` (the producer's spec is unchanged → never recreated → keeps the long alias →
+    //     the consumer's short-alias DSN lookup NXDOMAINs). That is simertec's live failure.
+    assert!(
+        backend.needs_redeploy(&db_handle, &server_spec("HEAL")).await,
+        "a producer primary on the project net but carrying a STALE long alias ({db_workload}) \
+         instead of the current short alias ({short_alias}) MUST be flagged for recreate — \
+         before the fix this was false and the upgrade left the producer unresolvable"
+    );
+
+    // (3) Drive the reconcile heal the same way the reconcile emits it: Stop then Launch. `launch`
+    //     re-creates the producer with the CURRENT short alias.
+    let _ = backend.stop(&db_handle).await;
+    let db_healed = launch(&backend, project, &db_workload, &server_spec("HEAL")).await;
+
+    // (3a) The recreated producer's LIVE alias on the project net now CONTAINS the short alias
+    //      (Docker also lists the short container id among the aliases, so assert containment).
+    let info = docker
+        .inspect_container(&db_name, None)
+        .await
+        .expect("inspect healed producer");
+    let live_aliases: Vec<String> = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .and_then(|nets| nets.get(&project_net))
+        .and_then(|ep| ep.aliases.clone())
+        .unwrap_or_default();
+    assert!(
+        live_aliases.iter().any(|a| a == &short_alias),
+        "the healed producer must advertise the CURRENT short alias {short_alias} on {project_net}; \
+         live aliases were {live_aliases:?}"
+    );
+    assert!(
+        !live_aliases.iter().any(|a| a == &db_workload),
+        "the healed producer must no longer advertise the stale long alias {db_workload}; \
+         live aliases were {live_aliases:?}"
+    );
+
+    // (3b) The sibling resolves + reaches the healed producer BY ITS SHORT ALIAS (the same label a
+    //      consumer's DSN host resolves). `nc <short> 8080` exercises resolution + TCP connect;
+    //      retry to absorb the listener's startup.
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "for i in $(seq 1 30); do R=$(nc -w3 {short_alias} 8080 </dev/null 2>/dev/null); \
+             if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+        ),
+    ];
+    let out = backend
+        .exec(&app.handle, &argv, None)
+        .await
+        .expect("exec nc by short alias");
+    assert_eq!(
+        out.exit_code, 0,
+        "app must resolve + reach the healed producer by its short alias {short_alias}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "HEAL",
+        "the sibling must read the producer's body (HEAL) over the short alias"
+    );
+
+    // (3c) IDEMPOTENCY: the healed producer is now current (primary on the net AND advertising the
+    //      current short alias), so `needs_redeploy` must report `false` — no churn loop.
+    assert!(
+        !backend
+            .needs_redeploy(&db_healed.handle, &server_spec("HEAL"))
+            .await,
+        "a healed producer carrying the current short alias must report needs_redeploy=false, \
+         else the reconcile would recreate it every tick"
+    );
+
+    for handle in [&app.handle, &db_healed.handle] {
+        let _ = backend.stop(handle).await;
+    }
+    // Best-effort GC of the per-project net in case a prior assertion left a workload attached.
+    let _ = docker.remove_network(&project_net).await;
+
+    // The single success marker the capability gate greps for — printed ONLY after the stale-alias
+    // producer was flagged, recreated with the current short alias, reached by a sibling over it,
+    // and reported idempotent.
+    println!(
+        "DOCKER MANAGED-DB ALIAS UPGRADE HEAL OK: a {}-octet producer carrying the stale long \
+         alias was flagged for recreate, relaunched with the short alias {short_alias}, reached by \
+         a sibling (HEAL) over that alias, and then reported needs_redeploy=false (idempotent)",
+        db_workload.len()
+    );
+}

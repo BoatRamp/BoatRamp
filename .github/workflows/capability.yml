@@ -859,7 +859,7 @@ jobs:
             || { echo "::error::blob cold fan-out never reached the success marker (silent skip or serialization?)" >&2; exit 1; }
 
   docker-compute-net:
-    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability
+    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal
     # The docker compute backend puts every long-lived workload on its per-project user-defined
     # network as the PRIMARY attachment (the sole tenancy boundary) so siblings resolve each other
     # by name over docker's embedded DNS. The one-shot export/import client (run_ephemeral), by
@@ -892,8 +892,10 @@ jobs:
           # no reconcile churn loop); (3) a DUAL-ATTACHED run_ephemeral one-shot (per-project-net
           # hint set) still reaches a DB on the DEFAULT bridge (the v0.56.0 regression shape); (4) a
           # managed-DB workload whose RAW name exceeds the 63-octet DNS-label cap resolves by its
-          # SHORT alias (the Docker-29 RFC-1035 SD-registration fix). Each marker prints ONLY after
-          # every assertion holds.
+          # SHORT alias (the Docker-29 RFC-1035 SD-registration fix); (5) the UPGRADE path — a
+          # producer created with a STALE pre-fix long alias is flagged for recreate by
+          # needs_redeploy, relaunched with the current SHORT alias, reached by a sibling over it,
+          # and reported idempotent (no churn). Each marker prints ONLY after every assertion holds.
           BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
             -- --ignored --nocapture 2>&1 | tee docker-net.log
           grep -qE 'test result: ok' docker-net.log \
@@ -906,3 +908,5 @@ jobs:
             || { echo "::error::dual-attached run_ephemeral never reached its default-bridge success marker (silent skip or the v0.56.0 per-project-net-PRIMARY regression — default-bridge DB unreachable)" >&2; exit 1; }
           grep -q 'DOCKER LONG MANAGED-DB SD OK' docker-net.log \
             || { echo "::error::long managed-DB workload (> 63-octet name) never reached its short-alias resolution marker (silent skip or the Docker-29 RFC-1035 label-cap regression — SD record for the over-long alias not published)" >&2; exit 1; }
+          grep -q 'DOCKER MANAGED-DB ALIAS UPGRADE HEAL OK' docker-net.log \
+            || { echo "::error::managed-DB alias UPGRADE auto-heal never reached its success marker (silent skip or a regression — a producer carrying a STALE pre-fix long alias was not flagged for recreate, not re-aliased to the current short label, or not idempotent afterwards)" >&2; exit 1; }
