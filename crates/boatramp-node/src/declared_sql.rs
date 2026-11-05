@@ -76,6 +76,16 @@ pub struct NodeDeclaredDbResolver {
     /// Resolved per-tenant backends, keyed by `(project[/site], name)` per the binding's
     /// tenant grain — so a hot path reuses the connection pool instead of re-provisioning +
     /// reconnecting each `sql.open()`. Mirrors the composite's own per-tenant cache.
+    ///
+    /// This positive cache has NO expiry (a backend, once resolved, is kept for the life of
+    /// the process), so a managed-DB credential ROTATION or revocation is not observed until
+    /// the serve process restarts (cap-req #28 review, F3). This is deliberately the SAME
+    /// lifetime the static per-tenant path has (the composite's own per-tenant cache and
+    /// `NodeTenantSqlResolver` cache a resolved backend for the process lifetime too), so the
+    /// declared fallback adds no new staleness window beyond the inherited one. It is keyed by
+    /// tenant grain, so it is NEVER a cross-tenant exposure — a stale entry only ever re-serves
+    /// the SAME tenant its own (now-rotated) backend. Left as-is on purpose (behavior unchanged):
+    /// a bounded TTL here would also expire the SQL connection pool a hot path depends on.
     resolved: Mutex<HashMap<String, Arc<dyn SqlBackend>>>,
     /// Negative cache: `(project, name)` → expiry, for names the project has NOT declared
     /// (see [`NEGATIVE_TTL`]).
@@ -169,14 +179,20 @@ impl DeclaredDbResolver for NodeDeclaredDbResolver {
         }
         // Read the project's declaration. A store error is PROPAGATED (never silently
         // treated as "not declared" — that would route a handler expecting the managed
-        // Postgres to the libsql default and silently diverge its data); the handler
-        // surfaces it the same retryable way a not-yet-ready managed DB does. Do NOT
-        // negative-cache a transient error.
+        // Postgres to the libsql default and silently diverge its data). It is classified
+        // as `Unavailable` (NOT `Other`) on purpose: `open_bindings_sql` / `build_bindings`
+        // only turn `is_unavailable()` errors into the readiness-gated, retryable 503 the
+        // module doc promises — a transient DeployStore blip wrapped as `Other` would fall
+        // into the "binding left ungranted" arm and hand the guest a hard, non-retryable
+        // "sql not granted" instead (cap-req #28 review, F1). This stays fail-closed: the
+        // resolver returns `Err`, so the composite's `?` propagates it and NEVER falls
+        // through to the libsql default on a store error. Do NOT negative-cache a transient
+        // error.
         let declared = self
             .deploy
             .get_project_database(ProjectRef::new(project), name)
             .await
-            .map_err(|e| SqlError::other(format!("read declared database {name:?}: {e}")))?;
+            .map_err(|e| SqlError::unavailable(format!("read declared database {name:?}: {e}")))?;
         let Some(apply_db) = declared else {
             self.negative_insert(project, name);
             return Ok(None);
