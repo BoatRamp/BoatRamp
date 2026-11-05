@@ -4167,6 +4167,25 @@ impl NodeProjectExport {
                     ProjectRef::new(project),
                 )
                 .map_err(Perr::Other)?;
+                // SYSTEM-PRINCIPAL NEUTRALIZATION (Security F3, release-gating): `project import` is
+                // `Project·Admin`-gated exactly like `project sync`, so the control-plane slice must
+                // never WRITE a site's `current-principal/<site>` (`system:<id>`) marker — that would
+                // let a tenant Project·Admin GRANT the node-global System principal to a site without
+                // holding System·Admin (forged bundle, or inherited source marker). Strip it here,
+                // fail-closed (the authoritative dest-side drop, mirroring the sync endpoint); the
+                // marker may only be (re)granted by a dest-side System·Admin activation.
+                let neutralized = boatramp_core::project_export::strip_system_principal_markers(
+                    &mut decoded.entries,
+                );
+                if !neutralized.is_empty() {
+                    tracing::warn!(
+                        project = %project,
+                        count = neutralized.len(),
+                        "project import: dropped system-principal marker(s) from the control-plane \
+                         KV slice (a Project·Admin import never grants a site the System principal; \
+                         re-grant via a dest-side System·Admin activation)"
+                    );
+                }
                 if opts.apply {
                     match boatramp_core::kv_dump::apply_import(
                         self.kv.as_ref(),
@@ -4231,6 +4250,20 @@ impl NodeProjectExport {
                     ProjectRef::new(project),
                 )
                 .map_err(Perr::Other)?;
+                // SYSTEM-PRINCIPAL NEUTRALIZATION (Security F3): the delta's UPSERTS can carry a
+                // `current-principal/<site>` marker exactly like a full slice — strip it fail-closed
+                // (a delta tombstone that DELETES the marker is safe and left alone: it only ever
+                // CLEARS authority). Same authoritative dest-side drop as the full-slice arm.
+                let neutralized =
+                    boatramp_core::project_export::strip_system_principal_markers(&mut upserts);
+                if !neutralized.is_empty() {
+                    tracing::warn!(
+                        project = %project,
+                        count = neutralized.len(),
+                        "project import (delta): dropped system-principal marker(s) from the \
+                         control-plane KV delta upserts (never grant System via a Project·Admin seam)"
+                    );
+                }
 
                 // TOMBSTONES: a deleted key is equally attacker-influenceable; a tombstone that
                 // escaped the target's owned scope would be a CROSS-TENANT DELETE. Re-key each then

@@ -202,11 +202,11 @@ impl Right {
     }
 
     /// Like [`required`](Self::required) but also given the request's `query` string, so an
-    /// endpoint whose TARGET lives in a query param (the native `/api/project-export` /
-    /// `/api/project-import`, scoped by `?project=`) resolves to a per-project
-    /// `Project·Admin` on that exact target — binding the authorization to the specific
-    /// project a Project·Admin may export/import (a Project·Admin for X must never reach Y).
-    /// `query` is consulted ONLY for those two endpoints; every other mapping is path-only.
+    /// endpoint whose TARGET lives in a query param (scoped by `?project=`) resolves to a
+    /// per-project `Project·Admin` on that exact target — binding the authorization to the specific
+    /// project a Project·Admin may act on (a Project·Admin for X must never reach Y). `query` is
+    /// consulted ONLY for the query-scoped family — `/api/project-export`, `/api/project-import`,
+    /// `/api/project-prune`, and `/api/project-kv-stratum`; every other mapping is path-only.
     pub fn required_for(method: &str, path: &str, query: Option<&str>) -> Option<Self> {
         let m = method.to_ascii_uppercase();
         let get = m == "GET";

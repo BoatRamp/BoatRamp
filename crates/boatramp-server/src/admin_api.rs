@@ -5247,14 +5247,23 @@ pub(super) struct KvStratumSkip {
     pub reason: String,
 }
 
-/// `POST /api/project-kv-stratum` response: how many records landed + what was skipped.
+/// `POST /api/project-kv-stratum` response: how many records landed, what was skipped, and which
+/// system-principal markers were neutralized.
 #[derive(Debug, Serialize)]
 pub(super) struct KvStratumWriteResponse {
     /// Records written (idempotent: re-writing the same bytes still counts them, but changes
     /// nothing on the store).
     pub written: usize,
-    /// Entries skipped (incoherent / excluded) — a non-zero count a human/CI can gate on.
+    /// Entries skipped (incoherent / excluded) — a non-zero count a human/CI can gate on; drives
+    /// the CLI's `--strict` refuse.
     pub skipped: Vec<KvStratumSkip>,
+    /// System-principal activation markers (`current-principal/<site>`) the dest refused to write
+    /// (always, fail-closed): a `Project·Admin` carry can never grant a site the System principal —
+    /// re-grant only via a dest-side System·Admin activation. Distinct from `skipped` so it is
+    /// purely informational and NEVER triggers a `--strict` refuse (a benign sync of a
+    /// system-activated source site legitimately reports these).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutralized: Vec<String>,
 }
 
 /// The target `?project=` of a kv-stratum request, derived through the EXACT same
@@ -5444,6 +5453,14 @@ pub(super) async fn kv_stratum_write(
         return (StatusCode::FORBIDDEN, format!("{msg}\n")).into_response();
     }
 
+    // SYSTEM-PRINCIPAL NEUTRALIZATION (Security F1, release-gating): a `current-principal/<site>`
+    // marker (`system:<id>`) is NEVER written over this `Project·Admin`-gated seam — else a tenant
+    // Project·Admin could GRANT a site the node-global System principal by forging the POST body
+    // (or by inheriting a source site's marker) without holding `System·Admin`. Strip them
+    // unconditionally here (the authoritative, fail-closed dest-side drop); the marker can only be
+    // (re)granted by a dest-side System·Admin activation. `current/`/`history/` still carry.
+    let neutralized = boatramp_core::project_export::strip_system_principal_markers(&mut entries);
+
     // Coherence: drop any entry under an engine-supplied exclude prefix (uncarried-site dependants),
     // and — for the HISTORY piece — any per-site pointer whose site has no config body on the dest
     // (the `current/`/`history/` → `siteconfig/<hash>` dependency, PLAN rule 3). Skipped, reported,
@@ -5495,7 +5512,12 @@ pub(super) async fn kv_stratum_write(
         )
             .into_response();
     }
-    Json(KvStratumWriteResponse { written, skipped }).into_response()
+    Json(KvStratumWriteResponse {
+        written,
+        skipped,
+        neutralized,
+    })
+    .into_response()
 }
 
 /// Whether the destination already holds `site`'s content-addressed config body — i.e. the

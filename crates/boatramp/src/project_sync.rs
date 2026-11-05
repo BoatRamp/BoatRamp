@@ -862,6 +862,17 @@ impl SyncExecutor for CliSyncExecutor {
                     .join("; ")
             ));
         }
+        // ALWAYS surface neutralized system-principal markers (Security F1) — informational, never a
+        // `--strict` refuse: a `Project·Admin` sync can't grant System authority, so the dest dropped
+        // these `current-principal/<site>` markers; re-grant via a dest-side System·Admin activation.
+        if !outcome.neutralized.is_empty() {
+            self.kv_skip_notes.push(format!(
+                "{tok}: {} system-principal marker(s) NOT carried (a Project·Admin sync never grants \
+                 a site the System principal; re-grant via a dest-side System·Admin activation): {}",
+                outcome.neutralized.len(),
+                outcome.neutralized.join(", ")
+            ));
+        }
         Ok(outcome.written)
     }
 
@@ -1164,6 +1175,7 @@ mod tests {
             axum::Json(serde_json::json!({
                 "written": 1,
                 "skipped": [{ "key": "project/dst/current/web", "reason": "history→siteconfig dependency: no config for site `web`" }],
+                "neutralized": ["project/dst/current-principal/web"],
             }))
             .into_response()
         }
@@ -1226,6 +1238,13 @@ mod tests {
         );
         // The dest-reported skip surfaced in the executor's notes (default posture, not aborted).
         assert!(exec_has_skip_note(&exec, "web"));
+        // The dest-reported system-principal neutralization (Security F1) ALSO surfaced as a note.
+        assert!(
+            exec_has_skip_note(&exec, "current-principal/web")
+                && exec_has_skip_note(&exec, "System principal"),
+            "neutralized marker must surface as an operator note: {:?}",
+            exec.kv_skip_notes
+        );
 
         fn exec_has_skip_note(exec: &CliSyncExecutor, needle: &str) -> bool {
             exec.kv_skip_notes.iter().any(|n| n.contains(needle))

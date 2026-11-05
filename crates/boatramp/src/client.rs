@@ -692,14 +692,20 @@ pub struct KvStratumSkip {
     pub reason: String,
 }
 
-/// The `POST /api/project-kv-stratum` outcome: records landed + entries skipped-and-reported.
+/// The `POST /api/project-kv-stratum` outcome: records landed, entries skipped-and-reported, and
+/// system-principal markers the dest neutralized.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct KvStratumWriteOutcome {
     /// Records actually written to the destination.
     pub written: usize,
-    /// Entries skipped (incoherent / excluded) — never half-applied.
+    /// Entries skipped (incoherent / excluded) — never half-applied; drives `--strict`.
     #[serde(default)]
     pub skipped: Vec<KvStratumSkip>,
+    /// System-principal markers (`current-principal/<site>`) the dest refused to write (always,
+    /// fail-closed) — a `Project·Admin` carry can never grant a site the System principal.
+    /// Informational only; NEVER triggers a `--strict` refuse.
+    #[serde(default)]
+    pub neutralized: Vec<String>,
 }
 
 impl ControlPlane {

@@ -13,9 +13,14 @@
 //!   2. **History→siteconfig dependency (PLAN rule 3).** A `current/`/`history/` pointer whose site
 //!      has a config body on the dest CARRIES; one whose site does NOT is SKIPPED-and-reported,
 //!      never written — the dest's prior state left intact.
-//!   3. **Idempotent resync.** A second carry of the unchanged source re-writes the same bytes and
+//!   3. **System-principal neutralization (Security F1).** The carried source site is
+//!      system-activated (`current-principal/<site> = system:…`), yet the dest NEVER inherits it —
+//!      a `Project·Admin` sync can't grant a site the node-global System principal; the dest drops
+//!      the marker (absent + reported), on both the benign carry AND a forged write body, while the
+//!      sibling `current/` pointer still lands (surgical drop).
+//!   4. **Idempotent resync.** A second carry of the unchanged source re-writes the same bytes and
 //!      leaves the dest identical (same source ⇒ same state).
-//!   4. **Cross-tenant isolation (the ≥2-tenant tenancy gate, MANDATORY for a KV transport).** With
+//!   5. **Cross-tenant isolation (the ≥2-tenant tenancy gate, MANDATORY for a KV transport).** With
 //!      the SOURCE holding BOTH tenant `acme` and tenant `globex`, a sync NAMING `acme` reads ZERO
 //!      of `globex`'s keys; and a crafted write body carrying a `globex`/global/sealed key under an
 //!      `acme`-scoped write is REFUSED fail-closed, leaving `globex` on the dest with ZERO bytes.
@@ -278,6 +283,61 @@ async fn kv_stratum_sync_gate() {
     );
 
     // ============================================================================================
+    // 2b) SYSTEM-PRINCIPAL NEUTRALIZATION (Security F1): the carried source site `web` was
+    //     system-activated (`current-principal/web = system:...` seeded on the source), yet the dest
+    //     must NOT inherit it — a Project·Admin sync can never grant a site the System principal.
+    //     The dest write dropped it (absent on the dest) and reported it in `neutralized`.
+    // ============================================================================================
+    assert!(
+        dst.kv
+            .get("project/acme/current-principal/web")
+            .await
+            .unwrap()
+            .is_none(),
+        "SECURITY F1: current-principal/web must be ABSENT on the dest after a sync (no System grant via a Project·Admin seam)"
+    );
+    assert!(
+        wrote["neutralized"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k.as_str().unwrap() == "project/acme/current-principal/web"),
+        "the dest must REPORT the neutralized system-principal marker: {wrote:?}"
+    );
+
+    // 2c) FORGERY: a crafted write body directly carrying `current-principal/web = system:<id>`
+    //     (an attacker-controlled POST — bypassing any read-side filter) is DROPPED by the
+    //     authoritative dest-side gate; the marker stays ABSENT. (`current/` in the SAME body still
+    //     lands, proving the drop is surgical, not a blanket history refusal.)
+    let forged = serde_json::json!({
+        "source_project": "acme",
+        "exclude_prefixes": [],
+        "entries": [
+            { "key": "project/acme/current/web", "value_b64": b64(b"deploy-web-1") },
+            { "key": "project/acme/current-principal/web", "value_b64": b64(b"system:deploy-web-1") },
+        ],
+    });
+    let (st, forged_resp) = write_stratum(&dst.app, "acme", "history", forged).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "forged history write returns 200 (marker silently neutralized): {forged_resp:?}"
+    );
+    assert!(
+        dst.kv
+            .get("project/acme/current-principal/web")
+            .await
+            .unwrap()
+            .is_none(),
+        "SECURITY F1: a FORGED current-principal marker must never land on the dest"
+    );
+    assert_eq!(
+        dst.kv.get("project/acme/current/web").await.unwrap(),
+        Some(b"deploy-web-1".to_vec()),
+        "the sibling current/ pointer in the same body still carries (surgical drop)"
+    );
+
+    // ============================================================================================
     // 3) IDEMPOTENT RESYNC: re-carry settings; the dest value is unchanged (same source ⇒ same).
     // ============================================================================================
     let (_st, read) = read_stratum(&src.app, "acme", "settings").await;
@@ -350,6 +410,6 @@ async fn kv_stratum_sync_gate() {
     );
 
     println!(
-        "KV STRATUM SYNC GATE OK: settings+graphql+history carried coherent+idempotent; history→siteconfig dependency skipped ghost; cross-tenant acme-only read + fail-closed write left globex with zero bytes"
+        "KV STRATUM SYNC GATE OK: settings+graphql+history carried coherent+idempotent; history→siteconfig dependency skipped ghost; system-principal marker neutralized on the dest (benign + forged); cross-tenant acme-only read + fail-closed write left globex with zero bytes"
     );
 }
