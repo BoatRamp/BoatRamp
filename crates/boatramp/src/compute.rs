@@ -318,8 +318,9 @@ enum ComputeCommand {
     /// Show observed per-replica runtime state — the reconcile plane's X-ray: stored
     /// health, lifecycle phase, assigned IP:port, age vs startup grace, backend. This
     /// is the record the endpoint resolver reads, so `HEALTHY=false` on a `running`,
-    /// endpoint-bearing replica is the "reachable but not served" signature. Node-global
-    /// (every tenant on the node); admin-scoped.
+    /// endpoint-bearing replica is the "reachable but not served" signature.
+    /// Project-scoped under `--project` (polls the tenant's OWN workloads; project_admin);
+    /// node-global across every tenant without it (System·Admin).
     Status {
         /// Show only this workload's replicas (default: every workload).
         workload: Option<String>,
@@ -955,6 +956,17 @@ fn write_netdiag(
     Ok(())
 }
 
+/// The `compute status` endpoint URL for a resolved collection `seg`. `status` is
+/// project-ROUTED like the CRUD subcommands: `seg` is [`client::project_seg`] for the
+/// `compute` collection, so with `--project <p>` this polls the project-scoped
+/// `/api/projects/<p>/compute/status` (a tenant's read of its OWN workloads' serving
+/// health, authorized at `project_admin`) and without it the node-global
+/// `/api/compute/status` (`System·Admin`). Factored out so the routing decision is a
+/// single tested unit.
+fn status_url(server: &str, seg: &str) -> String {
+    format!("{server}/api/{seg}/status")
+}
+
 /// Entry point for `boatramp compute`.
 pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOutput> {
     let server = client::resolve_server(args.server, config)?;
@@ -1317,11 +1329,15 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 }
             }
         }
-        // Node-global operator tools hit the direct `/api/compute/…` maintenance surface
-        // (admin-scoped, tenant-agnostic) rather than the project-scoped `seg`.
+        // `compute status` is project-ROUTED through the same `seg` as the CRUD
+        // subcommands: with `--project <p>` it polls the project-scoped
+        // `/api/projects/<p>/compute/status` (a tenant's read of its OWN workloads'
+        // serving health, authorized at `project_admin`); without it, the node-global
+        // `/api/compute/status` (`System·Admin`). So `--project` no longer silently
+        // drops a tenant onto the node-global surface it can't reach.
         ComputeCommand::Status { workload } => {
             let mut states: Vec<serde_json::Value> = http
-                .get(format!("{server}/api/compute/status"))
+                .get(status_url(&server, &seg))
                 .send()
                 .await?
                 .error_for_status()?
@@ -1332,6 +1348,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             }
             ComputeOutput::Status { states }
         }
+        // The remaining node-global operator tools hit the direct `/api/compute/…`
+        // maintenance surface (admin-scoped, tenant-agnostic) rather than `seg`.
         ComputeCommand::SetHealth {
             workload,
             replica,
@@ -2121,5 +2139,21 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1024 * 1024), "1.0 MiB");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn compute_status_url_is_project_routed() {
+        use boatramp_core::project::DEFAULT_PROJECT;
+        let server = "https://node.example";
+        // Default project ⇒ the node-global, byte-identical legacy path (unchanged).
+        assert_eq!(
+            status_url(server, &client::project_seg(DEFAULT_PROJECT, "compute")),
+            "https://node.example/api/compute/status",
+        );
+        // A named project ⇒ the project-scoped path `project_admin` can reach.
+        assert_eq!(
+            status_url(server, &client::project_seg("acme", "compute")),
+            "https://node.example/api/projects/acme/compute/status",
+        );
     }
 }

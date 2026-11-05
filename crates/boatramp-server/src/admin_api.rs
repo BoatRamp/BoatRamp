@@ -4468,11 +4468,34 @@ impl ReplicaStatusView {
     }
 }
 
-/// Node-global observed replica state across every tenant — the reconcile plane's
-/// X-ray. Read-only; `system·admin`. Sorted by (project, workload, replica) for a
-/// stable operator view.
-pub(super) async fn compute_status(State(deploy): State<DeployStore>) -> Response {
-    match deploy.list_all_replica_states().await {
+/// Observed replica state — the reconcile plane's X-ray: stored health, lifecycle
+/// phase, assigned endpoint, age. Read-only, sorted by (project, workload, replica)
+/// for a stable view. The route has TWO forms with distinct authority:
+///
+///   - **Node-global** (`GET /api/compute/status`, no rewrite): every tenant's
+///     replicas, the operator X-ray. `system·admin`.
+///   - **Project-scoped** (`GET /api/projects/<p>/compute/status`, rewritten here — the
+///     `project_scope` middleware stashes an [`OriginalPath`]): ONLY that project's
+///     replicas — a tenant's read of its OWN workloads' serving health so a
+///     `project_admin` can poll `healthy+running` readiness WITHOUT a node-global
+///     token. Gated at the per-project `Project·Read` (see `authz::Right::required`)
+///     and scoped at the store to that project's keyspace, so it can never surface —
+///     nor even read — another tenant's replica state.
+///
+/// The presence of [`OriginalPath`] is the one discriminator between the two forms
+/// (it is stashed iff the path was rewritten, i.e. the project-scoped form); the
+/// injected [`ProjectContext`] carries the tenant.
+pub(super) async fn compute_status(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    project_scoped: Option<axum::extract::Extension<OriginalPath>>,
+) -> Response {
+    let listed = if project_scoped.is_some() {
+        deploy.list_project_replica_states(project.as_ref()).await
+    } else {
+        deploy.list_all_replica_states().await
+    };
+    match listed {
         Ok(mut states) => {
             states.sort_by(|a, b| {
                 (&a.handle.project, &a.handle.workload, a.handle.replica).cmp(&(
@@ -6055,7 +6078,13 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = compute_status(State(deploy)).await;
+        // The node-global form (no `OriginalPath` ⇒ `None`) lists EVERY tenant.
+        let resp = compute_status(
+            State(deploy.clone()),
+            axum::extract::Extension(ProjectContext::default()),
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let arr = body.as_array().expect("array");
@@ -6080,6 +6109,63 @@ mod tests {
             .find(|r| r["project"] == "globex")
             .expect("globex present");
         assert_eq!(globex["healthy"], true);
+    }
+
+    #[tokio::test]
+    async fn compute_status_project_scoped_form_sees_only_its_own_tenant() {
+        let deploy = store();
+        // Same two-tenant fixture: `acme` healthy+running, `globex` present too.
+        deploy
+            .set_replica_state(
+                boatramp_core::project::ProjectRef::new("acme"),
+                &obs(
+                    "acme",
+                    "pg",
+                    0,
+                    "10.0.0.2",
+                    true,
+                    Some(boatramp_core::time::now_unix()),
+                ),
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                boatramp_core::project::ProjectRef::new("globex"),
+                &obs(
+                    "globex",
+                    "pg",
+                    0,
+                    "10.0.0.3",
+                    true,
+                    Some(boatramp_core::time::now_unix()),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // The project-scoped form (an `OriginalPath` is present ⇒ rewritten) carries the
+        // tenant in its `ProjectContext` and lists ONLY that tenant's replicas — no
+        // cross-tenant byte is surfaced, and the handler reads only `acme`'s keyspace.
+        let resp = compute_status(
+            State(deploy.clone()),
+            axum::extract::Extension(ProjectContext("acme".to_string())),
+            Some(axum::extract::Extension(OriginalPath(
+                "/api/projects/acme/compute/status".to_string(),
+            ))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "only acme's own replica is visible");
+        assert_eq!(arr[0]["project"], "acme");
+        assert_eq!(arr[0]["healthy"], true);
+        assert_eq!(arr[0]["phase"], "running");
+        assert!(
+            !arr.iter().any(|r| r["project"] == "globex"),
+            "a project-scoped status must NOT leak another tenant's replica"
+        );
     }
 
     #[test]

@@ -3529,6 +3529,29 @@ impl DeployStore {
         Ok(out)
     }
 
+    /// List every observed replica state in **one** project (all its workloads) — the
+    /// per-tenant slice of [`list_all_replica_states`](Self::list_all_replica_states),
+    /// scoped to that project's single `project/<proj>/compute_state/` prefix so a
+    /// project-scoped `compute status` read never touches another tenant's keyspace
+    /// (it reads only its own bytes, not the whole node then filters).
+    pub async fn list_project_replica_states(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Vec<crate::compute::ObservedInstance>, DeployError> {
+        let mut out = Vec::new();
+        let prefix = crate::compute::replica_states_project_prefix(project.as_str());
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await?
+                && let Ok(mut state) =
+                    serde_json::from_slice::<crate::compute::ObservedInstance>(&bytes)
+            {
+                backfill_replica_project(&mut state, project.as_str());
+                out.push(state);
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove a replica's observed state.
     pub async fn delete_replica_state(
         &self,

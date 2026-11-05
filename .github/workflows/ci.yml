@@ -36,6 +36,10 @@ name: CI
 #                       nodes — round-trip + coherence, the history→siteconfig dependency skip, an
 #                       idempotent resync, and the ≥2-tenant cross-tenant zero-leak that is mandatory
 #                       for a KV transport),
+#                       live-gate-compute-status-project-scope (the project-scoped `compute status`
+#                       token-tightening: a project_admin reads its OWN project's compute readiness
+#                       through the real router()+auth, sees ZERO of another tenant's replicas, and is
+#                       403 on another tenant's + on the node-global path — a node admin still spans all),
 #                       live-gate-connect-unary (a real Connect/gRPC-web UNARY round trip over the
 #                       hand-rolled HTTP stack — PLAN-connect-grpc IU-1, incl. the host residual
 #                       that must never compression-mangle a framed body),
@@ -1763,6 +1767,45 @@ jobs:
             || { echo "::error::project-sync KV-stratum gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'KV STRATUM SYNC GATE OK' kv-stratum-sync.log \
             || { echo "::error::KV-stratum sync gate never reached its marker (a carry/coherence regression, a history→siteconfig dependency break, or a CROSS-TENANT leak in the selective-sync KV endpoint)" >&2; exit 1; }
+
+  # PROJECT-SCOPED COMPUTE-STATUS LIVE GATE (marker `COMPUTE STATUS PROJECT-SCOPE GATE OK`). The
+  # multi-tenant CLI fix: `boatramp compute status --project <p>` polls the project-scoped
+  # `/api/projects/<p>/compute/status` so a tenant can read its OWN compute workload's readiness
+  # WITHOUT a node-global `admin` token (the `project_admin` token-tightening). Stands up ONE
+  # in-process node — the REAL full `router()` over a `DeployStore` with a REAL token `Auth`, so the
+  # authz layer actually runs — seeds TWO tenants (`acme`, `globex`) each with a healthy+running
+  # replica, and drives the endpoint end-to-end via `tower::oneshot`. It asserts the whole point of
+  # the fix: (1) a `project_admin:acme` token reads `/api/projects/acme/compute/status` → 200 with the
+  # healthy+running readiness signal present; (2) that response leaks ZERO of `globex`'s replicas
+  # (store-scoped to the one tenant's keyspace); (3) the SAME token is 403 on `globex`'s project-scoped
+  # status (cross-tenant, authz before any existence check); (4) and 403 on the node-global
+  # `/api/compute/status` (the fix does NOT weaken that surface); (5) a node `admin` token still reads
+  # the node-global status across BOTH tenants (the operator X-ray still works). `#[ignore]`d + greped
+  # here (marker + pass count), so a silent skip or an authz regression fails the merge
+  # (ignore-gated-tests-not-evidence).
+  live-gate-compute-status-project-scope:
+    name: live gate (compute-status project-scope)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-compute-status-project-scope-musl
+
+      - name: "compute-status project-scope gate (project_admin reads its OWN compute readiness; zero cross-tenant leak; 403 on another tenant's + the node-global path; node admin still spans all)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --test compute_status_project_scope_live \
+            -- --ignored --nocapture 2>&1 | tee compute-status-project-scope.log
+          grep -qE 'test result: ok\. 1 passed' compute-status-project-scope.log \
+            || { echo "::error::compute-status project-scope gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'COMPUTE STATUS PROJECT-SCOPE GATE OK' compute-status-project-scope.log \
+            || { echo "::error::compute-status project-scope gate never reached its marker (a routing/authz regression: the project-scoped status leaked another tenant, was wrongly gated System·Admin, or the node-global path was weakened)" >&2; exit 1; }
 
   # PLAN-connect-grpc §9 IU-1 CONNECT-UNARY LIVE GATE (marker `CONNECT UNARY LIVE OK`). The
   # Connect / gRPC-web transport's milestone-1 end-to-end proof: a REAL compiled guest component

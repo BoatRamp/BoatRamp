@@ -358,17 +358,21 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
-        // Compute **maintenance/diagnostic** tools (`compute status|ipam|dns|reconcile|
-        // restart|set-health|netdiag`) are NODE-GLOBAL operator instruments: they
-        // observe *and* override the reconcile plane across *every* tenant on the node
-        // (all replicas' health/state/IP, the shared IP pool, the internal-DNS fleet,
-        // and forcing/kicking replicas). Like `compute volumes`, they must be gated at
-        // `system·admin` — the general `/api/compute/*` branch and the project-scoped
-        // catch-all below would otherwise map them to a per-project `Project·Read/Deploy`
-        // right that any tenant's token satisfies, leaking cross-tenant state or letting
-        // one tenant flip another's health. Gate explicitly, above both branches,
-        // matching both the direct (`/api/compute/status…`) and project-scoped
-        // (`/api/projects/<p>/compute/status…`) forms.
+        // Compute **maintenance/diagnostic** tools (`compute ipam|dns|reconcile|restart|
+        // set-health|netdiag|reap` + the dev-bind/registry-auth affordances) are
+        // NODE-GLOBAL operator instruments: they observe *and* override the reconcile
+        // plane across *every* tenant on the node (all replicas' health/state/IP, the
+        // shared IP pool, the internal-DNS fleet, and forcing/kicking replicas). Like
+        // `compute volumes`, they must be gated at `system·admin` — the general
+        // `/api/compute/*` branch and the project-scoped catch-all below would otherwise
+        // map them to a per-project `Project·Read/Deploy` right that any tenant's token
+        // satisfies, leaking cross-tenant state or letting one tenant flip another's
+        // health. Gate explicitly, above both branches, matching both the direct and the
+        // project-scoped forms. The ONE exception is `status`: only its DIRECT form
+        // (`/api/compute/status`, the node-global X-ray) is matched here; the
+        // project-scoped `/api/projects/<p>/compute/status` is a tenant's read of its OWN
+        // workloads' serving health, so it falls through to the per-project `Project·Read`
+        // catch-all below (handler-scoped to that one tenant) — never `system·admin`.
         if is_compute_maintenance_path(path) {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
@@ -981,23 +985,42 @@ fn is_compute_volumes_path(path: &str) -> bool {
 }
 
 /// Whether `path` targets the node-global compute **maintenance/diagnostic** surface
-/// (`compute status|ipam|dns|reconcile` and the `compute/maintenance/*` mutators —
-/// `restart`, `set-health`, `netdiag`), in either the direct (`/api/compute/status…`)
-/// or the project-scoped (`/api/projects/<proj>/compute/status…`) form. These
-/// instruments read and override the reconcile plane across every tenant on the node,
-/// so [`Right::required`] gates them at `system·admin` rather than the per-project
-/// right the surrounding `/api/compute/*` mappings give. The reserved first segments
-/// (`status`, `ipam`, `dns`, `reconcile`, `maintenance`) therefore shadow any workload
-/// of the same name on these routes — the same trade-off `volumes` already makes.
+/// (`compute ipam|dns|reconcile` and the `compute/maintenance/*` mutators — `restart`,
+/// `set-health`, `netdiag`, `reap` — plus the `dev-bind-*`/`registry-auth` operator
+/// affordances), in either the direct (`/api/compute/…`) or the project-scoped
+/// (`/api/projects/<proj>/compute/…`) form. These instruments read and override the
+/// reconcile plane across every tenant on the node, so [`Right::required`] gates them
+/// at `system·admin` rather than the per-project right the surrounding `/api/compute/*`
+/// mappings give.
+///
+/// **`status` is the deliberate exception.** The DIRECT `/api/compute/status` is the
+/// node-global X-ray (every tenant), so it stays `system·admin`. The PROJECT-SCOPED
+/// `/api/projects/<p>/compute/status` is NOT a node-global instrument — it is a
+/// tenant's read of its OWN workloads' serving health, so it is *not* matched here and
+/// instead falls through to the per-project catch-all (`Project·Read`), the whole point
+/// of letting a `project_admin` poll readiness without a node-global token. The handler
+/// scopes that read to the one project's keyspace, so it surfaces no other tenant. Every
+/// OTHER maintenance segment is node-global in BOTH forms. The reserved first segments
+/// therefore shadow any workload of the same name on these routes — the same trade-off
+/// `volumes` already makes.
 fn is_compute_maintenance_path(path: &str) -> bool {
-    let after_compute = path.strip_prefix("/api/compute/").or_else(|| {
-        project_api_path(path)
-            .and_then(|(proj, sub)| (!proj.is_empty()).then_some(sub)?.strip_prefix("compute/"))
-    });
-    matches!(
-        after_compute,
-        Some(rest) if rest == "status"
-            || rest == "ipam"
+    // Resolve the `compute/<rest>` segment and WHICH form carried it: the direct global
+    // path, or the project-scoped `/api/projects/<proj>/compute/<rest>` path.
+    let (rest, project_scoped) = if let Some(rest) = path.strip_prefix("/api/compute/") {
+        (rest, false)
+    } else if let Some(rest) = project_api_path(path)
+        .and_then(|(proj, sub)| (!proj.is_empty()).then_some(sub)?.strip_prefix("compute/"))
+    {
+        (rest, true)
+    } else {
+        return false;
+    };
+    // `status` is node-global ONLY in its direct form; its project-scoped form falls
+    // through to the per-project `Project·Read` (a tenant reading its own workloads).
+    if rest == "status" {
+        return !project_scoped;
+    }
+    rest == "ipam"
             || rest == "dns"
             || rest.starts_with("dns/")
             || rest == "reconcile"
@@ -1024,7 +1047,6 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             // `/api/projects/<p>/secrets` surface (Project·Admin), NOT this path.
             || rest == "registry-auth"
             || rest.starts_with("registry-auth/")
-    )
 }
 
 /// Whether a granted target covers a required target:
@@ -2108,8 +2130,10 @@ mod tests {
             ("GET", "/api/compute/registry-auth"),
             ("POST", "/api/compute/registry-auth"),
             ("DELETE", "/api/compute/registry-auth/ghcr"),
-            // Project-scoped form (the `project_scope` rewrite's original path).
-            ("GET", "/api/projects/acme/compute/status"),
+            // Project-scoped form (the `project_scope` rewrite's original path). NOTE:
+            // `status` is DELIBERATELY ABSENT from this node-admin-only list — its
+            // project-scoped form is per-project `Project·Read` (asserted separately
+            // below). Every OTHER maintenance tool stays node-global in both forms.
             ("POST", "/api/projects/acme/compute/maintenance/set-health"),
             ("POST", "/api/projects/acme/compute/dev-bind-blob"),
             ("POST", "/api/projects/acme/compute/dev-bind-messaging"),
@@ -2127,6 +2151,46 @@ mod tests {
             }
             assert!(admin.satisfies(&required));
         }
+        // The DIRECT `/api/compute/status` is the node-global X-ray — still system·admin.
+        assert_eq!(
+            Right::required("GET", "/api/compute/status"),
+            Some(admin.clone()),
+            "the node-global /api/compute/status must stay system·admin"
+        );
+        // But the PROJECT-SCOPED `/api/projects/<p>/compute/status` is a tenant's read of
+        // its OWN workloads' serving health: per-project `Project·Read`, NOT system·admin
+        // (the token-tightening fix — a project_admin can poll readiness without a
+        // node-global token).
+        let project_status = Right::required("GET", "/api/projects/acme/compute/status")
+            .expect("project-scoped status is gated");
+        assert_eq!(
+            project_status,
+            Right::new(Resource::Project, Some("acme".to_string()), Action::Read),
+            "/api/projects/acme/compute/status must be Project(acme)·Read"
+        );
+        // Its OWN project's admin (or any read-granting role) satisfies it.
+        for role in ["project_admin", "project_publisher", "project_viewer"] {
+            let granted =
+                AuthzPolicy::default_policy().rights_for(&[GrantedRole::scoped(role, "acme")]);
+            assert!(
+                granted.allows(&project_status),
+                "{role}:acme must be allowed to poll its own /api/projects/acme/compute/status"
+            );
+        }
+        // A DIFFERENT tenant's token — even its admin — must be refused (cross-tenant),
+        // and so must the node-global path.
+        let beta_admin = AuthzPolicy::default_policy()
+            .rights_for(&[GrantedRole::scoped("project_admin", "beta")]);
+        assert!(
+            !beta_admin.allows(&project_status),
+            "project_admin:beta must be refused on acme's project-scoped compute status"
+        );
+        assert!(
+            !AuthzPolicy::default_policy()
+                .rights_for(&[GrantedRole::scoped("project_admin", "acme")])
+                .allows(&admin),
+            "project_admin:acme must be refused on the node-global /api/compute/status"
+        );
         // A workload whose name merely STARTS WITH a reserved word (e.g. `statuspage`)
         // is not the maintenance surface — it keeps its per-project right.
         assert_eq!(
