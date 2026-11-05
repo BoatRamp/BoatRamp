@@ -1370,9 +1370,8 @@ enum FeedState {
     /// The feed file was absent at the last stat — NO revocations (matches the platform's
     /// `authz/revoked/<cti>` absent ⇒ not-revoked semantics).
     Absent,
-    /// The feed was loaded at modification time `mtime` with these revoked sets.
+    /// The feed was loaded with these revoked sets.
     Present {
-        mtime: Option<std::time::SystemTime>,
         cti: HashSet<String>,
         subject: HashSet<String>,
     },
@@ -1394,11 +1393,12 @@ enum FeedState {
 /// - **File present but unreadable / malformed** ⇒ [`RevocationState::Unavailable`] (fail-closed — a
 ///   configured-but-unconsultable feed must refuse, never fail open).
 ///
-/// The feed is cached and reloaded only when its mtime changes (a `stat` per call; authority calls are
-/// infrequent and pre-verify-throttled). **Staleness bound (flagged):** a revocation propagates no
-/// faster than the feed is re-delivered, so within the freshness window a revoked token is refused only
-/// once the feed carries it; past the freshness window it is refused anyway (stale). The feed cadence is
-/// thus the revocation-latency knob the owner/ops set.
+/// The feed is RE-READ on every call (R-1: no mtime read-cache — authority calls are infrequent and
+/// pre-verify-throttled, so a delivered revocation takes effect on the very next call with no
+/// read-cache staleness window). **Staleness bound (flagged):** a revocation still propagates no faster
+/// than the feed is re-DELIVERED, so within the freshness window a revoked token is refused only once
+/// the projected feed carries it; past the freshness window it is refused anyway (stale). The feed
+/// delivery cadence is thus the revocation-latency knob the owner/ops set.
 pub struct FileRevocationList {
     path: std::path::PathBuf,
     cache: Mutex<FeedState>,
@@ -1444,27 +1444,20 @@ impl RevocationCheck for FileRevocationList {
                 tracing::warn!(path = %self.path.display(), error = %e, "[privsep] revocation feed stat failed — refusing fail-closed");
                 return RevocationState::Unavailable;
             }
-            Ok(meta) => {
-                let mtime = meta.modified().ok();
-                // Reload on a changed mtime — OR whenever mtime is unavailable (a degenerate FS that
-                // reports none): never trust a cached feed we cannot prove is current, so a later
-                // delivered revocation is always picked up (fail-safe freshness for a security feed).
-                let need_reload = mtime.is_none()
-                    || !matches!(&*cache, FeedState::Present { mtime: m, .. } if *m == mtime);
-                if need_reload {
-                    match Self::load(&self.path) {
-                        Ok((cti, subject)) => {
-                            *cache = FeedState::Present {
-                                mtime,
-                                cti,
-                                subject,
-                            };
-                        }
-                        Err(e) => {
-                            // Readable-stat but unreadable/malformed content — fail-closed, uncached.
-                            tracing::warn!(path = %self.path.display(), error = %e, "[privsep] revocation feed unreadable/malformed — refusing fail-closed");
-                            return RevocationState::Unavailable;
-                        }
+            Ok(_) => {
+                // R-1 (Security review): ALWAYS re-read — no mtime read-cache. On a coarse-mtime FS a
+                // revocation delivered in the same granularity tick as a cached stat could otherwise
+                // be served stale-`Active`; authority calls are infrequent + pre-verify-throttled, so
+                // re-reading the small feed every call costs nothing and a delivered revocation takes
+                // effect on the very next call.
+                match Self::load(&self.path) {
+                    Ok((cti, subject)) => {
+                        *cache = FeedState::Present { cti, subject };
+                    }
+                    Err(e) => {
+                        // Readable-stat but unreadable/malformed content — fail-closed, uncached.
+                        tracing::warn!(path = %self.path.display(), error = %e, "[privsep] revocation feed unreadable/malformed — refusing fail-closed");
+                        return RevocationState::Unavailable;
                     }
                 }
             }
