@@ -2062,9 +2062,13 @@ fn scope_target_authorized(principal: &VerifiedPrincipal, requested: &str) -> bo
         .any(|r| match r.target.as_deref() {
             Some(t) if t == requested => true,
             // A project role (`<project>`) covers any `<project>/<site>` under it (ProjectWildcard).
-            Some(project) => requested
+            // An empty project target must NOT act as a wildcard: `strip_prefix("")` returns the whole
+            // string, so a `target = Some("")` role would authorize anything beginning with `/`.
+            // `GrantedRole::parse` strips empty targets today, so this is defense-in-depth (Sec LOW-2).
+            Some(project) if !project.is_empty() => requested
                 .strip_prefix(project)
                 .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1),
+            Some(_) => false,
             None => false,
         })
 }
