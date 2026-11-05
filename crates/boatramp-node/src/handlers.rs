@@ -256,6 +256,11 @@ pub async fn build_handler_runtime(
     // resolution) and the `[secrets]` envelope (to seal a managed credential).
     deploy: &DeployStore,
     secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
+    // Whether this node runs a compute backend at all (`config.compute.is_some()`; cap-req
+    // #28 review, F2). Gates attachment of the serve-time project-DECLARED (apply-managed)
+    // SQL fallback: only a node that can actually run a managed database pays the fallback's
+    // per-project control-plane read on the SQL hot path.
+    has_managed_compute_backend: bool,
 ) -> Result<boatramp_server::HandlerRuntime> {
     // `allow_guest_email` is only consulted when the `email` feature wires the
     // gateway below; keep it from tripping unused-variable in a no-email build.
@@ -556,6 +561,7 @@ pub async fn build_handler_runtime(
         &kv,
         secrets_envelope.as_ref(),
         &boatramp_core::env::SystemEnv,
+        has_managed_compute_backend,
     )
     .await?;
     // Un-migrated-store default-scope backward-read-compat (Finding-8 migration-safety rewrite): the
@@ -823,6 +829,10 @@ async fn build_sql_backends(
     kv: &Arc<dyn KvStore>,
     secrets_envelope: Option<&Arc<dyn KeyEnvelope>>,
     env_source: &dyn boatramp_core::env::EnvSource,
+    // Whether this node runs a compute backend (`config.compute.is_some()`; cap-req #28
+    // review, F2). The project-DECLARED (apply-managed) SQL fallback is attached ONLY when
+    // true — see the gate below.
+    has_managed_compute_backend: bool,
 ) -> Result<Arc<dyn boatramp_core::sql::SqlBackends>> {
     let resolve_env = |var: &Option<String>| -> Result<Option<String>> {
         match var {
@@ -905,10 +915,22 @@ async fn build_sql_backends(
         // (daemon-wins). Crucially this is attached EVEN WITH AN EMPTY `[databases]` — the
         // mailroom case, where the declared `default` is MEANT to BE the `sql.open("")`
         // binding — which the pre-fix empty-map early return skipped entirely.
+        //
+        // F2 (cap-req #28 review): ALSO gate on the node actually running a compute backend
+        // (`has_managed_compute_backend` = `config.compute.is_some()`). Without one, no
+        // managed database can ever be provisioned or resolved on this node (its endpoint
+        // resolves through a compute backend; `build_compute` yields an EMPTY registry when
+        // `[compute]` is absent), so attaching the fallback would only put a per-project
+        // DeployStore/KV read on the SQL hot path for every `sql.open()` of an unbound name
+        // — widening the KV-degradation blast radius for projects that could never have a
+        // managed DB. The mailroom case is unaffected: a k8s/compute node keeps the fallback,
+        // so an apply-declared `default` with NO static `[databases]` entry still resolves
+        // `sql.open("")` to the managed Postgres.
         let empty_static = std::collections::BTreeMap::new();
         let static_dbs = databases.unwrap_or(&empty_static);
-        let declared_fallback: Option<Arc<dyn DeclaredDbResolver>> =
-            secrets_envelope.map(|envelope| {
+        let declared_fallback: Option<Arc<dyn DeclaredDbResolver>> = secrets_envelope
+            .filter(|_| has_managed_compute_backend)
+            .map(|envelope| {
                 Arc::new(crate::declared_sql::NodeDeclaredDbResolver::new(
                     deploy.clone(),
                     kv.clone(),
@@ -1080,6 +1102,10 @@ pub async fn build_handler_runtime(
     _allow_cross_tenant_db: bool,
     _deploy: &DeployStore,
     _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs
+    // caller (the caller passes it unconditionally); a lean node serves no SQL binding, so the
+    // declared-DB fallback gate (cap-req #28 review, F2) is ignored.
+    _has_managed_compute_backend: bool,
 ) -> Result<boatramp_server::HandlerRuntime> {
     Ok(boatramp_server::HandlerRuntime::disabled())
 }
@@ -1176,6 +1202,7 @@ mod tests {
             &kv,
             None,
             &boatramp_core::env::SystemEnv,
+            true, // a compute-backed static DB implies a managed-compute node
         )
         .await
         {
@@ -1203,6 +1230,7 @@ mod tests {
             &kv,
             Some(&envelope),
             &boatramp_core::env::SystemEnv,
+            true, // a compute-backed static DB implies a managed-compute node
         )
         .await
         .expect("managed sql builds without a live DB (lazy connect)");
@@ -1227,6 +1255,126 @@ mod tests {
             .unwrap()
             .expect("credential sealed on first resolve under the default project");
         assert_ne!(sealed.len(), 0);
+    }
+
+    /// An apply-declared `default` managed Postgres (`Single`/`Project`), the mailroom shape.
+    /// `provision_tenant` for this shape writes only to KV (spec + workload + sealed
+    /// credential), so resolving it seals a credential without a live replica — the
+    /// observable we use below to tell "reached the MANAGED backend" from "fell to libsql".
+    fn declared_default() -> boatramp_core::compute::ApplyDatabase {
+        use boatramp_core::compute::{
+            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
+            ApplyDatabaseTenant,
+        };
+        ApplyDatabase {
+            name: "default".to_string(),
+            kind: ApplyDatabaseKind::Postgres,
+            version: None,
+            extensions: vec![],
+            size: ApplyDatabaseSize::Small,
+            tenant: ApplyDatabaseTenant::Single,
+            tenant_scope: ApplyDatabaseScope::Project,
+            read_only: false,
+            rls_session: false,
+            tenant_guc: None,
+            session_guc: None,
+            tenant_all_marker: None,
+            pool_max: None,
+            connect_timeout_secs: None,
+            startup_grace_secs: None,
+            readiness_gate: Default::default(),
+            delta_capture: false,
+            restart_policy: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_fallback_resolves_the_mailroom_default_on_a_managed_compute_node() {
+        // F2 (cap-req #28 review): the MUST-STILL-WORK case. A node WITH a compute backend
+        // (`has_managed_compute_backend = true`) + a secrets envelope + an apply-declared
+        // `default` DB + NO node-static `[databases]` entry must still attach the declared
+        // fallback, so a guest's `sql.open("")` resolves to the managed Postgres — the exact
+        // mailroom shape. We prove it reached the MANAGED path (not the libsql default) by the
+        // per-tenant credential it seals on resolve.
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(TestEnvelope);
+        deploy
+            .set_project_database(
+                boatramp_core::project::ProjectRef::new("default"),
+                &declared_default(),
+            )
+            .await
+            .expect("seed the apply-declared default DB");
+        // The mailroom shape: `[handlers.bindings.sql]` present but with NO `databases` entry.
+        let cfg = crate::config::SqlBindingConfig::default();
+        let backends = build_sql_backends(
+            Some(&cfg),
+            tmp.path(),
+            &deploy,
+            &kv,
+            Some(&envelope),
+            &boatramp_core::env::SystemEnv,
+            true, // a managed-compute node
+        )
+        .await
+        .expect("build the composite with the declared fallback attached");
+        // `sql.open("")` ⇒ name "" ⇒ the declared `default`.
+        backends
+            .database("default", "blog", "")
+            .await
+            .expect("the declared default must resolve (lazy connect) on a managed-compute node");
+        let sealed = kv.list_prefix("managed-sql-cred/default/").await.unwrap();
+        assert!(
+            !sealed.is_empty(),
+            "the declared `default` must resolve to the MANAGED backend (sealing a per-tenant \
+             credential), not fall through to the libsql default — the mailroom case must keep \
+             working after the F2 gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_fallback_is_skipped_on_a_node_with_no_compute_backend() {
+        // F2 (cap-req #28 review): the gate. A node with NO compute backend
+        // (`has_managed_compute_backend = false`) must SKIP the declared fallback — even with
+        // a secrets envelope AND an apply-declared `default` seeded — because no managed DB can
+        // ever run there, so the fallback would only add a per-project control-plane read to the
+        // SQL hot path. `sql.open("")` then resolves to the plain libsql default, sealing NO
+        // managed credential.
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(TestEnvelope);
+        deploy
+            .set_project_database(
+                boatramp_core::project::ProjectRef::new("default"),
+                &declared_default(),
+            )
+            .await
+            .expect("seed the apply-declared default DB");
+        let cfg = crate::config::SqlBindingConfig::default();
+        let backends = build_sql_backends(
+            Some(&cfg),
+            tmp.path(),
+            &deploy,
+            &kv,
+            Some(&envelope),
+            &boatramp_core::env::SystemEnv,
+            false, // NO compute backend ⇒ the fallback must be skipped
+        )
+        .await
+        .expect("build the plain libsql default (no declared fallback)");
+        backends
+            .database("default", "blog", "")
+            .await
+            .expect("the libsql default resolves `sql.open(\"\")`");
+        let sealed = kv.list_prefix("managed-sql-cred/default/").await.unwrap();
+        assert!(
+            sealed.is_empty(),
+            "with no compute backend the declared fallback must be skipped — `sql.open(\"\")` \
+             falls to the libsql default and seals no managed credential"
+        );
     }
 }
 
