@@ -28,8 +28,8 @@ use bollard::container::{
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    EndpointSettings, HostConfig, Mount, MountTypeEnum, PortBinding,
-    RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
+    ContainerState, ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig,
+    Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
 use futures::StreamExt;
@@ -488,6 +488,71 @@ fn restart_policy(policy: RestartPolicy) -> DockerRestartPolicy {
     }
 }
 
+/// Whether a container's live PRIMARY network (`HostConfig.NetworkMode`) is already the
+/// expected per-project network — the auto-heal idempotency check behind `needs_redeploy`.
+///
+/// A container created by the current launch path has `NetworkMode == "boatramp-net-<proj>"`
+/// (current → no recreate). One created before the per-project net became the PRIMARY
+/// attachment has `"bridge"` / `"default"` / an empty/absent mode (stale → recreate so a
+/// relaunch puts it primary on the per-project net, where embedded DNS + service discovery
+/// make `<workload>` resolve). Anything that is not exactly the expected net is treated as
+/// stale.
+fn primary_network_is_current(network_mode: Option<&str>, expected_net: &str) -> bool {
+    network_mode == Some(expected_net)
+}
+
+/// Map a docker `inspect` container `State` to the runner-level [`Health`], GROUNDED in
+/// the container's ACTUAL state rather than its desired one.
+///
+/// The bug this fixes: a crash-looping container (the app can't reach its DB) is kept
+/// alive IN PLACE by its `restart: always` policy and docker reports it as
+/// `Status: "restarting"`. The old check read only the `State.Running` bool — which is
+/// momentarily `true` during each restart's brief up-window (and which docker's own API
+/// docs warn is *also* `true` for a merely *paused* container) — so a crash loop was
+/// masked as `Healthy`, and both the reconcile's health refresh and `boatramp compute
+/// status` reported a dead workload as up.
+///
+/// We instead key on the authoritative `Status` string: only a genuinely `running`
+/// container is `Healthy`; `restarting` (the crash loop), `exited`, `dead`, `created`,
+/// `paused`, and `removing` are all `Unhealthy`. A declared HEALTHCHECK that is reporting
+/// `unhealthy` overrides a bare "running" (the app itself says it is not serving); a
+/// `starting` healthcheck does NOT (runner-level health is "the process is up" — the
+/// reconcile's separate readiness pass owns service-level readiness). `Status` absent (an
+/// older daemon) falls back to the `Running` bool.
+fn health_from_state(state: Option<&ContainerState>) -> Health {
+    let Some(state) = state else {
+        return Health::Unhealthy;
+    };
+    // A healthcheck that has gone unhealthy is decisive, regardless of run state.
+    if matches!(
+        state.health.as_ref().and_then(|h| h.status),
+        Some(HealthStatusEnum::UNHEALTHY)
+    ) {
+        return Health::Unhealthy;
+    }
+    match state.status {
+        Some(ContainerStateStatusEnum::RUNNING) => Health::Healthy,
+        // A restart loop lands in RESTARTING — the crash loop the old check masked.
+        Some(
+            ContainerStateStatusEnum::RESTARTING
+            | ContainerStateStatusEnum::EXITED
+            | ContainerStateStatusEnum::DEAD
+            | ContainerStateStatusEnum::CREATED
+            | ContainerStateStatusEnum::PAUSED
+            | ContainerStateStatusEnum::REMOVING
+            | ContainerStateStatusEnum::EMPTY,
+        ) => Health::Unhealthy,
+        // Older daemon without a Status string: fall back to the Running bool.
+        None => {
+            if state.running.unwrap_or(false) {
+                Health::Healthy
+            } else {
+                Health::Unhealthy
+            }
+        }
+    }
+}
+
 /// PID cap for a launched container — a fork-bomb guard. Generous
 /// for normal app workloads, bounded so a runaway can't exhaust host PIDs.
 const MAX_PIDS: i64 = 512;
@@ -656,17 +721,30 @@ impl ComputeBackend for DockerBackend {
                 }]),
             )]));
         }
-        config.host_config = Some(host_config);
-
-        // Place the workload on its PER-PROJECT user-defined network (create-if-absent) and attach
-        // with a network ALIAS equal to the workload name. A sibling in the SAME project then
-        // resolves `<workload>:<port>` via docker's embedded DNS (the managed-DB DSN is name-based,
-        // and the default bridge — which this join replaces — has no embedded DNS). The network is
-        // per-project, so docker's inter-network isolation is the tenancy boundary: a different
-        // project's containers live on a different network and can neither resolve nor reach this
-        // one's. Published-port + bridge-IP reach (below) are unaffected — port publishing and
-        // container IPs work on a user-defined network exactly as on the default bridge.
+        // Create-if-absent the PER-PROJECT user-defined network and make it the container's
+        // PRIMARY network (`HostConfig.NetworkMode`), attaching it AT CREATE with a DNS ALIAS
+        // equal to the workload name (`networking_config` for that SAME network).
+        //
+        // This is the load-bearing DNS fix (Bug C). v0.55.0 set `networking_config` for the
+        // per-project net but left `NetworkMode` at its default, so the container's PRIMARY
+        // attachment was the DEFAULT bridge and the per-project net was merely SECONDARY. Two
+        // consequences made name resolution FAIL on the real workloads even though the network
+        // and the DNS aliases existed: (1) the container's `/etc/resolv.conf` pointed at the
+        // default-bridge/host resolver, NOT docker's embedded DNS (127.0.0.11); and (2) docker
+        // publishes a container into a user-defined network's service discovery ONLY when that
+        // net is the container's PRIMARY attachment — a secondary endpoint carrying DNSNames is
+        // not enough. Making the per-project net PRIMARY fixes BOTH: embedded DNS in resolv.conf
+        // AND SD publication, so a sibling resolves `<workload>:<port>` (the managed-DB DSN is
+        // name-based). The per-project net is a non-internal bridge, so egress still NATs out of
+        // it — the default bridge is not needed and is intentionally NOT attached (one network
+        // per project is also the tenancy boundary: docker's inter-network isolation keeps one
+        // project's containers off another's). Published-port + bridge-IP reach are unaffected:
+        // port publishing and `container_ip` work on a user-defined bridge exactly as on the
+        // default bridge (`container_ip` already falls back from the now-empty top-level
+        // `IPAddress` — only set for the default bridge — to the per-project endpoint's IP).
         let network = self.ensure_project_network(&req.project).await?;
+        host_config.network_mode = Some(network.clone());
+        config.host_config = Some(host_config);
         config.networking_config = Some(network_config(&network, vec![req.workload.clone()]));
 
         // Best-effort clean of a stale container with the same name, then create.
@@ -757,14 +835,31 @@ impl ComputeBackend for DockerBackend {
         };
         let info = match self.docker.inspect_container(&name, None).await {
             Ok(info) => info,
+            // Inspect failed (gone / unreachable): not serving.
             Err(_) => return Ok(Health::Unhealthy),
         };
-        let running = info.state.and_then(|s| s.running).unwrap_or(false);
-        Ok(if running {
-            Health::Healthy
-        } else {
-            Health::Unhealthy
-        })
+        Ok(health_from_state(info.state.as_ref()))
+    }
+
+    async fn needs_redeploy(&self, handle: &InstanceHandle, _spec: &ComputeSpec) -> bool {
+        // Auto-heal (Bug A/C): a container whose live PRIMARY network is not this project's
+        // per-project net was created by a release before that net became the primary
+        // attachment — it is up but cannot resolve siblings by name. Report it as needing a
+        // recreate so the reconcile stops + relaunches it (volume-safe), re-running `launch`
+        // with the per-project net as primary. Idempotent: a container already primary on the
+        // net returns `false`. Inspect failure / gone ⇒ `false` (the normal plan path owns it).
+        let name = match decode_ref(&handle.backend_ref) {
+            Some((n, _, _)) => n,
+            None => container_name(&handle.project, &handle.workload, handle.replica),
+        };
+        let Ok(info) = self.docker.inspect_container(&name, None).await else {
+            return false;
+        };
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|hc| hc.network_mode.as_deref());
+        !primary_network_is_current(network_mode, &project_network_name(&handle.project))
     }
 
     /// Run a one-shot command **inside** the running container via the Engine
@@ -1295,6 +1390,116 @@ impl DockerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `ContainerState` with a given `Status` (+ optional running bool / health),
+    /// the shape `inspect` returns, for the pure health-mapping tests.
+    fn state(
+        status: Option<ContainerStateStatusEnum>,
+        running: Option<bool>,
+        health: Option<HealthStatusEnum>,
+    ) -> ContainerState {
+        ContainerState {
+            status,
+            running,
+            health: health.map(|status| bollard::models::Health {
+                status: Some(status),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Bug B: health reflects the ACTUAL container state. A crash-looping container
+    /// (`Status: "restarting"`, kept alive in place by its restart policy) must report
+    /// `Unhealthy`, NOT the masked `Healthy` the old `Running`-bool-only check produced —
+    /// so `compute status` surfaces a crash loop instead of a dead workload reading "up".
+    #[test]
+    fn health_maps_restarting_and_exited_to_unhealthy() {
+        use ContainerStateStatusEnum::*;
+        // The bug: a restart loop. `Running` can even be momentarily true mid-restart.
+        assert_eq!(
+            health_from_state(Some(&state(Some(RESTARTING), Some(true), None))),
+            Health::Unhealthy,
+            "a restarting (crash-looping) container is NOT healthy"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(EXITED), Some(false), None))),
+            Health::Unhealthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(DEAD), Some(false), None))),
+            Health::Unhealthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(Some(CREATED), Some(false), None))),
+            Health::Unhealthy
+        );
+        // A paused container reports Running=true but is not serving — Status rules.
+        assert_eq!(
+            health_from_state(Some(&state(Some(PAUSED), Some(true), None))),
+            Health::Unhealthy
+        );
+    }
+
+    /// Bug B: only a genuinely running container (healthcheck not reporting unhealthy) is
+    /// `Healthy`; a declared healthcheck that has gone unhealthy overrides a bare running,
+    /// while a `starting` healthcheck does not (runner-level health is "process up").
+    #[test]
+    fn health_maps_running_respecting_the_healthcheck() {
+        use ContainerStateStatusEnum::RUNNING;
+        assert_eq!(
+            health_from_state(Some(&state(Some(RUNNING), Some(true), None))),
+            Health::Healthy,
+            "a plain running container with no healthcheck is healthy"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(
+                Some(RUNNING),
+                Some(true),
+                Some(HealthStatusEnum::STARTING)
+            ))),
+            Health::Healthy,
+            "a still-starting healthcheck does not fail runner-level health"
+        );
+        assert_eq!(
+            health_from_state(Some(&state(
+                Some(RUNNING),
+                Some(true),
+                Some(HealthStatusEnum::UNHEALTHY)
+            ))),
+            Health::Unhealthy,
+            "an app declaring itself unhealthy overrides a bare running"
+        );
+        // Older daemon (no Status string): fall back to the Running bool.
+        assert_eq!(
+            health_from_state(Some(&state(None, Some(true), None))),
+            Health::Healthy
+        );
+        assert_eq!(
+            health_from_state(Some(&state(None, Some(false), None))),
+            Health::Unhealthy
+        );
+        // No State at all (gone / unreachable): unhealthy.
+        assert_eq!(health_from_state(None), Health::Unhealthy);
+    }
+
+    /// Bug A/C auto-heal idempotency: only a container already on its per-project net as
+    /// PRIMARY is current; a bridge/default/absent primary is stale (→ recreate).
+    #[test]
+    fn primary_network_current_only_when_it_is_the_project_net() {
+        let expected = project_network_name("acme"); // "boatramp-net-acme"
+        assert!(primary_network_is_current(Some(&expected), &expected));
+        // Pre-fix shapes a v0.55.0/earlier container would report:
+        assert!(!primary_network_is_current(Some("bridge"), &expected));
+        assert!(!primary_network_is_current(Some("default"), &expected));
+        assert!(!primary_network_is_current(Some(""), &expected));
+        assert!(!primary_network_is_current(None, &expected));
+        // A DIFFERENT project's net is also not current (never cross-heal).
+        assert!(!primary_network_is_current(
+            Some("boatramp-net-other"),
+            &expected
+        ));
+    }
 
     #[test]
     fn docker_credentials_maps_registry_auth_and_never_leaks_the_secret() {
