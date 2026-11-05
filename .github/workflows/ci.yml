@@ -1721,7 +1721,7 @@ jobs:
   #  (5) CONTAINER SUBSTRATE — NAMESPACE/CGROUP-CONFINED SERVE (marker `PRIVSEP CONTAINER SUBSTRATE
   #      OK`, Phase 3 simple model / design-note Option C): pins the serving `core` to the now-WIRED
   #      `substrate: container`; the root does the SAME fork+exec with the child additionally
-  #      unsharing NS/PID/IPC/UTS/CGROUP in its pre_exec (no pivot_root, no new net namespace — the
+  #      unsharing NS/IPC/UTS/CGROUP in its pre_exec (no pivot_root, no new net/pid/user namespace — the
   #      per-capability Landlock profile stays the FS wall). The confined `core` self-confirms its
   #      fresh namespaces (fail-closed), installs its Enforced sandbox, and serves a real 200 over the
   #      cross-namespace SCM_RIGHTS splice. The node runs under `sudo -n` for the CAP_SYS_ADMIN the
@@ -1760,7 +1760,7 @@ jobs:
           grep -q 'PRIVSEP PER-TENANT OK' privsep-live.log \
             || { echo "::error::privsep per-tenant live gate never reached its marker (a WS-C per-tenant compute-plane spawn / execute-pin / resolver regression)" >&2; exit 1; }
           grep -q 'PRIVSEP CONTAINER SUBSTRATE OK' privsep-live.log \
-            || { echo "::error::privsep container-substrate gate never reached its marker (the WIRED substrate: container must serve a real 200 from a namespace/cgroup-confined instance that self-confirmed its unshared NS/PID/IPC/UTS/CGROUP; a regression that drops the namespace wall, or a lost CAP_SYS_ADMIN/sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-container.md)" >&2; exit 1; }
+            || { echo "::error::privsep container-substrate gate never reached its marker (the WIRED substrate: container must serve a real 200 from a namespace/cgroup-confined instance that self-confirmed its unshared NS/IPC/UTS/CGROUP; a regression that drops the namespace wall, or a lost CAP_SYS_ADMIN/sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-container.md)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into

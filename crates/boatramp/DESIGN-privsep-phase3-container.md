@@ -322,8 +322,8 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
 - **`spawn_wired_instance`** (`boatramp/src/privsep.rs`, the root's OWN fork+exec primitive, shared
   by the boot supervisor AND the per-tenant router): for a `spec.substrate == Container` child, the
   child's `pre_exec` first runs
-  `unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWCGROUP)`, THEN the
-  byte-identical OsProcess sequence — the `(src→tgt)` `dup2` loop with `CLOEXEC` cleared, then
+  `unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWCGROUP)` (FOUR namespaces —
+  `CLONE_NEWPID` was dropped; see flag #2), THEN the byte-identical OsProcess sequence — the `(src→tgt)` `dup2` loop with `CLOEXEC` cleared, then
   `PR_SET_PDEATHSIG(SIGKILL)`. The socketpair + `SCM_RIGHTS` fd-pass, the `env_clear().envs(scrubbed)`
   (F11-B), `PR_SET_PDEATHSIG`, and the root's `try_wait` → `FailNodeClosed` supervision are
   **unchanged** (for an OsProcess child the container branch is a no-op, so that path is literally
@@ -338,8 +338,9 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
   the one failure mode the spawner-side `unshare` cannot (a dispatch regression that spawns a
   Container spec WITHOUT the `unshare`). The live gate's 200 is the proof, exactly as the
   signer-unseal gate's 200 proves the unseal.
-- **Deliberately NOT unshared:** `CLONE_NEWNET` (a `backend.*` instance keeps host-net egress to its
-  DB/KV/blob — §5b/§egress corner) and `CLONE_NEWUSER` (no user namespace in the first cut — §5b).
+- **Deliberately NOT unshared:** `CLONE_NEWPID` (dropped — flag #2), `CLONE_NEWNET` (a `backend.*`
+  instance keeps host-net egress to its DB/KV/blob — §5b/§egress corner) and `CLONE_NEWUSER` (no user
+  namespace in the first cut — §5b).
 - **No `pivot_root`, no rootfs:** the per-capability **Landlock** profile remains the FS wall
   (`CLONE_NEWNS` only gives a *copy* of the mount table; the Landlock grants resolve to the same
   inodes, so the FS confinement is unchanged). The own-exe execute-pin is unchanged (`current_exe()`
@@ -353,13 +354,21 @@ the authoritative record of the implementation; §1–§7 above are the reasonin
    HARD precondition for `substrate: container`: on a node lacking it, the container instance
    fail-closes (correct, but operationally it means container substrate is root-only until a userns
    increment lands). The live gate runs the node under `sudo -n` to obtain it.
-2. **PID-namespace simple-model semantic.** `unshare(CLONE_NEWPID)` does NOT move the CALLER into the
-   new pid namespace — only its future children. So the `__instance` process itself keeps the root's
-   pid namespace; the pid-ns isolation applies to any sub-processes it forks (e.g. a per-tenant
-   router's children), not to the instance process. The self-check therefore asserts mnt/ipc/uts/
-   cgroup (immediate) but NOT pid. A stricter model (fork a pid-ns init, as the container worker does)
-   is a possible future increment; it was deliberately NOT done here to keep `FailNodeClosed`/
-   PDEATHSIG/reaping byte-identical to OsProcess (the whole point of Option C).
+2. **`CLONE_NEWPID` DROPPED (empirical — the live gate caught it).** The first cut included
+   `CLONE_NEWPID` as instructed, but the live gate showed the Container `core` self-confirmed its
+   namespaces and installed its Enforced sandbox, then **panicked at tokio runtime startup**:
+   `OS can't spawn worker thread: Resource temporarily unavailable (EAGAIN)`. Root cause:
+   `unshare(CLONE_NEWPID)` does NOT move the caller into the new pid namespace — it only retargets
+   `pid_ns_for_children` at a fresh, empty namespace with no init (pid 1). On the simple model there
+   is no fork-to-pid-1 (Option C deliberately never forks a pid-ns init, to keep FailNodeClosed/
+   PDEATHSIG/reaping byte-identical to OsProcess), so the FIRST thread/process the re-exec'd instance
+   creates fails `EAGAIN` — fatal for any multithreaded (tokio) instance. And because the caller is
+   never moved, the pid namespace gave the instance process itself NO isolation anyway (only
+   hypothetical sub-processes). So `CLONE_NEWPID` was removed: it is both useless on the simple model
+   and actively fatal. The self-check asserts mnt/ipc/uts/cgroup only. **True pid-namespace isolation
+   needs the pid-ns-init fork model** (the container worker's shape: `unshare(CLONE_NEWPID)` then fork
+   so the instance becomes pid 1, with the parent reaping the init) — a deferred increment that
+   changes the process/reaping model and must be designed with Security.
 3. **Net namespace shared (egress decision — as instructed).** `CLONE_NEWNET` is NOT unshared, so a
    `backend.*` instance keeps its path to Postgres/KV/blob and the already-connected client socket an
    SCM_RIGHTS splice hands it still works. Net isolation is therefore NOT provided by this cut; if it

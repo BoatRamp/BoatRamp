@@ -198,7 +198,7 @@ pub struct InstanceSpawnSpec {
     /// The ISOLATION SUBSTRATE this instance's spawn backend uses (design §7 "substrate is a spawn
     /// backend"). The supervisor dispatches on it: `OsProcess` is the Phase-1 fork+exec backend and
     /// `Container` the Phase-3 one (the SAME fork+exec, the child additionally unsharing
-    /// NS/PID/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8); `Vm` is refused
+    /// NS/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8); `Vm` is refused
     /// fail-closed by [`resolve_spawn_backend`] until its vsock-crossing wiring lands.
     pub substrate: InstanceSubstrate,
     /// The re-exec argv TAIL (after `argv[0]`): `["__instance", "<label>", "--config", "<path>"]`.
@@ -842,9 +842,9 @@ fn instance_listener_addr(
 /// **Phase-3 scope.** [`InstanceSubstrate::OsProcess`] is the Phase-1 WIRED backend (the root's
 /// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] is NOW WIRED
 /// too, on the SIMPLE model (design-note Option C, owner-approved): the SAME `fork`+`exec`, with the
-/// child additionally unsharing the mount/pid/ipc/uts/cgroup namespaces in its `pre_exec` (no
-/// `pivot_root`, no new net namespace — the per-capability Landlock profile stays the FS wall, and a
-/// `backend.*` instance keeps host-net egress). [`InstanceSubstrate::Vm`] stays the reported
+/// child additionally unsharing the mount/ipc/uts/cgroup namespaces in its `pre_exec` (no
+/// `pivot_root`, no new net/pid/user namespace — the per-capability Landlock profile stays the FS
+/// wall, and a `backend.*` instance keeps host-net egress; pid-ns isolation is a deferred increment). [`InstanceSubstrate::Vm`] stays the reported
 /// follow-on: a VM has its OWN kernel, so the `local` socketpair cannot cross (unlike Container on one
 /// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport. Until then
 /// `Vm` is refused fail-closed, naming the backend it reuses — never silently downgraded to an OS
@@ -1199,11 +1199,15 @@ mod per_tenant {
     /// machinery is POSIX; only `PR_SET_PDEATHSIG` is Linux-gated.
     ///
     /// **Container substrate (Phase-3 SIMPLE model — design-note Option C).** When
-    /// `spec.substrate == Container`, the child additionally `unshare(2)`s the mount, pid, ipc, uts,
-    /// and cgroup namespaces at the TOP of its `pre_exec`, BEFORE the (byte-identical) dup / CLOEXEC /
+    /// `spec.substrate == Container`, the child additionally `unshare(2)`s the mount, ipc, uts, and
+    /// cgroup namespaces at the TOP of its `pre_exec`, BEFORE the (byte-identical) dup / CLOEXEC /
     /// `PR_SET_PDEATHSIG` sequence an OS-process child runs — so a Container child is nothing but an
     /// OS-process child with a namespace/cgroup wall ADDED underneath. Deliberately NOT unshared:
-    /// `CLONE_NEWNET` (a `backend.*` instance must keep host-net egress to its DB/KV/blob — design §5b)
+    /// `CLONE_NEWPID` (on the simple model it only retargets `pid_ns_for_children` without moving the
+    /// caller, so with no fork-to-pid-1 the first thread the instance spawns fails `EAGAIN` — it
+    /// breaks a multithreaded tokio instance and gives the instance process itself no isolation; true
+    /// pid-ns isolation needs the pid-ns-init fork model, a deferred increment — design §8),
+    /// `CLONE_NEWNET` (a `backend.*` instance must keep host-net egress to its DB/KV/blob — design §5b),
     /// and `CLONE_NEWUSER` (the per-capability Landlock + seccomp wall + the existing privilege drop
     /// already contain it — design §5b). `CLONE_NEWNS` gives a COPY of the mount table (no
     /// `pivot_root`): the per-capability Landlock profile the child installs post-`exec` stays the FS
@@ -1233,7 +1237,7 @@ mod per_tenant {
         if container {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "the container substrate needs Linux namespaces (CLONE_NEWNS/NEWPID/NEWIPC/NEWUTS/\
+                "the container substrate needs Linux namespaces (CLONE_NEWNS/NEWIPC/NEWUTS/\
                  NEWCGROUP); refusing to spawn it unconfined on a non-Linux build",
             ));
         }
@@ -1241,16 +1245,25 @@ mod per_tenant {
         // async-signal-safe and touch only this child's namespaces + fd table + death-signal. The
         // caller assigns target fds above every source (boot path) or uses `src == tgt` (per-tenant
         // single link), so no `dup2` clobbers a not-yet-processed source. The `unshare` precedes the
-        // fd dups, but none of the unshared namespaces (NS/PID/IPC/UTS/CGROUP — net deliberately
-        // EXCLUDED) touch the fd table, so the fd-pass is byte-identical to the OS-process path.
+        // fd dups, but none of the unshared namespaces (NS/IPC/UTS/CGROUP — net + pid + user
+        // deliberately EXCLUDED) touch the fd table, so the fd-pass is byte-identical to the
+        // OS-process path.
         unsafe {
             cmd.pre_exec(move || {
                 // Container substrate: add the namespace/cgroup wall FIRST, then run the identical
                 // OS-process fd-pass + death-signal sequence below. (No-op for OS-process children.)
+                // `CLONE_NEWPID` is DELIBERATELY EXCLUDED on the simple model: `unshare(CLONE_NEWPID)`
+                // does not move the caller into the new pid namespace — it only retargets
+                // `pid_ns_for_children` — so with no fork-to-pid-1 (Option C never forks a pid-ns
+                // init, to keep FailNodeClosed/PDEATHSIG/reaping byte-identical to OS-process), the
+                // FIRST thread/process the re-exec'd instance creates fails `EAGAIN` ("can't spawn
+                // worker thread"), killing a multithreaded (tokio) instance at startup. Confirmed on
+                // the live gate. True pid-namespace isolation needs the pid-ns-init fork model (the
+                // container worker's shape) and is a deferred increment — see §8 flag in the design
+                // note. The four we unshare take effect for the caller IMMEDIATELY.
                 #[cfg(target_os = "linux")]
                 if container {
                     let flags = libc::CLONE_NEWNS
-                        | libc::CLONE_NEWPID
                         | libc::CLONE_NEWIPC
                         | libc::CLONE_NEWUTS
                         | libc::CLONE_NEWCGROUP;
@@ -2024,7 +2037,7 @@ mod supervise {
                         substrate = spec.substrate.tag(),
                         "[privsep] root: spawned __instance (fds wired, scrubbed env{})",
                         if matches!(spec.substrate, super::InstanceSubstrate::Container) {
-                            "; unshared NS/PID/IPC/UTS/CGROUP — net shared for egress"
+                            "; unshared NS/IPC/UTS/CGROUP — net+pid+user shared (simple model)"
                         } else {
                             ""
                         }
@@ -4326,7 +4339,7 @@ mod tests {
     #[test]
     fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm() {
         // OS-process is the Phase-1 wired backend; Container is the Phase-3 wired backend (the SIMPLE
-        // model — the SAME fork+exec, with the child unsharing NS/PID/IPC/UTS/CGROUP in its pre_exec).
+        // model — the SAME fork+exec, with the child unsharing NS/IPC/UTS/CGROUP in its pre_exec).
         resolve_spawn_backend("frontend", InstanceSubstrate::OsProcess)
             .expect("os-process is a wired spawn backend");
         resolve_spawn_backend("core", InstanceSubstrate::Container)

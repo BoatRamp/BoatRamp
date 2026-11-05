@@ -705,7 +705,7 @@ fn privsep_per_tenant_serves_end_to_end() {
 /// Forks `boatramp __root` against the known-valid frontend-inversion topology (union == `all`, grants
 /// disjoint, no crown co-resident with a listener/exec/control surface) whose serving `core` is pinned
 /// `substrate: container`. The root does the SAME fork+exec the OsProcess path does, with the `core`
-/// child additionally `unshare`ing the mount/pid/ipc/uts/cgroup namespaces in its `pre_exec` (no
+/// child additionally `unshare`ing the mount/ipc/uts/cgroup namespaces in its `pre_exec` (no
 /// `pivot_root`, no new net namespace — the per-capability Landlock profile stays the FS wall).
 ///
 /// Proves end-to-end, against the live kernel: a client `GET /` flows client → `frontend` listener fd
@@ -733,7 +733,7 @@ fn privsep_per_tenant_serves_end_to_end() {
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 #[test]
 #[ignore = "live: forks boatramp __root (as root, via sudo -n, for CAP_SYS_ADMIN) for a composition \
-            whose serving core is pinned `substrate: container`; the core unshares NS/PID/IPC/UTS/\
+            whose serving core is pinned `substrate: container`; the core unshares NS/IPC/UTS/\
             CGROUP, self-confirms the namespaces, installs its Enforced sandbox, and serves end-to-end \
             over the cross-namespace splice (Linux + `sandbox`); run via --include-ignored in the \
             `live gate (privsep)` job"]
