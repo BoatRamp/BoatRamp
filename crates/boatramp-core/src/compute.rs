@@ -154,6 +154,84 @@ pub fn compute_instance_id(project: &str, workload: &str, replica: u32) -> Strin
     }
 }
 
+/// The RFC 1035 single-label limit: one dot-separated component of a hostname is at most
+/// **63 octets**. Docker 29's libnetwork refuses to publish an embedded-DNS service-discovery
+/// record for a label longer than this (Docker 28 and earlier silently tolerated it), so a
+/// per-project-network ALIAS over 63 octets never resolves on 29.x — a sibling gets NXDOMAIN
+/// even though the container's endpoint joined the network and `docker inspect` shows the
+/// alias. This was empirically confirmed on a Docker 29.9.1 host (a 69-char alias failed to
+/// register; a 13-char one resolved; the only discriminator was the length, not the charset).
+pub const DNS_LABEL_MAX_LEN: usize = 63;
+
+/// Whether `s` is a resolvable single DNS label on a docker embedded-DNS network: 1..=63
+/// octets, each byte ASCII alphanumeric or `-`/`_`, not starting or ending with `-`. (`_`
+/// is deliberately accepted — boatramp's sanitized tenant idents contain it and Docker 29's
+/// embedded DNS registers it fine; the empirically-decisive constraint is the 63-octet
+/// length, which this enforces as [`DNS_LABEL_MAX_LEN`].)
+pub fn is_valid_dns_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > DNS_LABEL_MAX_LEN {
+        return false;
+    }
+    if b[0] == b'-' || b[b.len() - 1] == b'-' {
+        return false;
+    }
+    b.iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// The service-discovery ALIAS a co-located workload is published under on its per-project
+/// docker network — and, identically, the hostname a sibling composes into the managed-DB
+/// DSN it resolves. It MUST be a valid DNS label (≤ [`DNS_LABEL_MAX_LEN`] octets) or Docker
+/// 29's embedded DNS will not register it (see [`DNS_LABEL_MAX_LEN`]).
+///
+/// The compute workload NAME is the stable identity (container name, deploy-store key,
+/// per-tenant volume, sealed credential) and is intentionally left long and byte-stable. For
+/// a `Single`-isolation managed database that name is `<compute>-<sanitized-tenant-ident>`
+/// where BOTH halves already carry a 25-char digest, so it routinely exceeds 63 octets
+/// (`bramp-db-<25>-<body>_<25>` ≈ 69). Resolving a workload by that over-long name is exactly
+/// what broke on Docker 29.9.1 — the alias was the full workload name.
+///
+/// This maps a workload name to a short, STABLE, DNS-valid alias used for BOTH the network
+/// endpoint alias (`boatramp-docker`'s `launch`) AND the DSN host a consumer resolves
+/// (`NodeTenantSqlResolver::connection_parts`), so the two always MATCH:
+///
+/// - A name that already fits (≤ 63 octets) is returned UNCHANGED — so every current working
+///   name (a short user workload, a `Shared` server's plain `<compute>`) stays byte-identical
+///   and behavior/existing deployments are unaffected. This is also why Docker 28 was always
+///   fine: its names registered regardless of length.
+/// - A longer name is replaced by `bramp-db-<25-char base-36 digest of the full name>` (34
+///   octets): a fixed-width, collision-resistant (128-bit SHA-256-derived) label in the
+///   `[a-z0-9-]` grammar with a letter lead. Being a pure function of the workload name, the
+///   launch alias and the DSN host derive the IDENTICAL string.
+///
+/// Uniqueness only has to hold WITHIN one project's isolated network; the 128-bit digest makes
+/// a collision between two distinct workload names cryptographically negligible, and colliding
+/// with a short literal `bramp-db-<…>` workload would require an operator to name a workload
+/// the exact 25-char digest — not a reachable accident.
+pub fn managed_db_alias(workload: &str) -> String {
+    if workload.len() <= DNS_LABEL_MAX_LEN {
+        return workload.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    // Leading 128 bits of SHA-256, re-encoded base-36 at a fixed 25-char width (36^25 > 2^128),
+    // mirroring the managed-DB workload digest scheme so operators see a familiar shape.
+    let hex = hex::encode(Sha256::digest(workload.as_bytes()));
+    let mut n = u128::from_str_radix(&hex[..32], 16).expect("32 hex chars are a valid u128");
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = [b'0'; 25];
+    let mut i = buf.len();
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = DIGITS[(n % 36) as usize];
+        n /= 36;
+    }
+    format!(
+        "bramp-db-{}",
+        String::from_utf8(buf.to_vec()).expect("base-36 digits are ASCII")
+    )
+}
+
 /// The **per-(project, workload) scope** a backend keys a persistent volume's host
 /// backing directory under, so two co-located workloads that name a volume identically
 /// never collide on one host directory. It identifies `(project, workload)` (a volume
@@ -3020,6 +3098,63 @@ mod tests {
             compute_instance_id("acme", "web", 0),
             compute_instance_id("default", "web", 0)
         );
+    }
+
+    /// The Docker-29 service-discovery fix (RFC 1035 63-octet label cap): a short, valid
+    /// workload name is published as-is (so every pre-existing deployment and the green gate
+    /// are byte-unchanged), while a name over 63 octets — the real `Single` managed-DB shape
+    /// `bramp-db-<25>-<body>_<25>` — is mapped to a short, STABLE, DNS-valid alias. This is the
+    /// VERSION-INDEPENDENT guard: it fails on ANY host (no docker needed) if the emitted alias
+    /// could ever exceed a DNS label, which is exactly what Docker 29.9.1 refuses to register.
+    #[test]
+    fn managed_db_alias_fits_a_dns_label_and_is_stable() {
+        // Short/valid names pass straight through — no behavior change anywhere.
+        assert_eq!(managed_db_alias("web"), "web");
+        assert_eq!(managed_db_alias("pg"), "pg");
+        let shared = "bramp-db-abcdefghijklmnopqrstuvwxy"; // 34 octets (≤ 63): unchanged
+        assert!(shared.len() <= DNS_LABEL_MAX_LEN);
+        assert_eq!(managed_db_alias(shared), shared);
+
+        // A realistic >63-octet `Single` managed-DB workload name: `<compute>-<ident>` where
+        // BOTH halves carry a 25-char digest — the exact shape that broke on Docker 29.9.1.
+        let h = "abcdefghijklmnopqrstuvwxy"; // 25 base-36 chars
+        let long = format!("bramp-db-{h}-acme_{h}");
+        assert!(
+            long.len() > DNS_LABEL_MAX_LEN,
+            "fixture must exceed the 63-octet DNS label cap (the bug): got {}",
+            long.len()
+        );
+        let alias = managed_db_alias(&long);
+        assert!(
+            alias.len() <= DNS_LABEL_MAX_LEN,
+            "the emitted alias MUST fit a DNS label or Docker 29 drops its SD record: {alias} ({} octets)",
+            alias.len()
+        );
+        assert!(
+            is_valid_dns_label(&alias),
+            "the emitted alias must be a valid DNS label: {alias}"
+        );
+        assert!(alias.starts_with("bramp-db-"), "greppable prefix: {alias}");
+        // Pure + stable across calls (the launch alias and the DSN host must agree, forever).
+        assert_eq!(alias, managed_db_alias(&long));
+        // Distinct long workloads ⇒ distinct aliases (per-project uniqueness).
+        let long2 = format!("bramp-db-{h}-beta_{h}");
+        assert_ne!(
+            managed_db_alias(&long),
+            managed_db_alias(&long2),
+            "distinct managed-DB workloads must not collide on their SD alias"
+        );
+    }
+
+    #[test]
+    fn is_valid_dns_label_enforces_the_63_octet_cap() {
+        assert!(is_valid_dns_label("pg"));
+        assert!(is_valid_dns_label("bramp-db-acme_0123456789abcdef")); // `_` is accepted
+        assert!(is_valid_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN)));
+        assert!(!is_valid_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN + 1))); // 64 octets: invalid
+        assert!(!is_valid_dns_label("")); // empty
+        assert!(!is_valid_dns_label("-lead")); // leading hyphen
+        assert!(!is_valid_dns_label("trail-")); // trailing hyphen
     }
 
     #[test]
