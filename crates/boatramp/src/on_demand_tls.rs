@@ -2721,9 +2721,11 @@ mod tests {
                 // DNS-01 only is served by TXT; the VA resolves A records via challtestsrv's DNS.
                 // Disable challtestsrv's OWN http/tls-alpn responders — the node's edge answers
                 // TLS-ALPN-01. `-defaultIPv4` answers A queries (both domains resolve to the loopback
-                // the edge + Pebble run on).
+                // the edge + Pebble run on); `-defaultIPv6 ""` disables the default AAAA=::1 answer so
+                // the TLS-ALPN-01 VA dials the IPv4 edge (bound on 127.0.0.1) instead of an unbound
+                // [::1] (which would refuse → authz INVALID — a harness artifact, not a product fault).
                 .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
-                .args(["-defaultIPv4", "127.0.0.1"])
+                .args(["-defaultIPv4", "127.0.0.1", "-defaultIPv6", ""])
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn pebble-challtestsrv"),
