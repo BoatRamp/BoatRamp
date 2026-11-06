@@ -621,8 +621,10 @@ use rustls::sign::CertifiedKey;
 
 /// Picks a cached [`CertifiedKey`] by SNI, honoring single-label wildcards
 /// (so every `<id>.deploy.<host>` preview is served by the one wildcard cert).
+/// `pub(crate)` so the serve path can build the node control-plane set ONCE and share it between the
+/// `:443` edge config and the [`NodeCertSource`] handle a `use_node_cert` listener reads (Concept 1).
 #[derive(Debug)]
-struct SniCertResolver {
+pub(crate) struct SniCertResolver {
     entries: Vec<(String, Arc<CertifiedKey>)>,
 }
 
@@ -643,11 +645,71 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
-/// Serves the static (wildcard) certs first, then falls back to on-demand per-SNI issuance
-/// (cap-req 03). A concrete composite because `ResolvesServerCert::resolve` consumes the
-/// `ClientHello` by value — it extracts the SNI + ALPN once and dispatches to each tier's
-/// `resolve_sni`. Only built when `[serve.on_demand_tls]` is enabled; otherwise the static resolver
-/// is used alone (unchanged).
+/// **Concept 1 — the node's own control-plane certificate source.** The live, hot-swappable set of
+/// `--acme-domain` certs the `:443` edge serves (how the NODE obtains + serves its OWN cert, driven by
+/// `--tls`/`--acme-domain`). Exposed as a SHARED handle so a `use_node_cert` listener resolves the SAME
+/// cert the edge serves — never a one-time snapshot: the `--acme-domain` certs are hot-swapped on
+/// renewal (serve.rs), so the renewal loop swaps a fresh [`SniCertResolver`] in via [`store`](Self::store)
+/// and every reader (edge + listeners) picks it up on the next handshake (a lock-free atomic load, the
+/// same primitive `ReloadableTls` uses).
+///
+/// This is deliberately SEPARATE from the Concept-2 on-demand engine ([`crate::on_demand_tls`]), which
+/// ISSUES certs on demand for OTHER (tenant) domains under the #02 verified-domain gate. A
+/// `use_node_cert` listener SERVES this source directly and never touches the on-demand issuance path —
+/// so a pure control-plane FQDN (not a tenant attached+verified domain) is served without the
+/// tenant-verification gate. See `crates/boatramp/DESIGN-acme-concept-decouple.md`.
+#[cfg(feature = "acme-dns")]
+#[derive(Clone)]
+pub(crate) struct NodeCertSource {
+    resolver: Arc<arc_swap::ArcSwap<SniCertResolver>>,
+}
+
+#[cfg(feature = "acme-dns")]
+impl std::fmt::Debug for NodeCertSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCertSource").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "acme-dns")]
+impl NodeCertSource {
+    /// Wrap the initial control-plane resolver (the first obtained `--acme-domain` set).
+    pub(crate) fn new(resolver: Arc<SniCertResolver>) -> Self {
+        Self {
+            resolver: Arc::new(arc_swap::ArcSwap::from(resolver)),
+        }
+    }
+
+    /// Hot-swap the control-plane certs (the ACME renewal loop calls this with the freshly-obtained
+    /// set); every reader — the `:443` edge and every `use_node_cert` listener — serves it on the next
+    /// handshake. This is what makes the shared handle renewal-safe rather than a stale snapshot.
+    pub(crate) fn store(&self, resolver: Arc<SniCertResolver>) {
+        self.resolver.store(resolver);
+    }
+
+    /// The current control-plane cert for `sni` (exact / single-label wildcard), or `None` when the
+    /// node holds no control-plane cert for the name (the managed tier then falls back / fails closed).
+    pub(crate) fn resolve_sni(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+        self.resolver.load().resolve_sni(sni)
+    }
+}
+
+/// A three-tier SNI cert resolver (`ResolvesServerCert::resolve` consumes the `ClientHello` by value,
+/// so this extracts the SNI + ALPN once and dispatches to each tier). The tiers keep the two TLS/ACME
+/// concepts SEPARATE (see `DESIGN-acme-concept-decouple.md`):
+///
+/// 1. **managed_names tier (Concept 1):** an SNI in the listener's `server_names` allowlist is served
+///    the NODE'S CONTROL-PLANE cert (the same `--acme-domain` cert the `:443` edge serves) directly from
+///    [`node_certs`](Self::node_certs) — NEVER the on-demand engine. On a miss it falls back to the
+///    listener's own static cert, else fails closed; it never triggers on-demand issuance. Empty managed
+///    tier at the edge (so the edge is byte-for-byte unchanged).
+/// 2. **catch_all_on_demand tier (Concept 2):** a non-managed SNI is served a static (pre-known) cert
+///    if any, else — only when `catch_all_on_demand` — the on-demand per-SNI issuer (project-scope +
+///    verified-domain gating intact). The `:443` edge and an `on_demand` catch-all listener set this.
+/// 3. **static tier:** the listener's own `cert_file`/`key_file`.
+///
+/// Only built when `[serve.on_demand_tls]` is enabled (or a listener opts into `use_node_cert` /
+/// `on_demand`); otherwise the static resolver is used alone (unchanged).
 #[cfg(feature = "acme-dns")]
 #[derive(Debug)]
 struct CompositeResolver {
@@ -660,28 +722,31 @@ struct CompositeResolver {
     /// gets per-domain on-demand issuance. This is transport-level only — nothing here knows or cares
     /// what protocol runs over the connection.
     default_cert: Option<Arc<CertifiedKey>>,
-    /// cap-req #29: the SNI **patterns** for which the **NODE-MANAGED** cert is PREFERRED — served (and
-    /// triggered for issuance) through `on_demand`, the SAME engine the `:443` edge uses — with the
-    /// static cert (if any) demoted to a FALLBACK for these. Empty at the edge and for a listener that
-    /// did not opt into `use_node_cert` (so the resolution order is byte-for-byte unchanged there). A
-    /// listener sets this to its `server_names` allowlist; the gate inside `on_demand`
-    /// (verified+attached+project) still applies, so listing a name here never lets the listener serve
-    /// an unauthorized cert.
+    /// cap-req #29 (Concept 1): the SNI **patterns** the listener serves the NODE'S CONTROL-PLANE cert
+    /// for — resolved against [`node_certs`](Self::node_certs), the SAME source backing `:443`, NEVER
+    /// the on-demand engine. The listener's own static cert (if any) is only the FALLBACK when the node
+    /// holds no control-plane cert for the name. Empty at the edge and for a listener that did not opt
+    /// into `use_node_cert` (so the resolution order is byte-for-byte unchanged there). A listener sets
+    /// this to its `server_names` allowlist, which BOUNDS managed serving: an SNI outside it never gets
+    /// the node cert.
     ///
     /// Matched with the SAME [`sni_matches`] semantics as the static tier (Security review F1):
     /// case-insensitive + single-label wildcard. A plain `HashSet::contains` would be a case-sensitive
     /// EXACT match, so a wildcard or mixed-case `server_names` entry would silently MISS the managed
     /// path and the static tier (which IS wildcard/case-aware) would serve the operator's static cert
-    /// instead — a silent node-managed→static downgrade. A wildcard managed pattern routes a covered
-    /// concrete SNI to the engine, which issues per-concrete-SNI under the verified gate (a
-    /// DNS-verified ancestor zone authorizes the subtree — see `is_host_issuance_authorized`), so
-    /// wildcard managed serving is sound.
+    /// instead — a silent node-managed→static downgrade.
     managed_names: Vec<String>,
+    /// **Concept 1** — the node's control-plane cert source the managed tier resolves against (the SAME
+    /// live, hot-swappable handle the `:443` edge serves from). `Some` only for a `use_node_cert`
+    /// listener; `None` at the edge and for a listener that did not opt in (then `managed_names` is
+    /// empty and this is never consulted). Resolving the managed tier HERE — not through the on-demand
+    /// engine — is the decoupling fix: a pure control-plane FQDN serves without the Concept-2
+    /// tenant-verification gate.
+    node_certs: Option<NodeCertSource>,
     /// Whether a NON-managed SNI may fall through to on-demand issuance (serve/trigger). `true` at the
     /// `:443` edge and for an `on_demand` catch-all listener (unchanged). `false` for a
-    /// `use_node_cert`-only listener, so its managed serving/triggering is BOUNDED to `managed_names`
-    /// (cap-req #29 security: the listener never serves — nor triggers issuance for — a domain outside
-    /// its declared `server_names`).
+    /// `use_node_cert`-only listener, so it serves ONLY its `managed_names` control-plane certs (and
+    /// never serves — nor triggers issuance for — a domain outside its declared `server_names`).
     catch_all_on_demand: bool,
 }
 
@@ -693,26 +758,33 @@ impl ResolvesServerCert for CompositeResolver {
             return self.default_cert.clone();
         };
         let is_acme_alpn = crate::on_demand_tls::is_acme_tls_alpn(&hello);
-        // cap-req #29: for a listener-declared NODE-MANAGED name, the node-managed cert (the SAME cert
-        // the `:443` edge serves, via the SAME scoped engine) is PREFERRED; the listener's own static
-        // cert, if configured, is only the fallback (while the managed cert warms, or for a name the
-        // node cannot currently serve). On a TLS-ALPN-01 validation handshake serve ONLY the ephemeral
-        // challenge cert (never the static cert, which would fail validation).
+        // TIER 1 — managed_names (Concept 1): a listener-declared NODE control-plane name is served the
+        // node's OWN cert (the SAME `--acme-domain` cert the `:443` edge serves) straight from
+        // `node_certs`. The on-demand engine (Concept 2) is NEVER consulted for a managed name, so no
+        // tenant-verification gate and no issuance trigger apply here — a pure control-plane FQDN
+        // serves. The node control-plane cert is obtained via DNS-01 by the renewal loop, so a
+        // TLS-ALPN-01 validation handshake never targets a managed name at a listener; `is_acme_alpn`
+        // is irrelevant to this tier. On a genuine miss (the node holds no cert for the name yet) fall
+        // back to the listener's OWN static cert if present, else fail closed — but do NOT trigger
+        // on-demand issuance.
         if self
             .managed_names
             .iter()
             .any(|pattern| sni_matches(pattern, sni))
         {
-            let managed = self.on_demand.resolve_sni(sni, is_acme_alpn);
-            if is_acme_alpn {
-                return managed;
+            if let Some(key) = self
+                .node_certs
+                .as_ref()
+                .and_then(|src| src.resolve_sni(sni))
+            {
+                return Some(key);
             }
-            return managed.or_else(|| self.static_resolver.resolve_sni(sni));
+            return self.static_resolver.resolve_sni(sni);
         }
-        // A non-managed SNI: a static (pre-known) cert wins; else the catch-all on-demand per-SNI
-        // issuer — but ONLY when this config enables it (the edge, and an `on_demand` listener). A
-        // `use_node_cert`-only listener does NOT fall through here, so it never serves or triggers a
-        // cert for a domain outside its `managed_names`.
+        // TIER 2/3 — a NON-managed SNI (Concept 2): a static (pre-known) cert wins; else the catch-all
+        // on-demand per-SNI issuer — but ONLY when this config enables it (the `:443` edge, and an
+        // `on_demand` listener). A `use_node_cert`-only listener does NOT fall through here, so it never
+        // serves or triggers a cert for a domain outside its `managed_names`.
         if let Some(key) = self.static_resolver.resolve_sni(sni) {
             return Some(key);
         }
@@ -738,7 +810,9 @@ pub(crate) fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Ce
 
 /// Build the SNI cert resolver from `entries` (`(SNI-pattern, cert)`). Shared by
 /// the TCP and HTTP/3 server configs so they serve identical certs from one parse.
-fn sni_resolver(entries: Vec<(String, IssuedCert)>) -> Result<Arc<SniCertResolver>> {
+/// `pub(crate)` so the serve path can build the node control-plane set ONCE and share that single
+/// `Arc<SniCertResolver>` between the `:443` edge config and the [`NodeCertSource`] handle.
+pub(crate) fn sni_resolver(entries: Vec<(String, IssuedCert)>) -> Result<Arc<SniCertResolver>> {
     let mut resolved = Vec::new();
     for (pattern, cert) in entries {
         let key = certified_key_from_pem(&cert.certificate_pem, &cert.private_key_pem).map_err(
@@ -752,41 +826,6 @@ fn sni_resolver(entries: Vec<(String, IssuedCert)>) -> Result<Arc<SniCertResolve
     Ok(Arc::new(SniCertResolver { entries: resolved }))
 }
 
-/// Build a rustls [`ServerConfig`](rustls::ServerConfig) that serves
-/// `entries` (`(SNI-pattern, cert)`) by SNI, advertising ALPN `h2`/`http/1.1` so
-/// the serving stack negotiates HTTP/2 (the renewal path rebuilds through here, so
-/// a hot-swapped config keeps the same ALPN).
-pub fn build_server_config(entries: Vec<(String, IssuedCert)>) -> Result<rustls::ServerConfig> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(sni_resolver(entries)?);
-    config.alpn_protocols = boatramp_server::alpn_h1_h2();
-    Ok(config)
-}
-
-/// Build both the TCP rustls config **and** an HTTP/3-ready one (ALPN `h3`) from
-/// the same `entries`, sharing one SNI resolver. `IssuedCert`
-/// isn't `Clone`, so this is how the h3 listener gets the same dynamic ACME certs
-/// — and the caller swaps the quinn config on renewal exactly as the TCP path
-/// reloads. Only the HTTP/3 serve path needs the paired config, so it is gated
-/// on `http3` (matching its call sites) — without that feature a lone `acme-dns`
-/// build would see it as dead.
-#[cfg(feature = "http3")]
-pub fn build_server_configs(
-    entries: Vec<(String, IssuedCert)>,
-) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
-    let resolver = sni_resolver(entries)?;
-    let mut tcp = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
-    tcp.alpn_protocols = boatramp_server::alpn_h1_h2();
-    let mut h3 = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    h3.alpn_protocols = vec![b"h3".to_vec()];
-    Ok((tcp, h3))
-}
-
 /// A TCP rustls config from an arbitrary cert resolver (shared by the static + composite builders),
 /// advertising ALPN `h2`/`http/1.1`.
 #[cfg(feature = "acme-dns")]
@@ -798,56 +837,39 @@ fn server_config_from(resolver: Arc<dyn ResolvesServerCert>) -> rustls::ServerCo
     config
 }
 
-/// Like [`build_server_config`] but composed with an **on-demand** per-SNI resolver (cap-req 03): the
-/// static wildcard certs win, then on-demand issuance handles an unknown-but-verified custom domain.
-#[cfg(feature = "acme-dns")]
-pub fn build_server_config_composite(
-    entries: Vec<(String, IssuedCert)>,
-    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
-) -> Result<rustls::ServerConfig> {
-    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
-        static_resolver: sni_resolver(entries)?,
-        on_demand,
-        default_cert: None,
-        // The public edge: no per-name node-managed preference (static wildcards win), and the on-demand
-        // issuer is the catch-all for every verified SNI — unchanged (cap-req #29 fields inert here).
-        managed_names: Vec::new(),
-        catch_all_on_demand: true,
-    });
-    Ok(server_config_from(resolver))
-}
-
 /// Build a rustls [`ServerConfig`](rustls::ServerConfig) for a **dedicated listener** (cap-req 03 #4 +
-/// cap-req #29) composed with the shared on-demand per-SNI issuer, so a verified custom domain
-/// terminating here gets a cert the same way the public edge does.
+/// cap-req #29), composed from the three [`CompositeResolver`] tiers.
 ///
 /// `static_cert` is the listener's OPTIONAL own `(cert_pem, key_pem)` static pair (cap-req #29): `Some`
 /// ⇒ it serves `server_names` by SNI and an SNI-less handshake (and, for a `managed_names` SNI, is the
-/// fallback while the node-managed cert warms); `None` ⇒ a pure node-managed listener with no static
-/// cert (an SNI-less handshake then refuses cleanly, fail-closed).
+/// fallback when the node holds no control-plane cert); `None` ⇒ a pure node-cert listener with no
+/// static cert (an SNI-less handshake then refuses cleanly, fail-closed).
 ///
-/// `managed_names` (cap-req #29) are the SNIs the listener serves the **node-managed** cert for — its
-/// `server_names` allowlist under `use_node_cert`, EMPTY otherwise. `catch_all_on_demand` decides
-/// whether a non-managed SNI may still reach the on-demand issuer: `true` for an `on_demand` catch-all
-/// listener, `false` for a `use_node_cert`-only listener (bounding managed serving to `managed_names`).
+/// `managed_names` (Concept 1) are the SNIs the listener serves the **node CONTROL-PLANE** cert for —
+/// its `server_names` allowlist under `use_node_cert`, EMPTY otherwise — resolved against `node_certs`
+/// (the SAME source backing `:443`), never the on-demand engine. `node_certs` is therefore `Some` for a
+/// `use_node_cert` listener and `None` otherwise. `catch_all_on_demand` (Concept 2) decides whether a
+/// NON-managed SNI may still reach the on-demand issuer: `true` for an `on_demand` catch-all listener,
+/// `false` for a `use_node_cert`-only listener (bounding managed serving to `managed_names`).
 ///
 /// Deliberately **protocol-agnostic**: it advertises **no ALPN** and routes nothing through
 /// [`server_config_from`] (which would stamp `h2`/`http-1.1`). TLS management must not assume what
 /// speaks over the connection — the listener's byte pump owns the protocol, the resolver owns only the
-/// handshake. `on_demand` is the *same* `Arc` the edge uses (via a project-scoped resolver), so there
-/// is a single rate-limit / issuance budget and a single cluster certreq single-flight (never a second
-/// engine — see the design note).
+/// handshake. `on_demand` (the catch-all tier) is the *same* `Arc` the edge uses (via a project-scoped
+/// resolver), so there is a single rate-limit / issuance budget and a single cluster certreq
+/// single-flight (never a second engine — see the design note).
 #[cfg(feature = "acme-dns")]
-pub fn build_listener_server_config_composite(
+pub(crate) fn build_listener_server_config_composite(
     static_cert: Option<(&str, &str)>,
     server_names: &[String],
     managed_names: &[String],
     catch_all_on_demand: bool,
     on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+    node_certs: Option<NodeCertSource>,
 ) -> Result<rustls::ServerConfig> {
     // The listener's own static cert is now OPTIONAL (cap-req #29). When present it serves `server_names`
-    // by SNI and an SNI-less handshake; when absent there is no static tier (the node-managed cert is
-    // the only source) and an SNI-less handshake has no cert to serve → fail-closed.
+    // by SNI and an SNI-less handshake; when absent there is no static tier (the node control-plane cert
+    // is the only source) and an SNI-less handshake has no cert to serve → fail-closed.
     let own = match static_cert {
         Some((cert_pem, key_pem)) => Some(Arc::new(certified_key_from_pem(cert_pem, key_pem)?)),
         None => None,
@@ -864,6 +886,7 @@ pub fn build_listener_server_config_composite(
         on_demand,
         default_cert: own,
         managed_names: managed_names.to_vec(),
+        node_certs,
         catch_all_on_demand,
     });
     // No ALPN: protocol-agnostic. Build the config directly rather than via `server_config_from`.
@@ -872,58 +895,76 @@ pub fn build_listener_server_config_composite(
         .with_cert_resolver(resolver))
 }
 
-/// Like [`build_server_configs`] (TCP + h3) but composed with the on-demand resolver (cap-req 03).
+/// Build the `:443` edge rustls config from a **pre-built** static [`SniCertResolver`], so the serve
+/// path can parse the `--acme-domain` set ONCE and share that single `Arc<SniCertResolver>` between the
+/// edge config and the [`NodeCertSource`] handle a `use_node_cert` listener reads (one parse, one source
+/// of truth, hot-swapped together on renewal). When `on_demand` is `Some` the edge composite has an
+/// EMPTY managed tier + `catch_all_on_demand = true` (the public-edge shape); `None` is the static
+/// resolver alone with the serving ALPN. Infallible (the fallible PEM parse already happened in
+/// [`sni_resolver`]).
+#[cfg(feature = "acme-dns")]
+pub(crate) fn build_server_config_maybe_from_resolver(
+    resolver: Arc<SniCertResolver>,
+    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+) -> rustls::ServerConfig {
+    match on_demand {
+        Some(r) => {
+            let composite: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+                static_resolver: resolver,
+                on_demand: r,
+                default_cert: None,
+                managed_names: Vec::new(),
+                node_certs: None,
+                catch_all_on_demand: true,
+            });
+            server_config_from(composite)
+        }
+        None => {
+            let mut config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+            config.alpn_protocols = boatramp_server::alpn_h1_h2();
+            config
+        }
+    }
+}
+
+/// The TCP + h3 edge configs from a **pre-built** static resolver (the renewal-safe shared-handle seam
+/// — see [`build_server_config_maybe_from_resolver`]). Both configs share the one resolver so they
+/// serve identical certs, and the TCP leg advertises `h2`/`http-1.1` while the h3 leg advertises `h3`.
 #[cfg(all(feature = "http3", feature = "acme-dns"))]
-pub fn build_server_configs_composite(
-    entries: Vec<(String, IssuedCert)>,
-    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
-) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
-    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
-        static_resolver: sni_resolver(entries)?,
-        on_demand,
-        default_cert: None,
-        // Public edge (TCP + h3): unchanged — no per-name managed preference, on-demand is the catch-all.
-        managed_names: Vec::new(),
-        catch_all_on_demand: true,
-    });
-    let tcp = server_config_from(resolver.clone());
+pub(crate) fn build_server_configs_maybe_from_resolver(
+    resolver: Arc<SniCertResolver>,
+    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+) -> (rustls::ServerConfig, rustls::ServerConfig) {
+    let (tcp_resolver, h3_resolver): (Arc<dyn ResolvesServerCert>, Arc<dyn ResolvesServerCert>) =
+        match on_demand {
+            Some(r) => {
+                let composite: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+                    static_resolver: resolver,
+                    on_demand: r,
+                    default_cert: None,
+                    managed_names: Vec::new(),
+                    node_certs: None,
+                    catch_all_on_demand: true,
+                });
+                (composite.clone(), composite)
+            }
+            None => (resolver.clone(), resolver),
+        };
+    let tcp = server_config_from(tcp_resolver);
     let mut h3 = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .with_cert_resolver(h3_resolver);
     h3.alpn_protocols = vec![b"h3".to_vec()];
-    Ok((tcp, h3))
-}
-
-/// [`build_server_config`], composed with the on-demand resolver when `on_demand` is `Some` (cap-req
-/// 03), else the static resolver alone (unchanged). The serve path calls this at every (re)build site.
-#[cfg(feature = "acme-dns")]
-pub fn build_server_config_maybe(
-    entries: Vec<(String, IssuedCert)>,
-    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
-) -> Result<rustls::ServerConfig> {
-    match on_demand {
-        Some(r) => build_server_config_composite(entries, r),
-        None => build_server_config(entries),
-    }
-}
-
-/// [`build_server_configs`] (TCP + h3), composed with the on-demand resolver when `Some` (cap-req 03).
-#[cfg(all(feature = "http3", feature = "acme-dns"))]
-pub fn build_server_configs_maybe(
-    entries: Vec<(String, IssuedCert)>,
-    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
-) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
-    match on_demand {
-        Some(r) => build_server_configs_composite(entries, r),
-        None => build_server_configs(entries),
-    }
+    (tcp, h3)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "http3")]
+    #[cfg(all(feature = "http3", feature = "acme-dns"))]
     #[test]
     fn build_server_configs_sets_h3_alpn() {
         // rustls 0.23 needs a process crypto provider before building a config
@@ -932,7 +973,8 @@ mod tests {
         // Empty entries → empty SNI resolver; we only assert the ALPN wiring (the
         // TCP listener advertises h2+http/1.1 for the serve stack; the h3 listener
         // advertises `h3`).
-        let (tcp, h3) = build_server_configs(Vec::new()).unwrap();
+        let (tcp, h3) =
+            build_server_configs_maybe_from_resolver(sni_resolver(Vec::new()).unwrap(), None);
         assert_eq!(
             tcp.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -945,11 +987,10 @@ mod tests {
         );
     }
 
-    /// Forward serve-path consolidation (PLAN §4): `build_server_config_maybe` must build a VALID
-    /// resolver-only config from an EMPTY static entry set + `Some(on_demand_resolver)` — the
-    /// serve-purely-on-demand case a single-node node (or a cluster follower awaiting the leader) uses
-    /// when the static set is empty but on-demand issuance fronts it. (`None` is the unchanged static
-    /// path, already covered by `build_server_configs_sets_h3_alpn`.)
+    /// Forward serve-path consolidation (PLAN §4): the edge builder must build a VALID resolver-only
+    /// config from an EMPTY static resolver + `Some(on_demand_resolver)` — the serve-purely-on-demand
+    /// case a single-node node (or a cluster follower awaiting the leader) uses when the static set is
+    /// empty but on-demand issuance fronts it.
     #[cfg(feature = "acme-dns")]
     #[test]
     fn maybe_empty_entries_with_on_demand_builds_resolver_only_config() {
@@ -957,8 +998,11 @@ mod tests {
         let resolver = std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(
             std::sync::Arc::new(crate::on_demand_tls::CertCache::default()),
         ));
-        // EMPTY static entries + an on-demand resolver ⇒ a valid composite config (serves on-demand).
-        let cfg = build_server_config_maybe(Vec::new(), Some(resolver)).expect("valid config");
+        // EMPTY static resolver + an on-demand resolver ⇒ a valid composite config (serves on-demand).
+        let cfg = build_server_config_maybe_from_resolver(
+            sni_resolver(Vec::new()).unwrap(),
+            Some(resolver),
+        );
         assert_eq!(
             cfg.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -1186,11 +1230,12 @@ mod tests {
                 build_listener_server_config_composite(
                     Some((&own_cert, &own_key)),
                     &server_names,
-                    // An `on_demand` catch-all listener: no per-name managed preference, the catch-all
-                    // issuer serves a verified SNI that is NOT a static `server_name`.
+                    // An `on_demand` catch-all listener: no managed tier, the catch-all issuer serves a
+                    // verified SNI that is NOT a static `server_name`.
                     &[],
                     true,
                     on_demand,
+                    None, // no node control-plane source (Concept-1 managed tier is empty here)
                 )
                 .unwrap(),
             );
@@ -1231,32 +1276,55 @@ mod tests {
             );
         }
 
-        // cap-req #29: a `use_node_cert` listener serves the NODE-MANAGED cert (the same cert the
-        // `:443` edge serves, from the shared engine's cache) for a verified+attached domain in its
-        // `server_names` — NOT the listener's static cert. The static cert, when present, stays as the
-        // FALLBACK for a managed name the node can't serve yet and for an SNI-less handshake; and with
-        // the catch-all OFF (`use_node_cert` alone), a verified SNI OUTSIDE `server_names` is refused.
+        /// A [`NodeCertSource`] seeded with `(sni-pattern, cert_pem, key_pem)` entries — the Concept-1
+        /// node control-plane source a `use_node_cert` listener resolves its managed tier against (NOT
+        /// the on-demand cache). Stands in for the `--acme-domain` certs the `:443` edge serves.
+        fn node_source(entries: &[(&str, &str, &str)]) -> NodeCertSource {
+            let resolved = entries
+                .iter()
+                .map(|(pat, cert, key)| {
+                    (
+                        (*pat).to_string(),
+                        std::sync::Arc::new(certified_key_from_pem(cert, key).unwrap()),
+                    )
+                })
+                .collect();
+            NodeCertSource::new(std::sync::Arc::new(SniCertResolver { entries: resolved }))
+        }
+
+        // cap-req #29 (post-decouple): a `use_node_cert` listener serves the NODE'S CONTROL-PLANE cert
+        // (the same `--acme-domain` cert the `:443` edge serves) for a domain in its `server_names`,
+        // resolved straight from the shared `node_certs` source — NOT the listener's static cert, and
+        // NOT the on-demand engine. The static cert, when present, is only the FALLBACK for a name the
+        // node holds no control-plane cert for, and for an SNI-less handshake; with the catch-all OFF
+        // (`use_node_cert` alone), an SNI OUTSIDE `server_names` is refused.
         //
-        // MUTATION SENSE (what the fix changes): before #29, a `server_name` was always served the
-        // listener's STATIC cert (`composite_serves_own_cached_and_refuses_unknown`, case `own`). Here
-        // the SAME name, now `managed`, is served the node-managed cert instead — the two tests pin the
-        // before/after. And the no-static-cert variant could not even be constructed before (cert_file
-        // was required); it now builds and serves the managed cert, refusing a no-SNI handshake.
+        // MUTATION SENSE (what the decouple fix changes): the node control-plane cert lives in
+        // `node_certs`, and the on-demand cache is seeded with a DIFFERENT cert for the SAME name. A
+        // resolver that (as the pre-fix code did) routed the managed tier through the on-demand engine
+        // would serve the on-demand cert; here it must serve the node_certs cert — the two pin the
+        // before/after. The no-static-cert variant could not even be constructed before #29.
         #[test]
-        fn use_node_cert_prefers_managed_over_static_and_bounds_to_server_names() {
+        fn use_node_cert_serves_node_source_over_static_and_bounds_to_server_names() {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            // The managed name has a cert in the shared cache (as if the edge/engine issued it) — this
-            // stands in for the node-managed cert. A DIFFERENT (static) cert also covers that name.
-            let (managed_cert, managed_key) = self_signed("mail.example.test");
+            // The node's control-plane cert for the managed name (what the `:443` edge serves). A
+            // DIFFERENT static cert also covers that name (the listener's hand-fed fallback).
+            let (node_cert, node_key) = self_signed("mail.example.test");
             let (static_cert, static_key) = self_signed("mail.example.test"); // same SAN, distinct key/cert
-            // A verified, in-cache domain that is NOT in this listener's `server_names` (the bound).
+            // A domain NOT in this listener's `server_names` (the bound) whose cert IS in the on-demand
+            // cache — proving the bound holds even for a cert the engine could serve (catch-all is off).
             let (other_cert, other_key) = self_signed("other.example.test");
 
+            // The on-demand engine is seeded with a WRONG cert for the managed name + the out-of-bound
+            // name. The managed tier must IGNORE it (served from node_certs); the bound keeps `other`.
+            let (ondemand_wrong_cert, ondemand_wrong_key) = self_signed("mail.example.test");
             let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
             cache.insert_issued(
                 "mail.example.test",
-                std::sync::Arc::new(certified_key_from_pem(&managed_cert, &managed_key).unwrap()),
+                std::sync::Arc::new(
+                    certified_key_from_pem(&ondemand_wrong_cert, &ondemand_wrong_key).unwrap(),
+                ),
             );
             cache.insert_issued(
                 "other.example.test",
@@ -1265,9 +1333,11 @@ mod tests {
             let on_demand =
                 std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(cache));
 
+            let node_certs = node_source(&[("mail.example.test", &node_cert, &node_key)]);
             let server_names = vec!["mail.example.test".to_string()];
             // `use_node_cert`-only: managed_names = server_names, catch_all = false, static cert present
-            // (as the fallback) — the exact shape serve.rs builds for `use_node_cert = true`.
+            // (as the fallback), node_certs = the control-plane source — the exact shape serve.rs builds
+            // for `use_node_cert = true`.
             let config = std::sync::Arc::new(
                 build_listener_server_config_composite(
                     Some((&static_cert, &static_key)),
@@ -1275,6 +1345,7 @@ mod tests {
                     &server_names, // managed_names
                     false,         // catch_all_on_demand OFF (bounded to server_names)
                     on_demand,
+                    Some(node_certs.clone()),
                 )
                 .unwrap(),
             );
@@ -1283,26 +1354,30 @@ mod tests {
             let other = ServerName::try_from("other.example.test").unwrap();
             let no_sni = ServerName::try_from("127.0.0.1").unwrap();
 
-            // THE #29 fix: the managed `server_name` is served the NODE-MANAGED cert (cache), NOT the
-            // listener's static cert — even though the static cert also covers the name and would have
-            // won before the fix.
+            // THE decouple fix: the managed `server_name` is served the NODE CONTROL-PLANE cert (from
+            // node_certs), NOT the listener's static cert, and NOT the on-demand cache's cert.
             let served_mail = served_cert(&config, mail);
             assert_eq!(
                 served_mail.as_deref(),
-                Some(leaf_der(&managed_cert).as_slice()),
-                "a managed server_name is served the node-managed cert (not the static cert)"
+                Some(leaf_der(&node_cert).as_slice()),
+                "a managed server_name is served the node control-plane cert (not static, not on-demand)"
             );
             assert_ne!(
                 served_mail.as_deref(),
                 Some(leaf_der(&static_cert).as_slice()),
                 "the static cert must NOT be preferred for a managed server_name"
             );
-            // The security BOUND: a verified, in-cache domain OUTSIDE `server_names` is refused — a
-            // `use_node_cert`-only listener never serves a cert for a domain it did not declare.
+            assert_ne!(
+                served_mail.as_deref(),
+                Some(leaf_der(&ondemand_wrong_cert).as_slice()),
+                "the on-demand engine must NOT be consulted for a managed server_name"
+            );
+            // The security BOUND: a domain OUTSIDE `server_names` is refused — a `use_node_cert`-only
+            // listener never serves a cert for a domain it did not declare (catch-all OFF).
             assert_eq!(
                 served_cert(&config, other),
                 None,
-                "a verified SNI outside server_names is refused (catch-all OFF — bounded to the allowlist)"
+                "a SNI outside server_names is refused (catch-all OFF — bounded to the allowlist)"
             );
             // The static cert is still the SNI-less default (fallback).
             assert_eq!(
@@ -1311,23 +1386,17 @@ mod tests {
                 "an SNI-less handshake is served the static fallback cert"
             );
 
-            // The PURE node-managed variant (NO static cert) — impossible to construct before #29.
+            // The PURE node-cert variant (NO static cert) — impossible to construct before #29.
             let config_no_static = std::sync::Arc::new(
                 build_listener_server_config_composite(
                     None, // no static cert
                     &server_names,
                     &server_names,
                     false,
-                    std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache({
-                        let c = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
-                        c.insert_issued(
-                            "mail.example.test",
-                            std::sync::Arc::new(
-                                certified_key_from_pem(&managed_cert, &managed_key).unwrap(),
-                            ),
-                        );
-                        c
-                    })),
+                    std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(
+                        std::sync::Arc::new(crate::on_demand_tls::CertCache::default()),
+                    )),
+                    Some(node_source(&[("mail.example.test", &node_cert, &node_key)])),
                 )
                 .unwrap(),
             );
@@ -1337,8 +1406,8 @@ mod tests {
                     ServerName::try_from("mail.example.test").unwrap()
                 )
                 .as_deref(),
-                Some(leaf_der(&managed_cert).as_slice()),
-                "with NO static cert, the managed server_name is still served the node-managed cert"
+                Some(leaf_der(&node_cert).as_slice()),
+                "with NO static cert, the managed server_name is still served the node control-plane cert"
             );
             assert_eq!(
                 served_cert(
@@ -1349,44 +1418,81 @@ mod tests {
                 "with NO static cert, an SNI-less handshake refuses cleanly (fail-closed)"
             );
             println!(
-                "LISTENER USE-NODE-CERT OK: managed server_name served the node-managed cert (not static), \
-                 out-of-allowlist SNI refused, SNI-less falls back to static or fails closed"
+                "LISTENER USE-NODE-CERT OK: managed server_name served the node CONTROL-PLANE cert \
+                 (not static, not on-demand), out-of-allowlist SNI refused, SNI-less falls back to \
+                 static or fails closed"
+            );
+        }
+
+        /// Anti-cheat discriminator (the task's required NEW offline test): a `use_node_cert` managed
+        /// name is served from the ACTUAL node control-plane source even when the on-demand `CertCache`
+        /// is EMPTY (never pre-seeded). The pre-fix code routed the managed tier through the on-demand
+        /// engine, so with an empty cache it would fail the handshake; here it serves the node cert.
+        #[test]
+        fn use_node_cert_served_from_node_source_with_empty_on_demand_cache() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            let (node_cert, node_key) = self_signed("cp.example.test");
+            // The on-demand engine's cache is EMPTY — a miss there fails the handshake (from_cache has a
+            // dead trigger). The managed tier must NOT depend on it.
+            let on_demand =
+                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(
+                    std::sync::Arc::new(crate::on_demand_tls::CertCache::default()),
+                ));
+            let node_certs = node_source(&[("cp.example.test", &node_cert, &node_key)]);
+            let server_names = vec!["cp.example.test".to_string()];
+            let config = std::sync::Arc::new(
+                build_listener_server_config_composite(
+                    None, // pure node-cert listener, no static material
+                    &server_names,
+                    &server_names,
+                    false,
+                    on_demand,
+                    Some(node_certs),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                served_cert(&config, ServerName::try_from("cp.example.test").unwrap()).as_deref(),
+                Some(leaf_der(&node_cert).as_slice()),
+                "the managed name is served from the node control-plane source with an EMPTY on-demand \
+                 cache — proof the managed tier never touches the on-demand engine"
+            );
+            println!(
+                "LISTENER USE-NODE-CERT ANTI-CHEAT OK: node control-plane cert served without any \
+                 on-demand cache pre-seeding"
             );
         }
 
         // Security review F1: a WILDCARD or MIXED-CASE `server_names` entry under `use_node_cert` must
-        // route a covered concrete SNI to the NODE-MANAGED path — not silently fall through to the
+        // route a covered concrete SNI to the NODE CONTROL-PLANE path — not silently fall through to the
         // static tier (which IS wildcard/case-aware via `sni_matches`) and serve the operator's static
         // cert. MUTATION SENSE: the pre-fix membership check was a case-sensitive EXACT
         // `HashSet::contains(sni)`, so `foo.wild.example.test` (not literally in the set) and
         // `mixed.example.test` (lowercased SNI vs a `Mixed.Example.Test` entry) MISSED the managed path
-        // and the static cert was served. Here they are served the node-managed (cache) cert.
+        // and the static cert was served. Here they are served from the node control-plane source.
         #[test]
         fn use_node_cert_wildcard_and_mixed_case_route_to_managed() {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            // The node-managed certs (as if the shared engine issued them for the concrete SNIs).
-            let (wild_managed_cert, wild_managed_key) = self_signed("foo.wild.example.test");
-            let (mixed_managed_cert, mixed_managed_key) = self_signed("mixed.example.test");
-            // A DIFFERENT static cert that ALSO covers both (a `*.wild` wildcard + the mixed name) —
-            // what the operator hand-fed and what the pre-fix bug would have served.
+            // The node control-plane certs (as the renewal loop obtained them): a `*.wild` wildcard
+            // control-plane cert + a mixed-case apex. The node_certs source matches them with the SAME
+            // wildcard/case-insensitive `sni_matches` semantics as the managed-tier membership check.
+            let (wild_cp_cert, wild_cp_key) = self_signed("foo.wild.example.test");
+            let (mixed_cp_cert, mixed_cp_key) = self_signed("mixed.example.test");
+            // A DIFFERENT static cert that ALSO covers both — what the operator hand-fed and what the
+            // pre-fix bug would have served.
             let (static_cert, static_key) = self_signed("static.example.test");
 
-            let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
-            cache.insert_issued(
-                "foo.wild.example.test",
-                std::sync::Arc::new(
-                    certified_key_from_pem(&wild_managed_cert, &wild_managed_key).unwrap(),
-                ),
-            );
-            cache.insert_issued(
-                "mixed.example.test",
-                std::sync::Arc::new(
-                    certified_key_from_pem(&mixed_managed_cert, &mixed_managed_key).unwrap(),
-                ),
-            );
+            let node_certs = node_source(&[
+                ("*.wild.example.test", &wild_cp_cert, &wild_cp_key),
+                ("mixed.example.test", &mixed_cp_cert, &mixed_cp_key),
+            ]);
+            // The on-demand engine is EMPTY — the managed tier must not touch it.
             let on_demand =
-                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(cache));
+                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(
+                    std::sync::Arc::new(crate::on_demand_tls::CertCache::default()),
+                ));
 
             // A wildcard entry + a MIXED-CASE entry — exactly the shapes the EXACT `contains` missed.
             let server_names = vec![
@@ -1400,26 +1506,27 @@ mod tests {
                     &server_names, // managed_names (use_node_cert)
                     false,         // catch_all OFF
                     on_demand,
+                    Some(node_certs),
                 )
                 .unwrap(),
             );
 
-            // A concrete host under the wildcard managed entry → node-managed cert, not the static one.
+            // A concrete host under the wildcard managed entry → node control-plane cert, not static.
             assert_eq!(
                 served_cert(
                     &config,
                     ServerName::try_from("foo.wild.example.test").unwrap()
                 )
                 .as_deref(),
-                Some(leaf_der(&wild_managed_cert).as_slice()),
-                "a concrete SNI under a WILDCARD managed server_name is served the node-managed cert"
+                Some(leaf_der(&wild_cp_cert).as_slice()),
+                "a concrete SNI under a WILDCARD managed server_name is served the node control-plane cert"
             );
-            // The mixed-case managed entry → node-managed cert for the (lowercased) concrete SNI.
+            // The mixed-case managed entry → node control-plane cert for the (lowercased) concrete SNI.
             assert_eq!(
                 served_cert(&config, ServerName::try_from("mixed.example.test").unwrap())
                     .as_deref(),
-                Some(leaf_der(&mixed_managed_cert).as_slice()),
-                "a MIXED-CASE managed server_name is matched case-insensitively → node-managed cert"
+                Some(leaf_der(&mixed_cp_cert).as_slice()),
+                "a MIXED-CASE managed server_name is matched case-insensitively → node control-plane cert"
             );
             // Neither is the static cert (the pre-fix silent downgrade).
             assert_ne!(
@@ -1433,17 +1540,19 @@ mod tests {
             );
             println!(
                 "LISTENER USE-NODE-CERT WILDCARD/CASE OK: wildcard + mixed-case server_names route to \
-                 the node-managed path (no silent static downgrade)"
+                 the node control-plane path (no silent static downgrade)"
             );
         }
 
-        // Security review F3: isolate the PROJECT-SCOPE gate for `use_node_cert`. A listener pinned to
-        // project `mine` whose `server_names` allowlist contains a domain OWNED by a DIFFERENT project
-        // (`other`) — and whose cert is already in the shared cache — must serve NOTHING and trigger NO
-        // issuance. The domain IS in the allowlist (so it reaches the managed/scoped path), so a pass
-        // here proves the scope gate refuses it independently of the allowlist gate.
+        // Security review F3 (post-decouple): isolate the PROJECT-SCOPE gate on the Concept-2 CATCH-ALL
+        // tier. A `on_demand` catch-all listener pinned to project `mine` must NOT serve (nor trigger
+        // issuance for) a cross-project SNI (`cross.example.test`, owned by `other`) whose cert is
+        // already in the shared cache — the project scope, not a cache miss, is what refuses it. (The
+        // Concept-1 managed tier no longer routes through this gate — a `use_node_cert` name is served
+        // the NODE control-plane cert directly, bounded only by `server_names`; this test pins the
+        // scope gate on the on-demand path, where it still lives and still matters.)
         #[tokio::test]
-        async fn use_node_cert_listener_refuses_a_cross_project_server_name() {
+        async fn on_demand_catch_all_listener_refuses_a_cross_project_sni() {
             use boatramp_core::deploy::DeployStore;
             use boatramp_core::project::ProjectRef;
 
@@ -1490,16 +1599,16 @@ mod tests {
                     store.clone(),
                     tx,
                 ));
-            // The listener's `server_names` allowlist CONTAINS the cross-project domain (so it IS routed
-            // to the managed path); NO static cert, catch-all OFF.
-            let server_names = vec!["cross.example.test".to_string()];
+            // An `on_demand` catch-all listener: NO managed tier (empty), catch-all ON, no node_certs,
+            // no static cert. Every presented SNI falls through to the scoped on-demand engine.
             let config = std::sync::Arc::new(
                 build_listener_server_config_composite(
                     None,
-                    &server_names,
-                    &server_names,
-                    false,
+                    &[],  // server_names
+                    &[],  // managed_names (empty — Concept-1 tier off)
+                    true, // catch_all_on_demand ON (Concept-2)
                     scoped,
+                    None, // no node control-plane source
                 )
                 .unwrap(),
             );
@@ -1508,17 +1617,17 @@ mod tests {
             assert_eq!(
                 served_cert(&config, ServerName::try_from("cross.example.test").unwrap()),
                 None,
-                "a cross-project server_name is NOT served, even though it is in the allowlist and cached"
+                "a cross-project SNI is NOT served by a scoped catch-all listener, even though cached"
             );
             // …and NO issuance was triggered (a CONFIRMED other-project owner is refused outright — no
             // serve, no trigger).
             assert!(
                 rx.try_recv().is_err(),
-                "a confirmed other-project server_name must trigger NO issuance (project-scope gate)"
+                "a confirmed other-project SNI must trigger NO issuance (project-scope gate)"
             );
             println!(
-                "LISTENER USE-NODE-CERT CROSS-PROJECT OK: an allowlisted+cached domain owned by another \
-                 project is neither served nor triggered (project-scope gate isolated)"
+                "ON-DEMAND CATCH-ALL CROSS-PROJECT OK: a cached domain owned by another project is \
+                 neither served nor triggered (project-scope gate isolated on the Concept-2 tier)"
             );
         }
     }

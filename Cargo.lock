@@ -1623,6 +1623,7 @@ dependencies = [
 name = "boatramp"
 version = "0.58.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

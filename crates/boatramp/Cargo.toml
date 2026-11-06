@@ -206,6 +206,8 @@ acme-dns = [
   # `IssuanceGate`/`CertIssuer`/`ChallengeSolver` traits are `#[async_trait]` — so `acme-dns` must pull
   # `async-trait` itself (previously it rode in via `cluster`/`overlay`).
   "dep:boatramp-acme",
+  # The shared, hot-swappable node control-plane cert handle (`acme_dns::NodeCertSource`).
+  "dep:arc-swap",
   "boatramp-acme/acme",
   "boatramp-acme/cloudflare",
   "boatramp-acme/route53",
@@ -480,6 +482,10 @@ flate2.workspace = true
 rustls-acme = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
+# The node control-plane cert source ([`acme_dns::NodeCertSource`]) is a live, hot-swappable handle the
+# `:443` edge and `use_node_cert` listeners share — a lock-free atomic `Arc` swap, the same primitive
+# `ReloadableTls` uses. Only needed with the `acme-dns` cert-serving machinery.
+arc-swap = { version = "1", optional = true }
 rolldown = { workspace = true, optional = true }
 lightningcss = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }

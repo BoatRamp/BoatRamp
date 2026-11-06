@@ -2416,6 +2416,9 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
             &handlers,
             &deploy,
             None,
+            // No `--acme-domain` control-plane cert source in non-acme-dns modes; a `use_node_cert`
+            // listener fails closed here regardless (no on-demand engine).
+            None,
         );
     }
     // In a TLS mode, optionally bind a second plain-HTTP listener that redirects to HTTPS.
@@ -3791,6 +3794,16 @@ type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandTls>
 #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
 type ListenerOnDemand = Option<std::convert::Infallible>;
 
+/// The node control-plane cert source argument to [`spawn_listeners`] (Concept 1): the SAME live,
+/// hot-swappable handle the `:443` edge serves from, so a `use_node_cert` listener serves the node's
+/// own `--acme-domain` cert — never through the on-demand engine. `Some` only in the `--tls acme-dns`
+/// serve arm (where the `--acme-domain` set exists); `None` for every other mode, where a
+/// `use_node_cert` listener fails closed anyway. Uninhabited without `acme-dns` (always `None`).
+#[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
+type ListenerNodeCerts = Option<crate::acme_dns::NodeCertSource>;
+#[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
+type ListenerNodeCerts = Option<std::convert::Infallible>;
+
 #[cfg(feature = "tcp-listener")]
 fn spawn_listeners(
     // Borrow only the `listeners` map (not the whole `ServeConfig`, whose other fields are moved out
@@ -3799,14 +3812,16 @@ fn spawn_listeners(
     posture: &boatramp_core::security::SecurityPosture,
     handlers: &boatramp_server::HandlerRuntime,
     deploy: &DeployStore,
-    // The shared on-demand engine's resolver (cap-req 03 #4), or `None` to serve only static certs.
-    // Only ever `Some` in an `all(acme-dns, cluster)` build (see [`ListenerOnDemand`]).
+    // The shared on-demand engine (cap-req 03 #4, Concept 2), or `None` to serve only static certs.
     on_demand: ListenerOnDemand,
+    // The shared node control-plane cert source (cap-req #29, Concept 1), or `None`. A `use_node_cert`
+    // listener serves THIS, not the on-demand engine.
+    node_certs: ListenerNodeCerts,
 ) {
-    // In a build without the on-demand engine the arg is an always-`None` uninhabited `Option`; keep
-    // it "used" so `-D warnings` stays green (the on-demand branch below is compiled out there).
+    // In a build without the on-demand engine the args are always-`None` uninhabited `Option`s; keep
+    // them "used" so `-D warnings` stays green (the on-demand branch below is compiled out there).
     #[cfg(not(feature = "acme-dns"))]
-    let _ = &on_demand;
+    let _ = (&on_demand, &node_certs);
     if listeners.is_empty() {
         return;
     }
@@ -3853,14 +3868,13 @@ fn spawn_listeners(
                 if t.use_node_cert || t.on_demand {
                     match on_demand.clone() {
                         Some(engine) => {
-                            // Mint a PROJECT-SCOPED resolver from the shared engine (Finding B): this
-                            // listener serves on-demand certs only for its own project's verified
-                            // domains, never another project's — even though all certs share one engine
-                            // + cache. cap-req #29 layers the `server_names` allowlist on top: with
-                            // `use_node_cert` the node-managed cert is served (and issuance triggered)
-                            // ONLY for `server_names`; the catch-all issuer runs for other SNIs ONLY when
-                            // `on_demand` is also set — so a `use_node_cert`-only listener is bounded to
-                            // its declared names.
+                            // Mint a PROJECT-SCOPED resolver from the shared engine (Finding B) for the
+                            // Concept-2 CATCH-ALL tier: this listener issues on-demand certs only for its
+                            // own project's verified domains, never another project's. The Concept-1
+                            // managed tier (`use_node_cert`) does NOT go through the engine — it serves
+                            // the node's control-plane cert directly from `node_certs` (the SAME source
+                            // the `:443` edge serves), bounded by the `server_names` allowlist; the
+                            // catch-all issuer runs for OTHER SNIs ONLY when `on_demand` is also set.
                             let scoped = engine.scoped_resolver(l.project.clone(), deploy.clone());
                             let server_names = t.server_names.clone().unwrap_or_default();
                             let managed_names: Vec<String> = if t.use_node_cert {
@@ -3874,8 +3888,12 @@ fn spawn_listeners(
                                 static_ref,
                                 &server_names,
                                 &managed_names,
-                                t.on_demand, // catch_all_on_demand
+                                t.on_demand, // catch_all_on_demand (Concept 2)
                                 scoped,
+                                // Concept 1: the node control-plane source a `use_node_cert` managed name
+                                // is served from (shared with `:443`). `None` for an `on_demand`-only
+                                // listener (empty managed tier) — then this is never consulted.
+                                node_certs.clone(),
                             )?;
                             return Ok(std::sync::Arc::new(cfg));
                         }
@@ -5321,11 +5339,20 @@ async fn serve_acme_dns(
     if no_static_certs_is_fatal(entries.is_empty(), on_demand_engine.is_some()) {
         return Err(Error::NoCertsYet);
     }
-    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists and the edge cert
-    // is ready, bind the host-owned inbound-TCP listeners sharing that engine — a listener that opts in
-    // issues per-SNI through this SAME engine (one budget, one certreq single-flight). `on_demand_engine`
-    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
-    // exactly as the non-AcmeDns path would.
+    // Build the node's CONTROL-PLANE cert source (Concept 1) ONCE: parse the obtained `--acme-domain`
+    // set into one `Arc<SniCertResolver>` and wrap it in a live, hot-swappable `NodeCertSource`. The
+    // `:443` edge config below is built from the SAME resolver, and the renewal loop swaps a fresh set
+    // into this handle (AND reloads the edge) — so a `use_node_cert` listener always serves the exact
+    // cert the edge serves, never a stale snapshot. This is deliberately SEPARATE from the Concept-2
+    // on-demand engine (`on_demand_resolver`), which ISSUES certs for OTHER (tenant) domains.
+    let static_resolver = crate::acme_dns::sni_resolver(entries)?;
+    let node_certs = crate::acme_dns::NodeCertSource::new(static_resolver.clone());
+    // Deferred listener spawn (cap-req 03 #4): now that the on-demand engine + the node control-plane
+    // cert source exist, bind the host-owned inbound-TCP listeners. A `use_node_cert` listener serves
+    // the node control-plane cert (Concept 1) from `node_certs`; an `on_demand` listener issues per-SNI
+    // through the SAME shared engine (Concept 2, one budget, one certreq single-flight).
+    // `on_demand_engine` is `None` when on-demand TLS is disabled, so listeners then serve only their
+    // own static cert, exactly as the non-AcmeDns path would.
     #[cfg(feature = "tcp-listener")]
     spawn_listeners(
         listeners,
@@ -5333,30 +5360,41 @@ async fn serve_acme_dns(
         &handlers,
         &deploy,
         on_demand_engine.clone(),
+        Some(node_certs.clone()),
     );
     // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same certs (hot-swapped on renewal
     // below). When on-demand TLS is enabled, the config composes the static certs with the per-SNI
     // on-demand resolver (cap-req 03); otherwise it is the static resolver alone (`_maybe(_, None)`).
+    // Built from the SHARED `static_resolver` so the edge and `node_certs` are the one source of truth.
     #[cfg(feature = "http3")]
     let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) =
-            crate::acme_dns::build_server_configs_maybe(entries, on_demand_resolver.clone())?;
+        let (tcp, h3) = crate::acme_dns::build_server_configs_maybe_from_resolver(
+            static_resolver.clone(),
+            on_demand_resolver.clone(),
+        );
         let endpoint =
             boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
         (tcp, Some(endpoint))
     } else {
         (
-            crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?,
+            crate::acme_dns::build_server_config_maybe_from_resolver(
+                static_resolver.clone(),
+                on_demand_resolver.clone(),
+            ),
             None,
         )
     };
     #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand_resolver.clone())?;
+    let config = crate::acme_dns::build_server_config_maybe_from_resolver(
+        static_resolver.clone(),
+        on_demand_resolver.clone(),
+    );
     let tls = boatramp_server::ReloadableTls::new(config);
 
-    // Background renewal: re-run the refresh pass and hot-swap the served config (TCP + h3).
+    // Background renewal: re-run the refresh pass, hot-swap the shared node control-plane cert source
+    // (reaching `use_node_cert` listeners live), AND reload the served edge config (TCP + h3).
     {
-        let (tls, provider, base, cache, domains, on_demand_resolver, renew_refresh) = (
+        let (tls, provider, base, cache, domains, on_demand_resolver, renew_refresh, node_certs) = (
             tls.clone(),
             provider.clone(),
             base.clone(),
@@ -5364,6 +5402,7 @@ async fn serve_acme_dns(
             domains.clone(),
             on_demand_resolver.clone(),
             cert_refresh.clone(),
+            node_certs.clone(),
         );
         #[cfg(feature = "http3")]
         let h3_renew = h3_endpoint.clone();
@@ -5372,46 +5411,43 @@ async fn serve_acme_dns(
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
                 match renew_refresh.run(&domains, &base, &provider, &cache).await {
                     Ok(entries) if !entries.is_empty() => {
+                        // Parse the renewed static set ONCE. Hot-swap the shared `node_certs` handle
+                        // FIRST — every `use_node_cert` listener then serves the renewed control-plane
+                        // cert on its next handshake — then rebuild + reload the `:443` edge from the
+                        // SAME resolver so the edge and the listeners never diverge.
+                        let resolver = match crate::acme_dns::sni_resolver(entries) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                tracing::error!(%err, "acme-dns: rebuilding TLS resolver failed");
+                                continue;
+                            }
+                        };
+                        node_certs.store(resolver.clone());
                         #[cfg(feature = "http3")]
                         if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs_maybe(
-                                entries,
-                                on_demand_resolver.clone(),
-                            ) {
-                                Ok((tcp, h3)) => {
-                                    tls.reload(tcp);
-                                    match boatramp_server::quinn_server_config(h3) {
-                                        Ok(qc) => endpoint.set_server_config(Some(qc)),
-                                        Err(err) => {
-                                            tracing::error!(%err, "acme-dns: rebuilding h3 config failed");
-                                        }
-                                    }
-                                }
+                            let (tcp, h3) =
+                                crate::acme_dns::build_server_configs_maybe_from_resolver(
+                                    resolver.clone(),
+                                    on_demand_resolver.clone(),
+                                );
+                            tls.reload(tcp);
+                            match boatramp_server::quinn_server_config(h3) {
+                                Ok(qc) => endpoint.set_server_config(Some(qc)),
                                 Err(err) => {
-                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
+                                    tracing::error!(%err, "acme-dns: rebuilding h3 config failed");
                                 }
                             }
                         } else {
-                            match crate::acme_dns::build_server_config_maybe(
-                                entries,
+                            tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
+                                resolver.clone(),
                                 on_demand_resolver.clone(),
-                            ) {
-                                Ok(config) => tls.reload(config),
-                                Err(err) => {
-                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
-                                }
-                            }
+                            ));
                         }
                         #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config_maybe(
-                            entries,
+                        tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
+                            resolver,
                             on_demand_resolver.clone(),
-                        ) {
-                            Ok(config) => tls.reload(config),
-                            Err(err) => {
-                                tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
-                            }
-                        }
+                        ));
                     }
                     Ok(_) => {} // nothing stored yet (cluster follower awaiting the leader)
                     Err(err) => tracing::error!(%err, "acme-dns: renewal failed"),

@@ -145,7 +145,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "blog.example.com");
         // The bridged cert is real PEM that the serving config accepts.
-        crate::acme_dns::build_server_config(entries).expect("rustls config from stored cert");
+        let _ = crate::acme_dns::build_server_config_maybe_from_resolver(
+            crate::acme_dns::sni_resolver(entries).expect("rustls config from stored cert"),
+            None,
+        );
     }
 
     #[tokio::test]
@@ -163,7 +166,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         // Stored for the followers to pick up.
         assert!(s.get("blog.example.com").await.unwrap().is_some());
-        crate::acme_dns::build_server_config(entries).expect("rustls config");
+        let _ = crate::acme_dns::build_server_config_maybe_from_resolver(
+            crate::acme_dns::sni_resolver(entries).expect("rustls config"),
+            None,
+        );
     }
 
     #[tokio::test]
