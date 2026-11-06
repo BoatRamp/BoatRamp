@@ -2744,7 +2744,7 @@ pub struct OnDemandTlsConfig {
     /// DNS-01 only: **maximum** seconds to wait for the `_acme-challenge` TXT to become visible before
     /// telling the CA to validate. This is a real readiness poll, not a blind sleep — issuance proceeds
     /// as soon as the record resolves, falling back to proceeding-anyway (the CA retries) only if this
-    /// elapses. Absent ⇒ 15. Ignored for the `tls-alpn-01` challenge (nothing external to wait for).
+    /// elapses. Absent ⇒ 45. Ignored for the `tls-alpn-01` challenge (nothing external to wait for).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub propagation_wait_secs: Option<u64>,
     /// DNS-01 only: how often (seconds) to re-check DNS while waiting for the TXT to propagate. Absent
@@ -3105,9 +3105,13 @@ pub struct ListenerTlsConfig {
     ///
     /// Makes `cert_file`/`key_file` OPTIONAL: omit them for a pure node-cert listener, or keep them as the
     /// static FALLBACK for an SNI the node holds no control-plane cert for (and for an SNI-less
-    /// handshake). Requires `[serve.on_demand_tls] enabled = true` AND a non-empty `server_names`; the
-    /// node must actually run `--tls acme-dns` (so a control-plane cert source exists) or the listener
-    /// fails closed (it does NOT silently fall back to a static cert). Default `false` ⇒ unchanged (the
+    /// handshake). Requires a non-empty `server_names` (config-load) and the node actually running
+    /// `--tls acme-dns` so a control-plane cert source exists — the `--tls` mode is a serve-time CLI
+    /// choice the config file can't see, so it is enforced fail-closed at serve time (a `use_node_cert`
+    /// listener with no node control-plane source refuses to bind; it does NOT silently fall back to a
+    /// static cert). It does **not** require `[serve.on_demand_tls] enabled` (CHANGE 1): a `use_node_cert`
+    /// listener serves the Concept-1 cert directly and never routes through the Concept-2 on-demand
+    /// engine. Default `false` ⇒ unchanged (the
     /// static cert serves `server_names`). Composes with `on_demand`: set both to ALSO issue per-SNI
     /// (Concept 2) for this project's OTHER verified domains (the catch-all); `use_node_cert` alone keeps
     /// serving bounded to the `server_names` control-plane certs. Transport-level only — it carries no

@@ -126,7 +126,37 @@ acme: add this DNS record, then continue:
 acme: certificate issued (expires 2026-10-07)
 ```
 
+## Mix challenges per control-plane domain
+
+`--tls` sets **one** challenge for all your `--acme-domain` names — `acme-dns` is
+DNS-01 (this page), `acme` is TLS-ALPN-01. To obtain **one** control-plane domain
+by a *different* challenge — e.g. a concrete host you'd rather validate on the
+`:443` edge with no DNS write, while the zone wildcard stays on DNS-01 — list a
+per-domain override under `[serve.control_plane_tls]`:
+
+```ron
+// Node default is DNS-01 (--tls acme-dns); serve cp.example.com via TLS-ALPN-01
+// (validated on the node's own :443, no DNS write), wildcard stays DNS-01.
+serve: (
+    control_plane_tls: [
+        ( domain: "cp.example.com", challenge: "tls-alpn-01" ),
+        ( domain: "*.example.com",  challenge: "dns-01" ),
+    ],
+)
+```
+
+A domain with no entry uses the `--tls` default, so a flat `--acme-domain` config
+is unchanged. A `"tls-alpn-01"` override on a **wildcard** is refused at config
+load — only DNS-01 can satisfy a wildcard.
+
+This is **how the node obtains its own cert** (Concept 1). It is distinct from
+`[serve.on_demand_tls].challenge`, which governs how the on-demand engine issues
+certs for *other* (tenant) domains (Concept 2) — see
+[Issue certificates on-demand](./on-demand-tls.md). Full key details in
+[`serve.control_plane_tls`](../reference/boatramp-cfg.md#servecontrol_plane_tls).
+
 ## Reference
 
 - All `serve` TLS flags: [CLI reference](../reference/cli.md).
 - Provider credentials: [DNS providers & credentials](../reference/dns-providers.md).
+- Per-domain challenge override: [`serve.control_plane_tls`](../reference/boatramp-cfg.md#servecontrol_plane_tls).

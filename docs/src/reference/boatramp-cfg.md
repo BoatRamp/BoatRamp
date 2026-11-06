@@ -62,7 +62,8 @@ Top-level sections, all optional:
 | `console` | table | — | The embedded web management console's static baseline (`console` feature). See [`serve.console`](#serveconsole). |
 | `kv` | table | — | Control-plane SlateDB KV durability cadence + shutdown budget. See [`serve.kv`](#servekv). |
 | `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
-| `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
+| `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance for **other** (tenant) domains — **Concept 2**, distinct from how the node gets its own cert. See [`serve.on_demand_tls`](#serveon_demand_tls). |
+| `control_plane_tls` | list | `[]` | Per-control-plane-domain ACME **challenge override** (**Concept 1**): a `{ domain, challenge }` list letting each `--acme-domain` be obtained via `dns-01` or `tls-alpn-01`, overriding the node-wide `--tls` default. Empty ⇒ every domain uses the `--tls` default. `acme-dns` feature. See [`serve.control_plane_tls`](#servecontrol_plane_tls). |
 | `dns_publish` | table | — (off) | Host-held DNS provider backing the guest **`dns-publish` WRITE** capability (cap-req #24/#25). **Absent ⇒ no provider is wired ⇒ every guest `dns-publish` call is `access-denied`** (fail-closed). See [`serve.dns_publish`](#servedns_publish). |
 | `dns_providers` | list | `[]` | A per-zone DNS provider **list** (cap-req #27): N providers, each a `type:value`-pointer-sourced identity + credential, routed by longest-suffix `zone_root` for BOTH ACME DNS-01 and guest `dns-publish`. Empty ⇒ the single env-seeded provider path, unchanged. `acme-dns` feature. See [`serve.dns_providers`](#servedns_providers). |
 | `alerts` | table | — | Node/system-health alerting (leader-gated evaluation loop + sealed webhook/email channels + orphan reaper). See [`serve.alerts`](#servealerts). |
@@ -347,11 +348,25 @@ refuse credentials over plaintext and advertise STARTTLS only before the upgrade
 | `max_conn_duration_ms` | int | `3600000` | Absolute cap on a single connection's lifetime regardless of activity. `0` is refused. |
 | `max_promoted_splices` | int | `256` | **Per-listener** cap on concurrently-live **promoted** persistent splices (cap-req 22; see the escalation note below), atop the node-global `[handlers].max_promoted_splices` ceiling. A multi-tenant fairness bound so one session listener can't exhaust the whole node-global splice budget; a `promote-connection` past **either** cap is refused `capacity` (retryable). Only meaningful for a `mode = "session"` listener whose guest is granted egress. `0` is refused; absent ⇒ a small fraction of the node-global ceiling. |
 | `mode` | `connection` \| `session` | `connection` | How the accepted connection is driven. `connection` pins one wasm instance per connection for its whole life (exports `tcp-connection-handler`). `session` drives it through the re-entrant session model — the host owns the socket, holds no instance between batches, and a protocol-idle-but-alive peer (IMAP IDLE) is never reaped for inactivity (exports `session-handler`). |
-| `tls` | table | — | Host-side TLS termination (cap-req 06): the host terminates TLS and hands the guest a decrypted plaintext stream. Requires `cert_file` + `key_file` (PEM). Add a `starttls` sub-table (`trigger` / `response` / `tag_capture`) for in-band STARTTLS upgrade (SMTP/IMAP/POP3). Omit for a plaintext listener. |
+| `tls` | table | — | Host-side TLS termination (cap-req 06): the host terminates TLS and hands the guest a decrypted plaintext stream. Needs a cert **source** — either a static `cert_file` + `key_file` (PEM) pair **or** `use_node_cert = true` (serve the node's control-plane cert; cap-req #29); a block with neither is refused at load (fail-closed). Add a `starttls` sub-table (`trigger` / `response` / `tag_capture`) for in-band STARTTLS upgrade (SMTP/IMAP/POP3). Omit for a plaintext listener. See the `tls` sub-fields below. |
 
-A listener's optional `tls` block may set `on_demand = true` to share the
-`[serve.on_demand_tls]` engine for per-SNI issuance on a verified custom domain in
-its own project.
+The listener's optional `tls` block takes these sub-fields:
+
+| `tls` sub-field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cert_file` / `key_file` | path | — | Static PEM certificate chain + private key (a **pair** — both or neither). Serves `server_names` and SNI-less handshakes; under `use_node_cert` it demotes to the **fallback** for an SNI the node holds no control-plane cert for. Optional since cap-req #29 (omit both for a pure node-cert listener). |
+| `starttls` | table | — | In-band STARTTLS grammar (`trigger` / `response` / `tag_capture`) for SMTP/IMAP/POP3. Absent ⇒ implicit TLS (handshake at accept). |
+| `on_demand` | bool | `false` | Share the `[serve.on_demand_tls]` engine (**Concept 2**) to issue per-SNI for **this project's** other verified custom domains (the catch-all). Requires `[serve.on_demand_tls] enabled = true`. |
+| `use_node_cert` | bool | `false` | Serve the node's **control-plane** cert (**Concept 1**) — the same `--acme-domain` cert the `:443` edge serves — for the domains in `server_names`, resolved straight from the node's shared, hot-swappable cert source (a renewal reaches the listener live) and **not** through the on-demand engine, so no tenant verify/attach gate applies: a **pure control-plane FQDN serves**. Requires a non-empty `server_names` and the node actually running `--tls acme-dns` (enforced fail-closed at serve time — a listener with no node cert source refuses to bind); it does **not** require `[serve.on_demand_tls] enabled`. Composes with `on_demand` (set both to also catch-all per-SNI for the project's other domains). |
+| `server_names` | list | — | Under `use_node_cert = true`, the **allowlist** of domains this listener serves the node cert for (**required non-empty** then; an SNI outside it is never served the node cert). Under `on_demand`, the SNI names the static `cert_file` serves directly (an SNI match wins before on-demand). |
+
+> **`use_node_cert` is Concept 1, not the on-demand engine.** Before the ACME
+> concept decouple a `use_node_cert` listener was routed through the Concept-2
+> on-demand engine and so required `[serve.on_demand_tls] enabled = true`. It now
+> serves the node's control-plane cert **directly** and requires only the node
+> running `--tls acme-dns` plus a non-empty `server_names` — see
+> [`serve.control_plane_tls`](#servecontrol_plane_tls) for Concept 1 and
+> [`serve.on_demand_tls`](#serveon_demand_tls) for Concept 2.
 
 #### Session→connection escalation (`promote-connection`, cap-req 22)
 
@@ -404,10 +419,20 @@ an ACME storm. The ACME account + issued certs persist in the control-plane cert
 store and replicate across the cluster (the leader issues; followers serve the
 replicated cert).
 
+This is **Concept 2** — how the on-demand engine proves control of **other**
+(tenant) domains. It is **separate** from how the node obtains + serves its *own*
+`--acme-domain` control-plane cert (**Concept 1**, driven by `--tls` /
+`--acme-domain` and the per-domain
+[`serve.control_plane_tls`](#servecontrol_plane_tls) override); a `use_node_cert`
+listener *serves* the Concept-1 cert and never runs this challenge. Env parity:
+`BOATRAMP_ON_DEMAND_TLS_*` (the `serve` segment dropped, like `alerts`) — every
+scalar below, including `challenge`, is env-settable; see
+[env reference](env.md#on-demand-tls-serveon_demand_tls).
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Master toggle; `false` ⇒ the whole feature is off (the static `--tls acme-dns` resolver is unchanged). |
-| `challenge` | `tls-alpn-01` \| `dns-01` | `tls-alpn-01` | How to prove control of a name to the CA. `tls-alpn-01` validates on the 443 edge (no extra port); `dns-01` uses the node's configured ACME DNS provider. |
+| `challenge` | `"tls-alpn-01"` \| `"dns-01"` | `"tls-alpn-01"` | How to prove control of a name to the CA. Set as a **quoted string** in both RON (`challenge: "dns-01"`) and JSON (`"challenge": "dns-01"`), or via `BOATRAMP_ON_DEMAND_TLS_CHALLENGE`. `tls-alpn-01` validates on the 443 edge (no extra port); `dns-01` uses the node's configured ACME DNS provider. |
 | `directory_url` | string | ACME client default | ACME directory URL. Absent ⇒ Let's Encrypt production. |
 | `contact_email` | string | — | ACME account contact email (optional). |
 | `max_inflight` | int | `4` | Max concurrent in-flight issuances (global). |
@@ -415,6 +440,46 @@ replicated cert).
 | `rate_limit_per_hour` | int | `50` | Max CA orders per rolling hour (the account rate-limit floor). `0` ⇒ unlimited. |
 | `propagation_wait_secs` | int | `45` | DNS-01 only: **max** seconds to wait for the `_acme-challenge` TXT to become visible before telling the CA to validate — a real readiness poll against the zone's **authoritative** nameservers (resolve the record, confirm the value), not a blind sleep. Issuance proceeds as soon as the record resolves; if this elapses first it proceeds anyway (the CA retries). Ignored for `tls-alpn-01`. |
 | `propagation_poll_interval_secs` | int | `2` | DNS-01 only: how often to re-check DNS while waiting for the TXT to propagate. |
+
+### `serve.control_plane_tls`
+
+A **list** of per-control-plane-domain ACME **challenge overrides** (**Concept 1** —
+how the NODE obtains + serves its OWN `--acme-domain` cert). Each entry pins how ONE
+control-plane domain's cert is obtained — `dns-01` or `tls-alpn-01` — overriding the
+node-wide `--tls` default (`acme-dns` ⇒ DNS-01). So one `--acme-domain` can be issued
+via DNS-01 and another via TLS-ALPN-01 from the same `serve`. **Empty (the default) ⇒
+every domain uses the `--tls` default**, so an existing flat `--acme-domain` config is
+unchanged (full backward-compat). File-only (like [`dns_providers`](#servedns_providers)).
+
+This is **deliberately separate** from
+[`serve.on_demand_tls`](#serveon_demand_tls)`.challenge` (**Concept 2**, the on-demand
+engine's challenge for issuing OTHER/tenant domains' certs): an override here changes
+only how the node's OWN cert is obtained.
+
+Each entry:
+
+- **`domain`** — the control-plane domain this override applies to; must be one of the
+  node's `--acme-domain` values (an entry for a domain the node does not serve is inert).
+- **`challenge`** — a quoted string, `"dns-01"` or `"tls-alpn-01"`.
+
+Validation (fail-closed, boot-loud): an unsupported challenge token is rejected at parse,
+a blank `domain` is refused, and a `"tls-alpn-01"` override on a **wildcard** domain
+(`*.…`) is refused at config load — TLS-ALPN-01 proves control of one concrete name on
+the `:443` edge and cannot satisfy a wildcard (only DNS-01 can). A TLS-ALPN-01
+control-plane domain is validated against the node's own `:443` edge (the edge answers
+the CA's `acme-tls/1` handshake), so it needs no DNS write; DNS-01 uses the node's
+configured ACME DNS provider. Only usable on a build with the `acme-dns` feature.
+
+```ron
+// Node default is DNS-01 (`--tls acme-dns`); serve one control-plane host via
+// TLS-ALPN-01 instead (no DNS write for it), and leave the wildcard on DNS-01.
+serve: (
+    control_plane_tls: [
+        ( domain: "cp.example.com", challenge: "tls-alpn-01" ),
+        ( domain: "*.example.com",  challenge: "dns-01" ),
+    ],
+)
+```
 
 ### `serve.alerts`
 

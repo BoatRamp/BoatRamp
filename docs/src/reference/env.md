@@ -344,6 +344,30 @@ An **exact** host (an apex/`www`/`console` site or cert) always wins over a wild
 in both host→site routing and SNI cert selection — so `*.example.com` never shadows a
 declared exact host.
 
+### On-demand TLS (`[serve.on_demand_tls]`)
+
+Env parity for the on-demand per-SNI issuer (**Concept 2** — issuing **other** tenant
+domains' certs, distinct from the node's own `--acme-domain` cert). The `serve` segment
+is dropped (like `[serve.alerts]`). Previously file-only; now every scalar is
+env-settable. See [`serve.on_demand_tls`](./boatramp-cfg.md#serveon_demand_tls).
+
+| Variable | Description |
+| --- | --- |
+| `BOATRAMP_ON_DEMAND_TLS_ENABLED` | Master toggle for the on-demand engine (default off). |
+| `BOATRAMP_ON_DEMAND_TLS_CHALLENGE` | Challenge: `tls-alpn-01` (default) or `dns-01`. |
+| `BOATRAMP_ON_DEMAND_TLS_DIRECTORY_URL` | ACME directory URL (default Let's Encrypt production). |
+| `BOATRAMP_ON_DEMAND_TLS_CONTACT_EMAIL` | ACME account contact email. |
+| `BOATRAMP_ON_DEMAND_TLS_MAX_INFLIGHT` | Max concurrent in-flight issuances (default 4). |
+| `BOATRAMP_ON_DEMAND_TLS_NEGATIVE_TTL_SECS` | How long a refused/failed SNI is negatively cached (default 300). |
+| `BOATRAMP_ON_DEMAND_TLS_RATE_LIMIT_PER_HOUR` | Max CA orders per rolling hour (default 50; `0` ⇒ unlimited). |
+| `BOATRAMP_ON_DEMAND_TLS_PROPAGATION_WAIT_SECS` | DNS-01 only: max seconds to wait for the `_acme-challenge` TXT to become visible (default 45). |
+| `BOATRAMP_ON_DEMAND_TLS_PROPAGATION_POLL_INTERVAL_SECS` | DNS-01 only: how often (seconds) to re-check DNS while waiting (default 2). |
+
+The per-control-plane-domain challenge override
+([`serve.control_plane_tls`](./boatramp-cfg.md#servecontrol_plane_tls), **Concept 1**) is
+**file-only** — like [`serve.dns_providers`](./boatramp-cfg.md#servedns_providers), it is
+not env-settable.
+
 ## DNS provider credentials
 
 Auto-DNS and `--tls acme-dns` read provider credentials (`CLOUDFLARE_API_TOKEN`,

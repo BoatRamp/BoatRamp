@@ -7,6 +7,47 @@ versions.
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-11-06
+
+### Added
+
+- **Per-control-plane-domain ACME challenge override (`[serve.control_plane_tls]`).** A new
+  file-only `{ domain, challenge }` list (mirroring the `[serve.dns_providers]` idiom) lets each
+  `--acme-domain` control-plane domain be obtained via a different challenge — `dns-01` or
+  `tls-alpn-01` — overriding the node-wide `--tls` default (`acme-dns` ⇒ DNS-01). So one
+  control-plane host can be validated on the node's own `:443` edge (TLS-ALPN-01, no DNS write)
+  while the zone wildcard stays on DNS-01, from the same `serve`. A domain with no entry uses the
+  `--tls` default, so an existing flat config is unchanged. A `tls-alpn-01` override on a wildcard
+  domain (and a blank domain) is refused at config load, fail-closed (only DNS-01 can satisfy a
+  wildcard). This is **Concept 1** (how the node obtains its OWN cert) and is deliberately separate
+  from `[serve.on_demand_tls].challenge` (Concept 2).
+- **`[serve.on_demand_tls].challenge` is now settable from a config file and the environment.** The
+  on-demand engine's challenge (Concept 2 — how it issues OTHER/tenant domains' certs) was
+  effectively unsettable: its kebab tokens (`tls-alpn-01` / `dns-01`) are not valid RON identifiers,
+  so the previous bare-variant encoding could not be written from a RON file at all. It now
+  (de)serializes as a quoted **string** in both RON (`challenge: "dns-01"`) and JSON
+  (`"challenge": "dns-01"`), and every `[serve.on_demand_tls]` scalar — including `challenge` — is
+  env-settable via `BOATRAMP_ON_DEMAND_TLS_*` (the `serve` segment dropped, like `[serve.alerts]`),
+  so the block can be configured with no config file.
+
+### Fixed
+
+- **`use_node_cert` listeners now serve the node's control-plane cert directly, so a pure
+  control-plane domain is served (mailroom cap-req #29).** A `use_node_cert` listener was routed
+  through the on-demand (Concept 2) engine, which cannot see the node's own `--acme-domain`
+  (Concept 1) cert — it re-issued, used the wrong challenge, and was refused by the tenant
+  verify/attach gate for a pure control-plane FQDN, so such a name could not be served on a listener
+  at all. The listener resolver is now three clearly-separated tiers: a name in the listener's
+  `server_names` allowlist resolves against the node's shared, hot-swappable control-plane cert
+  source (a renewal reaches the listener live) and is served directly, with no on-demand issuance or
+  tenant gate; the on-demand catch-all and the static `cert_file` tiers are unchanged.
+- **`use_node_cert` no longer requires `[serve.on_demand_tls] enabled`.** Because it now serves the
+  control-plane cert directly instead of through the on-demand engine, a `use_node_cert` listener
+  needs only the node running `--tls acme-dns` (a serve-time precondition enforced fail-closed — a
+  listener with no node cert source refuses to bind) and a non-empty `server_names`. A
+  `use_node_cert`-only listener keeps its on-demand catch-all off, so a non-managed SNI still fails
+  closed.
+
 ## [0.58.0] - 2026-11-05
 
 ### Added

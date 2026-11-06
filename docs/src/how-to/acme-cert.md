@@ -86,3 +86,4 @@ boatramp serve --tls acme --acme-domain example.com --acme-cache /var/lib/boatra
 
 - All `serve` TLS flags: [CLI reference](../reference/cli.md).
 - Wildcard and preview certs via DNS-01: [Wildcard certs with DNS-01](./wildcard-dns01.md).
+- Obtain individual control-plane domains by a different challenge: [`serve.control_plane_tls`](../reference/boatramp-cfg.md#servecontrol_plane_tls).

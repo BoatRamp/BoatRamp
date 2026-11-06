@@ -7,6 +7,14 @@ certificate is issued at the **first TLS handshake** for that hostname, with no
 `serve` restart and no need to list the domain in `--acme-domain` ahead of time.
 This is how you front many customer-owned domains without enumerating them.
 
+> **Two different things called "challenge".** This page is **Concept 2**: how the
+> on-demand engine issues certs for **other** (tenant) domains. It is separate from
+> how the node obtains its **own** `--acme-domain` control-plane cert — **Concept 1**,
+> driven by `--tls` / `--acme-domain` and the per-domain
+> [`serve.control_plane_tls`](../reference/boatramp-cfg.md#servecontrol_plane_tls)
+> override. `[serve.on_demand_tls].challenge` here never affects the node's own cert,
+> and a listener serving the node cert (`use_node_cert`) does not run this engine.
+
 ## When to use this
 
 You have (or expect) **many attached custom domains** — one per tenant,
@@ -94,7 +102,10 @@ propagation knobs — is in the [config reference](../reference/boatramp-cfg.md#
 The default challenge is **TLS-ALPN-01**, which validates on the `443` edge with
 no extra port and no per-domain DNS write — ideal for customer-owned domains that
 are simply CNAMEd to you. To validate over DNS-01 instead (when you control the
-zone, e.g. for a wildcard), set `challenge: "dns-01"`; that path uses the node's
+zone, e.g. for a wildcard), set `challenge: "dns-01"` — a quoted string in RON or
+JSON, or the env var `BOATRAMP_ON_DEMAND_TLS_CHALLENGE=dns-01` (every
+`[serve.on_demand_tls]` scalar has a `BOATRAMP_ON_DEMAND_TLS_*` env parity, so the
+block can be configured with no config file). That path uses the node's
 configured ACME DNS provider and the `propagation_wait_secs` /
 `propagation_poll_interval_secs` knobs (the same readiness poll described in
 [Wildcard certs with DNS-01](./wildcard-dns01.md)).
