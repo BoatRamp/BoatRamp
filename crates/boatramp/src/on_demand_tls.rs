@@ -631,6 +631,22 @@ impl OnDemandResolver {
         None
     }
 
+    /// A resolver with NO issuance engine: an empty [`CertCache`] + a dead trigger channel + unscoped.
+    /// A miss simply fails the handshake (it never triggers issuance). The PRODUCTION seam for a
+    /// `use_node_cert` listener on a node that serves `--tls acme-dns` but has NO on-demand engine
+    /// (CHANGE 1): the Concept-1 managed tier is served from `node_certs`, and this inert resolver fills
+    /// the composite's Concept-2 slot so a non-managed SNI fails closed (the listener never issues
+    /// on-demand). Also the `:443` edge's inert Concept-2 slot when only a control-plane TLS-ALPN-01
+    /// challenge tier is wired (no on-demand engine).
+    pub(crate) fn dead() -> Arc<Self> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(Self {
+            cache: Arc::new(CertCache::default()),
+            trigger: tx,
+            scope: None,
+        })
+    }
+
     /// Build a resolver over a pre-seeded [`CertCache`] with a dead trigger channel. Test-only seam
     /// (no engine, no issuance) for exercising the composite's handshake dispatch: a miss simply fails
     /// the handshake instead of triggering issuance. Unscoped (edge-like).

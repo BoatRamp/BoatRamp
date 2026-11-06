@@ -666,7 +666,6 @@ impl ServerConfig {
             // implicit TLS (465/993) and STARTTLS (25/587/143) — STARTTLS still terminates TLS after the
             // in-band upgrade.
             if let Some(tls) = &l.tls {
-                let on_demand_enabled = serve.on_demand_tls.as_ref().is_some_and(|o| o.enabled);
                 // A static cert is a PAIR: a half-declared pair is always a misconfiguration.
                 if tls.cert_file.is_some() != tls.key_file.is_some() {
                     return err(
@@ -685,15 +684,12 @@ impl ServerConfig {
                          node-managed cert, or remove the `tls` block for a plaintext listener",
                     );
                 }
-                // `use_node_cert` shares the node's one on-demand engine (same budget / single-flight as
-                // `:443`), so it is meaningless unless that engine runs — refuse fail-closed if not.
-                if tls.use_node_cert && !on_demand_enabled {
-                    return err(
-                        "listener `tls.use_node_cert` requires `[serve.on_demand_tls] enabled = true`",
-                        " — enable node on-demand TLS (and serve with `--tls acme-dns`), or provide a \
-                         static cert_file/key_file instead",
-                    );
-                }
+                // `use_node_cert` SERVES the node's control-plane cert source directly (Concept 1 — the
+                // decoupled path; it does NOT route through the Concept-2 on-demand engine). It therefore
+                // needs only a NodeCertSource — i.e. the node serving `--tls acme-dns` — NOT the on-demand
+                // engine. That `--tls` mode is a serve-time CLI choice the config file cannot see, so the
+                // requirement is enforced fail-closed at serve time (`serve.rs`: a `use_node_cert` listener
+                // with no node control-plane source refuses to bind). No `[serve.on_demand_tls]` check here.
                 // `server_names` is the per-listener node-managed ALLOWLIST under `use_node_cert`; an
                 // empty allowlist authorizes no domain, so the listener could serve nothing managed —
                 // refuse it (fail-closed) rather than bind a dead listener.
@@ -5234,27 +5230,29 @@ mod tests {
         .expect("a valid conn_rate_ipv6_prefix parses");
 
         // ---- cap-req #29: node-managed listener cert (cert_file XOR use_node_cert) ----------------
-        // (p) THE #29 core: `use_node_cert = true` + node on-demand TLS enabled + a non-empty
-        //     `server_names` + NO static cert_file/key_file is now VALID — the listener serves the
-        //     node-managed cert. (Before #29 this was refused for "requires both cert_file and key_file".)
+        // (p) THE #29 core: `use_node_cert = true` + a non-empty `server_names` + NO static
+        //     cert_file/key_file is VALID — the listener serves the node control-plane cert. A present-
+        //     but-no-longer-required `[serve.on_demand_tls]` is harmless. (Before #29 this was refused for
+        //     "requires both cert_file and key_file".)
         ServerConfig::parse(
             r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true, server_names: ["mail.example.test"] ) ) } ) )"#,
         )
         .expect("use_node_cert with node on-demand + server_names and no static cert is valid (#29)");
-        // (q) `use_node_cert = true` WITHOUT node on-demand TLS enabled is refused (the shared engine
-        //     it would serve from does not exist — fail-closed, never a silent plaintext listener).
-        let err = ServerConfig::parse(
+        // (q) CHANGE 1: `use_node_cert = true` WITHOUT `[serve.on_demand_tls]` is now VALID — the node
+        //     control-plane cert source (Concept 1) is served directly, NOT through the on-demand engine,
+        //     so the engine is no longer required. The `--tls acme-dns` precondition (a NodeCertSource
+        //     must exist) is a serve-time CLI choice the config file cannot see, so it is enforced
+        //     fail-closed at serve time, not here. (Before CHANGE 1 this was refused.)
+        ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true, server_names: ["mail.example.test"] ) ) } ) )"#,
         )
-        .expect_err("use_node_cert without [serve.on_demand_tls] enabled must be refused");
-        assert!(
-            matches!(err, ConfigError::InvalidListener { .. }),
-            "{err:?}"
-        );
+        .expect("use_node_cert without [serve.on_demand_tls] is valid after CHANGE 1 (served directly)");
         // (r) `use_node_cert = true` with an EMPTY/absent `server_names` is refused — the allowlist of
-        //     node-managed domains must name at least one host (an empty allowlist serves nothing).
+        //     node-managed domains must name at least one host (an empty allowlist serves nothing). The
+        //     refusal is independent of `[serve.on_demand_tls]` (none set here), proving `server_names` is
+        //     checked on its own.
         let err = ServerConfig::parse(
-            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true ) ) } ) )"#,
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:993", component: "c.wasm", project: "p", site: "s", tls: ( use_node_cert: true ) ) } ) )"#,
         )
         .expect_err("use_node_cert with no server_names must be refused");
         assert!(

@@ -1464,6 +1464,74 @@ mod tests {
             );
         }
 
+        // CHANGE 1: a `use_node_cert` listener no longer needs the on-demand engine. With `--tls
+        // acme-dns` (⇒ a `NodeCertSource` exists) but `[serve.on_demand_tls]` DISABLED, serve.rs builds
+        // the listener composite with the PRODUCTION inert on-demand seam
+        // ([`crate::on_demand_tls::OnDemandResolver::dead`]) + `catch_all_on_demand = false`: the managed
+        // name is served the node control-plane cert, and a non-managed SNI fails closed (no engine to
+        // issue). WITHOUT `--tls acme-dns` there is no `node_certs` source, and the managed name itself
+        // fails closed — the serve.rs fail-closed branch, pinned here at the composite the branch builds.
+        //
+        // MUTATION SENSE: the first half (node_certs = Some, dead engine) is the exact shape CHANGE 1's
+        // serve.rs arm builds when `use_node_cert` is set with no engine — it must SERVE. The second half
+        // (node_certs = None) is the shape when the node is not `--tls acme-dns` — it must REFUSE. Flip
+        // either and the paired assertion goes red.
+        #[test]
+        fn use_node_cert_no_engine_serves_with_source_and_fails_closed_without() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            let (node_cert, node_key) = self_signed("cp.example.test");
+            let server_names = vec!["cp.example.test".to_string()];
+
+            // (a) `--tls acme-dns`, on-demand DISABLED: the node control-plane source is present and the
+            //     Concept-2 slot is the inert production `dead()` resolver (NOT a test seam).
+            let served = {
+                let config = std::sync::Arc::new(
+                    build_listener_server_config_composite(
+                        None, // pure node-cert listener, no static material
+                        &server_names,
+                        &server_names,
+                        false, // catch_all OFF (no engine)
+                        crate::on_demand_tls::OnDemandResolver::dead(),
+                        Some(node_source(&[("cp.example.test", &node_cert, &node_key)])),
+                    )
+                    .unwrap(),
+                );
+                served_cert(&config, ServerName::try_from("cp.example.test").unwrap())
+            };
+            assert_eq!(
+                served.as_deref(),
+                Some(leaf_der(&node_cert).as_slice()),
+                "use_node_cert serves the node control-plane cert with NO on-demand engine (CHANGE 1)"
+            );
+
+            // (b) NOT `--tls acme-dns` (no node_certs source): the managed name fails closed — exactly
+            //     the serve.rs fail-closed outcome, expressed at the composite it would build.
+            let config_no_source = std::sync::Arc::new(
+                build_listener_server_config_composite(
+                    None,
+                    &server_names,
+                    &server_names,
+                    false,
+                    crate::on_demand_tls::OnDemandResolver::dead(),
+                    None, // no node control-plane source (not `--tls acme-dns`)
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                served_cert(
+                    &config_no_source,
+                    ServerName::try_from("cp.example.test").unwrap()
+                ),
+                None,
+                "without a node control-plane source the managed name fails closed (no silent serve)"
+            );
+            println!(
+                "LISTENER USE-NODE-CERT NO-ENGINE OK: served with `--tls acme-dns` + on-demand OFF; \
+                 fails closed without a node control-plane source"
+            );
+        }
+
         // Security review F1: a WILDCARD or MIXED-CASE `server_names` entry under `use_node_cert` must
         // route a covered concrete SNI to the NODE CONTROL-PLANE path — not silently fall through to the
         // static tier (which IS wildcard/case-aware via `sni_matches`) and serve the operator's static

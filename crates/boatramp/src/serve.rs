@@ -3897,18 +3897,38 @@ fn spawn_listeners(
                             )?;
                             return Ok(std::sync::Arc::new(cfg));
                         }
-                        // The listener asked for node-managed certs but this node runs no on-demand
-                        // engine (not `--tls acme-dns`, or on-demand disabled/unbuilt). For
-                        // `use_node_cert` this is fail-closed (do NOT silently serve a static cert the
-                        // operator may not have intended as primary); for an `on_demand`-only listener
-                        // the historical graceful fallback to its (always-present) static cert is kept.
-                        None if t.use_node_cert => {
-                            return Err(Error::NoCert(
-                                "<listener use_node_cert: this node runs no on-demand TLS engine \
-                                 (serve with `--tls acme-dns` and `[serve.on_demand_tls] enabled`)>"
-                                    .into(),
-                            ));
-                        }
+                        // CHANGE 1: `use_node_cert` needs only a node CONTROL-PLANE cert source
+                        // (`--tls acme-dns`), NOT the on-demand engine — the managed tier is served
+                        // directly from `node_certs`, never through the Concept-2 engine. So when there is
+                        // no on-demand engine but the node DOES have a control-plane source, build the
+                        // listener composite serving from that source with NO on-demand tier (a DEAD
+                        // on-demand resolver + `catch_all_on_demand = false` — the Security-cleared
+                        // relaxation keeps the catch-all OFF, so a non-managed SNI fails closed). Fail
+                        // closed only when there is no control-plane source at all (this node is not
+                        // `--tls acme-dns`), never by silently serving a static cert as primary.
+                        None if t.use_node_cert => match node_certs.clone() {
+                            Some(src) => {
+                                let server_names = t.server_names.clone().unwrap_or_default();
+                                let static_ref =
+                                    static_pem.as_ref().map(|(c, k)| (c.as_str(), k.as_str()));
+                                let cfg = crate::acme_dns::build_listener_server_config_composite(
+                                    static_ref,
+                                    &server_names,
+                                    &server_names, // managed_names (use_node_cert, Concept 1)
+                                    false,         // no Concept-2 catch-all (no engine)
+                                    crate::on_demand_tls::OnDemandResolver::dead(),
+                                    Some(src),
+                                )?;
+                                return Ok(std::sync::Arc::new(cfg));
+                            }
+                            None => {
+                                return Err(Error::NoCert(
+                                    "<listener use_node_cert: this node is not serving `--tls \
+                                     acme-dns`, so it has no node control-plane cert source to serve>"
+                                        .into(),
+                                ));
+                            }
+                        },
                         None => { /* on_demand-only: fall through to the static cert below */ }
                     }
                 }
