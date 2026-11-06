@@ -106,20 +106,23 @@ jobs:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
     runs-on: ${{ matrix.os }}
     # Hard cap on the per-target build (Nix static build + cachix read/push) — fail a wedge
-    # fast instead of the 6h default. 90m is ample for a cold, cache-miss build.
-    timeout-minutes: 90
+    # fast instead of the 6h default. Per-leg (matrix.timeout): the Linux/Windows legs keep a
+    # tight 90m; the macOS legs get 150m because GitHub's winding-down Intel macOS pool can run
+    # a cold build past 90m (observed an x86_64-apple-darwin 90m timeout — the ARM leg is faster
+    # but shares the cap for headroom).
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, kind: linux }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: linux }
-          - { os: macos-15-intel, target: x86_64-apple-darwin, kind: unix }
-          - { os: macos-15, target: aarch64-apple-darwin, kind: unix }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, kind: linux, timeout: 90 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: linux, timeout: 90 }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, kind: unix, timeout: 150 }
+          - { os: macos-15, target: aarch64-apple-darwin, kind: unix, timeout: 150 }
           # Windows additionally ships the overlay service tunneler (`tun,overlay`): `boatramp
           # tunnel` on a wintun adapter, with the signed wintun.dll bundled alongside (R4). Only
           # the portable (cargo-built) targets read `extra_features`; the Linux legs build via Nix.
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows, extra_features: "tun,overlay" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows, extra_features: "tun,overlay", timeout: 90 }
     steps:
       - uses: actions/checkout@v5
 
