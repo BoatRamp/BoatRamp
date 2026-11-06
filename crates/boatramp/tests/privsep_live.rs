@@ -911,6 +911,169 @@ fn privsep_container_substrate_serves_end_to_end() {
     println!("PRIVSEP CONTAINER SUBSTRATE OK");
 }
 
+/// Live gate for the Phase-3 **`substrate: vm`** spawn backend — DESIGN-FIRST, still REFUSED
+/// fail-closed (the VM backend is NOT wired; see `crates/boatramp/DESIGN-privsep-phase3-vm.md`).
+///
+/// A VM has its OWN kernel, so fd-passing cannot cross the boundary: the `local` socketpair link
+/// ends, the public listener fd, AND the per-request `SCM_RIGHTS` client-connection splice all need a
+/// vsock byte-relay that is not built, and the hosting model (guest kernel + own-binary-as-init) is an
+/// unratified owner + Security decision. So the substrate stays refused.
+///
+/// Forks `boatramp __root` against the known-valid frontend-inversion topology (union == ALL; grants
+/// disjoint; no crown co-resident with a listener/exec/control surface — so it clears every
+/// pre-supervise lint + screen and REACHES the substrate-dispatch gate) whose serving `core` is pinned
+/// `substrate: vm`, and asserts the node **refuses fail-closed end-to-end**: the root exits NON-ZERO
+/// at the pre-spawn substrate-dispatch gate (`supervise::run` step 0 → `resolve_spawn_backend`),
+/// BEFORE it binds the public listener or spawns any instance, and the port is NEVER served. The "no
+/// silent downgrade to an OS process" invariant made observable end-to-end.
+///
+/// **This gate INVERTS** into a real serve gate once the VM backend is wired: the SAME composition
+/// then serves a real 200 from a VM-confined `core` over the vsock relay (marker
+/// `PRIVSEP VM SUBSTRATE OK`), at which point it moves to lighthouse (Linux + `/dev/kvm`). Until then
+/// the REFUSE assertion is the proof the fail-closed posture holds. The refuse gate needs NEITHER
+/// `/dev/kvm` NOR sudo — the refusal fires before any VM boot — so it runs on the ordinary CI runner.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the other live gates.
+/// The CI `live gate (privsep)` job runs it via `--include-ignored` and greps the
+/// `PRIVSEP VM SUBSTRATE REFUSED OK` marker + the pass count, so a silent skip / compile-out — or a
+/// fail-closed regression that spawns/binds a VM instance despite the unwired backend — fails the
+/// merge.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a composition whose serving core is pinned `substrate: \
+            vm`; asserts the node refuses FAIL-CLOSED (exits non-zero at the pre-spawn \
+            substrate-dispatch gate, never binds the listener, never serves) — the VM backend is not \
+            wired (DESIGN-first, see DESIGN-privsep-phase3-vm.md). Run via --include-ignored in the \
+            `live gate (privsep)` job"]
+fn privsep_vm_substrate_refuses_fail_closed_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    // The refusal fires at the pre-spawn substrate-dispatch gate (supervise::run step 0 →
+    // resolve_spawn_backend), BEFORE any instance is forked — so (unlike the container SERVE gate)
+    // there is no cap-drop/traversal concern and no root/sudo needed. Root the node dirs under cargo's
+    // integration-test temp (NOT /tmp — `derive_profile` refuses a data_dir there), like the
+    // 2-instance composition gate.
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-vm-refuse-{}", std::process::id()));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The SAME known-valid frontend-inversion topology the container serve gate uses, with the one
+    // change under test: the serving `core` is pinned to the still-REFUSED `substrate: vm`. Chosen so
+    // that when the VM backend is wired, this exact composition INVERTS into the serve gate (frontend
+    // splices client bytes → vsock relay → a VM-confined `core` returns a 200). `frontend` (OsProcess)
+    // binds the listener; `core` holds the backends + crown jewels.
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "frontend": (
+                capabilities: ["listen.public-tls", "listen.http-parse", "exec.wasmtime"],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay", "listen.s3ingress",
+                    "listen.inbound-tcp", "listen.gateway",
+                    "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: Vm,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "frontend", to: "core", transport: Local, purpose: Relay) }},
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    // Fail-closed proof: the node must EXIT (non-zero — the VM substrate refusal) within a few
+    // seconds, and must NEVER serve the port. Poll both: a served response AT ANY POINT means the
+    // fail-closed posture broke (a VM instance was spawned / the listener was bound despite the unwired
+    // backend); otherwise wait for the non-zero exit.
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let exit_status = loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "the `substrate: vm` node neither refused (exited) nor served within 15s — the \
+                 pre-spawn substrate-dispatch refusal did not fire as expected"
+            );
+        }
+        // A served response = the fail-closed posture broke: the unwired VM backend must be refused
+        // BEFORE the public listener is bound or any instance spawned.
+        if let Ok(resp) = try_http_get(&addr)
+            && !resp.is_empty()
+        {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "the `substrate: vm` node SERVED a response — fail-closed REGRESSION (an unwired VM \
+                 substrate must be refused before the listener is bound / any instance is spawned), \
+                 got:\n{resp}"
+            );
+        }
+        if let Ok(Some(status)) = root.try_wait() {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        !exit_status.success(),
+        "`boatramp __root` with a `substrate: vm` instance must EXIT NON-ZERO (fail-closed refusal of \
+         the unwired VM backend), got a clean exit: {exit_status}"
+    );
+    // Belt-and-suspenders: after the refusal the public listener must be unbound (connection refused),
+    // confirming the refusal fired BEFORE the step-2 listener bind.
+    assert!(
+        try_http_get(&addr).is_err(),
+        "after the fail-closed VM refusal the public listener must be unbound (connection refused) — \
+         the refusal must fire before the listener is bound"
+    );
+
+    // The marker the CI gate greps — reached only after the node refused the unwired VM substrate
+    // fail-closed (exited non-zero, never served). INVERTS to `PRIVSEP VM SUBSTRATE OK` + a real 200
+    // when the backend is wired (see `crates/boatramp/DESIGN-privsep-phase3-vm.md` §7).
+    println!("PRIVSEP VM SUBSTRATE REFUSED OK");
+}
+
 /// Read the container `core` instance's capability sets (CapEff/CapPrm/CapBnd) from `/proc`, for the
 /// Finding-2 zero-caps probe. Finds the process whose cmdline is `... __instance core --config
 /// <cfg_path>` (unique to this gate's node) and prints its `PID=` + `Cap*:` lines. The node runs as

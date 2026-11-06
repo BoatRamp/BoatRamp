@@ -883,21 +883,29 @@ fn instance_listener_addr(
 /// `pivot_root`, no new net/pid/user namespace — the per-capability Landlock profile stays the FS
 /// wall, and a `backend.*` instance keeps host-net egress; pid-ns isolation is a deferred increment). [`InstanceSubstrate::Vm`] stays the reported
 /// follow-on: a VM has its OWN kernel, so the `local` socketpair cannot cross (unlike Container on one
-/// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport. Until then
-/// `Vm` is refused fail-closed, naming the backend it reuses — never silently downgraded to an OS
-/// process (which would discard the operator's chosen isolation wall). Pure (host-testable).
+/// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport (the
+/// socketpair ends, the listener fd, AND the `SCM_RIGHTS` client splice all become a vsock byte-relay)
+/// PLUS an unratified hosting-model decision (guest kernel + own-binary-as-init) — see
+/// `crates/boatramp/DESIGN-privsep-phase3-vm.md`. Until then `Vm` is refused fail-closed, naming the
+/// backend it reuses + the concrete blockers — never silently downgraded to an OS process (which would
+/// discard the operator's chosen isolation wall). Pure (host-testable).
 fn resolve_spawn_backend(label: &str, substrate: InstanceSubstrate) -> Result<(), PrivsepError> {
     if substrate.is_wired() {
         return Ok(());
     }
     let backend = substrate.compute_plane_backend().unwrap_or("(none)");
     Err(PrivsepError::Supervise(format!(
-        "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is not wired in \
-         this cut (it reuses {backend} — a reported follow-on; a VM has its own kernel, so the `local` \
-         socketpair cannot cross and the whole link transport needs a vsock re-plumb). Refusing \
-         fail-closed rather than silently downgrading to an OS process (which would discard the \
-         chosen isolation wall); use `substrate: OsProcess` or `substrate: Container` until the {} \
-         backend lands",
+        "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is NOT wired in \
+         this cut (it reuses {backend}). Two concrete blockers, both pending ratification — see \
+         `crates/boatramp/DESIGN-privsep-phase3-vm.md`: (1) TRANSPORT — a VM has its OWN kernel, so \
+         fd-passing cannot cross the boundary: the `local` socketpair link ends, the public listener \
+         fd, AND the per-request `SCM_RIGHTS` client-connection splice all need a vsock byte-relay \
+         (a new root-wired CID/port topology + host relay), which is not built; (2) HOSTING MODEL — \
+         what guest kernel + root filesystem runs inside, and how the host's own static-musl binary \
+         becomes the guest init (own-binary-as-init), is an owner + Security decision that is not yet \
+         made. Refusing fail-closed rather than silently downgrading to an OS process (which would \
+         discard the chosen isolation wall); use `substrate: OsProcess` or `substrate: Container` \
+         until the {} backend lands",
         substrate.tag(),
         substrate.tag(),
     )))
@@ -4520,6 +4528,23 @@ mod tests {
         assert!(
             vm.contains("OsProcess") && vm.contains("Container"),
             "vm refusal must offer the wired OsProcess/Container fallbacks, got {vm:?}"
+        );
+        // Sharpened (DESIGN-first VM pass): the refusal names the TWO concrete blockers — the vsock
+        // byte-relay transport (fd-passing cannot cross a VM boundary: socketpair ends + listener fd +
+        // SCM_RIGHTS client splice) and the unratified HOSTING MODEL decision — and points at the
+        // design note, so a reviewer/operator sees exactly WHY it is refused, not just THAT it is.
+        assert!(
+            vm.contains("vsock") && vm.contains("SCM_RIGHTS"),
+            "vm refusal must name the vsock byte-relay transport blocker (fd-passing cannot cross the \
+             VM boundary), got {vm:?}"
+        );
+        assert!(
+            vm.to_lowercase().contains("hosting model") && vm.contains("own-binary-as-init"),
+            "vm refusal must name the hosting-model (own-binary-as-init) blocker, got {vm:?}"
+        );
+        assert!(
+            vm.contains("DESIGN-privsep-phase3-vm.md"),
+            "vm refusal must point at the VM design note, got {vm:?}"
         );
     }
 

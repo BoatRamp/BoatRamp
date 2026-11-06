@@ -766,9 +766,12 @@ impl TenantScope {
 /// fork+exec, the child unsharing mount/ipc/uts/cgroup namespaces in its `pre_exec`, no
 /// `pivot_root`, no new net/pid/user namespace; the per-capability Landlock profile stays the FS wall) are
 /// WIRED spawn backends. `Vm` parses + lints as valid composition vocabulary but the supervisor
-/// REFUSES to spawn it fail-closed (naming its reuse backend) rather than silently downgrading — a VM
-/// has its own kernel, so the `local` socketpair cannot cross and the link transport needs a vsock
-/// re-plumb. See [`InstanceSubstrate::is_wired`] and `crates/boatramp/DESIGN-privsep-phase3-container.md`.
+/// REFUSES to spawn it fail-closed (naming its reuse backend + the concrete blockers) rather than
+/// silently downgrading — a VM has its own kernel, so fd-passing cannot cross (the `local` socketpair
+/// ends, the listener fd, AND the `SCM_RIGHTS` client splice all need a vsock byte-relay) and the
+/// hosting model (guest kernel + own-binary-as-init) is unratified. See [`InstanceSubstrate::is_wired`],
+/// `crates/boatramp/DESIGN-privsep-phase3-container.md` (Container), and
+/// `crates/boatramp/DESIGN-privsep-phase3-vm.md` (the VM follow-on, DESIGN-first).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -799,8 +802,9 @@ impl InstanceSubstrate {
     /// `CLONE_NEWNS|NEWIPC|NEWUTS|NEWCGROUP` in the child's `pre_exec` on the SIMPLE model — no
     /// `pivot_root`, no new net/pid/user namespace, the per-capability Landlock profile stays the FS
     /// wall; see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` stays the reported follow-on
-    /// (its own kernel ⇒ the `local` socketpair cannot cross, so it needs a vsock re-plumb), refused
-    /// fail-closed by the supervisor.
+    /// (its own kernel ⇒ fd-passing cannot cross, so it needs a vsock byte-relay re-plumb + an unratified
+    /// hosting model — see `crates/boatramp/DESIGN-privsep-phase3-vm.md`), refused fail-closed by the
+    /// supervisor.
     pub const fn is_wired(self) -> bool {
         matches!(self, Self::OsProcess | Self::Container)
     }

@@ -1700,7 +1700,7 @@ jobs:
           grep -q 'SANDBOX LIVE OK' sandbox-live.log \
             || { echo "::error::sandbox live gate never reached its marker (a seccomp/Landlock whole-process sandbox regression)" >&2; exit 1; }
 
-  # privsep LIVE GATE — FIVE `#[ignore]`d end-to-end tests in `privsep_live.rs`:
+  # privsep LIVE GATE — SIX `#[ignore]`d end-to-end tests in `privsep_live.rs`:
   #  (1) WS-C 2-INSTANCE COMPOSITION (marker `PRIVSEP LIVE OK`): forks `boatramp __root` against a
   #      minimal `[privsep]` config (a `listen.*` FRONTEND + a backend/crown-jewel CORE wired by one
   #      `local` socketpair link), proving the WHOLE WS-C runtime — the root screens + lints
@@ -1727,7 +1727,15 @@ jobs:
   #      cross-namespace SCM_RIGHTS splice. The node runs under `sudo -n` for the CAP_SYS_ADMIN the
   #      userns-free unshare needs (GitHub runners have passwordless sudo); the harness stays
   #      unprivileged. See `crates/boatramp/DESIGN-privsep-phase3-container.md`.
-  # All five are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
+  #  (6) VM SUBSTRATE — FAIL-CLOSED REFUSE (marker `PRIVSEP VM SUBSTRATE REFUSED OK`, Phase-3 item 3c,
+  #      DESIGN-first): pins the serving `core` to `substrate: vm`, which is NOT wired (a VM has its
+  #      own kernel, so fd-passing — the socketpair ends, the listener fd, AND the SCM_RIGHTS client
+  #      splice — cannot cross; it needs a vsock byte-relay + an unratified hosting model). Asserts the
+  #      root REFUSES fail-closed: it exits non-zero at the pre-spawn substrate-dispatch gate, BEFORE
+  #      binding the listener or spawning any instance, and never serves. Needs no /dev/kvm/sudo (the
+  #      refusal fires before any VM boot). INVERTS into a real serve gate (on lighthouse) once the VM
+  #      backend is wired. See `crates/boatramp/DESIGN-privsep-phase3-vm.md`.
+  # All six are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
   # runs them. Greps every marker + the pass count so a silent skip / compile-out fails the merge.
   live-gate-privsep:
     name: live gate (privsep)
@@ -1749,8 +1757,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 5 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all five tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 6 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all six tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
@@ -1761,6 +1769,8 @@ jobs:
             || { echo "::error::privsep per-tenant live gate never reached its marker (a WS-C per-tenant compute-plane spawn / execute-pin / resolver regression)" >&2; exit 1; }
           grep -q 'PRIVSEP CONTAINER SUBSTRATE OK' privsep-live.log \
             || { echo "::error::privsep container-substrate gate never reached its marker (the WIRED substrate: container must serve a real 200 from a namespace/cgroup-confined instance that self-confirmed its unshared NS/IPC/UTS/CGROUP; a regression that drops the namespace wall, or a lost CAP_SYS_ADMIN/sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-container.md)" >&2; exit 1; }
+          grep -q 'PRIVSEP VM SUBSTRATE REFUSED OK' privsep-live.log \
+            || { echo "::error::privsep VM-substrate refuse gate never reached its marker (substrate: vm must be REFUSED fail-closed — the root exits non-zero at the pre-spawn substrate-dispatch gate, never binds the listener; a fail-closed regression that spawns/binds a VM instance despite the unwired backend fails here — see crates/boatramp/DESIGN-privsep-phase3-vm.md)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
