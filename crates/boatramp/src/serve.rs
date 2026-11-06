@@ -3892,8 +3892,10 @@ fn spawn_listeners(
                                 t.on_demand, // catch_all_on_demand (Concept 2)
                                 scoped,
                                 // Concept 1: the node control-plane source a `use_node_cert` managed name
-                                // is served from (shared with `:443`). `None` for an `on_demand`-only
-                                // listener (empty managed tier) — then this is never consulted.
+                                // is served from (shared with `:443`). Passed UNCONDITIONALLY, but INERT
+                                // for an `on_demand`-only listener — its `managed_names` is empty, so this
+                                // tier is never consulted (the SNI falls straight to the Concept-2
+                                // catch-all / static tiers).
                                 node_certs.clone(),
                             )?;
                             return Ok(std::sync::Arc::new(cfg));

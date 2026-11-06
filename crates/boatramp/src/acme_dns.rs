@@ -472,9 +472,17 @@ pub fn spawn_dns_reconcile(
 
 /// Whether a TLS SNI hostname matches a cert pattern. Exact match, or a single
 /// wildcard label (`*.suffix` matches `one-label.suffix`, not `a.b.suffix`).
+///
+/// DNS names are case-INSENSITIVE, so BOTH branches compare case-insensitively (Security review):
+/// the exact branch uses `eq_ignore_ascii_case`, and the wildcard branch lowercases `pattern`/`sni`
+/// once before the suffix compare — a case-SENSITIVE `strip_suffix` would miss e.g.
+/// `x.wild.example.test` against a `*.Wild.Example.Test` pattern and silently fall through to a
+/// lower tier. Hardening (a stricter match of the SAME names), never a loosening: a non-matching name
+/// is still refused, so it cannot over-serve.
 pub fn sni_matches(pattern: &str, sni: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        match sni.strip_suffix(suffix).and_then(|p| p.strip_suffix('.')) {
+        let (suffix, sni) = (suffix.to_ascii_lowercase(), sni.to_ascii_lowercase());
+        match sni.strip_suffix(&suffix).and_then(|p| p.strip_suffix('.')) {
             Some(label) => !label.is_empty() && !label.contains('.'),
             None => false,
         }
@@ -1225,6 +1233,24 @@ mod tests {
     fn exact_match_is_case_insensitive() {
         assert!(sni_matches("example.com", "Example.COM"));
         assert!(!sni_matches("example.com", "www.example.com"));
+    }
+
+    // Security review (CHANGE 3): the WILDCARD branch is case-insensitive too (DNS names are). A
+    // case-sensitive `strip_suffix` would have missed a mixed-case pattern/SNI and silently fallen
+    // through to a lower tier. MUTATION SENSE: revert to `sni.strip_suffix(suffix)` without the
+    // lowercasing and the first two assertions go red. Still fail-closed: a non-match is still refused.
+    #[test]
+    fn wildcard_match_is_case_insensitive() {
+        // Mixed-case pattern, lowercase concrete SNI.
+        assert!(sni_matches("*.Wild.Example.Test", "x.wild.example.test"));
+        // Lowercase pattern, mixed-case SNI.
+        assert!(sni_matches("*.wild.example.test", "X.Wild.Example.Test"));
+        // Mixed-case both, still one-label-only.
+        assert!(sni_matches("*.Wild.Example.Test", "Host.Wild.Example.Test"));
+        // Case-insensitivity does NOT loosen the single-label rule: two labels deep still misses.
+        assert!(!sni_matches("*.Wild.Example.Test", "a.b.wild.example.test"));
+        // A different base still misses (no over-serve).
+        assert!(!sni_matches("*.Wild.Example.Test", "x.other.example.test"));
     }
 
     #[test]
