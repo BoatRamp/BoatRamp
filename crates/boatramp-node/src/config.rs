@@ -2667,8 +2667,13 @@ pub struct ServeConfig {
 pub struct OnDemandTlsConfig {
     /// Master toggle. `false` (default) ⇒ the whole feature is off.
     pub enabled: bool,
-    /// How to prove control of a name to the CA. `tls-alpn-01` (default) validates on the 443 edge (no
-    /// extra port); `dns-01` uses the node's configured ACME DNS provider (an operator-controlled zone).
+    /// How the ON-DEMAND engine (Concept 2) proves control of an OTHER (tenant) domain to the CA:
+    /// `tls-alpn-01` (default) validates on the 443 edge (no extra port); `dns-01` uses the node's
+    /// configured ACME DNS provider (an operator-controlled zone). Set as a STRING in both RON and JSON
+    /// (`challenge: "dns-01"` / `"challenge": "dns-01"`) and via `BOATRAMP_ON_DEMAND_TLS_CHALLENGE`.
+    /// This is SEPARATE from `--tls`/`--acme-domain` (Concept 1, how the NODE gets its OWN control-plane
+    /// cert); `use_node_cert` SERVES the Concept-1 cert and never runs this challenge. See the DESIGN
+    /// note `crates/boatramp/DESIGN-acme-concept-decouple.md`.
     pub challenge: OnDemandChallenge,
     /// ACME directory URL. Absent ⇒ the ACME client default (Let's Encrypt production).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2697,15 +2702,64 @@ pub struct OnDemandTlsConfig {
     pub propagation_poll_interval_secs: Option<u64>,
 }
 
-/// How [`OnDemandTlsConfig`] proves control of a name to the CA.
+/// How [`OnDemandTlsConfig`] proves control of a name to the CA — **Concept 2: the ON-DEMAND engine's
+/// challenge for issuing OTHER (tenant) domains' certs**. This is SEPARATE from `--tls`/`--acme-domain`
+/// (**Concept 1**: how the NODE obtains + serves its OWN control-plane cert); a `use_node_cert` listener
+/// SERVES the Concept-1 cert and does not run this challenge. See
+/// `crates/boatramp/DESIGN-acme-concept-decouple.md`.
+///
+/// (De)serializes **as a string** in both RON and JSON (`"tls-alpn-01"` / `"dns-01"`) via
+/// `try_from`/`into`. The kebab tokens contain hyphens, which are not valid RON identifiers, so the
+/// bare enum-variant encoding (`#[serde(rename_all = "kebab-case")]`) was UNSETTABLE from a RON config
+/// file — `challenge: tls-alpn-01` is a parse error and `challenge: "tls-alpn-01"` did not map to a unit
+/// variant. The string form parses identically in both formats and round-trips to the kebab token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "String", into = "String")]
 pub enum OnDemandChallenge {
     /// TLS-ALPN-01 on the 443 edge (default) — no extra port.
     #[default]
     TlsAlpn01,
     /// DNS-01 via the node's configured ACME DNS provider (an operator-controlled zone / wildcard).
     Dns01,
+}
+
+impl OnDemandChallenge {
+    /// The canonical kebab token (`tls-alpn-01` / `dns-01`), as written in a config file and env var
+    /// and as emitted when the config is serialized back out.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsAlpn01 => "tls-alpn-01",
+            Self::Dns01 => "dns-01",
+        }
+    }
+}
+
+impl std::str::FromStr for OnDemandChallenge {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tls-alpn-01" | "tls_alpn_01" | "tlsalpn01" | "tls-alpn" | "alpn" => {
+                Ok(Self::TlsAlpn01)
+            }
+            "dns-01" | "dns_01" | "dns01" | "dns" => Ok(Self::Dns01),
+            other => Err(format!(
+                "unknown on_demand_tls challenge `{other}` (expected `tls-alpn-01` or `dns-01`)"
+            )),
+        }
+    }
+}
+
+impl TryFrom<String> for OnDemandChallenge {
+    type Error = String;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<OnDemandChallenge> for String {
+    fn from(c: OnDemandChallenge) -> Self {
+        c.as_str().to_string()
+    }
 }
 
 /// `[serve.listeners.<name>]` — a **host-owned inbound-TCP listener** (PLAN-handler-tcp-inbound). The
@@ -2905,24 +2959,26 @@ pub struct ListenerTlsConfig {
     /// project's domains.
     #[serde(default)]
     pub on_demand: bool,
-    /// Serve the **NODE-MANAGED** (ACME/on-demand) cert for the verified+attached domains in
-    /// `server_names` (cap-req #29) — giving this host-owned TCP listener the SAME cert the public
-    /// `:443` edge serves, via the SAME shared on-demand engine (`[serve.on_demand_tls]`), instead of a
-    /// hand-fed static `cert_file`. With it set, `server_names` is the per-listener **allowlist** of
-    /// node-managed domains: the listener serves (and triggers issuance for) the managed cert for an SNI
-    /// ONLY when that SNI is (a) present in `server_names`, (b) ownership-**verified** + attached, and
-    /// (c) owned by this listener's `project` — the exact gate the `:443` path applies (reused, not
-    /// forked). An SNI outside that set is never served or issued a managed cert by this flag.
+    /// Serve the node's **CONTROL-PLANE** cert (Concept 1) — the SAME `--acme-domain` cert the public
+    /// `:443` edge serves — for the domains in `server_names` (cap-req #29), instead of a hand-fed static
+    /// `cert_file`. The cert is resolved straight from the node's shared, hot-swappable control-plane
+    /// cert source (so a renewal reaches this listener live) — it does NOT go through the on-demand
+    /// engine (Concept 2), so there is no tenant verify/attach/project gate: a PURE control-plane FQDN
+    /// (e.g. an `--acme-domain` the node serves at `:443`) is served here directly. `server_names` is the
+    /// per-listener **allowlist** that BOUNDS this: the node cert is served for an SNI ONLY when it
+    /// matches `server_names`; an SNI outside that set is never served the node cert. Naturally, the node
+    /// only holds control-plane certs for its `--acme-domain` names, so a `server_names` entry that is not
+    /// a node control-plane domain simply has no cert (the static fallback, else fail-closed).
     ///
-    /// Makes `cert_file`/`key_file` OPTIONAL: omit them for a pure node-managed listener, or keep them
-    /// as the static FALLBACK for an SNI the node does not manage (and for an SNI-less handshake).
-    /// Requires `[serve.on_demand_tls] enabled = true` AND a non-empty `server_names`; the node must
-    /// actually run the on-demand engine (`--tls acme-dns`) or the listener fails closed (it does NOT
-    /// silently fall back to a static cert). Default `false` ⇒ unchanged (the static cert serves
-    /// `server_names`). Composes with `on_demand`: set both to ALSO issue per-SNI for this project's
-    /// OTHER verified domains (the catch-all); `use_node_cert` alone keeps managed serving bounded to
-    /// `server_names`. Transport-level only — it carries no notion of what protocol runs over the
-    /// listener.
+    /// Makes `cert_file`/`key_file` OPTIONAL: omit them for a pure node-cert listener, or keep them as the
+    /// static FALLBACK for an SNI the node holds no control-plane cert for (and for an SNI-less
+    /// handshake). Requires `[serve.on_demand_tls] enabled = true` AND a non-empty `server_names`; the
+    /// node must actually run `--tls acme-dns` (so a control-plane cert source exists) or the listener
+    /// fails closed (it does NOT silently fall back to a static cert). Default `false` ⇒ unchanged (the
+    /// static cert serves `server_names`). Composes with `on_demand`: set both to ALSO issue per-SNI
+    /// (Concept 2) for this project's OTHER verified domains (the catch-all); `use_node_cert` alone keeps
+    /// serving bounded to the `server_names` control-plane certs. Transport-level only — it carries no
+    /// notion of what protocol runs over the listener.
     #[serde(default)]
     pub use_node_cert: bool,
     /// SNI names the listener's own static `cert_file` serves directly (an SNI match here wins before
@@ -2930,9 +2986,10 @@ pub struct ListenerTlsConfig {
     /// fallback); every presented SNI then goes to on-demand. Only meaningful with `on_demand = true`.
     ///
     /// Under `use_node_cert = true` (cap-req #29) this list flips role: it is the allowlist of domains
-    /// the listener serves the **node-managed** cert for (each still gated verified+attached+project),
-    /// and the static `cert_file`, if present, demotes to the fallback for these. Required non-empty
-    /// then.
+    /// the listener serves the node's **control-plane** cert for (Concept 1 — the SAME `--acme-domain`
+    /// cert `:443` serves, resolved from the shared node cert source, NOT the on-demand engine, so no
+    /// tenant verify/attach gate applies), and the static `cert_file`, if present, demotes to the
+    /// fallback for a name the node holds no control-plane cert for. Required non-empty then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_names: Option<Vec<String>>,
 }
@@ -5890,6 +5947,58 @@ mod tests {
         assert_eq!(s_json.s3_bucket.as_deref(), Some("b"));
     }
 
+    /// FIX B: `[serve.on_demand_tls].challenge` (Concept 2) is settable from a RON config file AND a
+    /// JSON one, and the two are equivalent. Before the `try_from = "String"` change the kebab tokens
+    /// (`dns-01`, hyphenated) were unsettable in RON — `challenge: dns-01` is a RON parse error and
+    /// `challenge: "dns-01"` did not map to a unit variant — so there was NO way to pick DNS-01 from a
+    /// RON file, and NO test set `challenge` in either format. This pins both and their equivalence.
+    #[test]
+    fn config_json_gate_on_demand_tls_challenge_parses_from_ron_and_json() {
+        // RON: the challenge is a quoted STRING (a bare `dns-01` identifier does not parse in RON).
+        let ron = r#"( serve: ( on_demand_tls: ( enabled: true, challenge: "dns-01" ) ) )"#;
+        // JSON: the same value as a JSON string.
+        let json =
+            r#"{ "serve": { "on_demand_tls": { "enabled": true, "challenge": "dns-01" } } }"#;
+        let from_ron = ServerConfig::parse_with_format(ron, ConfigFormat::Ron)
+            .expect("challenge = \"dns-01\" parses from a RON config");
+        let from_json = ServerConfig::parse_with_format(json, ConfigFormat::Json)
+            .expect("challenge = \"dns-01\" parses from a JSON config");
+        let c_ron = from_ron.serve.unwrap().on_demand_tls.unwrap().challenge;
+        let c_json = from_json.serve.unwrap().on_demand_tls.unwrap().challenge;
+        assert_eq!(c_ron, OnDemandChallenge::Dns01, "RON `dns-01` ⇒ Dns01");
+        assert_eq!(c_json, OnDemandChallenge::Dns01, "JSON `dns-01` ⇒ Dns01");
+        assert_eq!(
+            c_ron, c_json,
+            "the challenge is equivalent across RON and JSON"
+        );
+
+        // The default (unset) and the other variant both round-trip too.
+        let alpn_ron = r#"( serve: ( on_demand_tls: ( challenge: "tls-alpn-01" ) ) )"#;
+        assert_eq!(
+            ServerConfig::parse_with_format(alpn_ron, ConfigFormat::Ron)
+                .unwrap()
+                .serve
+                .unwrap()
+                .on_demand_tls
+                .unwrap()
+                .challenge,
+            OnDemandChallenge::TlsAlpn01,
+            "RON `tls-alpn-01` ⇒ TlsAlpn01"
+        );
+        // Serialize-back emits the kebab token (into = "String"), so a round-trip is stable.
+        assert_eq!(String::from(OnDemandChallenge::Dns01), "dns-01");
+        assert_eq!(String::from(OnDemandChallenge::TlsAlpn01), "tls-alpn-01");
+        // An unknown token is a hard error (not silently defaulted).
+        assert!(
+            ServerConfig::parse_with_format(
+                r#"( serve: ( on_demand_tls: ( challenge: "bogus-01" ) ) )"#,
+                ConfigFormat::Ron
+            )
+            .is_err(),
+            "an unknown challenge token must be rejected"
+        );
+    }
+
     /// Equivalence (project): a `project.cfg` authored in RON and in equivalent JSON
     /// parses to the same publish target.
     #[test]
@@ -6209,6 +6318,50 @@ pub(crate) mod figment_resolve {
         ),
     ];
 
+    /// The `serve.on_demand_tls.*` aliases (cap-req 03, Concept 2). Like `alerts`/`s3_ingress_cloud`,
+    /// the env names drop the `serve` segment, so they are aliased explicitly to their nested figment
+    /// paths. All leaves are `Option`/defaulted (and `OnDemandTlsConfig` is `#[serde(default)]`), so a
+    /// partial env sub-dict deserializes without a `base_seed` entry. `CHALLENGE` is a plain string var
+    /// (`"tls-alpn-01"` / `"dns-01"`), coerced into [`OnDemandChallenge`] by its `try_from = "String"`.
+    const ON_DEMAND_TLS: &[(&str, &[&str])] = &[
+        (
+            "BOATRAMP_ON_DEMAND_TLS_ENABLED",
+            &["serve", "on_demand_tls", "enabled"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_CHALLENGE",
+            &["serve", "on_demand_tls", "challenge"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_DIRECTORY_URL",
+            &["serve", "on_demand_tls", "directory_url"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_CONTACT_EMAIL",
+            &["serve", "on_demand_tls", "contact_email"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_MAX_INFLIGHT",
+            &["serve", "on_demand_tls", "max_inflight"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_NEGATIVE_TTL_SECS",
+            &["serve", "on_demand_tls", "negative_ttl_secs"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_RATE_LIMIT_PER_HOUR",
+            &["serve", "on_demand_tls", "rate_limit_per_hour"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_PROPAGATION_WAIT_SECS",
+            &["serve", "on_demand_tls", "propagation_wait_secs"],
+        ),
+        (
+            "BOATRAMP_ON_DEMAND_TLS_PROPAGATION_POLL_INTERVAL_SECS",
+            &["serve", "on_demand_tls", "propagation_poll_interval_secs"],
+        ),
+    ];
+
     /// Insert `value` at the nested `path`, creating intermediate dicts as needed.
     fn put(dict: &mut Dict, path: &[&str], value: Value) {
         let (last, parents) = path.split_last().expect("path is non-empty");
@@ -6269,8 +6422,13 @@ pub(crate) mod figment_resolve {
         let mut d = Dict::new();
 
         // --- serve.* scalars (former Loader-A) + serve.kv.* (former Loader-C) +
-        // serve.alerts.* (node-health-alerting Stage 2) ----
-        for (var, path) in SERVE_SCALARS.iter().chain(SERVE_KV).chain(ALERTS) {
+        // serve.alerts.* (node-health-alerting Stage 2) + serve.on_demand_tls.* (cap-req 03) ----
+        for (var, path) in SERVE_SCALARS
+            .iter()
+            .chain(SERVE_KV)
+            .chain(ALERTS)
+            .chain(ON_DEMAND_TLS)
+        {
             emit(&mut d, source, var, path);
         }
 
@@ -7002,6 +7160,113 @@ pub(crate) mod figment_resolve {
             assert!(
                 unhandled.is_empty(),
                 "these ALERTS vars produced no overlay entry: {unhandled:?}"
+            );
+        }
+
+        /// FIX B: `[serve.on_demand_tls]` (Concept 2) was FILE-ONLY — no env lever at all. This proves
+        /// the whole section now resolves from env across every scalar, including the `challenge` string
+        /// (coerced into `OnDemandChallenge` by its `try_from = "String"`). A fly `[env]`-only / k8s
+        /// fleet can now pick DNS-01 on-demand without a `boatramp.cfg` edit + a server roll.
+        #[test]
+        fn serve_on_demand_tls_resolves_from_env() {
+            let cfg = resolve_from_env(&map(&[
+                ("BOATRAMP_ON_DEMAND_TLS_ENABLED", "true"),
+                ("BOATRAMP_ON_DEMAND_TLS_CHALLENGE", "dns-01"),
+                (
+                    "BOATRAMP_ON_DEMAND_TLS_DIRECTORY_URL",
+                    "https://acme.example.test/dir",
+                ),
+                ("BOATRAMP_ON_DEMAND_TLS_CONTACT_EMAIL", "ops@example.test"),
+                ("BOATRAMP_ON_DEMAND_TLS_MAX_INFLIGHT", "8"),
+                ("BOATRAMP_ON_DEMAND_TLS_NEGATIVE_TTL_SECS", "120"),
+                ("BOATRAMP_ON_DEMAND_TLS_RATE_LIMIT_PER_HOUR", "0"),
+                ("BOATRAMP_ON_DEMAND_TLS_PROPAGATION_WAIT_SECS", "30"),
+                ("BOATRAMP_ON_DEMAND_TLS_PROPAGATION_POLL_INTERVAL_SECS", "3"),
+            ]))
+            .expect("extract");
+            let od = cfg
+                .serve
+                .expect("serve materialised from env")
+                .on_demand_tls
+                .expect("on_demand_tls materialised from env");
+            assert!(od.enabled);
+            assert_eq!(
+                od.challenge,
+                super::super::OnDemandChallenge::Dns01,
+                "the challenge string coerced into the enum"
+            );
+            assert_eq!(
+                od.directory_url.as_deref(),
+                Some("https://acme.example.test/dir")
+            );
+            assert_eq!(od.contact_email.as_deref(), Some("ops@example.test"));
+            assert_eq!(od.max_inflight, Some(8));
+            assert_eq!(od.negative_ttl_secs, Some(120));
+            assert_eq!(od.rate_limit_per_hour, Some(0));
+            assert_eq!(od.propagation_wait_secs, Some(30));
+            assert_eq!(od.propagation_poll_interval_secs, Some(3));
+        }
+
+        /// Forgot-a-knob guard (the v0.4.18 shape, for `serve.on_demand_tls`): every scalar field on
+        /// `OnDemandTlsConfig` must have a `BOATRAMP_ON_DEMAND_TLS_*` entry in `ON_DEMAND_TLS`. The
+        /// destructure is the compile-time half — a NEW field breaks this until it is classified; the
+        /// loop is the runtime half, asserting each classified scalar is actually registered + produces
+        /// an overlay entry.
+        #[test]
+        fn every_on_demand_tls_scalar_has_an_env_mapping() {
+            let super::super::OnDemandTlsConfig {
+                enabled: _,
+                challenge: _,
+                directory_url: _,
+                contact_email: _,
+                max_inflight: _,
+                negative_ttl_secs: _,
+                rate_limit_per_hour: _,
+                propagation_wait_secs: _,
+                propagation_poll_interval_secs: _,
+            } = super::super::OnDemandTlsConfig::default();
+            for field in [
+                "enabled",
+                "challenge",
+                "directory_url",
+                "contact_email",
+                "max_inflight",
+                "negative_ttl_secs",
+                "rate_limit_per_hour",
+                "propagation_wait_secs",
+                "propagation_poll_interval_secs",
+            ] {
+                let var = format!("BOATRAMP_ON_DEMAND_TLS_{}", field.to_uppercase());
+                assert!(
+                    ON_DEMAND_TLS.iter().any(|(v, _)| *v == var),
+                    "OnDemandTlsConfig field `{field}` has no env mapping — add `{var}` to ON_DEMAND_TLS"
+                );
+            }
+        }
+
+        /// Drift guard: every `BOATRAMP_ON_DEMAND_TLS_*` var in the `ON_DEMAND_TLS` table produces an
+        /// overlay entry at the right nested path — a future field can't silently escape the overlay.
+        #[test]
+        fn overlay_honors_every_on_demand_tls_var() {
+            let mut unhandled = Vec::new();
+            for (var, _) in ON_DEMAND_TLS {
+                assert!(
+                    var.starts_with("BOATRAMP_ON_DEMAND_TLS_"),
+                    "an on_demand_tls env var must carry the BOATRAMP_ON_DEMAND_TLS_ prefix: {var}"
+                );
+                // A representative settable value per var (challenge needs a real token).
+                let value = if *var == "BOATRAMP_ON_DEMAND_TLS_CHALLENGE" {
+                    "dns-01"
+                } else {
+                    "1"
+                };
+                if env_overlay_dict(&map(&[(var, value)])).is_empty() {
+                    unhandled.push(*var);
+                }
+            }
+            assert!(
+                unhandled.is_empty(),
+                "these ON_DEMAND_TLS vars produced no overlay entry: {unhandled:?}"
             );
         }
 

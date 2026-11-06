@@ -465,14 +465,18 @@ pub fn from_serve_config(
     let challenge = match cfg.challenge {
         boatramp_node::config::OnDemandChallenge::TlsAlpn01 => AcmeChallenge::TlsAlpn01,
         boatramp_node::config::OnDemandChallenge::Dns01 => match dns_provider {
+            // The serve path passes the node's ACME DNS provider here (serve.rs), so `dns-01` on-demand
+            // issuance works once `challenge = dns-01` is set. This is the common DNS-01 path.
             Some(p) => AcmeChallenge::Dns01(p),
             None => {
-                // DNS-01 on-demand needs the node's ACME DNS provider wired to this path (a
-                // follow-up); don't silently serve nothing — refuse to start on-demand and log.
+                // No DNS provider in hand (e.g. the engine was built outside the `--tls acme-dns` serve
+                // arm). A `dns-01` challenge cannot proceed without one, so refuse to start on-demand
+                // and log rather than silently serving nothing.
                 tracing::error!(
                     target: "boatramp::acme",
-                    "on_demand_tls challenge = dns-01 but no DNS provider is wired here yet; \
-                     on-demand issuance NOT enabled (use challenge = tls-alpn-01)"
+                    "on_demand_tls challenge = dns-01 but no ACME DNS provider is available here; \
+                     on-demand issuance NOT enabled (serve with `--tls acme-dns`, or use \
+                     challenge = tls-alpn-01)"
                 );
                 return None;
             }
@@ -1948,25 +1952,270 @@ mod tests {
         println!("SINGLE-NODE ON-DEMAND TLS OK");
     }
 
-    /// cap-req #29 LIVE GATE: a host-owned TCP **listener** with `use_node_cert = true`, a
-    /// verified+attached `server_names` domain, and NO static `cert_file` serves the NODE-MANAGED
-    /// (ACME) cert for that domain — the SAME cert the `:443` edge serves — via the SAME shared
-    /// on-demand engine, over a REAL rustls handshake.
+    /// FIX B LIVE GATE: `challenge = dns-01` SET FROM A CONFIG FILE (parsed, not a struct literal)
+    /// drives real DNS-01 on-demand issuance end to end. It parses `[serve.on_demand_tls]` from a RON
+    /// document (the exact shape an operator writes), asserts the challenge decoded to `Dns01`, builds
+    /// the engine through the production seam [`from_serve_config`] WITH the node's ACME DNS provider,
+    /// and drives the edge resolver: a seeded attached+VERIFIED domain issues on the first handshake via
+    /// DNS-01 against Pebble. This pins the config→challenge→DNS-01 wiring the stale comment denied.
     ///
-    /// It stands up the single-node on-demand engine through the production seam [`from_serve_config`]
-    /// (DNS-01 against a throwaway local Pebble CA, behind the REAL [`DeployGate`] #02 allowlist),
-    /// mints the listener's PROJECT-SCOPED resolver, builds the listener TLS config through the exact
-    /// `serve.rs` call ([`crate::acme_dns::build_listener_server_config_composite`] with a `None` static
-    /// cert + the `server_names` managed allowlist + `catch_all_on_demand = false`), then drives an
-    /// in-memory TLS handshake on that config and asserts the served leaf is the Pebble-issued cert the
-    /// node stored for the domain (== what the edge serves), NOT a static/self-signed cert.
+    /// MUTATION SENSE: before the `try_from = "String"` change `challenge` was UNSETTABLE from a RON
+    /// file, so this document could not be authored at all; the engine then only ever ran TLS-ALPN-01.
     ///
-    /// MUTATION SENSE (what #29 changes): BEFORE the fix, this listener either (a) refused config-load
-    /// (`cert_file` was required), or (b) served the listener's own STATIC cert for a `server_name`
-    /// (never the node-managed one). Here there is NO static cert at all, and the handshake succeeds
-    /// serving the Pebble-issued node-managed cert — only possible with the fix. Two bound assertions
-    /// pin the security envelope: an SNI OUTSIDE `server_names` is refused (no serve, bounded to the
-    /// allowlist), and an SNI-less handshake refuses cleanly (no static fallback → fail-closed).
+    /// `#[ignore]`d — needs `pebble` + `pebble-challtestsrv` on PATH (nix dev shell) + binds local
+    /// ports. Run on lighthouse:
+    /// `cargo test -p boatramp --features acme-dns on_demand_dns01_from_config_against_pebble -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
+    async fn on_demand_dns01_from_config_against_pebble() {
+        use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+        use boatramp_node::config::{ConfigFormat, OnDemandChallenge, ServerConfig};
+        use std::time::Duration;
+
+        // Distinct ports from the other Pebble gates (so a name-filtered `--ignored` run never collides).
+        const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8255";
+        const DIRECTORY_URL: &str = "https://localhost:14200/dir";
+
+        struct ChallTestSrv {
+            client: reqwest::Client,
+        }
+        #[async_trait]
+        impl DnsProvider for ChallTestSrv {
+            async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.kind.flat_value() }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+            async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/clear-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+        }
+        struct Child(tokio::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.start_kill();
+            }
+        }
+        fn on_path(bin: &str) -> bool {
+            std::process::Command::new(bin)
+                .arg("-help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+        fn mint_certs(dir: &std::path::Path) -> std::path::PathBuf {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+            let ca_path = dir.join("ca.pem");
+            std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+            std::fs::write(dir.join("cert.pem"), leaf_cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem()).unwrap();
+            ca_path
+        }
+
+        if !on_path("pebble") || !on_path("pebble-challtestsrv") {
+            eprintln!(
+                "skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)"
+            );
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("br-dns01-cfg-pebble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = mint_certs(&dir);
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": "[::]:14200", "managementListenAddress": "[::]:15200",
+            "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
+            "httpPort": 5202, "tlsPort": 5201, "ocspResponderURL": "" } });
+        let config_path = dir.join("pebble.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let _challtestsrv = Child(
+            tokio::process::Command::new("pebble-challtestsrv")
+                .args([
+                    "-dnsserver",
+                    "127.0.0.1:8253",
+                    "-management",
+                    "127.0.0.1:8255",
+                ])
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble-challtestsrv"),
+        );
+        let _pebble = Child(
+            tokio::process::Command::new("pebble")
+                .args(["-config", config_path.to_str().unwrap()])
+                .args(["-dnsserver", "127.0.0.1:8253"])
+                .env("PEBBLE_VA_NOSLEEP", "1")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble"),
+        );
+        let probe = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .user_agent("boatramp-dns01-cfg-pebble-test")
+            .build()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if probe
+                .get(DIRECTORY_URL)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(ready, "Pebble directory did not become ready");
+        for _ in 0..50 {
+            if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // THE FIX B CRUX: author `[serve.on_demand_tls]` in RON with `challenge: "dns-01"` and parse it.
+        // Before the `try_from = "String"` change this document was a RON parse error (hyphenated token).
+        let ron = format!(
+            r#"( serve: ( on_demand_tls: (
+                enabled: true,
+                challenge: "dns-01",
+                directory_url: "{DIRECTORY_URL}",
+                contact_email: "ops@example.test",
+                propagation_wait_secs: 2,
+                propagation_poll_interval_secs: 1,
+                rate_limit_per_hour: 0,
+            ) ) )"#
+        );
+        let parsed = ServerConfig::parse_with_format(&ron, ConfigFormat::Ron)
+            .expect("the RON config with challenge = \"dns-01\" parses");
+        let od_cfg = parsed
+            .serve
+            .expect("serve section")
+            .on_demand_tls
+            .expect("on_demand_tls section");
+        assert_eq!(
+            od_cfg.challenge,
+            OnDemandChallenge::Dns01,
+            "the config-authored challenge decoded to DNS-01"
+        );
+
+        // Seed the #02 allowlist: one attached + ownership-VERIFIED domain (order per the sibling gate).
+        let deploy = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        let proj = ProjectRef::new("shop");
+        let site = SiteName::new("storefront");
+        deploy
+            .start_domain_verification(
+                proj,
+                &site,
+                "www.cfg.test",
+                boatramp_core::domain_verify::VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        deploy
+            .mark_domain_verified(proj, &site, "www.cfg.test")
+            .await
+            .unwrap();
+        deploy
+            .attach_verified_domain(proj, &site, "www.cfg.test")
+            .await
+            .unwrap();
+
+        // Build the engine through the production seam from the CONFIG-PARSED `od_cfg` + the DNS provider.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let cert_store: Arc<dyn CertStore> =
+            Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone()));
+        let provider: Arc<dyn DnsProvider> = Arc::new(ChallTestSrv {
+            client: reqwest::Client::new(),
+        });
+        let engine = from_serve_config(
+            &od_cfg,
+            deploy.clone(),
+            cert_store.clone(),
+            Arc::new(|| true),
+            Some(provider),
+            kv.clone(),
+            None,
+            Some(ca_path),
+        )
+        .expect("engine builds from the config-parsed DNS-01 on_demand_tls (DNS provider present)");
+        let resolver = engine.resolver();
+
+        // The VERIFIED SNI issues on the first handshake via DNS-01 (challenge came from the config).
+        let _ = resolver.resolve_sni("www.cfg.test", false);
+        let mut issued = false;
+        for _ in 0..80 {
+            if resolver.resolve_sni("www.cfg.test", false).is_some() {
+                issued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            issued,
+            "a verified domain must issue via DNS-01 driven by the config-authored challenge = dns-01"
+        );
+        assert!(
+            matches!(cert_store.get("www.cfg.test").await, Ok(Some(_))),
+            "the DNS-01-issued cert is persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "ON-DEMAND DNS-01 FROM CONFIG OK: challenge = \"dns-01\" (RON) drove DNS-01 issuance"
+        );
+    }
+
+    /// cap-req #29 LIVE GATE (post-decouple): a host-owned TCP **listener** with `use_node_cert = true`,
+    /// a `server_names` domain that is a PURE CONTROL-PLANE FQDN (NOT tenant `attach_verified_domain`'d),
+    /// and NO static `cert_file` serves the node's CONTROL-PLANE cert for that domain — the SAME cert the
+    /// `:443` edge serves — over a REAL rustls handshake.
+    ///
+    /// It issues the node's control-plane cert for the domain via DNS-01 against a throwaway local Pebble
+    /// CA ([`crate::acme_dns::obtain_or_load`], exactly how the `--acme-domain` renewal loop obtains it),
+    /// wraps it in a [`crate::acme_dns::NodeCertSource`] (the shared handle the edge + listeners read),
+    /// and builds the listener TLS config through the exact `serve.rs` call
+    /// ([`crate::acme_dns::build_listener_server_config_composite`] with a `None` static cert + the
+    /// `server_names` managed allowlist + `catch_all_on_demand = false` + `Some(node_certs)`), then drives
+    /// an in-memory handshake and asserts the served leaf is that Pebble-issued control-plane cert.
+    ///
+    /// MUTATION SENSE (what the decouple fix changes): the domain is NEVER `attach_verified_domain`'d, so
+    /// the Concept-2 tenant-verification gate (`is_host_issuance_authorized`) would REFUSE it — the
+    /// pre-fix code (which routed the managed tier through the on-demand engine) could not serve this at
+    /// all. Here the managed tier serves it from `node_certs` directly. Two bound assertions pin the
+    /// envelope: an SNI OUTSIDE `server_names` is refused (bounded to the allowlist), and an SNI-less
+    /// handshake refuses cleanly (no static fallback → fail-closed).
     ///
     /// `#[ignore]`d — needs `pebble` + `pebble-challtestsrv` on PATH (nix dev shell) + binds local
     /// ports. Run on lighthouse:
@@ -1975,9 +2224,6 @@ mod tests {
     #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
     async fn listener_use_node_cert_against_pebble() {
         use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
-        use boatramp_core::deploy::DeployStore;
-        use boatramp_core::project::ProjectRef;
-        use boatramp_core::site::SiteName;
         use rustls::client::danger::{
             HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
         };
@@ -2202,133 +2448,66 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Seed the #02 allowlist for the listener's project: a verified+attached custom domain that is
-        // the listener's ONE declared `server_name`. `set_site_config` (primary) makes it resolvable —
-        // which warms the synchronous owner cache the project-SCOPE check reads — BEFORE the additive
-        // verify+attach that authorizes issuance (order per `single_node_on_demand_against_pebble`).
-        const PROJECT: &str = "mailroom";
+        // The domain the listener serves the node's CONTROL-PLANE cert for. It is a PURE control-plane
+        // FQDN — NEVER tenant `attach_verified_domain`'d — so the Concept-2 tenant-verification gate
+        // would REFUSE it; the decouple fix serves it from the node control-plane source regardless.
         const DOMAIN: &str = "mail.listener.test";
-        let deploy = DeployStore::new(
-            Arc::new(NullStorage),
-            Arc::new(boatramp_core::kv::MemoryKv::new()),
-        );
-        let proj = ProjectRef::new(PROJECT);
-        let site = SiteName::new("mx");
-        let cfg = boatramp_core::config::SiteConfig {
-            domains: boatramp_core::config::DomainConfig {
-                primary: Some(DOMAIN.to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        deploy.set_site_config(proj, "mx", &cfg).await.unwrap();
-        deploy
-            .start_domain_verification(
-                proj,
-                &site,
-                DOMAIN,
-                boatramp_core::domain_verify::VerificationMethod::Dns,
-                100,
-            )
-            .await
-            .unwrap();
-        deploy
-            .mark_domain_verified(proj, &site, DOMAIN)
-            .await
-            .unwrap();
-        deploy
-            .attach_verified_domain(proj, &site, DOMAIN)
-            .await
-            .unwrap();
-        // Warm the synchronous owner cache the listener SCOPE reads (`cached_owner`): it must resolve
-        // DOMAIN to PROJECT, else the scoped resolver would refuse to serve its OWN project's cert.
-        assert!(
-            matches!(deploy.resolve_site_by_host(DOMAIN).await, Ok(Some(_))),
-            "the seeded domain must resolve (to warm the project-scope owner cache)"
-        );
 
-        // Build the on-demand engine through the SINGLE-NODE production seam (the SAME call `run` makes
-        // for `--tls acme-dns` + an enabled `[serve.on_demand_tls]`), then mint the listener's
-        // PROJECT-SCOPED resolver — exactly what `spawn_listeners` does.
-        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
-        let cert_store: Arc<dyn CertStore> =
-            Arc::new(boatramp_core::cert::KvCertStore::new(kv.clone()));
+        // Obtain the node's control-plane cert for DOMAIN via DNS-01 against Pebble — EXACTLY how the
+        // `--acme-domain` renewal loop (`cert_refresh.run` → `obtain_or_load`) gets the cert the `:443`
+        // edge serves. No DeployStore, no verify/attach: this is Concept 1, not tenant issuance.
         let provider: Arc<dyn DnsProvider> = Arc::new(ChallTestSrv {
             client: reqwest::Client::new(),
         });
-        let od_cfg = boatramp_node::config::OnDemandTlsConfig {
-            enabled: true,
-            challenge: boatramp_node::config::OnDemandChallenge::Dns01,
-            directory_url: Some(DIRECTORY_URL.to_string()),
+        let base = boatramp_acme::acme::CertRequest {
+            directory_url: DIRECTORY_URL.to_string(),
             contact_email: Some("ops@example.test".to_string()),
-            propagation_wait_secs: Some(2),
-            propagation_poll_interval_secs: Some(1),
-            rate_limit_per_hour: Some(0),
-            ..Default::default()
+            domains: Vec::new(), // `obtain_or_load` overrides with [DOMAIN]
+            dns_ttl: 60,
+            propagation_wait: Duration::from_secs(2),
+            propagation_poll_interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(120),
+            extra_root_ca: Some(ca_path.clone()),
         };
-        let engine = from_serve_config(
-            &od_cfg,
-            deploy.clone(),
-            cert_store.clone(),
-            Arc::new(|| true),
-            Some(provider),
-            kv.clone(),
-            None,
-            Some(ca_path),
-        )
-        .expect("single-node on-demand engine MUST build when enabled (anti-inert)");
-        let scoped = engine.scoped_resolver(PROJECT.to_string(), deploy.clone());
+        let issued = crate::acme_dns::obtain_or_load(DOMAIN, &base, &*provider, &dir)
+            .await
+            .expect("obtain the node control-plane cert via DNS-01 (Concept 1)");
+        // Keep the leaf chain for the assertion before `issued` is moved into the resolver.
+        let control_plane_chain = issued.certificate_pem.clone();
+        let node_resolver = crate::acme_dns::sni_resolver(vec![(DOMAIN.to_string(), issued)])
+            .expect("build the node control-plane SNI resolver");
+        let node_certs = crate::acme_dns::NodeCertSource::new(node_resolver);
 
         // The listener TLS config EXACTLY as `serve.rs` builds it for `use_node_cert = true`: NO static
-        // cert, `server_names` = the managed allowlist, `catch_all_on_demand = false`.
+        // cert, `server_names` = the managed allowlist, `catch_all_on_demand = false`, and the shared
+        // `node_certs` source. The on-demand resolver is carried (tier-2 slot) but NEVER consulted for a
+        // managed name — here it is a dead/empty resolver to prove the managed tier doesn't touch it.
+        let dead_on_demand = Arc::new(OnDemandResolver::from_cache(Arc::new(CertCache::default())));
         let server_names = vec![DOMAIN.to_string()];
         let listener_config = Arc::new(
             crate::acme_dns::build_listener_server_config_composite(
-                None, // NO static cert_file — pure node-managed (impossible to build before #29)
+                None, // NO static cert_file — pure node-cert listener (impossible to build before #29)
                 &server_names,
                 &server_names, // managed_names
                 false,         // catch_all_on_demand OFF — bounded to server_names
-                scoped.clone(),
+                dead_on_demand,
+                Some(node_certs),
             )
             .expect("listener composite builds with no static cert (#29)"),
         );
 
-        // Drive issuance by polling the scoped resolver (a real handshake triggers the same way); the
-        // worker issues the node-managed cert via Pebble DNS-01 and caches it for the retry.
-        let _ = scoped.resolve_sni(DOMAIN, false);
-        let mut issued = false;
-        for _ in 0..80 {
-            if scoped.resolve_sni(DOMAIN, false).is_some() {
-                issued = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        assert!(
-            issued,
-            "the listener's verified+attached server_name must issue the node-managed cert on first use"
-        );
-
-        // THE #29 assertion: a REAL handshake on the listener config for its server_name is served the
-        // NODE-MANAGED (Pebble-issued) cert — the SAME leaf the node stored (what `:443` serves) — over
-        // a listener that has NO static cert at all.
+        // THE decouple assertion: a REAL handshake on the listener config for its server_name is served
+        // the node CONTROL-PLANE cert (the SAME leaf the renewal loop obtained == what `:443` serves) —
+        // over a listener with NO static cert AND a domain that was NEVER tenant-verified/attached.
         let sni = ServerName::try_from(DOMAIN).unwrap();
         let served =
             served_leaf(&listener_config, sni).expect("the listener completes the handshake");
-        let stored = match cert_store.get(DOMAIN).await {
-            Ok(Some(c)) => c,
-            other => panic!("node-managed cert must be stored: {other:?}"),
-        };
         assert_eq!(
             served,
-            leaf_der(&stored.chain_pem),
-            "the listener serves the NODE-MANAGED cert (the exact leaf the node stored == `:443` serves)"
+            leaf_der(&control_plane_chain),
+            "the listener serves the node CONTROL-PLANE cert (the exact leaf the node obtained == :443)"
         );
-        // It is genuinely CA-ISSUED (same ISSUER as the `:443` edge), not a self-signed static cert:
-        // the served leaf's issuer DN differs from its subject DN (Security review F4 — a self-signed
-        // listener cert, the pre-#29 behavior, would have issuer == subject). The ONLY way a cert
-        // reaches `cert_store` here is a real ACME round-trip against the Pebble CA (this listener has
-        // NO static cert — `None` above — so there is no self-signed material to fall back to).
+        // It is genuinely CA-ISSUED (a Pebble round-trip), not self-signed: issuer DN != subject DN.
         let (_, parsed) =
             x509_parser::parse_x509_certificate(&served).expect("the served leaf parses as X.509");
         assert_ne!(
@@ -2337,9 +2516,8 @@ mod tests {
             "the served cert is CA-issued (issuer != subject), not a self-signed static cert"
         );
 
-        // BOUND 1: an SNI OUTSIDE `server_names` is REFUSED — the listener never serves (nor triggers)
-        // a cert for a domain it did not declare (catch-all OFF). This holds even though the engine
-        // would happily issue for any verified in-project domain at the edge.
+        // BOUND 1: an SNI OUTSIDE `server_names` is REFUSED — the listener never serves a cert for a
+        // domain it did not declare (catch-all OFF, and `node_certs` holds no cert for it either).
         assert_eq!(
             served_leaf(
                 &listener_config,
@@ -2358,8 +2536,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         println!(
             "LISTENER NODE-CERT LIVE GATE OK: use_node_cert listener (no static cert) served the \
-             Pebble-issued node-managed cert for its verified+attached server_name (== :443), \
-             out-of-allowlist + SNI-less refused fail-closed"
+             Pebble-issued node CONTROL-PLANE cert for a PURE control-plane server_name (NOT \
+             tenant-verified/attached), out-of-allowlist + SNI-less refused fail-closed"
         );
     }
 }
