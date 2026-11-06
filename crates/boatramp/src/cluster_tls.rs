@@ -148,6 +148,7 @@ mod tests {
         let _ = crate::acme_dns::build_server_config_maybe_from_resolver(
             crate::acme_dns::sni_resolver(entries).expect("rustls config from stored cert"),
             None,
+            None,
         );
     }
 
@@ -168,6 +169,7 @@ mod tests {
         assert!(s.get("blog.example.com").await.unwrap().is_some());
         let _ = crate::acme_dns::build_server_config_maybe_from_resolver(
             crate::acme_dns::sni_resolver(entries).expect("rustls config"),
+            None,
             None,
         );
     }

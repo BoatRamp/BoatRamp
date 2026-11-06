@@ -131,6 +131,16 @@ pub struct CertCache {
     challenge: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
 
+// A cache of signing keys is not meaningfully printable (and a `Debug` that locked the mutexes could
+// deadlock under a `{:?}` on a held lock); report it opaquely, matching `OnDemandResolver`. This lets a
+// composite resolver that carries an `Arc<CertCache>` (the Concept-1 control-plane challenge tier)
+// `#[derive(Debug)]`.
+impl std::fmt::Debug for CertCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertCache").finish_non_exhaustive()
+    }
+}
+
 impl CertCache {
     /// The serving cert for `sni`, if issued + cached.
     pub fn get_issued(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
@@ -899,9 +909,7 @@ impl CertIssuer for AcmeIssuer {
                 }
             }
             AcmeChallenge::TlsAlpn01 => {
-                let solver = TlsAlpn01Solver {
-                    cache: Arc::clone(&self.cache),
-                };
+                let solver = TlsAlpn01Solver::new(Arc::clone(&self.cache));
                 boatramp_acme::acme::obtain_certificate_with(account, &request, &solver).await
             }
         }
@@ -916,10 +924,23 @@ impl CertIssuer for AcmeIssuer {
 }
 
 /// A `boatramp_acme` [`ChallengeSolver`](boatramp_acme::acme::ChallengeSolver) for TLS-ALPN-01: build
-/// the ephemeral challenge cert for the identifier and install it in the shared [`CertCache`], which
-/// the [`OnDemandResolver`] serves on the `acme-tls/1` handshake; clear it on cleanup.
-struct TlsAlpn01Solver {
+/// the ephemeral challenge cert for the identifier and install it in the shared [`CertCache`], which a
+/// resolver serves on the `acme-tls/1` handshake; clear it on cleanup.
+///
+/// `pub(crate)` + [`new`](Self::new) so the Concept-1 control-plane obtention path
+/// ([`crate::acme_dns::obtain_or_load_with`]) REUSES the exact same TLS-ALPN-01 solver + challenge-cache
+/// machinery the Concept-2 on-demand engine uses (one mechanism, not two) — the control-plane path
+/// installs into its OWN `CertCache`, which the `:443` edge serves on the `acme-tls/1` handshake.
+pub(crate) struct TlsAlpn01Solver {
     cache: Arc<CertCache>,
+}
+
+impl TlsAlpn01Solver {
+    /// A TLS-ALPN-01 solver that installs its ephemeral challenge cert into `cache` (served on the
+    /// `acme-tls/1` handshake by whichever resolver reads `cache`'s challenge slot).
+    pub(crate) fn new(cache: Arc<CertCache>) -> Self {
+        Self { cache }
+    }
 }
 
 #[async_trait]
@@ -2554,6 +2575,269 @@ mod tests {
             "LISTENER NODE-CERT LIVE GATE OK: use_node_cert listener (no static cert) served the \
              Pebble-issued node CONTROL-PLANE cert for a PURE control-plane server_name (NOT \
              tenant-verified/attached), out-of-allowlist + SNI-less refused fail-closed"
+        );
+    }
+
+    /// CHANGE 2 LIVE GATE (Concept 1): obtain TWO control-plane (`--acme-domain`) certs via DIFFERENT
+    /// challenges against a local Pebble CA — one DNS-01, one TLS-ALPN-01 — through the per-domain
+    /// routing (`ControlPlaneTls::solver_for` → `obtain_or_load_with`). The DNS-01 domain validates via
+    /// challtestsrv's `_acme-challenge` TXT; the TLS-ALPN-01 domain validates on the node's OWN `:443`
+    /// edge, which is bound here on Pebble's `tlsPort` serving the edge composite's `node_challenge` tier
+    /// (the SAME `CertCache` the control-plane TLS-ALPN-01 solver installs its challenge cert into). This
+    /// is the mechanism CHANGE 2 adds, end to end against a real CA.
+    ///
+    /// `#[ignore]`d — needs `pebble` + `pebble-challtestsrv` on PATH (nix dev shell) + binds local
+    /// ports; CANNOT run on darwin — run on lighthouse / the mailroom DNS-01 gate:
+    /// `cargo test -p boatramp --features acme-dns control_plane_dual_challenge_against_pebble -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
+    async fn control_plane_dual_challenge_against_pebble() {
+        use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8355";
+        const DIRECTORY_URL: &str = "https://localhost:14300/dir";
+        // Pebble's VA connects to this port for the TLS-ALPN-01 validation (the edge binds it below).
+        const TLS_ALPN_PORT: u16 = 5301;
+        const DNS_DOMAIN: &str = "dns.cp.test";
+        const ALPN_DOMAIN: &str = "alpn.cp.test";
+
+        /// A `DnsProvider` backed by challtestsrv's management API (the `_acme-challenge` TXT for DNS-01).
+        struct ChallTestSrv {
+            client: reqwest::Client,
+        }
+        #[async_trait]
+        impl DnsProvider for ChallTestSrv {
+            async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.kind.flat_value() }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+            async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/clear-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+        }
+        struct Child(tokio::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.start_kill();
+            }
+        }
+        fn on_path(bin: &str) -> bool {
+            std::process::Command::new(bin)
+                .arg("-help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+        fn mint_certs(dir: &std::path::Path) -> std::path::PathBuf {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+            let ca_path = dir.join("ca.pem");
+            std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+            std::fs::write(dir.join("cert.pem"), leaf_cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem()).unwrap();
+            ca_path
+        }
+        /// Complete ONE `acme-tls/1` validation handshake over a real socket, then drop it (the CA's
+        /// successful handshake is the proof — the connection carries no request). A minimal manual
+        /// rustls server loop (no tokio-rustls dep).
+        async fn serve_one(mut stream: tokio::net::TcpStream, cfg: Arc<rustls::ServerConfig>) {
+            let mut conn = match rustls::ServerConnection::new(cfg) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 8192];
+            loop {
+                while conn.wants_write() {
+                    let mut out = Vec::new();
+                    if conn.write_tls(&mut out).is_err() || out.is_empty() {
+                        break;
+                    }
+                    if stream.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+                if !conn.is_handshaking() {
+                    return; // handshake complete (challenge satisfied)
+                }
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let mut rd: &[u8] = &buf[..n];
+                while !rd.is_empty() {
+                    if conn.read_tls(&mut rd).is_err() || conn.process_new_packets().is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if !on_path("pebble") || !on_path("pebble-challtestsrv") {
+            eprintln!(
+                "skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)"
+            );
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("br-cp-dual-pebble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = mint_certs(&dir);
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": "[::]:14300", "managementListenAddress": "[::]:15300",
+            "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
+            "httpPort": 5302, "tlsPort": TLS_ALPN_PORT, "ocspResponderURL": "" } });
+        let config_path = dir.join("pebble.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let _challtestsrv = Child(
+            tokio::process::Command::new("pebble-challtestsrv")
+                .args([
+                    "-dnsserver",
+                    "127.0.0.1:8353",
+                    "-management",
+                    "127.0.0.1:8355",
+                ])
+                // DNS-01 only is served by TXT; the VA resolves A records via challtestsrv's DNS.
+                // Disable challtestsrv's OWN http/tls-alpn responders — the node's edge answers
+                // TLS-ALPN-01. `-defaultIPv4` answers A queries (both domains resolve to the loopback
+                // the edge + Pebble run on).
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+                .args(["-defaultIPv4", "127.0.0.1"])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble-challtestsrv"),
+        );
+        let _pebble = Child(
+            tokio::process::Command::new("pebble")
+                .args(["-config", config_path.to_str().unwrap()])
+                .args(["-dnsserver", "127.0.0.1:8353"])
+                .env("PEBBLE_VA_NOSLEEP", "1")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble"),
+        );
+        let probe = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .user_agent("boatramp-cp-dual-pebble-test")
+            .build()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if probe
+                .get(DIRECTORY_URL)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(ready, "Pebble directory did not become ready");
+        for _ in 0..50 {
+            if probe.get(CHALLTESTSRV_MGMT).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let provider: Arc<dyn DnsProvider> = Arc::new(ChallTestSrv {
+            client: reqwest::Client::new(),
+        });
+        let base = boatramp_acme::acme::CertRequest {
+            directory_url: DIRECTORY_URL.to_string(),
+            contact_email: Some("ops@example.test".to_string()),
+            domains: Vec::new(),
+            dns_ttl: 60,
+            propagation_wait: Duration::from_secs(2),
+            propagation_poll_interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(120),
+            extra_root_ca: Some(ca_path.clone()),
+        };
+
+        // Per-domain routing: DNS_DOMAIN → DNS-01 (default); ALPN_DOMAIN → TLS-ALPN-01 (override).
+        let control_plane = crate::acme_dns::ControlPlaneTls::from_overrides(&[
+            boatramp_node::config::ControlPlaneDomainTls {
+                domain: ALPN_DOMAIN.to_string(),
+                challenge: boatramp_node::config::ControlPlaneChallenge::TlsAlpn01,
+            },
+        ]);
+
+        // Bind the node's `:443` edge on Pebble's tlsPort, serving the composite's `node_challenge` tier
+        // (the control-plane TLS-ALPN-01 challenge cache) so the CA's validation handshake is answered.
+        let edge_cfg = Arc::new(crate::acme_dns::build_server_config_maybe_from_resolver(
+            crate::acme_dns::sni_resolver(Vec::new()).unwrap(),
+            None,
+            Some(control_plane.challenge_cache().clone()),
+        ));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", TLS_ALPN_PORT))
+            .await
+            .expect("bind the control-plane TLS-ALPN-01 edge on the Pebble tlsPort");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_one(stream, edge_cfg.clone()));
+            }
+        });
+
+        // Obtain the DNS-01 control-plane domain (default solver).
+        let dns_cert = crate::acme_dns::obtain_or_load_with(
+            DNS_DOMAIN,
+            &base,
+            provider.as_ref(),
+            &dir,
+            control_plane.solver_for(DNS_DOMAIN),
+        )
+        .await
+        .expect("obtain the DNS-01 control-plane cert against Pebble");
+        assert!(
+            dns_cert.certificate_pem.contains("BEGIN CERTIFICATE"),
+            "a real Pebble-issued chain for the DNS-01 control-plane domain"
+        );
+
+        // Obtain the TLS-ALPN-01 control-plane domain (override solver): the solver installs the
+        // challenge cert into the shared cache, Pebble's VA validates on the bound edge above.
+        let alpn_cert = crate::acme_dns::obtain_or_load_with(
+            ALPN_DOMAIN,
+            &base,
+            provider.as_ref(),
+            &dir,
+            control_plane.solver_for(ALPN_DOMAIN),
+        )
+        .await
+        .expect("obtain the TLS-ALPN-01 control-plane cert against Pebble (validated on the edge)");
+        assert!(
+            alpn_cert.certificate_pem.contains("BEGIN CERTIFICATE"),
+            "a real Pebble-issued chain for the TLS-ALPN-01 control-plane domain"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "CONTROL-PLANE DUAL-CHALLENGE LIVE GATE OK: `{DNS_DOMAIN}` issued via DNS-01 and \
+             `{ALPN_DOMAIN}` issued via TLS-ALPN-01 (validated on the node's own :443 edge), both \
+             through the per-domain control-plane routing (Concept 1)"
         );
     }
 }

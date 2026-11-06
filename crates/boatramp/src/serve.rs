@@ -2518,6 +2518,7 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
                 dns_registry,
                 #[cfg(feature = "tcp-listener")]
                 &serve_cfg.listeners,
+                &serve_cfg.control_plane_tls,
             )
             .await
         }
@@ -5139,15 +5140,26 @@ impl CertRefresh {
         base: &boatramp_acme::acme::CertRequest,
         provider: &Arc<dyn boatramp_acme::dns::DnsProvider>,
         cache: &Path,
+        // Concept-1 per-domain challenge routing (CHANGE 2): picks DNS-01 or TLS-ALPN-01 per domain.
+        control_plane: &crate::acme_dns::ControlPlaneTls,
     ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
         match self {
-            Self::Local => obtain_all(domains, base, provider.as_ref(), cache).await,
+            Self::Local => obtain_all(domains, base, provider.as_ref(), cache, control_plane).await,
             #[cfg(feature = "cluster")]
             Self::Replicated {
                 cert_store,
                 is_leader,
             } => {
-                cluster_refresh_certs(cert_store, domains, is_leader(), provider, base, cache).await
+                cluster_refresh_certs(
+                    cert_store,
+                    domains,
+                    is_leader(),
+                    provider,
+                    base,
+                    cache,
+                    control_plane,
+                )
+                .await
             }
         }
     }
@@ -5223,6 +5235,7 @@ async fn cluster_refresh_certs(
     provider: &Arc<dyn boatramp_acme::dns::DnsProvider>,
     base: &boatramp_acme::acme::CertRequest,
     cache: &Path,
+    control_plane: &crate::acme_dns::ControlPlaneTls,
 ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5238,11 +5251,19 @@ async fn cluster_refresh_certs(
         is_leader,
         now,
         |domain| {
+            // Pick this domain's Concept-1 solver (DNS-01 or TLS-ALPN-01) BEFORE the `async move` — it
+            // owns an `Arc` (the challenge cache), so it crosses the boundary (CHANGE 2).
+            let solver = control_plane.solver_for(&domain);
             let (provider, base, cache) = (provider.clone(), base.clone(), cache.to_path_buf());
             async move {
-                let issued =
-                    crate::acme_dns::obtain_or_load(&domain, &base, provider.as_ref(), &cache)
-                        .await?;
+                let issued = crate::acme_dns::obtain_or_load_with(
+                    &domain,
+                    &base,
+                    provider.as_ref(),
+                    &cache,
+                    solver,
+                )
+                .await?;
                 Ok::<_, crate::acme_dns::Error>(crate::cluster_tls::issued_to_stored(&issued, now))
             }
         },
@@ -5292,6 +5313,10 @@ async fn serve_acme_dns(
         String,
         boatramp_node::config::ListenerConfig,
     >,
+    // Concept-1 per-control-plane-domain challenge overrides (`[serve.control_plane_tls]`, CHANGE 2):
+    // lets each `--acme-domain` be obtained via DNS-01 or TLS-ALPN-01. Empty ⇒ every domain uses the
+    // `--tls acme-dns` default (DNS-01); the common path is unchanged.
+    control_plane_tls: &[boatramp_node::config::ControlPlaneDomainTls],
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -5338,6 +5363,15 @@ async fn serve_acme_dns(
     // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
     // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
     let on_demand_resolver = on_demand_engine.as_ref().map(|e| e.resolver());
+    // Concept-1 per-control-plane-domain challenge routing (CHANGE 2): the node-wide `--tls acme-dns`
+    // default (DNS-01) + the `[serve.control_plane_tls]` overrides + the shared TLS-ALPN-01 challenge
+    // cache the `:443` edge serves. `node_challenge` is `Some` (the edge serves the `acme-tls/1`
+    // challenge) ONLY when some control-plane domain uses TLS-ALPN-01 — otherwise the common DNS-01 edge
+    // is byte-for-byte unchanged. SEPARATE from `on_demand_resolver` (Concept 2).
+    let control_plane = crate::acme_dns::ControlPlaneTls::from_overrides(control_plane_tls);
+    let node_challenge: Option<Arc<crate::on_demand_tls::CertCache>> = control_plane
+        .any_tls_alpn()
+        .then(|| control_plane.challenge_cache().clone());
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),
@@ -5352,11 +5386,26 @@ async fn serve_acme_dns(
     let cache = args.acme_cache.clone();
 
     // Initial pass: obtain/load the static set (cluster: the leader issues + stores; every node loads).
-    let entries = cert_refresh.run(&domains, &base, &provider, &cache).await?;
+    // CHANGE 2: a TLS-ALPN-01 control-plane domain CANNOT be obtained before the `:443` edge is up (the
+    // CA validates by connecting to it), so the initial pass obtains only the DNS-01 domains here; the
+    // TLS-ALPN-01 ones are obtained by a deferred pass once the edge is accepting (below). With no
+    // TLS-ALPN-01 override, `init_domains == domains` and this is the unchanged single-pass init.
+    let init_domains: Vec<String> = domains
+        .iter()
+        .filter(|d| !control_plane.uses_tls_alpn(d))
+        .cloned()
+        .collect();
+    let entries = cert_refresh
+        .run(&init_domains, &base, &provider, &cache, &control_plane)
+        .await?;
     // An empty static set with NO on-demand engine means there is nothing to serve yet — the cluster
     // follower "awaiting the leader to issue" semantics (preserved). With an on-demand engine, serve
-    // purely on-demand (per-SNI issuance fronts the empty static set).
-    if no_static_certs_is_fatal(entries.is_empty(), on_demand_engine.is_some()) {
+    // purely on-demand (per-SNI issuance fronts the empty static set). A pending TLS-ALPN-01 control-
+    // plane domain is likewise not-yet-fatal: the deferred pass fills it in once the edge is up.
+    if no_static_certs_is_fatal(
+        entries.is_empty() && !control_plane.any_tls_alpn(),
+        on_demand_engine.is_some(),
+    ) {
         return Err(Error::NoCertsYet);
     }
     // Build the node's CONTROL-PLANE cert source (Concept 1) ONCE: parse the obtained `--acme-domain`
@@ -5391,6 +5440,7 @@ async fn serve_acme_dns(
         let (tcp, h3) = crate::acme_dns::build_server_configs_maybe_from_resolver(
             static_resolver.clone(),
             on_demand_resolver.clone(),
+            node_challenge.clone(),
         );
         let endpoint =
             boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
@@ -5400,6 +5450,7 @@ async fn serve_acme_dns(
             crate::acme_dns::build_server_config_maybe_from_resolver(
                 static_resolver.clone(),
                 on_demand_resolver.clone(),
+                node_challenge.clone(),
             ),
             None,
         )
@@ -5408,13 +5459,28 @@ async fn serve_acme_dns(
     let config = crate::acme_dns::build_server_config_maybe_from_resolver(
         static_resolver.clone(),
         on_demand_resolver.clone(),
+        node_challenge.clone(),
     );
     let tls = boatramp_server::ReloadableTls::new(config);
 
-    // Background renewal: re-run the refresh pass, hot-swap the shared node control-plane cert source
-    // (reaching `use_node_cert` listeners live), AND reload the served edge config (TCP + h3).
+    // Background cert task: (1) a DEFERRED initial pass that obtains the TLS-ALPN-01 control-plane
+    // domains once the `:443` edge is accepting (CHANGE 2 — they can't validate before the edge is up),
+    // then (2) the 6h renewal loop. Both re-run the refresh, hot-swap the shared node control-plane cert
+    // source (reaching `use_node_cert` listeners live), AND reload the served edge config (TCP + h3) via
+    // the ONE `refresh_and_reload_edge` helper, so the edge and the listeners never diverge.
     {
-        let (tls, provider, base, cache, domains, on_demand_resolver, renew_refresh, node_certs) = (
+        let (
+            tls,
+            provider,
+            base,
+            cache,
+            domains,
+            on_demand_resolver,
+            renew_refresh,
+            node_certs,
+            control_plane,
+            node_challenge,
+        ) = (
             tls.clone(),
             provider.clone(),
             base.clone(),
@@ -5423,55 +5489,53 @@ async fn serve_acme_dns(
             on_demand_resolver.clone(),
             cert_refresh.clone(),
             node_certs.clone(),
+            control_plane.clone(),
+            node_challenge.clone(),
         );
         #[cfg(feature = "http3")]
         let h3_renew = h3_endpoint.clone();
         tokio::spawn(async move {
+            // (1) Deferred initial TLS-ALPN-01 pass. The CA validates TLS-ALPN-01 by connecting to the
+            // node's own `:443` edge, which binds in `serve_router_over_tls` (spawned ~now) — so wait
+            // for it to accept, then run the FULL refresh once (DNS-01 domains load from cache; the
+            // TLS-ALPN-01 ones obtain against the now-live edge) and reload. Skipped entirely when no
+            // control-plane domain uses TLS-ALPN-01 (the common path is unchanged).
+            if control_plane.any_tls_alpn() {
+                wait_until_listening(addr).await;
+                refresh_and_reload_edge(
+                    &renew_refresh,
+                    &domains,
+                    &base,
+                    &provider,
+                    &cache,
+                    &control_plane,
+                    &node_certs,
+                    &tls,
+                    &on_demand_resolver,
+                    &node_challenge,
+                    #[cfg(feature = "http3")]
+                    &h3_renew,
+                )
+                .await;
+            }
+            // (2) Periodic renewal (both DNS-01 and TLS-ALPN-01; the edge is up for the latter now).
             loop {
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                match renew_refresh.run(&domains, &base, &provider, &cache).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        // Parse the renewed static set ONCE. Hot-swap the shared `node_certs` handle
-                        // FIRST — every `use_node_cert` listener then serves the renewed control-plane
-                        // cert on its next handshake — then rebuild + reload the `:443` edge from the
-                        // SAME resolver so the edge and the listeners never diverge.
-                        let resolver = match crate::acme_dns::sni_resolver(entries) {
-                            Ok(r) => r,
-                            Err(err) => {
-                                tracing::error!(%err, "acme-dns: rebuilding TLS resolver failed");
-                                continue;
-                            }
-                        };
-                        node_certs.store(resolver.clone());
-                        #[cfg(feature = "http3")]
-                        if let Some(endpoint) = &h3_renew {
-                            let (tcp, h3) =
-                                crate::acme_dns::build_server_configs_maybe_from_resolver(
-                                    resolver.clone(),
-                                    on_demand_resolver.clone(),
-                                );
-                            tls.reload(tcp);
-                            match boatramp_server::quinn_server_config(h3) {
-                                Ok(qc) => endpoint.set_server_config(Some(qc)),
-                                Err(err) => {
-                                    tracing::error!(%err, "acme-dns: rebuilding h3 config failed");
-                                }
-                            }
-                        } else {
-                            tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
-                                resolver.clone(),
-                                on_demand_resolver.clone(),
-                            ));
-                        }
-                        #[cfg(not(feature = "http3"))]
-                        tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
-                            resolver,
-                            on_demand_resolver.clone(),
-                        ));
-                    }
-                    Ok(_) => {} // nothing stored yet (cluster follower awaiting the leader)
-                    Err(err) => tracing::error!(%err, "acme-dns: renewal failed"),
-                }
+                refresh_and_reload_edge(
+                    &renew_refresh,
+                    &domains,
+                    &base,
+                    &provider,
+                    &cache,
+                    &control_plane,
+                    &node_certs,
+                    &tls,
+                    &on_demand_resolver,
+                    &node_challenge,
+                    #[cfg(feature = "http3")]
+                    &h3_renew,
+                )
+                .await;
             }
         });
     }
@@ -5507,20 +5571,126 @@ async fn serve_acme_dns(
     .await
 }
 
-/// Obtain (or load) every domain's cert, returning `(SNI-pattern, cert)` pairs.
+/// Obtain (or load) every domain's cert via its Concept-1 solver (DNS-01 or TLS-ALPN-01, CHANGE 2),
+/// returning `(SNI-pattern, cert)` pairs.
 #[cfg(feature = "acme-dns")]
 async fn obtain_all(
     domains: &[String],
     base: &boatramp_acme::acme::CertRequest,
     provider: &dyn boatramp_acme::dns::DnsProvider,
     cache: &Path,
+    control_plane: &crate::acme_dns::ControlPlaneTls,
 ) -> Result<Vec<(String, boatramp_acme::acme::IssuedCert)>> {
     let mut entries = Vec::with_capacity(domains.len());
     for domain in domains {
-        let cert = crate::acme_dns::obtain_or_load(domain, base, provider, cache).await?;
+        let cert = crate::acme_dns::obtain_or_load_with(
+            domain,
+            base,
+            provider,
+            cache,
+            control_plane.solver_for(domain),
+        )
+        .await?;
         entries.push((domain.clone(), cert));
     }
     Ok(entries)
+}
+
+/// One cert refresh-and-serve pass shared by the deferred initial TLS-ALPN-01 pass AND the 6h renewal
+/// loop (CHANGE 2 — consolidated so the edge-reload logic lives in ONE place): run the refresh over the
+/// FULL `domains` set (DNS-01 ones load from cache, TLS-ALPN-01 ones obtain against the live `:443`
+/// edge), then — on a non-empty result — hot-swap the shared `node_certs` handle FIRST (so every
+/// `use_node_cert` listener serves the fresh control-plane cert on its next handshake) and rebuild +
+/// reload the `:443` edge config (TCP + h3) from the SAME resolver. An empty result (a cluster follower
+/// awaiting the leader) or an error is logged and left for the next tick.
+#[cfg(feature = "acme-dns")]
+#[allow(clippy::too_many_arguments)]
+async fn refresh_and_reload_edge(
+    refresh: &CertRefresh,
+    domains: &[String],
+    base: &boatramp_acme::acme::CertRequest,
+    provider: &Arc<dyn boatramp_acme::dns::DnsProvider>,
+    cache: &Path,
+    control_plane: &crate::acme_dns::ControlPlaneTls,
+    node_certs: &crate::acme_dns::NodeCertSource,
+    tls: &boatramp_server::ReloadableTls,
+    on_demand_resolver: &Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+    node_challenge: &Option<Arc<crate::on_demand_tls::CertCache>>,
+    #[cfg(feature = "http3")] h3_endpoint: &Option<boatramp_server::Http3Endpoint>,
+) {
+    match refresh
+        .run(domains, base, provider, cache, control_plane)
+        .await
+    {
+        Ok(entries) if !entries.is_empty() => {
+            let resolver = match crate::acme_dns::sni_resolver(entries) {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::error!(%err, "acme-dns: rebuilding TLS resolver failed");
+                    return;
+                }
+            };
+            node_certs.store(resolver.clone());
+            #[cfg(feature = "http3")]
+            if let Some(endpoint) = h3_endpoint {
+                let (tcp, h3) = crate::acme_dns::build_server_configs_maybe_from_resolver(
+                    resolver.clone(),
+                    on_demand_resolver.clone(),
+                    node_challenge.clone(),
+                );
+                tls.reload(tcp);
+                match boatramp_server::quinn_server_config(h3) {
+                    Ok(qc) => endpoint.set_server_config(Some(qc)),
+                    Err(err) => tracing::error!(%err, "acme-dns: rebuilding h3 config failed"),
+                }
+            } else {
+                tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
+                    resolver.clone(),
+                    on_demand_resolver.clone(),
+                    node_challenge.clone(),
+                ));
+            }
+            #[cfg(not(feature = "http3"))]
+            tls.reload(crate::acme_dns::build_server_config_maybe_from_resolver(
+                resolver,
+                on_demand_resolver.clone(),
+                node_challenge.clone(),
+            ));
+        }
+        Ok(_) => {} // nothing stored yet (cluster follower awaiting the leader)
+        Err(err) => tracing::error!(%err, "acme-dns: cert refresh failed"),
+    }
+}
+
+/// Wait (bounded) for the node's own `:443` edge to start accepting, so a deferred TLS-ALPN-01
+/// control-plane obtention (CHANGE 2) does not tell the CA to validate before the edge can answer the
+/// `acme-tls/1` handshake. The edge binds in `serve_router_over_tls`, spawned concurrently with the
+/// deferred task; a bounded poll-connect to the bind address (loopback for a wildcard bind) returns as
+/// soon as the listener answers. If it never comes up within the budget, proceed anyway — the CA retries
+/// validation, and the 6h renewal loop retries the obtention.
+#[cfg(feature = "acme-dns")]
+async fn wait_until_listening(addr: SocketAddr) {
+    let target = if addr.ip().is_unspecified() {
+        let ip = match addr.ip() {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        SocketAddr::new(ip, addr.port())
+    } else {
+        addr
+    };
+    // ~30s budget (120 × 250ms): the edge binds within a few ms of the task spawning.
+    for _ in 0..120 {
+        if tokio::net::TcpStream::connect(target).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    tracing::warn!(
+        %addr,
+        "acme-dns: the `:443` edge was not accepting within the readiness budget; obtaining \
+         control-plane TLS-ALPN-01 cert(s) anyway (the CA validation / renewal loop will retry)"
+    );
 }
 
 #[cfg(not(feature = "acme-dns"))]

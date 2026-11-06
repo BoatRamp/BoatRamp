@@ -131,6 +131,18 @@ pub enum ConfigError {
     /// (fail-closed, boot-LOUD) rather than binding a listener that would silently mislead the
     /// operator. (Host-side TLS/STARTTLS and a host-mediated `tcp-egress` `egress_allowlist` are
     /// supported — cap-req 06 / 19.)
+    /// A `[serve.control_plane_tls]` per-control-plane-domain challenge override (Concept 1) is invalid:
+    /// a blank `domain`, or a TLS-ALPN-01 override on a wildcard domain (only DNS-01 can satisfy a
+    /// wildcard). Refused at config load (fail-closed, boot-LOUD).
+    #[error("control-plane TLS override {domain:?}: {reason}{cure}")]
+    InvalidControlPlaneTls {
+        /// The offending `domain` value.
+        domain: String,
+        /// Why it was rejected.
+        reason: &'static str,
+        /// A trailing remediation hint.
+        cure: &'static str,
+    },
     #[error("inbound TCP listener {name:?}: {reason}{cure}")]
     InvalidListener {
         /// The offending listener key (the `listeners` map key).
@@ -406,6 +418,7 @@ impl ServerConfig {
         config.validate_sql_db_names()?;
         config.validate_blob_backend_projects()?;
         config.validate_listeners()?;
+        config.validate_control_plane_tls()?;
         Ok(config)
     }
 
@@ -753,6 +766,37 @@ impl ServerConfig {
             // is connect-only + SSRF-floored (the SAME gate as a request handler's egress). Entries
             // are validated (and rejected) at that runtime gate, mirroring the handler/function
             // allowlist, so no config-load format check here.
+        }
+        Ok(())
+    }
+
+    /// Validate `[serve.control_plane_tls]` (Concept 1, per-control-plane-domain challenge overrides):
+    /// each entry's `domain` must be non-blank, and a TLS-ALPN-01 override on a WILDCARD domain is
+    /// refused — TLS-ALPN-01 proves control of ONE concrete name on the `:443` edge and cannot satisfy a
+    /// wildcard (only DNS-01 can). The challenge token itself is validated by the enum's `FromStr` at
+    /// parse time, so an unsupported method never reaches here. Fail-closed, boot-LOUD.
+    fn validate_control_plane_tls(&self) -> Result<(), ConfigError> {
+        let Some(serve) = self.serve.as_ref() else {
+            return Ok(());
+        };
+        for entry in &serve.control_plane_tls {
+            let domain = entry.domain.trim();
+            if domain.is_empty() {
+                return Err(ConfigError::InvalidControlPlaneTls {
+                    domain: entry.domain.clone(),
+                    reason: "`domain` must be a non-blank control-plane domain",
+                    cure: " — set it to one of the node's `--acme-domain` values",
+                });
+            }
+            if domain.starts_with("*.") && entry.challenge == ControlPlaneChallenge::TlsAlpn01 {
+                return Err(ConfigError::InvalidControlPlaneTls {
+                    domain: entry.domain.clone(),
+                    reason: "TLS-ALPN-01 cannot satisfy a WILDCARD control-plane domain (it proves \
+                             control of one concrete name on the `:443` edge)",
+                    cure: " — use `challenge = \"dns-01\"` for a wildcard (only DNS-01 can), or name a \
+                           concrete host",
+                });
+            }
         }
         Ok(())
     }
@@ -2642,6 +2686,17 @@ pub struct ServeConfig {
     /// See [`OnDemandTlsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_demand_tls: Option<OnDemandTlsConfig>,
+    /// `[serve.control_plane_tls]` — per-control-plane-domain ACME challenge overrides (**Concept 1**).
+    /// A LIST (mirroring `[serve.dns_providers]`) that lets each `--acme-domain` control-plane domain be
+    /// obtained via a DIFFERENT challenge (DNS-01 or TLS-ALPN-01), overriding the node-wide `--tls`
+    /// default (`acme-dns` ⇒ DNS-01). A `--acme-domain` with no entry uses the `--tls` default, so a flat
+    /// config is byte-for-byte unchanged (**empty/absent ⇒ every domain uses the `--tls` default**). This
+    /// is SEPARATE from `[serve.on_demand_tls].challenge` (Concept 2, the on-demand engine's challenge for
+    /// OTHER/tenant domains); it changes how the NODE'S OWN cert is obtained. A TLS-ALPN-01 override on a
+    /// WILDCARD domain is refused at config load (only DNS-01 can satisfy a wildcard). File-only (like
+    /// `dns_providers`). See [`ControlPlaneDomainTls`] and `crates/boatramp/DESIGN-acme-concept-decouple.md`.
+    #[serde(default)]
+    pub control_plane_tls: Vec<ControlPlaneDomainTls>,
     /// `[serve.alerts]` — the node/system-health ALERTING subsystem (node-health-alerting
     /// Stage 2). Off unless `enabled`. Declares the evaluation cadence, the disk /
     /// managed-SQL / orphan-replica signal thresholds + graces, the webhook/email delivery
@@ -2756,6 +2811,88 @@ impl From<OnDemandChallenge> for String {
     fn from(c: OnDemandChallenge) -> Self {
         c.as_str().to_string()
     }
+}
+
+/// How ONE `--acme-domain` control-plane domain proves control of itself to the CA — **Concept 1: the
+/// control-plane cert verification mode** (how the NODE obtains + serves its OWN cert, driven by
+/// `--tls`/`--acme-domain`). This is DELIBERATELY SEPARATE from [`OnDemandChallenge`] (**Concept 2**, the
+/// on-demand engine's challenge for issuing OTHER (tenant) domains' certs): a per-control-plane-domain
+/// override here changes how the NODE'S OWN cert is obtained, and never touches
+/// `[serve.on_demand_tls].challenge`. See `crates/boatramp/DESIGN-acme-concept-decouple.md`.
+///
+/// Two methods are supported for the control plane: `dns-01` (the `--tls acme-dns` node-wide default —
+/// an operator-controlled zone, and the ONLY method that can satisfy a wildcard) and `tls-alpn-01`
+/// (validated on the node's own `:443` edge, no DNS write). (De)serializes **as a string** in both RON
+/// and JSON (`"dns-01"` / `"tls-alpn-01"`) via `try_from`/`into`, the same encoding as
+/// [`OnDemandChallenge`] (the kebab tokens are not valid RON identifiers, so a bare-variant encoding
+/// would be unsettable from a RON file).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ControlPlaneChallenge {
+    /// DNS-01 via the node's configured ACME DNS provider — the `--tls acme-dns` node-wide default, and
+    /// the only method that can satisfy a WILDCARD control-plane domain. `default`.
+    #[default]
+    Dns01,
+    /// TLS-ALPN-01 on the node's own `:443` edge (no DNS write). CANNOT satisfy a wildcard domain
+    /// (refused at config load).
+    TlsAlpn01,
+}
+
+impl ControlPlaneChallenge {
+    /// The canonical kebab token (`dns-01` / `tls-alpn-01`), as written in a config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns01 => "dns-01",
+            Self::TlsAlpn01 => "tls-alpn-01",
+        }
+    }
+}
+
+impl std::str::FromStr for ControlPlaneChallenge {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dns-01" | "dns_01" | "dns01" | "dns" => Ok(Self::Dns01),
+            "tls-alpn-01" | "tls_alpn_01" | "tlsalpn01" | "tls-alpn" | "alpn" => {
+                Ok(Self::TlsAlpn01)
+            }
+            other => Err(format!(
+                "unknown control-plane TLS challenge `{other}` (expected `dns-01` or `tls-alpn-01`)"
+            )),
+        }
+    }
+}
+
+impl TryFrom<String> for ControlPlaneChallenge {
+    type Error = String;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<ControlPlaneChallenge> for String {
+    fn from(c: ControlPlaneChallenge) -> Self {
+        c.as_str().to_string()
+    }
+}
+
+/// One `[serve.control_plane_tls]` entry: a per-control-plane-domain challenge override (**Concept 1**).
+/// Mirrors the `[serve.dns_providers]` per-zone LIST idiom (cap-req #27). An entry pins how ONE
+/// `--acme-domain` control-plane domain's OWN cert is obtained, overriding the node-wide `--tls` default
+/// (`acme-dns` ⇒ DNS-01) — e.g. one domain via DNS-01, another via TLS-ALPN-01. A `--acme-domain` with
+/// NO entry here uses the `--tls` default, so an existing flat config is unchanged (full backward-compat).
+///
+/// This is SEPARATE from `[serve.on_demand_tls].challenge` (Concept 2 — the on-demand engine's challenge
+/// for OTHER/tenant domains). See `crates/boatramp/DESIGN-acme-concept-decouple.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlPlaneDomainTls {
+    /// The control-plane domain this override applies to — must be one of the node's `--acme-domain`
+    /// values (an entry for a domain that is not served is inert). A wildcard (`*.…`) with
+    /// `challenge = tls-alpn-01` is refused at config load (TLS-ALPN-01 cannot satisfy a wildcard).
+    pub domain: String,
+    /// The challenge to obtain `domain`'s control-plane cert with (`dns-01` / `tls-alpn-01`).
+    pub challenge: ControlPlaneChallenge,
 }
 
 /// `[serve.listeners.<name>]` — a **host-owned inbound-TCP listener** (PLAN-handler-tcp-inbound). The
@@ -5995,6 +6132,88 @@ mod tests {
             .is_err(),
             "an unknown challenge token must be rejected"
         );
+    }
+
+    /// CHANGE 2 (Concept 1): `[serve.control_plane_tls]` — a per-control-plane-domain challenge override
+    /// list — parses identically from RON and JSON, with the challenge as a string (`dns-01` /
+    /// `tls-alpn-01`). An empty/absent list is the default (every domain uses the `--tls` default). This
+    /// is SEPARATE from `[serve.on_demand_tls].challenge` (Concept 2).
+    #[test]
+    fn control_plane_tls_config_parses_from_ron_and_json() {
+        // Default: no section ⇒ empty list.
+        let empty = ServerConfig::parse(r#"( serve: ( addr: "0.0.0.0:443" ) )"#).unwrap();
+        assert!(
+            empty.serve.unwrap().control_plane_tls.is_empty(),
+            "absent [serve.control_plane_tls] ⇒ empty (every domain uses the --tls default)"
+        );
+
+        let ron = r#"( serve: ( control_plane_tls: [
+            ( domain: "a.example.test", challenge: "dns-01" ),
+            ( domain: "b.example.test", challenge: "tls-alpn-01" ),
+        ] ) )"#;
+        let json = r#"{ "serve": { "control_plane_tls": [
+            { "domain": "a.example.test", "challenge": "dns-01" },
+            { "domain": "b.example.test", "challenge": "tls-alpn-01" }
+        ] } }"#;
+        let from_ron = ServerConfig::parse_with_format(ron, ConfigFormat::Ron).unwrap();
+        let from_json = ServerConfig::parse_with_format(json, ConfigFormat::Json).unwrap();
+        for cfg in [from_ron, from_json] {
+            let list = cfg.serve.unwrap().control_plane_tls;
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0].domain, "a.example.test");
+            assert_eq!(list[0].challenge, ControlPlaneChallenge::Dns01);
+            assert_eq!(list[1].domain, "b.example.test");
+            assert_eq!(list[1].challenge, ControlPlaneChallenge::TlsAlpn01);
+        }
+        // Round-trip of the string encoding + unknown-token rejection.
+        assert_eq!(String::from(ControlPlaneChallenge::Dns01), "dns-01");
+        assert_eq!(
+            String::from(ControlPlaneChallenge::TlsAlpn01),
+            "tls-alpn-01"
+        );
+        assert!(
+            ServerConfig::parse_with_format(
+                r#"( serve: ( control_plane_tls: [ ( domain: "x.example.test", challenge: "http-01" ) ] ) )"#,
+                ConfigFormat::Ron
+            )
+            .is_err(),
+            "an unsupported Concept-1 challenge (e.g. http-01) must be rejected"
+        );
+    }
+
+    /// CHANGE 2 validation (Concept 1): a TLS-ALPN-01 override on a WILDCARD control-plane domain is
+    /// refused (TLS-ALPN-01 cannot satisfy a wildcard — only DNS-01 can); a blank `domain` is refused;
+    /// the valid shapes (wildcard+DNS-01, concrete+TLS-ALPN-01) parse.
+    #[test]
+    fn control_plane_tls_wildcard_tls_alpn01_refused() {
+        // Wildcard + TLS-ALPN-01 ⇒ refused (fail-closed).
+        let err = ServerConfig::parse(
+            r#"( serve: ( control_plane_tls: [ ( domain: "*.wild.example.test", challenge: "tls-alpn-01" ) ] ) )"#,
+        )
+        .expect_err("TLS-ALPN-01 on a wildcard control-plane domain must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidControlPlaneTls { .. }),
+            "{err:?}"
+        );
+        // A blank domain ⇒ refused.
+        let err = ServerConfig::parse(
+            r#"( serve: ( control_plane_tls: [ ( domain: "   ", challenge: "dns-01" ) ] ) )"#,
+        )
+        .expect_err("a blank control-plane TLS domain must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidControlPlaneTls { .. }),
+            "{err:?}"
+        );
+        // Wildcard + DNS-01 is valid (only DNS-01 can satisfy a wildcard).
+        ServerConfig::parse(
+            r#"( serve: ( control_plane_tls: [ ( domain: "*.wild.example.test", challenge: "dns-01" ) ] ) )"#,
+        )
+        .expect("a wildcard control-plane domain via DNS-01 is valid");
+        // Concrete host + TLS-ALPN-01 is valid.
+        ServerConfig::parse(
+            r#"( serve: ( control_plane_tls: [ ( domain: "mail.example.test", challenge: "tls-alpn-01" ) ] ) )"#,
+        )
+        .expect("a concrete control-plane domain via TLS-ALPN-01 is valid");
     }
 
     /// Equivalence (project): a `project.cfg` authored in RON and in equivalent JSON

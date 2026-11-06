@@ -568,20 +568,129 @@ fn write_private_key(key_p: &Path, private_key_pem: &str) -> Result<()> {
     Ok(())
 }
 
-/// Obtain a cert for `domain` (single-SAN), reusing a fresh cached one. The CA
-/// settings come from `base` (directory, contact, timeouts); the `domains`
-/// field is overridden with `[domain]`.
+/// **Concept 1 (CHANGE 2): how ONE `--acme-domain` control-plane domain proves control of itself to the
+/// CA.** Chosen per domain by [`ControlPlaneTls::solver_for`] from the node-wide `--tls` default (`acme-dns`
+/// ⇒ DNS-01) and the per-domain `[serve.control_plane_tls]` override. Owns an `Arc` (cheap) rather than a
+/// borrow so it crosses the cluster refresh's `async move` boundary. DELIBERATELY SEPARATE from the
+/// Concept-2 on-demand engine — see `DESIGN-acme-concept-decouple.md`.
+#[cfg(feature = "acme-dns")]
+pub(crate) enum ControlPlaneSolver {
+    /// DNS-01 via the node's configured ACME DNS provider (an operator-controlled zone; the only method
+    /// that can satisfy a wildcard). The `--tls acme-dns` node-wide default.
+    Dns01,
+    /// TLS-ALPN-01 validated on the node's OWN `:443` edge: the ephemeral challenge cert installs into
+    /// this shared [`CertCache`](crate::on_demand_tls::CertCache) (REUSING the on-demand engine's
+    /// challenge-slot machinery via [`crate::on_demand_tls::TlsAlpn01Solver`]) and the edge serves it on
+    /// the `acme-tls/1` handshake.
+    TlsAlpn01 {
+        challenge_cache: Arc<crate::on_demand_tls::CertCache>,
+    },
+}
+
+/// **Concept 1 (CHANGE 2): per-control-plane-domain challenge routing for the whole node.** The node-wide
+/// `--tls` default (always DNS-01 here — this is the `--tls acme-dns` serve arm) plus the per-domain
+/// `[serve.control_plane_tls]` overrides, and the ONE shared [`CertCache`](crate::on_demand_tls::CertCache)
+/// a TLS-ALPN-01 control-plane solver installs its challenge cert into (which the `:443` edge serves).
+/// SEPARATE from `[serve.on_demand_tls]` (Concept 2). `Clone` (a `BTreeMap` + an `Arc`), so the renewal
+/// loop and the deferred initial-ALPN task each own a copy.
+#[cfg(feature = "acme-dns")]
+#[derive(Clone)]
+pub(crate) struct ControlPlaneTls {
+    /// Per-domain challenge override (domain → challenge). A domain not present uses DNS-01 (the `--tls`
+    /// default). Built from `[serve.control_plane_tls]`.
+    overrides: std::collections::BTreeMap<String, boatramp_node::config::ControlPlaneChallenge>,
+    /// The shared challenge cache a TLS-ALPN-01 control-plane solver installs into; the `:443` edge
+    /// serves it on the `acme-tls/1` handshake. Always present (cheap); only consulted when some domain
+    /// routes to TLS-ALPN-01.
+    challenge_cache: Arc<crate::on_demand_tls::CertCache>,
+}
+
+#[cfg(feature = "acme-dns")]
+impl ControlPlaneTls {
+    /// Build from the `[serve.control_plane_tls]` override list. The node-wide default is DNS-01 (this is
+    /// the `--tls acme-dns` serve arm). A wildcard override is dropped to DNS-01 defensively (config load
+    /// already refuses a wildcard + TLS-ALPN-01), so a wildcard is never routed to TLS-ALPN-01.
+    pub(crate) fn from_overrides(
+        overrides: &[boatramp_node::config::ControlPlaneDomainTls],
+    ) -> Self {
+        let overrides = overrides
+            .iter()
+            .filter(|e| !e.domain.trim().is_empty())
+            .map(|e| (e.domain.trim().to_string(), e.challenge))
+            .collect();
+        Self {
+            overrides,
+            challenge_cache: Arc::new(crate::on_demand_tls::CertCache::default()),
+        }
+    }
+
+    /// Whether `domain` is obtained via TLS-ALPN-01 (an override; never a wildcard, which is always
+    /// DNS-01).
+    pub(crate) fn uses_tls_alpn(&self, domain: &str) -> bool {
+        !domain.starts_with("*.")
+            && matches!(
+                self.overrides.get(domain),
+                Some(boatramp_node::config::ControlPlaneChallenge::TlsAlpn01)
+            )
+    }
+
+    /// Whether ANY control-plane domain routes to TLS-ALPN-01 — so the `:443` edge needs the challenge
+    /// tier wired (and the initial obtention of those domains deferred until the edge is up).
+    pub(crate) fn any_tls_alpn(&self) -> bool {
+        self.overrides
+            .values()
+            .any(|c| matches!(c, boatramp_node::config::ControlPlaneChallenge::TlsAlpn01))
+    }
+
+    /// The shared TLS-ALPN-01 challenge cache the `:443` edge serves on the `acme-tls/1` handshake.
+    pub(crate) fn challenge_cache(&self) -> &Arc<crate::on_demand_tls::CertCache> {
+        &self.challenge_cache
+    }
+
+    /// The [`ControlPlaneSolver`] for `domain`: its override, else DNS-01 (the `--tls` default). A
+    /// WILDCARD is ALWAYS DNS-01 (TLS-ALPN-01 cannot satisfy a wildcard).
+    pub(crate) fn solver_for(&self, domain: &str) -> ControlPlaneSolver {
+        if self.uses_tls_alpn(domain) {
+            ControlPlaneSolver::TlsAlpn01 {
+                challenge_cache: self.challenge_cache.clone(),
+            }
+        } else {
+            ControlPlaneSolver::Dns01
+        }
+    }
+}
+
+/// Obtain a cert for `domain` (single-SAN) via **DNS-01**, reusing a fresh cached one. The CA settings
+/// come from `base` (directory, contact, timeouts); the `domains` field is overridden with `[domain]`.
+/// The DNS-01 convenience over [`obtain_or_load_with`] — kept for the CLI `dns` path and the DNS-01
+/// live gates.
 pub async fn obtain_or_load(
     domain: &str,
     base: &CertRequest,
     provider: &dyn DnsProvider,
     cache_dir: &Path,
 ) -> Result<IssuedCert> {
+    obtain_or_load_with(domain, base, provider, cache_dir, ControlPlaneSolver::Dns01).await
+}
+
+/// Obtain a cert for `domain` (single-SAN) via the chosen Concept-1 `solver`, reusing a fresh cached one
+/// (CHANGE 2). DNS-01 uses the convenience account path (+ the authoritative propagation pre-check);
+/// TLS-ALPN-01 REUSES the on-demand engine's [`TlsAlpn01Solver`](crate::on_demand_tls::TlsAlpn01Solver)
+/// over the provided challenge cache (which the `:443` edge serves on `acme-tls/1`) against a throwaway
+/// account, matching the DNS-01 convenience's per-call account model (a handful of control-plane domains
+/// every ~60 days — well under the CA `newAccount` limit).
+#[cfg(feature = "acme-dns")]
+pub(crate) async fn obtain_or_load_with(
+    domain: &str,
+    base: &CertRequest,
+    provider: &dyn DnsProvider,
+    cache_dir: &Path,
+    solver: ControlPlaneSolver,
+) -> Result<IssuedCert> {
     if let Some(cert) = load_fresh(cache_dir, domain)? {
         tracing::info!(domain, "using cached certificate");
         return Ok(cert);
     }
-    tracing::info!(domain, "obtaining certificate via ACME DNS-01");
     let request = CertRequest {
         directory_url: base.directory_url.clone(),
         contact_email: base.contact_email.clone(),
@@ -592,7 +701,32 @@ pub async fn obtain_or_load(
         timeout: base.timeout,
         extra_root_ca: base.extra_root_ca.clone(),
     };
-    let cert = boatramp_acme::acme::obtain_certificate(&request, provider).await?;
+    let cert = match solver {
+        ControlPlaneSolver::Dns01 => {
+            tracing::info!(
+                domain,
+                "obtaining control-plane certificate via ACME DNS-01"
+            );
+            boatramp_acme::acme::obtain_certificate(&request, provider).await?
+        }
+        ControlPlaneSolver::TlsAlpn01 { challenge_cache } => {
+            tracing::info!(
+                domain,
+                "obtaining control-plane certificate via ACME TLS-ALPN-01"
+            );
+            // A throwaway account (same model as the DNS-01 convenience) + the REUSED on-demand
+            // TLS-ALPN-01 solver, which installs the ephemeral challenge cert into `challenge_cache`; the
+            // `:443` edge serves it on the `acme-tls/1` validation handshake.
+            let (account, _creds) = boatramp_acme::acme::create_account(
+                &request.directory_url,
+                request.contact_email.as_deref(),
+                request.extra_root_ca.as_deref(),
+            )
+            .await?;
+            let solver = crate::on_demand_tls::TlsAlpn01Solver::new(challenge_cache);
+            boatramp_acme::acme::obtain_certificate_with(&account, &request, &solver).await?
+        }
+    };
     // A genuine CA issuance/renewal (cache hits returned above) — count it for
     // the Prometheus `boatramp_cert_renewals_total` counter.
     boatramp_server::server_metrics().record_cert_renewal();
@@ -748,6 +882,16 @@ struct CompositeResolver {
     /// `use_node_cert`-only listener, so it serves ONLY its `managed_names` control-plane certs (and
     /// never serves — nor triggers issuance for — a domain outside its declared `server_names`).
     catch_all_on_demand: bool,
+    /// **Concept 1 — the control-plane TLS-ALPN-01 challenge cache (CHANGE 2).** When a `--acme-domain`
+    /// control-plane domain is obtained via TLS-ALPN-01 (a `[serve.control_plane_tls]` override), the CA
+    /// validates by an `acme-tls/1` handshake to the node's OWN `:443` edge; the control-plane solver
+    /// installs the ephemeral challenge cert here (the SAME [`CertCache`] challenge-slot machinery the
+    /// Concept-2 engine uses) and this tier serves it. Consulted FIRST on an `acme-tls/1` handshake —
+    /// BEFORE the static tier — so a RENEWAL validation handshake gets the challenge cert even though the
+    /// domain's REAL cert is already in `static_resolver`. `Some` only at the `:443` edge when some
+    /// control-plane domain uses TLS-ALPN-01; `None` at every listener and otherwise (the common DNS-01
+    /// edge is unchanged). SEPARATE from the Concept-2 `on_demand` cache. See the DESIGN note.
+    node_challenge: Option<Arc<crate::on_demand_tls::CertCache>>,
 }
 
 #[cfg(feature = "acme-dns")]
@@ -758,6 +902,20 @@ impl ResolvesServerCert for CompositeResolver {
             return self.default_cert.clone();
         };
         let is_acme_alpn = crate::on_demand_tls::is_acme_tls_alpn(&hello);
+        // TIER 0 — control-plane TLS-ALPN-01 challenge (Concept 1, CHANGE 2): on an `acme-tls/1`
+        // validation handshake, serve the ephemeral challenge cert the control-plane solver installed for
+        // this name, if any. Checked BEFORE the static tier so a RENEWAL handshake gets the challenge cert
+        // even though the domain's REAL cert is already in `static_resolver` (serving the real cert would
+        // fail TLS-ALPN-01 validation). ALPN-gated, so normal serving is untouched; `None` (the common
+        // DNS-01 edge + every listener) skips this entirely.
+        if is_acme_alpn
+            && let Some(key) = self
+                .node_challenge
+                .as_ref()
+                .and_then(|cache| cache.get_challenge(sni))
+        {
+            return Some(key);
+        }
         // TIER 1 — managed_names (Concept 1): a listener-declared NODE control-plane name is served the
         // node's OWN cert (the SAME `--acme-domain` cert the `:443` edge serves) straight from
         // `node_certs`. The on-demand engine (Concept 2) is NEVER consulted for a managed name, so no
@@ -888,6 +1046,10 @@ pub(crate) fn build_listener_server_config_composite(
         managed_names: managed_names.to_vec(),
         node_certs,
         catch_all_on_demand,
+        // A listener never answers a control-plane TLS-ALPN-01 validation handshake: the CA validates by
+        // connecting to the node's OWN `:443` edge, not to a host-owned listener port. Concept-1
+        // challenge serving lives at the edge only.
+        node_challenge: None,
     });
     // No ALPN: protocol-agnostic. Build the config directly rather than via `server_config_from`.
     Ok(rustls::ServerConfig::builder()
@@ -906,24 +1068,43 @@ pub(crate) fn build_listener_server_config_composite(
 pub(crate) fn build_server_config_maybe_from_resolver(
     resolver: Arc<SniCertResolver>,
     on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+    node_challenge: Option<Arc<crate::on_demand_tls::CertCache>>,
 ) -> rustls::ServerConfig {
-    match on_demand {
-        Some(r) => {
-            let composite: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
-                static_resolver: resolver,
-                on_demand: r,
-                default_cert: None,
-                managed_names: Vec::new(),
-                node_certs: None,
-                catch_all_on_demand: true,
-            });
-            server_config_from(composite)
-        }
-        None => {
+    match (on_demand, node_challenge) {
+        // The common DNS-01 edge with no on-demand engine and no control-plane TLS-ALPN-01 challenge:
+        // the static resolver alone with the serving ALPN (byte-for-byte unchanged).
+        (None, None) => {
             let mut config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
             config.alpn_protocols = boatramp_server::alpn_h1_h2();
+            config
+        }
+        // On-demand engine (Concept 2) and/or a control-plane TLS-ALPN-01 challenge tier (Concept 1):
+        // a composite. With no engine, the Concept-2 slot is the inert `dead()` resolver + the catch-all
+        // is OFF (so a non-managed SNI fails closed exactly as the static-only edge did).
+        (on_demand, node_challenge) => {
+            let (od, catch_all) = match on_demand {
+                Some(r) => (r, true),
+                None => (crate::on_demand_tls::OnDemandResolver::dead(), false),
+            };
+            let serves_alpn_challenge = node_challenge.is_some();
+            let composite: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+                static_resolver: resolver,
+                on_demand: od,
+                default_cert: None,
+                managed_names: Vec::new(),
+                node_certs: None,
+                catch_all_on_demand: catch_all,
+                node_challenge,
+            });
+            let mut config = server_config_from(composite);
+            // The CA validates a control-plane TLS-ALPN-01 challenge with an `acme-tls/1` handshake; rustls
+            // only NEGOTIATES that ALPN if the config advertises it. Add it ONLY when a control-plane
+            // TLS-ALPN-01 tier is wired (so the common DNS-01 / on-demand edge ALPN is unchanged).
+            if serves_alpn_challenge {
+                config.alpn_protocols.push(b"acme-tls/1".to_vec());
+            }
             config
         }
     }
@@ -936,23 +1117,35 @@ pub(crate) fn build_server_config_maybe_from_resolver(
 pub(crate) fn build_server_configs_maybe_from_resolver(
     resolver: Arc<SniCertResolver>,
     on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+    node_challenge: Option<Arc<crate::on_demand_tls::CertCache>>,
 ) -> (rustls::ServerConfig, rustls::ServerConfig) {
+    let serves_alpn_challenge = node_challenge.is_some();
     let (tcp_resolver, h3_resolver): (Arc<dyn ResolvesServerCert>, Arc<dyn ResolvesServerCert>) =
-        match on_demand {
-            Some(r) => {
+        match (on_demand, node_challenge) {
+            (None, None) => (resolver.clone(), resolver),
+            (on_demand, node_challenge) => {
+                let (od, catch_all) = match on_demand {
+                    Some(r) => (r, true),
+                    None => (crate::on_demand_tls::OnDemandResolver::dead(), false),
+                };
                 let composite: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
                     static_resolver: resolver,
-                    on_demand: r,
+                    on_demand: od,
                     default_cert: None,
                     managed_names: Vec::new(),
                     node_certs: None,
-                    catch_all_on_demand: true,
+                    catch_all_on_demand: catch_all,
+                    node_challenge,
                 });
                 (composite.clone(), composite)
             }
-            None => (resolver.clone(), resolver),
         };
-    let tcp = server_config_from(tcp_resolver);
+    let mut tcp = server_config_from(tcp_resolver);
+    // Only the TCP leg answers a control-plane TLS-ALPN-01 validation (it is a TCP/TLS challenge); the
+    // h3/QUIC leg advertises `h3` alone, unchanged.
+    if serves_alpn_challenge {
+        tcp.alpn_protocols.push(b"acme-tls/1".to_vec());
+    }
     let mut h3 = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(h3_resolver);
@@ -974,7 +1167,7 @@ mod tests {
         // TCP listener advertises h2+http/1.1 for the serve stack; the h3 listener
         // advertises `h3`).
         let (tcp, h3) =
-            build_server_configs_maybe_from_resolver(sni_resolver(Vec::new()).unwrap(), None);
+            build_server_configs_maybe_from_resolver(sni_resolver(Vec::new()).unwrap(), None, None);
         assert_eq!(
             tcp.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -1002,6 +1195,7 @@ mod tests {
         let cfg = build_server_config_maybe_from_resolver(
             sni_resolver(Vec::new()).unwrap(),
             Some(resolver),
+            None,
         );
         assert_eq!(
             cfg.alpn_protocols,
@@ -1529,6 +1723,107 @@ mod tests {
             println!(
                 "LISTENER USE-NODE-CERT NO-ENGINE OK: served with `--tls acme-dns` + on-demand OFF; \
                  fails closed without a node control-plane source"
+            );
+        }
+
+        /// A client that offers a specific ALPN set, so a test can drive an `acme-tls/1` validation
+        /// handshake (what the CA sends for TLS-ALPN-01) vs a normal `h2`/`http-1.1` handshake. Returns
+        /// `(leaf_der, negotiated_alpn)` or `None` if the handshake failed.
+        fn served_cert_with_alpn(
+            config: &std::sync::Arc<rustls::ServerConfig>,
+            name: ServerName<'static>,
+            alpn: &[&[u8]],
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+            let mut client_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny))
+                .with_no_client_auth();
+            client_config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+            let mut client =
+                ClientConnection::new(std::sync::Arc::new(client_config), name).unwrap();
+            let mut server = ServerConnection::new(config.clone()).unwrap();
+            drive(&mut client, &mut server).ok()?;
+            let leaf = client
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(|c| c.as_ref().to_vec())?;
+            Some((leaf, client.alpn_protocol().map(<[u8]>::to_vec)))
+        }
+
+        // CHANGE 2 (Concept 1): the `:443` EDGE serves a control-plane TLS-ALPN-01 challenge cert on the
+        // `acme-tls/1` handshake — BEFORE the domain's REAL cert (already in the static tier during a
+        // RENEWAL) — and a normal handshake still serves the real cert. This is the exact wiring the
+        // control-plane TLS-ALPN-01 obtention relies on: the reused on-demand `CertCache` challenge slot,
+        // served through the edge composite's `node_challenge` tier, with `acme-tls/1` advertised so the
+        // CA's validation ALPN negotiates.
+        //
+        // MUTATION SENSE: the static tier holds the REAL cert for the SAME name. If the edge checked the
+        // static tier before the challenge tier on an `acme-tls/1` handshake (or didn't advertise
+        // `acme-tls/1`), the challenge assertion would serve the real cert (or fail to negotiate) and go
+        // red — exactly the renewal-breaks-TLS-ALPN-01 bug the TIER-0 ordering prevents.
+        #[test]
+        fn edge_serves_control_plane_tls_alpn01_challenge() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            // The domain's REAL control-plane serving cert, already in the static tier (renewal case).
+            let (real_cert, real_key) = self_signed("cp.example.test");
+            let static_resolver = sni_resolver(vec![(
+                "cp.example.test".to_string(),
+                IssuedCert {
+                    certificate_pem: real_cert.clone(),
+                    private_key_pem: real_key,
+                },
+            )])
+            .unwrap();
+
+            // The ephemeral TLS-ALPN-01 challenge cert, installed into the shared challenge cache the
+            // control-plane solver uses (here seeded directly; the RFC-8737 acmeIdentifier extension is
+            // irrelevant to WHICH cert the handshake yields).
+            let (chal_cert, chal_key) = self_signed("cp.example.test");
+            let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
+            cache.install_challenge(
+                "cp.example.test",
+                std::sync::Arc::new(certified_key_from_pem(&chal_cert, &chal_key).unwrap()),
+            );
+
+            // The `:443` edge: static resolver + the control-plane `node_challenge` tier, no on-demand.
+            let config = std::sync::Arc::new(build_server_config_maybe_from_resolver(
+                static_resolver,
+                None,
+                Some(cache),
+            ));
+            assert!(
+                config.alpn_protocols.iter().any(|p| p == b"acme-tls/1"),
+                "the edge must advertise `acme-tls/1` so the CA's TLS-ALPN-01 ALPN negotiates"
+            );
+
+            let name = ServerName::try_from("cp.example.test").unwrap();
+            // An `acme-tls/1` validation handshake ⇒ the CHALLENGE cert (NOT the real static cert).
+            let (alpn_leaf, negotiated) =
+                served_cert_with_alpn(&config, name.clone(), &[b"acme-tls/1"])
+                    .expect("the acme-tls/1 challenge handshake completes");
+            assert_eq!(negotiated.as_deref(), Some(b"acme-tls/1".as_slice()));
+            assert_eq!(
+                alpn_leaf,
+                leaf_der(&chal_cert),
+                "an acme-tls/1 handshake is served the challenge cert, before the real static cert"
+            );
+            assert_ne!(
+                alpn_leaf,
+                leaf_der(&real_cert),
+                "the real cert must NOT be served on an acme-tls/1 validation handshake"
+            );
+            // A normal handshake ⇒ the REAL serving cert (the challenge tier is ALPN-gated).
+            let (serve_leaf, _) = served_cert_with_alpn(&config, name, &[b"h2", b"http/1.1"])
+                .expect("a normal handshake completes");
+            assert_eq!(
+                serve_leaf,
+                leaf_der(&real_cert),
+                "a normal handshake serves the real control-plane cert (not the challenge cert)"
+            );
+            println!(
+                "EDGE CONTROL-PLANE TLS-ALPN-01 OK: acme-tls/1 serves the challenge cert (before the \
+                 real static cert); normal handshake serves the real cert; `acme-tls/1` advertised"
             );
         }
 

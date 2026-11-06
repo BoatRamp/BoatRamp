@@ -67,13 +67,61 @@ Once a managed name is served from the Concept-1 source, the on-demand `is_host_
 tenant-verification gate (`deploy.rs`) no longer applies to it: a pure control-plane FQDN now SERVES. The
 project-scope gate still applies to the Concept-2 catch-all tier (unchanged).
 
-### Note on `use_node_cert` requiring the engine
+### `use_node_cert` no longer requires the on-demand engine (CHANGE 1)
 
-The config still requires `[serve.on_demand_tls] enabled = true` for a `use_node_cert` listener, and the
-no-engine / non-acme-dns branches still fail closed (kept per the task). The managed tier itself no longer
-depends on the engine — it reads `node_certs` — but the requirement and the fail-closed branches are
-unchanged by this work. Relaxing the requirement (so `use_node_cert` needs only `--tls acme-dns`, not the
-on-demand engine) is a possible follow-up, flagged for the owner, not taken here.
+A `use_node_cert` listener serves the Concept-1 control-plane source DIRECTLY (from `node_certs`); it
+never routes through the Concept-2 on-demand engine. So it needs only a `NodeCertSource` — i.e. the node
+serving `--tls acme-dns` — NOT `[serve.on_demand_tls] enabled`. `validate_listeners` no longer requires
+the engine (the `--tls acme-dns` precondition is a serve-time CLI choice the config file can't see, so it
+is enforced fail-closed at serve time). In `serve.rs`, when a `use_node_cert` listener finds no on-demand
+engine but the node HAS a control-plane source, it builds the composite from `node_certs` with a DEAD
+on-demand resolver + `catch_all_on_demand = false` (the Security-cleared relaxation: a `use_node_cert`-only
+listener's catch-all stays OFF, so a non-managed SNI still fails closed). It fails closed only when there
+is no control-plane source at all (not `--tls acme-dns`). The non-acme-dns build still fails closed.
+
+## FIX C — per-control-plane-domain challenge (Concept 1, CHANGE 2)
+
+Each `--acme-domain` control-plane domain can be obtained via a DIFFERENT challenge (DNS-01 or
+TLS-ALPN-01) — e.g. one domain DNS-01, another TLS-ALPN-01. This is Concept 1 (how the NODE gets its OWN
+cert); it is DISTINCT from `[serve.on_demand_tls].challenge` (Concept 2), which is untouched.
+
+- **Config (`[serve.control_plane_tls]`).** A LIST of `{ domain, challenge }` entries, mirroring the
+  cap-req #27 `[serve.dns_providers]` per-zone LIST idiom (a `Vec<ControlPlaneDomainTls>`), chosen over a
+  bare `{domain → challenge}` map so it is extensible (future per-domain knobs) without a breaking change.
+  The flat `--acme-domain`/`BOATRAMP_ACME_DOMAINS` list + `--tls <mode>` stay the DEFAULT; a domain with no
+  entry uses the `--tls` default (`acme-dns` ⇒ DNS-01), so an existing flat config is byte-for-byte
+  unchanged. File-only (like `dns_providers`). The challenge is a NEW `ControlPlaneChallenge` enum
+  (`dns-01` / `tls-alpn-01`), a DISTINCT type from `OnDemandChallenge` so the two concepts stay separate in
+  code (the shared *mechanism* — the `CertCache` challenge slot + `TlsAlpn01Solver` — is reused, not the
+  config type). **Validation:** the enum's `FromStr` rejects an unsupported method at parse; a TLS-ALPN-01
+  override on a WILDCARD domain is refused at config load (only DNS-01 can satisfy a wildcard), as is a
+  blank domain.
+- **Obtention routing.** `ControlPlaneTls::solver_for(domain)` picks the `ChallengeSolver` per domain
+  (override-or-default; a wildcard is ALWAYS DNS-01). `acme_dns::obtain_or_load_with` takes that solver:
+  DNS-01 uses the existing convenience (+ the authoritative propagation pre-check + the cap-req #27
+  `RoutingDnsProvider`); TLS-ALPN-01 REUSES the on-demand engine's `TlsAlpn01Solver` over a shared
+  `CertCache`, against a throwaway account (the DNS-01 convenience's per-call account model — a handful of
+  control-plane domains every ~60 days, well under the CA `newAccount` limit). `obtain_or_load` stays as
+  the DNS-01 convenience over it. The whole refresh path (`CertRefresh::run` → `obtain_all` /
+  `cluster_refresh_certs`) threads the per-domain solver.
+- **Edge wiring (how the CA's TLS-ALPN-01 handshake to `:443` is answered).** The acme-dns `:443` edge
+  served DNS-01 only, with NO ALPN-challenge slot. CHANGE 2 adds a TIER-0 `node_challenge:
+  Option<Arc<CertCache>>` to the edge `CompositeResolver`: on an `acme-tls/1` handshake it serves the
+  challenge cert the control-plane solver installed — checked BEFORE the static tier, so a RENEWAL
+  validation handshake is answered with the challenge cert even though the domain's REAL cert is already
+  in the static tier (serving the real cert would fail validation). The edge config additionally
+  advertises `acme-tls/1` in its ALPN (so the CA's validation ALPN negotiates) — ONLY when a control-plane
+  TLS-ALPN-01 tier is wired, so the common DNS-01 / on-demand edge is unchanged. Listeners never carry this
+  tier (the CA validates against the node's own `:443`, not a listener). The challenge machinery is the
+  SAME `CertCache` slot + `TlsAlpn01Solver` the Concept-2 engine uses — reused, not duplicated; the
+  control-plane gets its OWN dedicated `CertCache` so it works with the on-demand engine disabled.
+- **Init ordering (deferred TLS-ALPN-01 pass).** A TLS-ALPN-01 control-plane domain cannot be obtained
+  before `:443` is up (the CA validates by connecting to it), but DNS-01 domains are obtained before
+  serving starts (unchanged — no serving gap for the common path). So the initial pass obtains only the
+  DNS-01 domains; a single background task waits for the edge to accept (bounded poll-connect), then runs
+  the FULL refresh once (DNS-01 from cache, TLS-ALPN-01 obtained against the now-live edge) and swaps, then
+  continues as the 6h renewal loop. The deferred pass + renewal share ONE `refresh_and_reload_edge` helper.
+  An empty static set is not fatal while a TLS-ALPN-01 domain is pending (it fills in once the edge is up).
 
 ## FIX B — a clean, SETTABLE on-demand challenge (Concept 2)
 
@@ -107,3 +155,31 @@ on-demand engine) is a possible follow-up, flagged for the owner, not taken here
   `attach_verified_domain`'d (obtains it via `obtain_or_load` DNS-01, serves from `node_certs`);
   `on_demand_dns01_from_config_against_pebble` proves `challenge = "dns-01"` SET FROM A RON CONFIG drives
   DNS-01 on-demand end to end.
+
+### CHANGE 1 tests
+
+- `config.rs`: the p–u listener cases updated — `use_node_cert` WITHOUT `[serve.on_demand_tls]` now parses
+  (case q flipped), `server_names` is still required independently (case r).
+- `acme_dns.rs`: `use_node_cert_no_engine_serves_with_source_and_fails_closed_without` — a `use_node_cert`
+  listener serves the node control-plane cert with the on-demand engine DISABLED (the production `dead()`
+  resolver + `catch_all = false`), and fails closed when there is no `node_certs` source (not `--tls
+  acme-dns`).
+
+### CHANGE 2 tests
+
+- `config.rs`: `control_plane_tls_config_parses_from_ron_and_json` (RON + JSON parse of the per-domain
+  override list + the string round-trip + unknown-token rejection); `control_plane_tls_wildcard_tls_alpn01_refused`
+  (a wildcard + TLS-ALPN-01 refused, a blank domain refused, the valid shapes parse).
+- `acme_dns.rs`: `edge_serves_control_plane_tls_alpn01_challenge` — the `:443` edge serves the control-plane
+  TLS-ALPN-01 challenge cert on the `acme-tls/1` handshake BEFORE the real static cert (the renewal-safe
+  TIER-0 ordering), advertises `acme-tls/1`, and serves the real cert on a normal handshake.
+- `on_demand_tls.rs`: `control_plane_dual_challenge_against_pebble` — `#[ignore]` Pebble live gate obtaining
+  TWO control-plane domains via DIFFERENT challenges (one DNS-01 via challtestsrv, one TLS-ALPN-01 validated
+  on a locally-bound `:443` edge serving the `node_challenge` tier). Cannot run on darwin — lighthouse only.
+
+### CHANGE 3 (Security INFO fixes)
+
+- `acme_dns.rs` `sni_matches`: the wildcard branch's suffix compare is now case-INSENSITIVE (matching the
+  exact branch), with a mixed-case-wildcard test. Hardening only (still fail-closed; never over-serves).
+- Comment fixes: `serve.rs` (`node_certs` is passed-but-inert for an on-demand-only listener), `config.rs`
+  `validate_listeners` (the decouple — folded into CHANGE 1).
