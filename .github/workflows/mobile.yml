@@ -84,13 +84,13 @@ env:
 
 jobs:
   # iOS — build the lean client for the device + the Apple-silicon simulator target on a
-  # native macOS runner. CMake is preinstalled on the macos-14 image, and Xcode supplies
+  # native macOS runner. CMake is preinstalled on the macos-15 image, and Xcode supplies
   # the iOS SDK sysroot that aws-lc-sys's CMake build targets (CMAKE_OSX_SYSROOT); its
   # pregenerated iOS bindings mean no bindgen/libclang is needed.
   ios:
     name: iOS cross-compile · ${{ matrix.target }}
-    # macos-14 is Apple silicon — same runner release.yml uses for aarch64-apple-darwin.
-    runs-on: macos-14
+    # macos-15 is Apple silicon — same runner release.yml uses for aarch64-apple-darwin.
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:

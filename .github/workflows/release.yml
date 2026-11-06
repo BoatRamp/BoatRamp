@@ -115,7 +115,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, kind: linux }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: linux }
           - { os: macos-15-intel, target: x86_64-apple-darwin, kind: unix }
-          - { os: macos-14, target: aarch64-apple-darwin, kind: unix }
+          - { os: macos-15, target: aarch64-apple-darwin, kind: unix }
           # Windows additionally ships the overlay service tunneler (`tun,overlay`): `boatramp
           # tunnel` on a wintun adapter, with the signed wintun.dll bundled alongside (R4). Only
           # the portable (cargo-built) targets read `extra_features`; the Linux legs build via Nix.
