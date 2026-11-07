@@ -508,6 +508,16 @@ jobs:
           # no-clobber no-op (idempotent). Same self-skip trap → gate on its marker.
           grep -q 'PROJECT EXPORT CLONE SELF-PROVISION SHARED TENANT OK' project-export.log \
             || { echo "::error::clone self-provision (Shared tenant) never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # `project sync` managed-pg SHADOW-LAND (the incident regression gate): drives the REAL
+          # NodeProjectExport to EXPORT a DataPlane+ShadowSwap bundle of a seeded managed-pg source
+          # and IMPORT it into a fresh managed dest via the atomic non-superuser shadow+swap, asserts
+          # the rows LAND + the KV slice is not carried + no orphan shadow/apply-role remains, AND
+          # mutation-verifies that the SAME data as a ManagedRestore::Overlay bundle is STILL refused
+          # ("data-only restore of MANAGED pg … not supported"). Same self-skip trap → gate on its
+          # marker so a skip or a regression (the refusal creeping back, or the overlay guard being
+          # over-opened) fails the job.
+          grep -q 'PROJECT SYNC MANAGED PG SHADOW LAND OK' project-export.log \
+            || { echo "::error::project sync managed-pg shadow-land gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

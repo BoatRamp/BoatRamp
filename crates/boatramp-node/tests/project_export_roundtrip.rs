@@ -1137,6 +1137,316 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
     println!("PROJECT EXPORT PG CRAFTED ESCAPE DRIVER OK");
 }
 
+/// **Live `project sync` managed-pg SHADOW-LAND gate THROUGH THE REAL DRIVER** (the incident
+/// regression proof — Tier-2 / nightly, needs a live pg + Docker + `BOATRAMP_TEST_PG_URL`).
+/// Self-skips.
+///
+/// The incident: `project sync --include-pg` into a managed-pg destination requested a `DataPlane`
+/// bundle, which the pre-split coupling forced to the schema-less `--data-only` OVERLAY — refused for
+/// a managed binding. This gate proves the FIX end-to-end: a `DataPlane + ShadowSwap` bundle (exactly
+/// what sync now requests) EXPORTS a FULL managed-pg dump through the driver and IMPORTS it into a
+/// fresh managed dest via the atomic non-superuser shadow+swap, so the ROWS LAND and are queryable,
+/// the dest DB is provisioned, no orphan `*__shadow_*` db / `brexp_apply_*` role remains, and the
+/// control-plane KV slice is NOT carried (identity clean). The MUTATION half re-exports the SAME
+/// data with `ManagedRestore::Overlay` and proves the import still REFUSES it with the
+/// "data-only restore of MANAGED pg … not supported" error — so this gate catches the real bug
+/// (a managed overlay), not merely "the refusal went away". Emits
+/// `PROJECT SYNC MANAGED PG SHADOW LAND OK`.
+#[tokio::test]
+async fn project_sync_managed_pg_shadow_land_live() {
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_export::{
+        BundleScope, CloneSkip, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (managed-pg sync shadow-land gate not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!(
+                "SKIP: no reachable Docker daemon (managed-pg sync shadow-land gate not run)"
+            );
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    let s = now_suffix();
+    let table = format!("brsync_t_{s}");
+    let source_db = format!("brsync_src_{s}");
+    let live_db = format!("brsync_live_{s}");
+    let maint = conn(&user, &password, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // --- SOURCE + (empty) dest DBs; seed the source with known rows ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("CREATE DATABASE {source_db}"),
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("CREATE DATABASE {live_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "setup `{sql}`: {o}");
+    }
+    let expect = "1:alpha\n2:beta\n3:gamma";
+    let src_conn = conn(&user, &password, &host, port, &source_db);
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &src_conn,
+        &format!(
+            "CREATE TABLE {table}(id int primary key, v text); \
+             INSERT INTO {table} VALUES (1,'alpha'),(2,'beta'),(3,'gamma');"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "seed source rows: {o}");
+
+    // --- build a MANAGED Single/default driver pointing at a given physical db (seeded replica).
+    //     Returned as a closure-free local since each driver holds its own kv/blobs/work tempdirs. ---
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    let build_driver = |db_name: String| {
+        let databases = BTreeMap::from([(
+            "app".to_string(),
+            ExternalDatabaseConfig {
+                kind: "postgres".to_string(),
+                compute: Some("pg".to_string()),
+                database: Some(db_name),
+                user: Some(user.clone()),
+                ..Default::default() // tenant=Single, tenant_scope=Project (dedicated)
+            },
+        )]);
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let td = tempfile::tempdir().unwrap();
+        let blobs: Arc<dyn boatramp_core::Storage> =
+            Arc::new(FsStorage::new(td.path().join("blobs")));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        (databases, kv, blobs, deploy, td, work)
+    };
+
+    // Seal + seed-replica helper applied to each driver's own kv/deploy.
+    async fn wire(
+        kv: &Arc<dyn boatramp_core::kv::KvStore>,
+        deploy: &boatramp_core::deploy::DeployStore,
+        envelope: &Arc<dyn boatramp_core::envelope::KeyEnvelope>,
+        password: &str,
+        host: &str,
+        port: u16,
+    ) {
+        use boatramp_core::compute::{
+            Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
+        };
+        let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+        kv.put("managed-sql-cred/default/pg", sealed).await.unwrap();
+        deploy
+            .set_replica_state(
+                boatramp_core::project::ProjectRef::new("default"),
+                &ObservedInstance {
+                    handle: InstanceHandle {
+                        project: "default".to_string(),
+                        workload: "pg".to_string(),
+                        replica: 0,
+                        backend_ref: String::new(),
+                    },
+                    node: 0,
+                    backend: "docker".to_string(),
+                    endpoint: Endpoint {
+                        scheme: Scheme::Http,
+                        host: host.to_string(),
+                        port,
+                    },
+                    region: None,
+                    healthy: true,
+                    started_at: None,
+                    phase: ReplicaPhase::Running,
+                    readiness: boatramp_core::compute::Readiness::Provisioned,
+                    data_dir: None,
+                    snapshot: None,
+                    active_spec: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let op_for = |databases: BTreeMap<String, ExternalDatabaseConfig>,
+                  kv: Arc<dyn KvStore>,
+                  blobs: Arc<dyn boatramp_core::Storage>|
+     -> Arc<dyn boatramp_core::sql::OperatorSql> {
+        Arc::new(NodeOperatorSql::new(
+            databases,
+            kv.clone(),
+            Some(envelope.clone()),
+            DeployStore::new(blobs, kv),
+        ))
+    };
+
+    // --- SOURCE driver: export a DataPlane + ShadowSwap bundle of the seeded source db ---
+    let (sdbs, skv, sblobs, sdeploy, _std, swork) = build_driver(source_db.clone());
+    wire(&skv, &sdeploy, &envelope, &password, &host, port).await;
+    let sop = op_for(sdbs.clone(), skv.clone(), sblobs.clone());
+    let drv_src = NodeProjectExport::new(sdbs, sdeploy, skv.clone(), sblobs.clone(), swork)
+        .with_managed_pg(backend.clone(), envelope.clone(), sop, false);
+
+    let td_bundle = tempfile::tempdir().unwrap();
+    let export_bundle = |opts: ExportOptions| {
+        let drv = &drv_src;
+        let dir = td_bundle.path();
+        async move {
+            use tokio_util::compat::TokioAsyncWriteCompatExt;
+            let path = dir.join(format!("bundle-{}.brproj", now_suffix()));
+            let f = tokio::fs::File::create(&path).await.unwrap();
+            let mut sink = f.compat_write();
+            drv.export_clone("default", &opts, &CloneSkip::default(), &mut sink)
+                .await
+                .expect("export_clone");
+            std::fs::read(&path).unwrap()
+        }
+    };
+
+    let shadow_bundle = export_bundle(ExportOptions {
+        scope: BundleScope::DataPlane,
+        managed_restore: ManagedRestore::ShadowSwap,
+        ..Default::default()
+    })
+    .await;
+
+    // --- DEST driver: import the DataPlane+ShadowSwap bundle into the fresh dest → rows LAND ---
+    let (ddbs, dkv, dblobs, ddeploy, _dtd, dwork) = build_driver(live_db.clone());
+    wire(&dkv, &ddeploy, &envelope, &password, &host, port).await;
+    let dop = op_for(ddbs.clone(), dkv.clone(), dblobs.clone());
+    let drv_dst = NodeProjectExport::new(ddbs, ddeploy, dkv.clone(), dblobs.clone(), dwork)
+        .with_managed_pg(backend.clone(), envelope.clone(), dop, false)
+        .with_trusted_extensions(vec![]);
+
+    let mut body = futures::io::Cursor::new(shadow_bundle.clone());
+    let report = drv_dst
+        .import(
+            "default",
+            &mut body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DataPlane+ShadowSwap import must SUCCEED (the fix)");
+    assert_eq!(report.pg_databases, 1, "one managed pg db restored");
+    // Identity clean: a DataPlane bundle carries no control-plane KV slice.
+    assert_eq!(
+        report.kv_records, 0,
+        "a DataPlane bundle carries no KV records"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("control-plane KV") && n.contains("NOT imported")),
+        "the report must note the KV slice was not imported: {:?}",
+        report.notes
+    );
+
+    // --- rows LAND + are queryable on the provisioned dest db ---
+    let live_conn = conn(&user, &password, &host, port, &live_db);
+    let (_c, got) = psql(
+        backend.as_ref(),
+        &image,
+        &live_conn,
+        &format!("SELECT id || ':' || v FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(got, expect, "rows landed on the dest via shadow+swap");
+
+    // --- no orphan shadow db / ephemeral apply role remains ---
+    let (_c, shadows) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{live_db}__shadow_%'"),
+    )
+    .await;
+    assert!(
+        shadows.trim().is_empty(),
+        "no orphan shadow database must remain: {shadows:?}"
+    );
+    let (_c, roles) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        "SELECT rolname FROM pg_roles WHERE rolname LIKE 'brexp_apply_%'",
+    )
+    .await;
+    assert!(
+        roles.trim().is_empty(),
+        "no orphan ephemeral apply role must remain: {roles:?}"
+    );
+
+    // --- MUTATION: the SAME data as an Overlay bundle MUST still be refused on import (the real bug).
+    //     allow_schema_skew lets the restore reach the managed-overlay refusal instead of short-
+    //     circuiting on the fresh target's schema-ledger mismatch. ---
+    let overlay_bundle = export_bundle(ExportOptions {
+        scope: BundleScope::DataPlane,
+        managed_restore: ManagedRestore::Overlay,
+        ..Default::default()
+    })
+    .await;
+    let mut obody = futures::io::Cursor::new(overlay_bundle);
+    let refused = drv_dst
+        .import(
+            "default",
+            &mut obody,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                allow_schema_skew: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    let err = refused.expect_err("an Overlay managed-pg import MUST be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("data-only restore of MANAGED pg"),
+        "the refusal must be the managed-overlay RCE guard, got: {msg}"
+    );
+
+    // --- cleanup (best-effort) ---
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {live_db}"),
+        format!("DROP DATABASE IF EXISTS {source_db}"),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT SYNC MANAGED PG SHADOW LAND OK");
+}
+
 /// **Live POSITIVE pgvector round-trip THROUGH THE REAL DRIVER** (inc2 HIGH-1 L3 — the load-bearing
 /// correctness proof for the env-clone pipeline; Tier-2 / nightly, needs a live pgvector pg +
 /// `BOATRAMP_TEST_PG_URL`). Self-skips.
