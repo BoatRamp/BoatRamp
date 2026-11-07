@@ -35,6 +35,20 @@ versions.
 - **Stale `project sync` help** calling `--apply` "increment 2 / not-yet-implemented" is corrected —
   `--apply` shipped in v0.56.0.
 
+### Notes
+
+- **Managed Shared-tenant MySQL sync is a known limitation (follow-up).** A managed *dedicated*
+  MySQL's data lands (the atomic chunked shadow); a managed *Shared*-tenant MySQL has no sidecar
+  shadow+swap path, so `project sync` skips it fail-fast in the preflight with a reason (declare it
+  dedicated to sync its data). Managed Postgres has no such gap — it restores for either tenancy.
+- **Mixed-version fleets.** The new `managed_restore` wire field (clone `managed_restore` query
+  param / `clone/from` body field, and the bundle manifest's `managed_restore`) is **silently
+  ignored by a pre-0.59.1 node**: an older source or target falls back to the legacy coupling
+  (`data_only → Overlay`), so a cross-node `project sync` of a managed DB only lands the data when
+  **both** ends run v0.59.1+. The degradation is graceful (an older node refuses the managed member
+  exactly as before — never a silent wrong restore); it matters only while a fleet straddles the
+  upgrade.
+
 ## [0.59.0] - 2026-11-06
 
 ### Added

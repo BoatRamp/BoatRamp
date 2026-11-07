@@ -37,6 +37,34 @@ items:
 (dry-run preflight — nothing moved; re-run with `--apply -y` to execute this plan)
 ```
 
+### The preflight classifies each carried DB's restore feasibility
+
+When the selection carries managed-DB contents (`--include-pg`, or a carve that keeps `pg`), the
+preflight also classifies **whether each carried database can actually be restored** — so an
+unrestorable selection fails in the **plan** (in seconds) rather than part-way through an apply:
+
+- a **managed Postgres** binding — **either tenancy** — carries: it lands via provision + the
+  non-superuser atomic **shadow+swap** (a dedicated/single server via the chunked shadow, a
+  Shared-tenant server via the sidecar shadow+swap);
+- a **managed, dedicated/single MySQL** binding carries (the chunked shadow);
+- a **managed Shared-tenant MySQL** binding is **skipped with a reason** — MySQL has no
+  sidecar shadow+swap path, so only a dedicated MySQL restores (declare it dedicated to sync its
+  data);
+- an **external / bring-your-own-URL** binding is **skipped with a reason** — its data lives on
+  *your* server, so boatramp cannot shadow+swap it; replicate it out of band.
+
+A skipped (infeasible) database shows in the plan with its reason and counts toward the **skipped
+count** `--strict` refuses on, and a site that binds a skipped database is itself reported
+incoherent (its binding would dangle) — all before a byte moves.
+
+> **Why sync can land a managed DB when a plain `--clone-data-only` import cannot.** A data-plane
+> clone used to drive the managed-DB restore through the schema-less `--data-only` *overlay*, which
+> the import categorically **refuses** for a managed binding (overlaying an untrusted dump onto a
+> live schema would run as the bootstrap superuser — an RCE risk). `project sync` instead requests
+> a **full dump restored via the non-superuser shadow+swap** — the same safe path a `--force` full
+> clone uses — so a managed DB's data lands **without** dragging in the control-plane KV slice. See
+> [Managed-database restore is atomic](./clone-project.md#managed-database-restore-is-atomic).
+
 ## Choose what to sync
 
 A sync needs an **explicit selection** (naming neither an include nor an exclude is an error —
@@ -157,6 +185,15 @@ automation that wants all-or-nothing.
   [`project import --clone-from`](./clone-project.md#streaming-clone-pull-from-a-live-source-node),
   or exclude them and let the target's own `apply` bring them. A node-side selective-sync
   endpoint is the planned follow-up.
+- **A managed Shared-tenant MySQL is not synced yet.** MySQL has no sidecar shadow+swap path, so
+  only a managed *dedicated/single* MySQL lands (managed Postgres lands for either tenancy). A
+  Shared-tenant managed MySQL is **skipped fail-fast in the preflight** with a reason; declare it
+  dedicated to sync its data. A least-privilege Shared-MySQL restore is a planned follow-up.
+- **A cross-node managed-DB sync needs v0.59.1+ at both ends.** The `managed_restore` wire field
+  that selects the safe shadow+swap restore is **silently ignored by a pre-0.59.1 node**, which
+  falls back to the old coupling and refuses the managed member as before. The degradation is
+  graceful (never a silent wrong restore), but a managed DB's data only lands when **both** the
+  source and target run v0.59.1 or newer — relevant only while a fleet straddles the upgrade.
 
 ## See also
 

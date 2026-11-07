@@ -313,10 +313,13 @@ to write — an older-format bundle stays byte-identical to what a prior release
 
 ## Managed-database restore is atomic
 
-Restoring a **full** export of a **managed, dedicated (single-tenant)** Postgres, MySQL, or libsql
-database is atomic: the dump is applied into a **shadow** — a not-yet-live database — verified,
-and only then **swapped in** (a Postgres/MySQL database rename, or a libsql file rename) in place
-of the live one. Any failure along the way — a checksum mismatch, a truncated stream, a restore
+Restoring a **managed** Postgres, MySQL, or libsql database is atomic: the dump is applied into a
+**shadow** — a not-yet-live database — verified, and only then **swapped in** (a Postgres/MySQL
+database rename, or a libsql file rename) in place of the live one. A **dedicated (single-tenant)**
+server restores via a chunked streamed dump → shadow; a **Shared-tenant Postgres** restores the
+same way via a sidecar shadow+swap into the tenant's freshly-provisioned database (a Shared-tenant
+*MySQL* is the one managed case the shadow+swap cannot take — see [below](#managed-restore-what-is-covered-and-what-is-refused)).
+Any failure along the way — a checksum mismatch, a truncated stream, a restore
 error, a disconnect — tears the shadow down and leaves the live database completely untouched;
 nothing is ever half-restored. (The swap itself is per-member atomic, not whole-bundle atomic: if a
 bundle has several managed databases, a later member failing does not roll back an earlier member
@@ -359,27 +362,37 @@ fails the restore. Add exactly the extensions you intend to use — this is the 
 operator-controlled gate [Declare a managed database](./managed-databases.md) and schema
 migrations use, so widening it here widens it everywhere.
 
-### Two restore scenarios that are currently refused
+### Managed restore: what is covered, and what is refused
 
-**Data-only (or shared-tenant) import into a managed database is refused.** The atomic,
-non-superuser shadow-restore path above exists only for a **full** bundle restored into a
-**dedicated (single-tenant)** managed database. A **data-only** import, or a **full** import
-into a **shared**-tenant managed database, cannot use that path yet — and applying either
-directly against the live database would mean connecting as the binding's own (superuser-grade)
-credential, reopening exactly the RCE risk the shadow-restore path exists to close. So both are
-refused outright, with an error like:
+The atomic, non-superuser shadow-restore path above covers a **managed Postgres of either
+tenancy** (dedicated via the chunked shadow, Shared-tenant via the sidecar shadow+swap) and a
+**managed, dedicated/single MySQL or libsql**. Two cases a managed target still **cannot** take,
+both refused fail-closed:
+
+**A data-only (`--clone-data-only`) restore of a managed binding is refused.** A data-only dump is
+an **overlay** onto the target's existing live schema — there is no atomic shadow for an overlay,
+so applying it would connect as the binding's own (superuser-grade, on a managed co-located server)
+credential, reopening exactly the RCE risk the shadow-restore path exists to close. It is refused
+outright, with an error like:
 
 ```
-import refused: a MANAGED pg database ("app") can only be restored via the atomic chunked
-shadow path (a FULL, dedicated/Single bundle). A data-only or Shared sidecar restore would
-apply the untrusted dump as the bootstrap superuser (RCE risk); a least-privilege sidecar
-apply is a pending follow-up. Re-export as a FULL dedicated bundle, or import into an
-external (bring-your-own-URL) binding.
+import refused: a data-only restore of MANAGED pg database ("app") is not supported — it
+would overlay the untrusted dump onto the live schema as the bootstrap superuser (RCE risk),
+with no atomic shadow+swap; a least-privilege data-only/overlay apply is a pending follow-up.
+Re-export as a FULL bundle, or import into an external (bring-your-own-URL) binding.
 ```
 
-If you hit this: re-export with `--full` against a dedicated-tenant target, or restore into an
-**external** (bring-your-own-URL) database binding instead — see the next point. A
-least-privilege path for data-only/shared-tenant restore is a planned follow-up, not yet shipped.
+**A managed Shared-tenant MySQL is refused.** Unlike Postgres, MySQL has **no** sidecar
+shadow+swap path, so only a **dedicated/single** managed MySQL restores atomically; a
+Shared-tenant managed MySQL is refused with a matching error (declare it dedicated, or use an
+external binding).
+
+If you hit either: re-export with `--full` into a dedicated-tenant managed target, or restore into
+an **external** (bring-your-own-URL) database binding instead (next point). To replicate a managed
+Postgres (or dedicated MySQL) project's **data** into another environment *without* the
+control-plane slice, use [`project sync`](./project-sync.md) — it rides this same safe shadow+swap
+path (no `--force` full-bundle clone needed) and its dry-run preflight flags any non-restorable
+member up front. A least-privilege data-only/overlay apply is a planned follow-up, not yet shipped.
 
 **An external (bring-your-own-URL) database binding is unaffected by any of this.** Only a
 boatramp-*managed*, co-located database goes through the shadow-restore machinery (and its

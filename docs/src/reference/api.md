@@ -62,18 +62,22 @@ counted as it streams, with a trailing checksum+size record verified once the wh
 passed through) — peak for those members is one chunk, not the whole member. A truncated or
 corrupted stream fails loud at import (the per-member checksum catches it), never silently.
 
-A **full** import of a **managed, dedicated/single-tenant** Postgres/MySQL/libsql database is
-**atomic**: it restores into a not-yet-live shadow database, verifies it, then swaps it in only
-after verification succeeds (a Postgres/MySQL database rename, or a libsql file rename) — any
-failure tears the shadow down and leaves the live database untouched. The untrusted dump is applied
+An import of a **managed** Postgres/MySQL/libsql database restores **atomically**: into a
+not-yet-live shadow database, verified, then swapped in only after verification succeeds (a
+Postgres/MySQL database rename, or a libsql file rename) — any failure tears the shadow down and
+leaves the live database untouched. A dedicated/single-tenant server restores via a **chunked**
+streamed dump; a **Shared-tenant Postgres** restores the same way via a **sidecar shadow+swap**
+into the tenant's freshly-provisioned database. The untrusted dump is applied
 by a freshly-minted, import-scoped **non-superuser** role (Postgres/MySQL) or a confined SQLite
 authorizer (libsql) — never the binding's own (superuser-grade, on a managed co-located server)
-credential — closing an RCE-on-import hazard a crafted dump could otherwise exploit. This
-atomic path does **not** cover: a **data-only** import, a **shared**-tenant managed database (even
-on a full bundle), or an older pre-chunking bundle's managed dump — those are refused for a managed
-target with a `501` explaining that a full, dedicated-bundle re-export (or an external,
-bring-your-own-URL binding) is the way forward; a least-privilege data-only apply is a pending
-follow-up. An **external** (bring-your-own-URL) database binding is unaffected by any of this — it
+credential — closing an RCE-on-import hazard a crafted dump could otherwise exploit. Two managed
+cases this atomic path does **not** cover, refused for a managed target with a `501`: a
+**data-only / overlay** restore of a managed binding (there is no atomic shadow for an overlay, so
+the untrusted dump would run as the bootstrap superuser), and a **Shared-tenant managed MySQL**
+(MySQL has no sidecar shadow+swap — only a dedicated MySQL restores atomically). The way forward is
+a full, dedicated re-export, or an external (bring-your-own-URL) binding; a least-privilege
+data-only/overlay apply is a pending follow-up. An **external** (bring-your-own-URL) database
+binding is unaffected by any of this — it
 restores with the operator's own configured credential against the operator's own database (their
 trust boundary, not boatramp's managed cluster).
 
@@ -148,6 +152,18 @@ the `project-export` feature.
 | `GET` | `/api/projects/<proj>/clone/manifest[?data_only=true\|false]` | **Source.** The cheap clone manifest — a LIST of the project's blob objects (each an `etag`/`size` content ref for the target's per-SHA presence diff) plus the non-blob member paths the stream will carry. No full materialization. `Project·Admin`. |
 | `POST` | `/api/projects/<proj>/clone/stream[?data_only=true\|false]` | **Source.** Stream a format-v2/v3 bundle of exactly the members the target is missing — the request body is the target's skip set (the content-matched blob member paths to omit). `Project·Admin`. |
 | `POST` | `/api/projects/<target>/clone/from` | **Target orchestrator.** Pull the project from a live source node: fetch its manifest, diff this node's store, and (on apply) pull the missing members over the stream and restore through the same atomic shadow path as an import (always a **fresh** identity; the target enforces its own project scope on every member). Body `{ source_url, source_project?, apply?, verify?, overwrite?, force?, data_only?, enumerate_mismatches?, skip_member_mismatch?, skip_any_blob_mismatch? }` — the last three are the [member-mismatch tolerance](#member-mismatch-tolerance) policy, same semantics as `project-import`; the operator's source-node Project-Admin bearer rides in the `X-Boatramp-Source-Token` header, and `source_url` must be an absolute **https** URL resolving to a public address (SSRF-guarded). The **default** (`apply=false`, `verify=false`) returns a cheap **`ClonePlan`** JSON (manifest + diff only — **no** stream, nothing restored). `apply=true` (or `verify=true`, the stream-level validate) returns an **NDJSON progress stream** (`application/x-ndjson`): a `plan` event, periodic `progress` heartbeats, then one terminal `report`/`error` event. `Project·Admin`. |
+
+All three clone surfaces also accept an optional **`managed_restore`** descriptor (`overlay` /
+`shadow-swap`) — a query param on `clone/manifest` + `clone/stream`, a body field on `clone/from` —
+orthogonal to `data_only`. It selects *how* a managed engine member is dumped and restored, not
+*what* the bundle carries: it is an internal mode `boatramp project sync` sets to `shadow-swap` so a
+**data-plane** (`data_only=true`) clone still lands a managed DB's data via the safe non-superuser
+shadow+swap rather than the refused overlay. It is not a CLI flag. **Back-compat:** the field is
+optional and **silently ignored by a pre-0.59.1 node** — an older source or target falls back to the
+legacy coupling (`data_only=true ⇒ overlay`, refused for a managed member), so a cross-node managed
+sync lands only when **both** ends run v0.59.1+. The degradation is graceful (an older node refuses
+the managed member exactly as before, never a silent wrong restore). The bundle manifest records the
+same descriptor as an optional, back-compatible `serde` field, so a pre-split bundle reads unchanged.
 
 ## Sites & deployments
 
