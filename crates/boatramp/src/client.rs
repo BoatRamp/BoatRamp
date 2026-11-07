@@ -1117,6 +1117,7 @@ impl ControlPlane {
         overwrite: bool,
         force: bool,
         data_only: bool,
+        managed_restore: Option<boatramp_core::project_export::ManagedRestore>,
         mismatch: MismatchFlags,
     ) -> Result<CloneOutcome> {
         use boatramp_core::project_export::{CloneEvent, ClonePlan};
@@ -1144,6 +1145,11 @@ impl ControlPlane {
         });
         if let Some(sp) = source_project {
             body["source_project"] = serde_json::Value::String(sp.to_string());
+        }
+        // The managed-restore MODE (orthogonal to `data_only`) — only sent when explicitly chosen;
+        // absent lets the source apply the legacy coupling. `project sync` sets `ShadowSwap`.
+        if let Some(mr) = managed_restore {
+            body["managed_restore"] = serde_json::Value::String(mr.as_str().to_string());
         }
         if let Some(c) = &mismatch.continue_on_error {
             body["continue_on_error"] = serde_json::Value::String(c.clone());

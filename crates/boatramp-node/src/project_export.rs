@@ -75,8 +75,9 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::project_export::{
-    CloneBlobRef, CloneManifest, CloneSkip, ContinueErrorKind, ExportOptions, IdentityChoice,
-    ImportOptions, ImportReport, ProjectExport, ProjectExportError, SkipManifest, SkippedBlob,
+    BundleHead, BundleScope, CloneBlobRef, CloneManifest, CloneSkip, ContinueErrorKind,
+    ExportOptions, IdentityChoice, ImportOptions, ImportReport, ManagedRestore, ProjectExport,
+    ProjectExportError, SkipManifest, SkippedBlob,
 };
 use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
@@ -288,34 +289,52 @@ fn self_provisioned_managed_cred_keys(
 }
 
 /// How a SIDECAR (non-chunked) pg dump member must be applied on import — the narrowed post-HIGH-1
-/// policy (the untrusted dump must never reach the bootstrap superuser). A pure (managed × data_only)
-/// decision, factored out so the narrowing is unit-testable without a live backend.
+/// policy (the untrusted dump must never reach the bootstrap superuser). A pure
+/// (managed × [`ManagedRestore`]) decision, factored out so the narrowing is unit-testable without a
+/// live backend.
 #[derive(Debug, PartialEq, Eq)]
 enum SidecarPgApply {
     /// EXTERNAL bring-your-own-URL binding: the operator's OWN database + credential (their trust
     /// boundary, not our managed cluster) — the dump is applied directly.
     External,
-    /// MANAGED + FULL dump: apply via the atomic NON-superuser ephemeral-role shadow+swap. The
-    /// untrusted dump never reaches the bootstrap superuser, and the self-provisioned target is
-    /// replaced atomically (fresh or overwrite) — never a partial live overlay. This serves a Shared
-    /// tenant's sidecar-framed FULL export and any FULL dedicated dump staged sidecar.
+    /// MANAGED + [`ManagedRestore::ShadowSwap`]: apply via the atomic NON-superuser ephemeral-role
+    /// shadow+swap. The untrusted dump never reaches the bootstrap superuser, and the
+    /// self-provisioned target is replaced atomically (fresh or overwrite) — never a partial live
+    /// overlay. This serves a Shared tenant's sidecar-framed FULL export and any FULL dedicated dump
+    /// staged sidecar.
     ManagedShadowSwap,
-    /// MANAGED + data_only: an OVERLAY into the target's existing live schema. There is NO atomic
-    /// shadow for an overlay, and a direct apply would run as the bootstrap superuser (RCE) —
-    /// REFUSED fail-closed (a least-privilege overlay apply is a pending follow-up).
+    /// MANAGED + [`ManagedRestore::Overlay`]: an OVERLAY into the target's existing live schema.
+    /// There is NO atomic shadow for an overlay, and a direct apply would run as the bootstrap
+    /// superuser (RCE) — REFUSED fail-closed (a least-privilege overlay apply is a pending follow-up).
     RefuseManagedDataOnly,
 }
 
-/// Decide how a SIDECAR pg dump member is applied. The narrowing (vs. the prior blanket "refuse all
-/// managed sidecar apply") is EXACTLY: a managed FULL dump is now applied via the atomic
-/// non-superuser shadow+swap; a managed `data_only` dump is STILL refused (overlay into a live
-/// schema, no atomic shadow); an external binding is applied directly as before.
-fn sidecar_pg_apply(is_managed: bool, data_only: bool) -> SidecarPgApply {
-    match (is_managed, data_only) {
+/// Decide how a SIDECAR pg dump member is applied, from the binding's managed-ness and the bundle's
+/// [`ManagedRestore`] mode. EXACTLY: a managed [`ShadowSwap`](ManagedRestore::ShadowSwap) dump is
+/// applied via the atomic non-superuser shadow+swap; a managed [`Overlay`](ManagedRestore::Overlay)
+/// dump is REFUSED (overlay into a live schema, no atomic shadow); an external binding is applied
+/// directly. NB: this reads the managed-restore mode, NOT a conflated `data_only` scope flag — a
+/// `DataPlane`-scoped bundle whose managed members are `ShadowSwap` (what `project sync` produces)
+/// now lands here as `ManagedShadowSwap`, where before the coupling forced it to refuse.
+fn sidecar_pg_apply(is_managed: bool, restore: ManagedRestore) -> SidecarPgApply {
+    match (is_managed, restore) {
         (false, _) => SidecarPgApply::External,
-        (true, false) => SidecarPgApply::ManagedShadowSwap,
-        (true, true) => SidecarPgApply::RefuseManagedDataOnly,
+        (true, ManagedRestore::ShadowSwap) => SidecarPgApply::ManagedShadowSwap,
+        (true, ManagedRestore::Overlay) => SidecarPgApply::RefuseManagedDataOnly,
     }
+}
+
+/// Whether a MANAGED engine member (pg/mysql) is framed CHUNKED (a streamed dump → the atomic
+/// shadow-restore, Stage C/D) vs SIDECAR, from the binding's managed-ness, the bundle's
+/// [`ManagedRestore`] mode, and whether the tenant is Shared. Chunked IFF managed AND ShadowSwap AND
+/// not-Shared — a dedicated/Single managed ShadowSwap dump. The complementary cases stay SIDECAR: a
+/// Shared managed ShadowSwap reaches the shadow via `pg_sidecar_shadow_restore`
+/// ([`SidecarPgApply::ManagedShadowSwap`]); an Overlay dump or an external binding applies on the
+/// sidecar arm too. The pure framing decision behind `plan_export`, keyed on the SPLIT managed-restore
+/// mode (NOT a conflated scope flag) so a `DataPlane`-scope `project sync` still frames a dedicated
+/// managed DB chunked.
+fn managed_member_chunked(is_managed: bool, restore: ManagedRestore, is_shared: bool) -> bool {
+    is_managed && matches!(restore, ManagedRestore::ShadowSwap) && !is_shared
 }
 
 /// Parse a `postgres://` / `mysql://` DSN into `(user, password, host, port, database)`
@@ -1844,9 +1863,11 @@ impl Read for ChunkedBodyReader {
 
 /// The import servicer's request, sent by the blocking atomic reader as it streams.
 enum ImportMsg {
-    /// The bundle head (surfaced before any member) — the source project + data-only flag.
+    /// The bundle head (surfaced before any member) — the source project + the two orthogonal
+    /// bundle-head descriptors ([`BundleHead`]: its [`BundleScope`] drives the control-plane
+    /// post-stream steps; its [`ManagedRestore`] drives each managed member's restore routing).
     Head {
-        data_only: bool,
+        head: BundleHead,
         source_project: String,
     },
     /// A Sidecar member staged + size/SHA-verified at `temp`; the servicer restores it then
@@ -2167,14 +2188,14 @@ impl ProjectExport for NodeProjectExport {
         // A data-only bundle carries NO control-plane / identity material at all, so the
         // two flags are mutually exclusive — refuse the contradiction rather than silently
         // pick one.
-        if opts.data_only && opts.include_identity {
+        if opts.scope.is_data_only() && opts.include_identity {
             return Err(Perr::Other(
                 "--data-only and --include-identity are mutually exclusive: a data-only \
                  bundle carries application data only (no control-plane KV, no identity)"
                     .into(),
             ));
         }
-        let data_only = opts.data_only;
+        let head = opts.head();
         let created_at = now_secs();
         let session = self.work_dir.join(format!("export-{project}-{created_at}"));
         let stage_dir = session.join("stage");
@@ -2237,7 +2258,7 @@ impl ProjectExport for NodeProjectExport {
                 project_bundle::write_bundle_streaming_v3(
                     writer_out,
                     created_at,
-                    data_only,
+                    head,
                     source_for_task,
                     specs_for_task,
                     chunk_size,
@@ -2425,11 +2446,11 @@ impl ProjectExport for NodeProjectExport {
         );
         let read_handle = tokio::task::spawn_blocking(move || -> ReadOutput {
             let head_tx = req_tx_task.clone();
-            let on_head = move |data_only: bool, source: &SourceInfo| {
-                // Surfaced before any member: the servicer needs the source project (to
-                // re-key each member to the TARGET) and the data-only flag.
+            let on_head = move |head: BundleHead, source: &SourceInfo| {
+                // Surfaced before any member: the servicer needs the source project (to re-key each
+                // member to the TARGET) and the bundle head (scope + managed-restore mode).
                 let _ = head_tx.blocking_send(ImportMsg::Head {
-                    data_only,
+                    head,
                     source_project: source.project.clone(),
                 });
             };
@@ -2491,7 +2512,13 @@ impl ProjectExport for NodeProjectExport {
                 dry_run: !opts.apply,
                 ..Default::default()
             };
-            let mut data_only = false;
+            // Defaults until the Head arrives (a bundle always sends Head first): the safe
+            // Full-scope + ShadowSwap head, so a malformed head-less stream never silently
+            // down-scopes or routes a managed member to the refused overlay.
+            let mut head = BundleHead {
+                scope: BundleScope::Full,
+                managed_restore: ManagedRestore::ShadowSwap,
+            };
             let mut source_project = String::new();
             let mut saw_identity = false;
             let mut pending_chunk: Option<ChunkState> = None;
@@ -2499,17 +2526,17 @@ impl ProjectExport for NodeProjectExport {
             while let Some(msg) = req_rx.recv().await {
                 match msg {
                     ImportMsg::Head {
-                        data_only: d,
+                        head: h,
                         source_project: s,
                     } => {
-                        data_only = d;
+                        head = h;
                         source_project = s;
                     }
                     ImportMsg::Member { spec, temp, reply } => {
                         let r = self
                             .restore_member(
                                 project,
-                                data_only,
+                                head,
                                 &source_project,
                                 &spec,
                                 &temp,
@@ -2831,7 +2858,7 @@ impl ProjectExport for NodeProjectExport {
                                 } else {
                                     self.restore_member(
                                         project,
-                                        data_only,
+                                        head,
                                         &source_project,
                                         &spec,
                                         &temp,
@@ -2971,7 +2998,7 @@ impl ProjectExport for NodeProjectExport {
                 }
                 _ => {}
             }
-            Ok((report, data_only, saw_identity, source_project))
+            Ok((report, head, saw_identity, source_project))
         };
 
         let (feed_res, serv_res, read_res) = tokio::join!(feeder, servicer, read_handle);
@@ -2979,7 +3006,7 @@ impl ProjectExport for NodeProjectExport {
         // Error precedence: a restore failure is the most specific cause; a bundle-integrity
         // error (SHA / size / order / truncation) next; a body-read error last. On ANY error
         // skip the post-stream steps (fresh-drop etc.) so a half-stream never half-finishes.
-        let (mut report, data_only, saw_identity, source_project) = match serv_res {
+        let (mut report, head, saw_identity, source_project) = match serv_res {
             Ok(v) => v,
             Err(e) => {
                 let _ = tokio::fs::remove_dir_all(&session).await;
@@ -3043,8 +3070,8 @@ impl ProjectExport for NodeProjectExport {
 
         // --- post-stream steps (only after a clean, fully-verified pass) ---
 
-        // A `--data-only` bundle carries app data only; record that KV was not restored.
-        if data_only {
+        // A data-plane-scope bundle carries app data only; record that KV was not restored.
+        if head.scope.is_data_only() {
             report
                 .notes
                 .push("control-plane KV (identity/RBAC/routing) NOT imported: --data-only".into());
@@ -3070,7 +3097,10 @@ impl ProjectExport for NodeProjectExport {
         // "zero source-sealed artifacts that unwrap" a POSITIVE absence rather than
         // present-but-inert. Only for a FULL bundle (data-only carries no KV/secrets) and
         // only when applying.
-        if matches!(opts.identity, IdentityChoice::Fresh) && !data_only && opts.apply {
+        if matches!(opts.identity, IdentityChoice::Fresh)
+            && head.scope.carries_control_plane()
+            && opts.apply
+        {
             let prefixes =
                 boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
             // The managed-SQL credential prefix needs special handling. This import's OWN managed-DB
@@ -3110,7 +3140,7 @@ impl ProjectExport for NodeProjectExport {
         // deliberately carries no function/component CODE (deploy artifacts live in blob storage,
         // not this slice), no TLS private keys and no global routing ownership. Surface the
         // follow-up steps so the target is not silently half-restored.
-        if !data_only {
+        if head.scope.carries_control_plane() {
             report.notes.push(
                 "post-import: re-deploy function/component code (deploy artifacts are not \
                  bundled), re-verify + re-attach the project's domains, and let ACME re-issue TLS \
@@ -3220,12 +3250,12 @@ impl NodeProjectExport {
         opts: &ExportOptions,
     ) -> Result<CloneManifest, Perr> {
         check_project_slug(project)?;
-        if opts.data_only && opts.include_identity {
+        if opts.scope.is_data_only() && opts.include_identity {
             return Err(Perr::Other(
                 "--data-only and --include-identity are mutually exclusive".into(),
             ));
         }
-        let data_only = opts.data_only;
+        let carries_control_plane = opts.scope.carries_control_plane();
 
         // Blobs: a metadata-only LIST under the project's OWN scope (`hblob/{project}/`).
         let blob_metas = self
@@ -3270,13 +3300,13 @@ impl NodeProjectExport {
                 }
             }
         }
-        if !data_only {
+        if carries_control_plane {
             non_blob_members.push(project_bundle::KV_MEMBER_PATH.to_string());
         }
 
         Ok(CloneManifest {
             source_project: project.to_string(),
-            data_only,
+            data_only: opts.scope.is_data_only(),
             blobs,
             non_blob_members,
         })
@@ -3379,7 +3409,16 @@ impl NodeProjectExport {
         opts: &ExportOptions,
         created_at: u64,
     ) -> Result<(Vec<MemberSpec>, HashMap<String, StageJob>, SourceInfo), Perr> {
-        let data_only = opts.data_only;
+        // The two orthogonal concepts the old single `data_only` flag conflated, now kept apart:
+        //   - `carries_control_plane` (SCOPE): does the bundle carry the KV slice + identity?
+        //   - `managed_restore`       (MODE):  how are MANAGED members dumped/restored?
+        // `overlay_dump` is the `--data-only` toggle passed to pg_dump/mysqldump (an Overlay dump is
+        // schema-less; a ShadowSwap dump is FULL). These were always equal before the split; the new
+        // `DataPlane + ShadowSwap` combination (what `project sync` requests) is what makes a managed
+        // DB's data land via the safe shadow+swap without dragging in the control-plane KV slice.
+        let carries_control_plane = opts.scope.carries_control_plane();
+        let managed_restore = opts.managed_restore;
+        let overlay_dump = managed_restore.is_overlay();
         let mut ordered: Vec<(MemberSpec, StageJob)> = Vec::new();
 
         // --- identity transport container (`--include-identity` only) — FIRST (an adopt
@@ -3428,9 +3467,9 @@ impl NodeProjectExport {
             }
         }
 
-        // Checkpoint the durable KV frontier BEFORE we enumerate (full export only), so the
+        // Checkpoint the durable KV frontier BEFORE we enumerate (full-SCOPE export only), so the
         // KV slice staged later reflects a consistent frontier.
-        if !data_only {
+        if carries_control_plane {
             self.deploy.checkpoint().await.map_err(other)?;
         }
 
@@ -3461,15 +3500,16 @@ impl NodeProjectExport {
         for (db, cfg) in &self.databases {
             let is_managed = cfg.compute.as_deref().is_some_and(|c| !c.is_empty());
             let dumpable = is_managed || !cfg.url_env.is_empty();
-            // A MANAGED, DEDICATED/Single pg/mysql FULL dump is framed ChunkedTrailer → the inc2
-            // streamed dump + atomic shadow-restore (Stage C/D). A `--data-only` import stays on the
-            // inc1 sidecar path (default #1: FULL-restore atomicity only); an EXTERNAL
-            // bring-your-own-URL binding stays sidecar (we never CREATE/RENAME/DROP databases on an
-            // operator's own server); and a SHARED multi-tenant server stays sidecar (HIGH-1 / #6:
-            // the per-import physical shadow db is a cross-tenant surface deferred to the temp-schema
-            // follow-up). So: chunked IFF managed AND full AND not-Shared.
+            // A MANAGED, DEDICATED/Single pg/mysql ShadowSwap dump is framed ChunkedTrailer → the
+            // inc2 streamed dump + atomic shadow-restore (Stage C/D). An Overlay (schema-less
+            // `--data-only`) dump stays on the inc1 sidecar path (default #1: FULL-restore atomicity
+            // only); an EXTERNAL bring-your-own-URL binding stays sidecar (we never CREATE/RENAME/DROP
+            // databases on an operator's own server); and a SHARED multi-tenant server stays sidecar
+            // (reaching the shadow via `pg_sidecar_shadow_restore`). So: chunked IFF managed AND
+            // ShadowSwap AND not-Shared. NB: keyed on the MANAGED-RESTORE mode, NOT the bundle scope —
+            // a `DataPlane` sync bundle still frames a dedicated managed DB chunked (ShadowSwap).
             let is_shared = matches!(cfg.tenant, crate::config::TenantIsolation::Shared);
-            let chunked = is_managed && !data_only && !is_shared;
+            let chunked = managed_member_chunked(is_managed, managed_restore, is_shared);
             if kind_is_postgres(&cfg.kind) && dumpable {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let schema_fingerprint = self.schema_fingerprint(project, db).await;
@@ -3488,7 +3528,7 @@ impl NodeProjectExport {
                     StageJob::Pg {
                         conn,
                         image,
-                        data_only,
+                        data_only: overlay_dump,
                         server_version_num,
                         no_publications: cfg.delta_capture,
                     },
@@ -3511,7 +3551,7 @@ impl NodeProjectExport {
                     StageJob::Mysql {
                         conn,
                         image,
-                        data_only,
+                        data_only: overlay_dump,
                     },
                 ));
             }
@@ -3545,10 +3585,10 @@ impl NodeProjectExport {
             }
         }
 
-        // --- control-plane KV slice (FULL export only) — LAST in restore order. A
-        //     `--data-only` bundle carries application data ONLY, never the KV slice (RBAC,
-        //     routing, personas, sealed secrets), so it is not even staged for data-only. ---
-        if !data_only {
+        // --- control-plane KV slice (FULL-SCOPE export only) — LAST in restore order. A
+        //     `DataPlane`-scope bundle carries application data ONLY, never the KV slice (RBAC,
+        //     routing, personas, sealed secrets), so it is not even staged for a data-plane bundle. ---
+        if carries_control_plane {
             ordered.push((
                 MemberSpec::sidecar(KV_MEMBER_PATH.to_string(), MemberKind::Kv, None),
                 StageJob::Kv { created_at },
@@ -3809,7 +3849,7 @@ impl NodeProjectExport {
     async fn restore_member(
         &self,
         project: &str,
-        data_only: bool,
+        head: BundleHead,
         source_project: &str,
         spec: &MemberSpec,
         temp: &Path,
@@ -3817,6 +3857,11 @@ impl NodeProjectExport {
         report: &mut ImportReport,
         saw_identity: &mut bool,
     ) -> Result<(), Perr> {
+        // The bundle's two orthogonal descriptors: `head.scope` (does it carry the control-plane KV
+        // slice?) gates the Kv/KvDelta arms; `head.managed_restore` (Overlay vs ShadowSwap) routes
+        // each managed engine member. `overlay` is the `--data-only` toggle for an EXTERNAL binding's
+        // direct restore (a managed Overlay is refused before it reaches the invocation).
+        let overlay = head.managed_restore.is_overlay();
         // --only-blobs REPAIR (clone-robustness #3): restore ONLY the blob members named in the
         // manifest; SKIP every other member (non-blob members, and blobs not in the set). The body
         // was already streamed to its bounded temp by the reader — skipping means simply NOT writing
@@ -3963,7 +4008,7 @@ impl NodeProjectExport {
                     self.ensure_target_db_provisioned(project, db, cfg).await?;
                 }
                 let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
-                if data_only {
+                if overlay {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
                     let tgt_fp = self.schema_fingerprint(project, db).await;
                     if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
@@ -3979,10 +4024,11 @@ impl NodeProjectExport {
                     // configured user, which on a MANAGED co-located server is the BOOTSTRAP SUPERUSER
                     // — a crafted `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE c` / untrusted
                     // `CREATE EXTENSION` would then execute = RCE. `sidecar_pg_apply` encodes the
-                    // (managed × data_only) policy, and the confinement is NON-SUPERUSER-APPLY, not
-                    // DDL/flag inspection (`data_only` is itself an untrusted manifest flag that does
-                    // not constrain the member's bytes).
-                    match sidecar_pg_apply(is_managed_binding(cfg), data_only) {
+                    // (managed × ManagedRestore) policy, and the confinement is NON-SUPERUSER-APPLY,
+                    // not DDL/flag inspection (the managed-restore mode is itself an untrusted manifest
+                    // flag that does not constrain the member's bytes — a lying ShadowSwap can at worst
+                    // fail / empty-restore in a fresh shadow as a NOSUPERUSER role, never RCE).
+                    match sidecar_pg_apply(is_managed_binding(cfg), head.managed_restore) {
                         SidecarPgApply::RefuseManagedDataOnly => {
                             // Still REFUSED: a data-only sidecar is an OVERLAY into the target's
                             // EXISTING live schema (rows into tables that must already exist) — there
@@ -4023,7 +4069,7 @@ impl NodeProjectExport {
                             // dump directly. Capture stderr via `sh -c '… 2>&1'` so a failed restore
                             // is diagnosable instead of a causeless "exited N" (run_ephemeral drops
                             // stderr on nonzero).
-                            let inv = pg_restore_invocation(&conn, data_only);
+                            let inv = pg_restore_invocation(&conn, overlay);
                             let merged = merge_stderr_argv(&inv.argv);
                             let outfile = temp.with_extension("restore.out");
                             let code = self
@@ -4057,7 +4103,7 @@ impl NodeProjectExport {
                     self.ensure_target_db_provisioned(project, db, cfg).await?;
                 }
                 let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
-                if data_only {
+                if overlay {
                     let src_fp = spec.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
                     let tgt_fp = self.schema_fingerprint(project, db).await;
                     if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
@@ -4071,16 +4117,27 @@ impl NodeProjectExport {
                     // HIGH-1 (mirror of the pg sidecar arm): refuse a MANAGED sidecar mysql apply —
                     // it would connect as the bootstrap superuser against our co-located server. An
                     // EXTERNAL binding applies with the operator's own credential (their trust).
+                    // Unlike pg, mysql has no Shared-tenant sidecar shadow+swap path: a managed mysql
+                    // reaches the safe shadow+swap ONLY via the atomic CHUNKED arm (a ShadowSwap
+                    // DEDICATED/Single dump, which `project sync` of a dedicated mysql produces), so a
+                    // managed member landing on THIS sidecar arm is either an Overlay dump (the RCE
+                    // guard) or a Shared tenant (no mysql sidecar shadow) — both refused fail-closed.
                     if is_managed_binding(cfg) {
+                        let why = if overlay {
+                            "a data-only/Overlay restore would overlay the untrusted dump onto the \
+                             live schema as the bootstrap superuser (RCE risk)"
+                        } else {
+                            "a managed Shared-tenant mysql has no sidecar shadow+swap path (only a \
+                             dedicated/Single mysql restores via the atomic chunked shadow)"
+                        };
                         return Err(Perr::Unavailable(format!(
                             "import refused: a MANAGED mysql database ({db:?}) can only be restored \
-                             via the atomic chunked shadow path (a FULL, dedicated/Single bundle); a \
-                             data-only/Shared sidecar restore would apply the untrusted dump as a \
-                             superuser (RCE risk). Re-export as a FULL dedicated bundle, or import \
-                             into an external binding."
+                             via the atomic chunked shadow path (a FULL, dedicated/Single bundle) — \
+                             {why}. Re-export as a FULL dedicated bundle, or import into an external \
+                             (bring-your-own-URL) binding."
                         )));
                     }
-                    let inv = mysql_restore_invocation(&conn, data_only);
+                    let inv = mysql_restore_invocation(&conn, overlay);
                     // Capture the mysql client's stderr (a failed statement's error) via
                     // `sh -c '… 2>&1'` so a failed EXTERNAL restore is diagnosable, not a
                     // causeless "exited N" (run_ephemeral drops stderr on nonzero).
@@ -4127,9 +4184,9 @@ impl NodeProjectExport {
                 report.libsql_databases += 1;
             }
             MemberKind::Kv => {
-                if data_only {
-                    // A data-only bundle should not carry a KV slice; ignore one if present
-                    // (the post-stream note records that KV is not imported for data-only).
+                if head.scope.is_data_only() {
+                    // A data-plane bundle should not carry a KV slice; ignore one if present
+                    // (the post-stream note records that KV is not imported for a data-plane bundle).
                     return Ok(());
                 }
                 // `adopt` must have installed the source KEK (from an identity member that
@@ -4220,8 +4277,8 @@ impl NodeProjectExport {
             }
             MemberKind::KvDelta => {
                 // The control-plane KV DELTA slice (a delta bundle only): the upserts + tombstones
-                // since the base. A data-only bundle carries no KV, so ignore one if present.
-                if data_only {
+                // since the base. A data-plane bundle carries no KV, so ignore one if present.
+                if head.scope.is_data_only() {
                     return Ok(());
                 }
                 // adopt must have installed the source KEK before any sealed KV byte is written
@@ -4389,7 +4446,7 @@ impl NodeProjectExport {
         dir: &Path,
     ) -> Result<(), Perr> {
         check_project_slug(project)?;
-        if opts.data_only && opts.include_identity {
+        if opts.scope.is_data_only() && opts.include_identity {
             return Err(Perr::Other(
                 "--data-only and --include-identity are mutually exclusive".into(),
             ));
@@ -4440,7 +4497,8 @@ impl NodeProjectExport {
                 magic: project_bundle::BUNDLE_MAGIC.to_string(),
                 format_version: project_bundle::BUNDLE_FORMAT_VERSION_V3,
                 created_at,
-                data_only: opts.data_only,
+                data_only: opts.scope.is_data_only(),
+                managed_restore: Some(opts.managed_restore),
                 source: source.clone(),
                 members: specs.clone(),
                 delta: delta_info,
@@ -4587,7 +4645,7 @@ impl NodeProjectExport {
     > {
         use boatramp_core::project_delta as pd;
 
-        if opts.data_only {
+        if opts.scope.is_data_only() {
             return Err(Perr::Other(
                 "delta export is not supported for a --data-only bundle (a delta carries the \
                  control-plane KV delta, which a data-only bundle excludes)"
@@ -5255,7 +5313,7 @@ impl NodeProjectExport {
                 if let Err(e) = self
                     .restore_member(
                         project,
-                        m.data_only,
+                        m.head(),
                         &m.source.project,
                         spec,
                         &obj,
@@ -5396,7 +5454,7 @@ impl NodeProjectExport {
             }
             self.restore_member(
                 project,
-                manifest.data_only,
+                manifest.head(),
                 &manifest.source.project,
                 spec,
                 &obj,
@@ -9100,7 +9158,7 @@ mod tests {
         let mut got: Vec<(MemberSpec, Vec<u8>)> = Vec::new();
         project_bundle::read_bundle_streaming_with_head(
             bytes,
-            |d, _s| data_only = d,
+            |h, _s| data_only = h.scope.is_data_only(),
             |spec, _sz, body| {
                 let mut v = Vec::new();
                 body.read_to_end(&mut v)
@@ -9226,7 +9284,8 @@ mod tests {
             &drv,
             "acme",
             &ExportOptions {
-                data_only: true,
+                scope: boatramp_core::project_export::BundleScope::DataPlane,
+                managed_restore: boatramp_core::project_export::ManagedRestore::Overlay,
                 ..Default::default()
             },
         )
@@ -10009,30 +10068,84 @@ mod tests {
         assert!(data_only_skew_blocks(None, None));
     }
 
-    /// The SIDECAR pg apply narrowing (the pure decision behind the restore_member PgDump arm).
-    /// Pins the precise boundary: a MANAGED FULL dump is now applied via the atomic non-superuser
-    /// shadow+swap (so a Shared tenant's sidecar-framed FULL clone succeeds), while a MANAGED
-    /// `data_only` dump is STILL refused (overlay into a live schema, no atomic shadow) — the
-    /// narrowing must not over-open the guard. An external binding is applied directly as before.
-    /// (The live shadow apply itself needs Docker + pg; this unit test fixes the dispatch that the
-    /// `*_live` gates then exercise end-to-end.)
+    /// The SIDECAR pg apply decision (the pure dispatch behind the restore_member PgDump arm), now
+    /// keyed on the SPLIT [`ManagedRestore`] mode rather than a conflated `data_only` flag. Pins the
+    /// precise boundary: a MANAGED `ShadowSwap` dump applies via the atomic non-superuser shadow+swap
+    /// (so a Shared tenant's sidecar-framed FULL clone AND a `project sync` DataPlane+ShadowSwap
+    /// clone succeed), while a MANAGED `Overlay` dump is STILL refused (overlay into a live schema,
+    /// no atomic shadow) — the guard must fire on a genuine overlay only. An external binding is
+    /// applied directly regardless of the mode. (The live shadow apply itself needs Docker + pg;
+    /// this unit test fixes the dispatch that the `*_live` gates then exercise end-to-end.)
     #[test]
-    fn sidecar_pg_apply_narrows_only_full_managed_dumps() {
-        // MANAGED + FULL (data_only = false): the NOW-SAFE case — atomic non-superuser shadow+swap.
+    fn sidecar_pg_apply_dispatches_by_managed_restore_mode() {
+        use ManagedRestore::{Overlay, ShadowSwap};
+        // MANAGED + ShadowSwap: the SAFE case — atomic non-superuser shadow+swap. This is the arm a
+        // `project sync` of a Shared managed pg now reaches (DataPlane scope + ShadowSwap mode); the
+        // pre-split coupling forced it to refuse because `data_only` implied Overlay.
         assert_eq!(
-            sidecar_pg_apply(true, false),
+            sidecar_pg_apply(true, ShadowSwap),
             SidecarPgApply::ManagedShadowSwap,
-            "a FULL managed sidecar dump applies via the non-superuser shadow+swap"
+            "a ShadowSwap managed sidecar dump applies via the non-superuser shadow+swap"
         );
-        // MANAGED + data_only: STILL refused (the narrowing must not over-open the guard).
+        // MANAGED + Overlay: STILL refused — the RefuseManagedDataOnly guard must keep firing for a
+        // genuine overlay (external/BYO overlay, allow-schema-skew overlay), never over-opened.
         assert_eq!(
-            sidecar_pg_apply(true, true),
+            sidecar_pg_apply(true, Overlay),
             SidecarPgApply::RefuseManagedDataOnly,
-            "a data-only managed sidecar dump must STAY refused — no atomic shadow for an overlay"
+            "an Overlay managed sidecar dump must STAY refused — no atomic shadow for an overlay (RCE guard)"
         );
-        // EXTERNAL (not managed): applied directly with the operator's own credential, FULL or not.
-        assert_eq!(sidecar_pg_apply(false, false), SidecarPgApply::External);
-        assert_eq!(sidecar_pg_apply(false, true), SidecarPgApply::External);
+        // EXTERNAL (not managed): applied directly with the operator's own credential, either mode.
+        assert_eq!(
+            sidecar_pg_apply(false, ShadowSwap),
+            SidecarPgApply::External
+        );
+        assert_eq!(sidecar_pg_apply(false, Overlay), SidecarPgApply::External);
+    }
+
+    /// The EXPORT-side framing decision behind `plan_export` (the pure complement of the import-side
+    /// `sidecar_pg_apply`): a managed member is CHUNKED iff managed AND ShadowSwap AND not-Shared.
+    /// Pins that `project sync` (ShadowSwap) frames a DEDICATED managed DB chunked (→ the atomic
+    /// chunked shadow) and a SHARED one sidecar (→ `pg_sidecar_shadow_restore`), while an Overlay or
+    /// external binding is always sidecar. `plan_export` itself needs a live DB (version-detect), so
+    /// this fixes the decision the `*_live` gate then exercises end-to-end.
+    #[test]
+    fn managed_member_framing_follows_shadow_swap_and_tenancy() {
+        use ManagedRestore::{Overlay, ShadowSwap};
+        // Dedicated managed + ShadowSwap → CHUNKED (streamed dump → atomic shadow). The sync case.
+        assert!(managed_member_chunked(true, ShadowSwap, false));
+        // Shared managed + ShadowSwap → SIDECAR (reaches the shadow via pg_sidecar_shadow_restore).
+        assert!(!managed_member_chunked(true, ShadowSwap, true));
+        // Managed + Overlay → SIDECAR (the refused/direct-overlay path), dedicated or Shared.
+        assert!(!managed_member_chunked(true, Overlay, false));
+        assert!(!managed_member_chunked(true, Overlay, true));
+        // External (not managed) → always SIDECAR (we never CREATE/RENAME/DROP on the operator's db).
+        assert!(!managed_member_chunked(false, ShadowSwap, false));
+        assert!(!managed_member_chunked(false, Overlay, false));
+    }
+
+    /// The legacy `data_only` wire bool maps, via [`BundleHead`], to exactly the pre-split coupling:
+    /// `true → DataPlane + Overlay`, `false → Full + ShadowSwap`. This is what keeps a pre-split
+    /// bundle (and every legacy caller) behaving UNCHANGED after the overload was split, and what
+    /// makes the `sidecar_pg_apply` boundary above equivalent to the old `(managed × data_only)` one
+    /// for any bundle that did NOT ask for the new `DataPlane + ShadowSwap` combination.
+    #[test]
+    fn bundle_head_from_bool_reproduces_the_legacy_coupling() {
+        let data_only_head = BundleHead::from(true);
+        assert_eq!(data_only_head.scope, BundleScope::DataPlane);
+        assert_eq!(data_only_head.managed_restore, ManagedRestore::Overlay);
+        let full_head = BundleHead::from(false);
+        assert_eq!(full_head.scope, BundleScope::Full);
+        assert_eq!(full_head.managed_restore, ManagedRestore::ShadowSwap);
+        // A managed pg under the legacy coupling: data_only → refuse; full → shadow+swap. Identical
+        // to the pre-split boundary, so nothing that did not opt into the new combination changes.
+        assert_eq!(
+            sidecar_pg_apply(true, BundleHead::from(true).managed_restore),
+            SidecarPgApply::RefuseManagedDataOnly
+        );
+        assert_eq!(
+            sidecar_pg_apply(true, BundleHead::from(false).managed_restore),
+            SidecarPgApply::ManagedShadowSwap
+        );
     }
 
     /// The SHARED-shadow restore-window closer's terminate-sweep SQL composes correctly: it targets
@@ -10098,7 +10211,8 @@ mod tests {
             &drv,
             "acme",
             &ExportOptions {
-                data_only: false,
+                scope: boatramp_core::project_export::BundleScope::Full,
+                managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                 ..Default::default()
             },
         )
@@ -10116,7 +10230,8 @@ mod tests {
             &drv,
             "acme",
             &ExportOptions {
-                data_only: true,
+                scope: boatramp_core::project_export::BundleScope::DataPlane,
+                managed_restore: boatramp_core::project_export::ManagedRestore::Overlay,
                 ..Default::default()
             },
         )
@@ -10175,7 +10290,8 @@ mod tests {
             &drv,
             "acme",
             &ExportOptions {
-                data_only: false,
+                scope: boatramp_core::project_export::BundleScope::Full,
+                managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                 include_identity: true,
                 transport_key: Some(pass.clone()),
                 delta: None,
@@ -10228,7 +10344,8 @@ mod tests {
                 &drv,
                 "acme",
                 &ExportOptions {
-                    data_only: true,
+                    scope: boatramp_core::project_export::BundleScope::DataPlane,
+                    managed_restore: boatramp_core::project_export::ManagedRestore::Overlay,
                     include_identity: true,
                     transport_key: Some(pass.clone()),
                     delta: None,
@@ -10243,7 +10360,8 @@ mod tests {
                 &drv,
                 "acme",
                 &ExportOptions {
-                    data_only: false,
+                    scope: boatramp_core::project_export::BundleScope::Full,
+                    managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                     include_identity: true,
                     transport_key: None,
                     delta: None,
@@ -10259,7 +10377,8 @@ mod tests {
                 &vault,
                 "acme",
                 &ExportOptions {
-                    data_only: false,
+                    scope: boatramp_core::project_export::BundleScope::Full,
+                    managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                     include_identity: true,
                     transport_key: Some(pass.clone()),
                     delta: None,
@@ -10325,7 +10444,8 @@ mod tests {
             &src,
             "acme",
             &ExportOptions {
-                data_only: false,
+                scope: boatramp_core::project_export::BundleScope::Full,
+                managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                 include_identity: true,
                 transport_key: Some(pass.clone()),
                 delta: None,
@@ -10546,7 +10666,8 @@ mod tests {
             &src,
             "acme",
             &ExportOptions {
-                data_only: true,
+                scope: boatramp_core::project_export::BundleScope::DataPlane,
+                managed_restore: boatramp_core::project_export::ManagedRestore::Overlay,
                 ..Default::default()
             },
         )
@@ -11936,7 +12057,7 @@ mod tests {
         let r = drv
             .restore_member(
                 "acme",
-                false,
+                BundleHead::from(false),
                 "acme",
                 &spec,
                 &temp,

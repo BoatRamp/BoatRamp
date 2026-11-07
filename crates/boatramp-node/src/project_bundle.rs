@@ -29,6 +29,7 @@ use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use boatramp_core::project_export::{BundleHead, BundleScope, ManagedRestore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -157,12 +158,42 @@ pub struct Manifest {
     pub format_version: u32,
     /// Unix seconds when the bundle was produced.
     pub created_at: u64,
-    /// Whether this is a `--data-only` bundle (app data only — no identity/RBAC/routing).
+    /// Whether this is a `--data-only` bundle (app data only — no identity/RBAC/routing). This is
+    /// the control-plane [`BundleScope`] on the wire (`true` ⟺ `DataPlane`); read it through
+    /// [`head`](Self::head).
     pub data_only: bool,
+    /// How MANAGED engine members were dumped + must be restored ([`ManagedRestore`]). SPLIT out of
+    /// the overloaded `data_only` flag so a `DataPlane` bundle can still carry FULL shadow+swap dumps
+    /// (`project sync`). `#[serde(default)]` — ABSENT on a pre-split bundle, where [`head`](Self::head)
+    /// derives it from `data_only` (the legacy coupling) so old bundles read UNCHANGED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_restore: Option<ManagedRestore>,
     /// What the bundle was exported from.
     pub source: SourceInfo,
     /// Every non-manifest member, in write order.
     pub members: Vec<ManifestMember>,
+}
+
+impl Manifest {
+    /// The two orthogonal bundle-head descriptors ([`BundleScope`] + [`ManagedRestore`]). A
+    /// pre-split bundle (no `managed_restore` field) derives the managed-restore mode from
+    /// `data_only` via the legacy coupling, so it reads exactly as before.
+    pub fn head(&self) -> BundleHead {
+        manifest_head(self.data_only, self.managed_restore)
+    }
+}
+
+/// Reconstruct the [`BundleHead`] from a manifest's `data_only` (scope) + optional
+/// `managed_restore`: a present `managed_restore` is authoritative; an absent one (a pre-split
+/// bundle) falls back to the legacy coupling (`BundleHead::from(data_only)`).
+fn manifest_head(data_only: bool, managed_restore: Option<ManagedRestore>) -> BundleHead {
+    match managed_restore {
+        Some(managed_restore) => BundleHead {
+            scope: BundleScope::from_data_only(data_only),
+            managed_restore,
+        },
+        None => BundleHead::from(data_only),
+    }
 }
 
 /// A project-bundle error.
@@ -336,10 +367,11 @@ fn append_bytes<W: Write>(
 pub fn write_bundle(
     out: &Path,
     created_at: u64,
-    data_only: bool,
+    head: impl Into<BundleHead>,
     source: SourceInfo,
     staged: &[StagedMember],
 ) -> Result<Manifest, BundleError> {
+    let head = head.into();
     // 1. Describe every member (size + checksum), validating each path.
     let mut members = Vec::with_capacity(staged.len());
     for m in staged {
@@ -361,7 +393,8 @@ pub fn write_bundle(
         magic: BUNDLE_MAGIC.to_string(),
         format_version: BUNDLE_FORMAT_VERSION,
         created_at,
-        data_only,
+        data_only: head.scope.is_data_only(),
+        managed_restore: Some(head.managed_restore),
         source,
         members,
     };
@@ -643,8 +676,14 @@ pub struct StreamManifest {
     pub format_version: u32,
     /// Unix seconds when the bundle was produced.
     pub created_at: u64,
-    /// Whether this is a `--data-only` bundle.
+    /// Whether this is a `--data-only` bundle — the control-plane [`BundleScope`] on the wire
+    /// (`true` ⟺ `DataPlane`); read it through [`head`](Self::head).
     pub data_only: bool,
+    /// How MANAGED engine members were dumped + must be restored ([`ManagedRestore`]), split out of
+    /// the overloaded `data_only` flag. `#[serde(default)]` — ABSENT on a pre-split bundle, where
+    /// [`head`](Self::head) derives it from `data_only` so old bundles read UNCHANGED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_restore: Option<ManagedRestore>,
     /// What the bundle was exported from.
     pub source: SourceInfo,
     /// Every non-manifest member, in the order the reader must restore them.
@@ -682,6 +721,12 @@ impl StreamManifest {
     /// The sidecar tar-entry path for a member at `path`.
     fn meta_path(path: &str) -> String {
         format!("{path}{META_SUFFIX}")
+    }
+
+    /// The two orthogonal bundle-head descriptors ([`BundleScope`] + [`ManagedRestore`]); a
+    /// pre-split bundle (no `managed_restore`) derives the mode from `data_only` (legacy coupling).
+    pub fn head(&self) -> BundleHead {
+        manifest_head(self.data_only, self.managed_restore)
     }
 }
 
@@ -722,10 +767,11 @@ impl<W: Write> BundleStreamWriter<W> {
     pub fn new(
         out: W,
         created_at: u64,
-        data_only: bool,
+        head: impl Into<BundleHead>,
         source: SourceInfo,
         specs: Vec<MemberSpec>,
     ) -> Result<Self, BundleError> {
+        let head = head.into();
         for s in &specs {
             validate_member_path(&s.path)?;
         }
@@ -741,7 +787,8 @@ impl<W: Write> BundleStreamWriter<W> {
             magic: BUNDLE_MAGIC.to_string(),
             format_version,
             created_at,
-            data_only,
+            data_only: head.scope.is_data_only(),
+            managed_restore: Some(head.managed_restore),
             source,
             members: specs.clone(),
             // The forward-only streaming writer never emits a delta bundle (a delta needs a
@@ -917,7 +964,7 @@ impl<W: Write> BundleStreamWriter<W> {
 pub fn write_bundle_streaming<W, S>(
     out: W,
     created_at: u64,
-    data_only: bool,
+    head: impl Into<BundleHead>,
     source: SourceInfo,
     specs: Vec<MemberSpec>,
     mut stage: S,
@@ -926,7 +973,7 @@ where
     W: Write,
     S: FnMut(&MemberSpec) -> Result<PathBuf, BundleError>,
 {
-    let mut writer = BundleStreamWriter::new(out, created_at, data_only, source, specs.clone())?;
+    let mut writer = BundleStreamWriter::new(out, created_at, head.into(), source, specs.clone())?;
     for spec in &specs {
         let tmp = stage(spec)?;
         let appended = writer.append_member(&spec.path, spec.kind, &tmp);
@@ -951,7 +998,7 @@ where
 pub fn write_bundle_streaming_v3<W, S, O>(
     out: W,
     created_at: u64,
-    data_only: bool,
+    head: impl Into<BundleHead>,
     source: SourceInfo,
     specs: Vec<MemberSpec>,
     chunk_size: usize,
@@ -963,7 +1010,7 @@ where
     S: FnMut(&MemberSpec) -> Result<PathBuf, BundleError>,
     O: FnMut(&MemberSpec) -> Result<Box<dyn Read>, BundleError>,
 {
-    let mut writer = BundleStreamWriter::new(out, created_at, data_only, source, specs.clone())?;
+    let mut writer = BundleStreamWriter::new(out, created_at, head.into(), source, specs.clone())?;
     for spec in &specs {
         match spec.framing {
             MemberFraming::Sidecar => {
@@ -1205,7 +1252,7 @@ where
     R: Read,
     F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
 {
-    read_bundle_streaming_with_head(src, |_data_only, _source| {}, restore)
+    read_bundle_streaming_with_head(src, |_head, _source| {}, restore)
 }
 
 /// Like [`read_bundle_streaming`], but also surfaces the bundle HEAD — the `data_only` flag
@@ -1222,7 +1269,7 @@ pub fn read_bundle_streaming_with_head<R, H, F>(
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
-    H: FnMut(bool, &SourceInfo),
+    H: FnMut(BundleHead, &SourceInfo),
     F: FnMut(&MemberSpec, u64, &mut dyn Read) -> Result<(), BundleError>,
 {
     read_bundle_core(src, on_head, |spec, size, sha, body| {
@@ -1249,7 +1296,7 @@ pub fn read_bundle_streaming_staged<R, H, F>(
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
-    H: FnMut(bool, &SourceInfo),
+    H: FnMut(BundleHead, &SourceInfo),
     F: FnMut(&MemberSpec, &Path) -> Result<(), BundleError>,
 {
     let mut counter = 0u64;
@@ -1271,7 +1318,7 @@ fn read_bundle_core<R, H, M>(
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
-    H: FnMut(bool, &SourceInfo),
+    H: FnMut(BundleHead, &SourceInfo),
     M: FnMut(&MemberSpec, u64, &str, &mut dyn Read) -> Result<(), BundleError>,
 {
     let mut ar = tar::Archive::new(src);
@@ -1294,7 +1341,7 @@ where
         // --- v1: inline size/SHA in the manifest; members matched by path (any order). ---
         let manifest: Manifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
-        on_head(manifest.data_only, &manifest.source);
+        on_head(manifest.head(), &manifest.source);
         let mut seen: HashSet<String> = HashSet::new();
         for entry in entries {
             let mut entry = entry?;
@@ -1319,7 +1366,7 @@ where
         // --- v2: ordered `<path>.brmeta` sidecar then `<path>` data, in MANIFEST order. ---
         let manifest: StreamManifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
-        on_head(manifest.data_only, &manifest.source);
+        on_head(manifest.head(), &manifest.source);
         let mut specs = manifest.members.iter();
         let mut pending_meta: Option<(String, MemberMeta)> = None;
         for entry in entries {
@@ -1618,7 +1665,7 @@ pub fn read_bundle_streaming_atomic<R, H>(
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
-    H: FnMut(bool, &SourceInfo),
+    H: FnMut(BundleHead, &SourceInfo),
 {
     // The strict reader is the policy reader under [`VerifyPolicy::strict`] with a throwaway sink.
     let mut mismatches = Vec::new();
@@ -1652,7 +1699,7 @@ pub fn read_bundle_streaming_atomic_policy<R, H>(
 ) -> Result<Vec<MemberSpec>, BundleError>
 where
     R: Read,
-    H: FnMut(bool, &SourceInfo),
+    H: FnMut(BundleHead, &SourceInfo),
 {
     let mut ar = tar::Archive::new(src);
     let mut entries = ar.entries()?;
@@ -1676,7 +1723,7 @@ where
         //     Sidecar-framed (v1 predates chunking). ---
         let manifest: Manifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
-        on_head(manifest.data_only, &manifest.source);
+        on_head(manifest.head(), &manifest.source);
         let mut seen: HashSet<String> = HashSet::new();
         for entry in entries {
             let mut entry = entry?;
@@ -1714,7 +1761,7 @@ where
         //     (Sidecar = `.brmeta` + body; ChunkedTrailer = `.part{N}` run + `.brtrailer`). ---
         let manifest: StreamManifest = serde_json::from_str(&manifest_json)?;
         manifest.validate()?;
-        on_head(manifest.data_only, &manifest.source);
+        on_head(manifest.head(), &manifest.source);
         for spec in manifest.members {
             match spec.framing {
                 MemberFraming::Sidecar => {
@@ -2039,6 +2086,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2063,6 +2111,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION + 99,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2092,6 +2141,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2305,6 +2355,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V2,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2360,6 +2411,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V2,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2554,6 +2606,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V2,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "x".to_string(),
                     site: None,
@@ -2771,9 +2824,13 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         let mut r = RecordingRestorer::default();
         let mut data_only = true;
-        let restored =
-            read_bundle_streaming_atomic(bundle.as_slice(), &stage, |d, _s| data_only = d, &mut r)
-                .unwrap();
+        let restored = read_bundle_streaming_atomic(
+            bundle.as_slice(),
+            &stage,
+            |h, _s| data_only = h.scope.is_data_only(),
+            &mut r,
+        )
+        .unwrap();
 
         assert!(!data_only);
         assert_eq!(restored, specs, "both members restored in declared order");
@@ -2818,6 +2875,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V3,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "acme".to_string(),
                     site: None,
@@ -2887,6 +2945,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V3,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "acme".to_string(),
                     site: None,
@@ -3053,6 +3112,7 @@ mod tests {
                 format_version: BUNDLE_FORMAT_VERSION_V2,
                 created_at: 0,
                 data_only: true,
+                managed_restore: None,
                 source: SourceInfo {
                     project: "acme".to_string(),
                     site: None,
@@ -3374,6 +3434,7 @@ mod tests {
                     format_version: BUNDLE_FORMAT_VERSION_V3,
                     created_at: 0,
                     data_only: true,
+                    managed_restore: None,
                     source: SourceInfo {
                         project: "acme".to_string(),
                         site: None,

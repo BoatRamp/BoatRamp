@@ -291,10 +291,12 @@ enum ProjectCommand {
     /// toward a `--from` source for a SELECTED set of pieces (`--include-<piece>` /
     /// `--exclude-<piece>`), rewriting site configs so the result is always coherent.
     ///
-    /// Increment 1 is the DRY-RUN PREFLIGHT: it validates the selection, DETECTS whether the
-    /// destination exists (planning to create + provision an absent one — never 404), and reports
-    /// the per-piece + per-item plan (carry / rewrite / re-derive / drop / preserve / skip) BEFORE
-    /// a byte moves. `--apply` (execution) is increment 2.
+    /// The default (no `--apply`) run is the DRY-RUN PREFLIGHT: it validates the selection, DETECTS
+    /// whether the destination exists (planning to create + provision an absent one — never 404),
+    /// classifies each carried DB's restore feasibility, and reports the per-piece + per-item plan
+    /// (carry / rewrite / re-derive / drop / preserve / skip) BEFORE a byte moves. `--apply` EXECUTES
+    /// that plan (shipped v0.56.0): create+provision the destination, transfer the data plane via a
+    /// shadow+swap clone, carry the selected control-plane KV strata, and rewrite site configs.
     Sync(crate::project_sync::SyncArgs),
 }
 
@@ -728,7 +730,8 @@ pub enum ProjectOutput {
     Pruned {
         plan: boatramp_core::project_prune::ProjectPrunePlan,
     },
-    /// `project sync` (increment 1) — the dry-run preflight plan + operator notes.
+    /// `project sync` — the dry-run preflight plan + operator notes, plus the applied outcome when
+    /// `--apply` executed the plan.
     Sync(crate::project_sync::SyncReport),
     /// The output was already written directly by this arm (a delegated subcommand's own
     /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
@@ -1208,6 +1211,10 @@ pub async fn run(
                         overwrite,
                         force,
                         clone_data_only,
+                        // `project clone` keeps the legacy coupling (None ⇒ the source derives the
+                        // managed-restore mode from `data_only`); `project sync` is the surface that
+                        // requests an explicit `ShadowSwap`.
+                        None,
                         mismatch,
                     )
                     .await?;

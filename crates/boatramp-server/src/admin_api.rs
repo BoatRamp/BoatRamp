@@ -3342,8 +3342,14 @@ pub(super) async fn project_export(
             Ok(d) => d,
             Err(m) => return (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
         };
+    // The direct export endpoint takes only the `data_only` SCOPE on the wire; the managed-restore
+    // MODE follows the legacy coupling (`data_only → Overlay`, full → ShadowSwap) via `BundleHead`,
+    // so the console + `project export` surfaces are unchanged. (The cross-node CLONE path, which
+    // `project sync` drives, carries an explicit `managed_restore` — see `CloneSourceQuery`.)
+    let head = boatramp_core::project_export::BundleHead::from(q.data_only);
     let export_opts = boatramp_core::project_export::ExportOptions {
-        data_only: q.data_only,
+        scope: head.scope,
+        managed_restore: head.managed_restore,
         include_identity: q.include_identity,
         transport_key,
         delta,
@@ -3652,13 +3658,39 @@ const SOURCE_TOKEN_HEADER: &str = "x-boatramp-source-token";
 /// `manifest.blobs.len()`; the driver also caps the count explicitly before the HEAD fan-out.
 const CLONE_MANIFEST_CAP: usize = 64 * 1024 * 1024;
 
-/// Query for the SOURCE clone surfaces (`/api/clone/manifest`, `/api/clone/stream`): whether the
-/// clone stream is `--data-only` (no control-plane KV / identity). Default `false` ⇒ a FULL clone
-/// (carries the project's control-plane KV slice); the target mints a FRESH identity on restore.
+/// Query for the SOURCE clone surfaces (`/api/clone/manifest`, `/api/clone/stream`): the two
+/// orthogonal bundle-head descriptors. `data_only` is the control-plane SCOPE (`false` ⇒ a FULL
+/// clone carrying the project's KV slice; the target mints a FRESH identity on restore).
+/// `managed_restore` is HOW managed engine members are dumped+restored (`overlay` vs `shadow-swap`);
+/// ABSENT ⇒ the legacy coupling (`data_only → overlay`, full → shadow-swap). `project sync` sets
+/// `data_only=true` + `managed_restore=shadow-swap` to land a managed DB's data via the safe
+/// shadow+swap WITHOUT the control-plane slice.
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct CloneSourceQuery {
     #[serde(default)]
     data_only: bool,
+    #[serde(default)]
+    managed_restore: Option<String>,
+}
+
+impl CloneSourceQuery {
+    /// Build the [`ExportOptions`](boatramp_core::project_export::ExportOptions) for this clone
+    /// source, resolving the two orthogonal concepts. An unknown `managed_restore` token is a 400.
+    fn export_opts(&self) -> Result<boatramp_core::project_export::ExportOptions, String> {
+        use boatramp_core::project_export::{BundleHead, BundleScope, ManagedRestore};
+        let scope = BundleScope::from_data_only(self.data_only);
+        let managed_restore = match self.managed_restore.as_deref() {
+            None => BundleHead::from(self.data_only).managed_restore,
+            Some(tok) => ManagedRestore::parse(tok).ok_or_else(|| {
+                format!("unknown managed_restore {tok:?} (want overlay / shadow-swap)")
+            })?,
+        };
+        Ok(boatramp_core::project_export::ExportOptions {
+            scope,
+            managed_restore,
+            ..Default::default()
+        })
+    }
 }
 
 /// SOURCE — produce the cheap clone MANIFEST (`GET /api/projects/<proj>/clone/manifest`,
@@ -3681,9 +3713,9 @@ pub(super) async fn clone_manifest(
     if let Some(resp) = reject_invalid_name("project", &project) {
         return resp;
     }
-    let opts = boatramp_core::project_export::ExportOptions {
-        data_only: q.data_only,
-        ..Default::default()
+    let opts = match q.export_opts() {
+        Ok(o) => o,
+        Err(m) => return (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
     };
     match cap.clone_manifest(&project, &opts).await {
         Ok(manifest) => (StatusCode::OK, Json(manifest)).into_response(),
@@ -3739,9 +3771,9 @@ pub(super) async fn clone_stream(
             }
         }
     };
-    let opts = boatramp_core::project_export::ExportOptions {
-        data_only: q.data_only,
-        ..Default::default()
+    let opts = match q.export_opts() {
+        Ok(o) => o,
+        Err(m) => return (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
     };
     // Same bounded-pipe streaming as `project_export`: the driver writes the filtered bundle into
     // the duplex write half (a detached task), the response body drains the read half.
@@ -3797,9 +3829,14 @@ pub(super) struct CloneFromRequest {
     /// Overlay a non-empty control-plane KV destination on the target.
     #[serde(default)]
     force: bool,
-    /// Pull a `--data-only` clone (no control-plane KV / identity).
+    /// Pull a `--data-only` clone (no control-plane KV / identity) — the control-plane SCOPE.
     #[serde(default)]
     data_only: bool,
+    /// How MANAGED engine members are dumped+restored (`overlay` / `shadow-swap`) — orthogonal to
+    /// `data_only`. ABSENT ⇒ the legacy coupling (`data_only → overlay`). `project sync` sets
+    /// `shadow-swap` so a `data_only` clone still lands a managed DB's data via the safe shadow+swap.
+    #[serde(default)]
+    managed_restore: Option<String>,
     /// Clone-robustness (PLAN-clone-robustness #1): with `verify` (or `apply`), scan ALL members
     /// and report EVERY declared≠streamed integrity mismatch in one pass, failing at the end — the
     /// assess-scope pass (applies nothing that mismatches). Default `false`.
@@ -3906,6 +3943,23 @@ pub(super) async fn clone_from(
         )
             .into_response();
     };
+    // The managed-restore MODE to request of the source (orthogonal to `data_only`). An unknown
+    // token is a caller-facing 400; absent ⇒ `None` (the source applies the legacy coupling).
+    let managed_restore = match req.managed_restore.as_deref() {
+        None => None,
+        Some(tok) => match boatramp_core::project_export::ManagedRestore::parse(tok) {
+            Some(mr) => Some(mr),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "clone: unknown managed_restore {tok:?} (want overlay / shadow-swap)\n"
+                    ),
+                )
+                    .into_response();
+            }
+        },
+    };
     // The SSRF-pinned transport to the source's `clone/manifest` + `clone/stream` surfaces. The
     // orchestration (manifest → diff → PLAN → optional stream+restore) is driven by
     // `orchestrate_clone` over this transport seam, so the plan/apply control flow is unit-testable
@@ -3917,6 +3971,7 @@ pub(super) async fn clone_from(
         source_token,
         source_base,
         data_only: req.data_only,
+        managed_restore,
     }) as Arc<dyn CloneSourceTransport>;
 
     let continue_on_error = match boatramp_core::project_export::ContinueOnError::parse(
@@ -4028,6 +4083,24 @@ struct HttpCloneSource {
     source_token: String,
     source_base: String,
     data_only: bool,
+    /// The managed-restore MODE to request of the source, orthogonal to `data_only`. `None` ⇒ let
+    /// the source default to the legacy coupling; `Some` ⇒ send an explicit `managed_restore` query
+    /// param (what `project sync` does with `ShadowSwap`).
+    managed_restore: Option<boatramp_core::project_export::ManagedRestore>,
+}
+
+impl HttpCloneSource {
+    /// The clone-source query params: always `data_only`, plus `managed_restore` when explicitly set.
+    fn query_params(&self) -> Vec<(&'static str, String)> {
+        let mut q: Vec<(&'static str, String)> = vec![(
+            "data_only",
+            if self.data_only { "true" } else { "false" }.to_string(),
+        )];
+        if let Some(mr) = self.managed_restore {
+            q.push(("managed_restore", mr.as_str().to_string()));
+        }
+        q
+    }
 }
 
 #[async_trait::async_trait]
@@ -4035,14 +4108,13 @@ impl CloneSourceTransport for HttpCloneSource {
     async fn fetch_manifest(
         &self,
     ) -> Result<boatramp_core::project_export::CloneManifest, CloneTransportError> {
-        let data_only = if self.data_only { "true" } else { "false" };
         // Fetch the SOURCE manifest (cheap LIST), BOUNDED to `CLONE_MANIFEST_CAP` (OOM guard) with a
         // short per-request total timeout. A 3xx is a failure (the no-redirect client refuses to
         // follow off the pinned host). The source's error body is NEVER reflected to the caller.
         let manifest_resp = match self
             .client
             .get(&self.manifest_url)
-            .query(&[("data_only", data_only)])
+            .query(&self.query_params())
             .bearer_auth(&self.source_token)
             .timeout(std::time::Duration::from_secs(30))
             .send()
@@ -4108,14 +4180,13 @@ impl CloneSourceTransport for HttpCloneSource {
         &self,
         skip: &boatramp_core::project_export::CloneSkip,
     ) -> Result<Box<dyn futures::io::AsyncRead + Send + Unpin>, CloneTransportError> {
-        let data_only = if self.data_only { "true" } else { "false" };
         // Pull ONLY the missing members over the live stream. No total timeout (a legitimate large
         // clone is long) — the pinned client's idle `read_timeout` bounds a stalled peer and the
         // import driver caps the total bytes. 3xx ⇒ failure; the source body is NEVER reflected.
         let stream_resp = match self
             .client
             .post(&self.stream_url)
-            .query(&[("data_only", data_only)])
+            .query(&self.query_params())
             .bearer_auth(&self.source_token)
             .json(skip)
             .send()

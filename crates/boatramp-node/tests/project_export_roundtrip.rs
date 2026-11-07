@@ -2312,7 +2312,8 @@ async fn project_export_roundtrip_driver_live() {
             .export(
                 "default",
                 &ExportOptions {
-                    data_only: false,
+                    scope: boatramp_core::project_export::BundleScope::Full,
+                    managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                     include_identity: false,
                     transport_key: None,
                     delta: None,
@@ -2739,7 +2740,8 @@ async fn project_export_cross_tenant_leak_gate() {
         drv.export(
             "acme",
             &ExportOptions {
-                data_only: false,
+                scope: boatramp_core::project_export::BundleScope::Full,
+                managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                 ..Default::default()
             },
             &mut sink,
@@ -3453,7 +3455,8 @@ async fn project_export_pg_true_delta_roundtrip_live() {
 
     // --- BASE export: creates the pgoutput capture slot + the full dump ---
     let full = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: None,
@@ -3489,7 +3492,8 @@ async fn project_export_pg_true_delta_roundtrip_live() {
 
     // --- INCREMENTAL delta export: drains the slot into a PgWalDelta member ---
     let delta_opts = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -3837,7 +3841,8 @@ async fn project_export_pg_true_delta_overlap_window_live() {
 
     // --- BASE export: SNAPSHOT-PINNED capture slot + base dump, while the writer commits ---
     let full = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: None,
@@ -3880,7 +3885,8 @@ async fn project_export_pg_true_delta_overlap_window_live() {
 
     // --- INCREMENTAL delta export: drains the WAL (every post-snapshot write) into a PgWalDelta ---
     let delta_opts = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -4118,7 +4124,8 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
 
     // --- BASE export: records the snapshot GTID + start binlog in mysql_capture.json ---
     let full = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: None,
@@ -4167,7 +4174,8 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
 
     // --- INCREMENTAL delta export: streams the binlog into a MysqlBinlogDelta member ---
     let delta_opts = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -4487,7 +4495,8 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
         .await
         .expect("empty base export");
     let delta2 = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -5069,13 +5078,15 @@ async fn project_export_pg_true_delta_chain_live() {
         .with_resumable_base(Some(resumable.clone()));
 
     let full = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: None,
     };
     let incr = |base: &str| ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -5444,13 +5455,15 @@ async fn project_export_mysql_true_delta_chain_live() {
         .with_resumable_base(Some(resumable.clone()));
 
     let full = ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: None,
     };
     let incr = |base: &str| ExportOptions {
-        data_only: false,
+        scope: boatramp_core::project_export::BundleScope::Full,
+        managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
         include_identity: false,
         transport_key: None,
         delta: Some(DeltaRequest {
@@ -6279,7 +6292,8 @@ async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
             .export(
                 &src_project,
                 &ExportOptions {
-                    data_only: false,
+                    scope: boatramp_core::project_export::BundleScope::Full,
+                    managed_restore: boatramp_core::project_export::ManagedRestore::ShadowSwap,
                     include_identity: false,
                     transport_key: None,
                     delta: None,

@@ -268,13 +268,139 @@ pub fn enforce_target_scoped_kv(
     Ok(())
 }
 
+/// What a project bundle CARRIES — its control-plane SCOPE. The FIRST of the two orthogonal
+/// concepts the old overloaded `data_only` flag conflated (the other is [`ManagedRestore`]): whether
+/// the bundle includes the control-plane KV slice (RBAC, routing, personas, sealed secrets) + the
+/// identity container, or only the application data plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundleScope {
+    /// Application data ONLY: pg/mysql rows + libsql + blobs. EXCLUDES the control-plane KV slice
+    /// and identity reseal. (The old `data_only = true`.)
+    DataPlane,
+    /// EVERYTHING: the data plane PLUS the control-plane KV slice (and, with `--include-identity`,
+    /// the identity transport container). (The old `data_only = false` — the default.)
+    #[default]
+    Full,
+}
+
+impl BundleScope {
+    /// Whether this scope carries the control-plane KV slice + identity reseal (`Full`).
+    #[must_use]
+    pub fn carries_control_plane(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// The legacy wire bool: `data_only == true` ⟺ [`DataPlane`](Self::DataPlane).
+    #[must_use]
+    pub fn is_data_only(self) -> bool {
+        matches!(self, Self::DataPlane)
+    }
+
+    /// Recover the scope from the legacy `data_only` wire bool.
+    #[must_use]
+    pub fn from_data_only(data_only: bool) -> Self {
+        if data_only {
+            Self::DataPlane
+        } else {
+            Self::Full
+        }
+    }
+}
+
+/// How a MANAGED engine member (managed pg / mysql) is DUMPED and RESTORED. The SECOND of the two
+/// orthogonal concepts the old `data_only` flag conflated (the other is [`BundleScope`]). This is
+/// the RESTORE-MODE axis, INDEPENDENT of [`BundleScope`]: a `DataPlane` bundle can still be restored
+/// via the safe shadow+swap, which is exactly what `project sync` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedRestore {
+    /// A schema-less `--data-only` dump, applied DIRECTLY onto the target's existing live schema.
+    /// For a MANAGED binding this is REFUSED on import — an overlay onto a live schema has no atomic
+    /// shadow and would run the untrusted dump as the bootstrap superuser (RCE risk). Valid only for
+    /// an EXTERNAL (bring-your-own-URL) binding, where the operator owns the server + credential.
+    /// (The managed dump-mode the old `data_only = true` implied.)
+    Overlay,
+    /// A FULL (schema+data) dump → provision + the atomic NON-superuser shadow+swap: the untrusted
+    /// dump is applied ONLY as an ephemeral NOSUPERUSER role into a fresh shadow db, then the verified
+    /// shadow is atomically swapped into the self-provisioned target (the bootstrap superuser never
+    /// applies a byte of it, and a lying bundle can at worst fail / empty-restore — never RCE). The
+    /// SAFE managed path, and the default. (The managed dump-mode the old `data_only = false` implied.)
+    #[default]
+    ShadowSwap,
+}
+
+impl ManagedRestore {
+    /// Whether the managed dump is a schema-less `--data-only` overlay (vs a full shadow+swap dump) —
+    /// i.e. the `--data-only` toggle passed to `pg_dump` / `pg_restore` / `mysqldump`.
+    #[must_use]
+    pub fn is_overlay(self) -> bool {
+        matches!(self, Self::Overlay)
+    }
+
+    /// The stable wire/CLI token (`overlay` / `shadow-swap`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overlay => "overlay",
+            Self::ShadowSwap => "shadow-swap",
+        }
+    }
+
+    /// Parse the wire/CLI token, fail-closed (an unknown token is `None`, never a silent default).
+    /// Accepts the `shadow_swap` underscore spelling for a forgiving query-param surface.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.trim() {
+            "overlay" => Some(Self::Overlay),
+            "shadow-swap" | "shadow_swap" => Some(Self::ShadowSwap),
+            _ => None,
+        }
+    }
+}
+
+/// The bundle HEAD's two orthogonal descriptors, carried together: the control-plane [`BundleScope`]
+/// and the managed-member [`ManagedRestore`] mode. Recorded in the bundle MANIFEST and surfaced to
+/// the import driver before any member. `From<bool>` reproduces the pre-split coupling (the single
+/// `data_only` flag) so a legacy caller / an old bundle with no `managed_restore` field maps through
+/// UNCHANGED: `true → DataPlane + Overlay`, `false → Full + ShadowSwap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleHead {
+    /// What the bundle carries (control-plane scope).
+    pub scope: BundleScope,
+    /// How managed engine members are dumped + restored.
+    pub managed_restore: ManagedRestore,
+}
+
+impl From<bool> for BundleHead {
+    fn from(data_only: bool) -> Self {
+        Self {
+            scope: BundleScope::from_data_only(data_only),
+            managed_restore: if data_only {
+                ManagedRestore::Overlay
+            } else {
+                ManagedRestore::ShadowSwap
+            },
+        }
+    }
+}
+
 /// Flags for an export. `Debug` is implemented by hand to **redact** the transport key so
 /// it can never reach a log line.
 #[derive(Clone, Default)]
 pub struct ExportOptions {
-    /// App-data-only bundle (pg/mysql rows + libsql + blobs); EXCLUDES the control-plane KV
-    /// slice and identity. Mutually exclusive with `include_identity`.
-    pub data_only: bool,
+    /// The control-plane SCOPE of the bundle ([`BundleScope`]): `DataPlane` (app data only —
+    /// pg/mysql rows + libsql + blobs, no control-plane KV / identity) vs `Full` (everything).
+    /// This is the SCOPE half of the old overloaded `data_only` flag. `DataPlane` is mutually
+    /// exclusive with `include_identity`.
+    pub scope: BundleScope,
+    /// How MANAGED engine members are dumped + restored ([`ManagedRestore`]): `ShadowSwap` (the
+    /// default + safe path) dumps FULL and restores via the atomic non-superuser shadow+swap;
+    /// `Overlay` dumps a schema-less `--data-only` for a direct apply (refused for a managed binding
+    /// on import). ORTHOGONAL to `scope` — a `DataPlane` + `ShadowSwap` bundle is exactly what
+    /// `project sync` requests to land a managed DB's data safely. This is the managed-dump-mode half
+    /// of the old overloaded `data_only` flag.
+    pub managed_restore: ManagedRestore,
     /// Also stage the identity transport container (the project KEK, passphrase-wrapped) so
     /// an `--identity adopt` recovery can unseal the KV slice's sealed secrets. Requires
     /// `transport_key` and a local KEK envelope (refused for Vault / none). Default OFF —
@@ -292,10 +418,23 @@ pub struct ExportOptions {
     pub delta: Option<crate::project_delta::DeltaRequest>,
 }
 
+impl ExportOptions {
+    /// The two orthogonal bundle-head descriptors this export produces — the [`BundleScope`] +
+    /// [`ManagedRestore`] the MANIFEST records and the import reads back.
+    #[must_use]
+    pub fn head(&self) -> BundleHead {
+        BundleHead {
+            scope: self.scope,
+            managed_restore: self.managed_restore,
+        }
+    }
+}
+
 impl std::fmt::Debug for ExportOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExportOptions")
-            .field("data_only", &self.data_only)
+            .field("scope", &self.scope)
+            .field("managed_restore", &self.managed_restore)
             .field("include_identity", &self.include_identity)
             .field(
                 "transport_key",
