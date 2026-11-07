@@ -7,6 +7,34 @@ versions.
 
 ## [Unreleased]
 
+## [0.59.1]
+
+### Fixed
+
+- **`project sync --apply --include-pg` into a managed-Postgres (or managed-MySQL) destination now
+  LANDS the data, instead of being refused on the DB member.** Sync drove the managed-DB restore
+  through the schema-less `--data-only` overlay, which the import categorically refuses for a
+  managed binding (an overlay onto a live schema as the bootstrap superuser is an RCE risk). Sync
+  now requests the SAFE path — provision + the non-superuser atomic shadow+swap the `--force` clone
+  already used — so a dedicated managed DB restores via the chunked shadow and a Shared managed pg
+  via the sidecar shadow+swap, with the control-plane KV slice still excluded.
+- **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
+  threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
+  - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql
+    rows + libsql + blobs) vs everything (plus the control-plane KV slice + identity reseal).
+  - **`ManagedRestore` (`Overlay` | `ShadowSwap`)** — HOW managed engine members are dumped+restored:
+    a schema-less `--data-only` overlay (refused for a managed binding) vs a full dump → shadow+swap.
+  The RCE guard is preserved: a genuine `Overlay`-into-managed still refuses fail-closed; only the
+  now-expressible `DataPlane + ShadowSwap` combination (what sync requests) reaches the safe
+  shadow+swap. The bundle manifest records `managed_restore` as a back-compatible `serde` field, so a
+  pre-split bundle reads unchanged (legacy coupling: `data_only → Overlay`, full → `ShadowSwap`).
+- **`project sync`'s dry-run preflight now classifies each carried DB's restore FEASIBILITY**, so an
+  unrestorable database fails in the PLAN (in seconds) rather than at apply: a managed pg (any
+  tenant) or a managed dedicated MySQL carries; an external/BYO binding or a managed Shared-tenant
+  MySQL is `Skip`ped with a clear reason (surfaced by `--strict` and the skipped count).
+- **Stale `project sync` help** calling `--apply` "increment 2 / not-yet-implemented" is corrected —
+  `--apply` shipped in v0.56.0.
+
 ## [0.59.0] - 2026-11-06
 
 ### Added
