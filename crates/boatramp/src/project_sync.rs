@@ -12,9 +12,13 @@
 //! byte moves (construens cap-req #1 "fail fast").
 //!
 //! The classification engine is the pure [`boatramp_core::project_sync`] planner (unit-tested over
-//! seeded fixtures). **Execution (`--apply`) is increment 2** — here it returns a clear
-//! not-yet-implemented message; nothing in this increment transfers data/KV, rewrites a config
-//! body, or provisions an absent destination.
+//! seeded fixtures). The default (no `--apply`) run returns the DRY-RUN PREFLIGHT plan. **`--apply`
+//! EXECUTES the plan** (shipped v0.56.0): it creates + provisions an absent destination, transfers
+//! the data plane (managed-DB contents + blobs) via a `DataPlane` + `ShadowSwap` clone, carries the
+//! selected non-secret control-plane KV strata, and rewrites site configs so the result is coherent.
+//! The preflight also classifies each carried DB's restore FEASIBILITY (managed pg/mysql → carry;
+//! external/BYO or Shared-MySQL → skip-with-reason), so an unrestorable DB fails in the plan, not at
+//! apply.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -572,7 +576,31 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
     let mut source_dbs: Vec<boatramp_core::compute::ApplyDatabase> = Vec::new();
     if let Some(scp) = &source_cp {
         source_dbs = scp.list_databases().await?;
-        inventory.databases = source_dbs.iter().map(|d| d.name.clone()).collect();
+        // Feed the planner the per-DB metadata its restore-FEASIBILITY check needs (engine +
+        // tenancy). Every entry `list_databases` returns is a DECLARED (managed) binding — an
+        // external/BYO (`url_env`) binding is not representable in the `ApplyDatabase` apply surface,
+        // so `managed` is always `true` here; a BYO binding is out-of-scope for a cross-node sync and
+        // is never enumerated. The planner still classifies `managed = false` (external) as a Skip so
+        // it stays complete + unit-testable from a fixture.
+        inventory.databases = source_dbs
+            .iter()
+            .map(|d| project_sync::DbItem {
+                name: d.name.clone(),
+                engine: match d.kind {
+                    boatramp_core::compute::ApplyDatabaseKind::Postgres => {
+                        project_sync::DbEngine::Postgres
+                    }
+                    boatramp_core::compute::ApplyDatabaseKind::Mysql => {
+                        project_sync::DbEngine::Mysql
+                    }
+                },
+                managed: true,
+                shared: matches!(
+                    d.tenant,
+                    boatramp_core::compute::ApplyDatabaseTenant::Shared
+                ),
+            })
+            .collect();
         // Sites: enumerate + read each config for the domain-presence flag. `db_bindings` are left
         // empty (there is no cheap managed-DB-binding extraction from a SiteConfig today) — the
         // set_site_config write still fail-closes on a genuinely incoherent binding at apply time.
@@ -763,8 +791,13 @@ impl CliSyncExecutor {
                 true,  // apply
                 false, // verify
                 true,  // overwrite — sync's data plane is source-authoritative (mirror)
-                false, // force (data-only carries no control-plane KV)
-                true,  // data_only
+                false, // force (data-plane bundle carries no control-plane KV)
+                true,  // data_only == DataPlane scope: no control-plane KV / identity
+                // ShadowSwap is THE fix: a managed pg/mysql member is dumped FULL and restored via
+                // the atomic non-superuser shadow+swap (dedicated → chunked; Shared pg → sidecar
+                // shadow+swap), NOT the schema-less overlay the import categorically refuses for a
+                // managed binding. Orthogonal to the DataPlane scope above.
+                Some(boatramp_core::project_export::ManagedRestore::ShadowSwap),
                 client::MismatchFlags::default(),
             )
             .await

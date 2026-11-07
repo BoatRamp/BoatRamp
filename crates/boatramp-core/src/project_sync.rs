@@ -419,14 +419,91 @@ pub struct SiteItem {
     pub db_bindings: Vec<String>,
 }
 
+/// The engine of a database binding, for the per-DB restore-feasibility classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbEngine {
+    /// Postgres — restores via the atomic non-superuser shadow+swap (dedicated → chunked; Shared →
+    /// sidecar shadow+swap).
+    #[default]
+    Postgres,
+    /// MySQL — restores via shadow+swap ONLY for a dedicated/Single tenant (the chunked arm); a
+    /// Shared-tenant MySQL has no sidecar shadow path.
+    Mysql,
+    /// An engine a sync restore does not know how to shadow+swap.
+    Other,
+}
+
+/// One database in the SOURCE project's inventory — the inputs the per-DB restore-FEASIBILITY check
+/// needs. Deliberately abstract: HOW the engine / managed-ness / tenancy are extracted from the
+/// source is the caller's job, keeping the planner pure + fixture-seedable. NB: a declared managed
+/// DB (`list_databases` / `ApplyDatabase`) is DEFINITIONALLY `managed = true` — the CLI inventory
+/// cannot represent an external/BYO (`url_env`) binding today, so `managed = false` is reachable only
+/// from a fixture (the planner is complete; the real CLI feeds only managed DBs — see the feasibility
+/// classification in [`plan_sync`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbItem {
+    /// The binding name (how a guest reaches it + the `project/<p>/database/<name>` key segment).
+    pub name: String,
+    /// The engine (Postgres / MySQL).
+    pub engine: DbEngine,
+    /// Whether boatramp MANAGES this binding (provisions + seals the credential). `false` = an
+    /// EXTERNAL / bring-your-own-URL binding, which the non-superuser shadow+swap cannot restore (it
+    /// would run on the operator's OWN server — refused by `pg_shadow_plan`).
+    pub managed: bool,
+    /// Whether the tenant isolation is Shared (one server, per-tenant db + role) vs dedicated/Single.
+    pub shared: bool,
+}
+
+impl DbItem {
+    /// A managed, dedicated/Single Postgres binding (the common case the CLI produces).
+    #[must_use]
+    pub fn managed_pg(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            engine: DbEngine::Postgres,
+            managed: true,
+            shared: false,
+        }
+    }
+
+    /// Why this DB CANNOT be restored by a sync (so the preflight classifies it `Skip` with this
+    /// reason, surfaced by `--strict` + the skipped count) — or `None` when it is feasible
+    /// (restorable via the shadow+swap this fix routes managed members through). Managed pg (any
+    /// tenant) and managed dedicated MySQL are feasible; an external/BYO binding, a Shared MySQL, or
+    /// an unknown engine is not.
+    #[must_use]
+    pub fn infeasible_reason(&self) -> Option<String> {
+        if !self.managed {
+            return Some(
+                "external / bring-your-own-URL binding — the non-superuser shadow+swap cannot run \
+                 on the operator's own server; provision + replicate it out of band"
+                    .to_string(),
+            );
+        }
+        match self.engine {
+            DbEngine::Other => {
+                Some("unsupported managed engine for a sync shadow+swap restore".to_string())
+            }
+            DbEngine::Mysql if self.shared => Some(
+                "managed Shared-tenant MySQL has no sidecar shadow+swap path — only a \
+                 dedicated/Single MySQL restores via the atomic chunked shadow; declare it \
+                 dedicated to sync its data"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+}
+
 /// The SOURCE project's inventory the preflight classifies. Only the fields a given selection
 /// touches need be populated; an empty inventory yields a piece-level plan with no item rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncInventory {
     /// The source's sites (for the [`Piece::Sites`] per-item classification).
     pub sites: Vec<SiteItem>,
-    /// The source's declared managed databases (for [`Piece::Databases`] + the site coherence check).
-    pub databases: Vec<String>,
+    /// The source's declared databases, with the per-DB metadata the restore-feasibility check needs
+    /// (for [`Piece::Databases`] + the site coherence check).
+    pub databases: Vec<DbItem>,
 }
 
 /// The DESTINATION's observed state — the precondition the preflight reports up front. `Absent`
@@ -650,13 +727,18 @@ pub fn plan_sync(
     let sites_included = selection.includes(Piece::Sites);
 
     // A DB is "present on the destination after this sync" iff it is already on the dest, OR this
-    // sync carries it (databases included, the source declares it, and it is not per-item excluded).
+    // sync carries it (databases included, the source declares it as a FEASIBLE restore, and it is
+    // not per-item excluded). An INFEASIBLE DB (external/BYO, Shared MySQL, …) is NOT carried, so a
+    // site binding it is correctly judged incoherent (its reason surfaces on the DB row).
     let db_present_after = |name: &str| -> bool {
         if dest_dbs.contains(name) {
             return true;
         }
         databases_included
-            && inventory.databases.iter().any(|d| d == name)
+            && inventory
+                .databases
+                .iter()
+                .any(|d| d.name == name && d.infeasible_reason().is_none())
             && !selection.exclude_dbs.contains(name)
     };
 
@@ -717,17 +799,30 @@ pub fn plan_sync(
 
     if databases_included {
         for db in &inventory.databases {
-            if selection.exclude_dbs.contains(db) {
+            if selection.exclude_dbs.contains(&db.name) {
                 items.push(ItemPlan {
                     kind: ItemKind::Database,
-                    name: db.clone(),
+                    name: db.name.clone(),
                     disposition: Disposition::Drop,
                     reason: Some("dropped by --exclude-db".into()),
                 });
-            } else {
+            } else if let Some(reason) = db.infeasible_reason() {
+                // FEASIBILITY preflight (fail in the PLAN, not at apply): a DB whose restore the
+                // sync cannot perform (external/BYO binding, Shared MySQL, unknown engine) is SKIPPED
+                // with its reason — surfaced by `--strict` + the skipped count, so the operator sees
+                // it up front rather than hitting the node's late apply-time refusal.
                 items.push(ItemPlan {
                     kind: ItemKind::Database,
-                    name: db.clone(),
+                    name: db.name.clone(),
+                    disposition: Disposition::Skip,
+                    reason: Some(reason),
+                });
+            } else {
+                // Feasible: a managed pg (any tenant) or a managed dedicated MySQL — carried and
+                // restored via the provision + non-superuser shadow+swap (post-fix).
+                items.push(ItemPlan {
+                    kind: ItemKind::Database,
+                    name: db.name.clone(),
                     disposition: Disposition::Carry,
                     reason: None,
                 });
@@ -1506,7 +1601,7 @@ mod tests {
                     db_bindings: vec!["ghostdb".into()],
                 },
             ],
-            databases: vec!["maindb".into()],
+            databases: vec![DbItem::managed_pg("maindb")],
         }
     }
 
@@ -1568,6 +1663,133 @@ mod tests {
         assert_eq!(legacy.disposition, Disposition::Carry);
         assert_eq!(plan.skipped_count(), 0);
         assert_eq!(plan.dest, DestPrecondition::Exists);
+    }
+
+    /// FEASIBILITY preflight (fail in the PLAN, in seconds): classify each carried DB by whether a
+    /// sync can restore it. A managed pg (any tenant) and a managed DEDICATED MySQL are feasible →
+    /// Carry; an EXTERNAL/BYO binding, a managed SHARED MySQL, and an unknown engine are NOT →
+    /// `Disposition::Skip` with a clear reason (so `--strict` + the skipped count surface it rather
+    /// than the node's late apply-time refusal). Pure `plan_sync` over a seeded fixture — the real
+    /// CLI inventory only ever carries managed DBs (BYO is not representable in `list_databases`),
+    /// but the planner is complete, so the external case is exercised here from the fixture.
+    #[test]
+    fn plan_sync_classifies_db_restore_feasibility() {
+        let selection = sel(SelectionInput {
+            include: [Piece::Databases].into_iter().collect(),
+            identity_fresh: true,
+            ..Default::default()
+        });
+        let inventory = SyncInventory {
+            sites: vec![],
+            databases: vec![
+                // Feasible: managed pg dedicated.
+                DbItem::managed_pg("pg_dedicated"),
+                // Feasible: managed pg Shared (Shared pg restores via the sidecar shadow+swap).
+                DbItem {
+                    name: "pg_shared".into(),
+                    engine: DbEngine::Postgres,
+                    managed: true,
+                    shared: true,
+                },
+                // Feasible: managed MySQL dedicated (the chunked shadow arm).
+                DbItem {
+                    name: "my_dedicated".into(),
+                    engine: DbEngine::Mysql,
+                    managed: true,
+                    shared: false,
+                },
+                // Infeasible: managed MySQL Shared (no sidecar shadow+swap path).
+                DbItem {
+                    name: "my_shared".into(),
+                    engine: DbEngine::Mysql,
+                    managed: true,
+                    shared: true,
+                },
+                // Infeasible: external / BYO binding (shadow+swap can't run on the operator's server).
+                DbItem {
+                    name: "byo".into(),
+                    engine: DbEngine::Postgres,
+                    managed: false,
+                    shared: false,
+                },
+            ],
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let disp = |name: &str| plan.items.iter().find(|i| i.name == name).unwrap();
+        assert_eq!(disp("pg_dedicated").disposition, Disposition::Carry);
+        assert_eq!(disp("pg_shared").disposition, Disposition::Carry);
+        assert_eq!(disp("my_dedicated").disposition, Disposition::Carry);
+        // The two infeasible DBs are SKIPPED with a reason.
+        let my_shared = disp("my_shared");
+        assert_eq!(my_shared.disposition, Disposition::Skip);
+        assert!(my_shared.reason.as_deref().unwrap().contains("Shared"));
+        let byo = disp("byo");
+        assert_eq!(byo.disposition, Disposition::Skip);
+        assert!(byo.reason.as_deref().unwrap().contains("external"));
+        // Exactly the two infeasible DBs are skipped; `--strict` would refuse the whole run.
+        assert_eq!(plan.skipped_count(), 2);
+        assert!(
+            sel(SelectionInput {
+                include: [Piece::Databases].into_iter().collect(),
+                identity_fresh: true,
+                strict: true,
+                ..Default::default()
+            })
+            .strict
+        );
+        let strict_plan = plan_sync(
+            &sel(SelectionInput {
+                include: [Piece::Databases].into_iter().collect(),
+                identity_fresh: true,
+                strict: true,
+                ..Default::default()
+            }),
+            &inventory,
+            &DestState::Absent,
+            "src",
+            "dst",
+        );
+        assert!(strict_plan.is_refused());
+    }
+
+    /// A SITE binding an INFEASIBLE database is itself incoherent — the DB won't land, so the site
+    /// would serve a dangling binding. The coherence check treats an infeasible (skipped) DB as
+    /// NOT-present-after, so the site skips too.
+    #[test]
+    fn plan_sync_site_binding_an_infeasible_db_skips() {
+        let selection = sel(SelectionInput {
+            include: [Piece::Sites, Piece::Databases, Piece::Domains]
+                .into_iter()
+                .collect(),
+            identity_fresh: true,
+            ..Default::default()
+        });
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: false,
+                db_bindings: vec!["byo".into()],
+            }],
+            databases: vec![DbItem {
+                name: "byo".into(),
+                engine: DbEngine::Postgres,
+                managed: false,
+                shared: false,
+            }],
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let web = plan
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Site && i.name == "web")
+            .unwrap();
+        assert_eq!(web.disposition, Disposition::Skip);
+        let byo = plan
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Database && i.name == "byo")
+            .unwrap();
+        assert_eq!(byo.disposition, Disposition::Skip);
     }
 
     #[test]
@@ -1792,7 +2014,7 @@ mod tests {
                 has_domains: true,
                 db_bindings: vec!["maindb".into()],
             }],
-            databases: vec!["maindb".into()],
+            databases: vec![DbItem::managed_pg("maindb")],
         };
         let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
         let mut exec = FakeExecutor {
