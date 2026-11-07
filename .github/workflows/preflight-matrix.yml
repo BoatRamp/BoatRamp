@@ -394,15 +394,16 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 17 live/always-on tests + the 1 pure-unit URL-parser + the 1
-          # pure-unit WAL-render-inertness test must ALL actually run (both live DBs reachable,
-          # docker usable for the ephemeral client containers) — a self-skip (unset env /
-          # unreachable docker) still prints `test result: ok`, so require the exact passed-count
-          # AND every one of the file's success markers below. (The libsql true-delta + its CHAIN
-          # gate are `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features
-          # project-export` build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 20 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 20 tests (silent skip or failure?)" >&2; exit 1; }
+          # HARD gate: the file's 19 live/always-on tests (incl. the v0.59.1 managed-pg
+          # `project_sync_managed_pg_shadow_land_live` gate) + the 2 pure-unit tests (URL-parser,
+          # WAL-render-inertness) = 21 must ALL actually run (both live DBs reachable, docker usable
+          # for the ephemeral client containers) — a self-skip (unset env / unreachable docker) still
+          # prints `test result: ok`, so require the exact passed-count AND every one of the file's
+          # success markers below. (The libsql true-delta + its CHAIN gate are
+          # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
+          # build, so they are NOT in this count — they gate in capability.yml.)
+          grep -qE 'test result: ok\. 21 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 21 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
