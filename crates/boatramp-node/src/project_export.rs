@@ -6674,7 +6674,7 @@ impl NodeProjectExport {
         // `mysqldump_views_invocation`, REFUSE any name that is not a plausible, safe identifier —
         // reject a leading `-` (argument-injection: `--all-databases` dumps every tenant, `--host=…`
         // redirects the superuser credential) and anything carrying a control character (which would
-        // also mis-split the newline-delimited enumeration) or ASCII punctuation/space that is not a
+        // also corrupt the newline-delimited enumeration) or ASCII punctuation/space that is not a
         // normal mysql identifier char (`_`/`$`/alphanumeric/non-ASCII allowed). Abort the whole
         // restore — never silently skip a rejected object.
         if let Some(bad) = views.iter().find(|v| !is_safe_mysql_object_name(v)) {
