@@ -29,19 +29,28 @@ versions.
   simpler than the Shared-pg path. The engine-agnostic sidecar-apply classifier (renamed
   `sidecar_managed_apply`) now routes both the pg and mysql sidecar arms; the RCE guard is preserved
   (a genuine `Overlay`-into-managed-MySQL stays refused fail-closed).
-- **Managed MySQL sync/clone now carries triggers, stored routines, and scheduled events** (both the
-  dedicated chunked and the Shared sidecar path), restored SAFELY as a non-privileged user. The
-  staged dump adds `--routines --events` (triggers are mysqldump's default), and the driver rewrites
-  every `DEFINER=` clause to the ephemeral apply user before applying — so the objects create under
-  the non-superuser restore (a non-SUPER user cannot create an object with a foreign `DEFINER`). The
-  rewrite is precise: it only touches mysqldump executable-comment lines (`/*!… DEFINER=…*/`), never
-  row data or a routine body containing the text "DEFINER=". After the atomic swap the driver
-  re-points each carried object's `DEFINER` to the tenant's OWN db-scoped login role (Shared) — or
-  strips it to the served identity (dedicated) — via drop+recreate as the admin (MySQL has no
-  `ALTER … DEFINER`). SECURITY INVARIANTS: the apply user never gains SUPER/SET_USER_ID; the
-  re-pointed DEFINER is ONLY ever the tenant's own role (a malicious object body then runs with the
-  tenant's own grants — its own risk, never cross-tenant or server-wide); an object requiring a
-  privilege the tenant role lacks fails the import fail-closed rather than escalating.
+- **Managed MySQL sync/clone now carries triggers, stored routines, scheduled events, and views**
+  (both the dedicated chunked and the Shared sidecar path), restored SAFELY as a non-privileged user.
+  The staged dump adds `--routines --events` (triggers are mysqldump's default; views are captured by
+  name post-restore), and the driver rewrites every `DEFINER=` clause to the ephemeral apply user
+  before applying — so the objects create under the non-superuser restore (a non-SUPER user cannot
+  create an object with a foreign `DEFINER`). The rewrite is precise: it re-points only the ONE
+  structural object-definer per line — a stored PROCEDURE/FUNCTION definer on a plain
+  `CREATE DEFINER=… {PROCEDURE|FUNCTION}` header AND a trigger/event/view definer inside a
+  `/*!… DEFINER=…*/` comment — and never a `DEFINER=` inside row data or a routine body. After the
+  atomic swap the driver re-points each carried object's `DEFINER` to the tenant's OWN db-scoped login
+  role (Shared) — or strips it to the served identity (dedicated) — via drop+recreate as the admin
+  (MySQL has no `ALTER … DEFINER`; triggers/routines/events/views are re-created in the live db since
+  routines/events/views do not ride `RENAME TABLE` and a trigger blocks a cross-schema rename).
+  REQUIREMENT: on a binary-logging server MySQL 8.0 refuses a non-SUPER `CREATE TRIGGER`/
+  `CREATE FUNCTION` (ERROR 1419) unless `log_bin_trust_function_creators=ON`, so the managed-mysqld
+  spec now bakes that on alongside `--log-bin` (benign under `--binlog-format=ROW`; a managed server
+  launched before this change must relaunch to adopt it). SECURITY INVARIANTS: the apply user never
+  gains SUPER/SET_USER_ID (and `trust_function_creators` does NOT grant foreign-DEFINER ability, which
+  stays gated by `SET_USER_ID`, so the DEFINER rewrite is still load-bearing); the re-pointed DEFINER
+  is ONLY ever the tenant's own role (a malicious object body then runs with the tenant's own grants —
+  its own risk, never cross-tenant or server-wide); an object requiring a privilege the tenant role
+  lacks fails the import fail-closed rather than escalating.
 - **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
   threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
   - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql

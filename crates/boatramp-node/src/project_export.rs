@@ -88,8 +88,8 @@ use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
     mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
     mysqldump_definer_objects_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
-    pg_dump_invocation, pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major,
-    psql_invocation, psql_script_invocation,
+    mysqldump_views_invocation, pg_dump_invocation, pg_restore_invocation,
+    pg_restore_shadow_invocation, pg_server_major, psql_invocation, psql_script_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -2190,70 +2190,118 @@ impl MysqlShadowPlan {
     }
 }
 
-/// Rewrite every mysqldump `DEFINER=`user`@`host`` clause in `sql` to `target`, PRECISELY and
-/// SAFELY. The crux of the DEFINER-handling security story, so the matching is deliberately narrow:
+/// Rewrite the STRUCTURAL mysqldump `DEFINER=`user`@`host`` clause of each object definition in
+/// `sql` to `target`, PRECISELY and SAFELY. The crux of the DEFINER-handling security story, so the
+/// matching is deliberately narrow — it rewrites a DEFINER clause ONLY where mysqldump actually emits
+/// an object's definer, in two forms, and ONLY the ONE structural clause per line (never a DEFINER
+/// that appears later on the same line inside a trigger/routine BODY or a string literal):
 ///
-/// 1. **Only mysqldump executable-comment lines** (a line whose first non-whitespace is `/*!`) are
-///    touched. Every REAL `DEFINER=` clause mysqldump emits for a trigger/routine/event/view lives
-///    inside a `/*!NNNNN DEFINER=…*/` version-gated comment on such a line. An `INSERT … VALUES`
-///    data line starts with `INSERT` (and mysqldump escapes newlines in string data, so a value can
-///    never span lines to masquerade as a `/*!` line), so a string literal containing the TEXT
-///    "DEFINER=" is NEVER rewritten — the explicit "do not corrupt body text / string literals"
-///    requirement. (A routine BODY line between `BEGIN`/`END` does not start with `/*!` either.)
-/// 2. **Only the exact `DEFINER=`‹quoted-ident›`@`‹quoted-ident›`` shape** is replaced (backtick
-///    quoting, doubled `` `` `` for a literal backtick) — the shape mysqldump/`SHOW CREATE` always
-///    emit. A `DEFINER=` not in that shape is copied through untouched.
+/// 1. **A mysqldump executable-comment line** (first non-whitespace is `/*!`). A TRIGGER's, EVENT's,
+///    and VIEW's definer rides inside a `/*!NNNNN DEFINER=…*/` version-gated comment that is the
+///    FIRST `DEFINER=` on the line (the object body/select text, which could contain the literal
+///    "DEFINER=", comes AFTER it on the line, or on later lines — and is left untouched).
+/// 2. **A plain top-level `CREATE [OR REPLACE] [ALGORITHM=…] DEFINER=… {PROCEDURE|FUNCTION|VIEW|
+///    TRIGGER|EVENT}` statement line.** mysqldump emits a stored PROCEDURE/FUNCTION (and a plain-form
+///    VIEW) definer OUTSIDE any `/*!…*/` wrapper — `CREATE DEFINER=`root`@`%` PROCEDURE …` — because
+///    the body must execute. The structural prefix (`CREATE`, then only `OR REPLACE` / `ALGORITHM=…`
+///    before `DEFINER=`) is matched, so this fires ONLY on a real object header, never on an
+///    `INSERT …`/`SET …` data line or a routine BODY line (which do not start with that prefix).
 ///
-/// The rewrite can only ever REDUCE privilege (point at the least-privilege apply user, or the
-/// tenant's own role, or strip to the issuer) — it never raises it — so even a crafted edge that
-/// slipped a DEFINER through would at worst fail the non-superuser restore FAIL-CLOSED, never
-/// escalate. `SQL SECURITY DEFINER` is deliberately LEFT INTACT: safety comes from the re-pointed
-/// DEFINER being the tenant's own db-scoped role (or the served identity on a single-tenant server),
-/// so DEFINER semantics run strictly within the tenant's own authority.
+/// In BOTH forms, only the exact `DEFINER=`‹quoted-ident›`@`‹quoted-ident›`` shape (backtick quoting,
+/// doubled `` `` `` for a literal backtick — the shape mysqldump/`SHOW CREATE` always emit) is
+/// replaced; a `DEFINER=` not in that shape is copied through. The rewrite can only ever REDUCE
+/// privilege (point at the least-privilege apply user, the tenant's own role, or strip to the
+/// issuer) — never raise it — so even a crafted edge that slipped a DEFINER through would at worst
+/// fail the non-superuser restore FAIL-CLOSED, never escalate. `SQL SECURITY DEFINER` is deliberately
+/// LEFT INTACT: safety rides the re-pointed DEFINER being the tenant's own db-scoped role (or the
+/// served identity on a single-tenant server), so DEFINER semantics run within the tenant's authority.
 fn rewrite_mysql_definers(sql: &str, target: &MysqlDefinerTarget) -> String {
     let mut out = String::with_capacity(sql.len());
     for line in sql.split_inclusive('\n') {
-        if line.trim_start().starts_with("/*!") && line.contains("DEFINER=") {
-            rewrite_definer_clauses_in_line(line, target, &mut out);
-        } else {
-            out.push_str(line);
+        match structural_definer_offset(line) {
+            Some(off) => rewrite_one_definer_clause_at(line, off, target, &mut out),
+            None => out.push_str(line),
         }
     }
     out
 }
 
-/// Rewrite every well-formed `DEFINER=`u`@`h`` clause on ONE line into `out`.
-fn rewrite_definer_clauses_in_line(line: &str, target: &MysqlDefinerTarget, out: &mut String) {
-    let mut rest = line;
-    while let Some(pos) = rest.find("DEFINER=") {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + "DEFINER=".len()..];
-        match mysql_definer_account_len(after) {
-            Some(consumed) => {
-                match target {
-                    MysqlDefinerTarget::Account(name) => {
-                        out.push_str("DEFINER=");
-                        out.push_str(&quote_ident(ExternalSqlKind::Mysql, name));
-                        out.push_str("@`%`");
-                        rest = &after[consumed..];
-                    }
-                    MysqlDefinerTarget::Strip => {
-                        // Drop the clause AND a single trailing space, so `/*!50017 DEFINER=…*/`
-                        // collapses to `/*!50017 */` (not a stray double space).
-                        let next = &after[consumed..];
-                        rest = next.strip_prefix(' ').unwrap_or(next);
-                    }
-                }
-            }
-            None => {
-                // A `DEFINER=` not in the exact backtick-quoted shape — copy it through verbatim and
-                // keep scanning after it (never corrupt text we do not recognize).
+/// The byte offset within `line` of the ONE structural object-definer `DEFINER=` to rewrite, or
+/// `None` if this line carries no object definer. Handles both the `/*!…*/` comment form (trigger/
+/// event/view) and the plain `CREATE [OR REPLACE] [ALGORITHM=…] DEFINER=…` statement form (stored
+/// routine / plain view). Never matches a `DEFINER=` inside row data, a body, or a string literal.
+fn structural_definer_offset(line: &str) -> Option<usize> {
+    let ws = line.len() - line.trim_start().len();
+    let t = &line[ws..];
+    if t.starts_with("/*!") {
+        // The object's definer is the FIRST `DEFINER=` on a mysqldump version-comment line (the
+        // `CREATE*/` preamble before it carries none; the body/select AFTER it we must not touch).
+        return line.find("DEFINER=");
+    }
+    // A plain top-level CREATE-with-DEFINER object header (stored PROCEDURE/FUNCTION, plain VIEW).
+    plain_create_definer_offset(t).map(|off| ws + off)
+}
+
+/// If the whitespace-trimmed line `t` is a top-level `CREATE [OR REPLACE] [ALGORITHM=<token>]
+/// DEFINER=…` object header, return the byte offset (within `t`) of `DEFINER=`. ONLY `OR REPLACE` and
+/// `ALGORITHM=<token>` may sit between `CREATE` and `DEFINER=`, so a routine BODY line, a `SET …`
+/// save/restore line, or an `INSERT …` data line (none of which start with this exact prefix) is
+/// never matched — the structural guard the security review relies on.
+fn plain_create_definer_offset(t: &str) -> Option<usize> {
+    let rest = t.strip_prefix("CREATE")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    if let Some(r) = rest.strip_prefix("OR REPLACE") {
+        if !r.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest = r.trim_start();
+    }
+    if let Some(r) = rest.strip_prefix("ALGORITHM=") {
+        // Consume the algorithm token (UNDEFINED/MERGE/TEMPTABLE) up to the next whitespace.
+        let after = r.trim_start_matches(|c: char| !c.is_whitespace());
+        if after.len() == r.len() {
+            return None; // no token consumed — malformed
+        }
+        rest = after.trim_start();
+    }
+    rest.starts_with("DEFINER=").then(|| t.len() - rest.len())
+}
+
+/// Rewrite the single `DEFINER=` clause at byte offset `off` in `line` into `out`, copying the rest
+/// of the line verbatim. Only the exact backtick-quoted `` `u`@`h` `` shape is replaced.
+fn rewrite_one_definer_clause_at(
+    line: &str,
+    off: usize,
+    target: &MysqlDefinerTarget,
+    out: &mut String,
+) {
+    out.push_str(&line[..off]);
+    let after = &line[off + "DEFINER=".len()..];
+    match mysql_definer_account_len(after) {
+        Some(consumed) => match target {
+            MysqlDefinerTarget::Account(name) => {
                 out.push_str("DEFINER=");
-                rest = after;
+                out.push_str(&quote_ident(ExternalSqlKind::Mysql, name));
+                out.push_str("@`%`");
+                out.push_str(&after[consumed..]);
             }
+            MysqlDefinerTarget::Strip => {
+                // Drop the clause AND a single trailing space, so `/*!50017 DEFINER=…*/` collapses to
+                // `/*!50017 */` and `CREATE DEFINER=…`@`…` PROCEDURE …` to `CREATE PROCEDURE …`.
+                let rest = &after[consumed..];
+                out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            }
+        },
+        None => {
+            // A `DEFINER=` not in the exact backtick-quoted shape — copy it through verbatim (never
+            // corrupt text we do not recognize).
+            out.push_str("DEFINER=");
+            out.push_str(after);
         }
     }
-    out.push_str(rest);
 }
 
 /// If `s` begins with a complete `` `user`@`host` `` MySQL account spec (each a backtick-quoted
@@ -6360,12 +6408,25 @@ impl NodeProjectExport {
         // keeping the `__shadow_<suffix>` distinguisher intact — latent overflow for a long db name.
         let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_user = format!("brexp_apply_{suffix}");
-        // The post-swap DEFINER re-point target for carried triggers/routines/events. For a SHARED
-        // NON-default tenant this is the tenant's OWN db-scoped login role (`` `<role>`@`%` ``) — the
-        // same role the runtime serves the tenant's db as, so a carried object runs with exactly the
-        // tenant's own grants, never SUPER/cross-tenant. For Single/dedicated + Shared-DEFAULT there
-        // is no separate per-tenant role (the configured/served user owns the whole server), so the
-        // clause is STRIPPED and defaults to the admin that re-creates it (the served identity).
+        // The post-swap DEFINER re-point target for carried triggers/routines/events/views. For a
+        // SHARED NON-default tenant this is the tenant's OWN db-scoped login role (`` `<role>`@`%` ``)
+        // — the same role the runtime serves the tenant's db as, so a carried object runs with exactly
+        // the tenant's own grants, never SUPER/cross-tenant.
+        //
+        // For the two NON-shared-nondefault cases `Strip` removes the clause so the DEFINER defaults
+        // to the ADMIN connection that re-creates it, and what that admin IS differs by posture:
+        //   - SINGLE / dedicated: the admin IS the tenant's own served app user (its dedicated
+        //     server), so Strip re-points to the SAME identity the app already connects as — it grants
+        //     the object NO authority the tenant's app doesn't already hold on its own server.
+        //   - SHARED-DEFAULT (the plain install's default tenant): the admin is the cluster SUPERUSER,
+        //     so Strip defaults the DEFINER to that superuser. This is NOT a cross-tenant escalation
+        //     (the default tenant IS the operator-owned install, there is no OTHER tenant whose data it
+        //     could reach via its own server-wide privileges), but it is broader than a db-scoped role.
+        // LOW-3 regression note (security follow-up): if a lower-privilege per-replica RUNTIME login
+        // role is ever introduced for Single/dedicated (as the pg Phase-2 dynamic-role work does),
+        // switch THAT posture's re-point from `Strip` to `Account(<runtime_role>)` here — otherwise
+        // Strip-to-the-admin would silently become an escalation relative to that new, narrower runtime
+        // identity. (Today Single/dedicated genuinely has no narrower role, so Strip is correct.)
         let (tenant_ident_raw, is_default) =
             crate::tenant_sql::tenant_key(cfg.tenant_scope, project, "");
         let shared_nondefault =
@@ -6507,24 +6568,29 @@ impl NodeProjectExport {
         Ok(())
     }
 
-    /// Finalize a populated shadow: carry its DEFINER-bearing objects (triggers/stored routines/
-    /// events) across the atomic swap with their `DEFINER` RE-POINTED to the tenant's own role.
-    /// Shared by BOTH the sidecar and the dedicated chunked mysql paths (ONE DEFINER-handling seam).
+    /// Finalize a populated shadow: carry its DEFINER-bearing objects (triggers / stored routines /
+    /// events / VIEWS) across the atomic swap with their `DEFINER` RE-POINTED to the tenant's own
+    /// role. Shared by BOTH the sidecar and the dedicated chunked mysql paths (ONE DEFINER-handling
+    /// seam).
     ///
     /// The mechanics MySQL forces on us: a trigger blocks a cross-schema `RENAME TABLE` (ERROR 1435
-    /// "Trigger in wrong schema"), and stored routines + events are SCHEMA-level — they do NOT ride
-    /// `RENAME TABLE` at all and would be lost when the shadow db is dropped. So, in order:
+    /// "Trigger in wrong schema"), and stored routines + events + views are SCHEMA-level — they do
+    /// NOT ride `RENAME TABLE` at all and would be lost when the shadow db is dropped. So, in order:
     ///   1. CAPTURE the objects as clean DDL from the shadow (they exist there with `DEFINER` = the
     ///      ephemeral apply user, having proven they are creatable by a non-superuser — fail-closed
-    ///      otherwise). Done BEFORE the swap (the swap drops the shadow).
+    ///      otherwise). Routines/events/triggers in one dump; VIEWS by name in a second (a
+    ///      `--no-create-info` dump drops views). Done BEFORE the swap (the swap drops the shadow).
     ///   2. DROP the shadow's triggers (so the `RENAME TABLE` swap won't hit error 1435).
     ///   3. Atomic `RENAME TABLE` swap — the base tables move shadow→live; the shadow db + ephemeral
     ///      user are dropped.
     ///   4. RE-CREATE the captured objects in LIVE via the ADMIN connection, with every `DEFINER`
     ///      re-pointed (`plan.repoint`) to the tenant's own db-scoped role (Shared) or stripped to the
-    ///      admin/served identity (dedicated). The admin sets the definer; the object itself is only
-    ///      stored (CREATE does not run a routine/trigger/event body), and when it later runs it runs
-    ///      with the re-pointed definer's grants — the tenant's own, never SUPER/another tenant.
+    ///      admin/served identity (dedicated) — ROUTINES/EVENTS/TRIGGERS first, then VIEWS (a view's
+    ///      referenced tables/functions/views must already exist; a routine's references resolve
+    ///      lazily at call time, so routines-first is safe, and the view dump is internally
+    ///      dependency-ordered). The admin sets the definer; the object itself is only stored (CREATE
+    ///      does not run a body), and when it later runs it runs with the re-pointed definer's
+    ///      grants — the tenant's own, never SUPER/another tenant.
     ///
     /// A pre-swap failure leaves live intact; a post-swap re-create failure is LOUD (the tables are
     /// live but the carried objects did not land) — the same loud-but-live shape the pg shared
@@ -6535,17 +6601,72 @@ impl NodeProjectExport {
         stage_dir: &Path,
     ) -> Result<(), Perr> {
         let objects_sql = self.mysql_dump_definer_objects(plan, stage_dir).await?;
-        // A dump with no trigger/routine/event carries no `DEFINER=` clause at all.
-        let has_definer_objects = objects_sql.contains("DEFINER=");
-        if has_definer_objects {
+        let views_sql = self.mysql_dump_shadow_views(plan, stage_dir).await?;
+        // A dump with no trigger/routine/event/view carries no `DEFINER=` clause at all.
+        let has_objects = objects_sql.contains("DEFINER=");
+        let has_views = views_sql.contains("DEFINER=");
+        if has_objects {
+            // Only triggers block the cross-schema RENAME; drop them (routines/events/views do not).
             self.mysql_drop_shadow_triggers(plan, stage_dir).await?;
         }
         self.mysql_swap_shadow(plan, stage_dir).await?;
-        if has_definer_objects {
+        if has_objects {
             self.mysql_apply_definer_objects_to_live(plan, &objects_sql, stage_dir)
                 .await?;
         }
+        if has_views {
+            // Views LAST — their referenced tables (now live) + any functions (created above) exist.
+            self.mysql_apply_definer_objects_to_live(plan, &views_sql, stage_dir)
+                .await?;
+        }
         Ok(())
+    }
+
+    /// Re-extract the shadow's VIEWS as CREATE-VIEW DDL (DEFINER-bearing, dependency-ordered) via the
+    /// admin connection. Views are suppressed by `--no-create-info`, so they are captured by NAME
+    /// ([`mysqldump_views_invocation`]) — enumerated from `information_schema.views`. Returns an EMPTY
+    /// string when the shadow has no views (so the caller skips the view re-create entirely — never
+    /// runs a bare `mysqldump <db>` that would dump the whole database).
+    async fn mysql_dump_shadow_views(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<String, Perr> {
+        let sql = format!(
+            "SELECT table_name FROM information_schema.views WHERE table_schema = {};",
+            mysql_lit(&plan.shadow_db)
+        );
+        let (code, out) = self.mysql_run_admin(plan, &sql, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not list views of {:?} (exit {code}): {out}",
+                plan.shadow_db
+            )));
+        }
+        let views: Vec<String> = out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if views.is_empty() {
+            return Ok(String::new());
+        }
+        let inv = mysqldump_views_invocation(&plan.maint, &plan.shadow_db, &views);
+        let outfile = stage_dir.join(format!("myviews-{}.sql", shadow_suffix()));
+        let code = self
+            .run_sql_client(&plan.image, &inv.argv, &inv.env, None, &outfile)
+            .await?;
+        let content = tokio::fs::read_to_string(&outfile)
+            .await
+            .unwrap_or_default();
+        let _ = tokio::fs::remove_file(&outfile).await;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not capture view DDL of {:?} (exit {code})",
+                plan.shadow_db
+            )));
+        }
+        Ok(content)
     }
 
     /// Re-extract the shadow's DEFINER-bearing objects (triggers/routines/events) as clean,
@@ -6617,12 +6738,13 @@ impl NodeProjectExport {
         Ok(())
     }
 
-    /// Re-create the captured DEFINER objects in the LIVE (swapped-in) db via the ADMIN connection,
-    /// with every `DEFINER` RE-POINTED to the tenant's own role (`plan.repoint`). The attacker-shaped
-    /// object BODIES are only stored here (CREATE does not execute a routine/trigger/event body); when
-    /// they later run they run with the re-pointed definer's grants — the tenant's own db-scoped role
-    /// (Shared) or the served identity (dedicated), NEVER SUPER or another tenant. A missing-privilege
-    /// object fails this step FAIL-CLOSED (loud) rather than escalating.
+    /// Re-create a captured DEFINER-object DDL batch (routines/events/triggers, OR views) in the LIVE
+    /// (swapped-in) db via the ADMIN connection, with every `DEFINER` RE-POINTED to the tenant's own
+    /// role (`plan.repoint`). The attacker-shaped object BODIES are only stored here (CREATE does not
+    /// execute a routine/trigger/event/view body); when they later run they run with the re-pointed
+    /// definer's grants — the tenant's own db-scoped role (Shared) or the served identity (dedicated),
+    /// NEVER SUPER or another tenant. A missing-privilege object fails this step FAIL-CLOSED (loud)
+    /// rather than escalating.
     async fn mysql_apply_definer_objects_to_live(
         &self,
         plan: &MysqlShadowPlan,
@@ -6631,13 +6753,20 @@ impl NodeProjectExport {
     ) -> Result<(), Perr> {
         let rewritten = rewrite_mysql_definers(objects_sql, &plan.repoint);
         // The DDL is unqualified (positional-db dump), so `USE` the live db to land it there.
+        // TODO(security follow-up, LOW-1): this re-create runs over the full maint/superuser admin
+        // connection. CREATE never executes an object body, and the DEFINER is re-pointed to the
+        // tenant's own role (so run-time authority is tenant-scoped), so the only residual surface is
+        // a hypothetical create-TIME MySQL-parser breakout on the attacker-shaped DDL. To shrink that
+        // blast radius we could mint a one-shot role holding ONLY `SET_USER_ID` (enough to set a
+        // foreign DEFINER) + the tenant db's grants, and run this apply as it instead of the superuser.
         let live_q = quote_ident(ExternalSqlKind::Mysql, &plan.live_db);
         let script = format!("USE {live_q};\n{rewritten}");
         let (code, out) = self.mysql_run_admin(plan, &script, stage_dir).await?;
         if code != 0 {
             return Err(Perr::Other(format!(
-                "mysql shadow: could not re-create trigger/routine/event objects in live {:?} \
-                 (exit {code}); the tables swapped in but the carried objects did not land: {out}",
+                "mysql shadow: could not re-create carried trigger/routine/event/view objects in \
+                 live {:?} (exit {code}); the tables swapped in but the carried objects did not \
+                 land: {out}",
                 plan.live_db
             )));
         }
@@ -10611,72 +10740,120 @@ mod tests {
         );
     }
 
-    /// The SECURITY-load-bearing DEFINER rewrite: `rewrite_mysql_definers` must re-point EVERY
-    /// mysqldump `DEFINER=`u`@`h`` clause (trigger/routine/event/view) and NEVER touch row data or a
-    /// routine body — so a crafted string literal containing "DEFINER=" is left untouched. Mutation
-    /// proof: flip any matching rule (drop the `/*!`-line guard, or the exact backtick-shape parse)
-    /// and one of these cases fails.
+    /// The SECURITY-load-bearing DEFINER rewrite, against REAL `mysqldump --routines --events` output
+    /// (NOT fabricated): it must re-point EVERY object's own definer — a stored PROCEDURE's and
+    /// FUNCTION's definer are on a PLAIN `CREATE DEFINER=…` line (NO `/*!…*/` wrapper, because the
+    /// body executes), while a TRIGGER's/EVENT's/VIEW's definer rides a `/*!…*/` comment — and NEVER
+    /// touch row data or a routine body (a string literal containing "DEFINER=" stays). Mutation
+    /// proof: the old `/*!`-only matcher leaves the procedure+function definers as `root@%`, so the
+    /// non-superuser restore would hit ERROR 1227 — exactly the live regression this replaces. These
+    /// fixtures are the actual lines MySQL 8.0 `mysqldump` emits.
     #[test]
-    fn rewrite_mysql_definers_repoints_only_definer_comment_lines() {
+    fn rewrite_mysql_definers_repoints_real_mysqldump_objects() {
         let apply = MysqlDefinerTarget::Account("brexp_apply_deadbeef".to_string());
 
-        // A trigger's DEFINER comment line → re-pointed to the apply user @`%`.
-        let trig = "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t` BEFORE INSERT ON `x` FOR EACH ROW SET @n=1 */;;\n";
-        let got = rewrite_mysql_definers(trig, &apply);
-        assert!(
-            got.contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
-            "trigger DEFINER re-pointed: {got}"
-        );
-        assert!(
-            !got.contains("`root`@`localhost`"),
-            "old definer gone: {got}"
-        );
+        // A faithful fragment of `mysqldump --routines --events` of a db with a procedure, a
+        // function, a trigger, an event, a `/*!`-form view, a plain-form view, a data line whose
+        // string literal contains "DEFINER=", and a trigger whose BODY string literal (same line)
+        // contains "DEFINER=". Every OBJECT definer is `root@%`; the two NON-object DEFINER= texts
+        // are `evil@host` and must survive untouched.
+        let dump = "\
+/*!50003 DROP PROCEDURE IF EXISTS `addrow` */;
+/*!50003 SET @saved_cs_client      = @@character_set_client */ ;
+/*!50003 SET character_set_client  = utf8mb4 */ ;
+DELIMITER ;;
+CREATE DEFINER=`root`@`%` PROCEDURE `addrow`(IN i INT, IN sv TEXT)
+INSERT INTO t VALUES (i, sv) ;;
+DELIMITER ;
+/*!50003 SET character_set_client  = @saved_cs_client */ ;
+/*!50003 DROP FUNCTION IF EXISTS `dbl` */;
+DELIMITER ;;
+CREATE DEFINER=`root`@`%` FUNCTION `dbl`(x INT) RETURNS int
+    DETERMINISTIC
+RETURN x * 2 ;;
+DELIMITER ;
+DELIMITER ;;
+/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`%`*/ /*!50003 TRIGGER `trg` AFTER INSERT ON `t` FOR EACH ROW INSERT INTO audit VALUES (NEW.id) */;;
+/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`%`*/ /*!50003 TRIGGER `trg2` BEFORE INSERT ON `t` FOR EACH ROW INSERT INTO audit VALUES ('DEFINER=`evil`@`host`') */;;
+DELIMITER ;
+/*!50106 SET @save_time_zone= @@TIME_ZONE */ ;
+DELIMITER ;;
+/*!50106 CREATE*/ /*!50117 DEFINER=`root`@`%`*/ /*!50106 EVENT `ev` ON SCHEDULE EVERY 1 HOUR STARTS '2026-01-01 00:00:00' ON COMPLETION NOT PRESERVE ENABLE DO DELETE FROM audit WHERE n < 0 */ ;;
+DELIMITER ;
+/*!50001 DROP VIEW IF EXISTS `vw`*/;
+/*!50001 CREATE ALGORITHM=UNDEFINED */
+/*!50013 DEFINER=`root`@`%` SQL SECURITY DEFINER */
+/*!50001 VIEW `vw` AS select `t`.`id` AS `id`,`t`.`v` AS `v` from `t` */;
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `vw2` AS select 1 AS `one`;
+INSERT INTO `logs` VALUES (1,'note CREATE DEFINER=`evil`@`host` PROCEDURE foo');
+";
+        let got = rewrite_mysql_definers(dump, &apply);
 
-        // A routine DEFINER line → re-pointed; a view DEFINER line (with SQL SECURITY DEFINER) → the
-        // DEFINER re-pointed but SQL SECURITY DEFINER left intact.
-        let proc = "/*!50003 CREATE*/ /*!50020 DEFINER=`admin`@`10.0.0.1`*/ /*!50003 PROCEDURE `p`() SELECT 1 */;;\n";
+        // Every object's OWN definer is re-pointed — including the PLAIN-line routine headers (this is
+        // the case the old `/*!`-only matcher MISSED → ERROR 1227 on the live path).
+        for needle in [
+            "CREATE DEFINER=`brexp_apply_deadbeef`@`%` PROCEDURE `addrow`",
+            "CREATE DEFINER=`brexp_apply_deadbeef`@`%` FUNCTION `dbl`",
+            "/*!50017 DEFINER=`brexp_apply_deadbeef`@`%`*/ /*!50003 TRIGGER `trg` ",
+            "/*!50017 DEFINER=`brexp_apply_deadbeef`@`%`*/ /*!50003 TRIGGER `trg2` ",
+            "/*!50117 DEFINER=`brexp_apply_deadbeef`@`%`*/ /*!50106 EVENT `ev`",
+            "/*!50013 DEFINER=`brexp_apply_deadbeef`@`%` SQL SECURITY DEFINER */",
+            "CREATE ALGORITHM=UNDEFINED DEFINER=`brexp_apply_deadbeef`@`%` SQL SECURITY DEFINER VIEW `vw2`",
+        ] {
+            assert!(
+                got.contains(needle),
+                "object definer not re-pointed: {needle}\n--- in ---\n{got}"
+            );
+        }
+        // No object definer `root@%` survives.
         assert!(
-            rewrite_mysql_definers(proc, &apply).contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
-            "procedure DEFINER re-pointed"
+            !got.contains("DEFINER=`root`@`%`"),
+            "an object definer was left un-re-pointed:\n{got}"
         );
-        let view = "/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */\n";
-        let got_view = rewrite_mysql_definers(view, &apply);
-        assert!(
-            got_view.contains("DEFINER=`brexp_apply_deadbeef`@`%` SQL SECURITY DEFINER"),
-            "view DEFINER re-pointed, SQL SECURITY DEFINER kept: {got_view}"
-        );
-
-        // CRITICAL: a DATA line (INSERT) whose string literal contains the TEXT "DEFINER=" is NEVER
-        // rewritten (it does not start with `/*!`).
-        let data = "INSERT INTO `logs` VALUES (1,'/*!50017 DEFINER=`evil`@`host`*/ keep me');\n";
+        // The 7 structural object definers are re-pointed; the 2 NON-object "DEFINER=" texts
+        // (the trigger-body string literal + the INSERT data line) are UNTOUCHED (`evil@host` stays,
+        // never rewritten to the apply user).
         assert_eq!(
-            rewrite_mysql_definers(data, &apply),
-            data,
-            "a string literal containing DEFINER= must be left byte-for-byte untouched"
+            got.matches("DEFINER=`brexp_apply_deadbeef`@`%`").count(),
+            7,
+            "exactly the 7 object headers re-pointed:\n{got}"
+        );
+        assert_eq!(
+            got.matches("DEFINER=`evil`@`host`").count(),
+            2,
+            "the two DEFINER= texts inside a body/string literal are left byte-for-byte:\n{got}"
+        );
+        // The INSERT data line is byte-identical.
+        assert!(
+            got.contains(
+                "INSERT INTO `logs` VALUES (1,'note CREATE DEFINER=`evil`@`host` PROCEDURE foo');"
+            ),
+            "the INSERT data line must be untouched:\n{got}"
         );
 
+        // Edge cases on single lines.
         // A doubled-backtick account name parses as one identifier (not a premature close).
         let weird = "/*!50017 DEFINER=`we``ird`@`%`*/ /*!50003 TRIGGER `t` */;;\n";
         assert!(
             rewrite_mysql_definers(weird, &apply).contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
             "a doubled-backtick definer account is parsed + re-pointed"
         );
-
-        // STRIP removes the clause (and one trailing space) so DEFINER defaults to the issuer.
-        let stripped = rewrite_mysql_definers(trig, &MysqlDefinerTarget::Strip);
-        assert!(
-            !stripped.contains("DEFINER="),
-            "strip removes the DEFINER clause: {stripped}"
+        // STRIP removes the clause (and one trailing space) for both forms.
+        let proc1 = "CREATE DEFINER=`root`@`%` PROCEDURE `p`() SELECT 1;\n";
+        let stripped = rewrite_mysql_definers(proc1, &MysqlDefinerTarget::Strip);
+        assert_eq!(
+            stripped, "CREATE PROCEDURE `p`() SELECT 1;\n",
+            "strip collapses `CREATE DEFINER=… PROCEDURE` to `CREATE PROCEDURE` with no double space"
         );
+        let trig1 = "/*!50017 DEFINER=`root`@`%`*/ /*!50003 TRIGGER `t` */;;\n";
         assert!(
-            stripped.contains("/*!50017 */"),
-            "strip collapses to an empty version comment, no stray double space: {stripped}"
+            rewrite_mysql_definers(trig1, &MysqlDefinerTarget::Strip).contains("/*!50017 */"),
+            "strip collapses a `/*!…*/` definer comment to an empty version comment"
         );
-
-        // An account name with a literal backtick re-points with the backtick doubled in the output.
+        // A re-point target's own backtick is doubled in the emitted identifier.
         let role = MysqlDefinerTarget::Account("ro`le".to_string());
         assert!(
-            rewrite_mysql_definers(trig, &role).contains("DEFINER=`ro``le`@`%`"),
+            rewrite_mysql_definers(proc1, &role).contains("DEFINER=`ro``le`@`%`"),
             "a re-point target's backtick is doubled in the emitted identifier"
         );
     }

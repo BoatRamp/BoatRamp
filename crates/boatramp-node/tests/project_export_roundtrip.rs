@@ -2940,15 +2940,18 @@ async fn project_sync_managed_mysql_shared_shadow_land_live() {
 /// DATABASE`). Self-skips.
 ///
 /// Proves Part 2 end-to-end THROUGH THE REAL DRIVER on a Shared tenant: a source schema with a
-/// TRIGGER + a stored PROCEDURE + an EVENT (DEFINER = the superuser) is EXPORTED and IMPORTED into a
-/// FRESH Shared tenant, and the carried objects: (1) LAND (they exist in the fresh tenant db); (2)
-/// were restored as a NON-SUPER user (the restore itself connects only as the ephemeral apply user —
-/// the whole import would fail if a foreign DEFINER were required); (3) are RE-POINTED post-swap to
-/// the FRESH TENANT'S OWN LOGIN ROLE — asserted by querying `information_schema` for each object's
-/// `DEFINER = <fresh_role>@%`; and (4) actually WORK — the carried trigger FIRES (an INSERT appends
-/// to the audit table) and the carried procedure RUNS (a `CALL` inserts a row). A stored FUNCTION is
-/// deliberately omitted: a non-SUPER restore of a FUNCTION needs `log_bin_trust_function_creators` on
-/// a binlog-on server, which would fail-closed — the accepted edge. Emits
+/// TRIGGER + a stored PROCEDURE + a stored FUNCTION + an EVENT + a VIEW (DEFINER = the superuser) is
+/// EXPORTED and IMPORTED into a FRESH Shared tenant, and the carried objects: (1) LAND (they exist in
+/// the fresh tenant db); (2) were restored as a NON-SUPER user (the restore connects only as the
+/// ephemeral apply user — the whole import fails if a foreign DEFINER were required, and a non-SUPER
+/// `CREATE TRIGGER`/`CREATE FUNCTION` on a binlog-on server needs `log_bin_trust_function_creators`,
+/// which the managed-mysqld spec in `compute.rs` bakes on); (3) are RE-POINTED post-swap to the FRESH
+/// TENANT'S OWN LOGIN ROLE — asserted by querying `information_schema.{triggers,routines,events,views}`
+/// for each object's `DEFINER = <fresh_role>@%`; and (4) actually WORK — the carried trigger FIRES (an
+/// INSERT appends to the audit table), the carried procedure RUNS (a `CALL` inserts a row), the
+/// carried function RETURNS (`dbl(21)=42`), and the carried view is QUERYABLE over the live table.
+/// Requires a FAITHFUL binlog-on + ROW + GTID server configured the way `compute.rs` produces (incl.
+/// trust-function-creators), so the gate cannot false-green. Emits
 /// `PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK`.
 #[tokio::test]
 async fn project_export_mysql_routines_triggers_live() {
@@ -3093,7 +3096,9 @@ async fn project_export_mysql_routines_triggers_live() {
          CREATE TABLE audit(n INT); \
          CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW INSERT INTO audit VALUES (NEW.id); \
          CREATE PROCEDURE addrow(IN i INT, IN sv TEXT) INSERT INTO t VALUES (i, sv); \
+         CREATE FUNCTION dbl(x INT) RETURNS INT DETERMINISTIC RETURN x * 2; \
          CREATE EVENT ev ON SCHEDULE EVERY 1 HOUR DO DELETE FROM audit WHERE n < 0; \
+         CREATE VIEW vw AS SELECT id, v FROM t; \
          INSERT INTO t VALUES (1,'alpha');",
     )
     .await;
@@ -3214,6 +3219,66 @@ async fn project_export_mysql_routines_triggers_live() {
     assert_eq!(
         ev_def, expect_definer,
         "the carried EVENT is re-pointed to the tenant role (got {ev_def:?})"
+    );
+    // The stored FUNCTION (a plain-line `CREATE DEFINER=… FUNCTION` header — the case that hit the
+    // ERROR 1227/1419 regression) is carried + re-pointed too.
+    let fn_def = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!(
+            "SELECT definer FROM information_schema.routines WHERE routine_schema='{fresh_db}' \
+             AND routine_name='dbl';"
+        ),
+    )
+    .await
+    .1;
+    assert_eq!(
+        fn_def, expect_definer,
+        "the carried FUNCTION is re-pointed to the tenant role (got {fn_def:?})"
+    );
+    // The VIEW (schema-level, not swapped with the base tables) is carried + re-pointed too.
+    let vw_def = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!("SELECT definer FROM information_schema.views WHERE table_schema='{fresh_db}';"),
+    )
+    .await
+    .1;
+    assert_eq!(
+        vw_def, expect_definer,
+        "the carried VIEW is re-pointed to the tenant role (got {vw_def:?})"
+    );
+    // The carried VIEW is queryable (it resolves against the swapped-in base table).
+    let vw_rows = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "SELECT CONCAT(id, ':', v) FROM vw ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        vw_rows, "1:alpha",
+        "the carried view is queryable over the live table"
+    );
+    // The carried FUNCTION runs (deferred-resolution body + a DETERMINISTIC return).
+    let fn_run = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "SELECT dbl(21);",
+    )
+    .await
+    .1;
+    assert_eq!(
+        fn_run, "42",
+        "the carried function runs and returns its result"
     );
 
     // Row data landed too (the seed row + its trigger-written audit row rode the tables).

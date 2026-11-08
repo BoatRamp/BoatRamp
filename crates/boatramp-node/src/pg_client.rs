@@ -442,11 +442,14 @@ pub fn mysqldump_tables_only_invocation(conn: &MysqlConnection) -> SqlInvocation
         "--set-gtid-purged=OFF".to_string(),
         // Carry the schema's DEFINER-bearing objects too: `--triggers` is mysqldump's default (so
         // triggers already ride along), and `--routines --events` add stored procedures/functions and
-        // scheduled events. All four restore into the shadow AS the ephemeral non-superuser apply user
+        // scheduled events. All restore into the shadow AS the ephemeral non-superuser apply user
         // only after the node driver rewrites each `DEFINER=` clause to that apply user
         // (`rewrite_mysql_definers`); after the swap the driver re-points them to the tenant's own
-        // db-scoped role. A FUNCTION the apply user cannot create (e.g. no `log_bin_trust_function_
-        // creators` on a binlog-on server) fails the restore FAIL-CLOSED, never escalating.
+        // db-scoped role. NOTE: with binary logging ENABLED, MySQL 8.0 refuses a non-SUPER
+        // `CREATE TRIGGER` AND `CREATE FUNCTION` (ERROR 1419) unless the server has
+        // `log_bin_trust_function_creators=ON` — so the managed-mysqld spec (`compute.rs`) bakes that
+        // ON alongside `--log-bin` (benign under ROW binlog; it does NOT grant foreign-DEFINER
+        // ability, so the DEFINER rewrite is still required). Stored PROCEDUREs are not 1419-gated.
         "--routines".to_string(),
         "--events".to_string(),
     ];
@@ -481,6 +484,39 @@ pub fn mysqldump_definer_objects_invocation(conn: &MysqlConnection, db: &str) ->
     ];
     argv.extend(conn.conn_args());
     argv.push(db.to_string());
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build the `mysqldump` that RE-EXTRACTS a set of named VIEWS as CREATE-VIEW DDL (DEFINER-bearing),
+/// with NO row data. Views are schema-level objects that do NOT ride the `RENAME TABLE` swap and are
+/// suppressed by [`mysqldump_definer_objects_invocation`]'s `--no-create-info`, so they are captured
+/// here by NAME: mysqldump emits each view's placeholder-table + "Final view structure" in a
+/// dependency-SAFE order (a view referencing another view finds its placeholder), which the driver
+/// re-points (`rewrite_mysql_definers`) and applies to the live db AFTER the routines/events/triggers
+/// (a view's referenced tables/functions must already exist; a routine's references resolve lazily at
+/// call time, so routines-first is safe). `--no-data` (no rows — the base tables already swapped in),
+/// `--skip-triggers` (triggers ride the routines/events dump). Pass ONLY view names — never call this
+/// with an empty `views` (a bare `mysqldump <db>` would dump the WHOLE database).
+pub fn mysqldump_views_invocation(
+    conn: &MysqlConnection,
+    db: &str,
+    views: &[String],
+) -> SqlInvocation {
+    let mut argv = vec![
+        "mysqldump".to_string(),
+        "--no-tablespaces".to_string(),
+        "--set-gtid-purged=OFF".to_string(),
+        "--no-data".to_string(),
+        "--skip-triggers".to_string(),
+    ];
+    argv.extend(conn.conn_args());
+    argv.push(db.to_string());
+    for v in views {
+        argv.push(v.clone());
+    }
     SqlInvocation {
         argv,
         env: conn.env(),

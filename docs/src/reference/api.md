@@ -90,13 +90,17 @@ superuser maintenance connection pre-creates each allowlisted extension in the s
 non-superuser apply runs, so the dump's own `CREATE EXTENSION IF NOT EXISTS` no-ops instead of
 failing. An extension not on the allowlist fails the restore.
 
-A managed **MySQL** restore carries the database's **triggers, stored routines, and scheduled
-events**. Because a non-privileged user cannot create an object with a foreign `DEFINER`, each
-`DEFINER=` clause is rewritten to the ephemeral apply user for the non-superuser restore, and then —
-after the atomic swap — re-pointed to the destination tenant's **own database-scoped login role**
-(dropped + re-created as the admin, since MySQL has no `ALTER … DEFINER`). A carried object therefore
-runs with the tenant's own grants, never a server superuser's or another tenant's; one requiring a
-privilege the tenant role lacks fails the restore fail-closed.
+A managed **MySQL** restore carries the database's **triggers, stored routines (procedures +
+functions), scheduled events, and views**. Because a non-privileged user cannot create an object with
+a foreign `DEFINER`, each `DEFINER=` clause is rewritten to the ephemeral apply user for the
+non-superuser restore, and then — after the atomic swap — re-pointed to the destination tenant's
+**own database-scoped login role** (dropped + re-created as the admin, since MySQL has no
+`ALTER … DEFINER`; routines/events/views are re-created in the live database because they do not ride
+the `RENAME TABLE` swap). A carried object therefore runs with the tenant's own grants, never a server
+superuser's or another tenant's; one requiring a privilege the tenant role lacks fails the restore
+fail-closed. On a binary-logging managed server the non-superuser `CREATE TRIGGER`/`CREATE FUNCTION`
+requires `log_bin_trust_function_creators=ON`, which the managed-MySQL launch spec sets on (benign
+under row-format binlog).
 
 A bundle member is capped at **256 GiB**, and a whole bundle at **1 TiB** — fixed node limits, not
 currently exposed as a config key or CLI flag. Exceeding either refuses the import with a `501`

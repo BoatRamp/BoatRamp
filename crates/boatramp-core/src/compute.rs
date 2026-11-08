@@ -2253,6 +2253,19 @@ pub fn managed_db_spec(
             ManagedDbEngine::Mysql => {
                 // Row-format binlog + GTID so a delta can ship the binlog events since a base
                 // GTID. `server-id` must be nonzero for binary logging.
+                //
+                // `log_bin_trust_function_creators=ON` is REQUIRED for the export/import path to
+                // carry a database's triggers + stored routines across the non-superuser shadow
+                // restore: with binary logging ENABLED, MySQL 8.0 refuses a `CREATE TRIGGER` /
+                // `CREATE FUNCTION` from a non-SUPER user (ERROR 1419) UNLESS this is on — and the
+                // ephemeral least-privilege apply user deliberately lacks `SUPER`/
+                // `SYSTEM_VARIABLES_ADMIN` (which is GLOBAL-only, so the apply cannot set this
+                // itself). It is BENIGN under `--binlog-format=ROW` (the determinism concern it
+                // guards is a STATEMENT-binlog issue — row events log the effect, not the call), and
+                // it does NOT grant foreign-DEFINER ability (that stays gated by `SET_USER_ID`), so
+                // the driver's `DEFINER=` rewrite + post-swap re-point is still required. Only added
+                // alongside binary logging; a binlog-OFF server does not hit ERROR 1419 and needs no
+                // such setting.
                 entrypoint.extend(
                     [
                         "--log-bin",
@@ -2260,6 +2273,7 @@ pub fn managed_db_spec(
                         "--gtid-mode=ON",
                         "--enforce-gtid-consistency=ON",
                         "--server-id=1",
+                        "--log-bin-trust-function-creators=ON",
                     ]
                     .into_iter()
                     .map(str::to_string),
@@ -3297,6 +3311,24 @@ mod tests {
         assert!(my_on.entrypoint.iter().any(|a| a == "--log-bin"));
         assert!(my_on.entrypoint.iter().any(|a| a == "--binlog-format=ROW"));
         assert!(my_on.entrypoint.iter().any(|a| a == "--gtid-mode=ON"));
+        // With binary logging on, a non-SUPER CREATE TRIGGER/FUNCTION (the export/import carry path)
+        // needs log_bin_trust_function_creators=ON (ERROR 1419 otherwise). Benign under ROW binlog.
+        assert!(
+            my_on
+                .entrypoint
+                .iter()
+                .any(|a| a == "--log-bin-trust-function-creators=ON"),
+            "a binlog-on managed mysqld must trust function/trigger creators so the non-superuser \
+             shadow restore can carry triggers + routines"
+        );
+        // A binlog-OFF managed mysqld does not hit ERROR 1419, so it carries no such flag.
+        let my_off = managed_db_spec(ManagedDbEngine::Mysql, None, 512, false);
+        assert!(
+            !my_off
+                .entrypoint
+                .iter()
+                .any(|a| a.starts_with("--log-bin-trust-function-creators"))
+        );
     }
 
     #[test]
