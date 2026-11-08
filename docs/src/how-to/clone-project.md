@@ -316,9 +316,9 @@ to write — an older-format bundle stays byte-identical to what a prior release
 Restoring a **managed** Postgres, MySQL, or libsql database is atomic: the dump is applied into a
 **shadow** — a not-yet-live database — verified, and only then **swapped in** (a Postgres/MySQL
 database rename, or a libsql file rename) in place of the live one. A **dedicated (single-tenant)**
-server restores via a chunked streamed dump → shadow; a **Shared-tenant Postgres** restores the
-same way via a sidecar shadow+swap into the tenant's freshly-provisioned database (a Shared-tenant
-*MySQL* is the one managed case the shadow+swap cannot take — see [below](#managed-restore-what-is-covered-and-what-is-refused)).
+server restores via a chunked streamed dump → shadow; a **Shared-tenant** server — Postgres
+**or MySQL** — restores the same way via a sidecar shadow+swap into the tenant's
+freshly-provisioned database.
 Any failure along the way — a checksum mismatch, a truncated stream, a restore
 error, a disconnect — tears the shadow down and leaves the live database completely untouched;
 nothing is ever half-restored. (The swap itself is per-member atomic, not whole-bundle atomic: if a
@@ -364,10 +364,9 @@ migrations use, so widening it here widens it everywhere.
 
 ### Managed restore: what is covered, and what is refused
 
-The atomic, non-superuser shadow-restore path above covers a **managed Postgres of either
-tenancy** (dedicated via the chunked shadow, Shared-tenant via the sidecar shadow+swap) and a
-**managed, dedicated/single MySQL or libsql**. Two cases a managed target still **cannot** take,
-both refused fail-closed:
+The atomic, non-superuser shadow-restore path above covers a **managed Postgres or MySQL of
+either tenancy** (dedicated via the chunked shadow, Shared-tenant via the sidecar shadow+swap) and
+a **managed libsql**. The one case a managed target still **cannot** take, refused fail-closed:
 
 **A data-only (`--clone-data-only`) restore of a managed binding is refused.** A data-only dump is
 an **overlay** onto the target's existing live schema — there is no atomic shadow for an overlay,
@@ -382,10 +381,13 @@ with no atomic shadow+swap; a least-privilege data-only/overlay apply is a pendi
 Re-export as a FULL bundle, or import into an external (bring-your-own-URL) binding.
 ```
 
-**A managed Shared-tenant MySQL now restores too**, via the sidecar shadow+swap (mirroring
-Postgres): a dedicated/single managed MySQL lands via the chunked shadow, a Shared-tenant one via
-the sidecar shadow+swap. A genuine `Overlay` into a managed MySQL is still refused with the matching
-error (the RCE guard), exactly like Postgres.
+A managed **MySQL** target is covered for **either tenancy** (a dedicated/single server via the
+chunked shadow, a Shared-tenant server via the sidecar shadow+swap, mirroring Postgres), carrying
+its tables along with its **triggers, stored routines (procedures + functions), scheduled events,
+and views** — each object's `DEFINER` re-pointed to the destination tenant's own database-scoped
+role (so a carried object runs with that tenant's own grants, never a server superuser or another
+tenant). A genuine `Overlay` (`--clone-data-only`) into a managed MySQL is refused with the same
+error as Postgres above (the RCE guard).
 
 If you hit the managed-overlay refusal: re-export with `--full` into a managed target, or restore
 into an **external** (bring-your-own-URL) database binding instead (next point). To replicate a
