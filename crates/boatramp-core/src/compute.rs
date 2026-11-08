@@ -2210,6 +2210,22 @@ pub fn managed_db_spec(
                 "/usr/local/bin/docker-entrypoint.sh".to_string(),
                 "mysqld".to_string(),
                 "--bind-address=*".to_string(),
+                // AUTH: the official `mysql:8.0` image defaults new accounts to
+                // `caching_sha2_password`, whose FIRST auth over plain TCP needs either TLS or the
+                // server's RSA public key (`--get-server-public-key`). Our clients
+                // ([`MysqlConnection::conn_args`]) connect over the isolated per-project network with
+                // only host/port/user + `MYSQL_PWD` — no TLS, no public-key exchange — so a
+                // caching_sha2 account cannot authenticate (every managed-mysql access, not just the
+                // export/import path, would fail). Default new accounts (root + every `CREATE USER …
+                // IDENTIFIED BY …`, which name no explicit plugin) to `mysql_native_password` so
+                // password auth works over the plain-TCP intra-project link — the SAME
+                // trust-the-isolated-network posture managed Postgres already uses. UNCONDITIONAL:
+                // every managed mysql needs auth, delta-capture or not.
+                // TODO(mysql-8.4): `--default-authentication-plugin` is deprecated and REMOVED in
+                // MySQL 8.4 (replaced by `authentication_policy`). A future image bump past 8.0 must
+                // instead serve caching_sha2 with TLS on the intra-project link (or the client must
+                // pass `--get-server-public-key`) — do NOT simply drop this flag onto an 8.4 image.
+                "--default-authentication-plugin=mysql_native_password".to_string(),
             ],
             BTreeMap::from([(
                 "PATH".to_string(),
@@ -3328,6 +3344,26 @@ mod tests {
                 .entrypoint
                 .iter()
                 .any(|a| a.starts_with("--log-bin-trust-function-creators"))
+        );
+        // AUTH (UNCONDITIONAL — every managed mysql, delta or not): the `mysql:8.0` image defaults
+        // accounts to caching_sha2_password, which our plain-TCP (no-TLS, no-pubkey) clients cannot
+        // authenticate against, so the spec defaults them to mysql_native_password. Present for BOTH
+        // delta and non-delta mysql; never on a pg spec.
+        for my in [&my_on, &my_off] {
+            assert!(
+                my.entrypoint
+                    .iter()
+                    .any(|a| a == "--default-authentication-plugin=mysql_native_password"),
+                "every managed mysqld must default accounts to native_password for plain-TCP auth: {:?}",
+                my.entrypoint
+            );
+        }
+        assert!(
+            !pg_on
+                .entrypoint
+                .iter()
+                .any(|a| a.contains("authentication-plugin")),
+            "the mysql auth-plugin flag must never leak onto a Postgres spec"
         );
     }
 

@@ -55,6 +55,16 @@ versions.
   by-name VIEW capture passes a literal `--` end-of-options marker and the driver validates each view
   name fail-closed (rejecting a leading `-` / control characters), so a view named `--all-databases`
   or `--host=…` cannot inject a `mysqldump` option (cross-tenant dump / superuser-credential redirect).
+- **Managed MySQL now authenticates over the isolated per-project network** (pre-existing bug,
+  affecting every managed MySQL — dedicated and Shared). The official `mysql:8.0` image defaults new
+  accounts to `caching_sha2_password`, whose first auth over plain TCP needs TLS or the server's RSA
+  public key; boatramp's clients connect with only host/port/user + password (no TLS, no public-key
+  exchange), so no managed-MySQL account could authenticate. The managed-mysqld launch spec now
+  defaults accounts to `mysql_native_password` (`--default-authentication-plugin`), so password auth
+  works over the plain-TCP intra-project link — the SAME trust-the-isolated-network posture managed
+  Postgres already uses. (Caveat: `--default-authentication-plugin` is deprecated and removed in
+  MySQL 8.4; a future image bump past 8.0 must serve `caching_sha2_password` with TLS or
+  `--get-server-public-key` instead.)
 - **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
   threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
   - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql

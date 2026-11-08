@@ -102,6 +102,13 @@ fail-closed. On a binary-logging managed server the non-superuser `CREATE TRIGGE
 requires `log_bin_trust_function_creators=ON`, which the managed-MySQL launch spec sets on (benign
 under row-format binlog).
 
+A managed MySQL (`mysql:8.0`) authenticates with **`mysql_native_password`** over the isolated
+per-project network — the managed-MySQL launch spec sets `--default-authentication-plugin=
+mysql_native_password` so password auth works over the plain-TCP intra-project link, the same
+trust-the-isolated-network posture managed Postgres uses (the image's default `caching_sha2_password`
+cannot first-auth over plain TCP without TLS or the server's public key). A future image bump past
+MySQL 8.0 (where that flag is removed) must instead serve `caching_sha2_password` over TLS.
+
 A bundle member is capped at **256 GiB**, and a whole bundle at **1 TiB** — fixed node limits, not
 currently exposed as a config key or CLI flag. Exceeding either refuses the import with a `501`
 naming the cap.
