@@ -382,17 +382,18 @@ with no atomic shadow+swap; a least-privilege data-only/overlay apply is a pendi
 Re-export as a FULL bundle, or import into an external (bring-your-own-URL) binding.
 ```
 
-**A managed Shared-tenant MySQL is refused.** Unlike Postgres, MySQL has **no** sidecar
-shadow+swap path, so only a **dedicated/single** managed MySQL restores atomically; a
-Shared-tenant managed MySQL is refused with a matching error (declare it dedicated, or use an
-external binding).
+**A managed Shared-tenant MySQL now restores too**, via the sidecar shadow+swap (mirroring
+Postgres): a dedicated/single managed MySQL lands via the chunked shadow, a Shared-tenant one via
+the sidecar shadow+swap. A genuine `Overlay` into a managed MySQL is still refused with the matching
+error (the RCE guard), exactly like Postgres.
 
-If you hit either: re-export with `--full` into a dedicated-tenant managed target, or restore into
-an **external** (bring-your-own-URL) database binding instead (next point). To replicate a managed
-Postgres (or dedicated MySQL) project's **data** into another environment *without* the
-control-plane slice, use [`project sync`](./project-sync.md) — it rides this same safe shadow+swap
-path (no `--force` full-bundle clone needed) and its dry-run preflight flags any non-restorable
-member up front. A least-privilege data-only/overlay apply is a planned follow-up, not yet shipped.
+If you hit the managed-overlay refusal: re-export with `--full` into a managed target, or restore
+into an **external** (bring-your-own-URL) database binding instead (next point). To replicate a
+managed Postgres **or MySQL** project's **data** (either tenancy) into another environment *without*
+the control-plane slice, use [`project sync`](./project-sync.md) — it rides this same safe
+shadow+swap path (no `--force` full-bundle clone needed) and its dry-run preflight flags any
+non-restorable member up front. A least-privilege data-only/overlay apply is a planned follow-up,
+not yet shipped.
 
 **An external (bring-your-own-URL) database binding is unaffected by any of this.** Only a
 boatramp-*managed*, co-located database goes through the shadow-restore machinery (and its

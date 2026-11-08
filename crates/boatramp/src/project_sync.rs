@@ -16,8 +16,8 @@
 //! EXECUTES the plan** (shipped v0.56.0): it creates + provisions an absent destination, transfers
 //! the data plane (managed-DB contents + blobs) via a `DataPlane` + `ShadowSwap` clone, carries the
 //! selected non-secret control-plane KV strata, and rewrites site configs so the result is coherent.
-//! The preflight also classifies each carried DB's restore FEASIBILITY (managed pg/mysql → carry;
-//! external/BYO or Shared-MySQL → skip-with-reason), so an unrestorable DB fails in the plan, not at
+//! The preflight also classifies each carried DB's restore FEASIBILITY (managed pg/mysql, either
+//! tenancy → carry; external/BYO → skip-with-reason), so an unrestorable DB fails in the plan, not at
 //! apply.
 
 use std::collections::BTreeSet;

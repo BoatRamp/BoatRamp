@@ -2504,6 +2504,437 @@ async fn project_export_mysql_chunked_shadow_live() {
     println!("PROJECT EXPORT MYSQL SHADOW OK");
 }
 
+/// **Live Shared-tenant managed-MySQL `project sync` shadow-land gate** (Tier-2 / nightly — needs a
+/// Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE DATABASE`).
+/// Self-skips.
+///
+/// Proves the NEW Shared managed-MySQL sidecar shadow+swap END-TO-END THROUGH THE REAL DRIVER
+/// (`NodeProjectExport::export`/`import` → `mysql_sidecar_shadow_restore`), mirroring the Shared
+/// Postgres clone gate. ONE Shared MySQL server hosts ≥2 provisioned tenants (`src`, `other`) via the
+/// shipped `provision_tenant` path (per the tenancy-gate rule — a single-tenant fixture is blind to a
+/// leak). It EXPORTS `src`'s `DataPlane + ShadowSwap` bundle (framed SIDECAR/tables-only for a Shared
+/// binding) and IMPORTS it into a BRAND-NEW `fresh` tenant whose per-tenant db was never provisioned,
+/// then asserts: the rows LAND and are queryable AS THE FRESH TENANT'S OWN LOGIN ROLE; ZERO
+/// cross-tenant bytes (the sibling `other`'s login role cannot reach `fresh`'s db, and `other` is
+/// byte-for-byte unchanged); no orphan `*__shadow_*` db / `brexp_apply_%` user survives; a re-import
+/// is idempotent; and the MUTATION — the SAME data re-exported as `Overlay` — is still REFUSED by the
+/// RCE guard. Emits `PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK`.
+#[tokio::test]
+async fn project_sync_managed_mysql_shared_shadow_land_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, IdentityChoice, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name, tenant_role_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (managed-mysql Shared sync gate not run)");
+        return;
+    };
+    let Some((superuser, su_password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (managed-mysql Shared sync gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    const COMPUTE: &str = "my";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "clonesp";
+    let s = now_suffix();
+    let src_project = format!("myclone-src-{s}");
+    let fresh_project = format!("myclone-fresh-{s}");
+    let other_project = format!("myclone-other-{s}");
+
+    // Superuser maintenance connection (no default db) for CREATE/DROP DATABASE + catalog probes.
+    let su = MysqlConnection {
+        host: host.clone(),
+        port,
+        user: superuser.clone(),
+        password: su_password.clone(),
+        database: String::new(),
+        connect_timeout_secs: 10,
+        ephemeral_network: None,
+    };
+
+    // --- control plane: MemoryKv + a throwaway FsStorage DeployStore + a reversible test envelope. ---
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-myclone-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([7u8; 32]));
+
+    // Pre-seal the SUPERUSER credential under the key the resolver + provisioner read —
+    // `(DEFAULT_PROJECT, COMPUTE)` — to the test URL's ACTUAL password.
+    let sealed_su = envelope
+        .wrap(su_password.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+
+    // Seed ONE healthy, already-Provisioned replica of the `my` workload pointing at the test MySQL.
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-mysql".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "mysql".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+
+    let db_name = |project: &str| tenant_db_name(DATABASE, &sanitize_ident(project));
+    let mkconn = |db: &str, u: &str, pw: &str| MysqlConnection {
+        host: host.clone(),
+        port,
+        user: u.to_string(),
+        password: pw.to_string(),
+        database: db.to_string(),
+        connect_timeout_secs: 10,
+        ephemeral_network: None,
+    };
+
+    // Teardown any prior run (re-runnable).
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    // === Provision the SOURCE + the pre-existing sibling tenant through the SHIPPED path. ===
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+    provision_tenant(&deploy, &kv, &envelope, &binding, &other_project, "")
+        .await
+        .expect("provision the pre-existing sibling tenant");
+
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&src_project)),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed source tenant table; mysql output:\n{o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO t VALUES (99,'untouched');",
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "seed the pre-existing sibling tenant; mysql output:\n{o}"
+    );
+    let other_before = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+
+    // --- the driver, wired exactly like the normal serve path (managed mysql context). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-myclone-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-myclone-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false);
+
+    // === EXPORT the source tenant as DataPlane + ShadowSwap (framed SIDECAR/tables-only). ===
+    let export_bundle = |restore: ManagedRestore| {
+        let driver = &driver;
+        let src_project = src_project.clone();
+        async move {
+            let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+            driver
+                .export(
+                    &src_project,
+                    &ExportOptions {
+                        scope: BundleScope::DataPlane,
+                        managed_restore: restore,
+                        include_identity: false,
+                        transport_key: None,
+                        delta: None,
+                    },
+                    &mut sink,
+                )
+                .await
+                .expect("driver export of the source tenant");
+            sink.into_inner()
+        }
+    };
+    let bundle = export_bundle(ManagedRestore::ShadowSwap).await;
+
+    // === IMPORT into the BRAND-NEW `fresh` tenant (its db was never provisioned → self-provision). ===
+    let report = {
+        let mut source = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: false, // a genuinely fresh target — no prior data to overlay.
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Shared managed-mysql DataPlane+ShadowSwap import must SUCCEED")
+    };
+    assert!(
+        report.pg_databases >= 1,
+        "the clone restored at least one mysql database"
+    );
+
+    // --- rows LAND + are queryable AS THE FRESH TENANT'S OWN LOGIN ROLE (never the superuser). ---
+    let fresh_db = db_name(&fresh_project);
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let fresh_ident = sanitize_ident(&fresh_project);
+    let fresh_role = tenant_role_name(COMPUTE, &fresh_ident);
+    let fresh_pw = creds
+        .password(&fresh_project, &format!("{COMPUTE}/{fresh_ident}"))
+        .await
+        .expect("fresh login credential (minted at self-provision)");
+    let (c, got) = mysql_run(
+        backend.as_ref(),
+        image,
+        &mkconn(&fresh_db, &fresh_role, &fresh_pw),
+        Some(&fresh_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "fresh tenant's own login role must read its rows:\n{got}"
+    );
+    assert_eq!(got, "1:alpha\n2:beta", "rows landed on the fresh tenant db");
+
+    // === ZERO cross-tenant bytes: the sibling `other`'s login role cannot reach `fresh`'s db. ===
+    let other_ident = sanitize_ident(&other_project);
+    let other_role = tenant_role_name(COMPUTE, &other_ident);
+    let other_pw = creds
+        .password(&other_project, &format!("{COMPUTE}/{other_ident}"))
+        .await
+        .expect("sibling login credential");
+    let (code, out) = mysql_run(
+        backend.as_ref(),
+        image,
+        &mkconn(&fresh_db, &other_role, &other_pw),
+        Some(&fresh_db),
+        "SELECT COUNT(*) FROM t;",
+    )
+    .await;
+    assert_ne!(
+        code, 0,
+        "CROSS-TENANT LEAK: the sibling reached fresh's db + read its rows: {out}"
+    );
+    assert!(
+        out.to_ascii_lowercase().contains("access denied"),
+        "the sibling must be denied at fresh's db (got: {out})"
+    );
+
+    // --- no orphan shadow db / ephemeral apply user remains (read from the global catalogs). ---
+    let (_c, shadows) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.schemata \
+             WHERE schema_name LIKE '{fresh_db}%__shadow_%';"
+        ),
+    )
+    .await;
+    assert_eq!(
+        shadows.trim(),
+        "0",
+        "no orphan shadow database must remain: {shadows:?}"
+    );
+    let (_c, users) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        "SELECT COUNT(*) FROM mysql.user WHERE user LIKE 'brexp_apply_%';",
+    )
+    .await;
+    assert_eq!(
+        users.trim(),
+        "0",
+        "no orphan ephemeral apply user must remain: {users:?}"
+    );
+
+    // --- TENANCY GATE: the pre-existing sibling tenant is byte-for-byte UNCHANGED. ---
+    let other_after = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        other_after, other_before,
+        "self-provisioning the fresh target must not touch the pre-existing sibling tenant"
+    );
+
+    // --- IDEMPOTENCY: re-importing into the now-provisioned `fresh` target is a clean success. ---
+    let report2 = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: true, // now has prior data from the first import.
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-importing into an already-provisioned target is idempotent")
+    };
+    assert!(
+        report2.pg_databases >= 1,
+        "the re-import still restored the db"
+    );
+    let got_again = mysql_run(
+        backend.as_ref(),
+        image,
+        &mkconn(&fresh_db, &fresh_role, &fresh_pw),
+        Some(&fresh_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        got_again, "1:alpha\n2:beta",
+        "idempotent re-import — rows unchanged, no clobber"
+    );
+
+    // === MUTATION: the SAME data as an Overlay bundle MUST still be refused on import (RCE guard). ===
+    let overlay_bundle = export_bundle(ManagedRestore::Overlay).await;
+    let mut obody = futures::io::Cursor::new(overlay_bundle);
+    let refused = driver
+        .import(
+            &fresh_project,
+            &mut obody,
+            ImportOptions {
+                apply: true,
+                force: true,
+                overwrite: true,
+                allow_schema_skew: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await;
+    let err = refused.expect_err("an Overlay managed-mysql import MUST be refused");
+    assert!(
+        err.to_string()
+            .contains("data-only restore of MANAGED mysql"),
+        "the refusal must be the managed-overlay RCE guard, got: {err}"
+    );
+
+    // --- cleanup (best-effort) ---
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    println!("PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK");
+}
+
 /// **Live full-DRIVER round-trip** — drives the real `NodeProjectExport::export()` /
 /// `import()` (not the reconstructed primitives the pg/mysql/libsql tests use), closing the
 /// "driver has no end-to-end live coverage" gap for the pg path: it exercises the driver's

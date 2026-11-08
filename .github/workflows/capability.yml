@@ -518,6 +518,15 @@ jobs:
           # over-opened) fails the job.
           grep -q 'PROJECT SYNC MANAGED PG SHADOW LAND OK' project-export.log \
             || { echo "::error::project sync managed-pg shadow-land gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # `project sync` managed-MYSQL Shared SHADOW-LAND: the mysql analogue of the pg gate above —
+          # drives the REAL NodeProjectExport to EXPORT a Shared tenant's DataPlane+ShadowSwap bundle
+          # (framed sidecar/tables-only) and IMPORT it into a fresh Shared tenant via the NEW
+          # mysql_sidecar_shadow_restore (non-superuser shadow+swap), asserting rows land + queryable
+          # as the tenant role + ZERO cross-tenant bytes (≥2 tenants) + no orphan shadow/apply-user +
+          # idempotent re-import + the Overlay RCE guard still refusing. Same self-skip trap → gate on
+          # its marker.
+          grep -q 'PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK' project-export.log \
+            || { echo "::error::project sync managed-mysql Shared shadow-land gate never reached its marker (silent skip, a regression, or a cross-tenant leak)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

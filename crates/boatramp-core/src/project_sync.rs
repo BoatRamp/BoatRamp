@@ -426,8 +426,8 @@ pub enum DbEngine {
     /// sidecar shadow+swap).
     #[default]
     Postgres,
-    /// MySQL — restores via shadow+swap ONLY for a dedicated/Single tenant (the chunked arm); a
-    /// Shared-tenant MySQL has no sidecar shadow path.
+    /// MySQL — restores via the atomic non-superuser shadow+swap for EITHER tenancy (dedicated/Single
+    /// → the chunked arm; Shared → the sidecar shadow+swap, mirroring Postgres).
     Mysql,
     /// An engine a sync restore does not know how to shadow+swap.
     Other,
@@ -468,9 +468,9 @@ impl DbItem {
 
     /// Why this DB CANNOT be restored by a sync (so the preflight classifies it `Skip` with this
     /// reason, surfaced by `--strict` + the skipped count) — or `None` when it is feasible
-    /// (restorable via the shadow+swap this fix routes managed members through). Managed pg (any
-    /// tenant) and managed dedicated MySQL are feasible; an external/BYO binding, a Shared MySQL, or
-    /// an unknown engine is not.
+    /// (restorable via the shadow+swap this fix routes managed members through). Managed pg AND
+    /// managed MySQL are feasible for EITHER tenancy (dedicated → the chunked shadow, Shared → the
+    /// sidecar shadow+swap); an external/BYO binding or an unknown engine is not.
     #[must_use]
     pub fn infeasible_reason(&self) -> Option<String> {
         if !self.managed {
@@ -484,12 +484,9 @@ impl DbItem {
             DbEngine::Other => {
                 Some("unsupported managed engine for a sync shadow+swap restore".to_string())
             }
-            DbEngine::Mysql if self.shared => Some(
-                "managed Shared-tenant MySQL has no sidecar shadow+swap path — only a \
-                 dedicated/Single MySQL restores via the atomic chunked shadow; declare it \
-                 dedicated to sync its data"
-                    .to_string(),
-            ),
+            // Managed pg + managed MySQL both restore via the non-superuser shadow+swap for either
+            // tenancy (dedicated → chunked, Shared → the sidecar shadow+swap); only a non-managed
+            // (external/BYO) binding or an unknown engine is infeasible.
             _ => None,
         }
     }
@@ -1666,12 +1663,13 @@ mod tests {
     }
 
     /// FEASIBILITY preflight (fail in the PLAN, in seconds): classify each carried DB by whether a
-    /// sync can restore it. A managed pg (any tenant) and a managed DEDICATED MySQL are feasible →
-    /// Carry; an EXTERNAL/BYO binding, a managed SHARED MySQL, and an unknown engine are NOT →
-    /// `Disposition::Skip` with a clear reason (so `--strict` + the skipped count surface it rather
-    /// than the node's late apply-time refusal). Pure `plan_sync` over a seeded fixture — the real
-    /// CLI inventory only ever carries managed DBs (BYO is not representable in `list_databases`),
-    /// but the planner is complete, so the external case is exercised here from the fixture.
+    /// sync can restore it. A managed pg AND a managed MySQL are feasible for EITHER tenancy
+    /// (dedicated → chunked shadow, Shared → the sidecar shadow+swap) → Carry; an EXTERNAL/BYO
+    /// binding and an unknown engine are NOT → `Disposition::Skip` with a clear reason (so the
+    /// skipped count and `--strict` surface it rather than the node's late apply-time refusal). Pure
+    /// `plan_sync` over a seeded fixture — the real CLI inventory only ever carries managed DBs (BYO
+    /// is not representable in `list_databases`), but the planner is complete, so the external case
+    /// is exercised here from the fixture.
     #[test]
     fn plan_sync_classifies_db_restore_feasibility() {
         let selection = sel(SelectionInput {
@@ -1698,7 +1696,7 @@ mod tests {
                     managed: true,
                     shared: false,
                 },
-                // Infeasible: managed MySQL Shared (no sidecar shadow+swap path).
+                // Feasible: managed MySQL Shared (restores via the sidecar shadow+swap, like pg).
                 DbItem {
                     name: "my_shared".into(),
                     engine: DbEngine::Mysql,
@@ -1719,15 +1717,14 @@ mod tests {
         assert_eq!(disp("pg_dedicated").disposition, Disposition::Carry);
         assert_eq!(disp("pg_shared").disposition, Disposition::Carry);
         assert_eq!(disp("my_dedicated").disposition, Disposition::Carry);
-        // The two infeasible DBs are SKIPPED with a reason.
-        let my_shared = disp("my_shared");
-        assert_eq!(my_shared.disposition, Disposition::Skip);
-        assert!(my_shared.reason.as_deref().unwrap().contains("Shared"));
+        // Managed Shared MySQL now carries too (the sidecar shadow+swap, like Shared pg).
+        assert_eq!(disp("my_shared").disposition, Disposition::Carry);
+        // The ONE infeasible DB (external/BYO) is SKIPPED with a reason.
         let byo = disp("byo");
         assert_eq!(byo.disposition, Disposition::Skip);
         assert!(byo.reason.as_deref().unwrap().contains("external"));
-        // Exactly the two infeasible DBs are skipped; `--strict` would refuse the whole run.
-        assert_eq!(plan.skipped_count(), 2);
+        // Exactly the one infeasible DB is skipped; `--strict` would refuse the whole run.
+        assert_eq!(plan.skipped_count(), 1);
         assert!(
             sel(SelectionInput {
                 include: [Piece::Databases].into_iter().collect(),

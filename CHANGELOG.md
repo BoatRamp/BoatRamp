@@ -16,8 +16,19 @@ versions.
   through the schema-less `--data-only` overlay, which the import categorically refuses for a
   managed binding (an overlay onto a live schema as the bootstrap superuser is an RCE risk). Sync
   now requests the SAFE path — provision + the non-superuser atomic shadow+swap the `--force` clone
-  already used — so a dedicated managed DB restores via the chunked shadow and a Shared managed pg
-  via the sidecar shadow+swap, with the control-plane KV slice still excluded.
+  already used — so a managed Postgres OR MySQL binding of EITHER tenancy lands (a dedicated/single
+  server via the chunked shadow, a Shared-tenant server via the sidecar shadow+swap), with the
+  control-plane KV slice still excluded.
+- **Shared-tenant managed MySQL now syncs**, via a new `mysql_sidecar_shadow_restore` — the MySQL
+  analogue of the Shared-pg sidecar shadow+swap. A Shared binding's mysql export is framed
+  sidecar/tables-only (positional `<db>`, no `CREATE DATABASE`/`USE`) so it restores into a
+  differently-named per-tenant shadow db as the ephemeral least-privilege apply user, then the
+  verified shadow is atomically `RENAME TABLE`-swapped into the self-provisioned per-tenant target.
+  MySQL has no PUBLIC-connect surface (so no restore-window lockdown is needed) and the tenant's
+  db-level grant already covers the swapped-in tables (so no post-swap re-provision is needed) —
+  simpler than the Shared-pg path. The engine-agnostic sidecar-apply classifier (renamed
+  `sidecar_managed_apply`) now routes both the pg and mysql sidecar arms; the RCE guard is preserved
+  (a genuine `Overlay`-into-managed-MySQL stays refused fail-closed).
 - **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
   threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
   - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql
@@ -29,18 +40,14 @@ versions.
   shadow+swap. The bundle manifest records `managed_restore` as a back-compatible `serde` field, so a
   pre-split bundle reads unchanged (legacy coupling: `data_only → Overlay`, full → `ShadowSwap`).
 - **`project sync`'s dry-run preflight now classifies each carried DB's restore FEASIBILITY**, so an
-  unrestorable database fails in the PLAN (in seconds) rather than at apply: a managed pg (any
-  tenant) or a managed dedicated MySQL carries; an external/BYO binding or a managed Shared-tenant
-  MySQL is `Skip`ped with a clear reason (surfaced by `--strict` and the skipped count).
+  unrestorable database fails in the PLAN (in seconds) rather than at apply: a managed pg OR MySQL
+  binding of EITHER tenancy carries; only an external/BYO binding (or an unknown engine) is
+  `Skip`ped with a clear reason (surfaced by `--strict` and the skipped count).
 - **Stale `project sync` help** calling `--apply` "increment 2 / not-yet-implemented" is corrected —
   `--apply` shipped in v0.56.0.
 
 ### Notes
 
-- **Managed Shared-tenant MySQL sync is a known limitation (follow-up).** A managed *dedicated*
-  MySQL's data lands (the atomic chunked shadow); a managed *Shared*-tenant MySQL has no sidecar
-  shadow+swap path, so `project sync` skips it fail-fast in the preflight with a reason (declare it
-  dedicated to sync its data). Managed Postgres has no such gap — it restores for either tenancy.
 - **Mixed-version fleets.** The new `managed_restore` wire field (clone `managed_restore` query
   param / `clone/from` body field, and the bundle manifest's `managed_restore`) is **silently
   ignored by a pre-0.59.1 node**: an older source or target falls back to the legacy coupling

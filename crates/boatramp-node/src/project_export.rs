@@ -288,12 +288,13 @@ fn self_provisioned_managed_cred_keys(
     keys
 }
 
-/// How a SIDECAR (non-chunked) pg dump member must be applied on import — the narrowed post-HIGH-1
-/// policy (the untrusted dump must never reach the bootstrap superuser). A pure
-/// (managed × [`ManagedRestore`]) decision, factored out so the narrowing is unit-testable without a
-/// live backend.
+/// How a SIDECAR (non-chunked) MANAGED-engine dump member (pg OR mysql) must be applied on import —
+/// the narrowed post-HIGH-1 policy (the untrusted dump must never reach the bootstrap superuser). A
+/// pure (managed × [`ManagedRestore`]) decision, engine-agnostic, factored out so the narrowing is
+/// unit-testable without a live backend. Both the pg sidecar arm and the mysql sidecar arm route
+/// through this ONE classifier.
 #[derive(Debug, PartialEq, Eq)]
-enum SidecarPgApply {
+enum SidecarManagedApply {
     /// EXTERNAL bring-your-own-URL binding: the operator's OWN database + credential (their trust
     /// boundary, not our managed cluster) — the dump is applied directly.
     External,
@@ -309,18 +310,19 @@ enum SidecarPgApply {
     RefuseManagedDataOnly,
 }
 
-/// Decide how a SIDECAR pg dump member is applied, from the binding's managed-ness and the bundle's
+/// Decide how a SIDECAR managed-engine (pg/mysql) dump member is applied, from the binding's
+/// managed-ness and the bundle's
 /// [`ManagedRestore`] mode. EXACTLY: a managed [`ShadowSwap`](ManagedRestore::ShadowSwap) dump is
 /// applied via the atomic non-superuser shadow+swap; a managed [`Overlay`](ManagedRestore::Overlay)
 /// dump is REFUSED (overlay into a live schema, no atomic shadow); an external binding is applied
 /// directly. NB: this reads the managed-restore mode, NOT a conflated `data_only` scope flag — a
 /// `DataPlane`-scoped bundle whose managed members are `ShadowSwap` (what `project sync` produces)
 /// now lands here as `ManagedShadowSwap`, where before the coupling forced it to refuse.
-fn sidecar_pg_apply(is_managed: bool, restore: ManagedRestore) -> SidecarPgApply {
+fn sidecar_managed_apply(is_managed: bool, restore: ManagedRestore) -> SidecarManagedApply {
     match (is_managed, restore) {
-        (false, _) => SidecarPgApply::External,
-        (true, ManagedRestore::ShadowSwap) => SidecarPgApply::ManagedShadowSwap,
-        (true, ManagedRestore::Overlay) => SidecarPgApply::RefuseManagedDataOnly,
+        (false, _) => SidecarManagedApply::External,
+        (true, ManagedRestore::ShadowSwap) => SidecarManagedApply::ManagedShadowSwap,
+        (true, ManagedRestore::Overlay) => SidecarManagedApply::RefuseManagedDataOnly,
     }
 }
 
@@ -329,7 +331,7 @@ fn sidecar_pg_apply(is_managed: bool, restore: ManagedRestore) -> SidecarPgApply
 /// [`ManagedRestore`] mode, and whether the tenant is Shared. Chunked IFF managed AND ShadowSwap AND
 /// not-Shared — a dedicated/Single managed ShadowSwap dump. The complementary cases stay SIDECAR: a
 /// Shared managed ShadowSwap reaches the shadow via `pg_sidecar_shadow_restore`
-/// ([`SidecarPgApply::ManagedShadowSwap`]); an Overlay dump or an external binding applies on the
+/// ([`SidecarManagedApply::ManagedShadowSwap`]); an Overlay dump or an external binding applies on the
 /// sidecar arm too. The pure framing decision behind `plan_export`, keyed on the SPLIT managed-restore
 /// mode (NOT a conflated scope flag) so a `DataPlane`-scope `project sync` still frames a dedicated
 /// managed DB chunked.
@@ -1763,6 +1765,13 @@ enum StageJob {
         conn: MysqlConnection,
         image: String,
         data_only: bool,
+        /// Dump TABLES-ONLY ([`mysqldump_tables_only_invocation`] — a positional `<db>`, no
+        /// `--databases`, so NO `CREATE DATABASE`/`USE <original>`) rather than the FULL
+        /// [`mysqldump_invocation`]. Set for a MANAGED **Shared** ShadowSwap member so the sidecar
+        /// shadow+swap can apply it into a differently-named per-tenant shadow db — exactly the dump
+        /// shape the dedicated CHUNKED path already streams. External/Overlay members keep the FULL
+        /// (`--databases`) dump.
+        tables_only: bool,
     },
     /// A libsql `VACUUM INTO` snapshot of the project-qualified site DB.
     Libsql { qsite: String },
@@ -2765,14 +2774,20 @@ impl ProjectExport for NodeProjectExport {
                                     report.pg_databases += 1;
                                     pending_chunk = None;
                                 } else {
-                                    let plan =
-                                        match self.mysql_shadow_plan(project, &db, &cfg).await {
-                                            Ok(p) => p,
-                                            Err(e) => {
-                                                let _ = reply.send(Err(()));
-                                                return Err(e);
-                                            }
-                                        };
+                                    // Defense-in-depth: only a DEDICATED/Single managed ShadowSwap
+                                    // member is framed chunked, so refuse a Shared one here
+                                    // (`allow_shared = false`) — a Shared managed mysql reaches the
+                                    // shadow via the SIDECAR path instead.
+                                    let plan = match self
+                                        .mysql_shadow_plan(project, &db, &cfg, false)
+                                        .await
+                                    {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let _ = reply.send(Err(()));
+                                            return Err(e);
+                                        }
+                                    };
                                     if let Err(e) =
                                         self.mysql_create_shadow(&plan, &stage_dir).await
                                     {
@@ -3552,6 +3567,15 @@ impl NodeProjectExport {
                         conn,
                         image,
                         data_only: overlay_dump,
+                        // A MANAGED Shared ShadowSwap member is framed SIDECAR but must restore into
+                        // a differently-named per-tenant shadow db, so it needs the TABLES-ONLY dump
+                        // (no `CREATE DATABASE <livedb>; USE <livedb>;`) — the exact dump the chunked
+                        // path streams. A dedicated managed ShadowSwap is framed chunked (its producer
+                        // already uses the tables-only dump), and external/Overlay members keep the
+                        // FULL `--databases` dump, so they are not tables-only here.
+                        tables_only: is_managed
+                            && is_shared
+                            && matches!(managed_restore, ManagedRestore::ShadowSwap),
                     },
                 ));
             }
@@ -3798,8 +3822,16 @@ impl NodeProjectExport {
                 conn,
                 image,
                 data_only,
+                tables_only,
             } => {
-                let inv = mysqldump_invocation(conn, *data_only);
+                // A Shared managed ShadowSwap member stages TABLES-ONLY (so the sidecar shadow+swap
+                // can restore it into a differently-named per-tenant shadow); external/Overlay keep
+                // the FULL `--databases` dump.
+                let inv = if *tables_only {
+                    mysqldump_tables_only_invocation(conn)
+                } else {
+                    mysqldump_invocation(conn, *data_only)
+                };
                 let code = self
                     .run_sql_client(image, &inv.argv, &inv.env, None, &tmp)
                     .await?;
@@ -4023,13 +4055,13 @@ impl NodeProjectExport {
                     // integrity, not authenticity). It must NEVER be applied as the binding's
                     // configured user, which on a MANAGED co-located server is the BOOTSTRAP SUPERUSER
                     // — a crafted `COPY … TO PROGRAM` / `CREATE FUNCTION … LANGUAGE c` / untrusted
-                    // `CREATE EXTENSION` would then execute = RCE. `sidecar_pg_apply` encodes the
+                    // `CREATE EXTENSION` would then execute = RCE. `sidecar_managed_apply` encodes the
                     // (managed × ManagedRestore) policy, and the confinement is NON-SUPERUSER-APPLY,
                     // not DDL/flag inspection (the managed-restore mode is itself an untrusted manifest
                     // flag that does not constrain the member's bytes — a lying ShadowSwap can at worst
                     // fail / empty-restore in a fresh shadow as a NOSUPERUSER role, never RCE).
-                    match sidecar_pg_apply(is_managed_binding(cfg), head.managed_restore) {
-                        SidecarPgApply::RefuseManagedDataOnly => {
+                    match sidecar_managed_apply(is_managed_binding(cfg), head.managed_restore) {
+                        SidecarManagedApply::RefuseManagedDataOnly => {
                             // Still REFUSED: a data-only sidecar is an OVERLAY into the target's
                             // EXISTING live schema (rows into tables that must already exist) — there
                             // is no atomic shadow+swap for an overlay (the shadow is a FRESH db, not
@@ -4047,7 +4079,7 @@ impl NodeProjectExport {
                                  external (bring-your-own-URL) binding."
                             )));
                         }
-                        SidecarPgApply::ManagedShadowSwap => {
+                        SidecarManagedApply::ManagedShadowSwap => {
                             // NOW SAFE: a FULL managed sidecar dump (a Shared tenant's pg export is
                             // framed sidecar/non-chunked; also any FULL dedicated dump staged
                             // sidecar). Apply it through the SAME non-superuser ephemeral-role +
@@ -4063,7 +4095,7 @@ impl NodeProjectExport {
                             self.pg_sidecar_shadow_restore(project, db, cfg, temp, stage_dir)
                                 .await?;
                         }
-                        SidecarPgApply::External => {
+                        SidecarManagedApply::External => {
                             // EXTERNAL bring-your-own-URL binding: the OPERATOR'S OWN database +
                             // credential (their trust boundary, not our managed cluster) — apply the
                             // dump directly. Capture stderr via `sh -c '… 2>&1'` so a failed restore
@@ -4114,49 +4146,68 @@ impl NodeProjectExport {
                     }
                 }
                 if opts.apply {
-                    // HIGH-1 (mirror of the pg sidecar arm): refuse a MANAGED sidecar mysql apply —
-                    // it would connect as the bootstrap superuser against our co-located server. An
-                    // EXTERNAL binding applies with the operator's own credential (their trust).
-                    // Unlike pg, mysql has no Shared-tenant sidecar shadow+swap path: a managed mysql
-                    // reaches the safe shadow+swap ONLY via the atomic CHUNKED arm (a ShadowSwap
-                    // DEDICATED/Single dump, which `project sync` of a dedicated mysql produces), so a
-                    // managed member landing on THIS sidecar arm is either an Overlay dump (the RCE
-                    // guard) or a Shared tenant (no mysql sidecar shadow) — both refused fail-closed.
-                    if is_managed_binding(cfg) {
-                        let why = if overlay {
-                            "a data-only/Overlay restore would overlay the untrusted dump onto the \
-                             live schema as the bootstrap superuser (RCE risk)"
-                        } else {
-                            "a managed Shared-tenant mysql has no sidecar shadow+swap path (only a \
-                             dedicated/Single mysql restores via the atomic chunked shadow)"
-                        };
-                        return Err(Perr::Unavailable(format!(
-                            "import refused: a MANAGED mysql database ({db:?}) can only be restored \
-                             via the atomic chunked shadow path (a FULL, dedicated/Single bundle) — \
-                             {why}. Re-export as a FULL dedicated bundle, or import into an external \
-                             (bring-your-own-URL) binding."
-                        )));
+                    // HIGH-1 (mirror of the pg sidecar arm, same engine-agnostic classifier): a
+                    // SIDECAR mysql member is ATTACKER-CRAFTED and must NEVER be applied as the
+                    // binding's configured user, which on a MANAGED co-located server is the BOOTSTRAP
+                    // SUPERUSER — a crafted `LOAD DATA INFILE`/`INTO OUTFILE`/privileged routine would
+                    // then execute = RCE. `sidecar_managed_apply` encodes the (managed × ManagedRestore)
+                    // policy; the confinement is NON-SUPERUSER-APPLY, not DDL/flag inspection.
+                    match sidecar_managed_apply(is_managed_binding(cfg), head.managed_restore) {
+                        SidecarManagedApply::RefuseManagedDataOnly => {
+                            // STILL REFUSED (the RCE guard, preserved): a data-only/Overlay restore is
+                            // an OVERLAY into the target's EXISTING live schema — there is no atomic
+                            // shadow+swap for an overlay (the shadow is a FRESH db, not the live
+                            // schema), and a direct apply would run the untrusted dump as the bootstrap
+                            // superuser. A least-privilege overlay apply is a pending follow-up.
+                            // Fail-closed.
+                            return Err(Perr::Unavailable(format!(
+                                "import refused: a data-only restore of MANAGED mysql database \
+                                 ({db:?}) is not supported — it would overlay the untrusted dump \
+                                 onto the live schema as the bootstrap superuser (RCE risk), with no \
+                                 atomic shadow+swap; a least-privilege data-only/overlay apply is a \
+                                 pending follow-up. Re-export as a FULL bundle, or import into an \
+                                 external (bring-your-own-URL) binding."
+                            )));
+                        }
+                        SidecarManagedApply::ManagedShadowSwap => {
+                            // NOW SAFE: a FULL managed sidecar mysql dump — a Shared tenant's mysql
+                            // export is framed sidecar/non-chunked (a dedicated/Single managed
+                            // ShadowSwap is framed chunked and never reaches this arm). Apply it
+                            // through the SAME non-superuser ephemeral-user + shadow + atomic-swap
+                            // mechanism the chunked path uses — the untrusted dump is applied ONLY as
+                            // the ephemeral least-privilege user into a shadow db, then the verified
+                            // shadow is atomically swapped into the self-provisioned per-tenant target.
+                            let stage_dir = temp.parent().ok_or_else(|| {
+                                Perr::Other("sidecar mysql member temp has no parent dir".into())
+                            })?;
+                            self.mysql_sidecar_shadow_restore(project, db, cfg, temp, stage_dir)
+                                .await?;
+                        }
+                        SidecarManagedApply::External => {
+                            // EXTERNAL bring-your-own-URL binding: the operator's OWN database +
+                            // credential (their trust boundary) — apply the dump directly. Capture the
+                            // mysql client's stderr via `sh -c '… 2>&1'` so a failed restore is
+                            // diagnosable, not a causeless "exited N" (run_ephemeral drops stderr on
+                            // nonzero).
+                            let inv = mysql_restore_invocation(&conn, overlay);
+                            let merged = merge_stderr_argv(&inv.argv);
+                            let outfile = temp.with_extension("myrestore.out");
+                            let code = self
+                                .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
+                                .await?;
+                            if code != 0 {
+                                let diag = tokio::fs::read_to_string(&outfile)
+                                    .await
+                                    .unwrap_or_default();
+                                let _ = tokio::fs::remove_file(&outfile).await;
+                                return Err(Perr::Other(format!(
+                                    "mysql restore for {db:?} exited {code}: {}",
+                                    diag.trim()
+                                )));
+                            }
+                            let _ = tokio::fs::remove_file(&outfile).await;
+                        }
                     }
-                    let inv = mysql_restore_invocation(&conn, overlay);
-                    // Capture the mysql client's stderr (a failed statement's error) via
-                    // `sh -c '… 2>&1'` so a failed EXTERNAL restore is diagnosable, not a
-                    // causeless "exited N" (run_ephemeral drops stderr on nonzero).
-                    let merged = merge_stderr_argv(&inv.argv);
-                    let outfile = temp.with_extension("myrestore.out");
-                    let code = self
-                        .run_sql_client(&image, &merged, &inv.env, Some(temp), &outfile)
-                        .await?;
-                    if code != 0 {
-                        let diag = tokio::fs::read_to_string(&outfile)
-                            .await
-                            .unwrap_or_default();
-                        let _ = tokio::fs::remove_file(&outfile).await;
-                        return Err(Perr::Other(format!(
-                            "mysql restore for {db:?} exited {code}: {}",
-                            diag.trim()
-                        )));
-                    }
-                    let _ = tokio::fs::remove_file(&outfile).await;
                 }
                 report.pg_databases += 1;
             }
@@ -6129,26 +6180,39 @@ impl NodeProjectExport {
     // the maintenance connection runs the trusted `CREATE DATABASE` + atomic `RENAME TABLE` swap.
     // -----------------------------------------------------------------------
 
-    /// Resolve the [`MysqlShadowPlan`] for a MANAGED, non-Shared mysql binding (external bindings
-    /// stay sidecar; Shared multi-tenant is refused — dedicated/Single only). Mints an EPHEMERAL
-    /// apply user + password (HIGH-1: the configured user is the bootstrap superuser on a dedicated
-    /// instance, so the apply must NOT use it).
+    /// Resolve the [`MysqlShadowPlan`] for a MANAGED mysql binding (external bindings stay sidecar).
+    /// Mints an EPHEMERAL apply user + password (HIGH-1: the configured user is the bootstrap
+    /// superuser on a dedicated instance, so the apply must NOT use it).
+    ///
+    /// `allow_shared` gates the Shared multi-tenant tenancy: the CHUNKED servicer caller passes
+    /// `false` (defense-in-depth — a dedicated/Single managed ShadowSwap is the only member framed
+    /// chunked, so a Shared one reaching the chunked arm is a bug), while the SIDECAR shadow+swap
+    /// caller ([`mysql_sidecar_shadow_restore`](Self::mysql_sidecar_shadow_restore)) passes `true`.
+    /// A Shared tenant's per-tenant physical database is resolved tenant-qualified by
+    /// [`resolve_mysql`](Self::resolve_mysql) → `resolve_endpoint` (the same derivation served Shared
+    /// mysql uses), and [`ensure_target_db_provisioned`](Self::ensure_target_db_provisioned) has
+    /// already created that live per-tenant db + its login grant before the restore — so the
+    /// DATABASE-level shadow+swap applies exactly as for a dedicated server (MySQL has no PUBLIC
+    /// connect surface, so no restore-window lockdown is needed, and the tenant's db-level grant
+    /// already covers the swapped-in tables, so no post-swap re-provision is needed).
     async fn mysql_shadow_plan(
         &self,
         project: &str,
         db: &str,
         cfg: &ExternalDatabaseConfig,
+        allow_shared: bool,
     ) -> Result<MysqlShadowPlan, Perr> {
         if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
             return Err(Perr::Unavailable(format!(
-                "database {db:?}: the atomic chunked mysql shadow-restore is for MANAGED \
+                "database {db:?}: the atomic mysql shadow-restore is for MANAGED \
                  (compute-backed) databases only; an external binding uses the sidecar path"
             )));
         }
-        if matches!(cfg.tenant, crate::config::TenantIsolation::Shared) {
+        if !allow_shared && matches!(cfg.tenant, crate::config::TenantIsolation::Shared) {
             return Err(Perr::Unavailable(format!(
-                "database {db:?}: the atomic chunked mysql shadow-restore is for DEDICATED/Single \
-                 managed servers only; a Shared multi-tenant server is deferred"
+                "database {db:?}: the atomic CHUNKED mysql shadow-restore is for DEDICATED/Single \
+                 managed servers only; a Shared multi-tenant server restores via the sidecar \
+                 shadow+swap (mysql_sidecar_shadow_restore)"
             )));
         }
         // Clone self-provision — mirror of `pg_shadow_plan`'s call above (both callers only
@@ -6172,6 +6236,83 @@ impl NodeProjectExport {
             eph_password: random_token(),
             image,
         })
+    }
+
+    /// Apply a FULL MANAGED **sidecar** mysql dump (already staged + SHA-verified at `temp`) through
+    /// the SAME non-superuser ephemeral-user + shadow + atomic-swap mechanism the chunked/dedicated
+    /// path uses — now serving a SHARED tenant's sidecar-framed TABLES-ONLY export. The mysql analogue
+    /// of [`pg_sidecar_shadow_restore`](Self::pg_sidecar_shadow_restore); the Shared mysql case is
+    /// SIMPLER than Shared pg: MySQL has NO PUBLIC-connect surface, so there is no restore-window
+    /// lockdown, and the tenant's db-level `GRANT ALL ON <db>.*` already covers the swapped-in tables,
+    /// so there is no post-swap re-provision.
+    ///
+    /// THE INVARIANT (absolute): the untrusted tables-only dump is applied CONNECTED AS the ephemeral
+    /// least-privilege user ([`mysql_shadow_invocation`], `--local-infile=0`) into the shadow — so a
+    /// crafted `LOAD DATA INFILE` / `INTO OUTFILE` / privileged-routine statement FAILS at apply
+    /// (MySQL denies it to a user without `FILE`/`SUPER`), exactly as the chunked path and the
+    /// `mysql_assert_not_superuser` fail-closed probe prove. The SUPERUSER / maintenance connection
+    /// runs ONLY our own trusted scaffolding DDL (create shadow + eph user, the atomic `RENAME TABLE`
+    /// swap) — never a byte of the dump. Any create/apply/swap failure tears the shadow down and
+    /// leaves live untouched.
+    async fn mysql_sidecar_shadow_restore(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        temp: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let plan = self.mysql_shadow_plan(project, db, cfg, true).await?;
+        // TRUSTED DDL (superuser/maint): create the shadow db + mint the EPHEMERAL least-privilege
+        // apply user granted ONLY on the shadow.
+        if let Err(e) = self.mysql_create_shadow(&plan, stage_dir).await {
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // FAIL-CLOSED: refuse the untrusted apply unless the apply user is PROVABLY least-privilege
+        // (no SUPER/FILE/`*.*`).
+        if let Err(e) = self.mysql_assert_not_superuser(&plan, stage_dir).await {
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // Apply the untrusted tables-only dump into the shadow AS the ephemeral user, reading the
+        // staged member FILE on stdin. `--local-infile=0` (in `mysql_shadow_invocation`) disables
+        // client-side `LOAD DATA LOCAL INFILE`; stderr is merged so a refused/failed statement is
+        // diagnosable (`run_ephemeral` drops a container's stderr on a non-zero exit).
+        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let outfile = stage_dir.join(format!("myrestore-sidecar-{}.out", shadow_suffix()));
+        let code = match self
+            .run_sql_client(&plan.image, &merged, &inv.env, Some(temp), &outfile)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&outfile).await;
+                self.mysql_drop_shadow(&plan, stage_dir).await;
+                return Err(e);
+            }
+        };
+        if code != 0 {
+            let diag = tokio::fs::read_to_string(&outfile)
+                .await
+                .unwrap_or_default();
+            let _ = tokio::fs::remove_file(&outfile).await;
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(Perr::Other(format!(
+                "mysql apply into shadow {:?} for {db:?} exited {code}; live untouched: {}",
+                plan.shadow_db,
+                diag.trim()
+            )));
+        }
+        let _ = tokio::fs::remove_file(&outfile).await;
+        // Apply clean (and the sidecar member was SHA-verified at staging) → atomic swap. A swap
+        // failure tears the shadow down; live is untouched.
+        if let Err(e) = self.mysql_swap_shadow(&plan, stage_dir).await {
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Fail-closed probe: refuse the untrusted mysql apply unless the ephemeral user's grants carry
@@ -6591,7 +6732,7 @@ impl NodeProjectExport {
                     }
                 }
             } else if kind_is_mysql(&cfg.kind)
-                && let Ok(plan) = self.mysql_shadow_plan(project, db, cfg).await
+                && let Ok(plan) = self.mysql_shadow_plan(project, db, cfg, true).await
             {
                 let sql = "SELECT schema_name FROM information_schema.schemata \
                            WHERE schema_name LIKE '%\\_\\_shadow\\_%';";
@@ -8261,7 +8402,9 @@ impl NodeProjectExport {
                     Perr::Other(format!("import: no database named {db:?} on this node"))
                 })?
                 .clone();
-            let mut plan = self.mysql_shadow_plan(project, &db, &cfg).await?;
+            // mysql true-delta capture/replay is DEDICATED/Single-only (same scope as pg), so a
+            // Shared binding never reaches here — pass `allow_shared = false` (defense-in-depth).
+            let mut plan = self.mysql_shadow_plan(project, &db, &cfg, false).await?;
             // The delta member's row events were db-REWRITTEN at capture to the deterministic delta
             // shadow name (the member is SQL text, not re-rewritable at replay), so the shadow MUST be
             // exactly that name — override the per-import `__shadow_<hex>` the plan minted. The base
@@ -10077,33 +10220,36 @@ mod tests {
     /// applied directly regardless of the mode. (The live shadow apply itself needs Docker + pg;
     /// this unit test fixes the dispatch that the `*_live` gates then exercise end-to-end.)
     #[test]
-    fn sidecar_pg_apply_dispatches_by_managed_restore_mode() {
+    fn sidecar_managed_apply_dispatches_by_managed_restore_mode() {
         use ManagedRestore::{Overlay, ShadowSwap};
         // MANAGED + ShadowSwap: the SAFE case — atomic non-superuser shadow+swap. This is the arm a
         // `project sync` of a Shared managed pg now reaches (DataPlane scope + ShadowSwap mode); the
         // pre-split coupling forced it to refuse because `data_only` implied Overlay.
         assert_eq!(
-            sidecar_pg_apply(true, ShadowSwap),
-            SidecarPgApply::ManagedShadowSwap,
+            sidecar_managed_apply(true, ShadowSwap),
+            SidecarManagedApply::ManagedShadowSwap,
             "a ShadowSwap managed sidecar dump applies via the non-superuser shadow+swap"
         );
         // MANAGED + Overlay: STILL refused — the RefuseManagedDataOnly guard must keep firing for a
         // genuine overlay (external/BYO overlay, allow-schema-skew overlay), never over-opened.
         assert_eq!(
-            sidecar_pg_apply(true, Overlay),
-            SidecarPgApply::RefuseManagedDataOnly,
+            sidecar_managed_apply(true, Overlay),
+            SidecarManagedApply::RefuseManagedDataOnly,
             "an Overlay managed sidecar dump must STAY refused — no atomic shadow for an overlay (RCE guard)"
         );
         // EXTERNAL (not managed): applied directly with the operator's own credential, either mode.
         assert_eq!(
-            sidecar_pg_apply(false, ShadowSwap),
-            SidecarPgApply::External
+            sidecar_managed_apply(false, ShadowSwap),
+            SidecarManagedApply::External
         );
-        assert_eq!(sidecar_pg_apply(false, Overlay), SidecarPgApply::External);
+        assert_eq!(
+            sidecar_managed_apply(false, Overlay),
+            SidecarManagedApply::External
+        );
     }
 
     /// The EXPORT-side framing decision behind `plan_export` (the pure complement of the import-side
-    /// `sidecar_pg_apply`): a managed member is CHUNKED iff managed AND ShadowSwap AND not-Shared.
+    /// `sidecar_managed_apply`): a managed member is CHUNKED iff managed AND ShadowSwap AND not-Shared.
     /// Pins that `project sync` (ShadowSwap) frames a DEDICATED managed DB chunked (→ the atomic
     /// chunked shadow) and a SHARED one sidecar (→ `pg_sidecar_shadow_restore`), while an Overlay or
     /// external binding is always sidecar. `plan_export` itself needs a live DB (version-detect), so
@@ -10126,7 +10272,7 @@ mod tests {
     /// The legacy `data_only` wire bool maps, via [`BundleHead`], to exactly the pre-split coupling:
     /// `true → DataPlane + Overlay`, `false → Full + ShadowSwap`. This is what keeps a pre-split
     /// bundle (and every legacy caller) behaving UNCHANGED after the overload was split, and what
-    /// makes the `sidecar_pg_apply` boundary above equivalent to the old `(managed × data_only)` one
+    /// makes the `sidecar_managed_apply` boundary above equivalent to the old `(managed × data_only)` one
     /// for any bundle that did NOT ask for the new `DataPlane + ShadowSwap` combination.
     #[test]
     fn bundle_head_from_bool_reproduces_the_legacy_coupling() {
@@ -10139,12 +10285,12 @@ mod tests {
         // A managed pg under the legacy coupling: data_only → refuse; full → shadow+swap. Identical
         // to the pre-split boundary, so nothing that did not opt into the new combination changes.
         assert_eq!(
-            sidecar_pg_apply(true, BundleHead::from(true).managed_restore),
-            SidecarPgApply::RefuseManagedDataOnly
+            sidecar_managed_apply(true, BundleHead::from(true).managed_restore),
+            SidecarManagedApply::RefuseManagedDataOnly
         );
         assert_eq!(
-            sidecar_pg_apply(true, BundleHead::from(false).managed_restore),
-            SidecarPgApply::ManagedShadowSwap
+            sidecar_managed_apply(true, BundleHead::from(false).managed_restore),
+            SidecarManagedApply::ManagedShadowSwap
         );
     }
 

@@ -70,13 +70,14 @@ streamed dump; a **Shared-tenant Postgres** restores the same way via a **sideca
 into the tenant's freshly-provisioned database. The untrusted dump is applied
 by a freshly-minted, import-scoped **non-superuser** role (Postgres/MySQL) or a confined SQLite
 authorizer (libsql) — never the binding's own (superuser-grade, on a managed co-located server)
-credential — closing an RCE-on-import hazard a crafted dump could otherwise exploit. Two managed
-cases this atomic path does **not** cover, refused for a managed target with a `501`: a
-**data-only / overlay** restore of a managed binding (there is no atomic shadow for an overlay, so
-the untrusted dump would run as the bootstrap superuser), and a **Shared-tenant managed MySQL**
-(MySQL has no sidecar shadow+swap — only a dedicated MySQL restores atomically). The way forward is
-a full, dedicated re-export, or an external (bring-your-own-URL) binding; a least-privilege
-data-only/overlay apply is a pending follow-up. An **external** (bring-your-own-URL) database
+credential — closing an RCE-on-import hazard a crafted dump could otherwise exploit. This atomic
+path covers a managed **Postgres or MySQL** binding of **either tenancy** (dedicated/single via the
+chunked shadow, Shared-tenant via the sidecar shadow+swap). The one managed case it does **not**
+cover, refused for a managed target with a `501`: a **data-only / overlay** restore of a managed
+binding (there is no atomic shadow for an overlay, so the untrusted dump would run as the bootstrap
+superuser). The way forward is a full re-export, or an external (bring-your-own-URL) binding; a
+least-privilege data-only/overlay apply is a pending follow-up. An **external** (bring-your-own-URL)
+database
 binding is unaffected by any of this — it
 restores with the operator's own configured credential against the operator's own database (their
 trust boundary, not boatramp's managed cluster).
