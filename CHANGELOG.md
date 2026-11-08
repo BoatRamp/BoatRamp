@@ -29,6 +29,19 @@ versions.
   simpler than the Shared-pg path. The engine-agnostic sidecar-apply classifier (renamed
   `sidecar_managed_apply`) now routes both the pg and mysql sidecar arms; the RCE guard is preserved
   (a genuine `Overlay`-into-managed-MySQL stays refused fail-closed).
+- **Managed MySQL sync/clone now carries triggers, stored routines, and scheduled events** (both the
+  dedicated chunked and the Shared sidecar path), restored SAFELY as a non-privileged user. The
+  staged dump adds `--routines --events` (triggers are mysqldump's default), and the driver rewrites
+  every `DEFINER=` clause to the ephemeral apply user before applying — so the objects create under
+  the non-superuser restore (a non-SUPER user cannot create an object with a foreign `DEFINER`). The
+  rewrite is precise: it only touches mysqldump executable-comment lines (`/*!… DEFINER=…*/`), never
+  row data or a routine body containing the text "DEFINER=". After the atomic swap the driver
+  re-points each carried object's `DEFINER` to the tenant's OWN db-scoped login role (Shared) — or
+  strips it to the served identity (dedicated) — via drop+recreate as the admin (MySQL has no
+  `ALTER … DEFINER`). SECURITY INVARIANTS: the apply user never gains SUPER/SET_USER_ID; the
+  re-pointed DEFINER is ONLY ever the tenant's own role (a malicious object body then runs with the
+  tenant's own grants — its own risk, never cross-tenant or server-wide); an object requiring a
+  privilege the tenant role lacks fails the import fail-closed rather than escalating.
 - **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
   threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
   - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql

@@ -527,6 +527,12 @@ jobs:
           # its marker.
           grep -q 'PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK' project-export.log \
             || { echo "::error::project sync managed-mysql Shared shadow-land gate never reached its marker (silent skip, a regression, or a cross-tenant leak)" >&2; exit 1; }
+          # Managed MySQL carries triggers/stored routines/events across the shadow+swap, restored as
+          # a non-SUPER user and RE-POINTED to the tenant's own role post-swap (the DEFINER-handling
+          # seam). Gate on its marker so a skip or a regression (a carried object NOT re-pointed, or
+          # the carry silently dropped) fails the job.
+          grep -q 'PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK' project-export.log \
+            || { echo "::error::mysql triggers/routines/events carry + DEFINER re-point gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

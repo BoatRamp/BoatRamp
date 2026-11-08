@@ -440,10 +440,47 @@ pub fn mysqldump_tables_only_invocation(conn: &MysqlConnection) -> SqlInvocation
         "--single-transaction".to_string(),
         "--no-tablespaces".to_string(),
         "--set-gtid-purged=OFF".to_string(),
+        // Carry the schema's DEFINER-bearing objects too: `--triggers` is mysqldump's default (so
+        // triggers already ride along), and `--routines --events` add stored procedures/functions and
+        // scheduled events. All four restore into the shadow AS the ephemeral non-superuser apply user
+        // only after the node driver rewrites each `DEFINER=` clause to that apply user
+        // (`rewrite_mysql_definers`); after the swap the driver re-points them to the tenant's own
+        // db-scoped role. A FUNCTION the apply user cannot create (e.g. no `log_bin_trust_function_
+        // creators` on a binlog-on server) fails the restore FAIL-CLOSED, never escalating.
+        "--routines".to_string(),
+        "--events".to_string(),
     ];
     argv.extend(conn.conn_args());
     // Positional db, NO `--databases` ⇒ tables only, no `CREATE DATABASE`/`USE <original>`.
     argv.push(conn.database.clone());
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build the `mysqldump` that RE-EXTRACTS only a database's DEFINER-bearing objects (triggers +
+/// stored routines + events) as clean, `DELIMITER`-wrapped DDL — NO table schema, NO row data
+/// (`--no-create-info --no-data`). Used by the node driver AFTER the untrusted tables-only dump has
+/// been restored into the shadow by the ephemeral apply user: the driver dumps these objects back out
+/// of the shadow (their `DEFINER` now = the ephemeral apply user), rewrites each `DEFINER=` clause to
+/// the TENANT'S OWN role (`rewrite_mysql_definers`), and re-creates them in the live db as the admin
+/// after the atomic `RENAME TABLE` swap — because routines/events are schema-level (they do NOT ride
+/// `RENAME TABLE`) and a trigger blocks a cross-schema rename. `--set-gtid-purged=OFF` keeps the
+/// stream free of a privileged `SET @@GLOBAL.GTID_PURGED`. Positional `<db>` (no `--databases`), so
+/// the DDL is unqualified and lands in whatever db the applying connection `USE`s.
+pub fn mysqldump_definer_objects_invocation(conn: &MysqlConnection, db: &str) -> SqlInvocation {
+    let mut argv = vec![
+        "mysqldump".to_string(),
+        "--no-tablespaces".to_string(),
+        "--set-gtid-purged=OFF".to_string(),
+        "--no-create-info".to_string(),
+        "--no-data".to_string(),
+        "--routines".to_string(),
+        "--events".to_string(),
+    ];
+    argv.extend(conn.conn_args());
+    argv.push(db.to_string());
     SqlInvocation {
         argv,
         env: conn.env(),

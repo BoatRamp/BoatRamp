@@ -87,9 +87,9 @@ use crate::managed_sql::{ManagedSqlCredentials, operator_target, owner_target};
 use crate::pg_client::{
     MysqlConnection, PgConnection, mysql_admin_invocation, mysql_restore_invocation,
     mysql_shadow_invocation, mysqlbinlog_capture_invocation, mysqldump_capture_base_invocation,
-    mysqldump_invocation, mysqldump_tables_only_invocation, pg_dump_invocation,
-    pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major, psql_invocation,
-    psql_script_invocation,
+    mysqldump_definer_objects_invocation, mysqldump_invocation, mysqldump_tables_only_invocation,
+    pg_dump_invocation, pg_restore_invocation, pg_restore_shadow_invocation, pg_server_major,
+    psql_invocation, psql_script_invocation,
 };
 use crate::project_bundle::{
     self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, MemberSpec, PgMemberInfo, SourceInfo,
@@ -2039,12 +2039,15 @@ enum ChunkState {
         out_path: PathBuf,
     },
     /// A MySQL member streaming into a SHADOW database (inc2 Stage D), mirror of [`Pg`](Self::Pg):
-    /// `mysql <shadow>` applies the tables-only dump as the non-superuser role; finish swaps via an
-    /// atomic `RENAME TABLE` (verified) or drops the shadow (abort).
+    /// the restore task drains the body to `dump_path`, rewrites its `DEFINER=` clauses, and applies
+    /// the dump as the non-superuser role; finish carries the DEFINER objects + swaps via the atomic
+    /// `RENAME TABLE` (verified) or drops the shadow (abort).
     Mysql {
         plan: Box<MysqlShadowPlan>,
         restore: tokio::task::JoinHandle<Result<i32, Perr>>,
         out_path: PathBuf,
+        /// The staged dump file the restore task drains + rewrites (cleaned up at finish/abort).
+        dump_path: PathBuf,
     },
 }
 
@@ -2150,6 +2153,30 @@ struct MysqlShadowPlan {
     /// The ephemeral user's randomly-generated password.
     eph_password: String,
     image: String,
+    /// Where the swapped-in db's carried DEFINER-bearing objects (triggers/routines/events) have
+    /// their `DEFINER` RE-POINTED after the atomic swap — NEVER the ephemeral apply user (dropped
+    /// at swap) and NEVER a superuser/another tenant. For a Shared NON-default tenant this is the
+    /// tenant's own db-scoped LOGIN role (`` `<role>`@`%` ``); for Single/dedicated + Shared-DEFAULT
+    /// it is [`MysqlDefinerTarget::Strip`] (the clause is removed, so `DEFINER` defaults to the admin
+    /// connection that re-creates the object — i.e. the server's own served identity). See
+    /// [`rewrite_mysql_definers`].
+    repoint: MysqlDefinerTarget,
+}
+
+/// Where a mysqldump `DEFINER=` clause is (re)pointed by [`rewrite_mysql_definers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MysqlDefinerTarget {
+    /// Point every DEFINER at `` `<name>`@`%` ``: the ephemeral apply user at restore-into-shadow
+    /// time (so the untrusted objects create successfully as a non-superuser), or a Shared tenant's
+    /// own db-scoped LOGIN role at post-swap re-point time (so a malicious object body runs only with
+    /// the tenant's own grants — never cross-tenant or server-wide).
+    Account(String),
+    /// REMOVE the DEFINER clause entirely, so the object's DEFINER defaults to the CREATE statement's
+    /// issuer. Used for the dedicated/Single + Shared-DEFAULT post-swap re-point, where the admin
+    /// connection that re-creates the object IS the served identity (there is no separate per-tenant
+    /// role on a single-tenant server), so defaulting to it introduces no authority the tenant's own
+    /// app does not already hold.
+    Strip,
 }
 
 impl MysqlShadowPlan {
@@ -2161,6 +2188,103 @@ impl MysqlShadowPlan {
         c.database = self.shadow_db.clone();
         c
     }
+}
+
+/// Rewrite every mysqldump `DEFINER=`user`@`host`` clause in `sql` to `target`, PRECISELY and
+/// SAFELY. The crux of the DEFINER-handling security story, so the matching is deliberately narrow:
+///
+/// 1. **Only mysqldump executable-comment lines** (a line whose first non-whitespace is `/*!`) are
+///    touched. Every REAL `DEFINER=` clause mysqldump emits for a trigger/routine/event/view lives
+///    inside a `/*!NNNNN DEFINER=…*/` version-gated comment on such a line. An `INSERT … VALUES`
+///    data line starts with `INSERT` (and mysqldump escapes newlines in string data, so a value can
+///    never span lines to masquerade as a `/*!` line), so a string literal containing the TEXT
+///    "DEFINER=" is NEVER rewritten — the explicit "do not corrupt body text / string literals"
+///    requirement. (A routine BODY line between `BEGIN`/`END` does not start with `/*!` either.)
+/// 2. **Only the exact `DEFINER=`‹quoted-ident›`@`‹quoted-ident›`` shape** is replaced (backtick
+///    quoting, doubled `` `` `` for a literal backtick) — the shape mysqldump/`SHOW CREATE` always
+///    emit. A `DEFINER=` not in that shape is copied through untouched.
+///
+/// The rewrite can only ever REDUCE privilege (point at the least-privilege apply user, or the
+/// tenant's own role, or strip to the issuer) — it never raises it — so even a crafted edge that
+/// slipped a DEFINER through would at worst fail the non-superuser restore FAIL-CLOSED, never
+/// escalate. `SQL SECURITY DEFINER` is deliberately LEFT INTACT: safety comes from the re-pointed
+/// DEFINER being the tenant's own db-scoped role (or the served identity on a single-tenant server),
+/// so DEFINER semantics run strictly within the tenant's own authority.
+fn rewrite_mysql_definers(sql: &str, target: &MysqlDefinerTarget) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for line in sql.split_inclusive('\n') {
+        if line.trim_start().starts_with("/*!") && line.contains("DEFINER=") {
+            rewrite_definer_clauses_in_line(line, target, &mut out);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Rewrite every well-formed `DEFINER=`u`@`h`` clause on ONE line into `out`.
+fn rewrite_definer_clauses_in_line(line: &str, target: &MysqlDefinerTarget, out: &mut String) {
+    let mut rest = line;
+    while let Some(pos) = rest.find("DEFINER=") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + "DEFINER=".len()..];
+        match mysql_definer_account_len(after) {
+            Some(consumed) => {
+                match target {
+                    MysqlDefinerTarget::Account(name) => {
+                        out.push_str("DEFINER=");
+                        out.push_str(&quote_ident(ExternalSqlKind::Mysql, name));
+                        out.push_str("@`%`");
+                        rest = &after[consumed..];
+                    }
+                    MysqlDefinerTarget::Strip => {
+                        // Drop the clause AND a single trailing space, so `/*!50017 DEFINER=…*/`
+                        // collapses to `/*!50017 */` (not a stray double space).
+                        let next = &after[consumed..];
+                        rest = next.strip_prefix(' ').unwrap_or(next);
+                    }
+                }
+            }
+            None => {
+                // A `DEFINER=` not in the exact backtick-quoted shape — copy it through verbatim and
+                // keep scanning after it (never corrupt text we do not recognize).
+                out.push_str("DEFINER=");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+/// If `s` begins with a complete `` `user`@`host` `` MySQL account spec (each a backtick-quoted
+/// identifier, doubled `` `` `` for a literal backtick), return its byte length; else `None`.
+fn mysql_definer_account_len(s: &str) -> Option<usize> {
+    let user = mysql_quoted_ident_len(s)?;
+    let at = &s[user..];
+    let at = at.strip_prefix('@')?;
+    let host = mysql_quoted_ident_len(at)?;
+    Some(user + 1 + host)
+}
+
+/// Byte length of a leading `` `…` `` backtick-quoted identifier (doubled `` `` `` = one literal
+/// backtick), or `None` if `s` does not start with a complete one.
+fn mysql_quoted_ident_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'`') {
+        return None;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        if b[i] == b'`' {
+            if b.get(i + 1) == Some(&b'`') {
+                i += 2; // doubled backtick = a literal backtick inside the identifier
+                continue;
+            }
+            return Some(i + 1); // the closing backtick
+        }
+        i += 1;
+    }
+    None // unterminated
 }
 
 /// A random token (32 hex chars) for an ephemeral role's login password — never persisted, never
@@ -2805,11 +2929,14 @@ impl ProjectExport for NodeProjectExport {
                                     }
                                     let out_path =
                                         stage_dir.join(format!("myrestore-{chunk_idx}.out"));
+                                    let dump_path =
+                                        stage_dir.join(format!("mydump-{chunk_idx}.sql"));
                                     chunk_idx += 1;
                                     let restore = match self.spawn_mysql_restore(
                                         &plan,
                                         body_rx,
                                         out_path.clone(),
+                                        dump_path.clone(),
                                     ) {
                                         Ok(h) => h,
                                         Err(e) => {
@@ -2823,6 +2950,7 @@ impl ProjectExport for NodeProjectExport {
                                         plan: Box::new(plan),
                                         restore,
                                         out_path,
+                                        dump_path,
                                     });
                                 }
                             }
@@ -2942,15 +3070,20 @@ impl ProjectExport for NodeProjectExport {
                                 plan,
                                 restore,
                                 out_path,
+                                dump_path,
                             }) => {
                                 let code = restore.await;
                                 let out = tokio::fs::read_to_string(&out_path)
                                     .await
                                     .unwrap_or_default();
                                 let _ = tokio::fs::remove_file(&out_path).await;
+                                let _ = tokio::fs::remove_file(&dump_path).await;
                                 match code {
                                     Ok(Ok(0)) if verified => {
-                                        match self.mysql_swap_shadow(&plan, &stage_dir).await {
+                                        // Carry the DEFINER objects + atomic swap + re-point to the
+                                        // tenant's own role (the ONE DEFINER-handling seam the sidecar
+                                        // path shares).
+                                        match self.mysql_finalize_shadow(&plan, &stage_dir).await {
                                             Ok(()) => {
                                                 report.pg_databases += 1;
                                                 Ok(())
@@ -6227,6 +6360,25 @@ impl NodeProjectExport {
         // keeping the `__shadow_<suffix>` distinguisher intact — latent overflow for a long db name.
         let shadow_db = bounded_derived_db_name(&live_db, "__shadow_", &suffix);
         let eph_user = format!("brexp_apply_{suffix}");
+        // The post-swap DEFINER re-point target for carried triggers/routines/events. For a SHARED
+        // NON-default tenant this is the tenant's OWN db-scoped login role (`` `<role>`@`%` ``) — the
+        // same role the runtime serves the tenant's db as, so a carried object runs with exactly the
+        // tenant's own grants, never SUPER/cross-tenant. For Single/dedicated + Shared-DEFAULT there
+        // is no separate per-tenant role (the configured/served user owns the whole server), so the
+        // clause is STRIPPED and defaults to the admin that re-creates it (the served identity).
+        let (tenant_ident_raw, is_default) =
+            crate::tenant_sql::tenant_key(cfg.tenant_scope, project, "");
+        let shared_nondefault =
+            matches!(cfg.tenant, crate::config::TenantIsolation::Shared) && !is_default;
+        let repoint = if shared_nondefault {
+            let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+            let compute = cfg.compute.as_deref().unwrap_or_default();
+            MysqlDefinerTarget::Account(boatramp_storage::tenant_provision::tenant_role_name(
+                compute, &ident,
+            ))
+        } else {
+            MysqlDefinerTarget::Strip
+        };
         Ok(MysqlShadowPlan {
             live_db,
             shadow_db,
@@ -6235,6 +6387,7 @@ impl NodeProjectExport {
             eph_user,
             eph_password: random_token(),
             image,
+            repoint,
         })
     }
 
@@ -6275,21 +6428,67 @@ impl NodeProjectExport {
             self.mysql_drop_shadow(&plan, stage_dir).await;
             return Err(e);
         }
-        // Apply the untrusted tables-only dump into the shadow AS the ephemeral user, reading the
-        // staged member FILE on stdin. `--local-infile=0` (in `mysql_shadow_invocation`) disables
-        // client-side `LOAD DATA LOCAL INFILE`; stderr is merged so a refused/failed statement is
-        // diagnosable (`run_ephemeral` drops a container's stderr on a non-zero exit).
-        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
-        let merged = merge_stderr_argv(&inv.argv);
-        let outfile = stage_dir.join(format!("myrestore-sidecar-{}.out", shadow_suffix()));
-        let code = match self
-            .run_sql_client(&plan.image, &merged, &inv.env, Some(temp), &outfile)
+        // Rewrite every `DEFINER=` clause in the staged dump to the ephemeral apply user, then apply
+        // the untrusted tables-only dump into the shadow AS that user (so its triggers/routines/
+        // events create successfully as a non-superuser). Any apply failure tears the shadow down;
+        // live is untouched.
+        if let Err(e) = self
+            .mysql_apply_staged_to_shadow(&plan, temp, stage_dir)
             .await
         {
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        // Capture the carried DEFINER objects, drop the shadow's triggers, atomic `RENAME TABLE`
+        // swap, then re-create the objects in live with the DEFINER re-pointed to the tenant's own
+        // role. Any failure tears the shadow down (the swap keeps live intact on a pre-swap failure;
+        // a post-swap re-point failure is loud — the tables are live but the carried objects are not).
+        if let Err(e) = self.mysql_finalize_shadow(&plan, stage_dir).await {
+            self.mysql_drop_shadow(&plan, stage_dir).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Rewrite every `DEFINER=` clause in the staged mysql dump FILE to the ephemeral apply user
+    /// ([`rewrite_mysql_definers`]), then APPLY the rewritten dump into the shadow CONNECTED AS that
+    /// ephemeral non-superuser user ([`mysql_shadow_invocation`], `--local-infile=0`), reading it on
+    /// stdin. The DEFINER rewrite is what lets the untrusted triggers/routines/events create under the
+    /// non-superuser apply (a non-SUPER user cannot create an object with a FOREIGN definer); after
+    /// the swap the driver re-points them to the tenant's own role. Shared by the sidecar and chunked
+    /// paths. stderr is merged (`sh -c '… 2>&1'`) so a refused/failed statement is diagnosable.
+    async fn mysql_apply_staged_to_shadow(
+        &self,
+        plan: &MysqlShadowPlan,
+        staged_dump: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let raw = tokio::fs::read_to_string(staged_dump)
+            .await
+            .map_err(other)?;
+        let rewritten =
+            rewrite_mysql_definers(&raw, &MysqlDefinerTarget::Account(plan.eph_user.clone()));
+        let rewritten_path = stage_dir.join(format!("myapply-{}.sql", shadow_suffix()));
+        tokio::fs::write(&rewritten_path, rewritten.as_bytes())
+            .await
+            .map_err(other)?;
+        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let outfile = stage_dir.join(format!("myapply-{}.out", shadow_suffix()));
+        let r = self
+            .run_sql_client(
+                &plan.image,
+                &merged,
+                &inv.env,
+                Some(&rewritten_path),
+                &outfile,
+            )
+            .await;
+        let _ = tokio::fs::remove_file(&rewritten_path).await;
+        let code = match r {
             Ok(c) => c,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&outfile).await;
-                self.mysql_drop_shadow(&plan, stage_dir).await;
                 return Err(e);
             }
         };
@@ -6298,19 +6497,149 @@ impl NodeProjectExport {
                 .await
                 .unwrap_or_default();
             let _ = tokio::fs::remove_file(&outfile).await;
-            self.mysql_drop_shadow(&plan, stage_dir).await;
             return Err(Perr::Other(format!(
-                "mysql apply into shadow {:?} for {db:?} exited {code}; live untouched: {}",
+                "mysql apply into shadow {:?} exited {code}; live untouched: {}",
                 plan.shadow_db,
                 diag.trim()
             )));
         }
         let _ = tokio::fs::remove_file(&outfile).await;
-        // Apply clean (and the sidecar member was SHA-verified at staging) → atomic swap. A swap
-        // failure tears the shadow down; live is untouched.
-        if let Err(e) = self.mysql_swap_shadow(&plan, stage_dir).await {
-            self.mysql_drop_shadow(&plan, stage_dir).await;
-            return Err(e);
+        Ok(())
+    }
+
+    /// Finalize a populated shadow: carry its DEFINER-bearing objects (triggers/stored routines/
+    /// events) across the atomic swap with their `DEFINER` RE-POINTED to the tenant's own role.
+    /// Shared by BOTH the sidecar and the dedicated chunked mysql paths (ONE DEFINER-handling seam).
+    ///
+    /// The mechanics MySQL forces on us: a trigger blocks a cross-schema `RENAME TABLE` (ERROR 1435
+    /// "Trigger in wrong schema"), and stored routines + events are SCHEMA-level — they do NOT ride
+    /// `RENAME TABLE` at all and would be lost when the shadow db is dropped. So, in order:
+    ///   1. CAPTURE the objects as clean DDL from the shadow (they exist there with `DEFINER` = the
+    ///      ephemeral apply user, having proven they are creatable by a non-superuser — fail-closed
+    ///      otherwise). Done BEFORE the swap (the swap drops the shadow).
+    ///   2. DROP the shadow's triggers (so the `RENAME TABLE` swap won't hit error 1435).
+    ///   3. Atomic `RENAME TABLE` swap — the base tables move shadow→live; the shadow db + ephemeral
+    ///      user are dropped.
+    ///   4. RE-CREATE the captured objects in LIVE via the ADMIN connection, with every `DEFINER`
+    ///      re-pointed (`plan.repoint`) to the tenant's own db-scoped role (Shared) or stripped to the
+    ///      admin/served identity (dedicated). The admin sets the definer; the object itself is only
+    ///      stored (CREATE does not run a routine/trigger/event body), and when it later runs it runs
+    ///      with the re-pointed definer's grants — the tenant's own, never SUPER/another tenant.
+    ///
+    /// A pre-swap failure leaves live intact; a post-swap re-create failure is LOUD (the tables are
+    /// live but the carried objects did not land) — the same loud-but-live shape the pg shared
+    /// re-provision has.
+    async fn mysql_finalize_shadow(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let objects_sql = self.mysql_dump_definer_objects(plan, stage_dir).await?;
+        // A dump with no trigger/routine/event carries no `DEFINER=` clause at all.
+        let has_definer_objects = objects_sql.contains("DEFINER=");
+        if has_definer_objects {
+            self.mysql_drop_shadow_triggers(plan, stage_dir).await?;
+        }
+        self.mysql_swap_shadow(plan, stage_dir).await?;
+        if has_definer_objects {
+            self.mysql_apply_definer_objects_to_live(plan, &objects_sql, stage_dir)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Re-extract the shadow's DEFINER-bearing objects (triggers/routines/events) as clean,
+    /// `DELIMITER`-wrapped DDL ([`mysqldump_definer_objects_invocation`]) via the admin connection.
+    /// Their `DEFINER` is the ephemeral apply user at this point; the re-point happens at apply time.
+    async fn mysql_dump_definer_objects(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<String, Perr> {
+        let inv = mysqldump_definer_objects_invocation(&plan.maint, &plan.shadow_db);
+        let outfile = stage_dir.join(format!("mydefiner-{}.sql", shadow_suffix()));
+        let code = self
+            .run_sql_client(&plan.image, &inv.argv, &inv.env, None, &outfile)
+            .await?;
+        let content = tokio::fs::read_to_string(&outfile)
+            .await
+            .unwrap_or_default();
+        let _ = tokio::fs::remove_file(&outfile).await;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not capture trigger/routine/event DDL of {:?} (exit {code})",
+                plan.shadow_db
+            )));
+        }
+        Ok(content)
+    }
+
+    /// Drop every trigger on the SHADOW's tables (via the admin connection), so the cross-schema
+    /// `RENAME TABLE` swap does not hit ERROR 1435 "Trigger in wrong schema". The triggers are
+    /// re-created in LIVE after the swap from the captured DDL.
+    async fn mysql_drop_shadow_triggers(
+        &self,
+        plan: &MysqlShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let sql = format!(
+            "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = {};",
+            mysql_lit(&plan.shadow_db)
+        );
+        let (code, out) = self.mysql_run_admin(plan, &sql, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not list triggers of {:?} (exit {code}): {out}",
+                plan.shadow_db
+            )));
+        }
+        let triggers: Vec<String> = out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if triggers.is_empty() {
+            return Ok(());
+        }
+        let shadow_q = quote_ident(ExternalSqlKind::Mysql, &plan.shadow_db);
+        let mut stmts = String::new();
+        for t in &triggers {
+            let tq = quote_ident(ExternalSqlKind::Mysql, t);
+            stmts.push_str(&format!("DROP TRIGGER IF EXISTS {shadow_q}.{tq};\n"));
+        }
+        let (code, out) = self.mysql_run_admin(plan, &stmts, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not drop triggers of {:?} (exit {code}): {out}",
+                plan.shadow_db
+            )));
+        }
+        Ok(())
+    }
+
+    /// Re-create the captured DEFINER objects in the LIVE (swapped-in) db via the ADMIN connection,
+    /// with every `DEFINER` RE-POINTED to the tenant's own role (`plan.repoint`). The attacker-shaped
+    /// object BODIES are only stored here (CREATE does not execute a routine/trigger/event body); when
+    /// they later run they run with the re-pointed definer's grants — the tenant's own db-scoped role
+    /// (Shared) or the served identity (dedicated), NEVER SUPER or another tenant. A missing-privilege
+    /// object fails this step FAIL-CLOSED (loud) rather than escalating.
+    async fn mysql_apply_definer_objects_to_live(
+        &self,
+        plan: &MysqlShadowPlan,
+        objects_sql: &str,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let rewritten = rewrite_mysql_definers(objects_sql, &plan.repoint);
+        // The DDL is unqualified (positional-db dump), so `USE` the live db to land it there.
+        let live_q = quote_ident(ExternalSqlKind::Mysql, &plan.live_db);
+        let script = format!("USE {live_q};\n{rewritten}");
+        let (code, out) = self.mysql_run_admin(plan, &script, stage_dir).await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "mysql shadow: could not re-create trigger/routine/event objects in live {:?} \
+                 (exit {code}); the tables swapped in but the carried objects did not land: {out}",
+                plan.live_db
+            )));
         }
         Ok(())
     }
@@ -6551,23 +6880,57 @@ impl NodeProjectExport {
         Ok(())
     }
 
-    /// Spawn the `mysql <shadow>` subprocess that applies the untrusted tables-only dump as the
-    /// EPHEMERAL least-privilege user, reading the body channel as stdin.
+    /// Spawn the task that applies the untrusted tables-only dump into the shadow as the EPHEMERAL
+    /// least-privilege user. It DRAINS the streamed body to a staged `dump_path`, REWRITES every
+    /// `DEFINER=` clause to the ephemeral apply user ([`rewrite_mysql_definers`]) — so the carried
+    /// triggers/routines/events create under the non-superuser apply — then applies the rewritten
+    /// dump on stdin (`mysql <shadow>`, `--local-infile=0`, stderr merged). The DEFINER re-point to
+    /// the tenant's own role happens after the swap in [`mysql_finalize_shadow`]. (Draining to a file
+    /// is why the chunked path and the sidecar path share ONE file-based DEFINER-rewrite seam.)
     fn spawn_mysql_restore(
         &self,
         plan: &MysqlShadowPlan,
         body_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         out_path: PathBuf,
+        dump_path: PathBuf,
     ) -> Result<tokio::task::JoinHandle<Result<i32, Perr>>, Perr> {
+        use futures::io::AsyncWriteExt as _;
         let backend = self.require_backend()?.clone();
         let image = plan.image.clone();
-        let inv = mysql_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let apply_conn = plan.apply_conn();
+        let shadow_db = plan.shadow_db.clone();
+        let eph_user = plan.eph_user.clone();
         Ok(tokio::spawn(async move {
-            let mut reader = AsyncChannelReader::new(body_rx);
+            // 1. Drain the streamed body to a staged file.
+            {
+                let mut reader = AsyncChannelReader::new(body_rx);
+                let f = tokio::fs::File::create(&dump_path).await.map_err(other)?;
+                let mut sink = f.compat_write();
+                futures::io::copy(&mut reader, &mut sink)
+                    .await
+                    .map_err(other)?;
+                sink.flush().await.map_err(other)?;
+            }
+            // 2. Rewrite every `DEFINER=` clause to the ephemeral apply user.
+            let raw = tokio::fs::read_to_string(&dump_path).await.map_err(other)?;
+            let rewritten = rewrite_mysql_definers(&raw, &MysqlDefinerTarget::Account(eph_user));
+            tokio::fs::write(&dump_path, rewritten.as_bytes())
+                .await
+                .map_err(other)?;
+            // 3. Apply the rewritten dump into the shadow AS the ephemeral user. `sh -c '… 2>&1'`
+            //    merges stderr so a refused/failed object is diagnosable (run_ephemeral drops a
+            //    container's stderr on a non-zero exit); the mysql apply writes nothing to stdout, so
+            //    the merge never corrupts a data stream. Only driver-derived flags + the shadow-db
+            //    identifier are composed into the command — never the password (it rides in the env).
+            let inv = mysql_shadow_invocation(&apply_conn, &shadow_db);
+            let cmd = format!("exec {} 2>&1", sh_join(&inv.argv));
+            let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+            let infile = tokio::fs::File::open(&dump_path).await.map_err(other)?;
+            let mut rdr = infile.compat();
             let out = tokio::fs::File::create(&out_path).await.map_err(other)?;
             let mut sink = out.compat_write();
             backend
-                .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut reader), &mut sink)
+                .run_ephemeral(&image, &argv, &inv.env, Some(&mut rdr), &mut sink)
                 .await
                 .map_err(other)
         }))
@@ -10245,6 +10608,76 @@ mod tests {
         assert_eq!(
             sidecar_managed_apply(false, Overlay),
             SidecarManagedApply::External
+        );
+    }
+
+    /// The SECURITY-load-bearing DEFINER rewrite: `rewrite_mysql_definers` must re-point EVERY
+    /// mysqldump `DEFINER=`u`@`h`` clause (trigger/routine/event/view) and NEVER touch row data or a
+    /// routine body — so a crafted string literal containing "DEFINER=" is left untouched. Mutation
+    /// proof: flip any matching rule (drop the `/*!`-line guard, or the exact backtick-shape parse)
+    /// and one of these cases fails.
+    #[test]
+    fn rewrite_mysql_definers_repoints_only_definer_comment_lines() {
+        let apply = MysqlDefinerTarget::Account("brexp_apply_deadbeef".to_string());
+
+        // A trigger's DEFINER comment line → re-pointed to the apply user @`%`.
+        let trig = "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t` BEFORE INSERT ON `x` FOR EACH ROW SET @n=1 */;;\n";
+        let got = rewrite_mysql_definers(trig, &apply);
+        assert!(
+            got.contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
+            "trigger DEFINER re-pointed: {got}"
+        );
+        assert!(
+            !got.contains("`root`@`localhost`"),
+            "old definer gone: {got}"
+        );
+
+        // A routine DEFINER line → re-pointed; a view DEFINER line (with SQL SECURITY DEFINER) → the
+        // DEFINER re-pointed but SQL SECURITY DEFINER left intact.
+        let proc = "/*!50003 CREATE*/ /*!50020 DEFINER=`admin`@`10.0.0.1`*/ /*!50003 PROCEDURE `p`() SELECT 1 */;;\n";
+        assert!(
+            rewrite_mysql_definers(proc, &apply).contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
+            "procedure DEFINER re-pointed"
+        );
+        let view = "/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */\n";
+        let got_view = rewrite_mysql_definers(view, &apply);
+        assert!(
+            got_view.contains("DEFINER=`brexp_apply_deadbeef`@`%` SQL SECURITY DEFINER"),
+            "view DEFINER re-pointed, SQL SECURITY DEFINER kept: {got_view}"
+        );
+
+        // CRITICAL: a DATA line (INSERT) whose string literal contains the TEXT "DEFINER=" is NEVER
+        // rewritten (it does not start with `/*!`).
+        let data = "INSERT INTO `logs` VALUES (1,'/*!50017 DEFINER=`evil`@`host`*/ keep me');\n";
+        assert_eq!(
+            rewrite_mysql_definers(data, &apply),
+            data,
+            "a string literal containing DEFINER= must be left byte-for-byte untouched"
+        );
+
+        // A doubled-backtick account name parses as one identifier (not a premature close).
+        let weird = "/*!50017 DEFINER=`we``ird`@`%`*/ /*!50003 TRIGGER `t` */;;\n";
+        assert!(
+            rewrite_mysql_definers(weird, &apply).contains("DEFINER=`brexp_apply_deadbeef`@`%`"),
+            "a doubled-backtick definer account is parsed + re-pointed"
+        );
+
+        // STRIP removes the clause (and one trailing space) so DEFINER defaults to the issuer.
+        let stripped = rewrite_mysql_definers(trig, &MysqlDefinerTarget::Strip);
+        assert!(
+            !stripped.contains("DEFINER="),
+            "strip removes the DEFINER clause: {stripped}"
+        );
+        assert!(
+            stripped.contains("/*!50017 */"),
+            "strip collapses to an empty version comment, no stray double space: {stripped}"
+        );
+
+        // An account name with a literal backtick re-points with the backtick doubled in the output.
+        let role = MysqlDefinerTarget::Account("ro`le".to_string());
+        assert!(
+            rewrite_mysql_definers(trig, &role).contains("DEFINER=`ro``le`@`%`"),
+            "a re-point target's backtick is doubled in the emitted identifier"
         );
     }
 

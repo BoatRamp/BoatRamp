@@ -2935,6 +2935,352 @@ async fn project_sync_managed_mysql_shared_shadow_land_live() {
     println!("PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK");
 }
 
+/// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
+/// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
+/// DATABASE`). Self-skips.
+///
+/// Proves Part 2 end-to-end THROUGH THE REAL DRIVER on a Shared tenant: a source schema with a
+/// TRIGGER + a stored PROCEDURE + an EVENT (DEFINER = the superuser) is EXPORTED and IMPORTED into a
+/// FRESH Shared tenant, and the carried objects: (1) LAND (they exist in the fresh tenant db); (2)
+/// were restored as a NON-SUPER user (the restore itself connects only as the ephemeral apply user —
+/// the whole import would fail if a foreign DEFINER were required); (3) are RE-POINTED post-swap to
+/// the FRESH TENANT'S OWN LOGIN ROLE — asserted by querying `information_schema` for each object's
+/// `DEFINER = <fresh_role>@%`; and (4) actually WORK — the carried trigger FIRES (an INSERT appends
+/// to the audit table) and the carried procedure RUNS (a `CALL` inserts a row). A stored FUNCTION is
+/// deliberately omitted: a non-SUPER restore of a FUNCTION needs `log_bin_trust_function_creators` on
+/// a binlog-on server, which would fail-closed — the accepted edge. Emits
+/// `PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK`.
+#[tokio::test]
+async fn project_export_mysql_routines_triggers_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, IdentityChoice, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name, tenant_role_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (mysql routines/triggers gate not run)");
+        return;
+    };
+    let Some((superuser, su_password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (mysql routines/triggers gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    const COMPUTE: &str = "my";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "deftest";
+    let s = now_suffix();
+    let src_project = format!("mydef-src-{s}");
+    let fresh_project = format!("mydef-fresh-{s}");
+
+    let su = MysqlConnection {
+        host: host.clone(),
+        port,
+        user: superuser.clone(),
+        password: su_password.clone(),
+        database: String::new(),
+        connect_timeout_secs: 10,
+        ephemeral_network: None,
+    };
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-mydef-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([5u8; 32]));
+
+    let sealed_su = envelope
+        .wrap(su_password.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-mysql".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "mysql".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+    let db_name = |project: &str| tenant_db_name(DATABASE, &sanitize_ident(project));
+
+    for p in [&src_project, &fresh_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+
+    // Seed the SOURCE tenant db with a schema that HAS a trigger + a stored procedure + an event
+    // (all with DEFINER = the superuser, as any normal CREATE would). The trigger fires on INSERT.
+    let src_db = db_name(&src_project);
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&src_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         CREATE TABLE audit(n INT); \
+         CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW INSERT INTO audit VALUES (NEW.id); \
+         CREATE PROCEDURE addrow(IN i INT, IN sv TEXT) INSERT INTO t VALUES (i, sv); \
+         CREATE EVENT ev ON SCHEDULE EVERY 1 HOUR DO DELETE FROM audit WHERE n < 0; \
+         INSERT INTO t VALUES (1,'alpha');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed source schema + objects; mysql output:\n{o}");
+    // The source trigger fired on the seed INSERT → audit has {1}.
+    let src_audit = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&src_db),
+        "SELECT n FROM audit ORDER BY n;",
+    )
+    .await
+    .1;
+    assert_eq!(src_audit, "1", "source trigger fired on seed INSERT");
+
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-mydef-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-mydef-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false);
+
+    // EXPORT the source tenant (DataPlane + ShadowSwap → sidecar/tables-only + routines/events).
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(
+                &src_project,
+                &ExportOptions {
+                    scope: BundleScope::DataPlane,
+                    managed_restore: ManagedRestore::ShadowSwap,
+                    include_identity: false,
+                    transport_key: None,
+                    delta: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("driver export of the source tenant");
+        sink.into_inner()
+    };
+
+    // IMPORT into the fresh tenant (self-provisions its db + role).
+    let report = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: false,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("import carrying triggers/routines/events must SUCCEED (restored non-SUPER)")
+    };
+    assert!(report.pg_databases >= 1, "the mysql db restored");
+
+    let fresh_db = db_name(&fresh_project);
+    let fresh_ident = sanitize_ident(&fresh_project);
+    let fresh_role = tenant_role_name(COMPUTE, &fresh_ident);
+    let expect_definer = format!("{fresh_role}@%");
+
+    // (1)+(3) The carried objects LAND and are RE-POINTED to the fresh tenant's OWN login role
+    // (information_schema.*.definer is `user@host`, not backtick-quoted).
+    let trg_def = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!(
+            "SELECT definer FROM information_schema.triggers WHERE trigger_schema='{fresh_db}';"
+        ),
+    )
+    .await
+    .1;
+    assert_eq!(
+        trg_def, expect_definer,
+        "the carried TRIGGER is re-pointed to the tenant role (got {trg_def:?})"
+    );
+    let proc_def = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!(
+            "SELECT definer FROM information_schema.routines WHERE routine_schema='{fresh_db}' \
+             AND routine_name='addrow';"
+        ),
+    )
+    .await
+    .1;
+    assert_eq!(
+        proc_def, expect_definer,
+        "the carried PROCEDURE is re-pointed to the tenant role (got {proc_def:?})"
+    );
+    let ev_def = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        None,
+        &format!("SELECT definer FROM information_schema.events WHERE event_schema='{fresh_db}';"),
+    )
+    .await
+    .1;
+    assert_eq!(
+        ev_def, expect_definer,
+        "the carried EVENT is re-pointed to the tenant role (got {ev_def:?})"
+    );
+
+    // Row data landed too (the seed row + its trigger-written audit row rode the tables).
+    let landed = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(landed, "1:alpha", "table rows landed on the fresh tenant");
+
+    // (4) The carried PROCEDURE actually RUNS, and the carried TRIGGER actually FIRES.
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "CALL addrow(2, 'beta');",
+    )
+    .await;
+    assert_eq!(c, 0, "the carried procedure runs; mysql output:\n{o}");
+    let after = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        after, "1:alpha\n2:beta",
+        "the carried procedure inserted a row via CALL"
+    );
+    // The INSERT the procedure did must have fired the carried trigger → audit now has {1,2}.
+    let audit = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&fresh_db),
+        "SELECT n FROM audit ORDER BY n;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        audit, "1\n2",
+        "the carried trigger fired on the procedure's INSERT (audit got the new id)"
+    );
+
+    // cleanup (best-effort).
+    for p in [&src_project, &fresh_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    println!("PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK");
+}
+
 /// **Live full-DRIVER round-trip** — drives the real `NodeProjectExport::export()` /
 /// `import()` (not the reconstructed primitives the pg/mysql/libsql tests use), closing the
 /// "driver has no end-to-end live coverage" gap for the pg path: it exercises the driver's

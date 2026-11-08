@@ -55,6 +55,12 @@ A skipped (infeasible) database shows in the plan with its reason and counts tow
 count** `--strict` refuses on, and a site that binds a skipped database is itself reported
 incoherent (its binding would dangle) — all before a byte moves.
 
+A managed **MySQL** database carries its **triggers, stored routines, and scheduled events** along
+with its tables, restored safely as a non-privileged user: each object's `DEFINER` is re-pointed to
+the destination tenant's own database-scoped role (so a carried object runs with that tenant's own
+grants — never a server superuser or another tenant). An object that would require a privilege the
+tenant role lacks fails the import fail-closed rather than escalating.
+
 > **Why sync can land a managed DB when a plain `--clone-data-only` import cannot.** A data-plane
 > clone used to drive the managed-DB restore through the schema-less `--data-only` *overlay*, which
 > the import categorically **refuses** for a managed binding (overlaying an untrusted dump onto a
